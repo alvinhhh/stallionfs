@@ -1,0 +1,542 @@
+{
+  "format": 3,
+  "version": "0.6.0",
+  "status": "complete",
+  "timestamp": "2026-10-07T10:14:06.904142+00:00",
+  "implementation_sha256": "0405b6c33b0dfb0e450d1e4a581aa7f73a5f66ef39554d7a93d49bb5d4de1301",
+  "source_sha256": {
+    "core.py": "a66180dd740a738bb68a81cff9c96d969c218063ae53da2e302cf0971f185beb",
+    "_scan.c": "a96b28a935d998ddec3f86f595fbd43b0ca0df2a321fc25f62eee9239a071564",
+    "_tree.c": "d729f693743fd4a8a8fe6f8671a691f9be7e7a1259fe85533d806bbc865a0180",
+    "_walk.c": "364e196b09ae91b03007d5b0fa6f6530441a9ac41e92f2459085dfddbf64786a",
+    "_tree.h": "89b6491ff843fd8ceb91343db7e042925e6eddd4ccefb6dbf102e448cab3301d",
+    "images.py": "d75eab1fcc179b1abfab52c37a8a5b98541d19b11f9f3b439d6b2f304c805c85",
+    "__init__.py": "9afbfa31196892befb209c2bf0804dbc6043ef263a80099b955f8ffec5527bc5",
+    "tests/perf/run.py": "4fb532a02654694e83ca45e5ed3fcac3a82e1fd1a10158e23f0d8e3f32e90373"
+  },
+  "native_binary_sha256": "06aef98531edacb3a3d526deb01c4c62c440b17610c88f632a914d8566ad913c",
+  "harness_sha256": "4fb532a02654694e83ca45e5ed3fcac3a82e1fd1a10158e23f0d8e3f32e90373",
+  "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu": "Apple M2",
+  "memory_bytes": 25769803776,
+  "python": "3.13.3",
+  "node": "v24.19.0",
+  "npm": "10.9.2",
+  "git": "git version 2.49.0",
+  "samples": 7,
+  "concurrency": 4,
+  "methods_selected": [
+    "worktree_install",
+    "stallionfs_folder"
+  ],
+  "setup": [
+    "npm",
+    "ci",
+    "--offline",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--cache",
+    "<isolated warm npm cache>"
+  ],
+  "warmup_batches_per_method": 1,
+  "source_files_generated": 1000,
+  "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
+  "cpu_timing": "Process CPU including worker threads plus waited child-process CPU, summed over the same ready/remove/reclaim phases as wall time. Validation is excluded.",
+  "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
+  "methods": {
+    "1": {
+      "worktree_install": {
+        "ready_s": {
+          "median": 6.7853506250539795,
+          "min": 5.329047166975215,
+          "max": 20.27108987502288
+        },
+        "remove_s": {
+          "median": 2.348407833953388,
+          "min": 2.032004583044909,
+          "max": 4.853858208982274
+        },
+        "reclaim_s": {
+          "median": 5.333917215466499e-06,
+          "min": 4.375004209578037e-06,
+          "max": 7.291906513273716e-06
+        },
+        "total_s": {
+          "median": 9.133762834011577,
+          "min": 7.574814125080593,
+          "max": 24.092420457978733
+        },
+        "ready_cpu_s": {
+          "median": 8.739381999999992,
+          "min": 8.599829,
+          "max": 9.630612999999997
+        },
+        "remove_cpu_s": {
+          "median": 1.9545519999999783,
+          "min": 1.8275859999999966,
+          "max": 2.000540000000001
+        },
+        "reclaim_cpu_s": {
+          "median": 7.000000010748408e-06,
+          "min": 5.999999984851456e-06,
+          "max": 9.000000005698894e-06
+        },
+        "total_cpu_s": {
+          "median": 10.706097000000028,
+          "min": 10.427420999999981,
+          "max": 11.586448000000004
+        }
+      },
+      "stallionfs_folder": {
+        "ready_s": {
+          "median": 3.6013317910255864,
+          "min": 3.0372723329346627,
+          "max": 7.37243883300107
+        },
+        "remove_s": {
+          "median": 0.0023470000596717,
+          "min": 0.001733041019178927,
+          "max": 0.004885041969828308
+        },
+        "reclaim_s": {
+          "median": 1.1300364580238238,
+          "min": 0.996168875019066,
+          "max": 1.911768582998775
+        },
+        "total_s": {
+          "median": 4.983281000051647,
+          "min": 4.105893832980655,
+          "max": 9.289092457969673
+        },
+        "ready_cpu_s": {
+          "median": 6.98433,
+          "min": 5.317151999999993,
+          "max": 7.208281999999997
+        },
+        "remove_cpu_s": {
+          "median": 0.0023850000000038563,
+          "min": 0.0018019999999978609,
+          "max": 0.0029129999999994993
+        },
+        "reclaim_cpu_s": {
+          "median": 2.083258999999998,
+          "min": 1.6004500000000021,
+          "max": 2.174892
+        },
+        "total_cpu_s": {
+          "median": 9.070007000000032,
+          "min": 6.959739999999989,
+          "max": 9.384975999999995
+        }
+      }
+    },
+    "4": {
+      "worktree_install": {
+        "ready_s": {
+          "median": 22.1344616250135,
+          "min": 15.35445675009396,
+          "max": 39.08500149997417
+        },
+        "remove_s": {
+          "median": 5.666157124913298,
+          "min": 5.228526292019524,
+          "max": 6.564201749977656
+        },
+        "reclaim_s": {
+          "median": 6.166985258460045e-06,
+          "min": 4.666042514145374e-06,
+          "max": 4.0499959141016006e-05
+        },
+        "total_s": {
+          "median": 27.824296081904322,
+          "min": 20.58298995916266,
+          "max": 45.338985956972465
+        },
+        "ready_cpu_s": {
+          "median": 38.97663699999998,
+          "min": 37.434518000000025,
+          "max": 41.992869999999925
+        },
+        "remove_cpu_s": {
+          "median": 10.389900999999952,
+          "min": 9.945265999999947,
+          "max": 10.868588000000045
+        },
+        "reclaim_cpu_s": {
+          "median": 8.999999977277184e-06,
+          "min": 5.999999984851456e-06,
+          "max": 4.3000000005122274e-05
+        },
+        "total_cpu_s": {
+          "median": 49.33521900000005,
+          "min": 47.824427999999955,
+          "max": 51.93814499999985
+        }
+      },
+      "stallionfs_folder": {
+        "ready_s": {
+          "median": 9.375775667023845,
+          "min": 8.32721387501806,
+          "max": 12.523255083011463
+        },
+        "remove_s": {
+          "median": 0.0034334170632064342,
+          "min": 0.003086708951741457,
+          "max": 0.023609583033248782
+        },
+        "reclaim_s": {
+          "median": 3.996002250001766,
+          "min": 3.7177412080345675,
+          "max": 32.375143709010445
+        },
+        "total_s": {
+          "median": 13.596384083852172,
+          "min": 12.32641916605644,
+          "max": 41.59377945913002
+        },
+        "ready_cpu_s": {
+          "median": 31.58690100000007,
+          "min": 30.336544000000004,
+          "max": 32.5680900000001
+        },
+        "remove_cpu_s": {
+          "median": 0.004892999999924541,
+          "min": 0.0034849999999551073,
+          "max": 0.008946000000037202
+        },
+        "reclaim_cpu_s": {
+          "median": 7.6696730000001025,
+          "min": 7.209720999999945,
+          "max": 8.130319999999983
+        },
+        "total_cpu_s": {
+          "median": 39.11411500000008,
+          "min": 37.55051700000001,
+          "max": 40.679389000000015
+        }
+      }
+    }
+  },
+  "raw": {
+    "1": {
+      "worktree_install": [
+        {
+          "ready_s": 7.304185041924939,
+          "remove_s": 4.853858208982274,
+          "reclaim_s": 5.708076059818268e-06,
+          "total_s": 12.158048958983272,
+          "ready_cpu_s": 8.828311000000006,
+          "remove_cpu_s": 1.9985970000000037,
+          "reclaim_cpu_s": 7.000000003642981e-06,
+          "total_cpu_s": 10.826915000000014
+        },
+        {
+          "ready_s": 20.27108987502288,
+          "remove_s": 3.821325291064568,
+          "reclaim_s": 5.291891284286976e-06,
+          "total_s": 24.092420457978733,
+          "ready_cpu_s": 9.630612999999997,
+          "remove_cpu_s": 1.9558279999999968,
+          "reclaim_cpu_s": 7.000000010748408e-06,
+          "total_cpu_s": 11.586448000000004
+        },
+        {
+          "ready_s": 11.70756191702094,
+          "remove_s": 4.04965170903597,
+          "reclaim_s": 5.58304600417614e-06,
+          "total_s": 15.757219209102914,
+          "ready_cpu_s": 8.739381999999992,
+          "remove_cpu_s": 2.000540000000001,
+          "reclaim_cpu_s": 7.000000010748408e-06,
+          "total_cpu_s": 10.739929000000004
+        },
+        {
+          "ready_s": 6.7853506250539795,
+          "remove_s": 2.348407833953388,
+          "reclaim_s": 4.375004209578037e-06,
+          "total_s": 9.133762834011577,
+          "ready_cpu_s": 8.704219000000009,
+          "remove_cpu_s": 1.9471550000000093,
+          "reclaim_cpu_s": 5.999999999062311e-06,
+          "total_cpu_s": 10.651380000000017
+        },
+        {
+          "ready_s": 6.234171458054334,
+          "remove_s": 2.1795473750680685,
+          "reclaim_s": 5.333917215466499e-06,
+          "total_s": 8.413724167039618,
+          "ready_cpu_s": 8.792921000000007,
+          "remove_cpu_s": 1.9131689999999821,
+          "reclaim_cpu_s": 7.000000039170118e-06,
+          "total_cpu_s": 10.706097000000028
+        },
+        {
+          "ready_s": 5.542805125005543,
+          "remove_s": 2.032004583044909,
+          "reclaim_s": 4.417030140757561e-06,
+          "total_s": 7.574814125080593,
+          "ready_cpu_s": 8.599829,
+          "remove_cpu_s": 1.8275859999999966,
+          "reclaim_cpu_s": 5.999999984851456e-06,
+          "total_cpu_s": 10.427420999999981
+        },
+        {
+          "ready_s": 5.329047166975215,
+          "remove_s": 2.3079192499862984,
+          "reclaim_s": 7.291906513273716e-06,
+          "total_s": 7.636973708868027,
+          "ready_cpu_s": 8.675106999999997,
+          "remove_cpu_s": 1.9545519999999783,
+          "reclaim_cpu_s": 9.000000005698894e-06,
+          "total_cpu_s": 10.629667999999981
+        }
+      ],
+      "stallionfs_folder": [
+        {
+          "ready_s": 6.300748249981552,
+          "remove_s": 0.002631625044159591,
+          "reclaim_s": 1.7339245420880616,
+          "total_s": 8.037304417113774,
+          "ready_cpu_s": 5.423821000000004,
+          "remove_cpu_s": 0.0024809999999959587,
+          "reclaim_cpu_s": 1.6004500000000021,
+          "total_cpu_s": 7.026752000000002
+        },
+        {
+          "ready_s": 7.37243883300107,
+          "remove_s": 0.004885041969828308,
+          "reclaim_s": 1.911768582998775,
+          "total_s": 9.289092457969673,
+          "ready_cpu_s": 5.317151999999993,
+          "remove_cpu_s": 0.0029129999999994993,
+          "reclaim_cpu_s": 1.6396749999999969,
+          "total_cpu_s": 6.959739999999989
+        },
+        {
+          "ready_s": 5.281075500068255,
+          "remove_s": 0.002298958948813379,
+          "reclaim_s": 1.1300364580238238,
+          "total_s": 6.413410917040892,
+          "ready_cpu_s": 6.250146000000001,
+          "remove_cpu_s": 0.0023850000000038563,
+          "reclaim_cpu_s": 2.0639949999999914,
+          "total_cpu_s": 8.316525999999996
+        },
+        {
+          "ready_s": 3.168899832991883,
+          "remove_s": 0.0020632919622585177,
+          "reclaim_s": 1.0491677080281079,
+          "total_s": 4.22013083298225,
+          "ready_cpu_s": 7.030982000000009,
+          "remove_cpu_s": 0.002144000000015467,
+          "reclaim_cpu_s": 2.113424000000009,
+          "total_cpu_s": 9.146550000000033
+        },
+        {
+          "ready_s": 3.2129273751052096,
+          "remove_s": 0.0023573340149596334,
+          "reclaim_s": 1.7679962909314781,
+          "total_s": 4.983281000051647,
+          "ready_cpu_s": 7.093964999999997,
+          "remove_cpu_s": 0.002369999999984884,
+          "reclaim_cpu_s": 2.1328080000000114,
+          "total_cpu_s": 9.229142999999993
+        },
+        {
+          "ready_s": 3.6013317910255864,
+          "remove_s": 0.0023470000596717,
+          "reclaim_s": 0.996168875019066,
+          "total_s": 4.599847666104324,
+          "ready_cpu_s": 6.98433,
+          "remove_cpu_s": 0.002418000000034226,
+          "reclaim_cpu_s": 2.083258999999998,
+          "total_cpu_s": 9.070007000000032
+        },
+        {
+          "ready_s": 3.0372723329346627,
+          "remove_s": 0.001733041019178927,
+          "reclaim_s": 1.0668884590268135,
+          "total_s": 4.105893832980655,
+          "ready_cpu_s": 7.208281999999997,
+          "remove_cpu_s": 0.0018019999999978609,
+          "reclaim_cpu_s": 2.174892,
+          "total_cpu_s": 9.384975999999995
+        }
+      ]
+    },
+    "4": {
+      "worktree_install": [
+        {
+          "ready_s": 21.260055665974505,
+          "remove_s": 6.564201749977656,
+          "reclaim_s": 3.8665952160954475e-05,
+          "total_s": 27.824296081904322,
+          "ready_cpu_s": 39.31500299999999,
+          "remove_cpu_s": 9.979718999999989,
+          "reclaim_cpu_s": 4.200000000764703e-05,
+          "total_cpu_s": 49.29476399999999
+        },
+        {
+          "ready_s": 15.35445675009396,
+          "remove_s": 5.228526292019524,
+          "reclaim_s": 6.917049176990986e-06,
+          "total_s": 20.58298995916266,
+          "ready_cpu_s": 37.434518000000025,
+          "remove_cpu_s": 10.389900999999952,
+          "reclaim_cpu_s": 8.999999977277184e-06,
+          "total_cpu_s": 47.824427999999955
+        },
+        {
+          "ready_s": 39.08500149997417,
+          "remove_s": 6.2539782910607755,
+          "reclaim_s": 6.1659375205636024e-06,
+          "total_s": 45.338985956972465,
+          "ready_cpu_s": 41.992869999999925,
+          "remove_cpu_s": 9.945265999999947,
+          "reclaim_cpu_s": 8.999999977277184e-06,
+          "total_cpu_s": 51.93814499999985
+        },
+        {
+          "ready_s": 22.90887629194185,
+          "remove_s": 5.518774625030346,
+          "reclaim_s": 4.666042514145374e-06,
+          "total_s": 28.42765558301471,
+          "ready_cpu_s": 39.342168000000015,
+          "remove_cpu_s": 10.47507399999995,
+          "reclaim_cpu_s": 5.999999984851456e-06,
+          "total_cpu_s": 49.81724799999995
+        },
+        {
+          "ready_s": 22.542012250050902,
+          "remove_s": 6.505287416977808,
+          "reclaim_s": 6.166985258460045e-06,
+          "total_s": 29.04730583401397,
+          "ready_cpu_s": 38.50505700000008,
+          "remove_cpu_s": 10.830152999999882,
+          "reclaim_cpu_s": 9.000000090964022e-06,
+          "total_cpu_s": 49.33521900000005
+        },
+        {
+          "ready_s": 16.88161479192786,
+          "remove_s": 5.382953625055961,
+          "reclaim_s": 4.0499959141016006e-05,
+          "total_s": 22.26460891694296,
+          "ready_cpu_s": 37.49293399999988,
+          "remove_cpu_s": 10.386068999999907,
+          "reclaim_cpu_s": 4.3000000005122274e-05,
+          "total_cpu_s": 47.87904599999979
+        },
+        {
+          "ready_s": 22.1344616250135,
+          "remove_s": 5.666157124913298,
+          "reclaim_s": 5.37489540874958e-06,
+          "total_s": 27.800624124822207,
+          "ready_cpu_s": 38.97663699999998,
+          "remove_cpu_s": 10.868588000000045,
+          "reclaim_cpu_s": 6.999999982326699e-06,
+          "total_cpu_s": 49.84523200000001
+        }
+      ],
+      "stallionfs_folder": [
+        {
+          "ready_s": 9.674570084083825,
+          "remove_s": 0.0035813750000670552,
+          "reclaim_s": 3.7177412080345675,
+          "total_s": 13.39589266711846,
+          "ready_cpu_s": 30.63335500000005,
+          "remove_cpu_s": 0.004363000000012107,
+          "reclaim_cpu_s": 7.514982999999972,
+          "total_cpu_s": 38.152701000000036
+        },
+        {
+          "ready_s": 12.523255083011463,
+          "remove_s": 0.0031230830354616046,
+          "reclaim_s": 3.8506820410257205,
+          "total_s": 16.377060207072645,
+          "ready_cpu_s": 31.58690100000007,
+          "remove_cpu_s": 0.0034849999999551073,
+          "reclaim_cpu_s": 7.313378000000057,
+          "total_cpu_s": 38.90376400000008
+        },
+        {
+          "ready_s": 9.195026167086326,
+          "remove_s": 0.023609583033248782,
+          "reclaim_s": 32.375143709010445,
+          "total_s": 41.59377945913002,
+          "ready_cpu_s": 32.09173299999998,
+          "remove_cpu_s": 0.008946000000037202,
+          "reclaim_cpu_s": 8.130319999999983,
+          "total_cpu_s": 40.230999
+        },
+        {
+          "ready_s": 10.211261667078361,
+          "remove_s": 0.0034334170632064342,
+          "reclaim_s": 4.689064541016705,
+          "total_s": 14.903759625158273,
+          "ready_cpu_s": 30.336544000000004,
+          "remove_cpu_s": 0.004252000000064982,
+          "reclaim_cpu_s": 7.209720999999945,
+          "total_cpu_s": 37.55051700000001
+        },
+        {
+          "ready_s": 9.164306374965236,
+          "remove_s": 0.003086708951741457,
+          "reclaim_s": 4.428990999935195,
+          "total_s": 13.596384083852172,
+          "ready_cpu_s": 31.230646999999863,
+          "remove_cpu_s": 0.0049880000001394365,
+          "reclaim_cpu_s": 7.878480000000081,
+          "total_cpu_s": 39.11411500000008
+        },
+        {
+          "ready_s": 8.32721387501806,
+          "remove_s": 0.0032030410366132855,
+          "reclaim_s": 3.996002250001766,
+          "total_s": 12.32641916605644,
+          "ready_cpu_s": 32.5680900000001,
+          "remove_cpu_s": 0.004892999999924541,
+          "reclaim_cpu_s": 8.106405999999993,
+          "total_cpu_s": 40.679389000000015
+        },
+        {
+          "ready_s": 9.375775667023845,
+          "remove_s": 0.0038445829413831234,
+          "reclaim_s": 3.772093958919868,
+          "total_s": 13.151714208885096,
+          "ready_cpu_s": 32.305242000000135,
+          "remove_cpu_s": 0.005150000000185173,
+          "reclaim_cpu_s": 7.6696730000001025,
+          "total_cpu_s": 39.98006500000042
+        }
+      ]
+    }
+  },
+  "preparation": {
+    "stallionfs_folder": {
+      "cold_prepare_s": 2.9065012499922886,
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86581072,
+      "amortization_workspaces": 1
+    }
+  },
+  "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+  "fixture_dependencies": {
+    "axios": "1.20.0",
+    "date-fns": "4.4.0",
+    "eslint": "10.12.0",
+    "lodash": "4.18.1",
+    "prettier": "3.9.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "rxjs": "7.8.2",
+    "typescript": "7.0.2",
+    "zod": "4.6.5"
+  },
+  "fixture_digest": "1f5134d16fc4c586c822ec5689f3c47f9fbd31695b7b6006c4da8d134fb28b73",
+  "seed_regular_files": 12581,
+  "seed_logical_bytes": 86581072,
+  "storage_note": "Seed content bytes include Git; shared APFS clone blocks are not inferred from logical file sizes.",
+  "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test"
+}

@@ -245,6 +245,8 @@ def main():
         "volume": {key: volume.get(key) for key in ("filesystem", "readonly", "ignore_ownership")},
         "samples_by_fixture": SAMPLES, "warmups": 1, "random_seed": RNG_SEED, "native_jobs": 4,
         "cpu_unavailable_at_start": cpu_error, "fixtures": {}, "rows": [],
+        "output_formats": {"stallionfs": "plain", "baseline": "plain"},
+        "reference_platform": "macOS",
         "commands": {"clone": {"stallionfs": "stallionfs clone --jobs 4 SOURCE DESTINATION",
                                 "baseline": "/bin/cp -cRp SOURCE DESTINATION"},
                      "delete": {"stallionfs": "stallionfs delete --recursive --jobs 4 PATH",

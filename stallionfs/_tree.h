@@ -13,11 +13,12 @@ struct stallion_scan_stats {
 /* Counts descendants without following their symlinks. Nested mounts are counted
  * as directories but skipped; the root directory is not counted. bulk=0 selects
  * the private POSIX reference traversal. Callbacks run on the invoking thread.
+ * Bulk scans use up to workers (1–4) threads; the POSIX reference is sequential.
  * No fixed input-path byte limit is imposed. error_path is a bounded diagnostic
- * buffer and may be truncated. Stats are meaningful only on success.
+ * buffer and may be truncated. Stats remain zero on failure.
  * Returns 0, or -1 with errno; cancellation reports EINTR.
  */
-int stallion_scan(const char *path, int bulk, struct stallion_scan_stats *stats,
+int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_scan_stats *stats,
                    stallion_cancel_fn cancel, void *context,
                    char *error_path, size_t error_capacity);
 

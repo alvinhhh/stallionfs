@@ -8,6 +8,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - {os: macos-15, python: '3.13', images: '0'}
@@ -22,7 +23,73 @@ jobs:
         with:
           python-version: '${{ matrix.python }}'
       - run: python -m pip install -e .
-      - run: python -m unittest discover -s tests -v
+      - name: Run tests with image failure diagnostics
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import plistlib
+          import subprocess
+          import sys
+          import unittest
+          from stallionfs import images, _scan
+
+          original = images._command
+
+          def inspect_image(args):
+              creating = args[1] == 'create'
+              image = os.path.realpath(args[-1]) if creating else None
+              device = None if creating else str(args[2])
+              response = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+              response.check_returncode()
+              records = plistlib.loads(response.stdout).get('images', [])
+              matches = [r for r in records if r.get('owner-uid') == os.getuid() and
+                         (os.path.realpath(r.get('image-path', '')) == image if creating else
+                          any(e.get('dev-entry') == device for e in r.get('system-entities', [])))]
+              devices = {e['dev-entry'] for r in matches for e in r.get('system-entities', [])
+                         if e.get('dev-entry')}
+              points = {e['mount-point'] for r in matches for e in r.get('system-entities', [])
+                        if e.get('mount-point')}
+              paths = {r['image-path'] for r in matches if r.get('image-path')}
+              if image and os.path.exists(image):
+                  paths.add(image)
+              print('Image attachments:', json.dumps([{
+                  'image': r.get('image-path'), 'entities': r.get('system-entities', [])
+              } for r in matches]), file=sys.stderr, flush=True)
+              print('Matching mounts:', json.dumps([r for r in _scan.mounts()
+                    if r['device'] in devices or r['path'] in points]), file=sys.stderr, flush=True)
+              for options, names in (([], paths | devices), (['+f'], points)):
+                  if not names:
+                      continue
+                  result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'pcftn', *options, '--', *sorted(names)],
+                                          stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+                  print('Scoped lsof:', result.returncode, file=sys.stderr)
+                  print(result.stdout.decode(errors='replace'), file=sys.stderr)
+                  print(result.stderr.decode(errors='replace'), file=sys.stderr, flush=True)
+
+          def diagnostic_command(*args):
+              if len(args) < 2 or args[0] != '/usr/bin/hdiutil' or args[1] not in ('create', 'detach'):
+                  return original(*args)
+              try:
+                  return original(*args, '-verbose')
+              except BaseException as error:
+                  try:
+                      print('Image command failure (including intentional busy-volume checks):',
+                            repr(tuple(map(str, args))), str(error), file=sys.stderr, flush=True)
+                      inspect_image(args)
+                  except BaseException as inspection:
+                      try:
+                          print('Image diagnostics unavailable:', type(inspection).__name__,
+                                file=sys.stderr, flush=True)
+                      except BaseException:
+                          pass
+                  raise
+
+          images._command = diagnostic_command
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'))
+          sys.exit(not result.wasSuccessful())
+          PY
       - run: python -m compileall -q stallionfs
       - run: python -m pip wheel --no-deps --wheel-dir dist .
       - run: python -m pip install --force-reinstall --no-deps dist/*.whl

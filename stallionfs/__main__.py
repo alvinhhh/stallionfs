@@ -17,6 +17,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="action", required=True)
     scan = commands.add_parser("scan", help="Count files and logical bytes using bulk metadata reads")
     scan.add_argument("path", help="Directory to scan; symlinks and nested volumes are not followed")
+    scan.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
     clone = commands.add_parser("clone", help="Clone a file or directory to an exact new path")
     clone.add_argument("source")
     clone.add_argument("destination")
@@ -83,7 +84,7 @@ def main(argv=None):
                 from ._scan import scan
             except ImportError as exc:
                 raise StallionError("Install stallionfs first to build its native scanner: python3 -m pip install .") from exc
-            result = scan(os.path.expanduser(args.path))
+            result = scan(os.path.expanduser(args.path), jobs=args.jobs)
             text = (f"{result['files']} files, {result['directories']} directories, "
                     f"{result['symlinks']} symlinks, {result['other']} other entries\n"
                     f"{result['logical_bytes']} logical bytes; {result['skipped_mounts']} nested volumes skipped")

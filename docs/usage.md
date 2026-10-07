@@ -24,7 +24,7 @@ Directory clones require a destination parent owned by the current user or root.
 
 `delete` removes files and symlinks. Directories require `--recursive`; mounted volumes and directories containing mounts are refused. Deletion is permanent and finishes before the command returns. It can stop after partial deletion if an entry cannot be removed. `--missing-ok` accepts an absent final entry, while other errors still fail.
 
-`--jobs` accepts 1–4 for `clone` and `delete`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
+`--jobs` accepts 1–4 for `clone`, `delete` and `scan`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
 
 File operations, scans and volume listings run in the native executable, including with `--json`. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
 
@@ -44,9 +44,12 @@ print(mounts())
 ```sh
 stallionfs scan /path/to/folder
 stallionfs --json scan /path/to/folder
+stallionfs scan --jobs 1 /path/to/folder
 ```
 
 `scan` uses `getattrlistbulk` to count regular files, subdirectories, symlinks, other entries, and regular-file logical bytes. It reads metadata, leaves files unchanged, and does not create a workspace store. Symlinks inside the tree are not followed. Nested volumes are skipped and counted in `skipped_mounts`.
+
+Nested directories can be scanned concurrently. Flat folders use a sequential path; `--jobs 1` keeps all scanning sequential for lower CPU use.
 
 Logical bytes describe file lengths, not allocated disk space. Hard links count once per directory entry; sparse files count their full logical length. Permission errors, disappearing directories, unsupported metadata operations, and traversal deeper than 511 subdirectories stop the scan with an error instead of printing incomplete totals. A live scan is not an atomic snapshot of a changing tree.
 
@@ -84,7 +87,7 @@ These volumes have Spotlight indexing disabled. File permissions and ownership r
 
 Images require macOS 26 or later. After restarting the Mac, run `stallionfs mount WORKSPACE_ID` to mount a workspace again. `stallionfs unmount WORKSPACE_ID` releases its mount without moving it to trash. Stop processes using the volume before unmounting; stallionfs never forces an unmount.
 
-Images speed up repeated workspace creation, but add overhead to file writes. The [I/O comparison](../tests/perf/README.md#file-io-inside-a-workspace) measured slower durable writes and concurrent file operations inside images. Prefer folder workspaces for work that writes heavily.
+Image creation and file I/O are separate workloads. Use the [I/O comparison](../tests/perf/README.md#file-io-inside-a-workspace) to measure your workload before choosing images over folders.
 
 Preparing the image takes longer than preparing an ordinary folder. Small source-only repositories may be better served by folder workspaces or Git worktrees. Each mounted image also consumes a disk device; unmount workspaces when they are idle.
 

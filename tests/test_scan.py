@@ -59,8 +59,13 @@ class Scan(unittest.TestCase):
             (root / 'directory-link').symlink_to('empty', target_is_directory=True)
             (root / 'dangling').symlink_to('absent')
             os.mkfifo(root / 'pipe')
+            for i in range(64):  # More independent partitions than the bounded queue.
+                child = root / f'partition-{i}'
+                child.mkdir()
+                (child / 'content').write_bytes(bytes([i]))
             expected = reference(root)
             self.assertEqual(scan(root), expected)
+            self.assertEqual(scan(root, jobs=1), expected)
             self.assertEqual(scan(root, bulk=False), expected)
             with ThreadPoolExecutor(max_workers=4) as pool:
                 self.assertEqual(list(pool.map(scan, [root] * 8)), [expected] * 8)
@@ -81,6 +86,9 @@ class Scan(unittest.TestCase):
                         self.assertEqual(scan(str(root) + suffix, bulk=bulk), reference(root))
             with self.assertRaises(ValueError):
                 scan(str(root) + '\0suffix')
+            for jobs in (0, 5, -1, 2 ** 32 + 1, -(2 ** 32) + 1, 2 ** 64 + 1):
+                with self.subTest(jobs=jobs), self.assertRaises((ValueError, OverflowError)):
+                    scan(root, jobs=jobs)
             denied = root / 'denied'
             denied.mkdir()
             denied.chmod(0)
@@ -103,7 +111,8 @@ class Scan(unittest.TestCase):
             base = Path(temporary).resolve()
             object_file, driver, launcher = base / 'walk.o', base / 'faults', base / 'stallionfs'
             common = ['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-I', str(source)]
-            replacements = ('open', 'fstat', 'close', 'closedir', 'getattrlistbulk')
+            replacements = ('open', 'fstat', 'close', 'closedir', 'getattrlistbulk',
+                            'pthread_create', 'pthread_join')
             subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
                             '-c', str(source / '_walk.c'), '-o', str(object_file)], check=True, timeout=30)
             subprocess.run([*common, str(tests / 'native_scan_faults.c'), str(object_file), '-o', str(driver)],

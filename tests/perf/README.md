@@ -12,18 +12,18 @@ The existing scratch directory must be on writable APFS with 256 MiB free. This 
 
 Output contracts, counts, checksums, modes, inode behavior, source independence and the absence of an unnecessary workspace store are checked outside timing. No volume is mounted and no large fixture is created. Results retain every sample, wall and CPU time, and source plus installed-runtime hashes. A final report is written only after validation and cleanup; it omits personal paths and raw command output. Release-to-release speedups and Apple-command comparisons are reported separately. Keep both installations and the runtime source unchanged during the run.
 
-Recorded results: [M2 command startup, 0.5.0](results/cli-v0.5-m2.json). All 768 samples, including warmups and comparison controls, passed validation and cleanup. Current-release medians:
+Recorded results: [M2 command startup, 0.6.0](results/cli-v0.6-m2.json). This current-release view retains all 432 current-release and macOS samples, including warmups. Internal prior-release controls are omitted; the report records its source digest and row counts. Every retained sample passed validation and cleanup.
 
 | Command | Plain output | JSON output | macOS plain-output reference |
 | --- | ---: | ---: | ---: |
-| Copy one 4 KiB file | 2.83 ms | 3.51 ms | 2.31 ms |
-| Move one 4 KiB file | 2.83 ms | 3.00 ms | 2.24 ms |
-| Delete one 4 KiB file | 2.83 ms | 2.97 ms | 2.35 ms |
-| Scan an empty folder | 3.18 ms | 3.26 ms | — |
-| Scan 1,000 files | 4.22 ms | 4.31 ms | — |
-| List mounted volumes | 2.87 ms | 3.29 ms | — |
+| Copy one 4 KiB file | 3.18 ms | 3.08 ms | 2.46 ms |
+| Move one 4 KiB file | 3.09 ms | 3.17 ms | 2.29 ms |
+| Delete one 4 KiB file | 3.07 ms | 3.43 ms | 2.49 ms |
+| Scan an empty folder | 3.01 ms | 3.00 ms | — |
+| Scan 1,000 files | 3.64 ms | 3.28 ms | — |
+| List mounted volumes | 2.90 ms | 3.05 ms | — |
 
-Small-file commands remain slower than the macOS references. The raw comparison retains its original controls; displayed figures use only the current release.
+JSON file commands use the separately measured macOS plain-output reference; those comparisons are unpaired and the reference does not format JSON. No equivalent system command was measured for scans or mounted-volume output. The scanner API comparison below supplies its POSIX baseline. Small-file commands remain slower than the macOS references.
 
 ## File commands
 
@@ -37,7 +37,24 @@ The scratch directory must exist on writable APFS with at least 2 GiB free. The 
 
 Copying uses native copy-on-write on both sides. Every copy and move must preserve the fixture's contents, modes and symlink targets; clones must have independent inodes. Moves use an absent exact destination and must preserve the inode. Deletion must finish before returning. Fixture setup, validation and cleanup are outside timing. Results include wall time, process and child CPU, source and executable hashes, and every sample. These are warm-cache operations without a durability flush.
 
-The current release's small-file results are listed above. Larger-file and directory figures need a current-release run.
+Recorded results: [M2 file commands, 0.6.0](results/fileops-v0.6-m2.json). All 336 samples, including warmups, passed validation and cleanup. CPU is total process time across threads and children; it can exceed wall time.
+
+| Operation | Fixture | macOS wall | stallionfs wall | Speedup | macOS CPU | stallionfs CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Clone | 4 KiB file | 2.40 ms | 3.17 ms | 0.76× | 2.26 ms | 2.86 ms |
+| Clone | 64 MiB file | 3.49 ms | 3.81 ms | 0.91× | 3.13 ms | 3.43 ms |
+| Clone | 2,000 flat files | 200.84 ms | 194.40 ms | 1.03× | 198.85 ms | 192.37 ms |
+| Clone | 10,000 nested files | 1203.80 ms | 439.49 ms | 2.74× | 1185.63 ms | 1571.50 ms |
+| Delete | 4 KiB file | 2.80 ms | 3.60 ms | 0.78× | 2.72 ms | 3.09 ms |
+| Delete | 64 MiB file | 5.27 ms | 5.54 ms | 0.95× | 4.97 ms | 4.85 ms |
+| Delete | 2,000 flat files | 54.82 ms | 58.55 ms | 0.94× | 54.64 ms | 54.60 ms |
+| Delete | 10,000 nested files | 408.05 ms | 197.70 ms | 2.06× | 385.20 ms | 530.82 ms |
+| Move | 4 KiB file | 2.41 ms | 3.13 ms | 0.77× | 2.20 ms | 2.77 ms |
+| Move | 64 MiB file | 3.41 ms | 4.26 ms | 0.80× | 3.40 ms | 3.76 ms |
+| Move | 2,000 flat files | 3.94 ms | 4.87 ms | 0.81× | 3.91 ms | 4.49 ms |
+| Move | 10,000 nested files | 3.80 ms | 5.25 ms | 0.72× | 3.69 ms | 4.82 ms |
+
+Nested copying reached about 22,750 files/s, versus 8,300 files/s for `cp`. The larger gains use more CPU: nested copying used 33% more, deletion 38% more. Flat deletion, single-file commands and every move case were slower. `--jobs 1` provides a lower-CPU option; these command results use the default four workers.
 
 ## Metadata scanning
 
@@ -49,9 +66,20 @@ mkdir -p /tmp/stallionfs-perf
 python3 tests/perf/scan.py --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/scan.json
 ```
 
-Both paths are C implementations that retrieve the same counts and logical lengths. The baseline uses `readdir` and `fstatat`; the optimized path uses `getattrlistbulk`. The test creates flat and nested 20,000-file layouts, plus symlinks, a FIFO, Unicode names, a sparse file and a hard link. Every result must equal independently calculated fixture totals. Two warmups are discarded, then 11 samples run in shuffled order. API timings include the same Python call overhead and exclude fixture creation and process startup. This does not measure reads of file contents or acceleration inside other applications.
+All three paths are C implementations that retrieve the same counts and logical lengths. The baseline uses `readdir` and `fstatat`; the optimized paths use `getattrlistbulk`, with one worker or the default four. Folders with fewer than two immediate subdirectories stay sequential. The test creates flat and nested 20,000-file layouts, plus symlinks, a FIFO, Unicode names, a sparse file and a hard link. Every result must equal independently calculated fixture totals. Two warmups are discarded, then 11 samples run in shuffled order. Wall and process CPU timings include the same Python call overhead and exclude fixture creation and process startup. This does not measure reads of file contents or acceleration inside other applications.
 
-Recorded results: [M2 metadata scans, 0.5.0](results/scan-v0.5-m2.json). Bulk scanning took 18.06 ms versus 37.38 ms for the flat layout (2.07×), and 22.07 ms versus 41.36 ms for nested folders (1.87×). The nested result remains below 2×.
+Recorded results: [M2 metadata scans, 0.6.0](results/scan-v0.6-m2.json). Every measured scan returned the same totals.
+
+| Layout | Method | Wall | CPU |
+| --- | --- | ---: | ---: |
+| 20,000 flat files | Native POSIX | 38.20 ms | 38.08 ms |
+| 20,000 flat files | Bulk, one worker | 21.39 ms | 21.32 ms |
+| 20,000 flat files | Bulk, default | 20.30 ms | 20.27 ms |
+| 20,000 files across 200 folders | Native POSIX | 46.64 ms | 43.72 ms |
+| 20,000 files across 200 folders | Bulk, one worker | 24.82 ms | 24.16 ms |
+| 20,000 files across 200 folders | Bulk, default | 10.10 ms | 41.34 ms |
+
+Default scanning was 1.88× faster than POSIX for flat folders and 4.62× faster for nested folders. Nested parallel scanning was 2.46× faster than serial bulk scanning and used 71% more CPU. Flat folders do not start worker threads.
 
 ## Prepared workspaces
 
@@ -88,7 +116,18 @@ This uses the Python API. CLI process startup is excluded for stallionfs; Git/np
 
 Results include every measured sample, source-file hashes and the loaded native binary's hash. The runner rejects results if runtime source or the loaded native binary changes during measurement. Image allocation reports `st_blocks`, which does not distinguish shared APFS blocks from unique physical storage. Seed break-even is calculated from medians, not a guarantee for another workload.
 
-No workspace lifecycle figures are shown until this comparison has been run on the current release.
+Recorded results: [M2 prepared folder workspaces, 0.6.0](results/workspaces-v0.6-node24-m2.json). The 28 measured batches and their warmups passed content, executable-mode, fixture smoke and cleanup checks. This run selected `worktree_install` and `stallionfs_folder`; images and byte copies were not measured.
+
+| Workspaces | Method | Ready | Reclaim | Full lifecycle | Total CPU | Lifecycle range |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | Git worktree + npm ci | 6.785 s | Included in removal | 9.134 s | 10.706 s | 7.575–24.092 s |
+| 1 | Prepared folder | 3.601 s | 1.130 s | 4.983 s | 9.070 s | 4.106–9.289 s |
+| 4 | Git worktree + npm ci | 22.134 s | Included in removal | 27.824 s | 49.335 s | 20.583–45.339 s |
+| 4 | Prepared folder | 9.376 s | 3.996 s | 13.596 s | 39.114 s | 12.326–41.594 s |
+
+The seed contained 12,581 regular files, including Git metadata. Preparation took 2.907 s with the warm npm cache, amortized after one workspace using this run's median lifecycle savings.
+
+Single-workspace lifecycle was 1.83× faster with 15% less CPU; four-workspace lifecycle was 2.05× faster with 21% less CPU. Every paired lifecycle comparison favored prepared folders, but the ranges show substantial variation. The 41.594 s folder batch, including 32.375 s of reclamation, is retained. These are measurements of this release, not a claim of improvement over a previous release.
 
 ## File I/O inside a workspace
 

@@ -5,12 +5,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+struct scan_pool;
+struct parallel;
 struct scan {
     struct stallion_scan_stats *stats;
     dev_t device;
@@ -19,22 +24,60 @@ struct scan {
     void *context;
     char *error_path;
     size_t error_capacity;
+    struct scan_pool *pool;
+    struct parallel *parallel;
+};
+
+#define SCAN_QUEUE_LIMIT 24
+struct scan_job { int fd; char *path; unsigned depth; };
+struct scan_worker { struct scan_pool *pool; struct stallion_scan_stats stats; };
+struct scan_pool {
+    pthread_mutex_t mutex;
+    pthread_cond_t available, progress;
+    struct scan_job queue[SCAN_QUEUE_LIMIT];
+    unsigned head, queued, started, exited;
+    int done;
+    atomic_int error;
+    dev_t device;
+    char *error_path;
+    size_t error_capacity;
+    pthread_t threads[4];
+    struct scan_worker workers[4];
+};
+struct parallel {
+    unsigned workers;
+    int pending;
+    struct scan_job first;
+    struct scan_pool *pool;
 };
 
 static int fail(struct scan *s, int error, const char *path) {
     if (!s->error) {
         s->error = error ? error : EIO;
-        if (s->error_path && s->error_capacity)
+        if (s->pool) {
+            struct scan_pool *pool = s->pool;
+            pthread_mutex_lock(&pool->mutex);
+            if (!atomic_load(&pool->error)) {
+                if (pool->error_path && pool->error_capacity)
+                    snprintf(pool->error_path, pool->error_capacity, "%s", path);
+                atomic_store(&pool->error, s->error);
+                pthread_cond_broadcast(&pool->available);
+                pthread_cond_signal(&pool->progress);
+            }
+            pthread_mutex_unlock(&pool->mutex);
+        } else if (s->error_path && s->error_capacity)
             snprintf(s->error_path, s->error_capacity, "%s", path);
     }
     return -1;
 }
 
 static int cancelled(struct scan *s, const char *path) {
+    if (s->pool && atomic_load(&s->pool->error)) return -1;
     return s->cancel && s->cancel(s->context) ? fail(s, EINTR, path) : 0;
 }
 
 static int walk(int fd, const char *path, unsigned depth, struct scan *s);
+static int dispatch(struct scan_job job, struct scan *s);
 
 static int visit(int fd, const char *path, const char *name, unsigned type,
                  off_t size, unsigned depth, struct scan *s) {
@@ -61,6 +104,9 @@ static int visit(int fd, const char *path, const char *name, unsigned type,
             } else if (st.st_dev != s->device) {
                 s->stats->skipped_mounts++;
                 if (close(child)) result = fail(s, errno, child_path);
+            } else if (!depth && s->parallel && s->parallel->workers > 1) {
+                /* Dispatch owns the pinned descriptor and diagnostic path. */
+                return dispatch((struct scan_job){child, child_path, depth + 1}, s);
             } else result = walk(child, child_path, depth + 1, s);
         }
         free(child_path);
@@ -162,14 +208,184 @@ static int walk(int fd, const char *path, unsigned depth, struct scan *s) {
     return result;
 }
 
-int stallion_scan(const char *path, int bulk, struct stallion_scan_stats *stats,
+static int discard(struct scan_job job, struct scan *s) {
+    int result = close(job.fd) ? fail(s, errno, job.path) : 0;
+    free(job.path);
+    return result;
+}
+
+static void *scan_worker(void *context) {
+    struct scan_worker *worker = context;
+    struct scan_pool *pool = worker->pool;
+    struct scan s = {.stats = &worker->stats, .bulk = 1, .device = pool->device, .pool = pool};
+    for (;;) {
+        pthread_mutex_lock(&pool->mutex);
+        while (!pool->queued && !pool->done)
+            pthread_cond_wait(&pool->available, &pool->mutex);
+        if (!pool->queued) {
+            pool->exited++;
+            pthread_cond_signal(&pool->progress);
+            pthread_mutex_unlock(&pool->mutex);
+            return NULL;
+        }
+        struct scan_job job = pool->queue[pool->head];
+        int was_full = pool->queued == SCAN_QUEUE_LIMIT;
+        pool->head = (pool->head + 1) % SCAN_QUEUE_LIMIT;
+        pool->queued--;
+        if (was_full) pthread_cond_signal(&pool->progress);
+        pthread_mutex_unlock(&pool->mutex);
+        if (atomic_load(&pool->error)) discard(job, &s);
+        else {
+            walk(job.fd, job.path, job.depth, &s);
+            free(job.path);
+        }
+    }
+}
+
+static struct scan_pool *start_pool(struct scan *s, unsigned workers) {
+    struct scan_pool *pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+    if (pthread_mutex_init(&pool->mutex, NULL)) { free(pool); return NULL; }
+    if (pthread_cond_init(&pool->available, NULL)) {
+        pthread_mutex_destroy(&pool->mutex); free(pool); return NULL;
+    }
+    if (pthread_cond_init(&pool->progress, NULL)) {
+        pthread_cond_destroy(&pool->available);
+        pthread_mutex_destroy(&pool->mutex); free(pool); return NULL;
+    }
+    atomic_init(&pool->error, 0);
+    pool->device = s->device;
+    pool->error_path = s->error_path;
+    pool->error_capacity = s->error_capacity;
+    for (; pool->started < workers; pool->started++) {
+        struct scan_worker *worker = &pool->workers[pool->started];
+        worker->pool = pool;
+        if (pthread_create(&pool->threads[pool->started], NULL, scan_worker, worker)) break;
+    }
+    if (pool->started) return pool;
+    pthread_cond_destroy(&pool->progress);
+    pthread_cond_destroy(&pool->available);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+    return NULL;
+}
+
+/* Only the caller produces jobs; workers recursively consume pinned subtrees. */
+static int enqueue(struct scan_job job, struct scan *s) {
+    struct scan_pool *pool = s->pool;
+    pthread_mutex_lock(&pool->mutex);
+    while (pool->queued == SCAN_QUEUE_LIMIT && !atomic_load(&pool->error)) {
+        pthread_mutex_unlock(&pool->mutex);
+        cancelled(s, job.path);
+        pthread_mutex_lock(&pool->mutex);
+        if (pool->queued == SCAN_QUEUE_LIMIT && !atomic_load(&pool->error)) {
+            struct timespec delay = {.tv_nsec = 20000000};
+            int error = pthread_cond_timedwait_relative_np(&pool->progress, &pool->mutex, &delay);
+            if (error && error != ETIMEDOUT) {
+                pthread_mutex_unlock(&pool->mutex);
+                fail(s, error, job.path);
+                pthread_mutex_lock(&pool->mutex);
+            }
+        }
+    }
+    int stopped = atomic_load(&pool->error);
+    if (!stopped) {
+        pool->queue[(pool->head + pool->queued++) % SCAN_QUEUE_LIMIT] = job;
+        pthread_cond_signal(&pool->available);
+    }
+    pthread_mutex_unlock(&pool->mutex);
+    if (stopped) { discard(job, s); return -1; }
+    return 0;
+}
+
+static int dispatch(struct scan_job job, struct scan *s) {
+    struct parallel *parallel = s->parallel;
+    if (!parallel->pool && !parallel->pending) {
+        parallel->first = job;
+        parallel->pending = 1;
+        return 0;
+    }
+    if (!parallel->pool) {
+        parallel->pool = start_pool(s, parallel->workers);
+        parallel->pending = 0;
+        if (!parallel->pool) {
+            /* Thread limits affect throughput, not scan availability. */
+            parallel->workers = 1;
+            int result = walk(parallel->first.fd, parallel->first.path, parallel->first.depth, s);
+            free(parallel->first.path);
+            if (result) { discard(job, s); return -1; }
+            result = walk(job.fd, job.path, job.depth, s);
+            free(job.path);
+            return result;
+        }
+        s->pool = parallel->pool;
+        if (enqueue(parallel->first, s)) { discard(job, s); return -1; }
+    }
+    return enqueue(job, s);
+}
+
+static int finish_parallel(struct scan *s, const char *path) {
+    struct parallel *parallel = s->parallel;
+    if (parallel->pending) {
+        struct scan_job job = parallel->first;
+        if (s->error) return discard(job, s);
+        int result = walk(job.fd, job.path, job.depth, s);
+        free(job.path);
+        return result;
+    }
+    struct scan_pool *pool = parallel->pool;
+    if (!pool) return 0;
+    pthread_mutex_lock(&pool->mutex);
+    pool->done = 1;
+    pthread_cond_broadcast(&pool->available);
+    while (pool->exited < pool->started) {
+        pthread_mutex_unlock(&pool->mutex);
+        cancelled(s, path);
+        pthread_mutex_lock(&pool->mutex);
+        if (pool->exited < pool->started) {
+            struct timespec delay = {.tv_nsec = 20000000};
+            int error = pthread_cond_timedwait_relative_np(&pool->progress, &pool->mutex, &delay);
+            if (error && error != ETIMEDOUT) {
+                pthread_mutex_unlock(&pool->mutex);
+                fail(s, error, path);
+                pthread_mutex_lock(&pool->mutex);
+            }
+        }
+    }
+    pthread_mutex_unlock(&pool->mutex);
+    for (unsigned i = 0; i < pool->started; i++) {
+        int error = pthread_join(pool->threads[i], NULL);
+        if (error) fail(s, error, path);
+    }
+    if (!atomic_load(&pool->error)) {
+        for (unsigned i = 0; i < pool->started; i++) {
+            struct stallion_scan_stats *from = &pool->workers[i].stats;
+#define ADD(field) if (UINT64_MAX - s->stats->field < from->field) fail(s, EOVERFLOW, path); else s->stats->field += from->field
+            ADD(files); ADD(directories); ADD(symlinks); ADD(other); ADD(logical_bytes); ADD(skipped_mounts);
+#undef ADD
+        }
+    }
+    int error = atomic_load(&pool->error);
+    s->pool = NULL;
+    pthread_cond_destroy(&pool->progress);
+    pthread_cond_destroy(&pool->available);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+    if (error) s->error = error;
+    return error ? -1 : 0;
+}
+
+int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_scan_stats *stats,
                    stallion_cancel_fn cancel, void *context,
                    char *error_path, size_t error_capacity) {
     if (error_path && error_capacity) error_path[0] = 0;
-    if (!path || !stats) { errno = EINVAL; return -1; }
-    *stats = (struct stallion_scan_stats){0};
-    struct scan s = {.stats = stats, .bulk = bulk, .cancel = cancel, .context = context,
-                     .error_path = error_path, .error_capacity = error_capacity};
+    if (stats) *stats = (struct stallion_scan_stats){0};
+    if (!path || !stats || workers < 1 || workers > 4) { errno = EINVAL; return -1; }
+    struct stallion_scan_stats totals = {0};
+    struct parallel parallel = {.workers = workers};
+    struct scan s = {.stats = &totals, .bulk = bulk, .cancel = cancel, .context = context,
+                     .error_path = error_path, .error_capacity = error_capacity,
+                     .parallel = bulk && workers > 1 ? &parallel : NULL};
     int result = -1;
     if (!cancelled(&s, path)) {
         char *trimmed = NULL;
@@ -191,7 +407,9 @@ int stallion_scan(const char *path, int bulk, struct stallion_scan_stats *stats,
         }
         free(trimmed);
     }
+    if (s.parallel && finish_parallel(&s, path)) result = -1;
     if (!result && cancelled(&s, path)) result = -1;
+    if (!result) *stats = totals;
     errno = s.error;
     return result;
 }

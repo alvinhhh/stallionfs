@@ -32,16 +32,21 @@ static PyObject *operation_result(int result, int error, const char *path) {
 
 static PyObject *scan_tree(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    static char *names[] = {"path", "bulk", NULL};
+    static char *names[] = {"path", "bulk", "jobs", NULL};
     PyObject *path;
-    int bulk = 1;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O&|p", names, PyUnicode_FSConverter, &path, &bulk)) return NULL;
+    int bulk = 1, jobs = 4;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O&|pi", names, PyUnicode_FSConverter, &path, &bulk, &jobs)) return NULL;
+    if (jobs < 1 || jobs > 4) {
+        Py_DECREF(path);
+        PyErr_SetString(PyExc_ValueError, "jobs must be between 1 and 4");
+        return NULL;
+    }
     if (!valid_path(path)) { Py_DECREF(path); return NULL; }
     struct stallion_scan_stats stats;
     char error_path[4096] = {0};
     int result, error;
     Py_BEGIN_ALLOW_THREADS
-    result = stallion_scan(PyBytes_AS_STRING(path), bulk, &stats, check_cancel, NULL,
+    result = stallion_scan(PyBytes_AS_STRING(path), bulk, (unsigned)jobs, &stats, check_cancel, NULL,
                            error_path, sizeof(error_path));
     error = errno;
     Py_END_ALLOW_THREADS

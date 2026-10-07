@@ -21,7 +21,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from stallionfs.core import Store, git, remove_tree, run
-from stallionfs import _scan
+from stallionfs import __version__, _scan
 
 METHODS = ("worktree_install", "prepared_byte_copy", "stallionfs_folder", "stallionfs_image")
 
@@ -80,13 +80,13 @@ def main():
     setup = [] if args.source_only else ["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)]
     code = Path(__file__).resolve().parents[2] / "stallionfs"
     fingerprint_paths = {name: code / name
-                         for name in ("core.py", "_scan.c", "_tree.c", "_tree.h", "images.py", "__init__.py")}
+                         for name in ("core.py", "_scan.c", "_tree.c", "_walk.c", "_tree.h", "images.py", "__init__.py")}
     fingerprint_paths["tests/perf/run.py"] = Path(__file__).resolve()
     fingerprints = {name: hashlib.sha256(path.read_bytes()).hexdigest()
                     for name, path in fingerprint_paths.items()}
     native_binary = Path(_scan.__file__)
     native_fingerprint = hashlib.sha256(native_binary.read_bytes()).hexdigest()
-    result = {"format": 3, "status": "incomplete", "timestamp": datetime.now(timezone.utc).isoformat(),
+    result = {"format": 3, "version": __version__, "status": "incomplete", "timestamp": datetime.now(timezone.utc).isoformat(),
               "implementation_sha256": hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode()).hexdigest(),
               "source_sha256": fingerprints,
               "native_binary_sha256": native_fingerprint,

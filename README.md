@@ -23,7 +23,7 @@ stallionfs delete --recursive old-project
 stallionfs volumes
 ```
 
-Destinations are exact paths. Clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with cloning or deletion for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
+Destinations are exact paths. Clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with cloning, deletion or scanning for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
 
 Prepare a clean checkout, then start working in a copy:
 
@@ -72,31 +72,24 @@ source .venv/bin/activate
 
 ## Performance
 
-stallionfs 0.5.0 on an Apple M2 with 24 GB RAM, macOS 27. Median times with warm caches:
+stallionfs 0.6.0 on an Apple M2 with 24 GB RAM, macOS 27. Median times with warm caches:
 
-| File command | macOS command | stallionfs |
-| --- | ---: | ---: |
-| Copy one 4 KiB file | 2.31 ms | 2.83 ms |
-| Move one 4 KiB file | 2.24 ms | 2.83 ms |
-| Delete one 4 KiB file | 2.35 ms | 2.83 ms |
+| Operation | Baseline | stallionfs | Speedup |
+| --- | ---: | ---: | ---: |
+| Scan 20,000 files across 200 folders | 46.64 ms | 10.10 ms | 4.62× |
+| Scan 20,000 files in one folder | 38.20 ms | 20.30 ms | 1.88× |
+| Clone 10,000 files in nested folders | 1.204 s | 0.439 s | 2.74× |
+| Delete those 10,000 files | 0.408 s | 0.198 s | 2.06× |
+| Create and reclaim one folder workspace | 9.134 s | 4.983 s | 1.83× |
+| Create and reclaim four concurrent workspaces | 27.824 s | 13.596 s | 2.05× |
 
-These include process startup and compare against `cp -cRp`, `mv -n` and `rm -f`. Apple's commands are faster on these small files. The measured commands and their JSON output run in C.
+Scans compare against native `readdir`/`fstatat` traversal through the same Python API. Copies compare against `cp -cRp`, using copy-on-write on both sides; deletion compares against `rm -rf`. Command timings include process startup; deletion finishes before the command returns.
 
-| Command | Time |
-| --- | ---: |
-| Copy one 4 KiB file, JSON output | 3.51 ms |
-| Move one 4 KiB file, JSON output | 3.00 ms |
-| Delete one 4 KiB file, JSON output | 2.97 ms |
-| Scan 1,000 files | 4.22 ms |
+Workspace results compare prepared folder clones with `git worktree add` and an offline `npm ci` from a warm cache. They include complete cleanup, exclude one-time seed preparation, and varied substantially between samples. Four concurrent workspaces used 21% less CPU.
 
-| Scan | Native POSIX baseline | stallionfs |
-| --- | ---: | ---: |
-| 20,000 files in one folder | 37.38 ms | 18.06 ms |
-| 20,000 files across 200 folders | 41.36 ms | 22.07 ms |
+Parallel file operations trade CPU for elapsed time. Nested cloning used 33% more CPU than `cp`; deletion used 38% more than `rm`. Sequential scanning is available with `--jobs 1`.
 
-The 20,000-file scans use the Python API and exclude command startup. Both implementations retrieve the same counts and logical sizes. Flat scanning was 2.07× faster; nested scanning was 1.87× faster.
-
-[Results and test setup](tests/perf/README.md). Workspace lifecycle and image I/O figures will be added when measured on the current release.
+Single-file commands and moves remain slower than Apple's commands. [Full results](tests/perf/README.md) include every measured workload, CPU time, JSON output and native comparisons.
 
 ## Contributing
 
