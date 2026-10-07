@@ -10,6 +10,8 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q stallionfs
 ```
 
+Reinstall after changing native C code; both the extension and CLI need rebuilding.
+
 On macOS 26+, include the disk-image tests:
 
 ```sh

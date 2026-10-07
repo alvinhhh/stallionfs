@@ -84,12 +84,12 @@ def private_directory(path):
         raise StallionError(f"Storage must be an owned, real directory with mode 0700: {path}")
 
 
-def remove_tree(path):
-    from ._scan import mounts
+def remove_tree(path, *, jobs=4):
+    from ._scan import delete, mounts
     root = path.resolve()
     if any(Path(mount["path"]).is_relative_to(root) for mount in mounts()):
         raise StallionError(f"Directory contains a mounted volume; retained at {path}")
-    shutil.rmtree(path)
+    delete(path, recursive=True, jobs=jobs)
 
 
 @contextlib.contextmanager
@@ -105,15 +105,15 @@ def lock(path, *, shared=False):
         os.close(fd)
 
 
-def clone_tree(source, destination):
+def clone_tree(source, destination, *, jobs=4):
     """Clone prepared files using descriptor-relative native filesystem operations."""
     if sys.platform != "darwin":
         raise StallionError("stallionfs requires macOS and an APFS volume")
     try:
-        from ._scan import clone
+        from ._scan import _clone_tree
     except ImportError as exc:
         raise StallionError("Install stallionfs first to build its native filesystem tools: python3 -m pip install .") from exc
-    clone(source, destination)
+    _clone_tree(source, destination, jobs=jobs)
 
 
 def validate_tree(root):
@@ -273,8 +273,10 @@ class Store:
                     path.rename(stage / "expired")
             return {"deleted" if yes else "would_delete": seed}
 
-    def create(self, seed, *, name=""):
+    def create(self, seed, *, name="", jobs=4):
         identifier(seed, 64)
+        if type(jobs) is not int or not 1 <= jobs <= 4:
+            raise StallionError("jobs must be between 1 and 4")
         if name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
             raise StallionError("Name must be 1–64 letters, digits, dots, underscores or hyphens")
         with lock(self.root / "locks" / f"seed-{seed}", shared=True):
@@ -292,7 +294,7 @@ class Store:
                         (stage / "volume").mkdir(mode=0o700)
                         metadata.update(backend="image", capacity_gib=seed_meta["capacity_gib"])
                     else:
-                        clone_tree(base / "repo", stage / "repo")
+                        clone_tree(base / "repo", stage / "repo", jobs=jobs)
                         git(stage / "repo", "checkout", "-b", branch)
                     write_json(stage / "meta.json", metadata)
                     stage.rename(final)
@@ -366,7 +368,9 @@ class Store:
                 return self._mount(target, metadata)
             return {**metadata, "path": str(target / ("workspace.sparseimage" if metadata.get("backend") == "image" else "repo"))}
 
-    def gc(self, *, older_than=86400, yes=False):
+    def gc(self, *, older_than=86400, yes=False, jobs=4):
+        if type(jobs) is not int or not 1 <= jobs <= 4:
+            raise StallionError("jobs must be between 1 and 4")
         if older_than < 0 or not float(older_than) < float("inf"):
             raise StallionError("Trash age must be finite and nonnegative")
 
@@ -384,14 +388,15 @@ class Store:
                         if images.mounted(path / "workspace.sparseimage") is not None:
                             raise StallionError("Trashed image is still attached; detach it before collection")
                     # Only an owned, validated object in trash is ever recursively deleted.
-                    remove_tree(path)
+                    remove_tree(path, jobs=tree_jobs)
                 return entry.name
 
         entries = list((self.root / "trash").iterdir())
+        tree_jobs = max(1, jobs // max(1, len(entries)))
         if not yes or len(entries) < 2:
             return [value for value in map(collect, entries) if value is not None]
-        # Bound disk contention to four trees; tune only with workload measurements.
-        with ThreadPoolExecutor(max_workers=min(4, len(entries))) as pool:
+        # Share the worker budget across trees instead of multiplying it per tree.
+        with ThreadPoolExecutor(max_workers=min(jobs, len(entries))) as pool:
             return [value for value in pool.map(collect, entries) if value is not None]
 
     def doctor(self):

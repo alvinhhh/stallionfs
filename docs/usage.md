@@ -1,5 +1,44 @@
 # Usage
 
+## File operations
+
+```sh
+stallionfs clone source destination
+stallionfs clone source destination --jobs 1
+stallionfs move source destination
+stallionfs move source destination --replace
+stallionfs move first second --exchange
+stallionfs delete file
+stallionfs delete --recursive folder
+stallionfs delete --missing-ok file
+stallionfs volumes
+```
+
+`clone` creates an independent copy at an exact new path on the same APFS volume. It accepts regular files, directories and symlinks, preserves permissions, ACLs, extended attributes and timestamps, and never falls back to copying file data. Hard links become independent files. macOS applies its normal clone ownership rules, clears setuid/setgid bits on regular files, and adds inherited destination ACL entries to cloned files. A destination inside the source is rejected.
+
+Directory copying uses up to four workers. Files are pinned before cloning, links are copied without following their targets, and nested volumes and special files are rejected. Keep the source and destination trees stable during the operation; a recursive copy is not an atomic snapshot of concurrent changes. An error may leave a partial new destination. All workers stop before the command returns.
+
+Directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last.
+
+`move` uses the filesystem's atomic rename operation. It treats the destination as an exact path, including when that path names a directory. The default refuses an existing destination. `--replace` replaces it; `--exchange` swaps two existing paths. Cross-volume moves fail without copying or deleting the source.
+
+`delete` removes files and symlinks. Directories require `--recursive`; mounted volumes and directories containing mounts are refused. Deletion is permanent and finishes before the command returns. It can stop after partial deletion if an entry cannot be removed. `--missing-ok` accepts an absent final entry, while other errors still fail.
+
+`--jobs` accepts 1–4 for `clone` and `delete`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
+
+These four commands run in the native executable. `--json` selects the Python command path for structured results. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
+
+The same operations are available to Python applications:
+
+```python
+from stallionfs import clone, delete, mounts, move, scan
+
+clone("source", "destination", jobs=4)
+move("destination", "renamed")
+delete("renamed", recursive=True, jobs=1)
+print(mounts())
+```
+
 ## Scan a folder
 
 ```sh
@@ -68,7 +107,7 @@ The result contains `id`, `path`, `branch`, `seed`, `commit` and `created`. The 
 
 Each workspace is a standalone repository, so it is not listed by `git worktree list` in the source. Push its branch, or import a local commit with `git fetch /path/to/workspace branch-name` and cherry-pick it in your main checkout. Workspaces share no Git index or writable Git object files.
 
-stallionfs is most useful when many agents start at the same commit with expensive dependency or build preparation. It does not change APFS's general file-write, search or deletion speed.
+stallionfs is most useful when many agents start at the same commit with expensive dependency or build preparation. Other applications continue to use their own filesystem APIs.
 
 ## Remove and restore
 
