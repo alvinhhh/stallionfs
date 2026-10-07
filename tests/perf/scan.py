@@ -27,12 +27,14 @@ def main():
     if not 1 <= args.files <= 1000000 or not 1 <= args.samples <= 100:
         parser.error('Use 1–1,000,000 files and 1–100 samples')
     rng = random.Random(20261006)
-    source = Path(__file__).resolve().parents[2] / 'stallionfs/_scan.c'
+    package = Path(__file__).resolve().parents[2] / 'stallionfs'
+    sources = [package / name for name in ('_scan.c', '_walk.c', '_tree.h')]
+    hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     native_binary = Path(_scan.__file__)
     result = {'timestamp': datetime.now(timezone.utc).isoformat(), 'system': platform.platform(),
               'cpu': subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip(),
               'memory_bytes': int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'])),
-              'implementation_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+              'implementation_sha256': hashes,
               'native_binary_sha256': hashlib.sha256(native_binary.read_bytes()).hexdigest(),
               'python': platform.python_version(), 'samples': args.samples, 'warmup_rounds': 2,
               'timing': 'Python API wall time; native implementations; warm OS cache; no process startup',
@@ -74,7 +76,7 @@ def main():
             result['workloads'][layout] = {'expected': expected, 'raw_seconds': rows, 'median_seconds': medians,
                                           'speedup': medians['posix'] / medians['bulk']}
             print(layout, json.dumps(medians), flush=True)
-    if (hashlib.sha256(source.read_bytes()).hexdigest() != result['implementation_sha256']
+    if ({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sources} != hashes
             or hashlib.sha256(native_binary.read_bytes()).hexdigest() != result['native_binary_sha256']):
         raise RuntimeError('Scanner source or native binary changed during measurement; results are invalid')
     args.output.parent.mkdir(parents=True, exist_ok=True)

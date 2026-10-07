@@ -74,6 +74,14 @@ source .venv/bin/activate
 
 Apple M2, 24 GB RAM, macOS 27. Median times with warm caches:
 
+| Command | 0.4.0 | 0.5.0 |
+| --- | ---: | ---: |
+| Copy one 4 KiB file, JSON output | 51.02 ms | 3.51 ms |
+| Move one 4 KiB file, JSON output | 49.96 ms | 3.00 ms |
+| Scan 1,000 files | 50.96 ms | 4.22 ms |
+
+Scans and structured output now avoid Python startup. These timings include the whole command. Plain copy and move times were essentially unchanged; Apple's commands are still faster for a single small file. [Paired command results](tests/perf/README.md#cli-startup-and-structured-output).
+
 | File command, 0.4.0 | macOS command | stallionfs |
 | --- | ---: | ---: |
 | Copy 10,000 files in nested folders | 1.93 s | 0.67 s |
@@ -85,8 +93,8 @@ These include command startup and compare against `cp -cRp`, `rm -rf` and `mv -n
 
 | Scan | Native POSIX baseline | stallionfs |
 | --- | ---: | ---: |
-| 20,000 files in one folder | 41.67 ms | 20.90 ms |
-| 20,000 files across 200 folders | 47.86 ms | 25.93 ms |
+| 20,000 files in one folder | 37.38 ms | 18.06 ms |
+| 20,000 files across 200 folders | 41.36 ms | 22.07 ms |
 
 Folder workspace times in 0.4.0 include creation, setup and full cleanup:
 
@@ -95,7 +103,7 @@ Folder workspace times in 0.4.0 include creation, setup and full cleanup:
 | One | 2.87 s | 1.61 s |
 | Four concurrent | 11.20 s | 7.47 s |
 
-<sub><sup>Scans were measured in 0.3.0 over 11 runs. The 0.4.0 folder comparison uses seven runs with 12,581 prepared files and an offline `npm ci` baseline. Folder preparation took 2.79 s, recovered after three workspaces at these medians. CPU use was about equal for one workspace and 21% lower for four. Concurrent timings varied substantially, and one pair was slower with stallionfs; [all samples and test setup](tests/perf/README.md) are included.</sup></sub>
+<sub><sup>The 20,000-file scans were measured through the 0.5.0 Python API over 11 runs, excluding command startup. The 0.4.0 folder comparison uses seven runs with 12,581 prepared files and an offline `npm ci` baseline. Folder preparation took 2.79 s, recovered after three workspaces at these medians. CPU use was about equal for one workspace and 21% lower for four. Concurrent timings varied substantially, and one pair was slower with stallionfs; [all samples and test setup](tests/perf/README.md) are included.</sup></sub>
 
 The earlier [0.3.0 image comparison](tests/perf/README.md#prepared-workspaces) measured 3.97× faster creation and cleanup for one workspace and 6.76× for four. Image volumes also have a cost: durable writes took 2.14–3.74× as long as ordinary APFS folders, and concurrent file I/O took 2.55× as long in a separate [I/O comparison](tests/perf/README.md#file-io-inside-a-workspace). Use the image option for repeated workspace creation, and folders for work that writes heavily.
 

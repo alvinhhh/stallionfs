@@ -74,6 +74,11 @@ class Scan(unittest.TestCase):
             for target in ('absent', 'file', 'link'):
                 with self.assertRaises(OSError):
                     scan(root / target)
+            for bulk in (False, True):
+                for suffix in ('', '/', '///'):
+                    with self.subTest(bulk=bulk, suffix=suffix):
+                        with self.assertRaises(OSError): scan(str(root / 'link') + suffix, bulk=bulk)
+                        self.assertEqual(scan(str(root) + suffix, bulk=bulk), reference(root))
             with self.assertRaises(ValueError):
                 scan(str(root) + '\0suffix')
             denied = root / 'denied'
@@ -90,6 +95,30 @@ class Scan(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stderr)
             self.assertEqual(json.loads(process.stdout), reference(root))
             self.assertFalse(store.exists())
+
+    def test_native_cancellation_close_errors_and_no_partial_cli_totals(self):
+        tests = Path(__file__).resolve().parent
+        source = tests.parent / 'stallionfs'
+        with tempfile.TemporaryDirectory(prefix='stallionfs-scan-faults-') as temporary:
+            base = Path(temporary).resolve()
+            object_file, driver, launcher = base / 'walk.o', base / 'faults', base / 'stallionfs'
+            common = ['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-I', str(source)]
+            replacements = ('open', 'fstat', 'close', 'closedir', 'getattrlistbulk')
+            subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
+                            '-c', str(source / '_walk.c'), '-o', str(object_file)], check=True, timeout=30)
+            subprocess.run([*common, str(tests / 'native_scan_faults.c'), str(object_file), '-o', str(driver)],
+                           check=True, timeout=30)
+            subprocess.run([str(driver), str(base)], check=True, timeout=15)
+            subprocess.run([*common, '-DSTALLION_TEST_CLI', str(tests / 'native_scan_faults.c'),
+                            str(source / '_main.c'), str(source / '_tree.c'), str(object_file),
+                            '-o', str(launcher)], check=True, timeout=30)
+            fixture = base / 'fixture'; fixture.mkdir(); (fixture / 'file').write_bytes(b'counted before signal')
+            for options in ([], ['--json']):
+                interrupted = subprocess.run([str(launcher), *options, 'scan', str(fixture)],
+                                             capture_output=True, text=True, timeout=15)
+                self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+                self.assertEqual(interrupted.stdout, '')
+                self.assertTrue(interrupted.stderr)
 
 
 if __name__ == '__main__':

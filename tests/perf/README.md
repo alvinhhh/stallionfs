@@ -1,5 +1,21 @@
 # Internal performance checks
 
+## CLI startup and structured output
+
+Compare two releases installed into separate virtual environments:
+
+```sh
+python3 tests/perf/cli.py --baseline .venv-old/bin/stallionfs --candidate .venv-new/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/cli.json
+```
+
+The existing scratch directory must be on writable APFS with 256 MiB free. This measures plain and JSON clone, move and delete on a 4 KiB file; scans of an empty folder and a nested 1,000-file fixture; and mounted-filesystem output. Every invocation starts a new process. There are 31 measured pairs per case, seven for the nested scan, and one retained warmup. Method order is shuffled with a fixed seed. Small plain file operations also include separate `/bin/cp -cRp`, `/bin/mv -n` and `/bin/rm -f` references; these are not interchangeable commands outside the controlled fixture.
+
+Output contracts, counts, checksums, modes, inode behavior, source independence and the absence of an unnecessary workspace store are checked outside timing. No volume is mounted and no large fixture is created. Results retain every sample, wall and CPU time, and source plus installed-runtime hashes. A final report is written only after validation and cleanup; it omits personal paths and raw command output. Release-to-release speedups and Apple-command comparisons are reported separately. Keep both installations and the runtime source unchanged during the run.
+
+Recorded results: [M2 command startup, 0.4.0 versus 0.5.0](results/cli-v0.5-m2.json). All 768 samples, including warmups, passed. JSON copy took 3.51 ms versus 51.02 ms, JSON move 3.00 versus 49.96 ms, and JSON delete 2.97 versus 49.68 ms. A plain 1,000-file scan took 4.22 versus 50.96 ms. Total CPU time for those commands fell by 92–94%.
+
+Plain small-file command times remained close to 0.4.0. The 0.5.0 medians were 2.83 ms for copy, 2.83 ms for move and 2.83 ms for deletion, versus 2.31, 2.24 and 2.35 ms for Apple's commands. These remain regressions against the native-command baseline.
+
 ## File commands
 
 Compare the installed native executable with `/bin/cp -cRp`, `/bin/rm -rf` and `/bin/mv -n`:
@@ -43,7 +59,7 @@ python3 tests/perf/scan.py --scratch /tmp/stallionfs-perf --output /tmp/stallion
 
 Both paths are C implementations that retrieve the same counts and logical lengths. The baseline uses `readdir` and `fstatat`; the optimized path uses `getattrlistbulk`. The test creates flat and nested 20,000-file layouts, plus symlinks, a FIFO, Unicode names, a sparse file and a hard link. Every result must equal independently calculated fixture totals. Two warmups are discarded, then 11 samples run in shuffled order. API timings include the same Python call overhead and exclude fixture creation and process startup. This does not measure reads of file contents or acceleration inside other applications.
 
-Recorded results: [M2 metadata scans, 0.3.0](results/scan-v0.3-m2.json). Bulk scanning took 20.90 ms versus 41.67 ms for the flat layout (1.99×), and 25.93 ms versus 47.86 ms for nested folders (1.85×). Neither result reaches a strict 2× threshold. [Earlier 0.2.0 results](results/scan-m2.json) remain available.
+Recorded results: [M2 metadata scans, 0.5.0](results/scan-v0.5-m2.json). Bulk scanning took 18.06 ms versus 37.38 ms for the flat layout (2.07×), and 22.07 ms versus 41.36 ms for nested folders (1.87×). The nested result remains below 2×. Earlier [0.3.0](results/scan-v0.3-m2.json) and [0.2.0](results/scan-m2.json) results remain available.
 
 ## Prepared workspaces
 
