@@ -12,9 +12,18 @@ The existing scratch directory must be on writable APFS with 256 MiB free. This 
 
 Output contracts, counts, checksums, modes, inode behavior, source independence and the absence of an unnecessary workspace store are checked outside timing. No volume is mounted and no large fixture is created. Results retain every sample, wall and CPU time, and source plus installed-runtime hashes. A final report is written only after validation and cleanup; it omits personal paths and raw command output. Release-to-release speedups and Apple-command comparisons are reported separately. Keep both installations and the runtime source unchanged during the run.
 
-Recorded results: [M2 command startup, 0.4.0 versus 0.5.0](results/cli-v0.5-m2.json). All 768 samples, including warmups, passed. JSON copy took 3.51 ms versus 51.02 ms, JSON move 3.00 versus 49.96 ms, and JSON delete 2.97 versus 49.68 ms. A plain 1,000-file scan took 4.22 versus 50.96 ms. Total CPU time for those commands fell by 92–94%.
+Recorded results: [M2 command startup, 0.5.0](results/cli-v0.5-m2.json). All 768 samples, including warmups and comparison controls, passed validation and cleanup. Current-release medians:
 
-Plain small-file command times remained close to 0.4.0. The 0.5.0 medians were 2.83 ms for copy, 2.83 ms for move and 2.83 ms for deletion, versus 2.31, 2.24 and 2.35 ms for Apple's commands. These remain regressions against the native-command baseline.
+| Command | Plain output | JSON output | macOS plain-output reference |
+| --- | ---: | ---: | ---: |
+| Copy one 4 KiB file | 2.83 ms | 3.51 ms | 2.31 ms |
+| Move one 4 KiB file | 2.83 ms | 3.00 ms | 2.24 ms |
+| Delete one 4 KiB file | 2.83 ms | 2.97 ms | 2.35 ms |
+| Scan an empty folder | 3.18 ms | 3.26 ms | — |
+| Scan 1,000 files | 4.22 ms | 4.31 ms | — |
+| List mounted volumes | 2.87 ms | 3.29 ms | — |
+
+Small-file commands remain slower than the macOS references. The raw comparison retains its original controls; displayed figures use only the current release.
 
 ## File commands
 
@@ -28,24 +37,7 @@ The scratch directory must exist on writable APFS with at least 2 GiB free. The 
 
 Copying uses native copy-on-write on both sides. Every copy and move must preserve the fixture's contents, modes and symlink targets; clones must have independent inodes. Moves use an absent exact destination and must preserve the inode. Deletion must finish before returning. Fixture setup, validation and cleanup are outside timing. Results include wall time, process and child CPU, source and executable hashes, and every sample. These are warm-cache operations without a durability flush.
 
-Recorded results: [M2 file commands, 0.4.0](results/fileops-v0.4-m2.json). Medians in milliseconds; CPU ratios are stallionfs divided by the baseline, so values above one use more CPU.
-
-| Operation | Fixture | macOS command | stallionfs | CPU ratio |
-| --- | --- | ---: | ---: | ---: |
-| Copy | 4 KiB file | 2.27 | 2.94 | 1.23× |
-| Copy | 64 MiB file | 3.21 | 3.78 | 1.11× |
-| Copy | 2,000 files, flat | 277.65 | 252.38 | 0.91× |
-| Copy | 10,000 files, nested | 1930.25 | 673.42 | 1.27× |
-| Delete | 4 KiB file | 3.39 | 4.14 | 1.10× |
-| Delete | 64 MiB file | 4.16 | 4.69 | 1.05× |
-| Delete | 2,000 files, flat | 64.84 | 62.07 | 0.94× |
-| Delete | 10,000 files, nested | 461.91 | 289.07 | 1.51× |
-| Move | 4 KiB file | 2.91 | 3.77 | 1.19× |
-| Move | 64 MiB file | 3.47 | 6.01 | 1.64× |
-| Move | 2,000 files, flat | 4.39 | 5.20 | 1.11× |
-| Move | 10,000 files, nested | 4.02 | 5.89 | 1.29× |
-
-Nested copying was 2.87× faster and deletion 1.60× faster, with higher CPU use. Flat-directory gains were small; single-file commands and moves were slower. All 336 samples, including warmups, passed validation and cleanup. Repeated operations can use the Python API to avoid starting a command process for each call.
+The current release's small-file results are listed above. Larger-file and directory figures need a current-release run.
 
 ## Metadata scanning
 
@@ -59,7 +51,7 @@ python3 tests/perf/scan.py --scratch /tmp/stallionfs-perf --output /tmp/stallion
 
 Both paths are C implementations that retrieve the same counts and logical lengths. The baseline uses `readdir` and `fstatat`; the optimized path uses `getattrlistbulk`. The test creates flat and nested 20,000-file layouts, plus symlinks, a FIFO, Unicode names, a sparse file and a hard link. Every result must equal independently calculated fixture totals. Two warmups are discarded, then 11 samples run in shuffled order. API timings include the same Python call overhead and exclude fixture creation and process startup. This does not measure reads of file contents or acceleration inside other applications.
 
-Recorded results: [M2 metadata scans, 0.5.0](results/scan-v0.5-m2.json). Bulk scanning took 18.06 ms versus 37.38 ms for the flat layout (2.07×), and 22.07 ms versus 41.36 ms for nested folders (1.87×). The nested result remains below 2×. Earlier [0.3.0](results/scan-v0.3-m2.json) and [0.2.0](results/scan-m2.json) results remain available.
+Recorded results: [M2 metadata scans, 0.5.0](results/scan-v0.5-m2.json). Bulk scanning took 18.06 ms versus 37.38 ms for the flat layout (2.07×), and 22.07 ms versus 41.36 ms for nested folders (1.87×). The nested result remains below 2×.
 
 ## Prepared workspaces
 
@@ -96,24 +88,7 @@ This uses the Python API. CLI process startup is excluded for stallionfs; Git/np
 
 Results include every measured sample, source-file hashes and the loaded native binary's hash. The runner rejects results if runtime source or the loaded native binary changes during measurement. Image allocation reports `st_blocks`, which does not distinguish shared APFS blocks from unique physical storage. Seed break-even is calculated from medians, not a guarantee for another workload.
 
-Recorded folder results: [M2 workspaces, 0.4.0](results/workspaces-v0.4-m2.json), with Node 24.19.0 and npm 10.9.2:
-
-| Workspaces | Phase | Worktree + install | stallionfs folder |
-| --- | --- | ---: | ---: |
-| One | Ready | 1.964 s | 1.191 s |
-| One | Full lifecycle | 2.872 s | 1.606 s |
-| One | Full CPU time | 4.252 s | 4.240 s |
-| Four | Ready | 8.202 s | 5.765 s |
-| Four | Full lifecycle | 11.198 s | 7.473 s |
-| Four | Full CPU time | 25.737 s | 20.368 s |
-
-Full-lifecycle speedups were 1.79× and 1.50×, below 2×. Single-workspace times ranged from 2.28–3.58 seconds for worktree/install and 1.41–2.21 seconds for stallionfs. Concurrent batches ranged from 6.51–38.48 and 5.29–12.56 seconds respectively; stallionfs lost one of the seven paired concurrent samples. The run includes all samples. Folder preparation took 2.79 seconds and broke even after three workspaces at these medians. Each phase is summarized separately, so the medians need not add up to the median total.
-
-Earlier full comparison: [M2 workspaces, 0.3.0](results/workspaces-v0.3-m2.json). Image workspace creation and full cleanup took median 1.55 seconds for one workspace and 3.42 seconds for four, versus 6.14 and 23.10 seconds for worktree/install. The one-time image preparation took 12.28 seconds, recovered after three workspaces at these medians.
-
-This run had substantial timing variation. Full-cycle ranges were 5.13–24.85 seconds for one worktree/install versus 1.38–2.75 seconds for one image, and 11.28–42.82 seconds versus 2.44–4.18 seconds for four. All seven samples are retained. Folder cloning was slower than worktree/install for one workspace in this run.
-
-Earlier results: [M2 workspaces, 0.2.0](results/workspaces-m2.json), where folder clones were roughly tied with worktree/install.
+No workspace lifecycle figures are shown until this comparison has been run on the current release.
 
 ## File I/O inside a workspace
 
@@ -129,18 +104,4 @@ Operations cover 2,000 small-file creates, reads, metadata lookups, renames and 
 
 Compatibility checks cover permissions, extended attributes, hard links, symlinks, open-file unlinking, atomic replacement, case handling and Unicode names. Successful flush calls do not prove recovery from power loss or hardware failure. The runner records volume flags, code hashes, raw samples and all regressions, and only writes a final result after validation and safe cleanup.
 
-Recorded results: [M2 file I/O, 0.3.0](results/io-v0.3-m2.json). Medians over seven pairs, in milliseconds:
-
-| Operation | APFS folder | APFS image |
-| --- | ---: | ---: |
-| Create 2,000 small files (buffered) | 250.08 | 347.40 |
-| Look up metadata for 2,000 files | 6.30 | 6.33 |
-| Read 2,000 small files (warm) | 52.91 | 47.66 |
-| Rename 2,000 files | 184.63 | 189.75 |
-| Delete 2,000 files | 92.50 | 116.20 |
-| 20 durable 4 KiB overwrites | 116.38 | 249.18 |
-| Write 64 MiB durably | 33.74 | 126.26 |
-| Read and hash 64 MiB (warm) | 35.45 | 35.28 |
-| Four workers: create, read and delete 500 files each | 181.68 | 462.52 |
-
-The image backend does not accelerate general file I/O. Durable overwrite latency was 2.14× higher, durable 64 MiB writes took 3.74× as long, and concurrent file operations took 2.55× as long. Metadata lookups and large warm reads were roughly tied. Compatibility checks matched on both volumes, and cleanup completed. The published result removes the OS mount-owner account annotation; timings and functional mount flags are unchanged.
+No image I/O figures are shown until this comparison has been run on the current release. Image workspaces are intended for repeated workspace creation; they do not establish faster general file I/O.
