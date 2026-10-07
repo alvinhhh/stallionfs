@@ -1,5 +1,18 @@
 # Usage
 
+## Scan a folder
+
+```sh
+stallionfs scan /path/to/folder
+stallionfs --json scan /path/to/folder
+```
+
+`scan` uses `getattrlistbulk` to count regular files, subdirectories, symlinks, other entries, and regular-file logical bytes. It reads metadata, leaves files unchanged, and does not create a workspace store. Symlinks inside the tree are not followed. Nested volumes are skipped and counted in `skipped_mounts`.
+
+Logical bytes describe file lengths, not allocated disk space. Hard links count once per directory entry; sparse files count their full logical length. Permission errors, disappearing directories, unsupported metadata operations, and traversal deeper than 511 subdirectories stop the scan with an error instead of printing incomplete totals. A live scan is not an atomic snapshot of a changing tree.
+
+This accelerates the scan command. Other applications continue using their own filesystem APIs.
+
 ## Prepare a seed
 
 ```sh
