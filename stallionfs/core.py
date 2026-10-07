@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-import ctypes
-import errno
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -66,17 +65,31 @@ def read_json(path):
 
 
 def write_json(path, value):
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump({"format": 1, **value}, stream, sort_keys=True, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"format": 1, **value}, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish a complete file without replacing an existing marker.
+        os.link(temporary, path, follow_symlinks=False)
+    finally:
+        os.unlink(temporary)
 
 
 def private_directory(path):
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise StallionError(f"Storage must be an owned, real directory with mode 0700: {path}")
+
+
+def remove_tree(path):
+    from ._scan import mounts
+    root = path.resolve()
+    if any(Path(mount["path"]).is_relative_to(root) for mount in mounts()):
+        raise StallionError(f"Directory contains a mounted volume; retained at {path}")
+    shutil.rmtree(path)
 
 
 @contextlib.contextmanager
@@ -93,50 +106,14 @@ def lock(path, *, shared=False):
 
 
 def clone_tree(source, destination):
-    """Native recursive copyfile, accepting only successful copy-on-write clones."""
+    """Clone prepared files using descriptor-relative native filesystem operations."""
     if sys.platform != "darwin":
         raise StallionError("stallionfs requires macOS and an APFS volume")
-    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-    lib.copyfile_state_alloc.restype = ctypes.c_void_p
-    lib.copyfile_state_set.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
-    lib.copyfile_state_get.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
-    lib.copyfile_state_free.argtypes = [ctypes.c_void_p]
-    lib.copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32]
-    callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-                                    ctypes.c_void_p, use_errno=True)
-    failure = []
-
-    @callback_type
-    def check_clone(what, stage, state, src, dst, context):
-        if stage == 3:  # COPYFILE_ERR: abort rather than skipping an entry.
-            failure.append((ctypes.get_errno() or errno.EIO, os.fsdecode(src)))
-            return 2  # COPYFILE_QUIT
-        if what == 1 and stage == 2:  # COPYFILE_RECURSE_FILE / COPYFILE_FINISH
-            cloned = ctypes.c_bool()
-            if lib.copyfile_state_get(state, 10, ctypes.byref(cloned)) or not cloned.value:
-                failure.append((errno.ENOTSUP, os.fsdecode(src)))
-                return 2
-        return 0
-
-    state = lib.copyfile_state_alloc()
-    if not state:
-        raise OSError(errno.ENOMEM, "Unable to allocate native copy state")
     try:
-        no_cross_mount = ctypes.c_bool(True)
-        for option, value in ((6, check_clone), (14, ctypes.byref(no_cross_mount))):
-            if lib.copyfile_state_set(state, option, value):
-                number = ctypes.get_errno()
-                raise OSError(number, os.strerror(number))
-        # COPYFILE_RECURSIVE | COPYFILE_CLONE | COPYFILE_NOFOLLOW_DST.
-        # COPYFILE_CLONE alone allows fallback; the callback rejects it before publication.
-        result = lib.copyfile(os.fsencode(source), os.fsencode(destination), state,
-                              (1 << 15) | (1 << 24) | (1 << 19))
-        if result or failure:
-            number, path = failure[0] if failure else (ctypes.get_errno() or errno.EIO, str(source))
-            raise OSError(number, os.strerror(number), path)
-    finally:
-        lib.copyfile_state_free(state)
+        from ._scan import clone
+    except ImportError as exc:
+        raise StallionError("Install stallionfs first to build its native filesystem tools: python3 -m pip install .") from exc
+    clone(source, destination)
 
 
 def validate_tree(root):
@@ -190,7 +167,14 @@ class Store:
             yield path
         finally:
             if path.exists():
-                shutil.rmtree(path)
+                image = path / "workspace.sparseimage"
+                if os.path.lexists(image):
+                    from . import images
+                    # Inspection errors also retain staging: absence of a mount is
+                    # insufficient proof that the backing image is unused.
+                    if images.mounted(image) is not None:
+                        raise StallionError(f"Staging image is still attached; retained at {path}")
+                remove_tree(path)
 
     def object(self, kind, value):
         identifier(value, 64 if kind == "seeds" else 32)
@@ -201,16 +185,25 @@ class Store:
             raise StallionError(f"Metadata ID mismatch: {path}")
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(metadata.get("commit", ""))):
             raise StallionError(f"Invalid commit in metadata: {path}")
-        if (path / "repo").is_symlink() or not (path / "repo").is_dir():
+        backend = metadata.get("backend", "folder")
+        if backend == "image":
+            info = (path / "workspace.sparseimage").lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise StallionError(f"Missing or unsafe workspace image: {path}")
+            if kind != "seeds" and ((path / "volume").is_symlink() or not (path / "volume").is_dir()):
+                raise StallionError(f"Missing or unsafe mount directory: {path}")
+        elif backend != "folder" or (path / "repo").is_symlink() or not (path / "repo").is_dir():
             raise StallionError(f"Missing or unsafe repository: {path}")
         return path, metadata
 
-    def prepare(self, source, *, ref="HEAD", key, command=()):
+    def prepare(self, source, *, ref="HEAD", key, command=(), image_size=None):
         if sys.platform != "darwin":
             raise StallionError("stallionfs requires macOS and an APFS volume")
         source = Path(source).expanduser().resolve(strict=True)
         if not key.strip():
             raise StallionError("Supply a cache key describing the toolchain (for example node22-npm10-v1)")
+        if image_size is not None and (type(image_size) is not int or not 1 <= image_size <= 65536):
+            raise StallionError("Image capacity must be an integer between 1 and 65536 GiB")
         if self.root.is_relative_to(source) or source.is_relative_to(self.root):
             raise StallionError("Source and stallionfs storage must not overlap")
         if Path(git(source, "rev-parse", "--show-toplevel")).resolve() != source:
@@ -228,6 +221,8 @@ class Store:
         spec = {"source": str(source), "commit": commit, "origin": origin, "key": key,
                 "command": list(command), "system": platform.system(),
                 "release": platform.release(), "machine": platform.machine(), "format": 1}
+        if image_size is not None:
+            spec.update(backend="image", capacity_gib=image_size)
         seed = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         with lock(self.root / "locks" / f"seed-{seed}"):
             final = self.root / "seeds" / seed
@@ -254,6 +249,10 @@ class Store:
                 if any((repo / ".git").rglob("*.lock")):
                     raise StallionError("Preparation left a Git lock; stop background processes before preparing")
                 validate_tree(repo)
+                if image_size is not None:
+                    from . import images
+                    images.build(repo, stage / "workspace.sparseimage", image_size)
+                    remove_tree(repo)
                 metadata = {"id": seed, **spec, "created": time.time()}
                 write_json(stage / "meta.json", metadata)
                 # Publish only a fully prepared tree; a failed command never becomes a cache hit.
@@ -263,8 +262,12 @@ class Store:
     def forget(self, seed, *, yes=False):
         identifier(seed, 64)
         with lock(self.root / "locks" / f"seed-{seed}"):
-            path, _ = self.object("seeds", seed)
+            path, metadata = self.object("seeds", seed)
             if yes:
+                if metadata.get("backend") == "image":
+                    from . import images
+                    if images.mounted(path / "workspace.sparseimage") is not None:
+                        raise StallionError("Prepared image is still attached; detach it before deleting the seed")
                 # Existing workspaces own their Git objects and retain their cloned blocks.
                 with self.staging() as stage:
                     path.rename(stage / "expired")
@@ -278,15 +281,57 @@ class Store:
             base, seed_meta = self.object("seeds", seed)
             workspace = uuid.uuid4().hex
             final = self.root / "workspaces" / workspace
-            with self.staging() as stage:
-                clone_tree(base / "repo", stage / "repo")
-                branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
-                git(stage / "repo", "checkout", "-b", branch)
-                metadata = {"id": workspace, "seed": seed, "name": name, "branch": branch,
-                            "commit": seed_meta["commit"], "created": time.time()}
-                write_json(stage / "meta.json", metadata)
-                stage.rename(final)
-                return {**metadata, "path": str(final / "repo")}
+            with lock(self.root / "locks" / f"workspace-{workspace}"):
+                with self.staging() as stage:
+                    branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
+                    metadata = {"id": workspace, "seed": seed, "name": name, "branch": branch,
+                                "commit": seed_meta["commit"], "created": time.time()}
+                    if seed_meta.get("backend") == "image":
+                        from . import images
+                        images.clone(base / "workspace.sparseimage", stage / "workspace.sparseimage")
+                        (stage / "volume").mkdir(mode=0o700)
+                        metadata.update(backend="image", capacity_gib=seed_meta["capacity_gib"])
+                    else:
+                        clone_tree(base / "repo", stage / "repo")
+                        git(stage / "repo", "checkout", "-b", branch)
+                    write_json(stage / "meta.json", metadata)
+                    stage.rename(final)
+                return self._mount(final, metadata)
+
+    def _mount(self, path, metadata):
+        repo = path / "repo"
+        if metadata.get("backend") == "image":
+            from . import images
+            try:
+                repo = images.attach(path / "workspace.sparseimage", path / "volume")
+                ready = path / "ready.json"
+                if ready.exists():
+                    if read_json(ready).get("id") != metadata["id"]:
+                        raise StallionError("Invalid image initialization marker")
+                else:
+                    if git(repo, "branch", "--show-current") != metadata["branch"]:
+                        if git(repo, "rev-parse", "HEAD") != metadata["commit"]:
+                            raise StallionError("Uninitialized image has an unexpected Git commit")
+                        git(repo, "checkout", "-b", metadata["branch"])
+                    write_json(ready, {"id": metadata["id"]})
+            except (OSError, StallionError) as exc:
+                raise StallionError(f"Workspace {metadata['id']} retained; retry with mount: {exc}") from exc
+        return {**metadata, "path": str(repo)}
+
+    def mount(self, workspace):
+        identifier(workspace, 32)
+        with lock(self.root / "locks" / f"workspace-{workspace}"):
+            return self._mount(*self.object("workspaces", workspace))
+
+    def unmount(self, workspace):
+        identifier(workspace, 32)
+        with lock(self.root / "locks" / f"workspace-{workspace}"):
+            path, metadata = self.object("workspaces", workspace)
+            if metadata.get("backend") != "image":
+                raise StallionError("This workspace is an ordinary folder")
+            from . import images
+            images.detach(path / "workspace.sparseimage", path / "volume")
+            return {"unmounted": workspace}
 
     def list(self, kind="workspaces"):
         if kind not in ("workspaces", "trash", "seeds"):
@@ -295,7 +340,10 @@ class Store:
         for path in sorted((self.root / kind).iterdir()):
             try:
                 _, meta = self.object(kind, path.name)
-                values.append({**meta, "path": str(path / "repo")})
+                target = path / "repo"
+                if meta.get("backend") == "image":
+                    target = path / ("workspace.sparseimage" if kind == "seeds" else "volume/repo")
+                values.append({**meta, "path": str(target)})
             except FileNotFoundError:
                 continue  # An object can be moved by another process while listing.
         return values
@@ -308,28 +356,43 @@ class Store:
             target = self.root / destination / workspace
             if target.exists() or target.is_symlink():
                 raise StallionError("Destination already exists")
+            if metadata.get("backend") == "image":
+                from . import images
+                images.detach(path / "workspace.sparseimage", path / "volume")
             path.rename(target)
             # Directory mtime records trash age without an extra metadata transaction.
             os.utime(target, None, follow_symlinks=False)
-            return {**metadata, "path": str(target / "repo")}
+            if restore:
+                return self._mount(target, metadata)
+            return {**metadata, "path": str(target / ("workspace.sparseimage" if metadata.get("backend") == "image" else "repo"))}
 
     def gc(self, *, older_than=86400, yes=False):
         if older_than < 0 or not float(older_than) < float("inf"):
             raise StallionError("Trash age must be finite and nonnegative")
-        removed = []
-        for entry in (self.root / "trash").iterdir():
+
+        def collect(entry):
             identifier(entry.name, 32)
             with lock(self.root / "locks" / f"workspace-{entry.name}"):
-                if not entry.exists():
-                    continue
-                path, _ = self.object("trash", entry.name)
+                if not entry.exists() and not entry.is_symlink():
+                    return None
+                path, metadata = self.object("trash", entry.name)
                 if time.time() - path.stat().st_mtime < older_than:
-                    continue
+                    return None
                 if yes:
+                    if metadata.get("backend") == "image":
+                        from . import images
+                        if images.mounted(path / "workspace.sparseimage") is not None:
+                            raise StallionError("Trashed image is still attached; detach it before collection")
                     # Only an owned, validated object in trash is ever recursively deleted.
-                    shutil.rmtree(path)
-                removed.append(entry.name)
-        return removed
+                    remove_tree(path)
+                return entry.name
+
+        entries = list((self.root / "trash").iterdir())
+        if not yes or len(entries) < 2:
+            return [value for value in map(collect, entries) if value is not None]
+        # Bound disk contention to four trees; tune only with workload measurements.
+        with ThreadPoolExecutor(max_workers=min(4, len(entries))) as pool:
+            return [value for value in pool.map(collect, entries) if value is not None]
 
     def doctor(self):
         with self.staging() as stage:

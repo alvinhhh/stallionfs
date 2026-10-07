@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from stallionfs._scan import scan
+from stallionfs._scan import mounts, scan
 
 
 def reference(root):
@@ -30,6 +30,18 @@ def reference(root):
 
 
 class Scan(unittest.TestCase):
+    def test_mount_records_have_absolute_paths_and_typed_flags(self):
+        records = mounts()
+        self.assertIn('/', [record['path'] for record in records])
+        for record in records:
+            self.assertTrue(isinstance(record['path'], str) and os.path.isabs(record['path']))
+            self.assertIsInstance(record['device'], str)
+            self.assertIsInstance(record['filesystem'], str)
+            self.assertIsInstance(record['readonly'], bool)
+            self.assertIsInstance(record['ignore_ownership'], bool)
+            self.assertIsInstance(record['owner'], int)
+            self.assertGreaterEqual(record['owner'], 0)
+
     def test_bulk_matches_reference_and_parallel_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

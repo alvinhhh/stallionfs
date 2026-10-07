@@ -1,15 +1,17 @@
 """Run on APFS: python3 -m unittest discover -s tests -v."""
 
 from concurrent.futures import ThreadPoolExecutor
-import ctypes
+import errno
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -150,6 +152,35 @@ class Workspaces(unittest.TestCase):
             self.store.gc(older_than=0, yes=True)
         self.assertEqual((victim / "precious").read_text(), "keep")
 
+    def test_parallel_gc_preserves_symlink_targets_and_reports_errors(self):
+        seed = self.prepare()["id"]
+        victim = self.base / "keep"
+        victim.mkdir()
+        (victim / "precious").write_text("keep")
+        identifiers = []
+        for _ in range(4):
+            workspace = self.store.create(seed)
+            (Path(workspace["path"]) / "external").symlink_to(victim)
+            self.store.move(workspace["id"])
+            identifiers.append(workspace["id"])
+        original = shutil.rmtree
+        barrier = threading.Barrier(4, timeout=5)
+
+        def reclaim(path):
+            barrier.wait()  # Fails if reclamation regresses to serial traversal.
+            original(path)
+
+        with patch("stallionfs.core.shutil.rmtree", reclaim):
+            self.assertCountEqual(self.store.gc(older_than=0, yes=True), identifiers)
+        self.assertEqual((victim / "precious").read_text(), "keep")
+        self.assertEqual(self.store.list("trash"), [])
+        workspace = self.store.create(seed)
+        self.store.move(workspace["id"])
+        with patch("stallionfs.core.shutil.rmtree", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                self.store.gc(older_than=0, yes=True)
+        self.assertEqual(self.store.list("trash")[0]["id"], workspace["id"])
+
     def test_linked_worktree_source_and_environment_isolation(self):
         linked = self.base / "linked"
         git(self.source, "worktree", "add", "--detach", str(linked), "HEAD")
@@ -175,17 +206,84 @@ class Workspaces(unittest.TestCase):
         self.assertEqual(git(workspace["path"], "show", "HEAD:file"), "original")
         self.assertEqual((Path(workspace["path"]) / "file").read_text(), "original\n")
 
-    def test_native_copy_fallback_is_rejected(self):
+    def test_native_clone_rejects_fallback_and_handles_interruption(self):
         seed = self.prepare()["id"]
-        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-        def report_fallback(state, option, result):
-            result._obj.value = False
-            return 0
-        lib.copyfile_state_get = report_fallback
-        with patch("stallionfs.core.ctypes.CDLL", return_value=lib), self.assertRaises(OSError):
-            self.store.create(seed)
-        self.assertEqual(self.store.list(), [])
-        self.assertEqual(list((self.store.root / "staging").iterdir()), [])
+        shim = self.base / "unsupported.c"
+        shim.write_text('''#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/clonefile.h>
+static int unsupported(int a, const char *b, int c, const char *d, unsigned f) {
+    (void)a; (void)b; (void)c; (void)d; (void)f;
+    if (getenv("STALLIONFS_TEST_INTERRUPT")) { raise(SIGINT); errno = EINTR; return -1; }
+    errno = ENOTSUP; return -1;
+}
+__attribute__((used, section("__DATA,__interpose")))
+static struct { const void *replacement; const void *original; } interpose = {
+    (const void *)unsupported, (const void *)clonefileat
+};
+''')
+        library = self.base / "unsupported.dylib"
+        run(["cc", "-dynamiclib", str(shim), "-o", str(library)])
+        program = f'''import errno, os
+from pathlib import Path
+from stallionfs.core import Store
+store = Store({str(self.store.root)!r})
+try:
+    store.create({seed!r})
+except (OSError, KeyboardInterrupt) as exc:
+    if os.environ.get("STALLIONFS_TEST_INTERRUPT"):
+        assert isinstance(exc, KeyboardInterrupt), exc
+    else:
+        assert isinstance(exc, OSError) and exc.errno == errno.ENOTSUP, exc
+else:
+    raise AssertionError("unsupported clone silently fell back to copying")
+assert store.list() == []
+assert list((store.root / "staging").iterdir()) == []
+'''
+        for fault in ({}, {"STALLIONFS_TEST_INTERRUPT": "1"}):
+            result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                                    env={**os.environ, "DYLD_INSERT_LIBRARIES": str(library), **fault})
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_native_clone_preserves_metadata_and_never_follows_links(self):
+        source = self.base / "clone-source"
+        source.mkdir()
+        directory = source / "nested"
+        directory.mkdir()
+        target = directory / "file"
+        target.write_bytes(b"original")
+        target.chmod(0o754)
+        directory.chmod(0o750)
+        principal = pwd.getpwuid(os.getuid()).pw_name
+        for path in (source, directory, target):
+            run(["xattr", "-w", "com.stallionfs.test", "metadata", path])
+            run(["chmod", "+a", f"user:{principal} allow read,write", path])
+        (source / "external").symlink_to(self.source, target_is_directory=True)
+        (source / "dangling").symlink_to("absent")
+        os.utime(target, ns=(1_700_000_000_123456789,) * 2)
+        os.utime(directory, ns=(1_700_000_000_987654321,) * 2)
+        destination = self.base / "clone-destination"
+        clone_tree(source, destination)
+        for path in (source, directory, target):
+            copied = destination / path.relative_to(source)
+            self.assertEqual(copied.stat().st_mode, path.stat().st_mode)
+            self.assertEqual(copied.stat().st_mtime_ns, path.stat().st_mtime_ns)
+            self.assertEqual(run(["xattr", "-p", "com.stallionfs.test", copied]), "metadata")
+            self.assertEqual(run(["ls", "-lde", copied]).splitlines()[1:], run(["ls", "-lde", path]).splitlines()[1:])
+        self.assertEqual(os.readlink(destination / "external"), str(self.source))
+        self.assertEqual(os.readlink(destination / "dangling"), "absent")
+        (destination / "nested/file").write_bytes(b"changed")
+        self.assertEqual(target.read_bytes(), b"original")
+        with self.assertRaises(FileExistsError):
+            clone_tree(source, destination)
+        with self.assertRaises(OSError):
+            clone_tree(source / "external", self.base / "must-not-exist")
+        self.assertFalse((self.base / "must-not-exist").exists())
+        os.mkfifo(source / "fifo")
+        with self.assertRaises(OSError) as error:
+            clone_tree(source, self.base / "unsupported")
+        self.assertEqual(error.exception.errno, errno.ENOTSUP)
 
     def test_interrupted_preparation_is_not_cached(self):
         marker = self.base / "started"

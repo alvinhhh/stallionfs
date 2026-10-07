@@ -6,10 +6,16 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python: ['3.11', '3.13']
+        include:
+          - {os: macos-15, python: '3.13', images: '0'}
+          - {os: macos-26, python: '3.11', images: '1'}
+          - {os: macos-26, python: '3.13', images: '1'}
+          - {os: macos-26-intel, python: '3.13', images: '1'}
+    env:
+      STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
