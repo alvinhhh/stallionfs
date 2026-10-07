@@ -1,146 +1,179 @@
 # Internal performance checks
 
-## CLI startup and structured output
+Measured with stallionfs 0.6.1 on an Apple M2, 24 GiB RAM, macOS 27 and Python 3.13.3. JSON results retain samples, validation outcomes and source/runtime hashes.
 
-Compare two releases installed into separate virtual environments:
+The final package adds a Python interruption diagnostic fix after measurement. Native binaries and the workspace API are byte-identical; the changed dispatcher is outside every measured path. Each JSON records both package hashes and the change under `release_applicability`.
+
+Run from the repository with an installation outside the checkout and writable APFS scratch space. Use new output filenames:
 
 ```sh
-python3 tests/perf/cli.py --baseline .venv-old/bin/stallionfs --candidate .venv-new/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/cli.json
+python3 -m venv /tmp/stallionfs-perf-env
+/tmp/stallionfs-perf-env/bin/python -m pip install .
+mkdir -p /tmp/stallionfs-perf
 ```
 
-The existing scratch directory must be on writable APFS with 256 MiB free. This measures plain and JSON clone, move and delete on a 4 KiB file; scans of an empty folder and a nested 1,000-file fixture; and mounted-filesystem output. Every invocation starts a new process. There are 31 measured pairs per case, seven for the nested scan, and one retained warmup. Method order is shuffled with a fixed seed. Small plain file operations also include separate `/bin/cp -cRp`, `/bin/mv -n` and `/bin/rm -f` references; these are not interchangeable commands outside the controlled fixture.
+No caches are flushed. Setup, validation and cleanup are outside timing unless stated otherwise. Uncertain child completion retains the fixture. KiB/MiB/GiB use powers of 1,024; MB/GB are decimal. Speedup is baseline/stallionfs time; signed changes are stallionfs minus baseline. CLI paired savings use Apple minus stallionfs.
 
-Output contracts, counts, checksums, modes, inode behavior, source independence and the absence of an unnecessary workspace store are checked outside timing. No volume is mounted and no large fixture is created. Results retain every sample, wall and CPU time, and source plus installed-runtime hashes. A final report is written only after validation and cleanup; it omits personal paths and raw command output. Release-to-release speedups and Apple-command comparisons are reported separately. Keep both installations and the runtime source unchanged during the run.
+CPU seconds measure total work. Average CPU cores is the median of per-sample CPU-seconds/wall-seconds ratios: command CPU for file operations, matching lifecycle CPU/wall phases for workspaces. Less CPU work does not imply lower average or instantaneous load. Peak utilization is unmeasured.
 
-Recorded results: [M2 command startup, 0.6.0](results/cli-v0.6-m2.json). This current-release view retains all 432 current-release and macOS samples, including warmups. Internal prior-release controls are omitted; the report records its source digest and row counts. Every retained sample passed validation and cleanup.
+## CLI startup and structured output
 
-| Command | Plain output | JSON output | macOS plain-output reference |
-| --- | ---: | ---: | ---: |
-| Copy one 4 KiB file | 3.18 ms | 3.08 ms | 2.46 ms |
-| Move one 4 KiB file | 3.09 ms | 3.17 ms | 2.29 ms |
-| Delete one 4 KiB file | 3.07 ms | 3.43 ms | 2.49 ms |
-| Scan an empty folder | 3.01 ms | 3.00 ms | — |
-| Scan 1,000 files | 3.64 ms | 3.28 ms | — |
-| List mounted volumes | 2.90 ms | 3.05 ms | — |
+The baseline path must contain a separately installed release:
 
-JSON file commands use the separately measured macOS plain-output reference; those comparisons are unpaired and the reference does not format JSON. No equivalent system command was measured for scans or mounted-volume output. The scanner API comparison below supplies its POSIX baseline. Small-file commands remain slower than the macOS references.
+```sh
+/tmp/stallionfs-perf-env/bin/python tests/perf/cli.py --baseline /tmp/stallionfs-baseline/bin/stallionfs --candidate /tmp/stallionfs-perf-env/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/cli.json
+```
+
+Requires 256 MiB free. Timings include startup and completed operations: 31 measured rounds per case, seven for the nested scan, plus one warmup, with shuffled order. Checks cover output, contents, modes, inodes and absence of a workspace store.
+
+[CLI results](results/cli-v0.6.1-m2.json) retain 432 current-release/Apple rows; 336 prior-release rows and summaries are omitted. Tables show medians. Command CPU is user plus system time including threads (`cpu_children_s`); runner CPU is separate.
+
+| Command | Wall ms, Apple → plain → JSON | Command CPU ms, Apple → plain → JSON |
+| --- | ---: | ---: |
+| Clone 4 KiB | 2.191 → 2.791 → 2.735 | 1.214 → 1.639 → 1.602 |
+| Move 4 KiB | 2.121 → 2.837 → 2.814 | 1.144 → 1.604 → 1.611 |
+| Delete 4 KiB | 2.209 → 2.656 → 2.712 | 1.233 → 1.533 → 1.538 |
+| Scan empty folder | — → 2.651 → 2.537 | — → 1.493 → 1.441 |
+| Scan 1,000 nested files | — → 2.951 → 3.011 | — → 2.680 → 2.835 |
+| List mounted volumes | — → 2.617 → 2.676 | — → 1.476 → 1.524 |
+
+Apple references are plain `cp -cRp`, `mv -n` and `rm -f`; JSON comparisons are unpaired against these plain-output measurements. No system-command reference was measured for scan or volume output. Raw paired intervals assume independent rounds. Memory is measured separately.
 
 ## File commands
 
-Compare the installed native executable with `/bin/cp -cRp`, `/bin/rm -rf` and `/bin/mv -n`:
-
 ```sh
-python3 tests/perf/fileops.py --binary .venv/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/fileops.json
+/tmp/stallionfs-perf-env/bin/python tests/perf/fileops.py --memory --binary /tmp/stallionfs-perf-env/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/fileops.json
 ```
 
-The scratch directory must exist on writable APFS with at least 2 GiB free. The fixtures are a 4 KiB file, a 64 MiB file, 2,000 files in one folder and 10,000 files across nested folders. Each timed command starts a new process. There are 31 measured pairs for the small file and seven for each larger fixture, plus one excluded warmup pair. Pair order is shuffled with a fixed seed.
+Requires 2 GiB free. Clone, delete and move each cover a 4 KiB file, a 64 MiB file, 2,000 flat files and 10,000 nested files. References are `cp -cRp`, `rm -rf` and `mv -n`. Both copies use copy-on-write; moves use an absent exact destination. Overwrite and cross-volume behavior are outside this comparison.
 
-Copying uses native copy-on-write on both sides. Every copy and move must preserve the fixture's contents, modes and symlink targets; clones must have independent inodes. Moves use an absent exact destination and must preserve the inode. Deletion must finish before returning. Fixture setup, validation and cleanup are outside timing. Results include wall time, process and child CPU, source and executable hashes, and every sample. These are warm-cache operations without a durability flush.
+Fresh-process timings use 31 measured pairs for 4 KiB, seven otherwise, plus one warmup, with shuffled order. CPU uses `cpu_children_s`; `cpu_self_s` and aggregate `cpu_s` remain diagnostics. `--memory` adds three separate pairs using `time -lp`: child peak RSS and physical footprint, excluding the runner. Wrapped times are separate; memory counters do not measure unique filesystem-cache or APFS storage use.
 
-Recorded results: [M2 file commands, 0.6.0](results/fileops-v0.6-m2.json). All 336 samples, including warmups, passed validation and cleanup. CPU is total process time across threads and children; it can exceed wall time.
+Validation checks content, modes, symlinks, independent clone inodes, preserved move inodes and completed deletion. Deletion operates on a copy-on-write copy of the retained fixture. Verification reads precede timing; fixtures may exceed RAM. No durability flush is requested. `--timeout` adjusts the 600-second operation/setup-copy limit.
 
-| Operation | Fixture | macOS wall | stallionfs wall | Speedup | macOS CPU | stallionfs CPU |
+[File-command results](results/fileops-v0.6.1-m2.json). The combined standard/large run retains 496 timing rows (44 warmups) and 132 memory rows. JSON also includes user/system CPU, observed memory ranges and signed comparisons.
+
+| Operation | Fixture | Wall ms, Apple → stallionfs | Command CPU ms, Apple → stallionfs | Average CPU cores, Apple → stallionfs | Peak RSS KiB, Apple → stallionfs | Footprint KiB, Apple → stallionfs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Clone | 4 KiB file | 2.40 ms | 3.17 ms | 0.76× | 2.26 ms | 2.86 ms |
-| Clone | 64 MiB file | 3.49 ms | 3.81 ms | 0.91× | 3.13 ms | 3.43 ms |
-| Clone | 2,000 flat files | 200.84 ms | 194.40 ms | 1.03× | 198.85 ms | 192.37 ms |
-| Clone | 10,000 nested files | 1203.80 ms | 439.49 ms | 2.74× | 1185.63 ms | 1571.50 ms |
-| Delete | 4 KiB file | 2.80 ms | 3.60 ms | 0.78× | 2.72 ms | 3.09 ms |
-| Delete | 64 MiB file | 5.27 ms | 5.54 ms | 0.95× | 4.97 ms | 4.85 ms |
-| Delete | 2,000 flat files | 54.82 ms | 58.55 ms | 0.94× | 54.64 ms | 54.60 ms |
-| Delete | 10,000 nested files | 408.05 ms | 197.70 ms | 2.06× | 385.20 ms | 530.82 ms |
-| Move | 4 KiB file | 2.41 ms | 3.13 ms | 0.77× | 2.20 ms | 2.77 ms |
-| Move | 64 MiB file | 3.41 ms | 4.26 ms | 0.80× | 3.40 ms | 3.76 ms |
-| Move | 2,000 flat files | 3.94 ms | 4.87 ms | 0.81× | 3.91 ms | 4.49 ms |
-| Move | 10,000 nested files | 3.80 ms | 5.25 ms | 0.72× | 3.69 ms | 4.82 ms |
+| Clone | 4 KiB file | 2.317 → 2.856 | 1.311 → 1.650 | 0.567 → 0.585 | 1280.000 → 1600.000 | 1056.234 → 1152.375 |
+| Clone | 64 MiB file | 2.787 → 3.289 | 1.633 → 1.877 | 0.575 → 0.588 | 1280.000 → 1600.000 | 1056.234 → 1152.375 |
+| Clone | 2,000 flat files | 196.945 → 186.781 | 192.384 → 185.085 | 0.980 → 0.991 | 1952.000 → 1728.000 | 1712.234 → 1264.375 |
+| Clone | 10,000 nested files | 1136.211 → 422.773 | 1114.945 → 1530.642 | 0.982 → 3.620 | 1440.000 → 1936.000 | 1200.234 → 1472.375 |
+| Delete | 4 KiB file | 2.343 → 2.964 | 1.319 → 1.690 | 0.575 → 0.573 | 1424.000 → 1600.000 | 1152.234 → 1152.375 |
+| Delete | 64 MiB file | 3.913 → 4.514 | 2.449 → 2.884 | 0.683 → 0.635 | 1424.000 → 1600.000 | 1152.234 → 1152.375 |
+| Delete | 2,000 flat files | 54.525 → 47.731 | 51.097 → 46.250 | 0.964 → 0.968 | 1664.000 → 1808.000 | 1440.234 → 1344.375 |
+| Delete | 10,000 nested files | 390.566 → 178.170 | 375.642 → 533.704 | 0.955 → 3.052 | 1424.000 → 1888.000 | 1184.234 → 1424.375 |
+| Move | 4 KiB file | 2.288 → 2.937 | 1.241 → 1.684 | 0.548 → 0.574 | 1264.000 → 1600.000 | 1040.234 → 1152.375 |
+| Move | 64 MiB file | 2.933 → 3.747 | 1.601 → 2.172 | 0.551 → 0.571 | 1264.000 → 1600.000 | 1040.234 → 1152.375 |
+| Move | 2,000 flat files | 3.452 → 4.111 | 2.141 → 2.564 | 0.642 → 0.615 | 1264.000 → 1600.000 | 1040.234 → 1152.375 |
+| Move | 10,000 nested files | 3.527 → 4.378 | 1.871 → 2.273 | 0.546 → 0.534 | 1264.000 → 1600.000 | 1040.234 → 1152.375 |
 
-Nested copying reached about 22,750 files/s, versus 8,300 files/s for `cp`. The larger gains use more CPU: nested copying used 33% more, deletion 38% more. Flat deletion, single-file commands and every move case were slower. `--jobs 1` provides a lower-CPU option; these command results use the default four workers.
+## Large file trees
+
+```sh
+/tmp/stallionfs-perf-env/bin/python tests/perf/fileops.py --suite large --memory --binary /tmp/stallionfs-perf-env/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/large.json
+```
+
+Each profile measures clone and delete using the same protocol:
+
+| Synthetic input | Source files | Source bytes |
+| --- | ---: | ---: |
+| Dependency-shaped JavaScript tree | 100,000 | 102.4 MB |
+| Committed Git repository | 50,000 | 2 GB, plus `.git` |
+| Build cache | 200,000 | 10 GB |
+| HTML and assets | 5,000 | 100 MB |
+| Sharded dataset | 2,000 | 50 GB |
+
+Data is fully written; dependency files are generated, not installed packages. Git metadata is additional. Profiles run sequentially; the largest requires roughly 103 GB free. Each operation has seven timing pairs, one warmup and three memory pairs. `--suite all` includes the standard cases and moves.
+
+Results distinguish logical/allocated bytes and file counts. APFS blocks may be shared; copy-on-write files/s is not data-transfer throughput.
+
+Git metadata adds 13 regular files and 9,248,301 logical bytes; combined totals are 50,013 regular files and 2,009,248,301 logical bytes.
+
+| Operation | Fixture | Wall s, Apple → stallionfs | Command CPU s, Apple → stallionfs | Average CPU cores, Apple → stallionfs | Peak RSS KiB, Apple → stallionfs | Footprint KiB, Apple → stallionfs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Clone | Dependencies | 12.411 → 4.373 | 12.048 → 15.828 | 0.967 → 3.621 | 1792.000 → 1968.000 | 1568.258 → 1504.375 |
+| Clone | Git repository | 6.069 → 2.188 | 5.842 → 7.535 | 0.967 → 3.446 | 1632.000 → 1968.000 | 1408.258 → 1504.375 |
+| Clone | Build cache | 24.995 → 8.754 | 24.101 → 30.262 | 0.959 → 3.463 | 1824.000 → 1968.000 | 1600.258 → 1504.375 |
+| Clone | HTML/assets | 0.604 → 0.235 | 0.587 → 0.805 | 0.971 → 3.433 | 1456.000 → 1936.000 | 1216.234 → 1472.375 |
+| Clone | Dataset | 0.241 → 0.091 | 0.234 → 0.303 | 0.968 → 3.383 | 1424.000 → 1872.000 | 1184.234 → 1408.375 |
+| Delete | Dependencies | 4.042 → 1.800 | 3.806 → 5.815 | 0.939 → 3.249 | 1552.000 → 1904.000 | 1328.234 → 1440.375 |
+| Delete | Git repository | 2.089 → 0.948 | 1.927 → 2.970 | 0.931 → 3.129 | 1520.000 → 1888.000 | 1296.234 → 1440.398 |
+| Delete | Build cache | 8.210 → 4.146 | 7.688 → 11.899 | 0.936 → 2.894 | 1568.000 → 1920.000 | 1344.234 → 1456.375 |
+| Delete | HTML/assets | 0.199 → 0.100 | 0.192 → 0.324 | 0.957 → 3.259 | 1424.000 → 1872.000 | 1184.234 → 1408.375 |
+| Delete | Dataset | 0.196 → 0.140 | 0.184 → 0.242 | 0.954 → 1.699 | 1440.000 → 1888.000 | 1216.234 → 1424.375 |
 
 ## Metadata scanning
 
-Build the installed extension first, then compare its bulk scanner with the private native POSIX reference path:
-
 ```sh
-python3 -m pip install -e .
-mkdir -p /tmp/stallionfs-perf
-python3 tests/perf/scan.py --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/scan.json
+/tmp/stallionfs-perf-env/bin/python tests/perf/scan.py --memory --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/scan.json
 ```
 
-All three paths are C implementations that retrieve the same counts and logical lengths. The baseline uses `readdir` and `fstatat`; the optimized paths use `getattrlistbulk`, with one worker or the default four. Folders with fewer than two immediate subdirectories stay sequential. The test creates flat and nested 20,000-file layouts, plus symlinks, a FIFO, Unicode names, a sparse file and a hard link. Every result must equal independently calculated fixture totals. Two warmups are discarded, then 11 samples run in shuffled order. Wall and process CPU timings include the same Python call overhead and exclude fixture creation and process startup. This does not measure reads of file contents or acceleration inside other applications.
+[Scanner results](results/scan-v0.6.1-m2.json) compare native POSIX `readdir`/`fstatat`, serial `getattrlistbulk`, and bulk with a four-worker limit. Each layout has 20,000 files plus Unicode, symlink, FIFO, sparse-file, hard-link and empty-directory checks. Nested uses 200 folders; deep40 uses a 40-directory chain. Flat and deep40 stay sequential.
 
-Recorded results: [M2 metadata scans, 0.6.0](results/scan-v0.6-m2.json). Every measured scan returned the same totals.
+The 117 timing rows include two warmups and 11 measured rounds per method/layout. Wall/process CPU include Python API overhead, excluding startup. The 27 memory rows use three fresh Python children per method/layout, including interpreter, imports and count/hash checks; they are not standalone C-engine memory measurements.
 
-| Layout | Method | Wall | CPU |
-| --- | --- | ---: | ---: |
-| 20,000 flat files | Native POSIX | 38.20 ms | 38.08 ms |
-| 20,000 flat files | Bulk, one worker | 21.39 ms | 21.32 ms |
-| 20,000 flat files | Bulk, default | 20.30 ms | 20.27 ms |
-| 20,000 files across 200 folders | Native POSIX | 46.64 ms | 43.72 ms |
-| 20,000 files across 200 folders | Bulk, one worker | 24.82 ms | 24.16 ms |
-| 20,000 files across 200 folders | Bulk, default | 10.10 ms | 41.34 ms |
+| Layout | Method | Wall ms | Process CPU ms | Python peak RSS KiB | Python footprint KiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Flat | POSIX | 32.56 | 32.54 | 18032 | 8752.47 |
+| Flat | Bulk, one | 16.30 | 16.28 | 18032 | 8752.47 |
+| Flat | Bulk, default | 16.18 | 16.18 | 18016 | 8752.49 |
+| Nested | POSIX | 35.42 | 35.17 | 18000 | 8736.49 |
+| Nested | Bulk, one | 17.01 | 17.00 | 18016 | 8752.49 |
+| Nested | Bulk, default | 7.51 | 32.41 | 18160 | 8864.49 |
+| Deep40 | POSIX | 29.62 | 29.59 | 18272 | 8992.49 |
+| Deep40 | Bulk, one | 13.34 | 13.34 | 18016 | 8752.49 |
+| Deep40 | Bulk, default | 12.97 | 12.97 | 18048 | 8768.47 |
 
-Default scanning was 1.88× faster than POSIX for flat folders and 4.62× faster for nested folders. Nested parallel scanning was 2.46× faster than serial bulk scanning and used 71% more CPU. Flat folders do not start worker threads.
+The flat RSS difference is one 16 KiB page within overlapping observed ranges; three samples do not establish a gain beyond variation. JSON includes ranges and signed comparisons. This measures metadata counts and logical lengths, not content reads or other applications.
 
 ## Prepared workspaces
 
-The fixture is a locked JavaScript dependency tree with 1,000 generated source files. Tests compare:
-
-- `git worktree add` followed by an offline `npm ci` from a warm package cache.
-- A full byte copy of an already prepared standalone repository.
-- A stallionfs folder clone from the same prepared repository.
-- A stallionfs APFS image clone, including mounting and unmounting its volume.
-
-Install the fixture's packages once to populate a dedicated cache, then run on APFS:
+Use Node 24+ to fill a dedicated package cache, then compare folders:
 
 ```sh
-mkdir -p /tmp/stallionfs-perf
 npm ci --prefix tests/perf/fixture --ignore-scripts --no-audit --no-fund --cache /tmp/stallionfs-perf/npm-cache
-python3 tests/perf/run.py --scratch /tmp/stallionfs-perf --npm-cache /tmp/stallionfs-perf/npm-cache --output /tmp/stallionfs-perf/results.json
+/tmp/stallionfs-perf-env/bin/python tests/perf/run.py --methods worktree_install stallionfs_folder --scratch /tmp/stallionfs-perf --npm-cache /tmp/stallionfs-perf/npm-cache --output /tmp/stallionfs-perf/workspaces.json
 ```
 
-Use macOS 26+ and Node 24+ for this comparison. Package lifecycle scripts are disabled in the fixture. stallionfs itself does not need Node or npm. Images have an 8 GiB capacity by default; `--image-size` changes it.
+[Folder results](results/workspaces-v0.6.1-node24-m2.json) use locked dependencies, 1,000 generated source files and offline installation without lifecycle scripts. Validation checks content/executable modes and React rendering, excluding Git bookkeeping. The 28 rows retain seven batches per method/concurrency; warmup rows and method order were not recorded.
 
-Image volumes use the product defaults: Spotlight indexing disabled, file ownership enabled. The host's indexing configuration is unchanged.
+`ready_s` includes creation/setup; lifecycle adds removal and completed reclamation. CPU includes coordinator/worker threads and waited children, excluding validation. Stallionfs API timing excludes CLI startup; Git/npm startup is included. Only Git registration is serialized. Installs and deletion run concurrently; removal includes a final Git prune. Values are whole-batch medians:
 
-Git worktree registration runs one call at a time because concurrent `git worktree add` calls can race on shared repository metadata. Dependency installation and directory deletion run in parallel. A final `git worktree prune` is included in removal time, and the test verifies that no worktrees remain registered.
+| Workspaces | Method | Ready s | Ready CPU s | Lifecycle s | Lifecycle CPU s | Average CPU cores | Lifecycle range s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Git worktree + npm ci | 1.296 | 2.868 | 2.014 | 3.496 | 1.751 | 1.919–2.112 |
+| 1 | Prepared folder | 0.683 | 2.206 | 0.963 | 2.931 | 3.030 | 0.927–1.001 |
+| 4 | Git worktree + npm ci | 3.892 | 13.833 | 5.527 | 17.848 | 3.269 | 5.240–5.758 |
+| 4 | Prepared folder | 2.612 | 10.564 | 3.642 | 13.611 | 3.682 | 3.595–4.504 |
 
-One warmup batch per method is discarded. Seven measured samples run in a deterministic shuffled order, at one and four concurrent workspaces. Every generated workspace must match the prepared tree's content and executable-mode digest and render a small React component successfully. Git bookkeeping differs between standalone clones and linked worktrees and is excluded from the digest. Validation time is excluded from all methods' timing.
+The seed held 12,581 files including Git. Preparation took 1.906 s, amortized after two workspaces using median lifecycle savings. The baseline includes dependency installation, not just an Apple file command.
 
-`ready_s` measures creation plus required installation or image attachment. `remove_s` includes image detachment where applicable. `reclaim_s` includes full trash deletion for stallionfs. `total_s` is their sum. Worktree and byte-copy removal already reclaim their directories. The one-time seed cost is reported separately for each backend, with the number of workspaces needed to amortize it using median total times. Parallel batches are wall time for the entire batch, not per-workspace latencies.
+Omit `--methods` to include `prepared_byte_copy` and `stallionfs_image`, unmeasured here. Images require macOS 26+, include attach/detach, preserve ownership enforcement, disable Spotlight and default to 8 GiB (`--image-size`). Image CPU accounting excludes shared macOS helpers. Workload options: `--source-only`, `--samples`, `--concurrency`, `--source-files`.
 
-`--source-only` measures the same source checkout without dependency preparation. `--samples`, `--concurrency` and `--source-files` change the load. Use `--methods worktree_install stallionfs_folder` for a folder-only comparison; unselected image workspaces are not prepared. The package cache and filesystem cache are warm; the test does not flush OS caches, download packages during measurement, or measure unique APFS physical storage. Raw samples include hardware and software versions. Keep failed validation as a failure; never report its partial timings as a result.
+### Workspace memory
 
-Format 3 also records process CPU, including worker threads and waited child processes, over the same phases as wall time. Validation is excluded from both.
+[Workspace memory](results/workspace-memory-v0.6.1-m2.json) retains 16 batches/48 complete phases. Lifecycle peak medians use three paired rounds plus one excluded warmup per method/concurrency:
 
-This uses the Python API. CLI process startup is excluded for stallionfs; Git/npm subprocess startup is included in their operations. These are local workspace timings, not agent inference or general filesystem benchmarks. Results depend on file count, dependency layout, hardware, system load and cache state.
+| Workspaces | Sampled RSS MiB, Git/npm → folder | Charged footprint MiB, Git/npm → folder |
+| ---: | ---: | ---: |
+| 1 | 422.45 → 65.08 | 385.20 → 49.44 |
+| 4 | 1287.16 → 74.30 | 1314.69 → 53.88 |
 
-Results include every measured sample, source-file hashes and the loaded native binary's hash. The runner rejects results if runtime source or the loaded native binary changes during measurement. Image allocation reports `st_blocks`, which does not distinguish shared APFS blocks from unique physical storage. Seed break-even is calculated from medians, not a guarantee for another workload.
+The sampler sums current counters for the post-setup coordinator and observed descendants, including threads; preparation/validation are excluded. Sequential queries target 5 ms intervals; actual sweeps/gaps are recorded. These are sampled group sums, not exact atomic peaks or sums of lifetime maxima. Short processes/spikes may be missed; RSS may double-count shared pages; charged footprint is not unique RAM. This run does not measure CPU/wall speedups.
 
-Recorded results: [M2 prepared folder workspaces, 0.6.0](results/workspaces-v0.6-node24-m2.json). The 28 measured batches and their warmups passed content, executable-mode, fixture smoke and cleanup checks. This run selected `worktree_install` and `stallionfs_folder`; images and byte copies were not measured.
-
-| Workspaces | Method | Ready | Reclaim | Full lifecycle | Total CPU | Lifecycle range |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | Git worktree + npm ci | 6.785 s | Included in removal | 9.134 s | 10.706 s | 7.575–24.092 s |
-| 1 | Prepared folder | 3.601 s | 1.130 s | 4.983 s | 9.070 s | 4.106–9.289 s |
-| 4 | Git worktree + npm ci | 22.134 s | Included in removal | 27.824 s | 49.335 s | 20.583–45.339 s |
-| 4 | Prepared folder | 9.376 s | 3.996 s | 13.596 s | 39.114 s | 12.326–41.594 s |
-
-The seed contained 12,581 regular files, including Git metadata. Preparation took 2.907 s with the warm npm cache, amortized after one workspace using this run's median lifecycle savings.
-
-Single-workspace lifecycle was 1.83× faster with 15% less CPU; four-workspace lifecycle was 2.05× faster with 21% less CPU. Every paired lifecycle comparison favored prepared folders, but the ranges show substantial variation. The 41.594 s folder batch, including 32.375 s of reclamation, is retained. These are measurements of this release, not a claim of improvement over a previous release.
+Timing and memory fixture digests differ; cross-protocol identity is not established. JSON retains measurement hashes, replaces personal paths with labels and omits per-PID logs.
 
 ## File I/O inside a workspace
 
-Compare ordinary APFS folders with an already-mounted image workspace:
+This harness loads the checkout, so use a separate editable build:
 
 ```sh
-python3 tests/perf/io.py --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/io.json
+python3 -m venv /tmp/stallionfs-io-env
+/tmp/stallionfs-io-env/bin/python -m pip install -e .
+/tmp/stallionfs-io-env/bin/python tests/perf/io.py --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/io.json
 ```
 
-Use macOS 26+ and allow at least 4 GiB of free space. The test creates its own source repository and 2 GiB image through the production workspace API, then compares the same operations on both volumes. One warmup pair is discarded and seven measured pairs run in shuffled order. Image creation and mounting are excluded here; the workspace comparison above includes those costs.
+Requires macOS 26+ and 4 GiB free. A 2 GiB image is compared with ordinary APFS: 2,000 small-file creates/reads/lookups/renames/deletes, four concurrent create/read/delete workers, 64 MiB writes/reads and 20 durable 4 KiB overwrites. Seven shuffled pairs follow a warmup. Timing excludes mounting and includes Python overhead/inline validation.
 
-Operations cover 2,000 small-file creates, reads, metadata lookups, renames and deletes; four concurrent create/read/delete workers; 64 MiB writes and reads; and 20 durable 4 KiB overwrites. Durable writes require `F_FULLFSYNC` on both volumes. Other creates are buffered; read and metadata caches are warm. Timings include equal Python overhead and inline validation.
-
-Compatibility checks cover permissions, extended attributes, hard links, symlinks, open-file unlinking, atomic replacement, case handling and Unicode names. Successful flush calls do not prove recovery from power loss or hardware failure. The runner records volume flags, code hashes, raw samples and all regressions, and only writes a final result after validation and safe cleanup.
-
-No image I/O figures are shown until this comparison has been run on the current release. Image workspaces are intended for repeated workspace creation; they do not establish faster general file I/O.
+Compatibility covers permissions, xattrs, hard links, symlinks, open-file unlinking, atomic replacement, Unicode and case behavior. Durable writes require `F_FULLFSYNC`; other creates are buffered and read/metadata caches are warm. Flush success does not prove power-loss recovery. Image I/O is unmeasured in this release.

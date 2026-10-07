@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+from math import comb
 import os
 from pathlib import Path
 import platform
@@ -14,7 +15,7 @@ import subprocess
 import tempfile
 import time
 
-from fileops import (REPO, command, cpu_usage, digest, fingerprint_sources, manifest,
+from fileops import (REPO, ChildCompletionUnknown, command, cpu_usage, digest, fingerprint_sources, manifest,
                      no_mounts_below, remove_fixture, require, scratch_volume,
                      verify_clone, write_new_json)
 
@@ -161,8 +162,50 @@ def native_comparisons(medians):
                 "wall_speedup": reference["wall_s"] / candidate["wall_s"],
                 "cpu_speedup": reference["cpu_s"] / candidate["cpu_s"]
                     if reference["cpu_s"] is not None and candidate["cpu_s"] else None,
+                "cpu_speedup_metric": "cpu_s: benchmark runner plus reaped command CPU",
+                "command_cpu_speedup": reference["cpu_children_s"] / candidate["cpu_children_s"]
+                    if reference["cpu_children_s"] is not None and candidate["cpu_children_s"] else None,
             }
     return result
+
+
+def paired_plain_effects(rows):
+    """Compare the fixed 31 paired plain file-command rounds; never pair JSON output."""
+    result = {}
+    count, lower, target = 31, 10, 0.00001
+    coverage = 1 - 2 * sum(comb(count, rank) for rank in range(lower)) / 2**count
+    for operation in APPLE:
+        case = f"{operation}/tiny_4kib/plain"
+        pairs = {method: {} for method in ("apple", "candidate")}
+        for row in rows:
+            if row["case"] != case or row["warmup"] or row["method"] not in pairs:
+                continue
+            rounds = pairs[row["method"]]
+            require(row["round"] not in rounds, f"{case}: duplicate measured pair")
+            rounds[row["round"]] = row
+        require(all(set(rounds) == set(range(1, count + 1)) for rounds in pairs.values()),
+                f"{case}: missing measured pair; expected rounds 1 through 31")
+        effect = result[case] = {"pairs": count, "lower_order_statistic": lower,
+                                "interval_coverage": coverage, "required_wall_saving_s": target}
+        for metric in ("wall_s", "cpu_children_s"):
+            if any(row[metric] is None for rounds in pairs.values() for row in rounds.values()):
+                effect[metric] = None
+                continue
+            savings = sorted(pairs["apple"][number][metric] - pairs["candidate"][number][metric]
+                             for number in range(1, count + 1))
+            effect[metric] = {"median_saving_s": statistics.median(savings),
+                              "median_saving_interval_s": [savings[lower - 1], savings[-lower]],
+                              "pairs_with_lower_candidate_value": sum(value > 0 for value in savings)}
+            if metric == "wall_s":
+                effect["pairs_meeting_wall_target"] = sum(value >= target for value in savings)
+                effect["wall_target_demonstrated"] = savings[lower - 1] >= target
+    return result, {
+        "cpu": "cpu_children_s is completed-command user plus system CPU, excluding benchmark-runner CPU.",
+        "difference": "Apple minus StallionFS within the same measured round; positive values favor StallionFS.",
+        "interval": "Distribution-free two-sided order-statistic confidence interval for the median paired difference, assuming independent rounds. Coverage is at least 95%; repeated host conditions can correlate rounds.",
+        "memory": "Memory is measured separately; these effects do not establish a memory advantage.",
+        "scope": "Plain single-file cases only. JSON commands use an unpaired plain Apple reference and are excluded from this paired analysis."
+    }
 
 
 def main():
@@ -224,6 +267,7 @@ def main():
     environment = dict(os.environ, STALLIONFS_HOME=str(unused_store), PYTHONDONTWRITEBYTECODE="1")
     environment.pop("PYTHONPATH", None)
     environment.pop("PYTHONHOME", None)
+    cleanup_safe = True
     try:
         roots, counts = make_fixtures(base)
         expected = {name: content_manifest(path) for name, path in roots.items()}
@@ -298,13 +342,17 @@ def main():
                 print(json.dumps({"case": case, "round": round_number, "warmup": round_number == 0,
                                   "order": methods}), flush=True)
         require(all(content_manifest(path) == expected[name] for name, path in roots.items()), "Fixture changed")
+    except (ChildCompletionUnknown, KeyboardInterrupt):
+        cleanup_safe = False
+        raise
     finally:
-        current = base.lstat()
-        require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700 and current.st_uid == os.getuid()
-                and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino), "Private fixture root changed; preserve it")
-        no_mounts_below(runtimes["baseline"]["binary"], base)
-        shutil.rmtree(base)
-        require(not os.path.lexists(base), "Fixture cleanup did not complete")
+        if cleanup_safe:
+            current = base.lstat()
+            require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700 and current.st_uid == os.getuid()
+                    and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino), "Private fixture root changed; preserve it")
+            no_mounts_below(runtimes["baseline"]["binary"], base)
+            shutil.rmtree(base)
+            require(not os.path.lexists(base), "Fixture cleanup did not complete")
     require(source_hashes() == sources, "Source changed during measurement; results rejected")
     require({name: runtime_hashes(runtime) for name, runtime in runtimes.items()} == fingerprints,
             "Installed runtime changed during measurement; results rejected")
@@ -317,6 +365,7 @@ def main():
         case: methods["apple"]["wall_s"] / methods["candidate"]["wall_s"]
         for case, methods in report["medians"].items() if "apple" in methods}
     report["candidate_vs_native_plain_reference"] = native_comparisons(report["medians"])
+    report["paired_plain_effects"], report["paired_plain_effects_method"] = paired_plain_effects(report["rows"])
     report.update(passed=True, output_contracts_passed=True, no_store_created=True,
                   completed_utc=datetime.now(timezone.utc).isoformat())
     serialized = json.dumps(report)

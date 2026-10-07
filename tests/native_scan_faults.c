@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/attr.h>
@@ -19,7 +20,8 @@
 
 enum { NONE, CANCEL_ENTRY, CANCEL_FINAL, CLOSE_DIRECTORY, CLOSE_SKIPPED,
        CLOSE_ROOT, ROOT_ERROR, THREAD_FIRST, THREAD_THIRD,
-       WORKER_CLOSE, CANCEL_BACKPRESSURE, CANCEL_WAIT, WORKER_ERROR, PINNED_RENAME, AGGREGATE_OVERFLOW };
+       WORKER_CLOSE, CANCEL_BACKPRESSURE, CANCEL_WAIT, WORKER_ERROR, PINNED_RENAME, AGGREGATE_OVERFLOW,
+       PENDING_OK, PENDING_ERROR, PENDING_CANCEL, PENDING_CLOSE, DISCARD_CLOSE, LATER_BATCH, SKIP_FIRST };
 static int mode, root_fd = -1, skipped_fd = -1;
 static atomic_int opens, root_closed, injected, thread_calls, started, joined;
 static dev_t root_device;
@@ -27,6 +29,7 @@ static dev_t root_device;
 static pthread_t caller;
 static atomic_int waiters, gate;
 static int before_fds;
+static int pending_fd = -1, first_closed, root_calls, child_reads;
 static char moved_path[PATH_MAX], outside_path[PATH_MAX], renamed_from[PATH_MAX];
 #endif
 
@@ -42,6 +45,15 @@ int stallion_test_open(const char *path, int flags, ...) {
     return fd;
 }
 
+int stallion_test_openat(int fd, const char *name, int flags, ...) {
+#ifndef STALLION_TEST_CLI
+    if ((mode == LATER_BATCH || mode == SKIP_FIRST) && !strcmp(name, "second"))
+        assert(first_closed); /* Do not retain the first sibling while opening the second. */
+#endif
+    assert(!(flags & O_CREAT));
+    return openat(fd, name, flags);
+}
+
 /* Match the stat header's Intel inode ABI when _walk.c renames fstat. */
 int stallion_test_fstat(int fd, struct stat *st) __DARWIN_INODE64(stallion_test_fstat);
 int stallion_test_fstat(int fd, struct stat *st) {
@@ -51,6 +63,12 @@ int stallion_test_fstat(int fd, struct stat *st) {
         st->st_dev = root_device + 1;
         skipped_fd = fd;
     }
+#ifndef STALLION_TEST_CLI
+    if (!result && mode >= PENDING_OK && fd != root_fd && pending_fd < 0) {
+        pending_fd = fd;
+        if (mode == SKIP_FIRST) st->st_dev = root_device + 1;
+    }
+#endif
     return result;
 }
 
@@ -68,6 +86,14 @@ int stallion_test_close(int fd) {
     if (!result && mode == CLOSE_SKIPPED && fd == skipped_fd) {
         injected++; errno = EIO; return -1;
     }
+#ifndef STALLION_TEST_CLI
+    if (mode >= PENDING_OK && fd == pending_fd && !first_closed) {
+        first_closed = 1;
+        if (!result && (mode == PENDING_CLOSE || mode == DISCARD_CLOSE)) {
+            injected++; errno = EIO; return -1;
+        }
+    }
+#endif
     return result;
 }
 
@@ -77,9 +103,43 @@ int stallion_test_closedir(DIR *directory) {
     return result;
 }
 
+#ifndef STALLION_TEST_CLI
+struct __attribute__((packed, aligned(4))) attributes {
+    uint32_t length; attribute_set_t returned; uint32_t error;
+    attrreference_t name; fsobj_type_t type;
+};
+
+static int directory_record(void *buffer, size_t capacity, const char *name) {
+    struct attributes entry = {0};
+    size_t length = strlen(name) + 1;
+    entry.length = (uint32_t)((sizeof(entry) + length + 3) & ~(size_t)3);
+    assert(entry.length <= capacity);
+    entry.returned.commonattr = ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+    entry.name.attr_dataoffset = sizeof(entry) - offsetof(struct attributes, name);
+    entry.name.attr_length = (uint32_t)length;
+    entry.type = VDIR;
+    memset(buffer, 0, entry.length);
+    memcpy(buffer, &entry, sizeof(entry));
+    memcpy((char *)buffer + sizeof(entry), name, length);
+    return 1;
+}
+#endif
+
 int stallion_test_getattrlistbulk(int fd, struct attrlist *attrs, void *buffer,
                                 size_t size, uint64_t options) {
 #ifndef STALLION_TEST_CLI
+    if (mode >= PENDING_OK) {
+        if (fd != root_fd) {
+            child_reads++;
+            return getattrlistbulk(fd, attrs, buffer, size, options);
+        }
+        root_calls++;
+        if (root_calls == 1) return directory_record(buffer, size, "first");
+        if (root_calls == 2 && mode == PENDING_ERROR) { errno = EIO; return -1; }
+        if (root_calls == 2 && (mode == LATER_BATCH || mode == SKIP_FIRST))
+            return directory_record(buffer, size, "second");
+        return 0;
+    }
     if (!pthread_equal(pthread_self(), caller) && mode >= CANCEL_BACKPRESSURE) {
         waiters++;
         while (!gate) usleep(1000);
@@ -98,10 +158,6 @@ int stallion_test_getattrlistbulk(int fd, struct attrlist *attrs, void *buffer,
     int result = getattrlistbulk(fd, attrs, buffer, size, options);
 #ifndef STALLION_TEST_CLI
     if (mode == AGGREGATE_OVERFLOW && result > 0 && !pthread_equal(pthread_self(), caller)) {
-        struct __attribute__((packed, aligned(4))) attributes {
-            uint32_t length; attribute_set_t returned; uint32_t error;
-            attrreference_t name; fsobj_type_t type;
-        };
         size_t offset = 0;
         for (int i = 0; i < result; i++) {
             struct attributes entry;
@@ -162,12 +218,15 @@ static int cancelled(void *context) {
         return mode == CANCEL_WAIT;
     }
     if (mode == AGGREGATE_OVERFLOW && waiters == 4 && root_closed) gate = 1;
-    return mode == CANCEL_ENTRY || (mode == CANCEL_FINAL && root_closed);
+    return mode == CANCEL_ENTRY || (mode == CANCEL_FINAL && root_closed) ||
+           ((mode == PENDING_CANCEL || mode == DISCARD_CLOSE) && pending_fd >= 0);
 }
 
 static void reset(int fault) {
     mode = fault; root_fd = skipped_fd = -1;
     opens = root_closed = injected = thread_calls = started = joined = waiters = gate = 0;
+    pending_fd = -1;
+    first_closed = root_calls = child_reads = 0;
 }
 
 static struct stallion_scan_stats run(const char *path, int bulk, unsigned workers, int expected_error) {
@@ -187,6 +246,22 @@ static struct stallion_scan_stats run(const char *path, int bulk, unsigned worke
         if (expected_error != EINVAL) assert(error[0]);
     }
     return stats;
+}
+
+static void pending_case(const char *path, int fault, int expected_error) {
+    reset(fault);
+    struct stallion_scan_stats stats = run(path, 1, 1, expected_error);
+    assert(first_closed && !thread_calls);
+    if (!expected_error) {
+        assert(stats.directories == (fault >= LATER_BATCH ? 2 : 1));
+        assert(stats.skipped_mounts == (fault == SKIP_FIRST));
+        assert(!stats.files && !stats.logical_bytes && !stats.symlinks && !stats.other);
+    }
+    if (fault == PENDING_ERROR || fault == PENDING_CANCEL || fault == DISCARD_CLOSE)
+        assert(!child_reads); /* The pending subtree must be discarded without scanning. */
+    if (fault == PENDING_CLOSE || fault == DISCARD_CLOSE) assert(injected == 1);
+    if (fault == LATER_BATCH) assert(child_reads == 2 && root_calls == 3);
+    if (fault == SKIP_FIRST) assert(child_reads == 1 && root_calls == 3);
 }
 
 static void make_tree(const char *path, unsigned count) {
@@ -299,6 +374,19 @@ int main(int argc, char **argv) {
     assert(close(parents[0]) == 0);
     remove_tree(path, 2);
     assert(setrlimit(RLIMIT_NOFILE, &saved_limit) == 0);
+
+    assert(mkdir(path, 0700) == 0);
+    int pending = open(path, O_RDONLY | O_DIRECTORY);
+    assert(pending >= 0 && mkdirat(pending, "first", 0700) == 0 && mkdirat(pending, "second", 0700) == 0);
+    pending_case(path, PENDING_OK, 0);
+    pending_case(path, PENDING_ERROR, EIO);
+    pending_case(path, PENDING_CANCEL, EINTR);
+    pending_case(path, PENDING_CLOSE, EIO);
+    pending_case(path, DISCARD_CLOSE, EINTR); /* Preserve cancellation over a discard-close error. */
+    pending_case(path, LATER_BATCH, 0);
+    pending_case(path, SKIP_FIRST, 0);
+    assert(unlinkat(pending, "first", AT_REMOVEDIR) == 0 && unlinkat(pending, "second", AT_REMOVEDIR) == 0);
+    assert(close(pending) == 0 && rmdir(path) == 0);
     puts("scan cancellation, close errors and descriptor cleanup passed");
     return 0;
 }

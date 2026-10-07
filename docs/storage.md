@@ -16,7 +16,7 @@ Preparation and seed deletion take an exclusive lock on that seed. Creates take 
 
 Preparation and folder creation publish by renaming a completed staging directory. Image creation publishes the closed image and metadata before mounting at its final path. If mounting or branch creation fails, the workspace is retained; `stallionfs mount ID` retries initialization. A `ready.json` marker records completed initialization, so remounting never resets the branch.
 
-A process killed without cleanup may leave a directory in `staging`; `doctor` lists these entries. Stop other stallionfs processes and inspect the directory before removing it. A failed image preparation can leave an attached volume: detach that image normally first. Recursive cleanup refuses directories containing mounted volumes. Staging entries never become cache hits.
+Failed or interrupted preparation and creation retain unfinished directories in `staging`, since setup commands may still have running descendants. Errors report the retained path, and `doctor` lists these entries. Stop setup commands and other stallionfs processes, then inspect the directory before removing it. A failed image preparation can leave an attached volume: detach that image normally first. Recursive cleanup refuses directories containing mounted volumes. Staging entries never become cache hits.
 
 This protects against ordinary process interruption. It is not a backup or a filesystem-wide crash transaction: a power loss can leave newly written file data incomplete. Keep source code in Git and back up work you need. If a seed is damaged, delete it with `forget` and prepare it again. A damaged workspace should be copied aside and recovered with ordinary Git tools before cleanup.
 

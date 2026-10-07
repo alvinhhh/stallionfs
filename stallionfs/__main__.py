@@ -132,14 +132,18 @@ def main(argv=None):
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
         return 0
-    except (StallionError, OSError, shutil.Error) as exc:
-        print(json.dumps({"error": str(exc)}) if args.json else f"stallionfs: {exc}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt as exc:
-        print("stallionfs: interrupted", file=sys.stderr)
-        for note in getattr(exc, "__notes__", ()):
-            print(note, file=sys.stderr)
-        return 130
+    except (StallionError, OSError, shutil.Error, KeyboardInterrupt) as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        message = "interrupted" if interrupted else str(exc)
+        notes = getattr(exc, "__notes__", ())
+        error = {"error": message}
+        if notes:
+            error["notes"] = list(notes)
+        print(json.dumps(error) if args.json else f"stallionfs: {message}", file=sys.stderr)
+        if not args.json:
+            for note in notes:
+                print(note, file=sys.stderr)
+        return 130 if interrupted else 1
 
 
 if __name__ == "__main__":

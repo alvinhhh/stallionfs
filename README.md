@@ -73,24 +73,29 @@ source .venv/bin/activate
 
 ## Performance
 
-stallionfs 0.6.0 on an Apple M2 with 24 GB RAM, macOS 27. Median times with warm caches:
+0.6.1 · Apple M2 · 24 GiB RAM · macOS 27. Median elapsed times.
 
 | Operation | Baseline | stallionfs | Speedup |
 | --- | ---: | ---: | ---: |
-| Scan 20,000 files across 200 folders | 46.64 ms | 10.10 ms | 4.62× |
-| Scan 20,000 files in one folder | 38.20 ms | 20.30 ms | 1.88× |
-| Clone 10,000 files in nested folders | 1.204 s | 0.439 s | 2.74× |
-| Delete those 10,000 files | 0.408 s | 0.198 s | 2.06× |
-| Create and reclaim one folder workspace | 9.134 s | 4.983 s | 1.83× |
-| Create and reclaim four concurrent workspaces | 27.824 s | 13.596 s | 2.05× |
+| Scan 20,000 files across 200 folders | 35.42 ms | 7.51 ms | 4.72× |
+| Scan 20,000 files in one folder | 32.56 ms | 16.18 ms | 2.01× |
+| Clone 10,000 files in nested folders | 1.136 s | 0.423 s | 2.69× |
+| Delete those 10,000 files | 0.391 s | 0.178 s | 2.19× |
+| Create and reclaim one folder workspace | 2.014 s | 0.963 s | 2.09× |
+| Create and reclaim four concurrent workspaces | 5.527 s | 3.642 s | 1.52× |
+| Clone 100,000 JavaScript files | 12.411 s | 4.373 s | 2.84× |
+| Delete 100,000 JavaScript files | 4.042 s | 1.800 s | 2.25× |
+| Clone a Git repository (50,013 files) | 6.069 s | 2.188 s | 2.77× |
+| Delete a Git repository (50,013 files) | 2.089 s | 0.948 s | 2.20× |
+| Clone a build cache (200,000 files, 10 GB) | 24.995 s | 8.754 s | 2.86× |
+| Delete a build cache (200,000 files, 10 GB) | 8.210 s | 4.146 s | 1.98× |
+| Clone 5,000 HTML and asset files | 0.604 s | 0.235 s | 2.57× |
+| Delete 5,000 HTML and asset files | 0.199 s | 0.100 s | 1.99× |
+| Clone a dataset (2,000 files, 50 GB) | 0.241 s | 0.091 s | 2.64× |
+| Delete a dataset (2,000 files, 50 GB) | 0.196 s | 0.140 s | 1.39× |
+| Scan 20,000 files along a 40-folder chain | 29.62 ms | 12.97 ms | 2.28× |
 
-Scans compare against native `readdir`/`fstatat` traversal through the same Python API. Copies compare against `cp -cRp`, using copy-on-write on both sides; deletion compares against `rm -rf`. Command timings include process startup; deletion finishes before the command returns.
-
-Workspace results compare prepared folder clones with `git worktree add` and an offline `npm ci` from a warm cache. They include complete cleanup, exclude one-time seed preparation, and varied substantially between samples. Four concurrent workspaces used 21% less CPU.
-
-Parallel file operations trade CPU for elapsed time. Nested cloning used 33% more CPU than `cp`; deletion used 38% more than `rm`. Sequential scanning is available with `--jobs 1`.
-
-Single-file commands and moves remain slower than Apple's commands. [Full results](tests/perf/README.md) include every measured workload, CPU time, JSON output and native comparisons.
+Baselines: native POSIX scanning, `cp -cRp`, `rm -rf`, and Git worktrees + offline `npm ci`. File trees are generated; workspace times include cleanup and exclude seed preparation. [Full results, CPU and memory](tests/perf/README.md).
 
 ## Contributing
 
