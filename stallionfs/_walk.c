@@ -78,9 +78,10 @@ static int cancelled(struct scan *s, const char *path) {
 
 static int walk(int fd, const char *path, unsigned depth, struct scan *s);
 static int dispatch(struct scan_job job, struct scan *s);
+static int discard(struct scan_job job, struct scan *s);
 
 static int visit(int fd, const char *path, const char *name, unsigned type,
-                 off_t size, unsigned depth, struct scan *s) {
+                 off_t size, unsigned depth, struct scan *s, struct scan_job *pending) {
     if (type == VREG) {
         if (size < 0 || UINT64_MAX - s->stats->logical_bytes < (uint64_t)size)
             return fail(s, EOVERFLOW, path);
@@ -107,6 +108,9 @@ static int visit(int fd, const char *path, const char *name, unsigned type,
             } else if (!depth && s->parallel && s->parallel->workers > 1) {
                 /* Dispatch owns the pinned descriptor and diagnostic path. */
                 return dispatch((struct scan_job){child, child_path, depth + 1}, s);
+            } else if (pending) {
+                *pending = (struct scan_job){child, child_path, depth + 1};
+                return 0;
             } else result = walk(child, child_path, depth + 1, s);
         }
         free(child_path);
@@ -133,6 +137,9 @@ static int walk_bulk(int fd, const char *path, unsigned depth, struct scan *s) {
     requested.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
     requested.fileattr = ATTR_FILE_DATALENGTH;
     int result = 0;
+    /* Avoid retaining parent buffers along a chain of single-child directories. */
+    struct scan_job pending = {.fd = -1};
+    struct scan_job *defer = !depth && s->parallel ? NULL : &pending;
     for (;;) {
         if (cancelled(s, path)) { result = -1; break; }
         int count = getattrlistbulk(fd, &requested, buffer, capacity, FSOPT_PACK_INVAL_ATTRS);
@@ -162,7 +169,15 @@ static int walk_bulk(int fd, const char *path, unsigned depth, struct scan *s) {
                 memchr(name, '/', a.name.attr_length - 1) ||
                 memchr(name, 0, a.name.attr_length - 1) ||
                 !strcmp(name, ".") || !strcmp(name, "..")) goto invalid;
-            if (visit(fd, path, name, a.type, size, depth, s)) { result = -1; goto done; }
+            if (a.type == VDIR && pending.fd >= 0) {
+                struct scan_job job = pending;
+                pending.fd = -1;
+                defer = NULL;
+                result = walk(job.fd, job.path, job.depth, s);
+                free(job.path);
+                if (result) goto done;
+            }
+            if (visit(fd, path, name, a.type, size, depth, s, defer)) { result = -1; goto done; }
             offset += a.length;
         }
     }
@@ -171,6 +186,15 @@ invalid:
     result = fail(s, EIO, path);
 done:
     free(buffer);
+    if (pending.fd >= 0) {
+        if (result || cancelled(s, path)) {
+            discard(pending, s);
+            result = -1;
+        } else {
+            result = walk(pending.fd, pending.path, pending.depth, s);
+            free(pending.path);
+        }
+    }
     return result;
 }
 
@@ -194,7 +218,7 @@ static int walk_posix(int fd, const char *path, unsigned depth, struct scan *s) 
             break;
         }
         unsigned type = S_ISREG(st.st_mode) ? VREG : S_ISDIR(st.st_mode) ? VDIR : S_ISLNK(st.st_mode) ? VLNK : VNON;
-        if (visit(fd, path, entry->d_name, type, st.st_size, depth, s)) { result = -1; break; }
+        if (visit(fd, path, entry->d_name, type, st.st_size, depth, s, NULL)) { result = -1; break; }
     }
     if (closedir(directory) && !result) result = fail(s, errno, path);
     return result;

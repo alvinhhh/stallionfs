@@ -165,7 +165,10 @@ class Store:
         path = Path(tempfile.mkdtemp(prefix="build-", dir=self.root / "staging"))
         try:
             yield path
-        finally:
+        except BaseException as exc:
+            exc.add_note(f"Unfinished files retained at {path}")
+            raise
+        else:
             if path.exists():
                 image = path / "workspace.sparseimage"
                 if os.path.lexists(image):

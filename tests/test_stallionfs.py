@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import errno
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -112,18 +113,29 @@ class Workspaces(unittest.TestCase):
             reclaiming.assert_called_once_with(self.store.root / "trash" / workspace["id"], jobs=1)
 
     def test_failure_does_not_publish_partial_seed_or_workspace(self):
-        with self.assertRaises(StallionError):
+        with self.assertRaises(StallionError) as failed:
             self.prepare(command=[sys.executable, "-c", "raise SystemExit(17)"])
         self.assertEqual(self.store.list("seeds"), [])
+        retained = set((self.store.root / "staging").iterdir())
+        self.assertEqual(len(retained), 1)
+        first = next(iter(retained))
+        self.assertEqual(failed.exception.__notes__, [f"Unfinished files retained at {first}"])
+        self.assertEqual((first / "repo/file").read_text(), "original\n")
         seed = self.prepare()["id"]
+        error = OSError(28, "disk full")
         def partial(source, destination, *, jobs=4):
             destination.mkdir()
             (destination / "partial").write_text("partial")
-            raise OSError(28, "disk full")
-        with patch("stallionfs.core.clone_tree", partial), self.assertRaises(OSError):
+            raise error
+        with patch("stallionfs.core.clone_tree", partial), self.assertRaises(OSError) as failed:
             self.store.create(seed)
+        self.assertIs(failed.exception, error)
         self.assertEqual(self.store.list(), [])
-        self.assertEqual(list((self.store.root / "staging").iterdir()), [])
+        added = set((self.store.root / "staging").iterdir()) - retained
+        self.assertEqual(len(added), 1)
+        second = next(iter(added))
+        self.assertEqual((second / "repo/partial").read_text(), "partial")
+        self.assertEqual(error.__notes__, [f"Unfinished files retained at {second}"])
 
     def test_source_and_command_validation(self):
         (self.source / "file").write_text("uncommitted")
@@ -247,6 +259,7 @@ static struct { const void *replacement; const void *original; } interpose = {
 from pathlib import Path
 from stallionfs.core import Store
 store = Store({str(self.store.root)!r})
+before = set((store.root / "staging").iterdir())
 try:
     store.create({seed!r})
 except (OSError, KeyboardInterrupt) as exc:
@@ -254,10 +267,11 @@ except (OSError, KeyboardInterrupt) as exc:
         assert isinstance(exc, KeyboardInterrupt), exc
     else:
         assert isinstance(exc, OSError) and exc.errno == errno.ENOTSUP, exc
+    assert any("Unfinished files retained at" in note for note in exc.__notes__)
 else:
     raise AssertionError("unsupported clone silently fell back to copying")
 assert store.list() == []
-assert list((store.root / "staging").iterdir()) == []
+assert len(set((store.root / "staging").iterdir()) - before) == 1
 '''
         for fault in ({}, {"STALLIONFS_TEST_INTERRUPT": "1"}):
             result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
@@ -306,7 +320,7 @@ assert list((store.root / "staging").iterdir()) == []
     def test_interrupted_preparation_is_not_cached(self):
         marker = self.base / "started"
         setup = f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(20)"
-        command = [sys.executable, "-m", "stallionfs", "--root", str(self.store.root),
+        command = [sys.executable, "-m", "stallionfs", "--root", str(self.store.root), "--json",
                    "prepare", str(self.source), "--key", "interrupt", "--", sys.executable, "-c", setup]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -315,14 +329,80 @@ assert list((store.root / "staging").iterdir()) == []
                 time.sleep(0.01)
             self.assertTrue(marker.exists())
             process.send_signal(signal.SIGINT)
-            process.communicate(timeout=5)
+            stdout, stderr = process.communicate(timeout=5)
             self.assertEqual(process.returncode, 130)
+            self.assertEqual(stdout, "")
             self.assertEqual(self.store.list("seeds"), [])
-            self.assertEqual(list((self.store.root / "staging").iterdir()), [])
+            retained = list((self.store.root / "staging").iterdir())
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(json.loads(stderr), {"error": "interrupted", "notes": [f"Unfinished files retained at {retained[0]}"]})
+            self.assertEqual((retained[0] / "repo/file").read_text(), "original\n")
         finally:
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+    def test_cli_plain_interrupt_preserves_notes(self):
+        from stallionfs.__main__ import main
+
+        interrupted = KeyboardInterrupt()
+        note = f"Unfinished files retained at {self.store.root / 'staging/build-test'}"
+        interrupted.add_note(note)
+        with patch.object(Store, "prepare", side_effect=interrupted), \
+                patch("sys.stdout", new_callable=StringIO) as stdout, \
+                patch("sys.stderr", new_callable=StringIO) as stderr:
+            status = main(["--root", str(self.store.root), "prepare", str(self.source), "--key", "interrupt"])
+        self.assertEqual(status, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), f"stallionfs: interrupted\n{note}\n")
+
+    def test_failed_setup_retains_files_used_by_descendant(self):
+        owned = Path(tempfile.mkdtemp(prefix="stallionfs-descendant-")).resolve()
+        observer = '''from pathlib import Path
+import sys, time
+root = Path(sys.argv[1])
+deadline = time.monotonic() + 4
+(root / 'ready').touch()
+while not (root / 'stop').exists() and time.monotonic() < deadline:
+    if not Path('file').is_file(): (root / 'missing').touch()
+    time.sleep(0.01)
+(root / 'finished').touch()
+'''
+        setup = f'''from pathlib import Path
+import subprocess, sys, time
+root = Path({str(owned)!r})
+subprocess.Popen([sys.executable, '-I', '-B', '-c', {observer!r}, str(root)],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+deadline = time.monotonic() + 2
+while not (root / 'ready').exists():
+    if time.monotonic() >= deadline: raise RuntimeError('Observer startup timeout')
+    time.sleep(0.01)
+raise SystemExit(17)
+'''
+        try:
+            command = [sys.executable, '-I', '-B', '-m', 'stallionfs', '--json', '--root', str(owned / 'store'),
+                       'prepare', str(self.source), '--key', 'descendant', '--', sys.executable, '-I', '-B', '-c', setup]
+            failed = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+            self.assertEqual(failed.stdout, '')
+            error = json.loads(failed.stderr)
+            retained = list((owned / 'store/staging').iterdir())
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(error['notes'], [f'Unfinished files retained at {retained[0]}'])
+            self.assertEqual((retained[0] / 'repo/file').read_text(), 'original\n')
+            self.assertFalse((owned / 'finished').exists(), 'Observer exited before failure was checked')
+            time.sleep(0.05)
+            self.assertFalse((owned / 'missing').exists(), 'Setup failure deleted files used by its descendant')
+        finally:
+            (owned / 'stop').touch()
+            deadline = time.monotonic() + 5
+            while not (owned / 'finished').exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if (owned / 'finished').exists():
+                # The marker is the observer's final filesystem operation.
+                remove_tree(owned)
+            else:
+                raise RuntimeError(f'Observer completion unknown; retained fixture at {owned}')
 
     def test_relocatable_git_and_trash_age(self):
         with self.assertRaisesRegex(StallionError, "core.worktree"):

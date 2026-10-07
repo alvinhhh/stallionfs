@@ -1,0 +1,673 @@
+{
+  "concurrency": 4,
+  "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+  "cpu": "Apple M2",
+  "cpu_timing": "Process CPU including worker threads plus waited child-process CPU, summed over the same ready/remove/reclaim phases as wall time. Validation is excluded.",
+  "fixture_dependencies": {
+    "axios": "1.20.0",
+    "date-fns": "4.4.0",
+    "eslint": "10.12.0",
+    "lodash": "4.18.1",
+    "prettier": "3.9.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "rxjs": "7.8.2",
+    "typescript": "7.0.2",
+    "zod": "4.6.5"
+  },
+  "fixture_digest": "1f5134d16fc4c586c822ec5689f3c47f9fbd31695b7b6006c4da8d134fb28b73",
+  "format": 3,
+  "git": "git version 2.49.0",
+  "harness_sha256": "7fd17bdc8af88eb2b6de11c4e2ca6dd356a46532320c42ad18e49949393d01ae",
+  "implementation_sha256": "6face4328018b83338d6006fc582b9a4f546ab7000fbf7d53c23895961036dce",
+  "installed_python_sha256": {
+    "__init__.py": "d80fbb88124a211d0ed0ec952d3568c18078368ef1694f4db1ca2f02d970f0f0",
+    "core.py": "81999134ca84c77673487ee34166e73e3ed0f4d33f26b53dd81d3584f49e5723",
+    "images.py": "d75eab1fcc179b1abfab52c37a8a5b98541d19b11f9f3b439d6b2f304c805c85"
+  },
+  "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+  "machine": "arm64",
+  "memory_bytes": 25769803776,
+  "methods": {
+    "1": {
+      "stallionfs_folder": {
+        "ready_cpu_s": {
+          "max": 2.273405000000004,
+          "median": 2.2064279999999954,
+          "min": 2.1558819999999983
+        },
+        "ready_s": {
+          "max": 0.7415633749915287,
+          "median": 0.6834434579359367,
+          "min": 0.6378782080719247
+        },
+        "reclaim_cpu_s": {
+          "max": 0.7453349999999972,
+          "median": 0.7317949999999911,
+          "min": 0.7013610000000057
+        },
+        "reclaim_s": {
+          "max": 0.31820125004742295,
+          "median": 0.273568999953568,
+          "min": 0.25895008305087686
+        },
+        "remove_cpu_s": {
+          "max": 0.0009280000000018163,
+          "median": 0.0007659999999987122,
+          "min": 0.0007289999999997576
+        },
+        "remove_s": {
+          "max": 0.0009015409741550684,
+          "median": 0.0007379589369520545,
+          "min": 0.0006980830803513527
+        },
+        "total_cpu_s": {
+          "max": 2.9755440000000064,
+          "median": 2.930608999999997,
+          "min": 2.8960249999999945
+        },
+        "total_s": {
+          "max": 1.001238957978785,
+          "median": 0.9627305419417098,
+          "min": 0.9265619160141796
+        }
+      },
+      "worktree_install": {
+        "ready_cpu_s": {
+          "max": 3.1077840000000023,
+          "median": 2.8676299999999912,
+          "min": 2.7021310000000014
+        },
+        "ready_s": {
+          "max": 1.4451170419342816,
+          "median": 1.2957234169589356,
+          "min": 1.2118012079736218
+        },
+        "reclaim_cpu_s": {
+          "max": 3.999999989900971e-06,
+          "median": 2.9999999995311555e-06,
+          "min": 2.0000000020559128e-06
+        },
+        "reclaim_s": {
+          "max": 2.625049091875553e-06,
+          "median": 2.00001522898674e-06,
+          "min": 1.625041477382183e-06
+        },
+        "remove_cpu_s": {
+          "max": 0.6427410000000009,
+          "median": 0.6151650000000046,
+          "min": 0.614100999999998
+        },
+        "remove_s": {
+          "max": 0.8250037499237806,
+          "median": 0.6730655409628525,
+          "min": 0.658646541996859
+        },
+        "total_cpu_s": {
+          "max": 3.733799999999981,
+          "median": 3.496388000000003,
+          "min": 3.3166140000000013
+        },
+        "total_s": {
+          "max": 2.111959417932667,
+          "median": 2.0139957920182496,
+          "min": 1.9193695839494467
+        }
+      }
+    },
+    "4": {
+      "stallionfs_folder": {
+        "ready_cpu_s": {
+          "max": 10.646764000000019,
+          "median": 10.56367999999999,
+          "min": 9.885906000000006
+        },
+        "ready_s": {
+          "max": 3.4077301669167355,
+          "median": 2.611643624957651,
+          "min": 2.5378692500526085
+        },
+        "reclaim_cpu_s": {
+          "max": 3.1302890000000048,
+          "median": 3.059146999999996,
+          "min": 3.021948000000009
+        },
+        "reclaim_s": {
+          "max": 1.102896541939117,
+          "median": 1.0795250840019435,
+          "min": 1.0100106250029057
+        },
+        "remove_cpu_s": {
+          "max": 0.003110999999989872,
+          "median": 0.002858000000003358,
+          "min": 0.002368999999987409
+        },
+        "remove_s": {
+          "max": 0.0019561670487746596,
+          "median": 0.001673709019087255,
+          "min": 0.0014299170579761267
+        },
+        "total_cpu_s": {
+          "max": 13.707281000000023,
+          "median": 13.611110999999994,
+          "min": 13.019076000000013
+        },
+        "total_s": {
+          "max": 4.503959750873037,
+          "median": 3.6424197079613805,
+          "min": 3.5945774171268567
+        }
+      },
+      "worktree_install": {
+        "ready_cpu_s": {
+          "max": 14.171132,
+          "median": 13.833405999999968,
+          "min": 13.768777999999998
+        },
+        "ready_s": {
+          "max": 4.276506124995649,
+          "median": 3.891946625080891,
+          "min": 3.7021062079584226
+        },
+        "reclaim_cpu_s": {
+          "max": 6.999999982326699e-06,
+          "median": 2.999999992425728e-06,
+          "min": 1.9999999949504854e-06
+        },
+        "reclaim_s": {
+          "max": 5.999929271638393e-06,
+          "median": 2.6669586077332497e-06,
+          "min": 1.7919810488820076e-06
+        },
+        "remove_cpu_s": {
+          "max": 4.170117999999974,
+          "median": 3.9372460000000444,
+          "min": 3.8460210000000643
+        },
+        "remove_s": {
+          "max": 1.7437599169788882,
+          "median": 1.5381630830233917,
+          "min": 1.4481634170515463
+        },
+        "total_cpu_s": {
+          "max": 18.12431199999999,
+          "median": 17.84812699999992,
+          "min": 17.644059000000027
+        },
+        "total_s": {
+          "max": 5.757927292026579,
+          "median": 5.527324666036293,
+          "min": 5.239727666950785
+        }
+      }
+    }
+  },
+  "methods_selected": [
+    "worktree_install",
+    "stallionfs_folder"
+  ],
+  "native_binary_sha256": "033579836764d61363ec5fda5e07c11397e93717b10161f6fc1fb0e9a5292999",
+  "node": "v24.19.0",
+  "npm": "10.9.2",
+  "preparation": {
+    "stallionfs_folder": {
+      "amortization_workspaces": 2,
+      "cold_prepare_s": 1.9055350420530885,
+      "seed_logical_bytes": 86580682,
+      "seed_regular_files": 12581
+    }
+  },
+  "python": "3.13.3",
+  "raw": {
+    "1": {
+      "stallionfs_folder": [
+        {
+          "ready_cpu_s": 2.207207999999998,
+          "ready_s": 0.7415633749915287,
+          "reclaim_cpu_s": 0.7226469999999985,
+          "reclaim_s": 0.25895008305087686,
+          "remove_cpu_s": 0.0007540000000005875,
+          "remove_s": 0.0007254999363794923,
+          "total_cpu_s": 2.930608999999997,
+          "total_s": 1.001238957978785
+        },
+        {
+          "ready_cpu_s": 2.225414999999998,
+          "ready_s": 0.6977938750060275,
+          "reclaim_cpu_s": 0.7341160000000002,
+          "reclaim_s": 0.26419870799873024,
+          "remove_cpu_s": 0.0007659999999987122,
+          "remove_s": 0.0007379589369520545,
+          "total_cpu_s": 2.960296999999997,
+          "total_s": 0.9627305419417098
+        },
+        {
+          "ready_cpu_s": 2.179526999999993,
+          "ready_s": 0.6449313749326393,
+          "reclaim_cpu_s": 0.7156960000000012,
+          "reclaim_s": 0.31673229101579636,
+          "remove_cpu_s": 0.0008020000000001914,
+          "remove_s": 0.0007674579974263906,
+          "total_cpu_s": 2.8960249999999945,
+          "total_s": 0.962431123945862
+        },
+        {
+          "ready_cpu_s": 2.1701750000000075,
+          "ready_s": 0.6823283749399707,
+          "reclaim_cpu_s": 0.7417659999999984,
+          "reclaim_s": 0.31820125004742295,
+          "remove_cpu_s": 0.0007289999999997576,
+          "remove_s": 0.0006980830803513527,
+          "total_cpu_s": 2.9126700000000056,
+          "total_s": 1.001227708067745
+        },
+        {
+          "ready_cpu_s": 2.1558819999999983,
+          "ready_s": 0.6834434579359367,
+          "reclaim_cpu_s": 0.7453349999999972,
+          "reclaim_s": 0.273568999953568,
+          "remove_cpu_s": 0.0009280000000018163,
+          "remove_s": 0.0009015409741550684,
+          "total_cpu_s": 2.9021449999999973,
+          "total_s": 0.9579139988636598
+        },
+        {
+          "ready_cpu_s": 2.2064279999999954,
+          "ready_s": 0.6378782080719247,
+          "reclaim_cpu_s": 0.7317949999999911,
+          "reclaim_s": 0.28797137492801994,
+          "remove_cpu_s": 0.0007419999999882521,
+          "remove_s": 0.0007123330142349005,
+          "total_cpu_s": 2.9389649999999747,
+          "total_s": 0.9265619160141796
+        },
+        {
+          "ready_cpu_s": 2.273405000000004,
+          "ready_s": 0.6941202919697389,
+          "reclaim_cpu_s": 0.7013610000000057,
+          "reclaim_s": 0.2723833329509944,
+          "remove_cpu_s": 0.0007779999999968368,
+          "remove_s": 0.0007503749802708626,
+          "total_cpu_s": 2.9755440000000064,
+          "total_s": 0.9672539999010041
+        }
+      ],
+      "worktree_install": [
+        {
+          "ready_cpu_s": 2.7021310000000014,
+          "ready_s": 1.2899934579618275,
+          "reclaim_cpu_s": 2.9999999995311555e-06,
+          "reclaim_s": 2.00001522898674e-06,
+          "remove_cpu_s": 0.6144800000000004,
+          "remove_s": 0.6734929169761017,
+          "total_cpu_s": 3.3166140000000013,
+          "total_s": 1.9634883749531582
+        },
+        {
+          "ready_cpu_s": 2.864981,
+          "ready_s": 1.2957234169589356,
+          "reclaim_cpu_s": 2.9999999995311555e-06,
+          "reclaim_s": 2.125045284628868e-06,
+          "remove_cpu_s": 0.6165440000000011,
+          "remove_s": 0.6730655409628525,
+          "total_cpu_s": 3.481528000000001,
+          "total_s": 1.9687910829670727
+        },
+        {
+          "ready_cpu_s": 2.911538,
+          "ready_s": 1.313496083021164,
+          "reclaim_cpu_s": 2.9999999995311555e-06,
+          "reclaim_s": 2.459040842950344e-06,
+          "remove_cpu_s": 0.614100999999998,
+          "remove_s": 0.7004972499562427,
+          "total_cpu_s": 3.5256419999999977,
+          "total_s": 2.0139957920182496
+        },
+        {
+          "ready_cpu_s": 2.853645,
+          "ready_s": 1.2118012079736218,
+          "reclaim_cpu_s": 2.0000000020559128e-06,
+          "reclaim_s": 1.625041477382183e-06,
+          "remove_cpu_s": 0.6427410000000009,
+          "remove_s": 0.8250037499237806,
+          "total_cpu_s": 3.496388000000003,
+          "total_s": 2.0368065829388797
+        },
+        {
+          "ready_cpu_s": 3.1077840000000023,
+          "ready_s": 1.4451170419342816,
+          "reclaim_cpu_s": 2.999999992425728e-06,
+          "reclaim_s": 1.959037035703659e-06,
+          "remove_cpu_s": 0.6260129999999862,
+          "remove_s": 0.6668404169613495,
+          "total_cpu_s": 3.733799999999981,
+          "total_s": 2.111959417932667
+        },
+        {
+          "ready_cpu_s": 2.8676299999999912,
+          "ready_s": 1.26072129199747,
+          "reclaim_cpu_s": 2.0000000020559128e-06,
+          "reclaim_s": 1.7499551177024841e-06,
+          "remove_cpu_s": 0.6151400000000038,
+          "remove_s": 0.658646541996859,
+          "total_cpu_s": 3.482771999999997,
+          "total_s": 1.9193695839494467
+        },
+        {
+          "ready_cpu_s": 3.0063829999999996,
+          "ready_s": 1.4437198749510571,
+          "reclaim_cpu_s": 3.999999989900971e-06,
+          "reclaim_s": 2.625049091875553e-06,
+          "remove_cpu_s": 0.6151650000000046,
+          "remove_s": 0.6670145000098273,
+          "total_cpu_s": 3.621551999999994,
+          "total_s": 2.1107370000099763
+        }
+      ]
+    },
+    "4": {
+      "stallionfs_folder": [
+        {
+          "ready_cpu_s": 10.56367999999999,
+          "ready_s": 2.551302000065334,
+          "reclaim_cpu_s": 3.0444260000000014,
+          "reclaim_s": 1.0414226250723004,
+          "remove_cpu_s": 0.0030050000000017008,
+          "remove_s": 0.001852791989222169,
+          "total_cpu_s": 13.611110999999994,
+          "total_s": 3.5945774171268567
+        },
+        {
+          "ready_cpu_s": 10.589208999999983,
+          "ready_s": 3.4077301669167355,
+          "reclaim_cpu_s": 3.084914999999995,
+          "reclaim_s": 1.0946213339921087,
+          "remove_cpu_s": 0.002858000000003358,
+          "remove_s": 0.0016082499641925097,
+          "total_cpu_s": 13.676981999999981,
+          "total_s": 4.503959750873037
+        },
+        {
+          "ready_cpu_s": 10.207796000000002,
+          "ready_s": 2.623844209010713,
+          "reclaim_cpu_s": 3.021948000000009,
+          "reclaim_s": 1.0795250840019435,
+          "remove_cpu_s": 0.002368999999987409,
+          "remove_s": 0.0014299170579761267,
+          "total_cpu_s": 13.232112999999998,
+          "total_s": 3.7047992100706324
+        },
+        {
+          "ready_cpu_s": 9.885906000000006,
+          "ready_s": 2.675742999999784,
+          "reclaim_cpu_s": 3.1302890000000048,
+          "reclaim_s": 1.082354124984704,
+          "remove_cpu_s": 0.002881000000002132,
+          "remove_s": 0.001739499974064529,
+          "total_cpu_s": 13.019076000000013,
+          "total_s": 3.7598366249585524
+        },
+        {
+          "ready_cpu_s": 10.228310000000022,
+          "ready_s": 2.5605264590121806,
+          "reclaim_cpu_s": 3.078907000000015,
+          "reclaim_s": 1.052872083033435,
+          "remove_cpu_s": 0.0028409999999894353,
+          "remove_s": 0.001673709019087255,
+          "total_cpu_s": 13.310058000000026,
+          "total_s": 3.615072251064703
+        },
+        {
+          "ready_cpu_s": 10.604825000000005,
+          "ready_s": 2.611643624957651,
+          "reclaim_cpu_s": 3.059146999999996,
+          "reclaim_s": 1.0100106250029057,
+          "remove_cpu_s": 0.003110999999989872,
+          "remove_s": 0.0019561670487746596,
+          "total_cpu_s": 13.667082999999991,
+          "total_s": 3.6236104170093313
+        },
+        {
+          "ready_cpu_s": 10.646764000000019,
+          "ready_s": 2.5378692500526085,
+          "reclaim_cpu_s": 3.05767000000003,
+          "reclaim_s": 1.102896541939117,
+          "remove_cpu_s": 0.0028469999999742868,
+          "remove_s": 0.0016539159696549177,
+          "total_cpu_s": 13.707281000000023,
+          "total_s": 3.6424197079613805
+        }
+      ],
+      "worktree_install": [
+        {
+          "ready_cpu_s": 14.118922000000012,
+          "ready_s": 3.938596374937333,
+          "reclaim_cpu_s": 1.9999999949504854e-06,
+          "reclaim_s": 1.7919810488820076e-06,
+          "remove_cpu_s": 4.005387999999982,
+          "remove_s": 1.6054009580984712,
+          "total_cpu_s": 18.12431199999999,
+          "total_s": 5.543999125016853
+        },
+        {
+          "ready_cpu_s": 13.895288999999991,
+          "ready_s": 3.9891591659979895,
+          "reclaim_cpu_s": 2.999999992425728e-06,
+          "reclaim_s": 2.4170149117708206e-06,
+          "remove_cpu_s": 3.9372460000000444,
+          "remove_s": 1.5381630830233917,
+          "total_cpu_s": 17.832538000000028,
+          "total_s": 5.527324666036293
+        },
+        {
+          "ready_cpu_s": 13.768777999999998,
+          "ready_s": 3.8110100409248844,
+          "reclaim_cpu_s": 4.00000001832268e-06,
+          "reclaim_s": 3.832974471151829e-06,
+          "remove_cpu_s": 4.170117999999974,
+          "remove_s": 1.7437599169788882,
+          "total_cpu_s": 17.93889999999999,
+          "total_s": 5.554773790878244
+        },
+        {
+          "ready_cpu_s": 14.171132,
+          "ready_s": 4.276506124995649,
+          "reclaim_cpu_s": 2.999999992425728e-06,
+          "reclaim_s": 2.4170149117708206e-06,
+          "remove_cpu_s": 3.881518999999969,
+          "remove_s": 1.4814187500160187,
+          "total_cpu_s": 18.05265399999996,
+          "total_s": 5.757927292026579
+        },
+        {
+          "ready_cpu_s": 13.809198999999978,
+          "ready_s": 3.891946625080891,
+          "reclaim_cpu_s": 2.999999992425728e-06,
+          "reclaim_s": 2.6669586077332497e-06,
+          "remove_cpu_s": 3.8839609999999993,
+          "remove_s": 1.454823000007309,
+          "total_cpu_s": 17.69316299999997,
+          "total_s": 5.346772292046808
+        },
+        {
+          "ready_cpu_s": 13.79803099999998,
+          "ready_s": 3.7915582499699667,
+          "reclaim_cpu_s": 6.999999982326699e-06,
+          "reclaim_s": 5.999929271638393e-06,
+          "remove_cpu_s": 3.8460210000000643,
+          "remove_s": 1.4481634170515463,
+          "total_cpu_s": 17.644059000000027,
+          "total_s": 5.239727666950785
+        },
+        {
+          "ready_cpu_s": 13.833405999999968,
+          "ready_s": 3.7021062079584226,
+          "reclaim_cpu_s": 3.999999989900971e-06,
+          "reclaim_s": 3.2079406082630157e-06,
+          "remove_cpu_s": 4.014716999999962,
+          "remove_s": 1.5893542910926044,
+          "total_cpu_s": 17.84812699999992,
+          "total_s": 5.291463706991635
+        }
+      ]
+    }
+  },
+  "samples": 7,
+  "seed_logical_bytes": 86580682,
+  "seed_regular_files": 12581,
+  "setup": [
+    "npm",
+    "ci",
+    "--offline",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--cache",
+    "<isolated warm npm cache>"
+  ],
+  "source_files_generated": 1000,
+  "source_sha256": {
+    "__init__.py": "d80fbb88124a211d0ed0ec952d3568c18078368ef1694f4db1ca2f02d970f0f0",
+    "_scan.c": "a96b28a935d998ddec3f86f595fbd43b0ca0df2a321fc25f62eee9239a071564",
+    "_tree.c": "d729f693743fd4a8a8fe6f8671a691f9be7e7a1259fe85533d806bbc865a0180",
+    "_tree.h": "89b6491ff843fd8ceb91343db7e042925e6eddd4ccefb6dbf102e448cab3301d",
+    "_walk.c": "dbdf7abb3b46f8beac2dffe799e533248a26205d6feb8f25dbc4c0517a695979",
+    "core.py": "81999134ca84c77673487ee34166e73e3ed0f4d33f26b53dd81d3584f49e5723",
+    "images.py": "d75eab1fcc179b1abfab52c37a8a5b98541d19b11f9f3b439d6b2f304c805c85",
+    "tests/perf/fileops.py": "47d18ad719c5d7ff0c6e3a2f77eec6d5aabccef10487075648d49343bf271ff4",
+    "tests/perf/run.py": "7fd17bdc8af88eb2b6de11c4e2ca6dd356a46532320c42ad18e49949393d01ae"
+  },
+  "status": "complete",
+  "storage_note": "Seed content bytes include Git; shared APFS clone blocks are not inferred from logical file sizes.",
+  "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "timestamp": "2026-10-07T15:28:34.275193+00:00",
+  "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
+  "version": "0.6.1",
+  "warmup_batches_per_method": 1,
+  "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
+  "worktree_comparisons": {
+    "1": {
+      "ready_s": {
+        "baseline": 1.2957234169589356,
+        "candidate": 0.6834434579359367,
+        "candidate_minus_baseline": -0.6122799590229988,
+        "percent_change": -47.25390858953685,
+        "baseline_divided_by_candidate": 1.8958750748337567
+      },
+      "ready_cpu_s": {
+        "baseline": 2.8676299999999912,
+        "candidate": 2.2064279999999954,
+        "candidate_minus_baseline": -0.6612019999999958,
+        "percent_change": -23.057437675013787,
+        "baseline_divided_by_candidate": 1.2996707801024991
+      },
+      "total_s": {
+        "baseline": 2.0139957920182496,
+        "candidate": 0.9627305419417098,
+        "candidate_minus_baseline": -1.0512652500765398,
+        "percent_change": -52.197986422953456,
+        "baseline_divided_by_candidate": 2.0919620852126144
+      },
+      "total_cpu_s": {
+        "baseline": 3.496388000000003,
+        "candidate": 2.930608999999997,
+        "candidate_minus_baseline": -0.5657790000000062,
+        "percent_change": -16.18181391767749,
+        "baseline_divided_by_candidate": 1.1930585076344224
+      }
+    },
+    "4": {
+      "ready_s": {
+        "baseline": 3.891946625080891,
+        "candidate": 2.611643624957651,
+        "candidate_minus_baseline": -1.28030300012324,
+        "percent_change": -32.89621167650597,
+        "baseline_divided_by_candidate": 1.4902288305679534
+      },
+      "ready_cpu_s": {
+        "baseline": 13.833405999999968,
+        "candidate": 10.56367999999999,
+        "candidate_minus_baseline": -3.2697259999999773,
+        "percent_change": -23.63644933142268,
+        "baseline_divided_by_candidate": 1.3095252790694134
+      },
+      "total_s": {
+        "baseline": 5.527324666036293,
+        "candidate": 3.6424197079613805,
+        "candidate_minus_baseline": -1.8849049580749124,
+        "percent_change": -34.10157846628899,
+        "baseline_divided_by_candidate": 1.5174870303812054
+      },
+      "total_cpu_s": {
+        "baseline": 17.84812699999992,
+        "candidate": 13.611110999999994,
+        "candidate_minus_baseline": -4.237015999999926,
+        "percent_change": -23.739275275214844,
+        "baseline_divided_by_candidate": 1.311290973969717
+      }
+    }
+  },
+  "comparison_method": {
+    "baseline": "Git worktree add, offline npm ci, filesystem deletion and final Git prune; worktree_install.",
+    "candidate": "Prepared APFS folder clone, move to trash and completed reclamation; stallionfs_folder.",
+    "samples": "Seven measured batches per method at one and four concurrent workspaces. All 28 recorded rows are preserved. The original runner performed one warmup per method/concurrency but did not retain warmup rows or shuffled order.",
+    "cpu": "Process CPU including native worker threads plus waited child CPU; unlike direct CLI child-only CPU this includes the workspace coordinator. Validation is excluded.",
+    "formulas": "Difference = candidate median minus baseline median; percent change = 100 * difference / baseline median; ratio = baseline median / candidate median. Negative differences and ratios above 1 favor the candidate.",
+    "memory_protocol": "Memory was measured separately. Timing and memory reports have distinct, internally consistent content/executable-mode fixture digests; identical fixtures across protocols are not established.",
+    "timing_fixture_digest": "1f5134d16fc4c586c822ec5689f3c47f9fbd31695b7b6006c4da8d134fb28b73",
+    "memory_fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+    "cpu_utilization": "Average CPU cores per measured batch = total_cpu_s / total_s over the same ready/remove/reclaim phases, including coordinator and waited children but excluding validation. Reported median/min/max use the seven per-batch ratios, not ratios of aggregate medians. One core approximates one occupied logical CPU over those phases, not machine-wide utilization. Lower total CPU work does not imply lower average or instantaneous load. Peak utilization is unmeasured."
+  },
+  "export_provenance": {
+    "original_result_sha256": "29ee3b8c01735333e8fb376daa6b26c96dc685b220873babc8502ab8839e9cf9",
+    "retained_measured_rows": 28,
+    "preservation": "All original fields, raw batch values, source/runtime hashes and validation metadata are unchanged.",
+    "path_sanitization": "No personal local paths were present.",
+    "added_fields": [
+      "worktree_comparisons",
+      "comparison_method",
+      "export_provenance",
+      "average_cpu_cores"
+    ]
+  },
+  "average_cpu_cores": {
+    "1": {
+      "stallionfs_folder": {
+        "median": 3.0296508908343665,
+        "min": 2.9090984763307497,
+        "max": 3.171903516866539
+      },
+      "worktree_install": {
+        "median": 1.7505706883661902,
+        "min": 1.689143690539611,
+        "max": 1.8145395389842376
+      }
+    },
+    "4": {
+      "stallionfs_folder": {
+        "median": 3.681823508805385,
+        "min": 3.0366572430734684,
+        "max": 3.7865677715405406
+      },
+      "worktree_install": {
+        "median": 3.2691765621346294,
+        "min": 3.1352695309297816,
+        "max": 3.3730037638578354
+      }
+    }
+  },
+  "release_applicability": {
+    "measured_wheel_sha256": "c4c68a1975b2da792b50187343d0c5e84946a9012497aa2415032710cd228920",
+    "final_wheel_sha256": "872789af85058c75d878d29999e9361039b76f0a846baa0a3a37d664495e6830",
+    "measured_dispatcher_sha256": "18f32ac5bc0307def3c9a29d4b42f637a643ff2820781ffeeb222242c2b26c11",
+    "final_dispatcher_sha256": "f755f930389fcbb945b6cf4e79c076ecf17bb8135b436c8dcd5a331cce567ae2",
+    "changed_wheel_entries": [
+      "stallionfs-0.6.1.dist-info/METADATA",
+      "stallionfs-0.6.1.dist-info/RECORD",
+      "stallionfs/__main__.py"
+    ],
+    "all_other_wheel_entries_byte_identical": true,
+    "scope": "The final wheel changes Python interruption diagnostics to honor --json and refreshes README metadata. Native CLI operations, the scanner extension and imported workspace API modules are byte-identical to the measured package. None of the measured paths executes the Python dispatcher; file-command --version preflight uses it outside measurement. Original measurement fingerprints are retained. The revised interruption diagnostic was regression-tested, not benchmarked.",
+    "focused_installed_checks_passed": 8
+  }
+}

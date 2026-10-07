@@ -19,11 +19,22 @@ import threading
 import time
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import fileops as f
+import stallionfs
+from stallionfs import core, images
 from stallionfs.core import Store, git, remove_tree, run
 from stallionfs import __version__, _scan
 
 METHODS = ("worktree_install", "prepared_byte_copy", "stallionfs_folder", "stallionfs_image")
+
+
+def runtime_fingerprints():
+    checkout = Path(__file__).resolve().parents[2]
+    paths = {name: Path(module.__file__).resolve() for name, module in
+             (("__init__.py", stallionfs), ("core.py", core), ("images.py", images))}
+    f.require(all(not path.is_relative_to(checkout) for path in paths.values()),
+              "Use an installed runtime outside the source checkout")
+    return {name: f.digest(path) for name, path in paths.items()}
 
 
 def cpu_seconds():
@@ -71,24 +82,28 @@ def main():
     node_version = run(["node", "--version"])
     if not args.source_only and int(node_version.removeprefix("v").split(".")[0]) < 24:
         parser.error("The locked npm fixture requires Node 24 or newer; select the supported runtime before benchmarking")
-    args.output = args.output.resolve()
+    output_arg = args.output.expanduser().absolute()
+    output_arg.parent.mkdir(parents=True, exist_ok=True)
+    args.output = output_arg.parent.resolve() / output_arg.name
     partial_output = args.output.with_suffix('.partial.json')
-    if args.output.exists() or partial_output.exists():
+    if os.path.lexists(args.output) or os.path.lexists(partial_output):
         parser.error("Choose a new output path or archive existing results before another run")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     npm_cache = args.npm_cache.resolve()
     setup = [] if args.source_only else ["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)]
     code = Path(__file__).resolve().parents[2] / "stallionfs"
     fingerprint_paths = {name: code / name
                          for name in ("core.py", "_scan.c", "_tree.c", "_walk.c", "_tree.h", "images.py", "__init__.py")}
     fingerprint_paths["tests/perf/run.py"] = Path(__file__).resolve()
+    fingerprint_paths["tests/perf/fileops.py"] = Path(f.__file__).resolve()
     fingerprints = {name: hashlib.sha256(path.read_bytes()).hexdigest()
                     for name, path in fingerprint_paths.items()}
     native_binary = Path(_scan.__file__)
     native_fingerprint = hashlib.sha256(native_binary.read_bytes()).hexdigest()
+    installed_fingerprints = runtime_fingerprints()
     result = {"format": 3, "version": __version__, "status": "incomplete", "timestamp": datetime.now(timezone.utc).isoformat(),
               "implementation_sha256": hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode()).hexdigest(),
               "source_sha256": fingerprints,
+              "installed_python_sha256": installed_fingerprints,
               "native_binary_sha256": native_fingerprint,
               "harness_sha256": fingerprints["tests/perf/run.py"],
               "system": platform.platform(), "machine": platform.machine(),
@@ -105,10 +120,11 @@ def main():
               "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
               "methods": {}, "raw": {}, "preparation": {}}
 
-    def save(path):
-        temporary = path.with_name(path.name + '.tmp')
-        temporary.write_text(json.dumps(result, indent=2) + '\n')
-        temporary.replace(path)
+    checkpoint_identity = None
+
+    def save():
+        nonlocal checkpoint_identity
+        checkpoint_identity = f.write_json(partial_output, result, checkpoint_identity)
 
     base = Path(tempfile.mkdtemp(prefix="stallionfs-perf-", dir=args.scratch.resolve()))
     try:
@@ -231,7 +247,7 @@ def main():
                     result['current'] = dict(workers=count, phase='measurement', sample=sample + 1, method=method)
                     row = batch(method, count)
                     result["raw"][label][method].append(row)
-                    save(partial_output)
+                    save()
                     print(f"workers={count} sample={sample + 1} {method}: ready={row['ready_s']:.3f}s total={row['total_s']:.3f}s", file=sys.stderr, flush=True)
             result["methods"][label] = {method: summary(rows) for method, rows in result["raw"][label].items()}
         sequential = result["methods"]["1"]
@@ -246,18 +262,26 @@ def main():
             raise RuntimeError("Runtime source changed during the benchmark; results are invalid")
         if hashlib.sha256(native_binary.read_bytes()).hexdigest() != native_fingerprint:
             raise RuntimeError("Native binary changed during the benchmark; results are invalid")
+        if runtime_fingerprints() != installed_fingerprints:
+            raise RuntimeError("Installed Python modules changed during the benchmark; results are invalid")
         result["correctness"] = "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata)" + (" and passed fixture smoke test" if setup else "")
         remove_tree(base)
     except BaseException as exc:
         result['error'] = {'type': type(exc).__name__, 'message': str(exc).replace(str(base), '<benchmark>').replace(str(npm_cache), '<npm-cache>')}
-        save(partial_output)
+        save()
         # A failed attach can leave a live mount. Preserve the fixture for safe recovery.
         print(f"Benchmark failed; retained disposable storage for recovery: {base}", file=sys.stderr)
         raise
     result.pop('current', None)
     result['status'] = 'complete'
-    save(args.output)
-    partial_output.unlink(missing_ok=True)
+    f.write_new_json(args.output, result)
+    if checkpoint_identity is not None:
+        try:
+            info = partial_output.lstat()
+            if (info.st_dev, info.st_ino) == checkpoint_identity:
+                partial_output.unlink()
+        except FileNotFoundError:
+            pass
     print(args.output)
 
 
