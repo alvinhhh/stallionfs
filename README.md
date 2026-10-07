@@ -1,4 +1,5 @@
 # stallionfs
+## because horses eat Apple
 
 stallionfs provides native file operations and prepared Git workspaces on macOS.
 
