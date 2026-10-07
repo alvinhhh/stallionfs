@@ -30,6 +30,8 @@ int stallion_test_open(const char *path, int flags, ...) {
     return fd;
 }
 
+/* Match the stat header's Intel inode ABI when _walk.c renames fstat. */
+int stallion_test_fstat(int fd, struct stat *st) __DARWIN_INODE64(stallion_test_fstat);
 int stallion_test_fstat(int fd, struct stat *st) {
     int result = fstat(fd, st);
     if (!result && fd == root_fd) root_device = st->st_dev;
