@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stallionfs"
+version = "0.1.0"
+description = "Prepared copy-on-write Git workspaces for coding agents on macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "stallionfs contributors"}]
+classifiers = ["Operating System :: MacOS :: MacOS X", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+stallionfs = "stallionfs.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/alvinhhh/stallionfs"
+Issues = "https://github.com/alvinhhh/stallionfs/issues"
+
+[tool.setuptools]
+packages = ["stallionfs"]
