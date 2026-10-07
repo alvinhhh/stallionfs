@@ -10,11 +10,13 @@ from .core import StallionError, Store
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Prepared copy-on-write agent workspaces on macOS")
+    parser = argparse.ArgumentParser(description="Filesystem tools for macOS")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--root", default=os.environ.get("STALLIONFS_HOME", str(Path.home() / "Library/Application Support/stallionfs")))
     parser.add_argument("--json", action="store_true", help="Print structured output")
     commands = parser.add_subparsers(dest="action", required=True)
+    scan = commands.add_parser("scan", help="Count files and logical bytes using bulk metadata reads")
+    scan.add_argument("path", help="Directory to scan; symlinks and nested volumes are not followed")
     prepare = commands.add_parser("prepare", help="Prepare a clean commit once")
     prepare.add_argument("source")
     prepare.add_argument("--ref", default="HEAD")
@@ -43,8 +45,17 @@ def main(argv=None):
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
     try:
-        store = Store(args.root)
-        if args.action == "prepare":
+        store = None if args.action == "scan" else Store(args.root)
+        if args.action == "scan":
+            try:
+                from ._scan import scan
+            except ImportError as exc:
+                raise StallionError("Install stallionfs first to build its native scanner: python3 -m pip install .") from exc
+            result = scan(os.path.expanduser(args.path))
+            text = (f"{result['files']} files, {result['directories']} directories, "
+                    f"{result['symlinks']} symlinks, {result['other']} other entries\n"
+                    f"{result['logical_bytes']} logical bytes; {result['skipped_mounts']} nested volumes skipped")
+        elif args.action == "prepare":
             result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup)
             text = result["id"]
         elif args.action == "create":
@@ -72,7 +83,7 @@ def main(argv=None):
         print(json.dumps({"error": str(exc)}) if args.json else f"stallionfs: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("stallionfs: interrupted; no partial workspace was published", file=sys.stderr)
+        print("stallionfs: interrupted", file=sys.stderr)
         return 130
 
 

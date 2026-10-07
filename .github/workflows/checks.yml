@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '${{ matrix.python }}'
+      - run: python -m pip install -e .
       - run: python -m unittest discover -s tests -v
       - run: python -m compileall -q stallionfs
       - run: python -m pip wheel --no-deps --wheel-dir dist .

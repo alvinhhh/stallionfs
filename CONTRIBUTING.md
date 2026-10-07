@@ -5,6 +5,7 @@ Open an issue with the macOS version, filesystem, Python version, command and sm
 For code changes, use a Mac with APFS and run:
 
 ```sh
+python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q stallionfs
 ```
