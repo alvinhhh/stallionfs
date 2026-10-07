@@ -130,19 +130,44 @@ def verify_clone(source, destination, expected):
                     "Clone used mutable hard links to the source")
 
 
-def fixtures(base):
+def selected_workloads(suite, names=None, operations=None):
+    available = {}
+    if suite != "large":
+        available.update({name: list(BASELINES) for name in SAMPLES})
+    if suite != "standard":
+        available.update({name: ["clone", "delete"] for name in LARGE_PROFILES})
+    require(names is None or all(name in available for name in names), "Selected fixture is outside --suite")
+    selected = {name: [operation for operation in supported if operations is None or operation in operations]
+                for name, supported in available.items() if names is None or name in names}
+    require(names is None or all(selected[name] for name in names),
+            "Selected operations are unavailable for a requested fixture; large fixtures support clone/delete")
+    selected = {name: operations for name, operations in selected.items() if operations}
+    require(selected, "No fixture supports the selected operations")
+    require(operations is None or all(any(operation in supported for supported in selected.values())
+                                     for operation in operations),
+            "A requested operation is unavailable across the selected fixtures")
+    return selected
+
+
+def fixtures(base, names=None):
     source = base / "fixtures"
     source.mkdir(mode=0o700)
     block = random.Random(42).randbytes(1024 * 1024)
     tiny, large = source / "tiny", source / "large"
-    tiny.write_bytes(block[:4096])
-    with large.open("xb", buffering=0) as stream:
-        for _ in range(64):
-            require(stream.write(block) == len(block), "Short fixture write")
-    tiny.chmod(0o640)
-    large.chmod(0o640)
-    roots = {"tiny_4kib": tiny, "large_64mib": large}
+    roots = {}
+    if names is None or "tiny_4kib" in names:
+        tiny.write_bytes(block[:4096])
+        tiny.chmod(0o640)
+        roots["tiny_4kib"] = tiny
+    if names is None or "large_64mib" in names:
+        with large.open("xb", buffering=0) as stream:
+            for _ in range(64):
+                require(stream.write(block) == len(block), "Short fixture write")
+        large.chmod(0o640)
+        roots["large_64mib"] = large
     for name, count in (("flat_2000", 2000), ("nested_10000", 10000)):
+        if names is not None and name not in names:
+            continue
         root = source / name
         root.mkdir(mode=0o750)
         for index in range(count):
@@ -357,6 +382,8 @@ def compare_fixture(binary, base, fixture, source, expected, operations, samples
             rng.shuffle(methods)
             pair = {}
             for method in methods:
+                setup_start = time.perf_counter()
+                setup_validation = 0.0
                 target, destination = base / "target", base / "destination"
                 require(not os.path.lexists(target) and not os.path.lexists(destination), "Stale fixture path")
                 if operation == "clone":
@@ -364,25 +391,31 @@ def compare_fixture(binary, base, fixture, source, expected, operations, samples
                                  ["/bin/cp", "-cRp", source, destination])
                 else:
                     command(["/bin/cp", "-cRp", source, target], timeout=timeout)
+                    validation_start = time.perf_counter()
                     verify_clone(source, target, expected)
                     before_move = target.lstat()
+                    setup_validation = time.perf_counter() - validation_start
                     if operation == "delete":
                         arguments = ([binary, "delete", "--recursive", "--jobs", "4", target] if method == "stallionfs" else
                                      ["/bin/rm", "-rf", target])
                     else:
                         arguments = ([binary, "move", target, destination] if method == "stallionfs" else
                                      ["/bin/mv", "-n", target, destination])
+                setup = time.perf_counter() - setup_start - setup_validation
                 report["phase"] = {"fixture": fixture, "operation": operation, "method": method,
                                    "round": round_number, "measurement": "memory" if memory else "timing"}
                 checkpoint()
                 row = measure_memory(arguments, base / "memory.txt") if memory else measure(arguments, timeout=timeout)
                 row.update(operation=operation, fixture=fixture, method=method,
-                           round=round_number, warmup=not memory and round_number == 0, validated=False)
+                           round=round_number, warmup=not memory and round_number == 0, validated=False,
+                           setup_s=setup, setup_validation_s=setup_validation)
                 report["memory_rows" if memory else "rows"].append(row)
                 if row.get("completion_uncertain"):
                     raise ChildCompletionUnknown("Memory wrapper failed; preserve its fixture")
                 checkpoint()
                 require(row["exit_code"] == 0, f"Timed command failed: {row.get('error', row['exit_code'])}")
+                validation_start = time.perf_counter()
+                cleanup = 0.0
                 if operation == "delete":
                     require(not os.path.lexists(target), "Deletion returned before removing its tree")
                 else:
@@ -395,15 +428,20 @@ def compare_fixture(binary, base, fixture, source, expected, operations, samples
                         require((before_move.st_dev, before_move.st_ino) ==
                                 (after_move.st_dev, after_move.st_ino), "Move copied instead of renaming")
                     no_mounts_below(binary, base)
+                    cleanup_start = time.perf_counter()
                     remove_fixture(destination)
+                    cleanup = time.perf_counter() - cleanup_start
                 require((base / "outside-sentinel").read_bytes() == b"keep outside linked trees\n", "Operation followed a symlink")
+                row.update(validation_s=time.perf_counter() - validation_start - cleanup, cleanup_s=cleanup)
                 row["validated"] = True
                 checkpoint()
                 pair[method] = row["wrapper_wall_s" if memory else "wall_s"]
             print(json.dumps({"operation": operation, "fixture": fixture, "round": round_number,
                               "warmup": not memory and round_number == 0, "order": methods,
                               "wrapper_wall_s" if memory else "wall_s": pair}), flush=True)
+        validation_start = time.perf_counter()
         require(manifest(source) == expected, "Original source fixture changed")
+        report["fixture_validation_s"] += time.perf_counter() - validation_start
 
 
 def summarize(rows, keys=("wall_s", "cpu_s", "cpu_self_s", "cpu_children_s")):
@@ -433,9 +471,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New JSON result path")
     parser.add_argument("--suite", choices=("standard", "large", "all"), default="standard",
                         help="Large adds five synthetic clone/delete workloads; generation is sequential")
+    parser.add_argument("--fixtures", nargs="+", choices=(*SAMPLES, *LARGE_PROFILES),
+                        help="Generate only these fixtures within --suite")
+    parser.add_argument("--operations", nargs="+", choices=tuple(BASELINES),
+                        help="Measure only these operations supported by each fixture")
     parser.add_argument("--memory", action="store_true", help="Separate three-sample child peak-memory pass")
     parser.add_argument("--timeout", type=float, default=600, help="Timed operation/setup-copy timeout in seconds")
     args = parser.parse_args()
+    workloads = selected_workloads(args.suite, args.fixtures, args.operations)
     require(platform.system() == "Darwin", "This comparison requires macOS")
     binary = args.binary.expanduser().resolve(strict=True)
     scratch = args.scratch.expanduser().resolve(strict=True)
@@ -477,6 +520,9 @@ def main():
         "source_sha256": sources, "executable_sha256": executable_hashes,
         "volume": {key: volume.get(key) for key in ("filesystem", "readonly", "ignore_ownership")},
         "suite": args.suite, "samples_by_fixture": {}, "warmups": 1, "random_seed": RNG_SEED, "native_jobs": 4,
+        "selection": {"fixtures_requested": args.fixtures, "operations_requested": args.operations,
+                      "workloads": workloads, "full_suite": workloads == selected_workloads(args.suite)},
+        "fixture_setup_s": 0.0, "fixture_validation_s": 0.0,
         "timeout_s": args.timeout, "status": "running", "passed": False,
         "cpu_unavailable_at_start": cpu_error, "fixtures": {}, "rows": [],
         "memory_samples_per_method": 3 if args.memory else 0, "memory_rows": [],
@@ -495,6 +541,8 @@ def main():
             "Tiny-file commands have 31 measured pairs; the other fixtures have seven. One warmup pair is excluded from each median.",
             "No caches are purged. Full source/setup verification reads precede timing; larger fixtures can exceed RAM, so content is not assumed resident.",
             "Setup, full content/mode/link verification and cleanup are outside timed commands and identical between methods.",
+            "Per-row setup_s excludes setup_validation_s; validation_s excludes cleanup_s. Fixture setup/validation totals cover generation and source checks. These overheads exclude reporting and final cleanup and never enter command timings or CPU.",
+            "Selection lists the exact fixture/operation coverage. Filters run before generation; a complete selected run does not imply full-suite coverage. Verification preconditions caches; this is not a cold-cache comparison.",
             "Clone baseline uses cp -cRp to request native cloning and preserve metadata; no weaker byte-copy baseline is substituted.",
             "Every move uses an absent exact destination on the same filesystem. Existing-destination exit-status differences are not timed.",
             "Deletion timing ends only after process exit, and absence is checked immediately; no rename-to-trash or deferred deletion.",
@@ -527,42 +575,53 @@ def main():
             (base / "outside-sentinel").write_bytes(b"keep outside linked trees\n")
             no_mounts_below(binary, base)
             rng = random.Random(RNG_SEED)
-            if args.suite != "large":
-                roots = fixtures(base)
+            standard = [name for name in SAMPLES if name in workloads]
+            if standard:
+                setup_start = time.perf_counter()
+                roots = fixtures(base, standard)
+                report["fixture_setup_s"] += time.perf_counter() - setup_start
                 for name, source in roots.items():
+                    validation_start = time.perf_counter()
                     expected = manifest(source)
                     report["fixtures"][name] = fixture_totals(source, expected)
+                    report["fixture_validation_s"] += time.perf_counter() - validation_start
                     report["samples_by_fixture"][name] = SAMPLES[name]
-                    compare_fixture(binary, base, name, source, expected, tuple(BASELINES), SAMPLES[name], rng,
+                    compare_fixture(binary, base, name, source, expected, workloads[name], SAMPLES[name], rng,
                                     report, checkpoint, timeout=args.timeout)
                     if args.memory:
-                        compare_fixture(binary, base, name, source, expected, tuple(BASELINES), 3, rng,
+                        compare_fixture(binary, base, name, source, expected, workloads[name], 3, rng,
                                         report, checkpoint, timeout=args.timeout, memory=True)
                 no_mounts_below(binary, base)
                 remove_fixture(base / "fixtures")
             if args.suite != "standard":
                 for name, specification in LARGE_PROFILES.items():
+                    if name not in workloads:
+                        continue
                     reserve = (4 if name.startswith("git_") else 2) * specification["bytes"]
                     reserve += 2 * specification["files"] * 4096 + HEADROOM
                     free = shutil.disk_usage(scratch).free
                     report["phase"] = {"fixture": name, "operation": "generate"}
                     checkpoint()
                     require(free >= reserve, f"Insufficient space for {name}: {free} free, {reserve} required")
+                    setup_start = time.perf_counter()
                     source = large_fixture(base, name, specification)
+                    report["fixture_setup_s"] += time.perf_counter() - setup_start
+                    validation_start = time.perf_counter()
                     expected = manifest(source)
                     totals = fixture_totals(source, expected)
                     require(totals["source_regular_files"] == specification["files"] and
                             totals["source_logical_bytes"] == specification["bytes"], "Generated source totals differ")
                     require(shutil.disk_usage(scratch).free >= totals["allocated_bytes"] + HEADROOM,
                             "Insufficient headroom for a complete independent fixture copy")
+                    report["fixture_validation_s"] += time.perf_counter() - validation_start
                     report["fixtures"][name] = {**totals, "requested_source_regular_files": specification["files"],
                                                 "requested_source_logical_bytes": specification["bytes"],
                                                 "free_bytes_before_generation": free, "required_free_bytes": reserve}
                     report["samples_by_fixture"][name] = 7
-                    compare_fixture(binary, base, name, source, expected, ("clone", "delete"), 7, rng,
+                    compare_fixture(binary, base, name, source, expected, workloads[name], 7, rng,
                                     report, checkpoint, timeout=args.timeout)
                     if args.memory:
-                        compare_fixture(binary, base, name, source, expected, ("clone", "delete"), 3, rng,
+                        compare_fixture(binary, base, name, source, expected, workloads[name], 3, rng,
                                         report, checkpoint, timeout=args.timeout, memory=True)
                     no_mounts_below(binary, base)
                     remove_fixture(source)

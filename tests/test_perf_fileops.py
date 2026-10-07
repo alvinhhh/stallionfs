@@ -26,6 +26,112 @@ class BenchmarkFixtures(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_workload_filters_preserve_defaults_and_reject_impossible_selections(self):
+        standard = {name: ["clone", "delete", "move"] for name in fileops.SAMPLES}
+        large = {name: ["clone", "delete"] for name in fileops.LARGE_PROFILES}
+        self.assertEqual(fileops.selected_workloads("standard"), standard)
+        self.assertEqual(fileops.selected_workloads("large"), large)
+        self.assertEqual(fileops.selected_workloads("all"), standard | large)
+        self.assertEqual(fileops.selected_workloads("all", operations=["move"]),
+                         {name: ["move"] for name in standard})
+        self.assertEqual(fileops.selected_workloads("all", ["tiny_4kib", "dataset_2k_50gb"], ["clone", "move"]),
+                         {"tiny_4kib": ["clone", "move"], "dataset_2k_50gb": ["clone"]})
+        with self.assertRaisesRegex(RuntimeError, "outside --suite"):
+            fileops.selected_workloads("standard", ["dataset_2k_50gb"])
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            fileops.selected_workloads("all", ["tiny_4kib", "dataset_2k_50gb"], ["move"])
+        with self.assertRaisesRegex(RuntimeError, "No fixture"):
+            fileops.selected_workloads("large", operations=["move"])
+        with self.assertRaisesRegex(RuntimeError, "unavailable across"):
+            fileops.selected_workloads("large", operations=["clone", "move"])
+        arguments = ["fileops.py", "--binary", "/absent", "--scratch", "/absent", "--output", "/absent/result",
+                     "--suite", "large", "--operations", "clone", "move"]
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(fileops, "command") as command, \
+                self.assertRaisesRegex(RuntimeError, "unavailable across"):
+            fileops.main()
+        command.assert_not_called()
+        roots = fileops.fixtures(self.base, ["tiny_4kib"])
+        self.assertEqual(list(roots), ["tiny_4kib"])
+        self.assertEqual(list((self.base / "fixtures").iterdir()), [roots["tiny_4kib"]])
+        self.assertEqual(roots["tiny_4kib"].read_bytes(), fileops.random.Random(42).randbytes(1024 * 1024)[:4096])
+        self.assertEqual(roots["tiny_4kib"].stat().st_mode & 0o777, 0o640)
+
+    def test_selected_main_skips_unselected_generation_and_records_exact_coverage(self):
+        for name in ("tiny_4kib", "docs_5k_100mb"):
+            with self.subTest(fixture=name):
+                output = self.base / f"{name}.json"
+                arguments = ["fileops.py", "--binary", str(self.binary), "--scratch", str(self.base),
+                             "--output", str(output), "--suite", "all", "--fixtures", name,
+                             "--operations", "delete", "--memory"]
+                with mock.patch.object(sys, "argv", arguments), \
+                        mock.patch.dict(fileops.LARGE_PROFILES, {"docs_5k_100mb": {"files": 3, "bytes": 1536}}), \
+                        mock.patch.object(fileops, "fixtures", wraps=fileops.fixtures) as standard, \
+                        mock.patch.object(fileops, "large_fixture", wraps=fileops.large_fixture) as large, \
+                        mock.patch.object(fileops, "compare_fixture") as compare:
+                    fileops.main()
+                self.assertEqual(standard.call_count, int(name == "tiny_4kib"))
+                self.assertEqual(large.call_count, int(name == "docs_5k_100mb"))
+                self.assertEqual(compare.call_count, 2)
+                self.assertEqual([call.args[2] for call in compare.call_args_list], [name, name])
+                self.assertEqual([call.args[5] for call in compare.call_args_list], [["delete"], ["delete"]])
+                self.assertTrue(compare.call_args_list[1].kwargs["memory"])
+                report = json.loads(output.read_text())
+                self.assertEqual(report["selection"], {"fixtures_requested": [name], "operations_requested": ["delete"],
+                                                       "workloads": {name: ["delete"]}, "full_suite": False})
+                self.assertEqual(list(report["fixtures"]), [name])
+                self.assertGreater(report["fixture_setup_s"], 0)
+                self.assertGreater(report["fixture_validation_s"], 0)
+                self.assertTrue(report["cleanup_passed"])
+
+    def test_setup_validation_and_cleanup_do_not_enter_command_timings(self):
+        source = self.base / "source"
+        source.write_bytes(b"fixture")
+        (self.base / "outside-sentinel").write_bytes(b"keep outside linked trees\n")
+        expected = fileops.manifest(source)
+
+        def setup_copy(arguments, **kwargs):
+            self.assertEqual(arguments[:2], ["/bin/cp", "-cRp"])
+            fileops.shutil.copy2(arguments[-2], arguments[-1])
+
+        for operation in fileops.BASELINES:
+            for memory in (False, True):
+                with self.subTest(operation=operation, memory=memory):
+                    def measured(arguments, *args, **kwargs):
+                        if operation == "clone":
+                            fileops.shutil.copy2(arguments[-2], arguments[-1])
+                        elif operation == "delete":
+                            arguments[-1].unlink()
+                        else:
+                            arguments[-2].rename(arguments[-1])
+                        return {"exit_code": 0, "wrapper_wall_s" if memory else "wall_s": 3.0}
+
+                    clocks = []
+                    for offset in (0, 200):
+                        times = ([0, 4] if operation == "clone" else [0, 10, 30, 35])
+                        times += [100, 107] if operation == "delete" else [100, 120, 125, 132]
+                        clocks.extend(offset + value for value in times)
+                    clocks.extend([400, 409])
+                    report = {"rows": [], "memory_rows": [], "fixture_validation_s": 0.0}
+                    with mock.patch.object(fileops.time, "perf_counter", side_effect=clocks), \
+                            mock.patch.object(fileops, "command", side_effect=setup_copy), \
+                            mock.patch.object(fileops, "measure", side_effect=measured), \
+                            mock.patch.object(fileops, "measure_memory", side_effect=measured), \
+                            mock.patch.object(fileops, "no_mounts_below"):
+                        fileops.compare_fixture(self.binary, self.base, "tiny_4kib", source, expected,
+                                                [operation], 1 if memory else 0, fileops.random.Random(1),
+                                                report, lambda: None, memory=memory)
+                    rows = report["memory_rows" if memory else "rows"]
+                    self.assertEqual(len(rows), 2)
+                    for row in rows:
+                        self.assertEqual(row["wrapper_wall_s" if memory else "wall_s"], 3.0)
+                        self.assertEqual(row["setup_s"], 4.0 if operation == "clone" else 15.0)
+                        self.assertEqual(row["setup_validation_s"], 0.0 if operation == "clone" else 20.0)
+                        self.assertEqual(row["validation_s"], 7.0 if operation == "delete" else 27.0)
+                        self.assertEqual(row["cleanup_s"], 0.0 if operation == "delete" else 5.0)
+                        self.assertTrue(row["validated"])
+                    self.assertEqual(report["fixture_validation_s"], 9.0)
+                    self.assertEqual(fileops.manifest(source), expected)
+
     def test_scaled_profiles_have_exact_materialized_source_and_independent_clones(self):
         for name in fileops.LARGE_PROFILES:
             with self.subTest(profile=name):
@@ -64,7 +170,7 @@ class BenchmarkFixtures(unittest.TestCase):
         self.assertEqual(path.read_text(), "preserve unrelated contents")
 
     def test_failed_timed_command_saves_raw_row_without_complete_result(self):
-        def tiny_fixture(base):
+        def tiny_fixture(base, names=None):
             root = base / "fixtures"
             root.mkdir()
             source = root / "tiny"
@@ -99,7 +205,7 @@ class BenchmarkFixtures(unittest.TestCase):
         output = self.base / "uncertain.json"
         arguments = ["fileops.py", "--binary", str(self.binary), "--scratch", str(self.base), "--output", str(output)]
 
-        def interrupted_setup(base):
+        def interrupted_setup(base, names=None):
             raise fileops.ChildCompletionUnknown("injected wrapper interruption")
 
         with mock.patch.object(sys, "argv", arguments), mock.patch.object(fileops, "fixtures", interrupted_setup), \
@@ -118,7 +224,7 @@ class BenchmarkFixtures(unittest.TestCase):
                      "--output", str(output), "--memory"]
         compare, write = fileops.compare_fixture, fileops.write_json
 
-        def tiny_fixture(base):
+        def tiny_fixture(base, names=None):
             root = base / "fixtures"
             root.mkdir()
             source = root / "tiny"
@@ -153,7 +259,7 @@ class BenchmarkFixtures(unittest.TestCase):
                      "--output", str(output)]
         failure = KeyboardInterrupt()
 
-        def tiny_fixture(base):
+        def tiny_fixture(base, names=None):
             root = base / "fixtures"
             root.mkdir()
             source = root / "tiny"
