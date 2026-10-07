@@ -1,54 +1,41 @@
 # stallionfs
 
-stallionfs (Stallion File System) provides filesystem tools for macOS: bulk directory scans and ready-to-use workspaces for coding agents.
+stallionfs is a macOS CLI for prepared Git workspaces and directory scans.
 
-Scan an ordinary folder without reading every file's contents. For agent workspaces, prepare a repository once, including dependencies, then create independent copies using APFS copy-on-write. Each workspace has its own Git history and branch; unchanged file data shares space on disk.
+[Usage](docs/usage.md) · [Storage and recovery](docs/storage.md) · [Issues](https://github.com/alvinhhh/stallionfs/issues)
 
-## Features
+## Highlights
 
-- Count files and logical bytes with native bulk metadata reads.
-- Reuse installed dependencies across new agent workspaces.
-- Create multiple workspaces at once.
-- Start from a specific commit, branch or tag.
-- Use ordinary Git commands to commit and push changes.
-- Remove workspaces to trash and restore them when needed.
-- Use the CLI from scripts with JSON output.
+- Install dependencies once and reuse them across workspaces.
+- Clone a whole APFS workspace volume without copying every file.
+- Count files and sizes with native bulk metadata reads.
 
-## Quick start
+APFS copy-on-write shares unchanged data on disk. Each workspace has its own Git repository and branch; edits in one don't affect the others.
 
-You'll need macOS, Python 3.11+, and Xcode Command Line Tools to build from source. Workspaces also require APFS and Git.
+## Usage
+
+Prepare a clean checkout, then start working in a copy:
 
 ```sh
-git clone https://github.com/alvinhhh/stallionfs.git
-cd stallionfs
-python3 -m venv .venv
-.venv/bin/pip install .
-export PATH="$PWD/.venv/bin:$PATH"
-
-stallionfs scan /path/to/folder
-stallionfs --json scan /path/to/folder
-```
-
-To create a prepared workspace:
-
-```sh
-stallionfs doctor
-seed=$(stallionfs prepare /path/to/project --key node22-npm10-v1 -- npm ci)
+seed=$(stallionfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
 workspace=$(stallionfs create "$seed" --name fix-parser)
 cd "$workspace"
 ```
 
-Run your agent in the new directory. Commit and push changes as usual:
+The command after `--` runs once during preparation. Change `--key` when you change the toolchain or setup environment. A new source commit gets a new seed automatically.
+
+`--image-size 8` creates workspaces as separate 8 GiB APFS volumes and requires macOS 26+. Omit it to use ordinary folders. See [disk-image workspaces](docs/usage.md#disk-image-workspaces) for capacity and mounting details.
+
+To count files and their total logical size:
 
 ```sh
-git add src/parser.ts
-git commit -m "Fix parser"
-git push -u origin HEAD
+stallionfs scan /path/to/folder
+stallionfs --json scan /path/to/folder
 ```
 
-Prepare from a clean checkout. The cache key names your toolchain and environment; change it when those change. A new source commit gets a new seed automatically.
+The scanner counts symlinks without following them and skips nested volumes.
 
-## Manage workspaces
+Leave the workspace and stop processes using it before removal. To remove, restore, or clear old trash:
 
 ```sh
 stallionfs list
@@ -56,42 +43,46 @@ stallionfs remove WORKSPACE_ID
 stallionfs restore WORKSPACE_ID
 stallionfs gc                 # Preview trash older than 24 hours
 stallionfs gc --yes           # Delete that trash
-stallionfs forget SEED_ID --yes
 ```
 
-Storage defaults to `~/Library/Application Support/stallionfs`. Set `STALLIONFS_HOME` or use `--root` to put it elsewhere on APFS. Deleting a seed leaves existing workspaces intact.
+Files are stored in `~/Library/Application Support/stallionfs`. Set `STALLIONFS_HOME` or pass `--root` to use another location. All commands accept `--json` before the command name.
+
+## Installation
+
+Requires macOS, Python 3.11+ and Xcode Command Line Tools. Workspace storage must be on APFS. Install from source:
+
+```sh
+git clone https://github.com/alvinhhh/stallionfs.git
+cd stallionfs
+python3 -m venv .venv
+.venv/bin/pip install .
+source .venv/bin/activate
+```
 
 ## Performance
 
-Measured on an Apple M2 with 24 GB RAM and macOS 27, using warm caches. Times are medians.
+Apple M2, 24 GB RAM, macOS 27. Median times with warm caches:
 
-| Operation | Baseline | stallionfs |
+| Scan | Native POSIX baseline | stallionfs |
 | --- | ---: | ---: |
-| Scan 20,000 files in one folder | 40.83 ms | 20.57 ms |
-| Scan 20,000 files across 200 folders | 42.16 ms | 22.03 ms |
-| Create and fully clean up one prepared workspace | 5.28 s | 5.22 s |
-| Create and fully clean up four concurrent workspaces | 11.16 s | 11.34 s |
+| 20,000 files in one folder | 41.67 ms | 20.90 ms |
+| 20,000 files across 200 folders | 47.86 ms | 25.93 ms |
 
-<sub><sup>Scan comparisons use equivalent native POSIX traversal, with 11 samples per layout. Workspace comparisons use Git worktrees plus an offline npm install, with seven samples and 12,581 prepared files. One-time seed preparation took 1.97 seconds. Workspace results were roughly tied with the warm-cache baseline. [Measurements and test setup](tests/perf/README.md).</sup></sub>
+Workspace times include creation, setup or mounting, and full cleanup:
 
-## Development
+| Workspaces | Worktree + install | stallionfs folder | stallionfs image |
+| --- | ---: | ---: | ---: |
+| One | 6.14 s | 6.86 s | 1.55 s |
+| Four concurrent | 23.10 s | 13.65 s | 3.42 s |
 
-```sh
-python3 -m pip install -e .
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q stallionfs
-python3 -m pip wheel --no-deps --wheel-dir dist .
-```
+<sub><sup>Scans compare C implementations of `readdir`/`fstatat` and `getattrlistbulk` over 11 runs. Workspaces use seven runs with 12,581 prepared files and an offline `npm ci` baseline. Seed preparation took 2.38 s for folders and 12.28 s for images; image preparation broke even after three workspaces at these medians. Timings varied substantially; [all samples and test setup](tests/perf/README.md) are included.</sup></sub>
 
-The runtime uses Python's standard library, a small C extension, and native macOS filesystem APIs.
+Image volumes also have a cost: durable writes took 2.14–3.74× as long as ordinary APFS folders, and concurrent file I/O took 2.55× as long in a separate [I/O comparison](tests/perf/README.md#file-io-inside-a-workspace). Use the image option for repeated workspace creation, and folders for work that writes heavily.
 
-## Documentation
+## Contributing
 
-- [Usage and agent integration](docs/usage.md)
-- [Storage and recovery](docs/storage.md)
-- [Security](SECURITY.md)
-- [Contributing](CONTRIBUTING.md)
+[Open an issue](https://github.com/alvinhhh/stallionfs/issues) for bugs or feature requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions and tests, or [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). Maintained by [@alvinhhh](https://github.com/alvinhhh).

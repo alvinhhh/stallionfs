@@ -14,7 +14,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from stallionfs._scan import scan
+from stallionfs import _scan
 
 
 def main():
@@ -28,10 +28,12 @@ def main():
         parser.error('Use 1–1,000,000 files and 1–100 samples')
     rng = random.Random(20261006)
     source = Path(__file__).resolve().parents[2] / 'stallionfs/_scan.c'
+    native_binary = Path(_scan.__file__)
     result = {'timestamp': datetime.now(timezone.utc).isoformat(), 'system': platform.platform(),
               'cpu': subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip(),
               'memory_bytes': int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'])),
               'implementation_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+              'native_binary_sha256': hashlib.sha256(native_binary.read_bytes()).hexdigest(),
               'python': platform.python_version(), 'samples': args.samples, 'warmup_rounds': 2,
               'timing': 'Python API wall time; native implementations; warm OS cache; no process startup',
               'workloads': {}}
@@ -62,7 +64,7 @@ def main():
                 rng.shuffle(order)
                 for method in order:
                     start = time.perf_counter()
-                    observed = scan(path, bulk=method == 'bulk')
+                    observed = _scan.scan(path, bulk=method == 'bulk')
                     elapsed = time.perf_counter() - start
                     if observed != expected:
                         raise RuntimeError(f'{method}: expected {expected}, got {observed}')
@@ -72,6 +74,9 @@ def main():
             result['workloads'][layout] = {'expected': expected, 'raw_seconds': rows, 'median_seconds': medians,
                                           'speedup': medians['posix'] / medians['bulk']}
             print(layout, json.dumps(medians), flush=True)
+    if (hashlib.sha256(source.read_bytes()).hexdigest() != result['implementation_sha256']
+            or hashlib.sha256(native_binary.read_bytes()).hexdigest() != result['native_binary_sha256']):
+        raise RuntimeError('Scanner source or native binary changed during measurement; results are invalid')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + '\n')
 

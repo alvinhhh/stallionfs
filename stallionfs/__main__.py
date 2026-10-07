@@ -21,9 +21,13 @@ def main(argv=None):
     prepare.add_argument("source")
     prepare.add_argument("--ref", default="HEAD")
     prepare.add_argument("--key", required=True, help="Toolchain/environment cache key; change when the environment changes")
+    prepare.add_argument("--image-size", type=int, metavar="GIB", help="Store workspaces on separate APFS images with this capacity")
     create = commands.add_parser("create", help="Clone a prepared seed")
     create.add_argument("seed")
     create.add_argument("--name", default="")
+    for action in ("mount", "unmount"):
+        command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
+        command.add_argument("id")
     listing = commands.add_parser("list", help="List stored workspaces, seeds or trash")
     listing.add_argument("kind", nargs="?", choices=["workspaces", "seeds", "trash"], default="workspaces")
     for action in ("remove", "restore"):
@@ -56,11 +60,14 @@ def main(argv=None):
                     f"{result['symlinks']} symlinks, {result['other']} other entries\n"
                     f"{result['logical_bytes']} logical bytes; {result['skipped_mounts']} nested volumes skipped")
         elif args.action == "prepare":
-            result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup)
+            result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup, image_size=args.image_size)
             text = result["id"]
         elif args.action == "create":
             result = store.create(args.seed, name=args.name)
             text = result["path"]
+        elif args.action in ("mount", "unmount"):
+            result = getattr(store, args.action)(args.id)
+            text = result.get("path", result.get("unmounted"))
         elif args.action == "list":
             result = store.list(args.kind)
             text = "\n".join(f"{item['id']}\t{item.get('name', '')}\t{item['path']}" for item in result)
@@ -82,8 +89,10 @@ def main(argv=None):
     except (StallionError, OSError, shutil.Error) as exc:
         print(json.dumps({"error": str(exc)}) if args.json else f"stallionfs: {exc}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         print("stallionfs: interrupted", file=sys.stderr)
+        for note in getattr(exc, "__notes__", ()):
+            print(note, file=sys.stderr)
         return 130
 
 

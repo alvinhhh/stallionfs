@@ -14,11 +14,13 @@ import shutil
 import statistics
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from stallionfs.core import Store, git, run
+from stallionfs.core import Store, git, remove_tree, run
+from stallionfs import _scan
 
 
 def digest(root):
@@ -49,15 +51,29 @@ def main():
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--source-files", type=int, default=1000)
+    parser.add_argument("--image-size", type=int, default=8, metavar="GIB")
     parser.add_argument("--source-only", action="store_true")
     args = parser.parse_args()
-    if not 1 <= args.samples <= 100 or not 1 <= args.concurrency <= 32 or args.source_files < 1:
-        parser.error("Use 1–100 samples, 1–32 workers and a positive file count")
+    if (not 1 <= args.samples <= 100 or not 1 <= args.concurrency <= 32
+            or args.source_files < 1 or not 1 <= args.image_size <= 65536):
+        parser.error("Use 1–100 samples, 1–32 workers, a positive file count and a 1–65536 GiB image")
     args.output = args.output.resolve()
+    partial_output = args.output.with_suffix('.partial.json')
+    if args.output.exists() or partial_output.exists():
+        parser.error("Choose a new output path or archive existing results before another run")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     npm_cache = args.npm_cache.resolve()
     setup = [] if args.source_only else ["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)]
-    result = {"format": 1, "timestamp": datetime.now(timezone.utc).isoformat(),
-              "implementation_sha256": hashlib.sha256((Path(__file__).resolve().parents[2] / "stallionfs/core.py").read_bytes()).hexdigest(),
+    code = Path(__file__).resolve().parents[2] / "stallionfs"
+    fingerprints = {name: hashlib.sha256((code / name).read_bytes()).hexdigest()
+                    for name in ("core.py", "_scan.c", "images.py")}
+    native_binary = Path(_scan.__file__)
+    native_fingerprint = hashlib.sha256(native_binary.read_bytes()).hexdigest()
+    result = {"format": 2, "status": "incomplete", "timestamp": datetime.now(timezone.utc).isoformat(),
+              "implementation_sha256": hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode()).hexdigest(),
+              "source_sha256": fingerprints,
+              "native_binary_sha256": native_fingerprint,
+              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "system": platform.platform(), "machine": platform.machine(),
               "cpu": run(["sysctl", "-n", "machdep.cpu.brand_string"]),
               "memory_bytes": int(run(["sysctl", "-n", "hw.memsize"])),
@@ -67,9 +83,17 @@ def main():
               "setup": setup[:-1] + ["<isolated warm npm cache>"] if setup else [],
               "warmup_batches_per_method": 1, "source_files_generated": args.source_files,
               "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
-              "methods": {}, "raw": {}}
-    with tempfile.TemporaryDirectory(prefix="stallionfs-perf-", dir=args.scratch.resolve()) as directory:
-        base = Path(directory)
+              "image_timing": "Ready includes mount and branch creation; remove includes normal detach; reclaim includes backing-file deletion. Validation is outside timing.",
+              "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
+              "methods": {}, "raw": {}, "preparation": {}}
+
+    def save(path):
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(result, indent=2) + '\n')
+        temporary.replace(path)
+
+    base = Path(tempfile.mkdtemp(prefix="stallionfs-perf-", dir=args.scratch.resolve()))
+    try:
         source = base / "source"
         shutil.copytree(Path(__file__).parent / "fixture", source, ignore=shutil.ignore_patterns("node_modules"))
         for index in range(args.source_files):
@@ -85,22 +109,39 @@ def main():
         store.doctor()
         start = time.perf_counter()
         seed = store.prepare(source, key="locked-npm-fixture", command=setup)
-        result["cold_prepare_s"] = time.perf_counter() - start
+        folder_prepare = time.perf_counter() - start
         seed_repo = store.root / "seeds" / seed["id"] / "repo"
         expected = digest(seed_repo)
         result["fixture_digest"] = expected
         sizes = [p.stat().st_size for p in seed_repo.rglob("*") if p.is_file() and not p.is_symlink()]
         result["seed_regular_files"] = len(sizes)
         result["seed_logical_bytes"] = sum(sizes)
-        result["storage_note"] = "Logical bytes include Git; APFS shared physical bytes are not inferred from du or st_blocks."
+        result["preparation"]["stallionfs_folder"] = {
+            "cold_prepare_s": folder_prepare, "seed_regular_files": len(sizes),
+            "seed_logical_bytes": sum(sizes)}
+        start = time.perf_counter()
+        image_seed = store.prepare(source, key="locked-npm-fixture", command=setup, image_size=args.image_size)
+        image_prepare = time.perf_counter() - start
+        image_info = (store.root / "seeds" / image_seed["id"] / "workspace.sparseimage").stat()
+        result["preparation"]["stallionfs_image"] = {
+            "cold_prepare_s": image_prepare, "capacity_gib": args.image_size,
+            "seed_content_logical_bytes": sum(sizes),
+            "backing_file_logical_bytes": image_info.st_size,
+            "backing_file_allocated_bytes": image_info.st_blocks * 512}
+        result["storage_note"] = ("Seed content bytes include Git. Image allocation is the filesystem's reported st_blocks, "
+                                  "not unique physical usage; shared APFS clone blocks are not inferred from these values.")
+        seeds = {"stallionfs_folder": seed, "stallionfs_image": image_seed}
+        registration = threading.Lock()
 
         def create(method):
-            if method == "stallionfs":
-                value = store.create(seed["id"])
+            if method in seeds:
+                value = store.create(seeds[method]["id"])
                 return Path(value["path"]), value["id"]
             destination = base / f"{method}-{uuid.uuid4().hex}"
             if method == "worktree_install":
-                git(source, "worktree", "add", "--detach", str(destination), "HEAD")
+                # Another Git process must not observe a partially registered worktree.
+                with registration:
+                    git(source, "worktree", "add", "--detach", str(destination), "HEAD")
                 if setup:
                     run(setup, destination)
             elif method == "prepared_byte_copy":
@@ -111,10 +152,8 @@ def main():
 
         def remove(method, item):
             path, ident = item
-            if method == "stallionfs":
+            if method in seeds:
                 store.move(ident)
-            elif method == "worktree_install":
-                git(source, "worktree", "remove", "--force", str(path))
             else:
                 shutil.rmtree(path)
 
@@ -132,35 +171,62 @@ def main():
             start = time.perf_counter()
             with ThreadPoolExecutor(max_workers=count) as pool:
                 list(pool.map(lambda item: remove(method, item), created))
+            if method == "worktree_install":
+                git(source, "worktree", "prune", "--expire", "now")
             removed = time.perf_counter() - start
             start = time.perf_counter()
-            if method == "stallionfs":
-                store.gc(older_than=0, yes=True)
+            deleted = store.gc(older_than=0, yes=True) if method in seeds else []
             reclaimed = time.perf_counter() - start
+            if method in seeds and set(deleted) != {ident for _, ident in created}:
+                raise RuntimeError(f"Incomplete workspace reclamation: {method}")
+            if method == "worktree_install":
+                registered = [line.removeprefix('worktree ') for line in git(source, "worktree", "list", "--porcelain").splitlines()
+                              if line.startswith('worktree ')]
+                if registered != [str(source)]:
+                    raise RuntimeError("Baseline cleanup left registered worktrees")
             return {"ready_s": ready, "remove_s": removed, "reclaim_s": reclaimed,
                     "total_s": ready + removed + reclaimed}
 
-        methods = ["worktree_install", "prepared_byte_copy", "stallionfs"]
+        methods = ["worktree_install", "prepared_byte_copy", *seeds]
         randomizer = random.Random(20261006)
         for count in sorted({1, args.concurrency}):
             label = str(count)
             result["raw"][label] = {method: [] for method in methods}
             for method in methods:
+                result['current'] = dict(workers=count, phase='warmup', method=method)
                 batch(method, count)
             for sample in range(args.samples):
                 order = methods.copy()
                 randomizer.shuffle(order)
                 for method in order:
+                    result['current'] = dict(workers=count, phase='measurement', sample=sample + 1, method=method)
                     row = batch(method, count)
                     result["raw"][label][method].append(row)
+                    save(partial_output)
                     print(f"workers={count} sample={sample + 1} {method}: ready={row['ready_s']:.3f}s total={row['total_s']:.3f}s", file=sys.stderr, flush=True)
             result["methods"][label] = {method: summary(rows) for method, rows in result["raw"][label].items()}
         sequential = result["methods"]["1"]
-        saving = sequential["worktree_install"]["total_s"]["median"] - sequential["stallionfs"]["total_s"]["median"]
-        result["seed_amortization_workspaces"] = math.ceil(result["cold_prepare_s"] / saving) if saving > 0 else None
+        for method in seeds:
+            saving = sequential["worktree_install"]["total_s"]["median"] - sequential[method]["total_s"]["median"]
+            preparation = result["preparation"][method]
+            preparation["amortization_workspaces"] = math.ceil(preparation["cold_prepare_s"] / saving) if saving > 0 else None
+        if any(hashlib.sha256((code / name).read_bytes()).hexdigest() != value
+               for name, value in fingerprints.items()):
+            raise RuntimeError("Runtime source changed during the benchmark; results are invalid")
+        if hashlib.sha256(native_binary.read_bytes()).hexdigest() != native_fingerprint:
+            raise RuntimeError("Native binary changed during the benchmark; results are invalid")
         result["correctness"] = "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata)" + (" and passed fixture smoke test" if setup else "")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+        remove_tree(base)
+    except BaseException as exc:
+        result['error'] = {'type': type(exc).__name__, 'message': str(exc).replace(str(base), '<benchmark>').replace(str(npm_cache), '<npm-cache>')}
+        save(partial_output)
+        # A failed attach can leave a live mount. Preserve the fixture for safe recovery.
+        print(f"Benchmark failed; retained disposable storage for recovery: {base}", file=sys.stderr)
+        raise
+    result.pop('current', None)
+    result['status'] = 'complete'
+    save(args.output)
+    partial_output.unlink(missing_ok=True)
     print(args.output)
 
 

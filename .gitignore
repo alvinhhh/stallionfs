@@ -11,9 +11,3 @@ build/
 node_modules/
 benchmark-work/
 *.log
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-.agents/
-.codex/
-.claude/

@@ -1,6 +1,9 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <copyfile.h>
 #include <sys/attr.h>
+#include <sys/clonefile.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/vnode.h>
 #include <dirent.h>
@@ -155,7 +158,7 @@ static int walk_posix(int fd, const char *path, unsigned depth, struct scan *s) 
 }
 
 static int walk(int fd, const char *path, unsigned depth, struct scan *s) {
-    // ponytail: bounded recursion; use an explicit traversal stack if 512 levels are needed.
+    // Bounded recursion; use an explicit traversal stack if 512 levels are needed.
     int result = depth >= 512 ? fail(s, ELOOP, path) :
         s->bulk ? walk_bulk(fd, path, depth, s) : walk_posix(fd, path, depth, s);
     if (close(fd) && !result) result = fail(s, errno, path);
@@ -199,8 +202,126 @@ static PyObject *scan_tree(PyObject *self, PyObject *args, PyObject *kwargs) {
     return result;
 }
 
+static int clone_walk(int source, int destination, const char *path, unsigned depth, struct scan *s) {
+    if (depth >= 512) return fail(s, ELOOP, path);
+    int copy = dup(source);
+    if (copy < 0) return fail(s, errno, path);
+    DIR *directory = fdopendir(copy);
+    if (!directory) { int error = errno; close(copy); return fail(s, error, path); }
+    int result = 0;
+    unsigned checked = 0;
+    for (;;) {
+        if (!(checked++ % 256) && cancelled(s)) { result = -1; break; }
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (!entry) { if (errno) result = fail(s, errno, path); break; }
+        const char *name = entry->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        unsigned type = entry->d_type;
+        if (type == DT_UNKNOWN) {
+            struct stat st;
+            if (fstatat(source, name, &st, AT_SYMLINK_NOFOLLOW)) { result = fail(s, errno, path); break; }
+            type = S_ISDIR(st.st_mode) ? DT_DIR : S_ISREG(st.st_mode) ? DT_REG : S_ISLNK(st.st_mode) ? DT_LNK : DT_UNKNOWN;
+        }
+        if (type == DT_DIR) {
+            char *child_path = NULL;
+            if (asprintf(&child_path, "%s/%s", path, name) < 0) { result = fail(s, ENOMEM, path); break; }
+            int child = openat(source, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            int target = -1;
+            struct stat st;
+            if (child < 0) result = fail(s, errno, child_path);
+            else if (fstat(child, &st)) result = fail(s, errno, child_path);
+            else if (st.st_dev != s->device) result = fail(s, EXDEV, child_path);
+            else if (mkdirat(destination, name, 0700)) result = fail(s, errno, child_path);
+            else if ((target = openat(destination, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0)
+                result = fail(s, errno, child_path);
+            else result = clone_walk(child, target, child_path, depth + 1, s);
+            if (child >= 0 && close(child) && !result) result = fail(s, errno, child_path);
+            if (target >= 0 && close(target) && !result) result = fail(s, errno, child_path);
+            free(child_path);
+        } else if (type == DT_REG || type == DT_LNK) {
+            // The syscall either clones or fails; byte-copy fallback is impossible.
+            if (clonefileat(source, name, destination, name, CLONE_NOFOLLOW | CLONE_ACL))
+                result = fail(s, errno, path);
+        } else result = fail(s, ENOTSUP, path);
+        if (result) break;
+    }
+    if (closedir(directory) && !result) result = fail(s, errno, path);
+    // Apply directory permissions last so read-only prepared directories can be populated.
+    if (!result && fcopyfile(source, destination, NULL, COPYFILE_METADATA)) result = fail(s, errno, path);
+    return result;
+}
+
+static PyObject *clone_tree(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *source, *destination;
+    if (!PyArg_ParseTuple(args, "O&O&", PyUnicode_FSConverter, &source, PyUnicode_FSConverter, &destination)) return NULL;
+    const char *from = PyBytes_AS_STRING(source), *to = PyBytes_AS_STRING(destination);
+    if ((Py_ssize_t)strlen(from) != PyBytes_GET_SIZE(source) || (Py_ssize_t)strlen(to) != PyBytes_GET_SIZE(destination)) {
+        Py_DECREF(source); Py_DECREF(destination);
+        PyErr_SetString(PyExc_ValueError, "Path contains a null byte");
+        return NULL;
+    }
+    struct scan s = {0};
+    Py_BEGIN_ALLOW_THREADS
+    int src = open(from, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int dst = -1;
+    struct stat st;
+    if (src < 0) fail(&s, errno, from);
+    else if (fstat(src, &st)) fail(&s, errno, from);
+    else if (mkdir(to, 0700)) fail(&s, errno, to);
+    else if ((dst = open(to, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) fail(&s, errno, to);
+    else { s.device = st.st_dev; clone_walk(src, dst, from, 0, &s); }
+    if (src >= 0 && close(src) && !s.error) fail(&s, errno, from);
+    if (dst >= 0 && close(dst) && !s.error) fail(&s, errno, to);
+    Py_END_ALLOW_THREADS
+    PyObject *result = NULL;
+    if (s.error) {
+        errno = s.error;
+        PyErr_SetFromErrnoWithFilename(PyExc_OSError, s.error_path ? s.error_path : from);
+    } else if (!s.cancelled) result = Py_NewRef(Py_None);
+    free(s.error_path);
+    Py_DECREF(source); Py_DECREF(destination);
+    return result;
+}
+
+static PyObject *mount_records(PyObject *self, PyObject *unused) {
+    (void)self; (void)unused;
+    struct statfs *mounts;
+    // Keep the GIL until the static getmntinfo buffer has been copied.
+    errno = 0;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (!count) {
+        if (!errno) errno = EIO;
+        return PyErr_SetFromErrno(PyExc_OSError);
+    }
+    PyObject *result = PyList_New(count);
+    if (!result) return NULL;
+    for (int i = 0; i < count; i++) {
+        PyObject *path = PyUnicode_DecodeFSDefault(mounts[i].f_mntonname);
+        PyObject *device = PyUnicode_DecodeFSDefault(mounts[i].f_mntfromname);
+        PyObject *filesystem = PyUnicode_DecodeFSDefault(mounts[i].f_fstypename);
+        if (!path || !device || !filesystem) {
+            Py_XDECREF(path); Py_XDECREF(device); Py_XDECREF(filesystem);
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyObject *record = Py_BuildValue("{s:O,s:O,s:O,s:O,s:O,s:I}",
+            "path", path, "device", device, "filesystem", filesystem,
+            "readonly", mounts[i].f_flags & MNT_RDONLY ? Py_True : Py_False,
+            "ignore_ownership", mounts[i].f_flags & MNT_IGNORE_OWNERSHIP ? Py_True : Py_False,
+            "owner", (unsigned int)mounts[i].f_owner);
+        Py_DECREF(path); Py_DECREF(device); Py_DECREF(filesystem);
+        if (!record) { Py_DECREF(result); return NULL; }
+        PyList_SET_ITEM(result, i, record);
+    }
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},
+    {"clone", clone_tree, METH_VARARGS, "Clone a tree with independent metadata and copy-on-write file data."},
+    {"mounts", mount_records, METH_NOARGS, "Read cached mount identities and flags without walking their contents."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_scan", NULL, -1, methods, NULL, NULL, NULL, NULL};

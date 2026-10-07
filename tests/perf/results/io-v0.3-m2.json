@@ -1,0 +1,354 @@
+{
+  "compatibility": {
+    "apfs_folder": {
+      "atomic_replace_reads": 1083,
+      "case_sensitive": false,
+      "directory_fsync": true,
+      "file_fsync": true,
+      "file_fullfsync": true,
+      "unicode_normalization_equivalent": true
+    },
+    "apfs_image": {
+      "atomic_replace_reads": 608,
+      "case_sensitive": false,
+      "directory_fsync": true,
+      "file_fsync": true,
+      "file_fullfsync": true,
+      "unicode_normalization_equivalent": true
+    }
+  },
+  "driver_sha256": "327751e5d5f3c57c6f04ffc70fe9ae54ceb01e76ccaba9856b709b69582e1854",
+  "format": 1,
+  "hardware": {
+    "hw.logicalcpu": "8",
+    "hw.memsize": "25769803776",
+    "hw.model": "Mac14,2",
+    "machdep.cpu.brand_string": "Apple M2"
+  },
+  "image_speedup": {
+    "create_2000_buffered_s": 0.7198468083283424,
+    "delete_2000_s": 0.7960152523844595,
+    "overwrite_20_fullfsync_s": 0.46706524718953446,
+    "parallel_4x500_create_read_delete_s": 0.3928057752280702,
+    "read_2000_warm_s": 1.1099771098874025,
+    "read_64mib_warm_hash_s": 1.0048763510992063,
+    "rename_2000_s": 0.9730187048008937,
+    "stat_2000_warm_s": 0.9950378374502036,
+    "write_64mib_fullfsync_s": 0.2672284863400408
+  },
+  "medians": {
+    "apfs_folder": {
+      "create_2000_buffered_s": 0.25007604097481817,
+      "delete_2000_s": 0.09249620896298438,
+      "overwrite_20_fullfsync_s": 0.11638487502932549,
+      "parallel_4x500_create_read_delete_s": 0.1816801669774577,
+      "read_2000_warm_s": 0.052906042081303895,
+      "read_64mib_warm_hash_s": 0.03545275004580617,
+      "rename_2000_s": 0.1846290830289945,
+      "stat_2000_warm_s": 0.006299708969891071,
+      "write_64mib_fullfsync_s": 0.0337406249018386
+    },
+    "apfs_image": {
+      "create_2000_buffered_s": 0.3474017500411719,
+      "delete_2000_s": 0.1161990410182625,
+      "overwrite_20_fullfsync_s": 0.24918333301320672,
+      "parallel_4x500_create_read_delete_s": 0.4625190830556676,
+      "read_2000_warm_s": 0.04766408388968557,
+      "read_64mib_warm_hash_s": 0.035280708922073245,
+      "rename_2000_s": 0.18974875006824732,
+      "stat_2000_warm_s": 0.006331125041469932,
+      "write_64mib_fullfsync_s": 0.12626133300364017
+    }
+  },
+  "native_binary_sha256": "a33cdec5850e2eca80020341bb04f87beb03083952e25d44040dd9f83c98962c",
+  "notes": [
+    "Compares ordinary OS file APIs inside a normal APFS directory and an APFS image workspace.",
+    "Image workspace is prepared and created by the shipped Store API with capacity 2 GiB.",
+    "Only already-mounted steady-state I/O is timed; image preparation, mounting and final cleanup are excluded.",
+    "One warmup pair is discarded. Seven paired rounds use deterministic shuffled order.",
+    "Both methods use the same generated contents and validation; all raw samples and losses are retained.",
+    "Python overhead and inline content/type/size validation are included equally.",
+    "Read and stat caches are warm; no cache purges or global settings are changed.",
+    "Only fullfsync-labeled write timings request durable completion; buffered creates do not.",
+    "Successful fsync/fullfsync does not establish power-loss, controller-cache or device-failure recovery.",
+    "The image uses shipped mount options, including enabled ownership and disabled Spotlight indexing.",
+    "Speedup is folder median divided by image median; values below 1 mean the image is slower."
+  ],
+  "order": [
+    {
+      "methods": [
+        "apfs_image",
+        "apfs_folder"
+      ],
+      "round": 0,
+      "warmup": true
+    },
+    {
+      "methods": [
+        "apfs_folder",
+        "apfs_image"
+      ],
+      "round": 1,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_image",
+        "apfs_folder"
+      ],
+      "round": 2,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_folder",
+        "apfs_image"
+      ],
+      "round": 3,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_image",
+        "apfs_folder"
+      ],
+      "round": 4,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_folder",
+        "apfs_image"
+      ],
+      "round": 5,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_image",
+        "apfs_folder"
+      ],
+      "round": 6,
+      "warmup": false
+    },
+    {
+      "methods": [
+        "apfs_image",
+        "apfs_folder"
+      ],
+      "round": 7,
+      "warmup": false
+    }
+  ],
+  "passed": true,
+  "python": "3.13.3",
+  "rows": {
+    "apfs_folder": [
+      {
+        "create_2000_buffered_s": 0.2480762500781566,
+        "delete_2000_s": 0.0963702080771327,
+        "overwrite_20_fullfsync_s": 0.12626375001855195,
+        "parallel_4x500_create_read_delete_s": 0.15037345804739743,
+        "read_2000_warm_s": 0.06241162505466491,
+        "read_64mib_warm_hash_s": 0.03487616591155529,
+        "rename_2000_s": 0.2216154580237344,
+        "stat_2000_warm_s": 0.016013458953239024,
+        "write_64mib_fullfsync_s": 0.059247749974019825
+      },
+      {
+        "create_2000_buffered_s": 0.28416987496893853,
+        "delete_2000_s": 0.08677745808381587,
+        "overwrite_20_fullfsync_s": 0.11638487502932549,
+        "parallel_4x500_create_read_delete_s": 0.19740337505936623,
+        "read_2000_warm_s": 0.052906042081303895,
+        "read_64mib_warm_hash_s": 0.03330608305986971,
+        "rename_2000_s": 0.16982429195195436,
+        "stat_2000_warm_s": 0.006279542110860348,
+        "write_64mib_fullfsync_s": 0.027971125091426075
+      },
+      {
+        "create_2000_buffered_s": 0.25912029191385955,
+        "delete_2000_s": 0.0869690419640392,
+        "overwrite_20_fullfsync_s": 0.12034070794470608,
+        "parallel_4x500_create_read_delete_s": 0.1759254999924451,
+        "read_2000_warm_s": 0.06974399997852743,
+        "read_64mib_warm_hash_s": 0.03809899999760091,
+        "rename_2000_s": 0.18019633297808468,
+        "stat_2000_warm_s": 0.006299708969891071,
+        "write_64mib_fullfsync_s": 0.027731665992178023
+      },
+      {
+        "create_2000_buffered_s": 0.25007604097481817,
+        "delete_2000_s": 0.19184316706378013,
+        "overwrite_20_fullfsync_s": 0.11366008396726102,
+        "parallel_4x500_create_read_delete_s": 0.2097580418922007,
+        "read_2000_warm_s": 0.053781166090629995,
+        "read_64mib_warm_hash_s": 0.03545275004580617,
+        "rename_2000_s": 0.225597457960248,
+        "stat_2000_warm_s": 0.007480832980945706,
+        "write_64mib_fullfsync_s": 0.0337406249018386
+      },
+      {
+        "create_2000_buffered_s": 0.1917829590383917,
+        "delete_2000_s": 0.08026154199615121,
+        "overwrite_20_fullfsync_s": 0.11052674998063594,
+        "parallel_4x500_create_read_delete_s": 0.17175029194913805,
+        "read_2000_warm_s": 0.043746542069129646,
+        "read_64mib_warm_hash_s": 0.03984595893416554,
+        "rename_2000_s": 0.17206158302724361,
+        "stat_2000_warm_s": 0.006388291949406266,
+        "write_64mib_fullfsync_s": 0.037801625090651214
+      },
+      {
+        "create_2000_buffered_s": 0.2629189579747617,
+        "delete_2000_s": 0.09429524990264326,
+        "overwrite_20_fullfsync_s": 0.14077570801600814,
+        "parallel_4x500_create_read_delete_s": 0.18300670804455876,
+        "read_2000_warm_s": 0.04616408294532448,
+        "read_64mib_warm_hash_s": 0.034929499961435795,
+        "rename_2000_s": 0.1846290830289945,
+        "stat_2000_warm_s": 0.006269583012908697,
+        "write_64mib_fullfsync_s": 0.03415570792276412
+      },
+      {
+        "create_2000_buffered_s": 0.17760712502058595,
+        "delete_2000_s": 0.09249620896298438,
+        "overwrite_20_fullfsync_s": 0.10731529199983925,
+        "parallel_4x500_create_read_delete_s": 0.1816801669774577,
+        "read_2000_warm_s": 0.04805329197552055,
+        "read_64mib_warm_hash_s": 0.037133750040084124,
+        "rename_2000_s": 0.18808362493291497,
+        "stat_2000_warm_s": 0.006206959020346403,
+        "write_64mib_fullfsync_s": 0.028128542006015778
+      }
+    ],
+    "apfs_image": [
+      {
+        "create_2000_buffered_s": 0.36446862493176013,
+        "delete_2000_s": 0.1036805419716984,
+        "overwrite_20_fullfsync_s": 0.24390704091638327,
+        "parallel_4x500_create_read_delete_s": 0.4956632920075208,
+        "read_2000_warm_s": 0.0550933328922838,
+        "read_64mib_warm_hash_s": 0.03684858395718038,
+        "rename_2000_s": 0.18533520796336234,
+        "stat_2000_warm_s": 0.006323083071038127,
+        "write_64mib_fullfsync_s": 0.15215841599274427
+      },
+      {
+        "create_2000_buffered_s": 0.3181252080248669,
+        "delete_2000_s": 0.1161990410182625,
+        "overwrite_20_fullfsync_s": 0.24918333301320672,
+        "parallel_4x500_create_read_delete_s": 0.3999178339727223,
+        "read_2000_warm_s": 0.04605325008742511,
+        "read_64mib_warm_hash_s": 0.03488087491132319,
+        "rename_2000_s": 0.18589479208458215,
+        "stat_2000_warm_s": 0.005965125048533082,
+        "write_64mib_fullfsync_s": 0.12626133300364017
+      },
+      {
+        "create_2000_buffered_s": 0.34709287504665554,
+        "delete_2000_s": 0.1132251659873873,
+        "overwrite_20_fullfsync_s": 0.2288528330391273,
+        "parallel_4x500_create_read_delete_s": 0.34363437502179295,
+        "read_2000_warm_s": 0.04679654201027006,
+        "read_64mib_warm_hash_s": 0.03507833299227059,
+        "rename_2000_s": 0.1948011249769479,
+        "stat_2000_warm_s": 0.00716262508649379,
+        "write_64mib_fullfsync_s": 0.10891350009478629
+      },
+      {
+        "create_2000_buffered_s": 0.28180516697466373,
+        "delete_2000_s": 0.15402320807334036,
+        "overwrite_20_fullfsync_s": 0.2349471669876948,
+        "parallel_4x500_create_read_delete_s": 0.6234917910769582,
+        "read_2000_warm_s": 0.04563079192303121,
+        "read_64mib_warm_hash_s": 0.035280708922073245,
+        "rename_2000_s": 0.18974875006824732,
+        "stat_2000_warm_s": 0.0065897919703274965,
+        "write_64mib_fullfsync_s": 0.11396650003734976
+      },
+      {
+        "create_2000_buffered_s": 0.40017616702243686,
+        "delete_2000_s": 0.162136375089176,
+        "overwrite_20_fullfsync_s": 0.28177758399397135,
+        "parallel_4x500_create_read_delete_s": 0.46599295805208385,
+        "read_2000_warm_s": 0.051020750077441335,
+        "read_64mib_warm_hash_s": 0.0352650829590857,
+        "rename_2000_s": 0.21342170797288418,
+        "stat_2000_warm_s": 0.0065032499842345715,
+        "write_64mib_fullfsync_s": 0.1054289999883622
+      },
+      {
+        "create_2000_buffered_s": 0.3474017500411719,
+        "delete_2000_s": 0.11548462498467416,
+        "overwrite_20_fullfsync_s": 0.2613176670856774,
+        "parallel_4x500_create_read_delete_s": 0.4625190830556676,
+        "read_2000_warm_s": 0.05003558297175914,
+        "read_64mib_warm_hash_s": 0.05845241597853601,
+        "rename_2000_s": 0.1874802919337526,
+        "stat_2000_warm_s": 0.006331125041469932,
+        "write_64mib_fullfsync_s": 0.14546583301853389
+      },
+      {
+        "create_2000_buffered_s": 0.3616267499746755,
+        "delete_2000_s": 0.15503108291886747,
+        "overwrite_20_fullfsync_s": 0.3278487090719864,
+        "parallel_4x500_create_read_delete_s": 0.42396954202558845,
+        "read_2000_warm_s": 0.04766408388968557,
+        "read_64mib_warm_hash_s": 0.047523749992251396,
+        "rename_2000_s": 0.19132945907767862,
+        "stat_2000_warm_s": 0.0059517910704016685,
+        "write_64mib_fullfsync_s": 0.16056679200846702
+      }
+    ]
+  },
+  "samples": 7,
+  "source_sha256": {
+    "stallionfs/_scan.c": "7250a792e895cbf0160fd3ce703a0f062488533f2d4d32f5ec14727249cb1959",
+    "stallionfs/core.py": "af5d19b5aeadb0d3928337649a83ec41089c33854510f4d2639a76a98d3e0bb4",
+    "stallionfs/images.py": "d75eab1fcc179b1abfab52c37a8a5b98541d19b11f9f3b439d6b2f304c805c85",
+    "tests/fs_volume.py": "49dbe7b27baa7b11e9c5652ddd5f2a45d5c851eb6bd805865c0e2e7bcae69038"
+  },
+  "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "timestamp": "2026-10-07T06:08:35.665784+00:00",
+  "volumes": {
+    "apfs_folder": {
+      "BlockSize": null,
+      "DeviceBlockSize": 4096,
+      "FilesystemName": "APFS",
+      "FilesystemType": "apfs",
+      "GlobalPermissionsEnabled": true,
+      "Journaled": null,
+      "VolumeSize": 0,
+      "WritableVolume": true,
+      "mount_flags": [
+        "apfs",
+        "local",
+        "journaled",
+        "nobrowse",
+        "protect",
+        "root data"
+      ]
+    },
+    "apfs_image": {
+      "BlockSize": null,
+      "DeviceBlockSize": 4096,
+      "FilesystemName": "APFS",
+      "FilesystemType": "apfs",
+      "GlobalPermissionsEnabled": true,
+      "Journaled": null,
+      "VolumeSize": 0,
+      "WritableVolume": true,
+      "mount_flags": [
+        "apfs",
+        "local",
+        "nodev",
+        "nosuid",
+        "journaled",
+        "nobrowse"
+      ]
+    }
+  },
+  "warmups": 1,
+  "publication_note": "Mount-owner account annotation removed; measured data and functional mount flags unchanged."
+}
