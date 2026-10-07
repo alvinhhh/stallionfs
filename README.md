@@ -72,7 +72,7 @@ Measured on an Apple M2 with 24 GB RAM and macOS 27, using warm caches. Times ar
 | Create and fully clean up one prepared workspace | 5.28 s | 5.22 s |
 | Create and fully clean up four concurrent workspaces | 11.16 s | 11.34 s |
 
-Scan comparisons use equivalent native POSIX traversal, with 11 samples per layout. Workspace comparisons use Git worktrees plus an offline npm install, with seven samples and 12,581 prepared files. One-time seed preparation took 1.97 seconds. Workspace results were roughly tied with the warm-cache baseline. [Measurements and test setup](tests/perf/README.md).
+<sub><sup>Scan comparisons use equivalent native POSIX traversal, with 11 samples per layout. Workspace comparisons use Git worktrees plus an offline npm install, with seven samples and 12,581 prepared files. One-time seed preparation took 1.97 seconds. Workspace results were roughly tied with the warm-cache baseline. [Measurements and test setup](tests/perf/README.md).</sup></sub>
 
 ## Development
 
