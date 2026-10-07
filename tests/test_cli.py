@@ -84,6 +84,8 @@ class InstalledCLI(unittest.TestCase):
         launcher = self.native_only()
         source = self.base / '--scan café 🐎'; source.mkdir(mode=0o700)
         (source / 'empty').mkdir()
+        (source / 'second').mkdir()
+        (source / 'second' / 'nested').write_bytes(b'worker')
         (source / 'file').write_bytes(b'abc')
         with (source / 'sparse').open('wb') as stream: stream.truncate(1 << 20)
         os.link(source / 'file', source / 'hardlink')
@@ -94,6 +96,13 @@ class InstalledCLI(unittest.TestCase):
         output = self.command('--root', str(self.base / 'unused-store'), '--json',
                               'scan', '--', source.name, launcher=launcher)
         self.assertEqual(json.loads(output.stdout), expected)
+        for options in (('--jobs', '1'), ('--jobs=2',), ('--jobs', '4')):
+            output = self.command('--json', 'scan', *options, '--', source.name, launcher=launcher)
+            self.assertEqual(json.loads(output.stdout), expected)
+        for jobs in ('0', '5', '-1', '4294967297', '-18446744073709551615'):
+            output = self.command('--json', 'scan', '--jobs=' + jobs, '--', source.name,
+                                  launcher=launcher, status=2)
+            self.assertEqual(output.stdout, '')
         output = self.command('scan', '--', source.name, launcher=launcher)
         self.assertEqual(output.stdout, f"{expected['files']} files, {expected['directories']} directories, "
                          f"{expected['symlinks']} symlinks, {expected['other']} other entries\n"
@@ -162,9 +171,10 @@ class InstalledCLI(unittest.TestCase):
                 for name in ('clone', 'move', 'delete', 'volumes'):
                     self.assertIn(name, help_text)
                 self.assertIn('--jobs', self.command('clone', '--help', launcher=launcher).stdout)
+                self.assertIn('--jobs', self.command('scan', '--help', launcher=launcher).stdout)
         home = self.base / 'home'; home.mkdir()
         fixture = home / 'fixture'; fixture.mkdir(); (fixture / 'file').write_bytes(b'abc')
-        result = self.command('--json', 'scan', '~/fixture',
+        result = self.command('--json', 'scan', '--jobs', '1', '~/fixture',
                               environment={**self.environment, 'HOME': str(home)})
         self.assertEqual(json.loads(result.stdout), dict(files=1, directories=0, symlinks=0,
                                                         other=0, logical_bytes=3, skipped_mounts=0))

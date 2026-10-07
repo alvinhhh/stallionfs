@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     for (int i = command + 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!end_options && !strcmp(arg, "--")) { end_options = 1; continue; }
-        if (!end_options && (cloning || deleting) && (!strcmp(arg, "--jobs") || !strncmp(arg, "--jobs=", 7))) {
+        if (!end_options && (cloning || deleting || scanning) && (!strcmp(arg, "--jobs") || !strncmp(arg, "--jobs=", 7))) {
             const char *value = arg + 7;
             if (!strcmp(arg, "--jobs")) { if (++i >= argc) goto usage; value = argv[i]; }
             if (value[0] < '1' || value[0] > '4' || value[1]) goto usage;
@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
         char error_path[4096] = {0};
         struct stallion_scan_stats stats;
         int result;
-        if (scanning) result = stallion_scan(paths[0], 1, &stats, cancelled, NULL, error_path, sizeof(error_path));
+        if (scanning) result = stallion_scan(paths[0], 1, workers, &stats, cancelled, NULL, error_path, sizeof(error_path));
         else if (moving) result = renamex_np(paths[0], paths[1], (unsigned)move_flags);
         else if (cloning) result = stallion_clone(paths[0], paths[1], workers, cancelled, NULL, error_path, sizeof(error_path));
         else result = stallion_delete(paths[0], recursive, missing_ok, workers, cancelled, NULL, error_path, sizeof(error_path));

@@ -145,6 +145,26 @@ def summarize(rows):
     return result
 
 
+def native_comparisons(medians):
+    """Name the measured plain Apple reference, including for JSON candidate output."""
+    result = {}
+    for operation, arguments in APPLE.items():
+        reference_case = f"{operation}/tiny_4kib/plain"
+        reference = medians[reference_case]["apple"]
+        for output in ("plain", "json"):
+            case = f"{operation}/tiny_4kib/{output}"
+            candidate = medians[case]["candidate"]
+            result[case] = {
+                "reference_command": " ".join(arguments) + (" PATH" if operation == "delete" else " SOURCE DESTINATION"),
+                "reference_case": reference_case, "reference_output": "plain", "candidate_output": output,
+                "paired": output == "plain",
+                "wall_speedup": reference["wall_s"] / candidate["wall_s"],
+                "cpu_speedup": reference["cpu_s"] / candidate["cpu_s"]
+                    if reference["cpu_s"] is not None and candidate["cpu_s"] else None,
+            }
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True, help="Older installed CLI in a virtual environment")
@@ -183,6 +203,9 @@ def main():
         "volume": {key: volume.get(key) for key in ("filesystem", "readonly", "ignore_ownership")},
         "samples": {"tiny_4kib": 31, "empty": 31, "nested_1000": 7, "volumes": 31},
         "warmups": 1, "random_seed": SEED, "rows": [], "fixtures": {},
+        "native_reference_unavailable": {
+            "scan": "No equivalent macOS command measured; scan.py separately compares native POSIX and bulk APIs without process startup.",
+            "volumes": "No equivalent macOS command measured; diskutil disk inventory has different semantics from cached mounted filesystems."},
         "notes": [
             "Baseline and candidate are two installed StallionFS releases; Apple commands are separate plain-output references.",
             "Fresh subprocess wall time includes startup and completed operation; CPU includes harness and reaped child time.",
@@ -190,6 +213,7 @@ def main():
             "Setup, output validation, checksums, mode/inode checks and cleanup are outside timing.",
             "Warm caches; no durability flush, large fixture, new volume, or asynchronous cleanup.",
             "Apple references are cp -cRp, mv -n and rm -f on an absent exact destination or existing regular file.",
+            "JSON file-command comparisons reuse the measured Apple plain-output case: they are unpaired across output cases and do not include JSON formatting in the reference.",
             "Those controlled cases do not establish equivalent overwrite, cross-volume or general command semantics.",
             "The requested store path must remain absent throughout; no workspace is prepared.",
             "Runtime/source paths, mount paths, owners and command output are validated locally and omitted from this report."]}
@@ -292,6 +316,7 @@ def main():
     report["candidate_vs_apple_wall_speedup"] = {
         case: methods["apple"]["wall_s"] / methods["candidate"]["wall_s"]
         for case, methods in report["medians"].items() if "apple" in methods}
+    report["candidate_vs_native_plain_reference"] = native_comparisons(report["medians"])
     report.update(passed=True, output_contracts_passed=True, no_store_created=True,
                   completed_utc=datetime.now(timezone.utc).isoformat())
     serialized = json.dumps(report)
