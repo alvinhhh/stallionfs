@@ -1,9 +1,25 @@
 #ifndef STALLION_TREE_H
 #define STALLION_TREE_H
 #include <stddef.h>
+#include <stdint.h>
 
 /* Called only on the invoking thread; return nonzero to cancel. */
 typedef int (*stallion_cancel_fn)(void *context);
+
+struct stallion_scan_stats {
+    uint64_t files, directories, symlinks, other, logical_bytes, skipped_mounts;
+};
+
+/* Counts descendants without following their symlinks. Nested mounts are counted
+ * as directories but skipped; the root directory is not counted. bulk=0 selects
+ * the private POSIX reference traversal. Callbacks run on the invoking thread.
+ * No fixed input-path byte limit is imposed. error_path is a bounded diagnostic
+ * buffer and may be truncated. Stats are meaningful only on success.
+ * Returns 0, or -1 with errno; cancellation reports EINTR.
+ */
+int stallion_scan(const char *path, int bulk, struct stallion_scan_stats *stats,
+                   stallion_cancel_fn cancel, void *context,
+                   char *error_path, size_t error_capacity);
 
 /* Exact destination, which must not exist. Never falls back to byte copying.
  * Workers are joined before return; failures can leave a partial new destination.

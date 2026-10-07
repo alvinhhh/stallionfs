@@ -1,6 +1,8 @@
 """Integration checks for the installed native launcher and its Python helper."""
 import os
+import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -26,11 +28,93 @@ class InstalledCLI(unittest.TestCase):
         self.environment = {**os.environ, 'PATH': '/usr/bin:/bin',
                             'STALLIONFS_HOME': str(self.base / 'unused-store')}
 
-    def command(self, *arguments, launcher=None, status=0):
+    def command(self, *arguments, launcher=None, status=0, environment=None):
         result = subprocess.run([str(launcher or self.launcher), *arguments], cwd=self.base,
-                                env=self.environment, capture_output=True, text=True, timeout=15)
+                                env=environment or self.environment, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, status, result.stderr)
         return result
+
+    def native_only(self):
+        directory = self.base / 'without helper'; directory.mkdir(mode=0o700)
+        launcher = directory / 'stallionfs'
+        shutil.copy2(self.launcher, launcher)
+        self.assertFalse((directory / 'stallionfs-python').exists())
+        return launcher
+
+    def test_native_json_roundtrip_errors_and_no_helper(self):
+        launcher = self.native_only()
+        source = '--source café 🐎 "\\\t\n\x01'
+        destination = '--copy café 🐎 "\\\t\n\x02'
+        moved = '--moved café 🐎 "\\\t\n\x03'
+        (self.base / source).write_bytes(b'original')
+        store = self.base / 'unused-store'
+        result = self.command('--root=' + str(store), '--json', 'clone', '--jobs=1', '--',
+                              source, destination, launcher=launcher)
+        self.assertEqual(json.loads(result.stdout), {'source': source, 'destination': destination})
+        result = self.command('--json', '--root', str(store), 'move', '--', destination, moved,
+                              launcher=launcher)
+        self.assertEqual(json.loads(result.stdout), {'source': destination, 'destination': moved})
+        self.assertEqual((self.base / moved).read_bytes(), b'original')
+        result = self.command('--json', 'delete', '--', moved, launcher=launcher)
+        self.assertEqual(json.loads(result.stdout), {'path': moved})
+        self.assertFalse((self.base / moved).exists())
+        volumes = json.loads(self.command('--json', 'volumes', launcher=launcher).stdout)
+        self.assertTrue(any(row['path'] == '/' for row in volumes))
+        for row in volumes:
+            self.assertEqual(set(row), {'path', 'device', 'filesystem', 'readonly', 'ignore_ownership', 'owner'})
+            self.assertIsInstance(row['readonly'], bool)
+            self.assertIsInstance(row['ignore_ownership'], bool)
+            self.assertIsInstance(row['owner'], int)
+        bad_name = os.fsdecode(b'missing-\xff-\xc0\xaf-\xed\xa0\x80-\xf4\x90\x80\x80-\xf0\x9f-"\\\n')
+        failed = self.command('--json', 'move', '--', bad_name, 'never-created',
+                              launcher=launcher, status=1)
+        self.assertEqual(failed.stdout, '')
+        self.assertIn(os.fsencode(bad_name), os.fsencode(json.loads(failed.stderr)['error']))
+        self.assertFalse((self.base / 'never-created').exists())
+        invalid = self.command('--json', 'clone', '--jobs=5', '--', source, 'invalid',
+                               launcher=launcher, status=2)
+        self.assertEqual(invalid.stdout, '')
+        self.assertFalse(invalid.stderr.lstrip().startswith('{'))
+        self.assertFalse((self.base / 'invalid').exists())
+        self.assertEqual((self.base / source).read_bytes(), b'original')
+        self.assertFalse(store.exists())
+
+    def test_native_scan_counts_failures_and_closed_output(self):
+        from stallionfs._scan import scan
+        launcher = self.native_only()
+        source = self.base / '--scan café 🐎'; source.mkdir(mode=0o700)
+        (source / 'empty').mkdir()
+        (source / 'file').write_bytes(b'abc')
+        with (source / 'sparse').open('wb') as stream: stream.truncate(1 << 20)
+        os.link(source / 'file', source / 'hardlink')
+        (source / 'dangling').symlink_to('absent')
+        (source / 'outside').symlink_to('/')
+        os.mkfifo(source / 'fifo')
+        expected = scan(source)
+        output = self.command('--root', str(self.base / 'unused-store'), '--json',
+                              'scan', '--', source.name, launcher=launcher)
+        self.assertEqual(json.loads(output.stdout), expected)
+        output = self.command('scan', '--', source.name, launcher=launcher)
+        self.assertEqual(output.stdout, f"{expected['files']} files, {expected['directories']} directories, "
+                         f"{expected['symlinks']} symlinks, {expected['other']} other entries\n"
+                         f"{expected['logical_bytes']} logical bytes; {expected['skipped_mounts']} nested volumes skipped\n")
+        denied = source / 'denied'; denied.mkdir(); denied.chmod(0)
+        try:
+            failed = self.command('--json', 'scan', '--', source.name, launcher=launcher, status=1)
+            self.assertEqual(failed.stdout, '')
+            self.assertIsInstance(json.loads(failed.stderr)['error'], str)
+        finally:
+            denied.chmod(0o700)
+        for arguments in (('--json', 'scan', '--', source.name), ('--json', 'volumes')):
+            read_fd, write_fd = os.pipe()
+            os.close(read_fd)
+            try:
+                result = subprocess.run([str(launcher), *arguments], cwd=self.base,
+                                        env=self.environment, stdout=write_fd, stderr=subprocess.PIPE, timeout=15)
+            finally:
+                os.close(write_fd)
+            self.assertNotEqual(result.returncode, 0, 'Output failure was reported as success')
+        self.assertFalse((self.base / 'unused-store').exists())
 
     def test_native_file_operations_with_literal_leading_dashes(self):
         source = self.base / '--source'; source.mkdir(mode=0o700)
@@ -78,6 +162,12 @@ class InstalledCLI(unittest.TestCase):
                 for name in ('clone', 'move', 'delete', 'volumes'):
                     self.assertIn(name, help_text)
                 self.assertIn('--jobs', self.command('clone', '--help', launcher=launcher).stdout)
+        home = self.base / 'home'; home.mkdir()
+        fixture = home / 'fixture'; fixture.mkdir(); (fixture / 'file').write_bytes(b'abc')
+        result = self.command('--json', 'scan', '~/fixture',
+                              environment={**self.environment, 'HOME': str(home)})
+        self.assertEqual(json.loads(result.stdout), dict(files=1, directories=0, symlinks=0,
+                                                        other=0, logical_bytes=3, skipped_mounts=0))
         self.assertFalse((self.base / 'unused-store').exists())
 
 

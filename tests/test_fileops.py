@@ -12,6 +12,7 @@ import pwd
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import unittest
 
@@ -232,6 +233,14 @@ class FileOperations(unittest.TestCase):
         images.build(seed, image, 1)
         try:
             repo = images.attach(image, point)
+            expected = dict(files=1, directories=1, symlinks=0, other=0, logical_bytes=4, skipped_mounts=1)
+            self.assertEqual(_scan.scan(victim), expected)
+            self.assertEqual(_scan.scan(victim, bulk=False), expected)
+            launcher = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+            scanned = subprocess.run([str(launcher), '--json', 'scan', str(victim)],
+                                     capture_output=True, text=True, timeout=15)
+            self.assertEqual(scanned.returncode, 0, scanned.stderr)
+            self.assertEqual(json.loads(scanned.stdout), expected)
             for path in (victim, point):
                 with self.assertRaises(OSError): _scan.delete(path, recursive=True)
             self.assertEqual(sentinel.read_bytes(), b'kept')

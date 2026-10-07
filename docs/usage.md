@@ -26,7 +26,7 @@ Directory clones require a destination parent owned by the current user or root.
 
 `--jobs` accepts 1–4 for `clone` and `delete`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
 
-These four commands run in the native executable. `--json` selects the Python command path for structured results. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
+File operations, scans and volume listings run in the native executable, including with `--json`. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
 
 The same operations are available to Python applications:
 
