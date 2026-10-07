@@ -1,5 +1,36 @@
 # Internal performance checks
 
+## File commands
+
+Compare the installed native executable with `/bin/cp -cRp`, `/bin/rm -rf` and `/bin/mv -n`:
+
+```sh
+python3 tests/perf/fileops.py --binary .venv/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/fileops.json
+```
+
+The scratch directory must exist on writable APFS with at least 2 GiB free. The fixtures are a 4 KiB file, a 64 MiB file, 2,000 files in one folder and 10,000 files across nested folders. Each timed command starts a new process. There are 31 measured pairs for the small file and seven for each larger fixture, plus one excluded warmup pair. Pair order is shuffled with a fixed seed.
+
+Copying uses native copy-on-write on both sides. Every copy and move must preserve the fixture's contents, modes and symlink targets; clones must have independent inodes. Moves use an absent exact destination and must preserve the inode. Deletion must finish before returning. Fixture setup, validation and cleanup are outside timing. Results include wall time, process and child CPU, source and executable hashes, and every sample. These are warm-cache operations without a durability flush.
+
+Recorded results: [M2 file commands, 0.4.0](results/fileops-v0.4-m2.json). Medians in milliseconds; CPU ratios are stallionfs divided by the baseline, so values above one use more CPU.
+
+| Operation | Fixture | macOS command | stallionfs | CPU ratio |
+| --- | --- | ---: | ---: | ---: |
+| Copy | 4 KiB file | 2.27 | 2.94 | 1.23× |
+| Copy | 64 MiB file | 3.21 | 3.78 | 1.11× |
+| Copy | 2,000 files, flat | 277.65 | 252.38 | 0.91× |
+| Copy | 10,000 files, nested | 1930.25 | 673.42 | 1.27× |
+| Delete | 4 KiB file | 3.39 | 4.14 | 1.10× |
+| Delete | 64 MiB file | 4.16 | 4.69 | 1.05× |
+| Delete | 2,000 files, flat | 64.84 | 62.07 | 0.94× |
+| Delete | 10,000 files, nested | 461.91 | 289.07 | 1.51× |
+| Move | 4 KiB file | 2.91 | 3.77 | 1.19× |
+| Move | 64 MiB file | 3.47 | 6.01 | 1.64× |
+| Move | 2,000 files, flat | 4.39 | 5.20 | 1.11× |
+| Move | 10,000 files, nested | 4.02 | 5.89 | 1.29× |
+
+Nested copying was 2.87× faster and deletion 1.60× faster, with higher CPU use. Flat-directory gains were small; single-file commands and moves were slower. All 336 samples, including warmups, passed validation and cleanup. Repeated operations can use the Python API to avoid starting a command process for each call.
+
 ## Metadata scanning
 
 Build the installed extension first, then compare its bulk scanner with the private native POSIX reference path:
@@ -41,13 +72,28 @@ One warmup batch per method is discarded. Seven measured samples run in a determ
 
 `ready_s` measures creation plus required installation or image attachment. `remove_s` includes image detachment where applicable. `reclaim_s` includes full trash deletion for stallionfs. `total_s` is their sum. Worktree and byte-copy removal already reclaim their directories. The one-time seed cost is reported separately for each backend, with the number of workspaces needed to amortize it using median total times. Parallel batches are wall time for the entire batch, not per-workspace latencies.
 
-`--source-only` measures the same source checkout without dependency preparation. `--samples`, `--concurrency` and `--source-files` change the load. The package cache and filesystem cache are warm; the test does not flush OS caches, download packages during measurement, or measure unique APFS physical storage. Raw samples include hardware and software versions. Keep failed validation as a failure; never report its partial timings as a result.
+`--source-only` measures the same source checkout without dependency preparation. `--samples`, `--concurrency` and `--source-files` change the load. Use `--methods worktree_install stallionfs_folder` for a folder-only comparison; unselected image workspaces are not prepared. The package cache and filesystem cache are warm; the test does not flush OS caches, download packages during measurement, or measure unique APFS physical storage. Raw samples include hardware and software versions. Keep failed validation as a failure; never report its partial timings as a result.
+
+Format 3 also records process CPU, including worker threads and waited child processes, over the same phases as wall time. Validation is excluded from both.
 
 This uses the Python API. CLI process startup is excluded for stallionfs; Git/npm subprocess startup is included in their operations. These are local workspace timings, not agent inference or general filesystem benchmarks. Results depend on file count, dependency layout, hardware, system load and cache state.
 
 Results include every measured sample, source-file hashes and the loaded native binary's hash. The runner rejects results if runtime source or the loaded native binary changes during measurement. Image allocation reports `st_blocks`, which does not distinguish shared APFS blocks from unique physical storage. Seed break-even is calculated from medians, not a guarantee for another workload.
 
-Recorded results: [M2 workspaces, 0.3.0](results/workspaces-v0.3-m2.json). Image workspace creation and full cleanup took median 1.55 seconds for one workspace and 3.42 seconds for four, versus 6.14 and 23.10 seconds for worktree/install. The one-time image preparation took 12.28 seconds, recovered after three workspaces at these medians.
+Recorded folder results: [M2 workspaces, 0.4.0](results/workspaces-v0.4-m2.json), with Node 24.19.0 and npm 10.9.2:
+
+| Workspaces | Phase | Worktree + install | stallionfs folder |
+| --- | --- | ---: | ---: |
+| One | Ready | 1.964 s | 1.191 s |
+| One | Full lifecycle | 2.872 s | 1.606 s |
+| One | Full CPU time | 4.252 s | 4.240 s |
+| Four | Ready | 8.202 s | 5.765 s |
+| Four | Full lifecycle | 11.198 s | 7.473 s |
+| Four | Full CPU time | 25.737 s | 20.368 s |
+
+Full-lifecycle speedups were 1.79× and 1.50×, below 2×. Single-workspace times ranged from 2.28–3.58 seconds for worktree/install and 1.41–2.21 seconds for stallionfs. Concurrent batches ranged from 6.51–38.48 and 5.29–12.56 seconds respectively; stallionfs lost one of the seven paired concurrent samples. The run includes all samples. Folder preparation took 2.79 seconds and broke even after three workspaces at these medians. Each phase is summarized separately, so the medians need not add up to the median total.
+
+Earlier full comparison: [M2 workspaces, 0.3.0](results/workspaces-v0.3-m2.json). Image workspace creation and full cleanup took median 1.55 seconds for one workspace and 3.42 seconds for four, versus 6.14 and 23.10 seconds for worktree/install. The one-time image preparation took 12.28 seconds, recovered after three workspaces at these medians.
 
 This run had substantial timing variation. Full-cycle ranges were 5.13–24.85 seconds for one worktree/install versus 1.38–2.75 seconds for one image, and 11.28–42.82 seconds versus 2.44–4.18 seconds for four. All seven samples are retained. Folder cloning was slower than worktree/install for one workspace in this run.
 

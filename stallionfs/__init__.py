@@ -1,3 +1,7 @@
-"""Prepared, independent Git workspaces using APFS copy-on-write."""
+"""Native filesystem operations and prepared Git workspaces for macOS."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
+
+from ._scan import clone, delete, mounts, move, scan
+
+__all__ = ["clone", "delete", "mounts", "move", "scan"]

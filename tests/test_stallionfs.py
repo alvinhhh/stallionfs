@@ -14,9 +14,9 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
-from stallionfs.core import Store, StallionError, clone_tree, git, run
+from stallionfs.core import Store, StallionError, clone_tree, git, remove_tree, run
 
 
 @unittest.skipUnless(sys.platform == "darwin", "APFS integration tests require macOS")
@@ -94,12 +94,29 @@ class Workspaces(unittest.TestCase):
         self.assertEqual(len(self.store.list()), 4)
         self.assertEqual(list((self.store.root / "staging").iterdir()), [])
 
+    def test_worker_limit_is_forwarded_and_invalid_limits_leave_storage_unchanged(self):
+        seed = self.prepare()["id"]
+        with patch("stallionfs.core.clone_tree", wraps=clone_tree) as copying:
+            workspace = self.store.create(seed, jobs=1)
+            copying.assert_called_once_with(self.store.root / "seeds" / seed / "repo", ANY, jobs=1)
+        self.assertEqual(git(workspace["path"], "branch", "--show-current"), workspace["branch"])
+        self.store.move(workspace["id"])
+        before = sorted(str(path.relative_to(self.store.root)) for path in self.store.root.rglob("*"))
+        for jobs in (0, 5, True, 1.5, "1"):
+            with self.subTest(jobs=jobs):
+                with self.assertRaises(StallionError): self.store.create(seed, jobs=jobs)
+                with self.assertRaises(StallionError): self.store.gc(older_than=0, yes=True, jobs=jobs)
+                self.assertEqual(sorted(str(path.relative_to(self.store.root)) for path in self.store.root.rglob("*")), before)
+        with patch("stallionfs.core.remove_tree", wraps=remove_tree) as reclaiming:
+            self.assertEqual(self.store.gc(older_than=0, yes=True, jobs=1), [workspace["id"]])
+            reclaiming.assert_called_once_with(self.store.root / "trash" / workspace["id"], jobs=1)
+
     def test_failure_does_not_publish_partial_seed_or_workspace(self):
         with self.assertRaises(StallionError):
             self.prepare(command=[sys.executable, "-c", "raise SystemExit(17)"])
         self.assertEqual(self.store.list("seeds"), [])
         seed = self.prepare()["id"]
-        def partial(source, destination):
+        def partial(source, destination, *, jobs=4):
             destination.mkdir()
             (destination / "partial").write_text("partial")
             raise OSError(28, "disk full")
@@ -163,20 +180,21 @@ class Workspaces(unittest.TestCase):
             (Path(workspace["path"]) / "external").symlink_to(victim)
             self.store.move(workspace["id"])
             identifiers.append(workspace["id"])
-        original = shutil.rmtree
+        original = remove_tree
         barrier = threading.Barrier(4, timeout=5)
 
-        def reclaim(path):
+        def reclaim(path, *, jobs=4):
+            self.assertEqual(jobs, 1)  # Four roots share the four-worker budget.
             barrier.wait()  # Fails if reclamation regresses to serial traversal.
-            original(path)
+            original(path, jobs=jobs)
 
-        with patch("stallionfs.core.shutil.rmtree", reclaim):
+        with patch("stallionfs.core.remove_tree", reclaim):
             self.assertCountEqual(self.store.gc(older_than=0, yes=True), identifiers)
         self.assertEqual((victim / "precious").read_text(), "keep")
         self.assertEqual(self.store.list("trash"), [])
         workspace = self.store.create(seed)
         self.store.move(workspace["id"])
-        with patch("stallionfs.core.shutil.rmtree", side_effect=PermissionError("denied")):
+        with patch("stallionfs.core.remove_tree", side_effect=PermissionError("denied")):
             with self.assertRaises(PermissionError):
                 self.store.gc(older_than=0, yes=True)
         self.assertEqual(self.store.list("trash")[0]["id"], workspace["id"])
@@ -213,14 +231,14 @@ class Workspaces(unittest.TestCase):
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/clonefile.h>
-static int unsupported(int a, const char *b, int c, const char *d, unsigned f) {
-    (void)a; (void)b; (void)c; (void)d; (void)f;
+static int unsupported(int a, int b, const char *c, unsigned f) {
+    (void)a; (void)b; (void)c; (void)f;
     if (getenv("STALLIONFS_TEST_INTERRUPT")) { raise(SIGINT); errno = EINTR; return -1; }
     errno = ENOTSUP; return -1;
 }
 __attribute__((used, section("__DATA,__interpose")))
 static struct { const void *replacement; const void *original; } interpose = {
-    (const void *)unsupported, (const void *)clonefileat
+    (const void *)unsupported, (const void *)fclonefileat
 };
 ''')
         library = self.base / "unsupported.dylib"
