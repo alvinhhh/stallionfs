@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+from ._scan import _private_directory
+
 import contextlib
-from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import stat
@@ -18,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 
 
 class StallionError(Exception):
@@ -44,6 +42,7 @@ def run(args, cwd=None, *, capture=True):
 
 def git(repo, *args):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
                 "-C", repo, *args])
 
 
@@ -80,7 +79,6 @@ def write_json(path, value):
 
 
 def private_directory(path):
-    from ._scan import _private_directory
     try:
         _private_directory(path)
     except OSError as exc:
@@ -205,6 +203,8 @@ class Store:
         return path, metadata
 
     def prepare(self, source, *, ref="HEAD", key, command=(), image_size=None):
+        import hashlib
+        import platform
         if sys.platform != "darwin":
             raise StallionError("stallionfs requires macOS and an APFS volume")
         source = Path(source).expanduser().resolve(strict=True)
@@ -282,6 +282,7 @@ class Store:
             return {"deleted" if yes else "would_delete": seed}
 
     def create(self, seed, *, name="", jobs=4):
+        import uuid
         identifier(seed, 64)
         if type(jobs) is not int or not 1 <= jobs <= 4:
             raise StallionError("jobs must be between 1 and 4")
@@ -407,11 +408,13 @@ class Store:
         tree_jobs = max(1, jobs // max(1, len(entries)))
         if not yes or len(entries) < 2:
             return [value for value in map(collect, entries) if value is not None]
+        from concurrent.futures import ThreadPoolExecutor
         # Share the worker budget across trees instead of multiplying it per tree.
         with ThreadPoolExecutor(max_workers=min(jobs, len(entries))) as pool:
             return [value for value in pool.map(collect, entries) if value is not None]
 
     def doctor(self):
+        import platform
         with self.staging() as stage:
             source = stage / "source"
             source.mkdir()

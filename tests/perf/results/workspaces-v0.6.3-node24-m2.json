@@ -1,0 +1,1413 @@
+{
+  "acceptance_protocol": {
+    "failures": "Stop and preserve partial rows and owned storage on any failure; no automatic restart/rerun.",
+    "fixture_mode": "Common umask 077 and locked Node 24/npm 10 offline fixture; content/executable-mode digest must agree across timing and memory, while fresh seed IDs/commit times remain recorded.",
+    "interval": "Seven within-round pairs; [minimum,maximum] gives 98.4375% distribution-free median coverage only under independent rounds. Retain order/timestamps for drift review.",
+    "memory": "This timing run does not measure memory. A separate memory report is required; no all-resource win is inferred.",
+    "paired_comparison": "Within each concurrency, paired Git/npm-minus-StallionFS lifecycle wall and process-plus-waited-child CPU seconds; positive values favor StallionFS. No predeclared 2x threshold.",
+    "public_coverage": "One/four requests, two current methods, default create/move/gc jobs 4; cold preparation, ready and complete cleanup remain distinct.",
+    "rounds": "One retained warmup plus seven measured rounds per configuration; two methods at each of one/four requests. Blocks alternate [1,4]/[4,1]; methods shuffle with fixed seed 20261006. All 32 batches retained (28 measured, 4 warmups).",
+    "scope": "0.6.3 folder workspace timing, one/four requests versus contemporaneous Git/npm. Both methods use the common Git helper."
+  },
+  "canonical_fixture_identity": {
+    "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+    "dependencies": {
+      "axios": "1.20.0",
+      "date-fns": "4.4.0",
+      "eslint": "10.12.0",
+      "lodash": "4.18.1",
+      "prettier": "3.9.9",
+      "react": "19.3.0",
+      "react-dom": "19.3.0",
+      "rxjs": "7.8.2",
+      "typescript": "7.0.2",
+      "zod": "4.6.5"
+    },
+    "digest_definition": "Existing harness SHA256 of sorted relative path, content/symlink-target SHA256 and executable bits; .git excluded",
+    "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+    "native_counts_including_git": {
+      "directories": 671,
+      "files": 12581,
+      "logical_bytes": 86580712,
+      "other": 0,
+      "skipped_mounts": 0,
+      "symlinks": 5
+    },
+    "seed_commit": "5063d4272e9b3b089fbca1579342fb4d7a9035d6",
+    "source_files_generated": 1000
+  },
+  "cleanup_passed": true,
+  "completed_utc": "2026-10-08T10:35:06.758409+00:00",
+  "concurrency_levels": [
+    1,
+    4
+  ],
+  "configurations": {
+    "stallionfs_folder": "Store.create jobs=4 per request; one or four requests",
+    "worktree_install": "Git worktree plus offline npm ci per request; serialized registration"
+  },
+  "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+  "cpu": "Apple M2",
+  "cpu_timing": "Process CPU including worker threads plus waited child-process CPU, summed over the same ready/remove/reclaim phases as wall time. Validation is excluded.",
+  "fixture_dependencies": {
+    "axios": "1.20.0",
+    "date-fns": "4.4.0",
+    "eslint": "10.12.0",
+    "lodash": "4.18.1",
+    "prettier": "3.9.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "rxjs": "7.8.2",
+    "typescript": "7.0.2",
+    "zod": "4.6.5"
+  },
+  "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+  "fixture_path": "<removed disposable workspace fixture>",
+  "fixture_umask": "077",
+  "format": 3,
+  "gc_configuration": "Folder method uses Store.move and Store.gc jobs=4",
+  "git": "git version 2.49.0",
+  "harness_sha256": "58c6aa77472a181dd2bd16e5d3c0a114cf8560717170c541e3c2a82615ddc59a",
+  "implementation_sha256": "76f96c6c2874030c35061c3fba657b4231722fd09b7da6917786aa4b5231e7dd",
+  "installed_python_sha256": {
+    "__init__.py": "b96bb47bca1946aa1aabb11cae6082698761a25cbc3f090eeae1f181a79d8fa1",
+    "core.py": "0968b0433cc88decf0fc8c08bd0d7f8b176c8cbf78db1a821f787af010f83888",
+    "images.py": "f9e54b6dff6c955c9b2ac6a91bbf1fcefe1ff9dfe243e6e37c4637560f56a687"
+  },
+  "internal_git_configuration": {
+    "core.fsmonitor": "false",
+    "core.hooksPath": "/dev/null",
+    "gc.autoDetach": "false",
+    "maintenance.autoDetach": "false"
+  },
+  "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+  "machine": "arm64",
+  "maximum_concurrency": 4,
+  "memory_bytes": 25769803776,
+  "methods": {
+    "1": {
+      "stallionfs_folder": {
+        "ready_cpu_s": {
+          "max": 8.893033999999943,
+          "median": 5.64888099999996,
+          "min": 2.7805960000000027
+        },
+        "ready_s": {
+          "max": 51.57455754105467,
+          "median": 3.368288667057641,
+          "min": 0.9012050000019372
+        },
+        "reclaim_cpu_s": {
+          "max": 2.3639990000000353,
+          "median": 2.114614000000074,
+          "min": 0.9624850000000009
+        },
+        "reclaim_s": {
+          "max": 34.97968233306892,
+          "median": 1.3338560829870403,
+          "min": 0.38675725006032735
+        },
+        "remove_cpu_s": {
+          "max": 0.0043230000001130975,
+          "median": 0.0023450000001048465,
+          "min": 0.000773999999992725
+        },
+        "remove_s": {
+          "max": 0.008698749938048422,
+          "median": 0.0024019579868763685,
+          "min": 0.0007467499235644937
+        },
+        "total_cpu_s": {
+          "max": 11.261356000000092,
+          "median": 7.743792000000099,
+          "min": 3.7438549999999964
+        },
+        "total_s": {
+          "max": 86.56293862406164,
+          "median": 5.339527914999053,
+          "min": 1.288708999985829
+        }
+      },
+      "worktree_install": {
+        "ready_cpu_s": {
+          "max": 19.111352999999895,
+          "median": 7.649840999999981,
+          "min": 3.628091000000012
+        },
+        "ready_s": {
+          "max": 86.20937241602223,
+          "median": 5.470459208008833,
+          "min": 1.6943002910120413
+        },
+        "reclaim_cpu_s": {
+          "max": 1.3000000080864993e-05,
+          "median": 7.999999979801942e-06,
+          "min": 5.000000001587068e-06
+        },
+        "reclaim_s": {
+          "max": 9.584007784724236e-06,
+          "median": 6.00004568696022e-06,
+          "min": 4.625064320862293e-06
+        },
+        "remove_cpu_s": {
+          "max": 3.603753999999981,
+          "median": 1.6311640000000125,
+          "min": 0.6815619999999996
+        },
+        "remove_s": {
+          "max": 12.661693250061944,
+          "median": 1.9307098749559373,
+          "min": 0.7616860419511795
+        },
+        "total_cpu_s": {
+          "max": 22.715119999999956,
+          "median": 9.281011999999976,
+          "min": 4.309658000000013
+        },
+        "total_s": {
+          "max": 98.87107525009196,
+          "median": 9.210638666991144,
+          "min": 2.4559909580275416
+        }
+      }
+    },
+    "4": {
+      "stallionfs_folder": {
+        "ready_cpu_s": {
+          "max": 25.101707000000005,
+          "median": 23.32908900000001,
+          "min": 12.256946000000013
+        },
+        "ready_s": {
+          "max": 12.402789792045951,
+          "median": 7.879145957995206,
+          "min": 3.660373791004531
+        },
+        "reclaim_cpu_s": {
+          "max": 8.627499000000057,
+          "median": 7.793025999999998,
+          "min": 4.053822999999994
+        },
+        "reclaim_s": {
+          "max": 19.83226283302065,
+          "median": 3.4298070420045406,
+          "min": 1.701228916994296
+        },
+        "remove_cpu_s": {
+          "max": 0.006909000000177912,
+          "median": 0.003816999999997961,
+          "min": 0.002970000000004802
+        },
+        "remove_s": {
+          "max": 0.007769000018015504,
+          "median": 0.003729332936927676,
+          "min": 0.0016482080100104213
+        },
+        "total_cpu_s": {
+          "max": 32.898521000000045,
+          "median": 31.45449500000018,
+          "min": 16.313739000000012
+        },
+        "total_s": {
+          "max": 32.24029179208446,
+          "median": 10.566189583041705,
+          "min": 5.3632509160088375
+        }
+      },
+      "worktree_install": {
+        "ready_cpu_s": {
+          "max": 40.434567000000015,
+          "median": 35.8165919999999,
+          "min": 18.018964999999994
+        },
+        "ready_s": {
+          "max": 38.12744162499439,
+          "median": 13.958055083057843,
+          "min": 5.43607012508437
+        },
+        "reclaim_cpu_s": {
+          "max": 1.1000000085914508e-05,
+          "median": 8.999999977277184e-06,
+          "min": 4.0000000041118255e-06
+        },
+        "reclaim_s": {
+          "max": 9.416951797902584e-06,
+          "median": 7.333001121878624e-06,
+          "min": 2.874992787837982e-06
+        },
+        "remove_cpu_s": {
+          "max": 12.13316599999996,
+          "median": 10.613454000000047,
+          "min": 5.089537000000007
+        },
+        "remove_s": {
+          "max": 11.384315666975453,
+          "median": 5.548727208049968,
+          "min": 2.1245513750473037
+        },
+        "total_cpu_s": {
+          "max": 51.57874200000009,
+          "median": 45.65614500000004,
+          "min": 23.108506000000006
+        },
+        "total_s": {
+          "max": 44.68988904193975,
+          "median": 25.342378166969866,
+          "min": 7.560624375124462
+        }
+      }
+    }
+  },
+  "methods_selected": [
+    "worktree_install",
+    "stallionfs_folder"
+  ],
+  "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+  "node": "v24.19.0",
+  "npm": "10.9.2",
+  "paired_comparisons": {
+    "1": {
+      "candidate": "stallionfs_folder",
+      "cpu_saving_interval_s": [
+        0.5658030000000167,
+        11.453763999999865
+      ],
+      "interval_coverage": 0.984375,
+      "lower_cpu_demonstrated": true,
+      "lower_wall_demonstrated": true,
+      "median_cpu_saving_s": 1.9757280000000037,
+      "median_wall_saving_s": 3.8711107519920915,
+      "paired_cpu_saving_s": [
+        0.5658030000000167,
+        1.1966150000000084,
+        1.0471650000000068,
+        2.1471859999999765,
+        1.9757280000000037,
+        3.1617359999997916,
+        11.453763999999865
+      ],
+      "paired_wall_saving_s": [
+        1.1672819580417126,
+        2.078306998941116,
+        1.30800858407747,
+        3.8711107519920915,
+        8.85680091578979,
+        9.313038539956324,
+        12.308136626030318
+      ],
+      "reference": "worktree_install",
+      "wall_saving_interval_s": [
+        1.1672819580417126,
+        12.308136626030318
+      ]
+    },
+    "4": {
+      "candidate": "stallionfs_folder",
+      "cpu_saving_interval_s": [
+        6.794766999999993,
+        19.64372700000007
+      ],
+      "interval_coverage": 0.984375,
+      "lower_cpu_demonstrated": true,
+      "lower_wall_demonstrated": false,
+      "median_cpu_saving_s": 14.439344000000006,
+      "median_wall_saving_s": 14.815919458051212,
+      "paired_cpu_saving_s": [
+        6.794766999999993,
+        14.439344000000006,
+        15.24741000000003,
+        19.64372700000007,
+        13.573800000000233,
+        19.635532000000126,
+        14.201649999999859
+      ],
+      "paired_wall_saving_s": [
+        2.1973734591156244,
+        5.762684248038568,
+        15.578019417007454,
+        27.70962837501429,
+        14.815919458051212,
+        21.014388834824786,
+        -14.462017126032151
+      ],
+      "reference": "worktree_install",
+      "wall_saving_interval_s": [
+        -14.462017126032151,
+        27.70962837501429
+      ]
+    }
+  },
+  "preparation": {
+    "stallionfs_folder": {
+      "amortization_workspaces": 1,
+      "cold_prepare_s": 2.328742375015281,
+      "seed_logical_bytes": 86580712,
+      "seed_regular_files": 12581
+    }
+  },
+  "python": "3.13.3",
+  "raw": {
+    "1": {
+      "stallionfs_folder": [
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:19:18.930231+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 2.418750000000001,
+          "ready_s": 0.7753596249967813,
+          "reclaim_cpu_s": 0.8858340000000009,
+          "reclaim_s": 0.34845525003038347,
+          "remove_cpu_s": 0.0008959999999991197,
+          "remove_s": 0.0008672919357195497,
+          "sample": 0,
+          "started_utc": "2026-10-08T10:19:15.519868+00:00",
+          "total_cpu_s": 3.305480000000001,
+          "total_s": 1.1246821669628844,
+          "validated": true,
+          "warmup": true,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:20:19.909112+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 2.7805960000000027,
+          "ready_s": 0.9012050000019372,
+          "reclaim_cpu_s": 0.9624850000000009,
+          "reclaim_s": 0.38675725006032735,
+          "remove_cpu_s": 0.000773999999992725,
+          "remove_s": 0.0007467499235644937,
+          "sample": 1,
+          "started_utc": "2026-10-08T10:20:16.337203+00:00",
+          "total_cpu_s": 3.7438549999999964,
+          "total_s": 1.288708999985829,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:20:23.852859+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 3.098811000000012,
+          "ready_s": 1.0022402500035241,
+          "reclaim_cpu_s": 1.0975880000000018,
+          "reclaim_s": 0.5366087920265272,
+          "remove_cpu_s": 0.0008969999999948186,
+          "remove_s": 0.0008663330227136612,
+          "sample": 2,
+          "started_utc": "2026-10-08T10:20:19.910293+00:00",
+          "total_cpu_s": 4.197296000000009,
+          "total_s": 1.539715375052765,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:23:06.160470+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 6.030760999999984,
+          "ready_s": 4.712650500005111,
+          "reclaim_cpu_s": 2.20061800000002,
+          "reclaim_s": 1.3338560829870403,
+          "remove_cpu_s": 0.0024679999999648317,
+          "remove_s": 0.002590458025224507,
+          "sample": 3,
+          "started_utc": "2026-10-08T10:22:48.113775+00:00",
+          "total_cpu_s": 8.233846999999969,
+          "total_s": 6.049097041017376,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:23:29.271758+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 5.619793000000072,
+          "ready_s": 3.5661724159726873,
+          "reclaim_cpu_s": 2.1203409999999963,
+          "reclaim_s": 1.7690360830165446,
+          "remove_cpu_s": 0.003658000000029915,
+          "remove_s": 0.004319416009820998,
+          "sample": 4,
+          "started_utc": "2026-10-08T10:23:16.400626+00:00",
+          "total_cpu_s": 7.743792000000099,
+          "total_s": 5.339527914999053,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:27:12.704983+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 5.691834999999969,
+          "ready_s": 2.1759192920289934,
+          "reclaim_cpu_s": 1.4675099999999475,
+          "reclaim_s": 0.5841947920853272,
+          "remove_cpu_s": 0.001180000000090331,
+          "remove_s": 0.0011338329641148448,
+          "sample": 5,
+          "started_utc": "2026-10-08T10:27:06.566610+00:00",
+          "total_cpu_s": 7.160525000000007,
+          "total_s": 2.7612479170784354,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:28:02.412097+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 5.64888099999996,
+          "ready_s": 3.368288667057641,
+          "reclaim_cpu_s": 2.114614000000074,
+          "reclaim_s": 2.4875469589605927,
+          "remove_cpu_s": 0.0023450000001048465,
+          "remove_s": 0.0024019579868763685,
+          "sample": 6,
+          "started_utc": "2026-10-08T10:27:50.969668+00:00",
+          "total_cpu_s": 7.765840000000139,
+          "total_s": 5.85823758400511,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:34:37.918698+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 8.893033999999943,
+          "ready_s": 51.57455754105467,
+          "reclaim_cpu_s": 2.3639990000000353,
+          "reclaim_s": 34.97968233306892,
+          "remove_cpu_s": 0.0043230000001130975,
+          "remove_s": 0.008698749938048422,
+          "sample": 7,
+          "started_utc": "2026-10-08T10:32:44.847091+00:00",
+          "total_cpu_s": 11.261356000000092,
+          "total_s": 86.56293862406164,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        }
+      ],
+      "worktree_install": [
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:19:15.518926+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 3.3074790000000007,
+          "ready_s": 1.4785547079518437,
+          "reclaim_cpu_s": 2.000000000279556e-06,
+          "reclaim_s": 1.6669509932398796e-06,
+          "remove_cpu_s": 0.6946499999999993,
+          "remove_s": 0.7192302909679711,
+          "sample": 0,
+          "started_utc": "2026-10-08T10:19:12.518017+00:00",
+          "total_cpu_s": 4.002131,
+          "total_s": 2.197786665870808,
+          "validated": true,
+          "warmup": true,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:20:16.336081+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 3.628091000000012,
+          "ready_s": 1.6943002910120413,
+          "reclaim_cpu_s": 5.000000001587068e-06,
+          "reclaim_s": 4.625064320862293e-06,
+          "remove_cpu_s": 0.6815619999999996,
+          "remove_s": 0.7616860419511795,
+          "sample": 1,
+          "started_utc": "2026-10-08T10:20:13.025743+00:00",
+          "total_cpu_s": 4.309658000000013,
+          "total_s": 2.4559909580275416,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:20:28.439887+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 4.3381200000000035,
+          "ready_s": 1.965436915983446,
+          "reclaim_cpu_s": 6.000000013273166e-06,
+          "reclaim_s": 4.708068445324898e-06,
+          "remove_cpu_s": 1.0557850000000002,
+          "remove_s": 1.6525807499419898,
+          "sample": 2,
+          "started_utc": "2026-10-08T10:20:23.854231+00:00",
+          "total_cpu_s": 5.393911000000017,
+          "total_s": 3.618022373993881,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:23:16.397067+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 7.649840999999981,
+          "ready_s": 5.4263897080672905,
+          "reclaim_cpu_s": 6.999999982326699e-06,
+          "reclaim_s": 6.042071618139744e-06,
+          "remove_cpu_s": 1.6311640000000125,
+          "remove_s": 1.9307098749559373,
+          "sample": 3,
+          "started_utc": "2026-10-08T10:23:06.164101+00:00",
+          "total_cpu_s": 9.281011999999976,
+          "total_s": 7.357105625094846,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:23:41.076485+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 8.343719000000021,
+          "ready_s": 7.471335917012766,
+          "reclaim_cpu_s": 8.00000003664536e-06,
+          "reclaim_s": 6.00004568696022e-06,
+          "remove_cpu_s": 1.547251000000017,
+          "remove_s": 1.7392967499326915,
+          "sample": 4,
+          "started_utc": "2026-10-08T10:23:29.276274+00:00",
+          "total_cpu_s": 9.890978000000075,
+          "total_s": 9.210638666991144,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:27:33.062176+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 6.872068000000013,
+          "ready_s": 5.470459208008833,
+          "reclaim_cpu_s": 7.999999979801942e-06,
+          "reclaim_s": 5.874899215996265e-06,
+          "remove_cpu_s": 2.264177000000018,
+          "remove_s": 6.147583749960177,
+          "sample": 5,
+          "started_utc": "2026-10-08T10:27:12.707319+00:00",
+          "total_cpu_s": 9.13625300000001,
+          "total_s": 11.618048832868226,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:27:50.964746+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 8.892976999999973,
+          "ready_s": 12.428921708022244,
+          "reclaim_cpu_s": 8.999999977277184e-06,
+          "reclaim_s": 6.95791095495224e-06,
+          "remove_cpu_s": 2.03458999999998,
+          "remove_s": 2.7423474580282345,
+          "sample": 6,
+          "started_utc": "2026-10-08T10:27:33.066429+00:00",
+          "total_cpu_s": 10.927575999999931,
+          "total_s": 15.171276123961434,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:32:44.826132+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 19.111352999999895,
+          "ready_s": 86.20937241602223,
+          "reclaim_cpu_s": 1.3000000080864993e-05,
+          "reclaim_s": 9.584007784724236e-06,
+          "remove_cpu_s": 3.603753999999981,
+          "remove_s": 12.661693250061944,
+          "sample": 7,
+          "started_utc": "2026-10-08T10:30:29.593553+00:00",
+          "total_cpu_s": 22.715119999999956,
+          "total_s": 98.87107525009196,
+          "validated": true,
+          "warmup": false,
+          "workers": 1
+        }
+      ]
+    },
+    "4": {
+      "stallionfs_folder": [
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:19:36.602070+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 10.507156000000002,
+          "ready_s": 3.3619815830606967,
+          "reclaim_cpu_s": 3.571681000000005,
+          "reclaim_s": 1.4479945410275832,
+          "remove_cpu_s": 0.003080999999998113,
+          "remove_s": 0.0021475410321727395,
+          "sample": 0,
+          "started_utc": "2026-10-08T10:19:18.930996+00:00",
+          "total_cpu_s": 14.081918000000005,
+          "total_s": 4.812123665120453,
+          "validated": true,
+          "warmup": true,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:20:13.024728+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 12.256946000000013,
+          "ready_s": 3.660373791004531,
+          "reclaim_cpu_s": 4.053822999999994,
+          "reclaim_s": 1.701228916994296,
+          "remove_cpu_s": 0.002970000000004802,
+          "remove_s": 0.0016482080100104213,
+          "sample": 1,
+          "started_utc": "2026-10-08T10:19:58.325738+00:00",
+          "total_cpu_s": 16.313739000000012,
+          "total_s": 5.3632509160088375,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:20:45.998763+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 16.64814899999999,
+          "ready_s": 4.727165958960541,
+          "reclaim_cpu_s": 6.209231000000017,
+          "reclaim_s": 2.6347096669487655,
+          "remove_cpu_s": 0.003816999999997961,
+          "remove_s": 0.0024463749723508954,
+          "sample": 2,
+          "started_utc": "2026-10-08T10:20:28.441861+00:00",
+          "total_cpu_s": 22.861197000000004,
+          "total_s": 7.364322000881657,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:21:25.733608+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 25.101707000000005,
+          "ready_s": 6.330822375020944,
+          "reclaim_cpu_s": 7.793025999999998,
+          "reclaim_s": 3.4298070420045406,
+          "remove_cpu_s": 0.003788000000042757,
+          "remove_s": 0.003729332936927676,
+          "sample": 3,
+          "started_utc": "2026-10-08T10:21:04.946911+00:00",
+          "total_cpu_s": 32.898521000000045,
+          "total_s": 9.764358749962412,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:24:17.347616+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 23.32908900000001,
+          "ready_s": 9.998170958016999,
+          "reclaim_cpu_s": 8.600561999999968,
+          "reclaim_s": 6.979014666983858,
+          "remove_cpu_s": 0.005364000000042779,
+          "remove_s": 0.0030750419246032834,
+          "sample": 4,
+          "started_utc": "2026-10-08T10:23:41.094713+00:00",
+          "total_cpu_s": 31.93501500000002,
+          "total_s": 16.98026066692546,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:26:14.872832+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 0,
+          "ready_cpu_s": 23.340823999999998,
+          "ready_s": 11.237742458004504,
+          "reclaim_cpu_s": 8.627499000000057,
+          "reclaim_s": 4.1153890419518575,
+          "remove_cpu_s": 0.006426999999916916,
+          "remove_s": 0.005102416966110468,
+          "sample": 5,
+          "started_utc": "2026-10-08T10:25:23.927726+00:00",
+          "total_cpu_s": 31.974749999999972,
+          "total_s": 15.358233916922472,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:29:13.327417+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 23.83372899999995,
+          "ready_s": 7.879145957995206,
+          "reclaim_cpu_s": 7.368273000000045,
+          "reclaim_s": 2.6792746250284836,
+          "remove_cpu_s": 0.003621999999950276,
+          "remove_s": 0.007769000018015504,
+          "sample": 6,
+          "started_utc": "2026-10-08T10:28:50.767147+00:00",
+          "total_cpu_s": 31.205623999999943,
+          "total_s": 10.566189583041705,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:30:29.577426+00:00",
+          "method": "stallionfs_folder",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 1,
+          "ready_cpu_s": 23.092540999999983,
+          "ready_s": 12.402789792045951,
+          "reclaim_cpu_s": 8.355045000000018,
+          "reclaim_s": 19.83226283302065,
+          "remove_cpu_s": 0.006909000000177912,
+          "remove_s": 0.005239167017862201,
+          "sample": 7,
+          "started_utc": "2026-10-08T10:29:36.489417+00:00",
+          "total_cpu_s": 31.45449500000018,
+          "total_s": 32.24029179208446,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        }
+      ],
+      "worktree_install": [
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:19:47.568429+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 17.499920999999993,
+          "ready_s": 5.601979665923864,
+          "reclaim_cpu_s": 2.9999999995311555e-06,
+          "reclaim_s": 2.1669548004865646e-06,
+          "remove_cpu_s": 5.090841999999995,
+          "remove_s": 2.1112376670353115,
+          "sample": 0,
+          "started_utc": "2026-10-08T10:19:36.603122+00:00",
+          "total_cpu_s": 22.590765999999988,
+          "total_s": 7.713219499913976,
+          "validated": true,
+          "warmup": true,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:19:58.324170+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 18.018964999999994,
+          "ready_s": 5.43607012508437,
+          "reclaim_cpu_s": 4.0000000041118255e-06,
+          "reclaim_s": 2.874992787837982e-06,
+          "remove_cpu_s": 5.089537000000007,
+          "remove_s": 2.1245513750473037,
+          "sample": 1,
+          "started_utc": "2026-10-08T10:19:47.569401+00:00",
+          "total_cpu_s": 23.108506000000006,
+          "total_s": 7.560624375124462,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:21:04.943972+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 28.253874000000025,
+          "ready_s": 9.348340207943693,
+          "reclaim_cpu_s": 7.999999979801942e-06,
+          "reclaim_s": 5.875015631318092e-06,
+          "remove_cpu_s": 9.046659000000005,
+          "remove_s": 3.7786601659609005,
+          "sample": 2,
+          "started_utc": "2026-10-08T10:20:46.000639+00:00",
+          "total_cpu_s": 37.30054100000001,
+          "total_s": 13.127006248920225,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:22:48.107918+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 36.01275500000003,
+          "ready_s": 13.958055083057843,
+          "reclaim_cpu_s": 1.0000000088439265e-05,
+          "reclaim_s": 7.416936568915844e-06,
+          "remove_cpu_s": 12.13316599999996,
+          "remove_s": 11.384315666975453,
+          "sample": 3,
+          "started_utc": "2026-10-08T10:21:25.736858+00:00",
+          "total_cpu_s": 48.145931000000076,
+          "total_s": 25.342378166969866,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:25:23.921929+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 40.434567000000015,
+          "ready_s": 38.12744162499439,
+          "reclaim_cpu_s": 1.0000000031595846e-05,
+          "reclaim_s": 7.333001121878624e-06,
+          "remove_cpu_s": 11.144165000000044,
+          "remove_s": 6.562440083944239,
+          "sample": 4,
+          "started_utc": "2026-10-08T10:24:17.357586+00:00",
+          "total_cpu_s": 51.57874200000009,
+          "total_s": 44.68988904193975,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:27:06.561142+00:00",
+          "method": "worktree_install",
+          "order": [
+            "stallionfs_folder",
+            "worktree_install"
+          ],
+          "position": 1,
+          "ready_cpu_s": 34.84090800000001,
+          "ready_s": 24.62541674997192,
+          "reclaim_cpu_s": 1.1000000085914508e-05,
+          "reclaim_s": 9.416951797902584e-06,
+          "remove_cpu_s": 10.707631000000106,
+          "remove_s": 5.548727208049968,
+          "sample": 5,
+          "started_utc": "2026-10-08T10:26:14.876413+00:00",
+          "total_cpu_s": 45.548550000000205,
+          "total_s": 30.174153374973685,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            1,
+            4
+          ],
+          "block_position": 1,
+          "completed_utc": "2026-10-08T10:28:50.761874+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 40.22769400000004,
+          "ready_s": 26.06344891700428,
+          "reclaim_cpu_s": 7.999999979801942e-06,
+          "reclaim_s": 5.833921022713184e-06,
+          "remove_cpu_s": 10.613454000000047,
+          "remove_s": 5.517123666941188,
+          "sample": 6,
+          "started_utc": "2026-10-08T10:28:02.419188+00:00",
+          "total_cpu_s": 50.84115600000007,
+          "total_s": 31.58057841786649,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        },
+        {
+          "block_order": [
+            4,
+            1
+          ],
+          "block_position": 0,
+          "completed_utc": "2026-10-08T10:29:36.484522+00:00",
+          "method": "worktree_install",
+          "order": [
+            "worktree_install",
+            "stallionfs_folder"
+          ],
+          "position": 0,
+          "ready_cpu_s": 35.8165919999999,
+          "ready_s": 11.847112666000612,
+          "reclaim_cpu_s": 8.999999977277184e-06,
+          "reclaim_s": 7.3750270530581474e-06,
+          "remove_cpu_s": 9.83954400000016,
+          "remove_s": 5.9311546250246465,
+          "sample": 7,
+          "started_utc": "2026-10-08T10:29:13.331749+00:00",
+          "total_cpu_s": 45.65614500000004,
+          "total_s": 17.77827466605231,
+          "validated": true,
+          "warmup": false,
+          "workers": 4
+        }
+      ]
+    }
+  },
+  "runtime_note": "Git-only corrected installed 0.6.3 Python; one/four requests with default jobs4. Both methods use foreground automatic Git maintenance. Historical timings are not a causal comparison.",
+  "samples": 7,
+  "seed_logical_bytes": 86580712,
+  "seed_regular_files": 12581,
+  "setup": [
+    "npm",
+    "ci",
+    "--offline",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--cache",
+    "<isolated warm npm cache>"
+  ],
+  "source_files_generated": 1000,
+  "source_sha256": {
+    "__init__.py": "b96bb47bca1946aa1aabb11cae6082698761a25cbc3f090eeae1f181a79d8fa1",
+    "_scan.c": "7b3a358c844f698a7e60ba25be2265d5e9344d273388ff5bb035edb87172c545",
+    "_tree.c": "999d4a718c27eccd588d61d42165765ddc5daea09e12ce5bce16e1fdfee9eb8d",
+    "_tree.h": "511181733341af3f9e6dd41f918a1534453b8911acae0bf4a1f8d2cee3a924af",
+    "_walk.c": "dbdf7abb3b46f8beac2dffe799e533248a26205d6feb8f25dbc4c0517a695979",
+    "core.py": "0968b0433cc88decf0fc8c08bd0d7f8b176c8cbf78db1a821f787af010f83888",
+    "images.py": "f9e54b6dff6c955c9b2ac6a91bbf1fcefe1ff9dfe243e6e37c4637560f56a687",
+    "tests/perf/fileops.py": "cf0c0ceace7f35a30feb439c09d1dba551dd1d8b27d9a2952b5185539d808027",
+    "tests/perf/run.py": "3071f1b779543e89c7d2d077b0a612beffdd4f33f96614bcdda0303c8e66a4ad"
+  },
+  "status": "complete",
+  "storage_note": "Seed content bytes include Git; shared APFS clone blocks are not inferred from logical file sizes.",
+  "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "tested_wheel_sha256": "a5e54736d29084c02f279dae7e7e7af8d4faf91f2b0441b98e23ac55f2f76454",
+  "timestamp": "2026-10-08T10:19:08.327872+00:00",
+  "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
+  "version": "0.6.3",
+  "warmup_batches_per_configuration": 1,
+  "workload_matrix": {
+    "1": [
+      "worktree_install",
+      "stallionfs_folder"
+    ],
+    "4": [
+      "worktree_install",
+      "stallionfs_folder"
+    ]
+  },
+  "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
+  "worktree_comparisons": {
+    "1": {
+      "ready_s": {
+        "baseline": 5.470459208008833,
+        "candidate": 3.368288667057641,
+        "candidate_minus_baseline": -2.1021705409511924,
+        "percent_change": -38.42767967035717,
+        "baseline_divided_by_candidate": 1.6241064079544991
+      },
+      "ready_cpu_s": {
+        "baseline": 7.649840999999981,
+        "candidate": 5.64888099999996,
+        "candidate_minus_baseline": -2.0009600000000205,
+        "percent_change": -26.156883522154583,
+        "baseline_divided_by_candidate": 1.3542223672263647
+      },
+      "total_s": {
+        "baseline": 9.210638666991144,
+        "candidate": 5.339527914999053,
+        "candidate_minus_baseline": -3.8711107519920915,
+        "percent_change": -42.02868977875857,
+        "baseline_divided_by_candidate": 1.7249912002740748
+      },
+      "total_cpu_s": {
+        "baseline": 9.281011999999976,
+        "candidate": 7.743792000000099,
+        "candidate_minus_baseline": -1.537219999999877,
+        "percent_change": -16.563064458917637,
+        "baseline_divided_by_candidate": 1.1985099806399575
+      }
+    },
+    "4": {
+      "ready_s": {
+        "baseline": 13.958055083057843,
+        "candidate": 7.879145957995206,
+        "candidate_minus_baseline": -6.078909125062637,
+        "percent_change": -43.55126189780667,
+        "baseline_divided_by_candidate": 1.7715187861057689
+      },
+      "ready_cpu_s": {
+        "baseline": 35.8165919999999,
+        "candidate": 23.32908900000001,
+        "candidate_minus_baseline": -12.48750299999989,
+        "percent_change": -34.8651345722673,
+        "baseline_divided_by_candidate": 1.5352760667165308
+      },
+      "total_s": {
+        "baseline": 25.342378166969866,
+        "candidate": 10.566189583041705,
+        "candidate_minus_baseline": -14.77618858392816,
+        "percent_change": -58.3062429523161,
+        "baseline_divided_by_candidate": 2.39844060792202
+      },
+      "total_cpu_s": {
+        "baseline": 45.65614500000004,
+        "candidate": 31.45449500000018,
+        "candidate_minus_baseline": -14.201649999999859,
+        "percent_change": -31.105670441514164,
+        "baseline_divided_by_candidate": 1.4514982675766939
+      }
+    }
+  },
+  "average_cpu_cores": {
+    "1": {
+      "worktree_install": {
+        "min": 0.22974484643302015,
+        "median": 1.0738645122891546,
+        "max": 1.7547532029438702
+      },
+      "stallionfs_folder": {
+        "min": 0.1300944281583089,
+        "median": 1.4502765269280313,
+        "max": 2.905120550908828
+      }
+    },
+    "4": {
+      "worktree_install": {
+        "min": 1.1541479091969866,
+        "median": 1.899818978423712,
+        "max": 3.0564282595535763
+      },
+      "stallionfs_folder": {
+        "min": 0.9756268709615956,
+        "median": 2.9533469709916687,
+        "max": 3.3692454202511444
+      }
+    }
+  },
+  "comparison_method": {
+    "baseline": "Git worktree creation plus offline npm ci, completed removal and final Git prune.",
+    "default": "Prepared folder backend with create jobs=4; one or four concurrent requests. Move and GC remain jobs=4.",
+    "samples": "Seven measured rounds plus one retained warmup for each of four configurations; all 32 rows preserved.",
+    "cpu": "Coordinator process CPU including native threads plus waited child CPU over matching ready/remove/reclaim phases; validation excluded.",
+    "cpu_utilization": "Median/min/max of per-batch total_cpu_s/total_s, not a ratio of medians. Average occupied cores are not peak or machine-wide utilization.",
+    "formulas": "Current default comparison: candidate median minus Git/npm median; ratio Git/npm divided by candidate. Negative differences and ratios above one favor candidate.",
+    "paired_intervals": "Default-method intervals use seven within-round Git/npm-minus-StallionFS lifecycle differences at each concurrency; min/max has 98.4375% coverage for the median only under independent rounds. Host drift may correlate rounds; no sample exclusions or correction applied.",
+    "memory": "No memory measurement in this timing report. Separate memory results must validate the canonical fixture digest; no memory advantage is inferred here.",
+    "units": "Seconds for wall/CPU; average CPU cores dimensionless. Cold preparation remains separate from ready/lifecycle timing."
+  },
+  "host_drift_context": {
+    "note": "Elapsed-time ranges, timestamps and shuffled order are retained for both methods. These data do not isolate causes of variation or establish a causal comparison against earlier releases.",
+    "baseline_lifecycle_range_s": {
+      "1": {
+        "min": 2.4559909580275416,
+        "median": 9.210638666991144,
+        "max": 98.87107525009196
+      },
+      "4": {
+        "min": 7.560624375124462,
+        "median": 25.342378166969866,
+        "max": 44.68988904193975
+      }
+    }
+  },
+  "export_provenance": {
+    "original_result_sha256": "f94b3ce9ef81f06d419955f442ffd687b079a913ad5232020df883df075f4056",
+    "derivation_script_sha256": "0504919160e2b7a23ed9ef51b1e426f8eb0e10a26d25f21c4ac5f1cea532cbe3",
+    "helper_script_sha256": "e80226f48e28b41a529ab8fb8eeeee472a788ac9399a712c6f6e88adbc1a4f56",
+    "package_build_sha256": "cf4a6e893b80fd6fd606c8c337ae0805dc70452a1072b7f1e066eadb994634ff",
+    "tested_wheel_sha256": "a5e54736d29084c02f279dae7e7e7af8d4faf91f2b0441b98e23ac55f2f76454",
+    "retained_rows": 32,
+    "retained_warmup_rows": 4,
+    "retained_measured_rows": 28,
+    "preserved_raw_sha256": "99bbd50c662155ca6e2857909355261da8e418705eab2e0760d600fda0507677",
+    "medians_and_paired_effects_verified": true,
+    "modified_fields": [
+      "fixture_path",
+      "acceptance_protocol.memory",
+      "source_sha256",
+      "acceptance_protocol.version_comparison",
+      "acceptance_protocol.scope"
+    ],
+    "preservation": "All 32 raw rows, summaries, paired comparisons and retained runtime/product-source hashes are unchanged. The fixture path and memory note are sanitized; five internal preparation/verification source aliases and a run-history note are omitted, and the scope wording is updated. No measured rows, warmups or losses are omitted.",
+    "added_fields": [
+      "worktree_comparisons",
+      "average_cpu_cores",
+      "comparison_method",
+      "host_drift_context",
+      "export_provenance"
+    ]
+  }
+}

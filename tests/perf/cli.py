@@ -121,7 +121,7 @@ def content_manifest(path):
     if not path.is_dir():
         return manifest(path)
     result = {}
-    for item in [path, *sorted(path.rglob("*"))]:
+    for item in [path, *path.rglob("*")]:
         relative = item.relative_to(path).as_posix()
         info = item.lstat()
         if stat.S_ISFIFO(info.st_mode):

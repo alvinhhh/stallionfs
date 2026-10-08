@@ -1,5 +1,6 @@
 """Native scanner checks; install with `python -m pip install -e .` first."""
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -118,7 +119,8 @@ class Scan(unittest.TestCase):
             subprocess.run([*common, str(tests / 'native_scan_faults.c'), str(object_file), '-o', str(driver)],
                            check=True, timeout=30)
             subprocess.run([str(driver), str(base)], check=True, timeout=15)
-            subprocess.run([*common, '-DSTALLION_TEST_CLI', str(tests / 'native_scan_faults.c'),
+            subprocess.run([*common, '-DSTALLION_TEST_CLI', f'-DSTALLIONFS_VERSION="{version("stallionfs")}"',
+                            str(tests / 'native_scan_faults.c'),
                             str(source / '_main.c'), str(source / '_tree.c'), str(object_file),
                             '-o', str(launcher)], check=True, timeout=30)
             fixture = base / 'fixture'; fixture.mkdir(); (fixture / 'file').write_bytes(b'counted before signal')

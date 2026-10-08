@@ -17,7 +17,7 @@
 
 static const char *fault;
 static pthread_t caller;
-static char outside[PATH_MAX];
+static char outside[PATH_MAX], source[PATH_MAX];
 static atomic_int entered, release_worker, cancelled, active, swaps, starts, created, joined;
 static int cancel(void *unused) { (void)unused; assert(pthread_equal(pthread_self(), caller)); return atomic_load(&cancelled); }
 static void pause_worker(void) {
@@ -43,19 +43,16 @@ int stallion_test_fclonefileat(int source, int destination, const char *name, ui
     pause_worker();
     return fclonefileat(source, destination, name, flags);
 }
-int stallion_test_clonefileat(int src, const char *from, int dst, const char *to, uint32_t flags) {
-    if (copy_error()) return -1;
-    pause_worker();
-    return clonefileat(src, from, dst, to, flags);
-}
-int stallion_test_clonefile(const char *from, const char *to, uint32_t flags) {
-    if (copy_error()) return -1;
-    pause_worker();
-    return clonefile(from, to, flags);
-}
 int stallion_test_unlinkat(int fd, const char *name, int flags) {
     if (!flags) pause_worker();
-    return unlinkat(fd, name, flags);
+    int result = unlinkat(fd, name, flags);
+    if (!result && !flags && !strcmp(fault, "swap-postorder") && !atomic_exchange(&swaps, 1)) {
+        char held[PATH_MAX];
+        assert(snprintf(held, sizeof(held), "%s-held", source) < (int)sizeof(held));
+        assert(rename(source, held) == 0);
+        assert(rename(outside, source) == 0);
+    }
+    return result;
 }
 int stallion_test_openat(int fd, const char *name, int flags, ...) {
     mode_t mode = 0;
@@ -110,7 +107,7 @@ static void *cancel_worker(void *unused) {
     return NULL;
 }
 static void check(const char *base, int deleting, const char *kind) {
-    char root[PATH_MAX], source[PATH_MAX], destination[PATH_MAX], child[PATH_MAX], error_path[PATH_MAX];
+    char root[PATH_MAX], destination[PATH_MAX], child[PATH_MAX], error_path[PATH_MAX];
     snprintf(root, sizeof(root), "%s/%s-%s", base, deleting ? "delete" : "clone", kind);
     assert(mkdir(root, 0700) == 0);
     snprintf(source, sizeof(source), "%s/source", root); assert(mkdir(source, 0700) == 0);
@@ -140,6 +137,12 @@ static void check(const char *base, int deleting, const char *kind) {
     else if (!strcmp(kind, "enospc")) assert(error == ENOSPC);
     else if (!strcmp(kind, "unsupported")) assert(error == ENOTSUP);
     else if (!strncmp(kind, "thread-", 7)) assert(error == EAGAIN);
+    else if (!strcmp(kind, "swap-postorder")) {
+        assert(deleting && error == ESTALE && atomic_load(&swaps) == 1);
+        sentinel(source);
+        printf("PASS delete postorder root replacement: outside directory unchanged\n");
+        return;
+    }
     else {
         assert(atomic_load(&swaps) == 1);
         if (!strcmp(kind, "swap-destination")) {
@@ -176,5 +179,6 @@ int main(int argc, char **argv) {
     check(argv[1], 0, "swap-file-fifo");
     check(argv[1], 0, "swap-destination");
     check(argv[1], 0, "enospc"); check(argv[1], 0, "unsupported");
+    check(argv[1], 1, "swap-postorder");
     return 0;
 }

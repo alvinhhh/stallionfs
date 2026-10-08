@@ -65,7 +65,14 @@ static void json_text(FILE *stream, const char *text) {
                 code -= 0x10000;
                 fprintf(stream, "\\u%04x\\u%04x", (unsigned)(0xd800 + (code >> 10)), (unsigned)(0xdc00 + (code & 0x3ff)));
             } else fprintf(stream, "\\u%04x", (unsigned)code);
-        } else fputc((int)code, stream);
+        } else {
+            const unsigned char *end = p + 1;
+            while (end - p < INT_MAX && *end >= 0x20 && *end < 0x7f && *end != '"' && *end != '\\') end++;
+            if (end == p + 1) fputc((int)code, stream);
+            else fprintf(stream, "%.*s", (int)(end - p), (const char *)p);
+            p = end;
+            continue;
+        }
         p += length;
     }
 }
@@ -173,6 +180,7 @@ int main(int argc, char **argv) {
             fputs("}\n", stdout);
         } else return 0;
     }
+output:
     if (fflush(stdout) == EOF || ferror(stdout)) { errno = EIO; goto failed; }
     return 0;
 usage:
@@ -181,6 +189,10 @@ usage:
 failed:
     return report_error(json, NULL, errno);
 helper:
+    if (argc == 2 && !strcmp(argv[1], "--version")) {
+        fputs(STALLIONFS_VERSION "\n", stdout);
+        goto output;
+    }
     python(argc, argv);
     fprintf(stderr, "stallionfs: cannot run installed Python helper: %s\n", strerror(errno));
     return 1;

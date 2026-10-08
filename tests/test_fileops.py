@@ -213,7 +213,7 @@ class FileOperations(unittest.TestCase):
         source = tests.parent / 'stallionfs'
         object_file, executable = self.base / 'tree.o', self.base / 'native-faults'
         common = ['cc', '-O2', '-g', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(source)]
-        replacements = ['openat', 'fclonefileat', 'clonefileat', 'clonefile', 'unlinkat', 'pthread_create', 'pthread_join']
+        replacements = ['openat', 'fclonefileat', 'unlinkat', 'pthread_create', 'pthread_join']
         subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
                         '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)
         subprocess.run([*common, str(tests / 'native_faults.c'), str(object_file), '-o', str(executable)],

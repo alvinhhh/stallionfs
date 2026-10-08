@@ -113,7 +113,7 @@ def manifest(root):
             raise RuntimeError(f"Unexpected fixture entry: {relative}")
         result[relative] = row
         if row["kind"] == "directory":
-            for child in sorted(path.iterdir()):
+            for child in path.iterdir():
                 visit(child, f"{relative}/{child.name}" if relative else child.name)
 
     visit(root, "")
@@ -353,7 +353,7 @@ class ChildCompletionUnknown(RuntimeError):
 
 
 def measure_memory(arguments, metrics):
-    """Measure one child's peak bytes; wrapper wall time is separate from timing samples."""
+    """Return peak-byte metrics and the completed child; wrapper time is separate."""
     started_utc = datetime.now(timezone.utc).isoformat()
     start = time.perf_counter()
     try:
@@ -362,12 +362,12 @@ def measure_memory(arguments, metrics):
                "exit_code": completed.returncode, "time_output": metrics.read_text() if metrics.exists() else ""}
         if completed.returncode:
             row.update(completion_uncertain=True, error=completed.stderr.decode(errors="replace").strip())
-            return row
+            return row, completed
         for key, label in (("rss_bytes", "maximum resident set size"), ("footprint_bytes", "peak memory footprint")):
             match = re.search(r"^\s*(\d+)\s+" + label + r"\s*$", row["time_output"], re.MULTILINE)
             row[key] = int(match.group(1)) if match else None
         require(row["rss_bytes"] is not None, "time did not report the child's peak RSS")
-        return row
+        return row, completed
     except ChildCompletionUnknown:
         raise
     except BaseException as exc:
@@ -405,7 +405,7 @@ def compare_fixture(binary, base, fixture, source, expected, operations, samples
                 report["phase"] = {"fixture": fixture, "operation": operation, "method": method,
                                    "round": round_number, "measurement": "memory" if memory else "timing"}
                 checkpoint()
-                row = measure_memory(arguments, base / "memory.txt") if memory else measure(arguments, timeout=timeout)
+                row = measure_memory(arguments, base / "memory.txt")[0] if memory else measure(arguments, timeout=timeout)
                 row.update(operation=operation, fixture=fixture, method=method,
                            round=round_number, warmup=not memory and round_number == 0, validated=False,
                            setup_s=setup, setup_validation_s=setup_validation)

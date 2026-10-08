@@ -7,6 +7,7 @@ permissions:
   contents: read
 jobs:
   test:
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,6 +32,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
+          import faulthandler
           import json
           import os
           from pathlib import Path
@@ -101,8 +103,10 @@ jobs:
                   raise
 
           images._command = diagnostic_command
+          faulthandler.dump_traceback_later(300)
           suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
           result = unittest.TextTestRunner(verbosity=2).run(suite)
+          faulthandler.cancel_dump_traceback_later()
           required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and result.skipped
           if required_skips:
               print('Required filesystem tests were skipped.', file=sys.stderr)
