@@ -98,6 +98,8 @@ source .venv/bin/activate
 | Delete a dataset (2,000 files, 50 GB) | 0.190 s | 0.148 s | 1.29× |
 | Scan 20,000 files along a 40-folder chain | 37.39 ms | 20.03 ms | 1.87× |
 
+As for single file operations, I can only say I still recommend native unix commands. But for everything else, use stallion.
+
 Baselines: native POSIX scanning, `cp -cRp`, `mv -n`, `rm -rf`, and Git worktrees + offline `npm ci`. File trees are generated; workspace times include cleanup and exclude seed preparation. [Full results, CPU and memory](tests/perf/README.md).
 
 ## Contributing
