@@ -1,6 +1,7 @@
 # stallionfs
 **because stallions eat Apples**
 
+**STILL IN DEVELOPMENT! DO NOT USE IN A PRODUCTION ENVIRONMENT!**
 stallionfs provides native file operations and prepared Git workspaces on macOS.
 
 [Usage](docs/usage.md) · [Storage and recovery](docs/storage.md) · [Issues](https://github.com/alvinhhh/stallionfs/issues)
