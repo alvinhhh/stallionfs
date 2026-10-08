@@ -6,6 +6,11 @@
 /* Called only on the invoking thread; return nonzero to cancel. */
 typedef int (*stallion_cancel_fn)(void *context);
 
+/* Validate an owned, mode-private directory and reject ACL grants to other
+ * principals. No permissions are changed. Return 0, or -1 with errno.
+ */
+int stallion_private_directory(const char *path);
+
 struct stallion_scan_stats {
     uint64_t files, directories, symlinks, other, logical_bytes, skipped_mounts;
 };
