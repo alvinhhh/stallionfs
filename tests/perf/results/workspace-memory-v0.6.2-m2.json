@@ -1,0 +1,1405 @@
+{
+  "status": "complete",
+  "started_utc": "2026-10-07T20:26:59.473692+00:00",
+  "fingerprints": {
+    "measurement/run.py": "985a7a11d305714b6331de82a3b65e0819811096d8d8d9542aec3f44ff0a1976",
+    "measurement/coordinator.py": "e7936a86e8561c2bf10ea474445d8e40e66f96ec85d1bd633dd7c9d689a33f9f",
+    "measurement/original-run.py": "7fd17bdc8af88eb2b6de11c4e2ca6dd356a46532320c42ad18e49949393d01ae",
+    "measurement/provenance.json": "61bed2642ec169dbd2d65d1bfd85fed7c17e0968ff59b9e34448573e68395123",
+    "tests/perf/run.py": "7fd17bdc8af88eb2b6de11c4e2ca6dd356a46532320c42ad18e49949393d01ae",
+    "tests/perf/fileops.py": "4c893729f18a7010a3f1918827f02552d29af30a95325e9874e1a40fa5025c28",
+    "tools/node": "27db838bb204ef7c21df2931f5656e4c8fb32e6e947f363a402b49714d32b5b1",
+    "tools/npm-cli.js": "8e5f6f3429f8cdbe693cdc29904e9d5a7b127a494bd15c804bd54c7403bfcbe7",
+    "measurement/timing-result.json": "ebea1ed5fbcc913bbc64b7acba561ea853d45700675140b027743d22ff694229",
+    "measurement/package-build.json": "015635ce455bfc23447c2d4a815a58a33da8446e93f6865426042185a8d665b6",
+    "measurement/package-checks.json": "8dc3eb2c4cf45d56d302a1b0d23ef918e5d381f3b00b23fe513dd7ccceacc3b0",
+    "installed/stallionfs/__init__.py": "8640ec99a67481d6157e9142062460039ff8eedb0ca0cc236aeaedc0fd51edfc",
+    "installed/stallionfs/__main__.py": "f755f930389fcbb945b6cf4e79c076ecf17bb8135b436c8dcd5a331cce567ae2",
+    "installed/stallionfs/_scan.cpython-313-darwin.so": "05f06cd8cd011ba7ba95457e209e6c6fe740bab8fc4766ed91818e04f23d44ef",
+    "installed/stallionfs/core.py": "51218560a622268fcd69567729f32cc7acb2dcd422d730a10495578474593172",
+    "installed/stallionfs/images.py": "f9e54b6dff6c955c9b2ac6a91bbf1fcefe1ff9dfe243e6e37c4637560f56a687"
+  },
+  "rows": [
+    {
+      "method": "stallionfs_folder",
+      "workers": 1,
+      "round": 0,
+      "warmup": true,
+      "phases": {
+        "ready": {
+          "samples": 122,
+          "complete": true,
+          "max_sweep_ns": 1443125,
+          "max_gap_ns": 7826250,
+          "sampled_peak_rss_bytes": 63537152,
+          "sampled_peak_footprint_bytes": 51724864
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 202459,
+          "max_gap_ns": 1522000,
+          "sampled_peak_rss_bytes": 31784960,
+          "sampled_peak_footprint_bytes": 28230184
+        },
+        "reclaim": {
+          "samples": 67,
+          "complete": true,
+          "max_sweep_ns": 1239125,
+          "max_gap_ns": 21622250,
+          "sampled_peak_rss_bytes": 31899648,
+          "sampled_peak_footprint_bytes": 28344872
+        }
+      },
+      "log": "workers1-round0-stallionfs_folder.log",
+      "coordinator_result": "workers1-round0-stallionfs_folder-coordinator.json",
+      "fixture": "workers1/round0/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "8ee45771fb8ee1862b4e758f0104a1e7f29ad1ba",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.055095000000000005,
+      "coordinator_elapsed_s_not_a_timing_comparison": 8.278606834006496
+    },
+    {
+      "method": "worktree_install",
+      "workers": 1,
+      "round": 0,
+      "warmup": true,
+      "phases": {
+        "ready": {
+          "samples": 272,
+          "complete": true,
+          "max_sweep_ns": 3179291,
+          "max_gap_ns": 21605333,
+          "sampled_peak_rss_bytes": 404783104,
+          "sampled_peak_footprint_bytes": 381437672
+        },
+        "remove": {
+          "samples": 303,
+          "complete": true,
+          "max_sweep_ns": 140555875,
+          "max_gap_ns": 261629666,
+          "sampled_peak_rss_bytes": 58195968,
+          "sampled_peak_footprint_bytes": 50676312
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 32208,
+          "max_gap_ns": 61916,
+          "sampled_peak_rss_bytes": 19890176,
+          "sampled_peak_footprint_bytes": 24265256
+        }
+      },
+      "log": "workers1-round0-worktree_install.log",
+      "coordinator_result": "workers1-round0-worktree_install-coordinator.json",
+      "fixture": "workers1/round0/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "9b0b0d3df1a3cb34ceb4a70476487e048ff4f50b",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.155096,
+      "coordinator_elapsed_s_not_a_timing_comparison": 10.87584737490397
+    },
+    {
+      "method": "worktree_install",
+      "workers": 1,
+      "round": 1,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 266,
+          "complete": true,
+          "max_sweep_ns": 3729750,
+          "max_gap_ns": 9436875,
+          "sampled_peak_rss_bytes": 398426112,
+          "sampled_peak_footprint_bytes": 405210064
+        },
+        "remove": {
+          "samples": 124,
+          "complete": true,
+          "max_sweep_ns": 17425875,
+          "max_gap_ns": 23770041,
+          "sampled_peak_rss_bytes": 56229888,
+          "sampled_peak_footprint_bytes": 54346760
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 24000,
+          "max_gap_ns": 55208,
+          "sampled_peak_rss_bytes": 30113792,
+          "sampled_peak_footprint_bytes": 52232768
+        }
+      },
+      "log": "workers1-round1-worktree_install.log",
+      "coordinator_result": "workers1-round1-worktree_install-coordinator.json",
+      "fixture": "workers1/round1/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "434dada34fbb82807dac948fa99882c62e2e6c9d",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.08421400000000001,
+      "coordinator_elapsed_s_not_a_timing_comparison": 9.165392208029516
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 1,
+      "round": 1,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 106,
+          "complete": true,
+          "max_sweep_ns": 1556833,
+          "max_gap_ns": 9674208,
+          "sampled_peak_rss_bytes": 65175552,
+          "sampled_peak_footprint_bytes": 54281224
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 166959,
+          "max_gap_ns": 2651041,
+          "sampled_peak_rss_bytes": 31571968,
+          "sampled_peak_footprint_bytes": 26051088
+        },
+        "reclaim": {
+          "samples": 69,
+          "complete": true,
+          "max_sweep_ns": 561750,
+          "max_gap_ns": 8737916,
+          "sampled_peak_rss_bytes": 31703040,
+          "sampled_peak_footprint_bytes": 26165776
+        }
+      },
+      "log": "workers1-round1-stallionfs_folder.log",
+      "coordinator_result": "workers1-round1-stallionfs_folder-coordinator.json",
+      "fixture": "workers1/round1/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "785d08d12acabf1d1126bce4c796c8a762fc139d",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.051259,
+      "coordinator_elapsed_s_not_a_timing_comparison": 7.965526417014189
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 1,
+      "round": 2,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 116,
+          "complete": true,
+          "max_sweep_ns": 728458,
+          "max_gap_ns": 10719792,
+          "sampled_peak_rss_bytes": 58408960,
+          "sampled_peak_footprint_bytes": 52150872
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 135000,
+          "max_gap_ns": 1134541,
+          "sampled_peak_rss_bytes": 32604160,
+          "sampled_peak_footprint_bytes": 26526248
+        },
+        "reclaim": {
+          "samples": 59,
+          "complete": true,
+          "max_sweep_ns": 549791,
+          "max_gap_ns": 7339791,
+          "sampled_peak_rss_bytes": 32751616,
+          "sampled_peak_footprint_bytes": 26640936
+        }
+      },
+      "log": "workers1-round2-stallionfs_folder.log",
+      "coordinator_result": "workers1-round2-stallionfs_folder-coordinator.json",
+      "fixture": "workers1/round2/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "8e43dc0c68dea4c2d589ddb820a17a058481a88c",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.05604699999999996,
+      "coordinator_elapsed_s_not_a_timing_comparison": 8.255578250042163
+    },
+    {
+      "method": "worktree_install",
+      "workers": 1,
+      "round": 2,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 296,
+          "complete": true,
+          "max_sweep_ns": 4176875,
+          "max_gap_ns": 36715375,
+          "sampled_peak_rss_bytes": 391430144,
+          "sampled_peak_footprint_bytes": 408503848
+        },
+        "remove": {
+          "samples": 120,
+          "complete": true,
+          "max_sweep_ns": 355375,
+          "max_gap_ns": 7433583,
+          "sampled_peak_rss_bytes": 56213504,
+          "sampled_peak_footprint_bytes": 52118104
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 20292,
+          "max_gap_ns": 44083,
+          "sampled_peak_rss_bytes": 30179328,
+          "sampled_peak_footprint_bytes": 26034728
+        }
+      },
+      "log": "workers1-round2-worktree_install.log",
+      "coordinator_result": "workers1-round2-worktree_install-coordinator.json",
+      "fixture": "workers1/round2/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "d3e807d30756408ad374d4047b1a93f40050a8e4",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.10968299999999997,
+      "coordinator_elapsed_s_not_a_timing_comparison": 9.833068708889186
+    },
+    {
+      "method": "worktree_install",
+      "workers": 1,
+      "round": 3,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 223,
+          "complete": true,
+          "max_sweep_ns": 266459,
+          "max_gap_ns": 6898792,
+          "sampled_peak_rss_bytes": 401997824,
+          "sampled_peak_footprint_bytes": 382190688
+        },
+        "remove": {
+          "samples": 188,
+          "complete": true,
+          "max_sweep_ns": 40847250,
+          "max_gap_ns": 46575792,
+          "sampled_peak_rss_bytes": 57262080,
+          "sampled_peak_footprint_bytes": 52068952
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 119416,
+          "max_gap_ns": 178083,
+          "sampled_peak_rss_bytes": 26411008,
+          "sampled_peak_footprint_bytes": 22676008
+        }
+      },
+      "log": "workers1-round3-worktree_install.log",
+      "coordinator_result": "workers1-round3-worktree_install-coordinator.json",
+      "fixture": "workers1/round3/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "46ee40be6c7c3a050c4e25c3d0d3e8a2cdbd340b",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.08586899999999997,
+      "coordinator_elapsed_s_not_a_timing_comparison": 8.072554874932393
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 1,
+      "round": 3,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 133,
+          "complete": true,
+          "max_sweep_ns": 1071833,
+          "max_gap_ns": 10904000,
+          "sampled_peak_rss_bytes": 62423040,
+          "sampled_peak_footprint_bytes": 53396512
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 98250,
+          "max_gap_ns": 3676084,
+          "sampled_peak_rss_bytes": 31424512,
+          "sampled_peak_footprint_bytes": 26034728
+        },
+        "reclaim": {
+          "samples": 57,
+          "complete": true,
+          "max_sweep_ns": 583042,
+          "max_gap_ns": 7288500,
+          "sampled_peak_rss_bytes": 31539200,
+          "sampled_peak_footprint_bytes": 26149416
+        }
+      },
+      "log": "workers1-round3-stallionfs_folder.log",
+      "coordinator_result": "workers1-round3-stallionfs_folder-coordinator.json",
+      "fixture": "workers1/round3/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "6f46a7baf18d5badb4299eafa18e17839c789c1a",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.049436000000000035,
+      "coordinator_elapsed_s_not_a_timing_comparison": 7.563745209015906
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 4,
+      "round": 0,
+      "warmup": true,
+      "phases": {
+        "ready": {
+          "samples": 391,
+          "complete": true,
+          "max_sweep_ns": 24013709,
+          "max_gap_ns": 49713083,
+          "sampled_peak_rss_bytes": 59260928,
+          "sampled_peak_footprint_bytes": 52839048
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 155333,
+          "max_gap_ns": 3587458,
+          "sampled_peak_rss_bytes": 34750464,
+          "sampled_peak_footprint_bytes": 23675432
+        },
+        "reclaim": {
+          "samples": 370,
+          "complete": true,
+          "max_sweep_ns": 21089708,
+          "max_gap_ns": 47876083,
+          "sampled_peak_rss_bytes": 35160064,
+          "sampled_peak_footprint_bytes": 25526872
+        }
+      },
+      "log": "workers4-round0-stallionfs_folder.log",
+      "coordinator_result": "workers4-round0-stallionfs_folder-coordinator.json",
+      "fixture": "workers4/round0/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "6b10a6c819a97d19a0e13ff634877e4569c0fc86",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.18870999999999993,
+      "coordinator_elapsed_s_not_a_timing_comparison": 19.347143959021196
+    },
+    {
+      "method": "worktree_install",
+      "workers": 4,
+      "round": 0,
+      "warmup": true,
+      "phases": {
+        "ready": {
+          "samples": 1019,
+          "complete": true,
+          "max_sweep_ns": 35677959,
+          "max_gap_ns": 57236333,
+          "sampled_peak_rss_bytes": 1205436416,
+          "sampled_peak_footprint_bytes": 1416379976
+        },
+        "remove": {
+          "samples": 399,
+          "complete": true,
+          "max_sweep_ns": 2221292,
+          "max_gap_ns": 16967875,
+          "sampled_peak_rss_bytes": 40681472,
+          "sampled_peak_footprint_bytes": 30376536
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 21333,
+          "max_gap_ns": 88458,
+          "sampled_peak_rss_bytes": 33275904,
+          "sampled_peak_footprint_bytes": 27853352
+        }
+      },
+      "log": "workers4-round0-worktree_install.log",
+      "coordinator_result": "workers4-round0-worktree_install-coordinator.json",
+      "fixture": "workers4/round0/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "9125ef79193130163fb9042f0d5129e70df9634d",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.3618180000000001,
+      "coordinator_elapsed_s_not_a_timing_comparison": 18.878898792085238
+    },
+    {
+      "method": "worktree_install",
+      "workers": 4,
+      "round": 1,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 1253,
+          "complete": true,
+          "max_sweep_ns": 6999125,
+          "max_gap_ns": 53488417,
+          "sampled_peak_rss_bytes": 1165819904,
+          "sampled_peak_footprint_bytes": 1283868576
+        },
+        "remove": {
+          "samples": 424,
+          "complete": true,
+          "max_sweep_ns": 1535333,
+          "max_gap_ns": 9747958,
+          "sampled_peak_rss_bytes": 59555840,
+          "sampled_peak_footprint_bytes": 54559344
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 23375,
+          "max_gap_ns": 60042,
+          "sampled_peak_rss_bytes": 33751040,
+          "sampled_peak_footprint_bytes": 28492328
+        }
+      },
+      "log": "workers4-round1-worktree_install.log",
+      "coordinator_result": "workers4-round1-worktree_install-coordinator.json",
+      "fixture": "workers4/round1/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "577c1af4d55d6d6b8aacab488f9da3f5df1337a8",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.39569699999999997,
+      "coordinator_elapsed_s_not_a_timing_comparison": 24.11009487498086
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 4,
+      "round": 1,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 635,
+          "complete": true,
+          "max_sweep_ns": 4793292,
+          "max_gap_ns": 18464083,
+          "sampled_peak_rss_bytes": 61489152,
+          "sampled_peak_footprint_bytes": 50627208
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 148458,
+          "max_gap_ns": 2086083,
+          "sampled_peak_rss_bytes": 38060032,
+          "sampled_peak_footprint_bytes": 26706472
+        },
+        "reclaim": {
+          "samples": 380,
+          "complete": true,
+          "max_sweep_ns": 19185375,
+          "max_gap_ns": 25493208,
+          "sampled_peak_rss_bytes": 38649856,
+          "sampled_peak_footprint_bytes": 28557912
+        }
+      },
+      "log": "workers4-round1-stallionfs_folder.log",
+      "coordinator_result": "workers4-round1-stallionfs_folder-coordinator.json",
+      "fixture": "workers4/round1/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "a0147c4c82a5a05bb32d23e5744b0783687cd36f",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.23168100000000003,
+      "coordinator_elapsed_s_not_a_timing_comparison": 21.275205375044607
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 4,
+      "round": 2,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 677,
+          "complete": true,
+          "max_sweep_ns": 21125375,
+          "max_gap_ns": 38091875,
+          "sampled_peak_rss_bytes": 63700992,
+          "sampled_peak_footprint_bytes": 51823240
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 142208,
+          "max_gap_ns": 2917125,
+          "sampled_peak_rss_bytes": 54116352,
+          "sampled_peak_footprint_bytes": 47727168
+        },
+        "reclaim": {
+          "samples": 347,
+          "complete": true,
+          "max_sweep_ns": 1306167,
+          "max_gap_ns": 20357875,
+          "sampled_peak_rss_bytes": 54771712,
+          "sampled_peak_footprint_bytes": 48087664
+        }
+      },
+      "log": "workers4-round2-stallionfs_folder.log",
+      "coordinator_result": "workers4-round2-stallionfs_folder-coordinator.json",
+      "fixture": "workers4/round2/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "46db350cbf921e8635ea596180f66ebd298d306e",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.28052999999999995,
+      "coordinator_elapsed_s_not_a_timing_comparison": 25.947858792031184
+    },
+    {
+      "method": "worktree_install",
+      "workers": 4,
+      "round": 2,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 1580,
+          "complete": true,
+          "max_sweep_ns": 88354250,
+          "max_gap_ns": 203768792,
+          "sampled_peak_rss_bytes": 1086160896,
+          "sampled_peak_footprint_bytes": 1402926816
+        },
+        "remove": {
+          "samples": 761,
+          "complete": true,
+          "max_sweep_ns": 3207583,
+          "max_gap_ns": 16827958,
+          "sampled_peak_rss_bytes": 40386560,
+          "sampled_peak_footprint_bytes": 25871344
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 42416,
+          "max_gap_ns": 143083,
+          "sampled_peak_rss_bytes": 32997376,
+          "sampled_peak_footprint_bytes": 23708200
+        }
+      },
+      "log": "workers4-round2-worktree_install.log",
+      "coordinator_result": "workers4-round2-worktree_install-coordinator.json",
+      "fixture": "workers4/round2/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580682,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "ac1c7aaf6d87d031b3f55ba864f5f0637bd17260",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580682,
+      "memory_available": true,
+      "sampler_cpu_s": 0.7555750000000003,
+      "coordinator_elapsed_s_not_a_timing_comparison": 35.4124750419287
+    },
+    {
+      "method": "stallionfs_folder",
+      "workers": 4,
+      "round": 3,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 1057,
+          "complete": true,
+          "max_sweep_ns": 981856583,
+          "max_gap_ns": 1198881250,
+          "sampled_peak_rss_bytes": 42795008,
+          "sampled_peak_footprint_bytes": 28788704
+        },
+        "remove": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 248500,
+          "max_gap_ns": 6086666,
+          "sampled_peak_rss_bytes": 31653888,
+          "sampled_peak_footprint_bytes": 24396328
+        },
+        "reclaim": {
+          "samples": 715,
+          "complete": true,
+          "max_sweep_ns": 16983042,
+          "max_gap_ns": 45585041,
+          "sampled_peak_rss_bytes": 32407552,
+          "sampled_peak_footprint_bytes": 24724056
+        }
+      },
+      "log": "workers4-round3-stallionfs_folder.log",
+      "coordinator_result": "workers4-round3-stallionfs_folder-coordinator.json",
+      "fixture": "workers4/round3/stallionfs_folder",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "b4109078914adaa41549dbc1bcde264c41af2e6d",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 0.7322220000000002,
+      "coordinator_elapsed_s_not_a_timing_comparison": 51.99313420895487
+    },
+    {
+      "method": "worktree_install",
+      "workers": 4,
+      "round": 3,
+      "warmup": false,
+      "phases": {
+        "ready": {
+          "samples": 2053,
+          "complete": true,
+          "max_sweep_ns": 239707667,
+          "max_gap_ns": 270432042,
+          "sampled_peak_rss_bytes": 1114554368,
+          "sampled_peak_footprint_bytes": 1294036112
+        },
+        "remove": {
+          "samples": 664,
+          "complete": true,
+          "max_sweep_ns": 21928500,
+          "max_gap_ns": 33052625,
+          "sampled_peak_rss_bytes": 39141376,
+          "sampled_peak_footprint_bytes": 24478704
+        },
+        "reclaim": {
+          "samples": 2,
+          "complete": true,
+          "max_sweep_ns": 65209,
+          "max_gap_ns": 132792,
+          "sampled_peak_rss_bytes": 31703040,
+          "sampled_peak_footprint_bytes": 22266408
+        }
+      },
+      "log": "workers4-round3-worktree_install.log",
+      "coordinator_result": "workers4-round3-worktree_install-coordinator.json",
+      "fixture": "workers4/round3/worktree_install",
+      "cleanup_passed": true,
+      "correctness": "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata) and passed fixture smoke test",
+      "fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+      "canonical_fixture_identity": {
+        "content_executable_mode_sha256": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+        "dependencies": {
+          "axios": "1.20.0",
+          "date-fns": "4.4.0",
+          "eslint": "10.12.0",
+          "lodash": "4.18.1",
+          "prettier": "3.9.9",
+          "react": "19.3.0",
+          "react-dom": "19.3.0",
+          "rxjs": "7.8.2",
+          "typescript": "7.0.2",
+          "zod": "4.6.5"
+        },
+        "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+        "native_counts_including_git": {
+          "directories": 671,
+          "files": 12581,
+          "logical_bytes": 86580683,
+          "other": 0,
+          "skipped_mounts": 0,
+          "symlinks": 5
+        },
+        "seed_commit": "9899ef5afe20d7856635798a9e6148b9ad7f59de",
+        "source_files_generated": 1000
+      },
+      "seed_regular_files": 12581,
+      "seed_logical_bytes": 86580683,
+      "memory_available": true,
+      "sampler_cpu_s": 1.0374399999999997,
+      "coordinator_elapsed_s_not_a_timing_comparison": 40.801328333094716
+    }
+  ],
+  "sample_interval_target_s": 0.005,
+  "version": "0.6.2",
+  "fixture_umask": "077",
+  "timing_result_sha256": "ebea1ed5fbcc913bbc64b7acba561ea853d45700675140b027743d22ff694229",
+  "expected_fixture_digest": "aeb30a3cefa158b7c19d12489b494a836bbfc42771ce3f811ca3bd1935038582",
+  "notes": [
+    "Memory-only run: no wall/CPU speed comparisons are drawn from sampled coordinators.",
+    "Fresh coordinator per method/workers/round; one warmup plus three paired measured rounds for workers1/4.",
+    "Both methods freshly prepare identical source content/executable modes before sampling; the digest must match timing. Seed IDs and commit timestamps are distinct. Post-setup coordinator resident memory is included.",
+    "The coordinator, native worker threads and inherited Git/npm/Node descendants are included; sampler is outside the group.",
+    "Maxima are sampled sums of current counters, never sums of individual lifetime maxima.",
+    "Queries are sequential, not an atomic group snapshot; brief children/spikes can be missed. No exact peak or strict lower-bound claim.",
+    "RSS can double-count shared pages; charged footprint includes compressed memory and is not unique system RAM.",
+    "Group membership covers inherited descendants. Known escaping children invalidate the pass; unobserved detached descendants remain a sampling limitation.",
+    "Any incomplete sweep makes that phase's peak unavailable; raw samples and exit races are retained in samples.jsonl.",
+    "Only ready/remove/reclaim are sampled; fixture preparation and digest/smoke validation are excluded.",
+    "Sampler CPU, sample spans/gaps, correctness and cleanup are recorded separately. No public result claimed before review."
+  ],
+  "raw_samples_sha256": "27f01fe125ee2195eacb46246f900b83cac2c4e82aae5a5e7d3b2e0157dad613",
+  "memory_available": true,
+  "medians": {
+    "1/worktree_install": {
+      "sampled_peak_rss_bytes": 398426112,
+      "sampled_peak_footprint_bytes": 405210064
+    },
+    "1/stallionfs_folder": {
+      "sampled_peak_rss_bytes": 62423040,
+      "sampled_peak_footprint_bytes": 53396512
+    },
+    "4/worktree_install": {
+      "sampled_peak_rss_bytes": 1114554368,
+      "sampled_peak_footprint_bytes": 1294036112
+    },
+    "4/stallionfs_folder": {
+      "sampled_peak_rss_bytes": 61489152,
+      "sampled_peak_footprint_bytes": 50627208
+    }
+  },
+  "ready_phase_comparisons": {
+    "1": {
+      "sampled_peak_rss_bytes": {
+        "baseline": 398426112,
+        "candidate": 62423040,
+        "candidate_minus_baseline": -336003072,
+        "percent_change": -84.33259314088329,
+        "baseline_divided_by_candidate": 6.38267716535433
+      },
+      "sampled_peak_footprint_bytes": {
+        "baseline": 405210064,
+        "candidate": 53396512,
+        "candidate_minus_baseline": -351813552,
+        "percent_change": -86.82251090387528,
+        "baseline_divided_by_candidate": 7.588699127014139
+      }
+    },
+    "4": {
+      "sampled_peak_rss_bytes": {
+        "baseline": 1114554368,
+        "candidate": 61489152,
+        "candidate_minus_baseline": -1053065216,
+        "percent_change": -94.48307289752599,
+        "baseline_divided_by_candidate": 18.126032507327473
+      },
+      "sampled_peak_footprint_bytes": {
+        "baseline": 1294036112,
+        "candidate": 50627208,
+        "candidate_minus_baseline": -1243408904,
+        "percent_change": -96.08765106858162,
+        "baseline_divided_by_candidate": 25.560092351922705
+      }
+    }
+  },
+  "lifecycle_comparisons": {
+    "1": {
+      "sampled_peak_rss_bytes": {
+        "baseline": 398426112,
+        "candidate": 62423040,
+        "candidate_minus_baseline": -336003072,
+        "percent_change": -84.33259314088329,
+        "baseline_divided_by_candidate": 6.38267716535433
+      },
+      "sampled_peak_footprint_bytes": {
+        "baseline": 405210064,
+        "candidate": 53396512,
+        "candidate_minus_baseline": -351813552,
+        "percent_change": -86.82251090387528,
+        "baseline_divided_by_candidate": 7.588699127014139
+      }
+    },
+    "4": {
+      "sampled_peak_rss_bytes": {
+        "baseline": 1114554368,
+        "candidate": 61489152,
+        "candidate_minus_baseline": -1053065216,
+        "percent_change": -94.48307289752599,
+        "baseline_divided_by_candidate": 18.126032507327473
+      },
+      "sampled_peak_footprint_bytes": {
+        "baseline": 1294036112,
+        "candidate": 50627208,
+        "candidate_minus_baseline": -1243408904,
+        "percent_change": -96.08765106858162,
+        "baseline_divided_by_candidate": 25.560092351922705
+      }
+    }
+  },
+  "observed_ranges": {
+    "ready": {
+      "1/worktree_install": {
+        "sampled_peak_rss_bytes": {
+          "min": 391430144,
+          "median": 398426112,
+          "max": 401997824
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 382190688,
+          "median": 405210064,
+          "max": 408503848
+        }
+      },
+      "1/stallionfs_folder": {
+        "sampled_peak_rss_bytes": {
+          "min": 58408960,
+          "median": 62423040,
+          "max": 65175552
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 52150872,
+          "median": 53396512,
+          "max": 54281224
+        }
+      },
+      "4/worktree_install": {
+        "sampled_peak_rss_bytes": {
+          "min": 1086160896,
+          "median": 1114554368,
+          "max": 1165819904
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 1283868576,
+          "median": 1294036112,
+          "max": 1402926816
+        }
+      },
+      "4/stallionfs_folder": {
+        "sampled_peak_rss_bytes": {
+          "min": 42795008,
+          "median": 61489152,
+          "max": 63700992
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 28788704,
+          "median": 50627208,
+          "max": 51823240
+        }
+      }
+    },
+    "lifecycle": {
+      "1/worktree_install": {
+        "sampled_peak_rss_bytes": {
+          "min": 391430144,
+          "median": 398426112,
+          "max": 401997824
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 382190688,
+          "median": 405210064,
+          "max": 408503848
+        }
+      },
+      "1/stallionfs_folder": {
+        "sampled_peak_rss_bytes": {
+          "min": 58408960,
+          "median": 62423040,
+          "max": 65175552
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 52150872,
+          "median": 53396512,
+          "max": 54281224
+        }
+      },
+      "4/worktree_install": {
+        "sampled_peak_rss_bytes": {
+          "min": 1086160896,
+          "median": 1114554368,
+          "max": 1165819904
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 1283868576,
+          "median": 1294036112,
+          "max": 1402926816
+        }
+      },
+      "4/stallionfs_folder": {
+        "sampled_peak_rss_bytes": {
+          "min": 42795008,
+          "median": 61489152,
+          "max": 63700992
+        },
+        "sampled_peak_footprint_bytes": {
+          "min": 28788704,
+          "median": 50627208,
+          "max": 51823240
+        }
+      }
+    }
+  },
+  "coordinator_metadata": {
+    "version": "0.6.2",
+    "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu": "Apple M2",
+    "memory_bytes": 25769803776,
+    "python": "3.13.3",
+    "node": "v24.19.0",
+    "npm": "10.9.2",
+    "git": "git version 2.49.0",
+    "fixture_dependencies": {
+      "axios": "1.20.0",
+      "date-fns": "4.4.0",
+      "eslint": "10.12.0",
+      "lodash": "4.18.1",
+      "prettier": "3.9.9",
+      "react": "19.3.0",
+      "react-dom": "19.3.0",
+      "rxjs": "7.8.2",
+      "typescript": "7.0.2",
+      "zod": "4.6.5"
+    },
+    "lockfile_sha256": "518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e",
+    "native_binary_sha256": "05f06cd8cd011ba7ba95457e209e6c6fe740bab8fc4766ed91818e04f23d44ef"
+  },
+  "incomplete_phases": [],
+  "comparison_method": {
+    "scope": "Default create jobs=4 only, one or four simultaneous requests; no jobs2 memory measurements.",
+    "statistics": "Medians of three measured batches after one retained warmup per configuration; all 16 batches / 48 phases preserved. Ranges are observations, not confidence intervals.",
+    "lifecycle": "Maximum sampled group sum across ready/remove/reclaim within each batch, then median across batches. Independent process lifetime peaks are never summed.",
+    "processes": "Includes post-setup coordinator, native worker threads and inherited descendants; excludes sampler and setup/validation phases.",
+    "limitations": "Sequential process queries are not atomic; transient processes/spikes and unobserved detached descendants can be missed. Known escapes/incomplete access invalidate a phase. No exact peak or strict lower-bound claim. RSS may double-count shared pages; footprint is charged memory, not unique RAM.",
+    "sampling": "5 ms target only. Per-phase sweep times, maximum gaps and sampler CPU remain in every original row; timing from this sampled pass is not a performance comparison.",
+    "fixture": "Content/symlink-target and executable-mode digest, lockfile and dependencies match timing. Fresh seed commits and Git metadata byte counts remain distinct and are preserved per batch.",
+    "units": "Bytes; MiB=1048576 bytes. Difference is folder minus Git/npm; ratio is Git/npm divided by folder."
+  },
+  "export_provenance": {
+    "original_result_sha256": "14bef4dbab4a913e6e1807e7c4c2a18c2de4c90d3712d5d106a2b14408a521ca",
+    "derivation_script_sha256": "7155b582a5c04689544e27a04a66daf48bd1ecde13db3d9ded53b7dbeb8ca161",
+    "helper_script_sha256": "87c65b4e0f823afedda258aa26307c47e189d07e4980c491368c8ebc2b90597c",
+    "retained_rows": 16,
+    "retained_warmup_rows": 4,
+    "retained_measured_rows": 12,
+    "retained_complete_phases": 48,
+    "coordinator_metadata_sources_sha256": {
+      "workers1-round0-stallionfs_folder-coordinator.json": "91e8514ade8eac7611e074054b7a3d3ccc97c33f99f6594b7d9cf9683aed38f1",
+      "workers1-round0-worktree_install-coordinator.json": "be65b57de5bda38b067efbbe9efe4759b17978fd630823a22e8793e10b48ad2b",
+      "workers1-round1-worktree_install-coordinator.json": "042a8ff20d4d1ee1ca61e6faac44287e32dfe73933f0f273d9da2a458f6a13c9",
+      "workers1-round1-stallionfs_folder-coordinator.json": "15d022ab4a0d615dcbb7f797528c95906e45ca907b13af39d348e5647578eb48",
+      "workers1-round2-stallionfs_folder-coordinator.json": "24a4f7382019302d0d5067b4fd74d4e4838824d5fa2a84542dec44e2eecae32a",
+      "workers1-round2-worktree_install-coordinator.json": "670efbad430e5d4c06efef454a7fad260e43d0c42ad61563ee958b9b6707ec10",
+      "workers1-round3-worktree_install-coordinator.json": "5c3c08dfc2f4fe46bcc8e14cb58d07992f736c08d9fd6981591b543d0731c1c2",
+      "workers1-round3-stallionfs_folder-coordinator.json": "afd440413090cd2080b727129ce9e4e0fb225d380956bd2b4ee20aa96f56117b",
+      "workers4-round0-stallionfs_folder-coordinator.json": "55d91f985d4708d18b66438ef7c2e99ea8ab3f90e066ad859e97e00f97546619",
+      "workers4-round0-worktree_install-coordinator.json": "0546d90ec68ba3b7471fba0a978323abf75802365e2d4fba7319dce02d992d93",
+      "workers4-round1-worktree_install-coordinator.json": "4d2dfb5da4dd31298a06acec0574af51917ef8e8f7aaf8fbfaf748da162178c8",
+      "workers4-round1-stallionfs_folder-coordinator.json": "9b65c110b53c21ef44225bc73b1215890bdfeea683ed799ba3e3c7c557039834",
+      "workers4-round2-stallionfs_folder-coordinator.json": "cd96e1a0c7971f1f93debf78d16386cf4797e1be22aa6f8858b36ddd7bdcd24b",
+      "workers4-round2-worktree_install-coordinator.json": "e50a06b9f0246fb1e6f2386b337088ce1debc8b8898027cf3e6ae0288e34824f",
+      "workers4-round3-stallionfs_folder-coordinator.json": "07fe6fbf43d292c3d4326132e956a5edd2c0f699ca50ec0f3e230aa23b469334",
+      "workers4-round3-worktree_install-coordinator.json": "27d678ea33a012f3cca5fefa4c887cc51bce02555740a59e4d4f56b1df8ca981"
+    },
+    "modified_fields": [
+      "fingerprints keys",
+      "rows[*].fixture"
+    ],
+    "preservation": "Every measurement, phase counter, status, hash and row order is unchanged; only absolute fingerprint labels and fixture paths become role labels.",
+    "unpublished_artifacts": "Per-PID sample log, command logs and full coordinator reports are not exported. Recorded filenames are identifiers only; the original sample-log hash is retained."
+  }
+}

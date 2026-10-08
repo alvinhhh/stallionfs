@@ -73,29 +73,32 @@ source .venv/bin/activate
 
 ## Performance
 
-0.6.1 · Apple M2 · 24 GiB RAM · macOS 27. Median elapsed times.
+0.6.2 · Apple M2 · 24 GiB RAM · macOS 27. Median elapsed times.
 
 | Operation | Baseline | stallionfs | Speedup |
 | --- | ---: | ---: | ---: |
-| Scan 20,000 files across 200 folders | 35.42 ms | 7.51 ms | 4.72× |
-| Scan 20,000 files in one folder | 32.56 ms | 16.18 ms | 2.01× |
-| Clone 10,000 files in nested folders | 1.136 s | 0.423 s | 2.69× |
-| Delete those 10,000 files | 0.391 s | 0.178 s | 2.19× |
-| Create and reclaim one folder workspace | 2.014 s | 0.963 s | 2.09× |
-| Create and reclaim four concurrent workspaces | 5.527 s | 3.642 s | 1.52× |
-| Clone 100,000 JavaScript files | 12.411 s | 4.373 s | 2.84× |
-| Delete 100,000 JavaScript files | 4.042 s | 1.800 s | 2.25× |
-| Clone a Git repository (50,013 files) | 6.069 s | 2.188 s | 2.77× |
-| Delete a Git repository (50,013 files) | 2.089 s | 0.948 s | 2.20× |
-| Clone a build cache (200,000 files, 10 GB) | 24.995 s | 8.754 s | 2.86× |
-| Delete a build cache (200,000 files, 10 GB) | 8.210 s | 4.146 s | 1.98× |
-| Clone 5,000 HTML and asset files | 0.604 s | 0.235 s | 2.57× |
-| Delete 5,000 HTML and asset files | 0.199 s | 0.100 s | 1.99× |
-| Clone a dataset (2,000 files, 50 GB) | 0.241 s | 0.091 s | 2.64× |
-| Delete a dataset (2,000 files, 50 GB) | 0.196 s | 0.140 s | 1.39× |
-| Scan 20,000 files along a 40-folder chain | 29.62 ms | 12.97 ms | 2.28× |
+| Clone a 4 KiB file | 2.573 ms | 3.250 ms | 0.79× |
+| Move a 4 KiB file | 2.772 ms | 3.504 ms | 0.79× |
+| Delete a 4 KiB file | 2.748 ms | 3.271 ms | 0.84× |
+| Scan 20,000 files across 200 folders | 36.75 ms | 7.25 ms | 5.07× |
+| Scan 20,000 files in one folder | 38.37 ms | 20.87 ms | 1.84× |
+| Clone 10,000 files in nested folders | 2.435 s | 1.260 s | 1.93× |
+| Delete those 10,000 files | 0.995 s | 0.721 s | 1.38× |
+| Create and reclaim one folder workspace | 3.514 s | 2.169 s | 1.62× |
+| Create and reclaim four concurrent workspaces | 17.584 s | 10.376 s | 1.69× |
+| Clone 100,000 JavaScript files | 19.232 s | 10.942 s | 1.76× |
+| Delete 100,000 JavaScript files | 5.096 s | 3.870 s | 1.32× |
+| Clone a Git repository (50,013 files) | 8.050 s | 4.243 s | 1.90× |
+| Delete a Git repository (50,013 files) | 3.356 s | 2.776 s | 1.21× |
+| Clone a build cache (200,000 files, 10 GB) | 30.430 s | 12.456 s | 2.44× |
+| Delete a build cache (200,000 files, 10 GB) | 20.404 s | 13.895 s | 1.47× |
+| Clone 5,000 HTML and asset files | 1.244 s | 0.484 s | 2.57× |
+| Delete 5,000 HTML and asset files | 0.365 s | 0.176 s | 2.08× |
+| Clone a dataset (2,000 files, 50 GB) | 0.305 s | 0.134 s | 2.27× |
+| Delete a dataset (2,000 files, 50 GB) | 0.190 s | 0.148 s | 1.29× |
+| Scan 20,000 files along a 40-folder chain | 37.39 ms | 20.03 ms | 1.87× |
 
-Baselines: native POSIX scanning, `cp -cRp`, `rm -rf`, and Git worktrees + offline `npm ci`. File trees are generated; workspace times include cleanup and exclude seed preparation. [Full results, CPU and memory](tests/perf/README.md).
+Baselines: native POSIX scanning, `cp -cRp`, `mv -n`, `rm -rf`, and Git worktrees + offline `npm ci`. File trees are generated; workspace times include cleanup and exclude seed preparation. [Full results, CPU and memory](tests/perf/README.md).
 
 ## Contributing
 
