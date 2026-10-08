@@ -1,0 +1,2893 @@
+{
+  "cleanup_passed": true,
+  "cpu": "Apple M2",
+  "implementation_sha256": {
+    "__init__.py": "b96bb47bca1946aa1aabb11cae6082698761a25cbc3f090eeae1f181a79d8fa1",
+    "_scan.c": "7b3a358c844f698a7e60ba25be2265d5e9344d273388ff5bb035edb87172c545",
+    "_tree.h": "511181733341af3f9e6dd41f918a1534453b8911acae0bf4a1f8d2cee3a924af",
+    "_walk.c": "dbdf7abb3b46f8beac2dffe799e533248a26205d6feb8f25dbc4c0517a695979",
+    "fileops.py": "cf0c0ceace7f35a30feb439c09d1dba551dd1d8b27d9a2952b5185539d808027",
+    "scan.py": "c87975143c59430f1711be1497427532dea234a98f67dc4575fedb314784bb34"
+  },
+  "jobs": {
+    "bulk": 4,
+    "bulk_serial": 1,
+    "posix": 1
+  },
+  "layouts": "Flat and 100-files-per-folder nested layouts; deep40 distributes files evenly along a 40-directory single-child chain, with special entries and empty directory at its deepest leaf",
+  "memory_bytes": 25769803776,
+  "memory_method": "Separate fresh Python-process peak RSS/physical footprint from time -lp. Includes interpreter, import and child count/hash checks; excludes parent runner. Same startup for every method. Wrapper times are diagnostics, not API timing results or standalone C-engine memory.",
+  "memory_samples_per_method": 3,
+  "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+  "native_module": "_scan.cpython-313-darwin.so",
+  "native_origin": "Installed runtime outside source checkout; memory children verify the same binary hash",
+  "passed": true,
+  "python": "3.13.3",
+  "python_binary_sha256": "34af8eed630f46919dcb77457077ae3564f7cd25f5d83c56530e64d00de78804",
+  "samples": 11,
+  "status": "complete",
+  "system": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "time_sha256": "6fe69a2da5af0a6e965785f8fbb03901c5bb8eef7f308f70620d4458ed28cce7",
+  "timestamp": "2026-10-08T06:11:15.650818+00:00",
+  "timing": "Python API wall and process CPU time; native implementations; warm OS cache; no process startup",
+  "version": "0.6.3",
+  "volume": {
+    "filesystem": "apfs",
+    "ignore_ownership": false,
+    "readonly": false
+  },
+  "warmup_rounds": 2,
+  "workloads": {
+    "deep40": {
+      "expected": {
+        "directories": 41,
+        "files": 20003,
+        "logical_bytes": 12196597,
+        "other": 1,
+        "skipped_mounts": 0,
+        "symlinks": 3
+      },
+      "median_cpu_seconds": {
+        "bulk": 0.017190999999999512,
+        "bulk_serial": 0.017212999999999923,
+        "posix": 0.03554499999999994
+      },
+      "median_seconds": {
+        "bulk": 0.01720679202117026,
+        "bulk_serial": 0.017217583023011684,
+        "posix": 0.03566395794041455
+      },
+      "memory_medians": {
+        "bulk": {
+          "footprint_bytes": 8962552,
+          "rss_bytes": 18448384
+        },
+        "bulk_serial": {
+          "footprint_bytes": 8962552,
+          "rss_bytes": 18448384
+        },
+        "posix": {
+          "footprint_bytes": 9175520,
+          "rss_bytes": 18694144
+        }
+      },
+      "memory_rows": [
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9257464,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "rss_bytes": 18759680,
+          "started_utc": "2026-10-08T06:11:24.672280+00:00",
+          "time_output": "real 0.07\nuser 0.02\nsys 0.04\n            18759680  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1907  page reclaims\n                  52  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   1  voluntary context switches\n                 269  involuntary context switches\n           584147915  instructions retired\n           226578300  cycles elapsed\n             9257464  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.07975870801601559
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8929784,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "rss_bytes": 18415616,
+          "started_utc": "2026-10-08T06:11:24.754642+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18415616  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1891  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  54  involuntary context switches\n           397366796  instructions retired\n           153345068  cycles elapsed\n             8929784  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05187791702337563
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8978912,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "rss_bytes": 18481152,
+          "started_utc": "2026-10-08T06:11:24.809090+00:00",
+          "time_output": "real 0.07\nuser 0.02\nsys 0.03\n            18481152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1896  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 340  involuntary context switches\n           405212139  instructions retired\n           175837525  cycles elapsed\n             8978912  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.07541250006761402
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:24.886990+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1893  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  41  involuntary context switches\n           397212599  instructions retired\n           150582787  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05078258295543492
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9142776,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18644992,
+          "started_utc": "2026-10-08T06:11:24.940157+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.03\n            18644992  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1909  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  41  involuntary context switches\n           573665636  instructions retired\n           207215562  cycles elapsed\n             9142776  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.06832374993246049
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8880632,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18366464,
+          "started_utc": "2026-10-08T06:11:25.011050+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18366464  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1889  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  27  involuntary context switches\n           397642862  instructions retired\n           149059853  cycles elapsed\n             8880632  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.049929582979530096
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:25.063322+00:00",
+          "time_output": "real 0.05\nuser 0.02\nsys 0.02\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1893  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  60  involuntary context switches\n           398209863  instructions retired\n           158173902  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05588070792146027
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9175520,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "rss_bytes": 18694144,
+          "started_utc": "2026-10-08T06:11:25.121806+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.04\n            18694144  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1912  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  64  involuntary context switches\n           573849048  instructions retired\n           211332788  cycles elapsed\n             9175520  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.0701934170210734
+        },
+        {
+          "counts": {
+            "directories": 41,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8978912,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "rss_bytes": 18481152,
+          "started_utc": "2026-10-08T06:11:25.194445+00:00",
+          "time_output": "real 0.05\nuser 0.02\nsys 0.02\n            18481152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1895  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  56  involuntary context switches\n           397450381  instructions retired\n           155351098  cycles elapsed\n             8978912  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05558654200285673
+        }
+      ],
+      "raw_cpu_seconds": {
+        "bulk": [
+          0.017190999999999512,
+          0.019557999999999964,
+          0.01654800000000023,
+          0.01730099999999979,
+          0.016644000000000325,
+          0.01689100000000021,
+          0.016967999999999428,
+          0.018365000000000187,
+          0.01748300000000036,
+          0.017071999999999754,
+          0.01782000000000039
+        ],
+        "bulk_serial": [
+          0.01855600000000024,
+          0.017430000000000057,
+          0.017228000000000243,
+          0.017655999999999672,
+          0.017205999999999833,
+          0.017212999999999923,
+          0.01683900000000005,
+          0.017089999999999606,
+          0.01690700000000067,
+          0.016769000000000034,
+          0.017761000000000138
+        ],
+        "posix": [
+          0.035204000000000235,
+          0.038110999999999784,
+          0.03463100000000008,
+          0.03513400000000022,
+          0.03554799999999947,
+          0.034299000000000746,
+          0.03554499999999994,
+          0.036767000000000216,
+          0.03467399999999987,
+          0.047579999999999956,
+          0.04039899999999985
+        ]
+      },
+      "raw_seconds": {
+        "bulk": [
+          0.01720679202117026,
+          0.01964904193300754,
+          0.016564249992370605,
+          0.01731191703584045,
+          0.01666166598442942,
+          0.016897291992790997,
+          0.016994041041471064,
+          0.018381792004220188,
+          0.017496125074103475,
+          0.017089208005927503,
+          0.017888500005938113
+        ],
+        "bulk_serial": [
+          0.018572666915133595,
+          0.01744837500154972,
+          0.017239792039617896,
+          0.01765866600908339,
+          0.01721741701476276,
+          0.017217583023011684,
+          0.016856375033967197,
+          0.01710358401760459,
+          0.01692966604605317,
+          0.016772459028288722,
+          0.017768959049135447
+        ],
+        "posix": [
+          0.035286500002257526,
+          0.039715041988529265,
+          0.03472708398476243,
+          0.03527054202277213,
+          0.03566395794041455,
+          0.0343563340138644,
+          0.03587183298077434,
+          0.0368922499474138,
+          0.03481016703881323,
+          0.0875601660227403,
+          0.04227670899126679
+        ]
+      },
+      "sample_rows": [
+        {
+          "cpu_s": 0.03837500000000027,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.03878225001972169,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.01732900000000015,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.017408582963980734,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.016652999999999807,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.016663249931298196,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.017236000000000473,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.017238374915905297,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.03521899999999967,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.03531579102855176,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.01732199999999917,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.017334874952211976,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.035204000000000235,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.035286500002257526,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017190999999999512,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.01720679202117026,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01855600000000024,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.018572666915133595,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.019557999999999964,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.01964904193300754,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.038110999999999784,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.039715041988529265,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017430000000000057,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.01744837500154972,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03463100000000008,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.03472708398476243,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017228000000000243,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.017239792039617896,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01654800000000023,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.016564249992370605,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017655999999999672,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.01765866600908339,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01730099999999979,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.01731191703584045,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03513400000000022,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.03527054202277213,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017205999999999833,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.01721741701476276,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.016644000000000325,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.01666166598442942,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03554799999999947,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.03566395794041455,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01689100000000021,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 7,
+          "wall_s": 0.016897291992790997,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.034299000000000746,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 7,
+          "wall_s": 0.0343563340138644,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017212999999999923,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 7,
+          "wall_s": 0.017217583023011684,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01683900000000005,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 8,
+          "wall_s": 0.016856375033967197,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03554499999999994,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 8,
+          "wall_s": 0.03587183298077434,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.016967999999999428,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 8,
+          "wall_s": 0.016994041041471064,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018365000000000187,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.018381792004220188,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.036767000000000216,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.0368922499474138,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017089999999999606,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.01710358401760459,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03467399999999987,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 10,
+          "wall_s": 0.03481016703881323,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01748300000000036,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 10,
+          "wall_s": 0.017496125074103475,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01690700000000067,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 10,
+          "wall_s": 0.01692966604605317,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.016769000000000034,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.016772459028288722,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017071999999999754,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.017089208005927503,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.047579999999999956,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.0875601660227403,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017761000000000138,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.017768959049135447,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01782000000000039,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.017888500005938113,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.04039899999999985,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.04227670899126679,
+          "warmup": false
+        }
+      ],
+      "speedup": 2.07266746157771
+    },
+    "flat": {
+      "expected": {
+        "directories": 1,
+        "files": 20003,
+        "logical_bytes": 12196597,
+        "other": 1,
+        "skipped_mounts": 0,
+        "symlinks": 3
+      },
+      "median_cpu_seconds": {
+        "bulk": 0.018032000000000048,
+        "bulk_serial": 0.017742000000000147,
+        "posix": 0.03470099999999965
+      },
+      "median_seconds": {
+        "bulk": 0.018058084067888558,
+        "bulk_serial": 0.017759290989488363,
+        "posix": 0.034835999947972596
+      },
+      "memory_medians": {
+        "bulk": {
+          "footprint_bytes": 8962552,
+          "rss_bytes": 18448384
+        },
+        "bulk_serial": {
+          "footprint_bytes": 8913400,
+          "rss_bytes": 18399232
+        },
+        "posix": {
+          "footprint_bytes": 8946168,
+          "rss_bytes": 18432000
+        }
+      },
+      "memory_rows": [
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8913400,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18399232,
+          "started_utc": "2026-10-08T06:11:18.556472+00:00",
+          "time_output": "real 0.08\nuser 0.02\nsys 0.02\n            18399232  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1880  page reclaims\n                  51  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   1  voluntary context switches\n                 141  involuntary context switches\n           400730642  instructions retired\n           172388566  cycles elapsed\n             8913400  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.08655662508681417
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8995320,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18481152,
+          "started_utc": "2026-10-08T06:11:18.644643+00:00",
+          "time_output": "real 0.05\nuser 0.02\nsys 0.02\n            18481152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1894  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 102  involuntary context switches\n           391859094  instructions retired\n           162241590  cycles elapsed\n             8995320  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05716224992647767
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:18.703363+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.03\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1893  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  43  involuntary context switches\n           566857651  instructions retired\n           204951119  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.06694133393466473
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8946168,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18432000,
+          "started_utc": "2026-10-08T06:11:18.771577+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.03\n            18432000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1890  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  45  involuntary context switches\n           563179555  instructions retired\n           207993364  cycles elapsed\n             8946168  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.06838670803699642
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8913400,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18399232,
+          "started_utc": "2026-10-08T06:11:18.841442+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18399232  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1889  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  30  involuntary context switches\n           388956302  instructions retired\n           151384556  cycles elapsed\n             8913400  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05056620796676725
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8929784,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18415616,
+          "started_utc": "2026-10-08T06:11:18.893293+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18415616  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1890  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  42  involuntary context switches\n           389386122  instructions retired\n           153511418  cycles elapsed\n             8929784  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05116775003261864
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:18.945740+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1891  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  22  involuntary context switches\n           389095089  instructions retired\n           150660616  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.0499945409828797
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:18.997217+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1891  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  30  involuntary context switches\n           389232684  instructions retired\n           151800646  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05063558300025761
+        },
+        {
+          "counts": {
+            "directories": 1,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8896992,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "rss_bytes": 18399232,
+          "started_utc": "2026-10-08T06:11:19.049226+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.03\n            18399232  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1890  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  36  involuntary context switches\n           563763419  instructions retired\n           207564183  cycles elapsed\n             8896992  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.06781854201108217
+        }
+      ],
+      "raw_cpu_seconds": {
+        "bulk": [
+          0.01707700000000001,
+          0.018743000000000176,
+          0.018032000000000048,
+          0.01863999999999999,
+          0.01831000000000005,
+          0.018046000000000006,
+          0.018568999999999836,
+          0.017229000000000383,
+          0.017352999999999952,
+          0.017795000000000005,
+          0.01787599999999978
+        ],
+        "bulk_serial": [
+          0.020232000000000028,
+          0.02632000000000012,
+          0.01747399999999999,
+          0.01758700000000002,
+          0.018341000000000163,
+          0.01699800000000007,
+          0.017160000000000064,
+          0.018270999999999926,
+          0.018060999999999883,
+          0.017053999999999903,
+          0.017742000000000147
+        ],
+        "posix": [
+          0.035406999999999966,
+          0.04220299999999999,
+          0.034977000000000036,
+          0.03485000000000005,
+          0.03475500000000009,
+          0.03463700000000003,
+          0.034486999999999934,
+          0.03470099999999965,
+          0.03458300000000003,
+          0.03455500000000011,
+          0.03454399999999991
+        ]
+      },
+      "raw_seconds": {
+        "bulk": [
+          0.01709645800292492,
+          0.018767250003293157,
+          0.018058834015391767,
+          0.018669082899577916,
+          0.01835995796136558,
+          0.018058084067888558,
+          0.018576167058199644,
+          0.017235834035091102,
+          0.017362582962960005,
+          0.017822791007347405,
+          0.017903708037920296
+        ],
+        "bulk_serial": [
+          0.02032295905519277,
+          0.03008570894598961,
+          0.017483624978922307,
+          0.017610791022889316,
+          0.01835145801305771,
+          0.01700629200786352,
+          0.01718499988783151,
+          0.018294333014637232,
+          0.01810787501744926,
+          0.017061625025235116,
+          0.017759290989488363
+        ],
+        "posix": [
+          0.0355288750724867,
+          0.06307854107581079,
+          0.03511758300010115,
+          0.034942583995871246,
+          0.034835999947972596,
+          0.03486158302985132,
+          0.03459075000137091,
+          0.034775499952957034,
+          0.03466358396690339,
+          0.03464362502563745,
+          0.034667083993554115
+        ]
+      },
+      "sample_rows": [
+        {
+          "cpu_s": 0.018485000000000085,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 0,
+          "wall_s": 0.01849045802373439,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.03580799999999984,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 0,
+          "wall_s": 0.035888083977624774,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.019018999999999897,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 0,
+          "wall_s": 0.01907312497496605,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.038899999999999935,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.04133325000293553,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.017966999999999844,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.017997374990954995,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.01715599999999995,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.01722783292643726,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.01707700000000001,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.01709645800292492,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.035406999999999966,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.0355288750724867,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.020232000000000028,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 2,
+          "wall_s": 0.02032295905519277,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.02632000000000012,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 3,
+          "wall_s": 0.03008570894598961,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.04220299999999999,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 3,
+          "wall_s": 0.06307854107581079,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018743000000000176,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 3,
+          "wall_s": 0.018767250003293157,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01747399999999999,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.017483624978922307,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.034977000000000036,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.03511758300010115,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018032000000000048,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 4,
+          "wall_s": 0.018058834015391767,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01758700000000002,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.017610791022889316,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01863999999999999,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.018669082899577916,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03485000000000005,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.034942583995871246,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018341000000000163,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.01835145801305771,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01831000000000005,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.01835995796136558,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03475500000000009,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 6,
+          "wall_s": 0.034835999947972596,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018046000000000006,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.018058084067888558,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01699800000000007,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.01700629200786352,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03463700000000003,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.03486158302985132,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.034486999999999934,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 8,
+          "wall_s": 0.03459075000137091,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018568999999999836,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 8,
+          "wall_s": 0.018576167058199644,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017160000000000064,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 8,
+          "wall_s": 0.01718499988783151,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017229000000000383,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.017235834035091102,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03470099999999965,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.034775499952957034,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018270999999999926,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 9,
+          "wall_s": 0.018294333014637232,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018060999999999883,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.01810787501744926,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017352999999999952,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.017362582962960005,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03458300000000003,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.03466358396690339,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017795000000000005,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.017822791007347405,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017053999999999903,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.017061625025235116,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03455500000000011,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.03464362502563745,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017742000000000147,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.017759290989488363,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01787599999999978,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.017903708037920296,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03454399999999991,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 12,
+          "wall_s": 0.034667083993554115,
+          "warmup": false
+        }
+      ],
+      "speedup": 1.9291083050122158
+    },
+    "nested": {
+      "expected": {
+        "directories": 201,
+        "files": 20003,
+        "logical_bytes": 12196597,
+        "other": 1,
+        "skipped_mounts": 0,
+        "symlinks": 3
+      },
+      "median_cpu_seconds": {
+        "bulk": 0.029593000000000202,
+        "bulk_serial": 0.018645999999999496,
+        "posix": 0.03555399999999942
+      },
+      "median_seconds": {
+        "bulk": 0.006794292014092207,
+        "bulk_serial": 0.018665499985218048,
+        "posix": 0.03563929197844118
+      },
+      "memory_medians": {
+        "bulk": {
+          "footprint_bytes": 9077240,
+          "rss_bytes": 18579456
+        },
+        "bulk_serial": {
+          "footprint_bytes": 8978936,
+          "rss_bytes": 18481152
+        },
+        "posix": {
+          "footprint_bytes": 8962552,
+          "rss_bytes": 18448384
+        }
+      },
+      "memory_rows": [
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9093624,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18595840,
+          "started_utc": "2026-10-08T06:11:21.560795+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.03\n            18595840  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1866  page reclaims\n                  83  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 169  involuntary context switches\n           429690960  instructions retired\n           182943081  cycles elapsed\n             9093624  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.04357229091692716
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8995320,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18481152,
+          "started_utc": "2026-10-08T06:11:21.606291+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18481152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1895  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  31  involuntary context switches\n           420204952  instructions retired\n           152908134  cycles elapsed\n             8995320  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05190854100510478
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8995296,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 0,
+          "rss_bytes": 18497536,
+          "started_utc": "2026-10-08T06:11:21.660052+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.04\n            18497536  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1896  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 106  involuntary context switches\n           608382393  instructions retired\n           215821850  cycles elapsed\n             8995296  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.07100633392110467
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8946168,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18432000,
+          "started_utc": "2026-10-08T06:11:21.732987+00:00",
+          "time_output": "real 0.06\nuser 0.02\nsys 0.04\n            18432000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1893  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  36  involuntary context switches\n           603004509  instructions retired\n           210429327  cycles elapsed\n             8946168  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.06879516702611
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8978912,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18481152,
+          "started_utc": "2026-10-08T06:11:21.803815+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.02\n            18481152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1896  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  34  involuntary context switches\n           420304994  instructions retired\n           153422065  cycles elapsed\n             8978912  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05121049995068461
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9077240,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "rss_bytes": 18579456,
+          "started_utc": "2026-10-08T06:11:21.856818+00:00",
+          "time_output": "real 0.03\nuser 0.02\nsys 0.03\n            18579456  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1908  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  63  involuntary context switches\n           421129729  instructions retired\n           175856962  cycles elapsed\n             9077240  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.03788499999791384
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8978936,
+          "method": "bulk_serial",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 2,
+          "rss_bytes": 18464768,
+          "started_utc": "2026-10-08T06:11:21.896511+00:00",
+          "time_output": "real 0.05\nuser 0.02\nsys 0.02\n            18464768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1897  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  57  involuntary context switches\n           420364887  instructions retired\n           157369243  cycles elapsed\n             8978936  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.05352575005963445
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 8962552,
+          "method": "posix",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 2,
+          "rss_bytes": 18448384,
+          "started_utc": "2026-10-08T06:11:21.952402+00:00",
+          "time_output": "real 0.11\nuser 0.02\nsys 0.04\n            18448384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1895  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 182  involuntary context switches\n           605578104  instructions retired\n           237717059  cycles elapsed\n             8962552  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.11548758298158646
+        },
+        {
+          "counts": {
+            "directories": 201,
+            "files": 20003,
+            "logical_bytes": 12196597,
+            "other": 1,
+            "skipped_mounts": 0,
+            "symlinks": 3
+          },
+          "exit_code": 0,
+          "footprint_bytes": 9011680,
+          "method": "bulk",
+          "native_binary_sha256": "d4e539987105b18e043c74643a5fc23c0012955bad9c6dd7f1e43e645cf2faee",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 2,
+          "rss_bytes": 18530304,
+          "started_utc": "2026-10-08T06:11:22.070943+00:00",
+          "time_output": "real 0.04\nuser 0.02\nsys 0.03\n            18530304  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1907  page reclaims\n                  38  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 158  involuntary context switches\n           422800859  instructions retired\n           185050241  cycles elapsed\n             9011680  peak memory footprint\n",
+          "warmup": false,
+          "wrapper_wall_s": 0.052681125001981854
+        }
+      ],
+      "raw_cpu_seconds": {
+        "bulk": [
+          0.03407099999999996,
+          0.0267299999999997,
+          0.029593000000000202,
+          0.03079300000000007,
+          0.02847899999999992,
+          0.02568000000000037,
+          0.025638000000000716,
+          0.02848300000000048,
+          0.030895000000000117,
+          0.029944999999999666,
+          0.03093400000000024
+        ],
+        "bulk_serial": [
+          0.02193199999999962,
+          0.018316999999999695,
+          0.01888199999999962,
+          0.018924999999999415,
+          0.018645999999999496,
+          0.019124999999999837,
+          0.018683000000000227,
+          0.018367000000000466,
+          0.017712000000000394,
+          0.017269999999999897,
+          0.018219000000000207
+        ],
+        "posix": [
+          0.03763400000000061,
+          0.03559900000000038,
+          0.036450000000000315,
+          0.03494300000000017,
+          0.035358999999999696,
+          0.03585100000000008,
+          0.0353090000000007,
+          0.03555399999999942,
+          0.038920000000000066,
+          0.03527099999999983,
+          0.034913000000000416
+        ]
+      },
+      "raw_seconds": {
+        "bulk": [
+          0.009820249979384243,
+          0.0060070829931646585,
+          0.006830250029452145,
+          0.006934082950465381,
+          0.006412249989807606,
+          0.005753207951784134,
+          0.005676667089574039,
+          0.006361540989018977,
+          0.00711445789784193,
+          0.006794292014092207,
+          0.0070552079705521464
+        ],
+        "bulk_serial": [
+          0.02224979200400412,
+          0.018338375026360154,
+          0.018925582990050316,
+          0.01895912503823638,
+          0.018665499985218048,
+          0.019202583003789186,
+          0.018718292005360126,
+          0.018414166988804936,
+          0.017737500020302832,
+          0.017302457941696048,
+          0.018266125000081956
+        ],
+        "posix": [
+          0.04040658299345523,
+          0.035671915975399315,
+          0.03660066705197096,
+          0.035024542012251914,
+          0.035464791930280626,
+          0.0359982920344919,
+          0.03546816704329103,
+          0.03563929197844118,
+          0.04690541699528694,
+          0.03537662501912564,
+          0.0349794999929145
+        ]
+      },
+      "sample_rows": [
+        {
+          "cpu_s": 0.019626000000000143,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.019647791050374508,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.04165799999999997,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.04222262499388307,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.04584100000000024,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 0,
+          "wall_s": 0.033777208998799324,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.042654000000000636,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.04512304102536291,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.02587800000000051,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.040564666967839,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.03903900000000071,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk_serial",
+            "bulk"
+          ],
+          "round": 1,
+          "wall_s": 0.01692375005222857,
+          "warmup": true
+        },
+        {
+          "cpu_s": 0.02193199999999962,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "wall_s": 0.02224979200400412,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03407099999999996,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "wall_s": 0.009820249979384243,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03763400000000061,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 2,
+          "wall_s": 0.04040658299345523,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.0267299999999997,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.0060070829931646585,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03559900000000038,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.035671915975399315,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018316999999999695,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 3,
+          "wall_s": 0.018338375026360154,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.036450000000000315,
+          "method": "posix",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 4,
+          "wall_s": 0.03660066705197096,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.029593000000000202,
+          "method": "bulk",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 4,
+          "wall_s": 0.006830250029452145,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.01888199999999962,
+          "method": "bulk_serial",
+          "order": [
+            "posix",
+            "bulk",
+            "bulk_serial"
+          ],
+          "round": 4,
+          "wall_s": 0.018925582990050316,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018924999999999415,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.01895912503823638,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03079300000000007,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.006934082950465381,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03494300000000017,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 5,
+          "wall_s": 0.035024542012251914,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.02847899999999992,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 6,
+          "wall_s": 0.006412249989807606,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.035358999999999696,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 6,
+          "wall_s": 0.035464791930280626,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018645999999999496,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 6,
+          "wall_s": 0.018665499985218048,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.02568000000000037,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.005753207951784134,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.019124999999999837,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.019202583003789186,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03585100000000008,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 7,
+          "wall_s": 0.0359982920344919,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018683000000000227,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 8,
+          "wall_s": 0.018718292005360126,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.025638000000000716,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 8,
+          "wall_s": 0.005676667089574039,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.0353090000000007,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 8,
+          "wall_s": 0.03546816704329103,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018367000000000466,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 9,
+          "wall_s": 0.018414166988804936,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03555399999999942,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 9,
+          "wall_s": 0.03563929197844118,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.02848300000000048,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "posix",
+            "bulk"
+          ],
+          "round": 9,
+          "wall_s": 0.006361540989018977,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017712000000000394,
+          "method": "bulk_serial",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.017737500020302832,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.030895000000000117,
+          "method": "bulk",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.00711445789784193,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.038920000000000066,
+          "method": "posix",
+          "order": [
+            "bulk_serial",
+            "bulk",
+            "posix"
+          ],
+          "round": 10,
+          "wall_s": 0.04690541699528694,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.029944999999999666,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.006794292014092207,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.017269999999999897,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.017302457941696048,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03527099999999983,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "bulk_serial",
+            "posix"
+          ],
+          "round": 11,
+          "wall_s": 0.03537662501912564,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.03093400000000024,
+          "method": "bulk",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 12,
+          "wall_s": 0.0070552079705521464,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.034913000000000416,
+          "method": "posix",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 12,
+          "wall_s": 0.0349794999929145,
+          "warmup": false
+        },
+        {
+          "cpu_s": 0.018219000000000207,
+          "method": "bulk_serial",
+          "order": [
+            "bulk",
+            "posix",
+            "bulk_serial"
+          ],
+          "round": 12,
+          "wall_s": 0.018266125000081956,
+          "warmup": false
+        }
+      ],
+      "speedup": 5.245475452706604
+    }
+  },
+  "posix_comparisons": {
+    "deep40": {
+      "baseline": "posix",
+      "memory_samples_per_method": 3,
+      "python_process_memory_ranges_bytes": {
+        "posix": {
+          "rss_bytes": {
+            "min": 18644992,
+            "median": 18694144,
+            "max": 18759680
+          },
+          "footprint_bytes": {
+            "min": 9142776,
+            "median": 9175520,
+            "max": 9257464
+          }
+        },
+        "bulk_serial": {
+          "rss_bytes": {
+            "min": 18415616,
+            "median": 18448384,
+            "max": 18481152
+          },
+          "footprint_bytes": {
+            "min": 8929784,
+            "median": 8962552,
+            "max": 8978912
+          }
+        },
+        "bulk": {
+          "rss_bytes": {
+            "min": 18366464,
+            "median": 18448384,
+            "max": 18481152
+          },
+          "footprint_bytes": {
+            "min": 8880632,
+            "median": 8962552,
+            "max": 8978912
+          }
+        }
+      },
+      "candidates": {
+        "bulk_serial": {
+          "wall_s": {
+            "baseline": 0.03566395794041455,
+            "candidate": 0.017217583023011684,
+            "candidate_minus_baseline": -0.018446374917402864,
+            "percent_change": -51.72273629366121,
+            "baseline_divided_by_candidate": 2.071368431489418
+          },
+          "process_cpu_s": {
+            "baseline": 0.03554499999999994,
+            "candidate": 0.017212999999999923,
+            "candidate_minus_baseline": -0.018332000000000015,
+            "percent_change": -51.574061049374166,
+            "baseline_divided_by_candidate": 2.0650090048219427
+          },
+          "rss_bytes": {
+            "baseline": 18694144,
+            "candidate": 18448384,
+            "candidate_minus_baseline": -245760,
+            "percent_change": -1.3146362839614374,
+            "baseline_divided_by_candidate": 1.0133214920071048
+          },
+          "footprint_bytes": {
+            "baseline": 9175520,
+            "candidate": 8962552,
+            "candidate_minus_baseline": -212968,
+            "percent_change": -2.3210455647200376,
+            "baseline_divided_by_candidate": 1.0237619820783188
+          }
+        },
+        "bulk": {
+          "wall_s": {
+            "baseline": 0.03566395794041455,
+            "candidate": 0.01720679202117026,
+            "candidate_minus_baseline": -0.01845716591924429,
+            "percent_change": -51.752993736930556,
+            "baseline_divided_by_candidate": 2.07266746157771
+          },
+          "process_cpu_s": {
+            "baseline": 0.03554499999999994,
+            "candidate": 0.017190999999999512,
+            "candidate_minus_baseline": -0.018354000000000426,
+            "percent_change": -51.6359544239709,
+            "baseline_divided_by_candidate": 2.067651678203766
+          },
+          "rss_bytes": {
+            "baseline": 18694144,
+            "candidate": 18448384,
+            "candidate_minus_baseline": -245760,
+            "percent_change": -1.3146362839614374,
+            "baseline_divided_by_candidate": 1.0133214920071048
+          },
+          "footprint_bytes": {
+            "baseline": 9175520,
+            "candidate": 8962552,
+            "candidate_minus_baseline": -212968,
+            "percent_change": -2.3210455647200376,
+            "baseline_divided_by_candidate": 1.0237619820783188
+          }
+        }
+      }
+    },
+    "flat": {
+      "baseline": "posix",
+      "memory_samples_per_method": 3,
+      "python_process_memory_ranges_bytes": {
+        "posix": {
+          "rss_bytes": {
+            "min": 18399232,
+            "median": 18432000,
+            "max": 18448384
+          },
+          "footprint_bytes": {
+            "min": 8896992,
+            "median": 8946168,
+            "max": 8962552
+          }
+        },
+        "bulk_serial": {
+          "rss_bytes": {
+            "min": 18399232,
+            "median": 18399232,
+            "max": 18448384
+          },
+          "footprint_bytes": {
+            "min": 8913400,
+            "median": 8913400,
+            "max": 8962552
+          }
+        },
+        "bulk": {
+          "rss_bytes": {
+            "min": 18415616,
+            "median": 18448384,
+            "max": 18481152
+          },
+          "footprint_bytes": {
+            "min": 8929784,
+            "median": 8962552,
+            "max": 8995320
+          }
+        }
+      },
+      "candidates": {
+        "bulk_serial": {
+          "wall_s": {
+            "baseline": 0.034835999947972596,
+            "candidate": 0.017759290989488363,
+            "candidate_minus_baseline": -0.017076708958484232,
+            "percent_change": -49.020292180469106,
+            "baseline_divided_by_candidate": 1.9615647926818618
+          },
+          "process_cpu_s": {
+            "baseline": 0.03470099999999965,
+            "candidate": 0.017742000000000147,
+            "candidate_minus_baseline": -0.016958999999999502,
+            "percent_change": -48.87179043831496,
+            "baseline_divided_by_candidate": 1.9558674332092978
+          },
+          "rss_bytes": {
+            "baseline": 18432000,
+            "candidate": 18399232,
+            "candidate_minus_baseline": -32768,
+            "percent_change": -0.17777777777777778,
+            "baseline_divided_by_candidate": 1.0017809439002672
+          },
+          "footprint_bytes": {
+            "baseline": 8946168,
+            "candidate": 8913400,
+            "candidate_minus_baseline": -32768,
+            "percent_change": -0.3662797300475466,
+            "baseline_divided_by_candidate": 1.0036762627055893
+          }
+        },
+        "bulk": {
+          "wall_s": {
+            "baseline": 0.034835999947972596,
+            "candidate": 0.018058084067888558,
+            "candidate_minus_baseline": -0.016777915880084038,
+            "percent_change": -48.162578669025656,
+            "baseline_divided_by_candidate": 1.9291083050122158
+          },
+          "process_cpu_s": {
+            "baseline": 0.03470099999999965,
+            "candidate": 0.018032000000000048,
+            "candidate_minus_baseline": -0.0166689999999996,
+            "percent_change": -48.03607965188257,
+            "baseline_divided_by_candidate": 1.92441215616679
+          },
+          "rss_bytes": {
+            "baseline": 18432000,
+            "candidate": 18448384,
+            "candidate_minus_baseline": 16384,
+            "percent_change": 0.08888888888888889,
+            "baseline_divided_by_candidate": 0.9991119005328597
+          },
+          "footprint_bytes": {
+            "baseline": 8946168,
+            "candidate": 8962552,
+            "candidate_minus_baseline": 16384,
+            "percent_change": 0.1831398650237733,
+            "baseline_divided_by_candidate": 0.9981719492394577
+          }
+        }
+      }
+    },
+    "nested": {
+      "baseline": "posix",
+      "memory_samples_per_method": 3,
+      "python_process_memory_ranges_bytes": {
+        "posix": {
+          "rss_bytes": {
+            "min": 18432000,
+            "median": 18448384,
+            "max": 18497536
+          },
+          "footprint_bytes": {
+            "min": 8946168,
+            "median": 8962552,
+            "max": 8995296
+          }
+        },
+        "bulk_serial": {
+          "rss_bytes": {
+            "min": 18464768,
+            "median": 18481152,
+            "max": 18481152
+          },
+          "footprint_bytes": {
+            "min": 8978912,
+            "median": 8978936,
+            "max": 8995320
+          }
+        },
+        "bulk": {
+          "rss_bytes": {
+            "min": 18530304,
+            "median": 18579456,
+            "max": 18595840
+          },
+          "footprint_bytes": {
+            "min": 9011680,
+            "median": 9077240,
+            "max": 9093624
+          }
+        }
+      },
+      "candidates": {
+        "bulk_serial": {
+          "wall_s": {
+            "baseline": 0.03563929197844118,
+            "candidate": 0.018665499985218048,
+            "candidate_minus_baseline": -0.01697379199322313,
+            "percent_change": -47.626625140283004,
+            "baseline_divided_by_candidate": 1.909367121516453
+          },
+          "process_cpu_s": {
+            "baseline": 0.03555399999999942,
+            "candidate": 0.018645999999999496,
+            "candidate_minus_baseline": -0.016907999999999923,
+            "percent_change": -47.55583056758789,
+            "baseline_divided_by_candidate": 1.9067896599807133
+          },
+          "rss_bytes": {
+            "baseline": 18448384,
+            "candidate": 18481152,
+            "candidate_minus_baseline": 32768,
+            "percent_change": 0.17761989342806395,
+            "baseline_divided_by_candidate": 0.99822695035461
+          },
+          "footprint_bytes": {
+            "baseline": 8962552,
+            "candidate": 8978936,
+            "candidate_minus_baseline": 16384,
+            "percent_change": 0.182805076054231,
+            "baseline_divided_by_candidate": 0.9981752849112634
+          }
+        },
+        "bulk": {
+          "wall_s": {
+            "baseline": 0.03563929197844118,
+            "candidate": 0.006794292014092207,
+            "candidate_minus_baseline": -0.028844999964348972,
+            "percent_change": -80.93595120183029,
+            "baseline_divided_by_candidate": 5.245475452706604
+          },
+          "process_cpu_s": {
+            "baseline": 0.03555399999999942,
+            "candidate": 0.029593000000000202,
+            "candidate_minus_baseline": -0.005960999999999217,
+            "percent_change": -16.766046014511208,
+            "baseline_divided_by_candidate": 1.2014327712634467
+          },
+          "rss_bytes": {
+            "baseline": 18448384,
+            "candidate": 18579456,
+            "candidate_minus_baseline": 131072,
+            "percent_change": 0.7104795737122558,
+            "baseline_divided_by_candidate": 0.9929453262786596
+          },
+          "footprint_bytes": {
+            "baseline": 8962552,
+            "candidate": 9077240,
+            "candidate_minus_baseline": 114688,
+            "percent_change": 1.279635532379617,
+            "baseline_divided_by_candidate": 0.9873653224989094
+          }
+        }
+      }
+    }
+  },
+  "average_cpu_cores": {
+    "deep40": {
+      "posix": {
+        "median": 0.9961287234348779,
+        "min": 0.5433977819051066,
+        "max": 0.9983311952363568,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk_serial": {
+        "median": 0.9993159987318551,
+        "min": 0.9986611640187797,
+        "max": 0.9998490254539982,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk": {
+        "median": 0.9990189720405174,
+        "min": 0.9953665968387682,
+        "max": 0.9996276330672708,
+        "measured_samples": 11,
+        "available_samples": 11
+      }
+    },
+    "flat": {
+      "posix": {
+        "median": 0.9970006431960319,
+        "min": 0.6690547891600476,
+        "max": 0.9978576885146679,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk_serial": {
+        "median": 0.9987245769157784,
+        "min": 0.8748339634359371,
+        "max": 0.9995530891562828,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk": {
+        "median": 0.9987078552644247,
+        "min": 0.9972789719088324,
+        "max": 0.9996141799232665,
+        "measured_samples": 11,
+        "available_samples": 11
+      }
+    },
+    "nested": {
+      "posix": {
+        "median": 0.9970142708902077,
+        "min": 0.8297549087754779,
+        "max": 0.9980988866928472,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk_serial": {
+        "median": 0.9981145712787367,
+        "min": 0.9857170797845071,
+        "max": 0.9989552926396831,
+        "measured_samples": 11,
+        "available_samples": 11
+      },
+      "bulk": {
+        "median": 4.440817945209813,
+        "min": 3.4694636156437544,
+        "max": 4.516382517320479,
+        "measured_samples": 11,
+        "available_samples": 11
+      }
+    }
+  },
+  "comparison_method": {
+    "baseline": "POSIX readdir/fstatat in the same installed extension, not a separate Apple command.",
+    "timing": "11 API samples after two warmups; all 117 rows retained. Wall and process CPU exclude interpreter startup.",
+    "memory": "Three fresh Python processes per method/layout; all 27 rows retained. Peak RSS/footprint include interpreter, imports and validation, not standalone engine memory.",
+    "formulas": "Difference is candidate minus POSIX; ratio is POSIX/candidate. Negative differences and ratios above one favor candidate.",
+    "ranges": "Three-sample observed ranges are not confidence intervals; overlapping ranges do not establish a memory advantage.",
+    "cpu_utilization": "Median of each measured process CPU/wall ratio; average occupied cores, not peak or machine-wide load.",
+    "units": "Seconds and bytes. KiB=1024 bytes.",
+    "scope": "Synthetic layouts do not establish universal filesystem gains."
+  },
+  "export_provenance": {
+    "original_result_sha256": "2dcee2b1d8037cc6943693474c3a25099ac3dd0441ca613a7c3ec7ad5ab28875",
+    "derivation_script_sha256": "e80226f48e28b41a529ab8fb8eeeee472a788ac9399a712c6f6e88adbc1a4f56",
+    "retained_timing_rows": 117,
+    "retained_timing_warmup_rows": 18,
+    "retained_memory_rows": 27,
+    "preservation": "Every original field and row, including warmups, losses and diagnostics, is unchanged.",
+    "added_fields": [
+      "posix_comparisons",
+      "average_cpu_cores",
+      "comparison_method",
+      "export_provenance"
+    ]
+  }
+}

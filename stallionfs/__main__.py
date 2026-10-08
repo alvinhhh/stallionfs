@@ -6,7 +6,6 @@ import shutil
 import sys
 
 from . import __version__
-from .core import StallionError, Store
 
 
 def main(argv=None):
@@ -77,6 +76,7 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    from .core import StallionError, Store
     try:
         store = None if args.action in {"scan", "clone", "delete", "move", "volumes"} else Store(args.root)
         if args.action == "scan":

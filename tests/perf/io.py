@@ -5,7 +5,6 @@ which has its own benchmark. Publishes no result until checks and cleanup pass.
 """
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import importlib.util
 import json
 import os
@@ -21,9 +20,10 @@ import tempfile
 
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
+sys.path[:0] = [str(REPO), str(Path(__file__).resolve().parent)]
 from stallionfs import _scan, images
 from stallionfs.core import Store, git, remove_tree, write_json
+from fileops import digest as hash_file
 
 spec = importlib.util.spec_from_file_location('fs_volume', REPO / 'tests' / 'fs_volume.py')
 checks = importlib.util.module_from_spec(spec)
@@ -52,11 +52,6 @@ def volume_info(path):
     }
 
 
-def hash_file(path):
-    with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scratch', type=Path, required=True,
@@ -77,7 +72,8 @@ def main():
     sources = {
         path.relative_to(REPO).as_posix(): hash_file(path)
         for path in (REPO / 'stallionfs' / 'core.py', REPO / 'stallionfs' / 'images.py',
-                     REPO / 'stallionfs' / '_scan.c', REPO / 'tests' / 'fs_volume.py')
+                     REPO / 'stallionfs' / '_scan.c', REPO / 'tests' / 'fs_volume.py',
+                     Path(__file__).with_name('fileops.py'))
     }
     report = {
         'timestamp': datetime.now(timezone.utc).isoformat(),

@@ -1,4 +1,5 @@
 """Integration checks for the installed native launcher and its Python helper."""
+from importlib.metadata import version
 import os
 import json
 from pathlib import Path
@@ -114,7 +115,7 @@ class InstalledCLI(unittest.TestCase):
             self.assertIsInstance(json.loads(failed.stderr)['error'], str)
         finally:
             denied.chmod(0o700)
-        for arguments in (('--json', 'scan', '--', source.name), ('--json', 'volumes')):
+        for arguments in (('--json', 'scan', '--', source.name), ('--json', 'volumes'), ('--version',)):
             read_fd, write_fd = os.pipe()
             os.close(read_fd)
             try:
@@ -161,7 +162,63 @@ class InstalledCLI(unittest.TestCase):
         self.assertTrue(all(len(row) == 3 and row[1] in ('read-only', 'writable') for row in volumes))
         self.assertFalse((self.base / 'unused-store').exists())
 
+    def test_native_exports_load_once_on_first_access(self):
+        result = subprocess.run([sys.executable, '-I', '-c', """
+import sys, threading, stallionfs
+from concurrent.futures import ThreadPoolExecutor
+names = ('clone', 'delete', 'mounts', 'move', 'scan')
+assert stallionfs.__all__ == list(names)
+assert set(names) | {'_scan'} <= set(dir(stallionfs))
+assert not hasattr(stallionfs, 'not_an_export')
+assert 'stallionfs._scan' not in sys.modules
+requested = ('_scan', *names)
+barrier = threading.Barrier(len(requested), timeout=5)
+def get(name):
+    barrier.wait()
+    return getattr(stallionfs, name)
+with ThreadPoolExecutor(max_workers=len(requested)) as pool:
+    values = dict(zip(requested, pool.map(get, requested)))
+from stallionfs import _scan
+namespace = {}
+exec('from stallionfs import *', namespace)
+assert set(namespace) - {'__builtins__'} == set(names)
+assert values['_scan'] is _scan
+for name in names:
+    assert namespace[name] is values[name] is getattr(_scan, name)
+    assert getattr(stallionfs, name) is vars(stallionfs)[name] is values[name]
+"""], cwd=self.base, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_native_extension_fails_before_store_creation(self):
+        import stallionfs
+        help_text = self.command('--help').stdout
+        for damage in ('missing', 'corrupt'):
+            with self.subTest(damage=damage):
+                package = self.base / damage / 'stallionfs'; package.mkdir(parents=True)
+                for source in Path(stallionfs.__file__).parent.glob('*.py'):
+                    shutil.copyfile(source, package / source.name)
+                if damage == 'corrupt':
+                    (package / ('_scan' + sysconfig.get_config_var('EXT_SUFFIX'))).write_bytes(b'invalid')
+                store = package.parent / 'must-not-exist'
+                environment = {key: value for key, value in self.environment.items()
+                               if not key.startswith('PYTHON')}
+                environment.update(PYTHONPATH=str(package.parent), PYTHONNOUSERSITE='1',
+                                   PYTHONDONTWRITEBYTECODE='1', STALLIONFS_HOME=str(store))
+                self.assertEqual(self.command('--help', environment=environment).stdout, help_text)
+                self.assertEqual(self.command('--version', environment=environment).stdout, __version__ + '\n')
+                failed = self.command('--root', str(store), 'list', status=1, environment=environment)
+                self.assertEqual(failed.stdout, '')
+                self.assertIn('ModuleNotFoundError' if damage == 'missing' else 'ImportError', failed.stderr)
+                self.assertFalse(store.exists())
+
     def test_helper_dispatch_from_installed_and_symlinked_launcher(self):
+        self.assertEqual(__version__, version('stallionfs'))
+        native = self.native_only()
+        self.assertEqual(self.command('--version', launcher=native).stdout, __version__ + '\n')
+        for arguments in (('--ver',), ('--json', '--version'), ('--version', 'ignored')):
+            failed = self.command(*arguments, launcher=native, status=1)
+            self.assertEqual(failed.stdout, '')
+            self.assertIn('cannot run installed Python helper', failed.stderr)
         alias = self.base / 'linked launcher'
         alias.symlink_to(self.launcher)
         for launcher in (self.launcher, alias):

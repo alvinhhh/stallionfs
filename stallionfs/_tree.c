@@ -25,7 +25,7 @@ enum operation { CLONING, DELETING };
 struct job {
     int source, destination;
     char *name;
-    struct stat identity;
+    ino_t inode;
     struct job *parent;
     unsigned pending, depth;
 };
@@ -116,7 +116,8 @@ static void finish(struct tree *state, struct job *job) {
                 struct stat current;
                 if (fstatat(parent_fd, job->name, &current, AT_SYMLINK_NOFOLLOW))
                     fail(state, errno, parent_fd, job->name);
-                else if (!same_object(&current, &job->identity)) fail(state, ESTALE, parent_fd, job->name);
+                else if (current.st_dev != state->device || current.st_ino != job->inode ||
+                         !S_ISDIR(current.st_mode)) fail(state, ESTALE, parent_fd, job->name);
                 else if (unlinkat(parent_fd, job->name, AT_REMOVEDIR)) fail(state, errno, parent_fd, job->name);
             }
         }
@@ -155,7 +156,7 @@ static void directory(struct tree *state, struct job *parent, const char *name, 
         return;
     }
     *child = (struct job){.source = source, .destination = destination, .name = owned_name,
-        .identity = identity, .parent = parent, .pending = 1, .depth = parent->depth + 1};
+        .inode = identity.st_ino, .parent = parent, .pending = 1, .depth = parent->depth + 1};
     pthread_mutex_lock(&state->mutex);
     parent->pending++;
     state->live++;
@@ -233,7 +234,7 @@ static int run_tree(int source, int destination, int parent, const char *name,
         errno = ENOMEM; return -1;
     }
     *root = (struct job){.source = source, .destination = destination, .name = owned_name,
-                        .identity = *identity, .pending = 1};
+                        .inode = identity->st_ino, .pending = 1};
     struct tree state = {.mutex = PTHREAD_MUTEX_INITIALIZER, .available = PTHREAD_COND_INITIALIZER,
         .parent_fd = parent, .operation = operation, .device = identity->st_dev, .live = 1, .queued = 1};
     atomic_init(&state.error, 0);

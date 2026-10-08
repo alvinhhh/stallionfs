@@ -40,7 +40,8 @@ def fixture(path, files, layout):
     for i in range(files):
         parent = (chain[i * 40 // files] if chain else
                   path / str(i // 100) if layout == 'nested' else path)
-        parent.mkdir(exist_ok=True)
+        if layout == 'nested' and i % 100 == 0:
+            parent.mkdir()
         (parent / f'file-{i}').write_bytes(bytes([i % 256]) * (i % 1024))
     extras = chain[-1] if chain else path
     (extras / 'empty').mkdir()
@@ -59,20 +60,8 @@ def fixture(path, files, layout):
 
 
 def memory_sample(path, method, expected, native_hash, metrics):
-    completed = None
-    original = f.command
-
-    def capture(*args, **kwargs):
-        nonlocal completed
-        completed = original(*args, **kwargs)
-        return completed
-
-    try:
-        f.command = capture
-        row = f.measure_memory([sys.executable, '-I', '-B', '-c', CHILD, path, method,
-                                json.dumps(expected), native_hash], metrics)
-    finally:
-        f.command = original
+    row, completed = f.measure_memory([sys.executable, '-I', '-B', '-c', CHILD, path, method,
+                                       json.dumps(expected), native_hash], metrics)
     if row.get('completion_uncertain') or row['exit_code'] != 0:
         raise f.ChildCompletionUnknown('Memory child completion uncertain; preserve fixture')
     f.require(completed is not None and not completed.stderr, 'Memory child output unavailable or invalid')

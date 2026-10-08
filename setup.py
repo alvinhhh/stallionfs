@@ -17,7 +17,9 @@ class NativeScripts(build_scripts):
         compiler = new_compiler(force=self.force)
         customize_compiler(compiler)
         temporary = str(Path(self.get_finalized_command("build").build_temp) / "native-scripts")
-        objects = compiler.compile(NATIVE, output_dir=temporary, extra_postargs=FLAGS, depends=[HEADER])
+        objects = compiler.compile(NATIVE, output_dir=temporary, extra_postargs=FLAGS,
+                                   macros=[("STALLIONFS_VERSION", f'"{self.distribution.get_version()}"')],
+                                   depends=[HEADER, "pyproject.toml"])
         compiler.link_executable(objects, "stallionfs", output_dir=self.build_dir)
 
     def get_outputs(self):

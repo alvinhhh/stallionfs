@@ -45,8 +45,8 @@ def cpu_seconds():
 def digest(root):
     rows = []
     for parent, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [d for d in sorted(dirs) if d != ".git"]
-        for name in sorted(files + [d for d in dirs if Path(parent, d).is_symlink()]):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in files + [d for d in dirs if Path(parent, d).is_symlink()]:
             if name == ".git":
                 continue
             path = Path(parent, name)

@@ -103,7 +103,8 @@ class BenchmarkFixtures(unittest.TestCase):
                             arguments[-1].unlink()
                         else:
                             arguments[-2].rename(arguments[-1])
-                        return {"exit_code": 0, "wrapper_wall_s" if memory else "wall_s": 3.0}
+                        row = {"exit_code": 0, "wrapper_wall_s" if memory else "wall_s": 3.0}
+                        return (row, None) if memory else row
 
                     clocks = []
                     for offset in (0, 200):
@@ -199,7 +200,8 @@ class BenchmarkFixtures(unittest.TestCase):
         metrics.write_text("real 0.01\n 1048576 maximum resident set size\n 2097152 peak memory footprint\n")
         completed = fileops.subprocess.CompletedProcess([], 0, b"", b"")
         with mock.patch.object(fileops, "command", return_value=completed):
-            row = fileops.measure_memory(["unused"], metrics)
+            row, returned = fileops.measure_memory(["unused"], metrics)
+        self.assertIs(returned, completed)
         self.assertEqual((row["rss_bytes"], row["footprint_bytes"]), (1048576, 2097152))
         self.assertNotIn("wall_s", row)
         output = self.base / "uncertain.json"
@@ -243,7 +245,7 @@ class BenchmarkFixtures(unittest.TestCase):
         row = {"exit_code": 1, "wrapper_wall_s": 0.01, "completion_uncertain": True}
         with mock.patch.object(sys, "argv", arguments), mock.patch.object(fileops, "fixtures", tiny_fixture), \
                 mock.patch.object(fileops, "compare_fixture", only_memory), \
-                mock.patch.object(fileops, "measure_memory", return_value=row), \
+                mock.patch.object(fileops, "measure_memory", return_value=(row, None)), \
                 mock.patch.object(fileops, "write_json", fail_after_uncertain_row), \
                 self.assertRaisesRegex(OSError, "checkpoint disk full"):
             fileops.main()
