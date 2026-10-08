@@ -110,7 +110,11 @@ class Workspaces(unittest.TestCase):
                 self.assertEqual(sorted(str(path.relative_to(self.store.root)) for path in self.store.root.rglob("*")), before)
         with patch("stallionfs.core.remove_tree", wraps=remove_tree) as reclaiming:
             self.assertEqual(self.store.gc(older_than=0, yes=True, jobs=1), [workspace["id"]])
-            reclaiming.assert_called_once_with(self.store.root / "trash" / workspace["id"], jobs=1)
+            reclaiming.assert_called_once_with(ANY, jobs=1)
+            retired = reclaiming.call_args.args[0]
+            self.assertEqual(retired.name, "expired")
+            self.assertEqual(retired.parent.parent, self.store.root / "staging")
+        self.assertEqual(list((self.store.root / "staging").iterdir()), [])
 
     def test_failure_does_not_publish_partial_seed_or_workspace(self):
         with self.assertRaises(StallionError) as failed:
@@ -205,11 +209,40 @@ class Workspaces(unittest.TestCase):
         self.assertEqual((victim / "precious").read_text(), "keep")
         self.assertEqual(self.store.list("trash"), [])
         workspace = self.store.create(seed)
+        (Path(workspace["path"]) / "external").symlink_to(victim)
         self.store.move(workspace["id"])
-        with patch("stallionfs.core.remove_tree", side_effect=PermissionError("denied")):
-            with self.assertRaises(PermissionError):
-                self.store.gc(older_than=0, yes=True)
-        self.assertEqual(self.store.list("trash")[0]["id"], workspace["id"])
+        expired = self.store.root / "trash" / workspace["id"]
+        os.utime(expired, (time.time() - 120,) * 2)
+        recent = self.store.create(seed)
+        self.store.move(recent["id"])
+        failure = PermissionError("denied after partial deletion")
+
+        def partial(path, *, jobs=4):
+            self.assertEqual(json.loads((path / "meta.json").read_text())["id"], workspace["id"])
+            (path / "meta.json").unlink()
+            raise failure
+
+        with patch("stallionfs.core.remove_tree", partial), self.assertRaises(PermissionError) as caught:
+            self.store.gc(older_than=60, yes=True)
+        self.assertIs(caught.exception, failure)
+        retained = list((self.store.root / "staging").iterdir())
+        self.assertEqual(len(retained), 1)
+        stage = retained[0]
+        self.assertFalse(stage.is_symlink())
+        self.assertEqual((stage.stat().st_uid, stage.stat().st_mode & 0o777), (os.getuid(), 0o700))
+        self.assertEqual(failure.__notes__, [f"Unfinished files retained at {stage}"])
+        self.assertFalse(expired.exists())
+        self.assertFalse((stage / "expired/meta.json").exists())
+        self.assertEqual((stage / "expired/repo/file").read_text(), "original\n")
+        self.assertTrue((stage / "expired/repo/external").is_symlink())
+        self.assertEqual((victim / "precious").read_text(), "keep")
+        self.assertEqual([row["id"] for row in self.store.list("trash")], [recent["id"]])
+        self.assertEqual(self.store.gc(older_than=60), [])
+        self.assertEqual(self.store.gc(older_than=60, yes=True), [])
+        self.assertEqual(list((self.store.root / "staging").iterdir()), retained)
+        restored = self.store.move(recent["id"], restore=True)
+        self.assertEqual((Path(restored["path"]) / "file").read_text(), "original\n")
+        self.assertEqual(self.store.list("trash"), [])
 
     def test_linked_worktree_source_and_environment_isolation(self):
         linked = self.base / "linked"

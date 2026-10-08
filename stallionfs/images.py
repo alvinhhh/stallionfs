@@ -61,10 +61,12 @@ def _path(value):
 
 
 def _directory(path, *, private=True):
+    if private:
+        from .core import private_directory
+        return private_directory(path)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (private and info.st_mode & 0o077):
-        raise _error(f"Expected an owned {'private ' if private else ''}directory: {path}")
-    return info
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise _error(f"Expected an owned directory: {path}")
 
 
 def _image(value, *, new=False):

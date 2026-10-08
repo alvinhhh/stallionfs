@@ -1,6 +1,6 @@
 # Storage and recovery
 
-The private storage directory has mode `0700` and contains:
+The private storage directory has mode `0700`. ACLs granting access to other users are rejected. It contains:
 
 | Directory | Contents |
 | --- | --- |
@@ -9,7 +9,7 @@ The private storage directory has mode `0700` and contains:
 | `trash/<id>/repo` | Removed workspaces, available to restore |
 | `<collection>/<id>/workspace.sparseimage` | APFS image for a seed or image workspace |
 | `workspaces/<id>/volume/repo` | Repository inside a mounted image workspace |
-| `staging` | Unpublished work during preparation or creation |
+| `staging` | Unpublished work and interrupted permanent deletion |
 | `locks` | Advisory per-object locks |
 
 Preparation and seed deletion take an exclusive lock on that seed. Creates take a shared lock, so independent clones can run concurrently. Workspace moves and deletion take a per-workspace lock. There is no background process.
@@ -17,6 +17,8 @@ Preparation and seed deletion take an exclusive lock on that seed. Creates take 
 Preparation and folder creation publish by renaming a completed staging directory. Image creation publishes the closed image and metadata before mounting at its final path. If mounting or branch creation fails, the workspace is retained; `stallionfs mount ID` retries initialization. A `ready.json` marker records completed initialization, so remounting never resets the branch.
 
 Failed or interrupted preparation and creation retain unfinished directories in `staging`, since setup commands may still have running descendants. Errors report the retained path, and `doctor` lists these entries. Stop setup commands and other stallionfs processes, then inspect the directory before removing it. A failed image preparation can leave an attached volume: detach that image normally first. Recursive cleanup refuses directories containing mounted volumes. Staging entries never become cache hits.
+
+Permanent deletion moves an eligible trash object into staging first. If deletion fails, its remaining files stay there and the error reports their location. Other trash objects can still be listed, restored or collected.
 
 This protects against ordinary process interruption. It is not a backup or a filesystem-wide crash transaction: a power loss can leave newly written file data incomplete. Keep source code in Git and back up work you need. If a seed is damaged, delete it with `forget` and prepare it again. A damaged workspace should be copied aside and recovered with ordinary Git tools before cleanup.
 

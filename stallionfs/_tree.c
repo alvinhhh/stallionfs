@@ -317,6 +317,46 @@ static int outside_source(int parent, const struct stat *source) {
     return error ? -1 : 0;
 }
 
+static int check_acl(int fd, uid_t owner, int private) {
+    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    /* Darwin reports ENOENT when a pinned directory has no extended ACL. */
+    if (!acl) { if (errno == ENOENT) { errno = 0; return 0; } if (!errno) errno = EIO; return -1; }
+    int error = 0, have_user = 0;
+    uuid_t user;
+    acl_entry_t entry;
+    acl_permset_mask_t known, mutations = ACL_ADD_FILE | ACL_ADD_SUBDIRECTORY | ACL_DELETE_CHILD |
+        ACL_WRITE_ATTRIBUTES | ACL_WRITE_SECURITY | ACL_CHANGE_OWNER;
+    if (acl_valid(acl)) error = errno ? errno : EIO;
+    if (!error && acl_maximal_permset_mask_np(&known)) error = errno ? errno : EIO;
+    for (int index = ACL_FIRST_ENTRY; !error; index = ACL_NEXT_ENTRY) {
+        errno = 0;
+        if (acl_get_entry(acl, index, &entry)) {
+            /* Darwin uses EINVAL for the end of a valid ACL. */
+            if (errno != EINVAL) error = errno ? errno : EIO;
+            break;
+        }
+        acl_tag_t tag;
+        acl_permset_mask_t permissions;
+        if (acl_get_tag_type(entry, &tag) || acl_get_permset_mask_np(entry, &permissions)) { error = errno ? errno : EIO; break; }
+        if (permissions & ~known) { error = EINVAL; break; }
+        if (tag == ACL_EXTENDED_DENY) continue;
+        if (tag != ACL_EXTENDED_ALLOW) { error = EINVAL; break; }
+        if (!(private ? permissions : permissions & mutations)) continue;
+        if (!have_user) {
+            error = mbr_uid_to_uuid(owner, user);
+            if (error) break;
+            have_user = 1;
+        }
+        void *principal = acl_get_qualifier(entry);
+        if (!principal) { error = errno ? errno : EIO; break; }
+        if (uuid_compare(principal, user)) error = EPERM;
+        acl_free(principal);
+    }
+    acl_free(acl);
+    errno = error;
+    return error ? -1 : 0;
+}
+
 /* Other users must not be able to replace our private staging directory. */
 static int protected_parent(int fd) {
     struct stat st;
@@ -324,39 +364,26 @@ static int protected_parent(int fd) {
     if ((st.st_uid != geteuid() && st.st_uid != 0) || (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) {
         errno = EPERM; return -1;
     }
-    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
-    /* Darwin reports ENOENT when a pinned directory has no extended ACL. */
-    if (!acl) { if (errno == ENOENT) { errno = 0; return 0; } return -1; }
-    int error = 0, have_user = 0;
-    uuid_t user;
-    acl_entry_t entry;
-    acl_perm_t mutations[] = {ACL_ADD_FILE, ACL_ADD_SUBDIRECTORY, ACL_DELETE_CHILD,
-                             ACL_WRITE_ATTRIBUTES, ACL_WRITE_SECURITY, ACL_CHANGE_OWNER};
-    if (acl_valid(acl)) error = errno;
-    for (int index = ACL_FIRST_ENTRY; !error && !acl_get_entry(acl, index, &entry); index = ACL_NEXT_ENTRY) {
-        acl_tag_t tag;
-        acl_permset_t permissions;
-        if (acl_get_tag_type(entry, &tag) || acl_get_permset(entry, &permissions)) { error = errno; break; }
-        if (tag == ACL_EXTENDED_DENY) continue;
-        if (tag != ACL_EXTENDED_ALLOW) { error = EINVAL; break; }
-        int mutation = 0;
-        for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
-            int value = acl_get_perm_np(permissions, mutations[i]);
-            if (value < 0) { error = errno; break; }
-            mutation |= value;
-        }
-        if (error || !mutation) continue;
-        if (!have_user) {
-            error = mbr_uid_to_uuid(geteuid(), user);
-            if (error) break;
-            have_user = 1;
-        }
-        void *principal = acl_get_qualifier(entry);
-        if (!principal) { error = errno; break; }
-        if (uuid_compare(principal, user)) error = EPERM;
-        acl_free(principal);
-    }
-    acl_free(acl);
+    return check_acl(fd, geteuid(), 0);
+}
+
+int stallion_private_directory(const char *path) {
+    if (!path || !*path) { errno = EINVAL; return -1; }
+    char *owned = strdup(path);
+    if (!owned) return -1;
+    size_t length = strlen(owned);
+    while (length > 1 && owned[length - 1] == '/') owned[--length] = 0;
+    int fd = open(owned, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int open_error = errno;
+    free(owned);
+    errno = open_error;
+    if (fd < 0) return -1;
+    struct stat st;
+    int error = 0;
+    if (fstat(fd, &st)) error = errno;
+    else if (st.st_uid != getuid() || (st.st_mode & 0077)) error = EPERM;
+    else if (check_acl(fd, getuid(), 1)) error = errno;
+    if (close(fd) && !error) error = errno;
     errno = error;
     return error ? -1 : 0;
 }

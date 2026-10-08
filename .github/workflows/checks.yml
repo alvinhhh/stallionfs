@@ -1,6 +1,7 @@
 name: Checks
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -11,9 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-15, python: '3.13', images: '0'}
+          - {os: macos-15, python: '3.12', images: '0'}
           - {os: macos-26, python: '3.11', images: '1'}
           - {os: macos-26, python: '3.13', images: '1'}
+          - {os: macos-26, python: '3.14', images: '1'}
           - {os: macos-26-intel, python: '3.13', images: '1'}
     env:
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
@@ -22,18 +24,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '${{ matrix.python }}'
-      - run: python -m pip install -e .
-      - name: Run tests with image failure diagnostics
+      - run: python -m compileall -q stallionfs
+      - run: python -m pip wheel --no-deps --wheel-dir dist .
+      - run: python -m pip install --force-reinstall --no-deps dist/*.whl
+      - name: Test installed wheel with image failure diagnostics
         run: |
-          python - <<'PY'
+          cd "$RUNNER_TEMP"
+          python -I -B - <<'PY'
           import json
           import os
+          from pathlib import Path
           import plistlib
+          import re
           import subprocess
           import sys
           import unittest
+          import stallionfs
           from stallionfs import images, _scan
 
+          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
+          assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
           original = images._command
 
           def inspect_image(args):
@@ -52,6 +63,9 @@ jobs:
               points = {e['mount-point'] for r in matches for e in r.get('system-entities', [])
                         if e.get('mount-point')}
               paths = {r['image-path'] for r in matches if r.get('image-path')}
+              raw_devices = {'/dev/r' + d[5:] for d in devices
+                             if re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', d)
+                             and os.path.exists('/dev/r' + d[5:])}
               if image and os.path.exists(image):
                   paths.add(image)
               print('Image attachments:', json.dumps([{
@@ -59,7 +73,7 @@ jobs:
               } for r in matches]), file=sys.stderr, flush=True)
               print('Matching mounts:', json.dumps([r for r in _scan.mounts()
                     if r['device'] in devices or r['path'] in points]), file=sys.stderr, flush=True)
-              for options, names in (([], paths | devices), (['+f'], points)):
+              for options, names in (([], paths | devices | raw_devices), (['+f'], points)):
                   if not names:
                       continue
                   result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'pcftn', *options, '--', *sorted(names)],
@@ -87,13 +101,13 @@ jobs:
                   raise
 
           images._command = diagnostic_command
-          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'))
-          sys.exit(not result.wasSuccessful())
+          suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and result.skipped
+          if required_skips:
+              print('Required filesystem tests were skipped.', file=sys.stderr)
+          sys.exit(not result.wasSuccessful() or bool(required_skips))
           PY
-      - run: python -m compileall -q stallionfs
-      - run: python -m pip wheel --no-deps --wheel-dir dist .
-      - run: python -m pip install --force-reinstall --no-deps dist/*.whl
       - run: |
           cd "$RUNNER_TEMP"
-          python "$GITHUB_WORKSPACE/tests/test_cli.py" -v
           stallionfs --root "$RUNNER_TEMP/stallionfs-smoke" doctor

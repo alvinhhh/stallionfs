@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import fcntl
 import hashlib
 import json
@@ -79,9 +80,13 @@ def write_json(path, value):
 
 
 def private_directory(path):
-    info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise StallionError(f"Storage must be an owned, real directory with mode 0700: {path}")
+    from ._scan import _private_directory
+    try:
+        _private_directory(path)
+    except OSError as exc:
+        if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOTDIR, errno.ELOOP):
+            raise
+        raise StallionError(f"Storage must be an owned, real directory with mode 0700 and no ACL access for other users: {path}") from exc
 
 
 def remove_tree(path, *, jobs=4):
@@ -390,8 +395,12 @@ class Store:
                         from . import images
                         if images.mounted(path / "workspace.sparseimage") is not None:
                             raise StallionError("Trashed image is still attached; detach it before collection")
-                    # Only an owned, validated object in trash is ever recursively deleted.
-                    remove_tree(path, jobs=tree_jobs)
+                    # Keep partial deletion out of the restorable trash collection.
+                    with self.staging() as stage:
+                        expired = stage / "expired"
+                        path.rename(expired)
+                        remove_tree(expired, jobs=tree_jobs)
+                        stage.rmdir()
                 return entry.name
 
         entries = list((self.root / "trash").iterdir())

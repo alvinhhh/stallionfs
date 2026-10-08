@@ -187,7 +187,23 @@ static PyObject *mount_records(PyObject *self, PyObject *unused) {
     return result;
 }
 
+static PyObject *private_directory(PyObject *self, PyObject *argument) {
+    (void)self;
+    PyObject *path;
+    if (!PyUnicode_FSConverter(argument, &path)) return NULL;
+    if (!valid_path(path)) { Py_DECREF(path); return NULL; }
+    int result, error;
+    Py_BEGIN_ALLOW_THREADS
+    result = stallion_private_directory(PyBytes_AS_STRING(path));
+    error = errno;
+    Py_END_ALLOW_THREADS
+    PyObject *value = operation_result(result, error, PyBytes_AS_STRING(path));
+    Py_DECREF(path);
+    return value;
+}
+
 static PyMethodDef methods[] = {
+    {"_private_directory", private_directory, METH_O, "Validate private directory ownership, mode and ACLs without changing them."},
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},
     {"clone", (PyCFunction)(void(*)(void))clone_path, METH_VARARGS | METH_KEYWORDS, "Clone to an exact new path without byte-copy fallback."},
     {"_clone_tree", (PyCFunction)(void(*)(void))clone_tree, METH_VARARGS | METH_KEYWORDS, "Clone a prepared directory; reject root symlinks."},
