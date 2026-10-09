@@ -155,7 +155,12 @@ Omit `--methods` to include `prepared_byte_copy` and `stallionfs_image`, unmeasu
 
 ### Workspace memory
 
-No complete current workspace memory result is available. Two prior attempts stopped after a child was reported outside its tracked process group.
+[Workspace memory results](results/workspace-memory-v0.6.3-m2.json) show median sampled peaks from three runs after a warmup. A process exited during sampling, leaving the four-workspace Git/npm comparison unavailable.
+
+| Concurrent workspaces | Sampled lifecycle RSS MiB, Git/npm → folder | Sampled lifecycle footprint MiB, Git/npm → folder |
+| ---: | ---: | ---: |
+| 1 | 426.359 → 67.125 | 388.205 → 51.657 |
+| 4 | unavailable → 75.453 | unavailable → 54.345 |
 
 The sampler sums current counters for the post-setup coordinator and observed descendants, including threads; preparation/validation are excluded. Sequential queries target 5 ms intervals; actual sweeps/gaps are recorded. These are sampled group sums, not exact atomic peaks or sums of lifetime maxima. Short processes/spikes may be missed; RSS may double-count shared pages; charged footprint is not unique RAM. Memory sampling does not measure CPU/wall speedups.
 
