@@ -215,7 +215,7 @@ class FileOperations(unittest.TestCase):
         object_file, executable = self.base / 'tree.o', self.base / 'native-faults'
         common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
                   '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
-        replacements = ['openat', 'fclonefileat', 'unlinkat', 'pthread_create', 'pthread_join']
+        replacements = ['openat', 'fstat', 'fclonefileat', 'unlinkat', 'pthread_create', 'pthread_join']
         subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
                         '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)
         subprocess.run([*common, str(tests / 'native_faults.c'), str(object_file), '-o', str(executable)],
