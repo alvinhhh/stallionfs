@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -212,7 +213,8 @@ class FileOperations(unittest.TestCase):
         tests = Path(__file__).resolve().parent
         source = tests.parent / 'stallionfs'
         object_file, executable = self.base / 'tree.o', self.base / 'native-faults'
-        common = ['cc', '-O2', '-g', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(source)]
+        common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+                  '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
         replacements = ['openat', 'fclonefileat', 'unlinkat', 'pthread_create', 'pthread_join']
         subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
                         '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)

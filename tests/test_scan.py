@@ -4,6 +4,7 @@ from importlib.metadata import version
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import sys
@@ -111,7 +112,8 @@ class Scan(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='stallionfs-scan-faults-') as temporary:
             base = Path(temporary).resolve()
             object_file, driver, launcher = base / 'walk.o', base / 'faults', base / 'stallionfs'
-            common = ['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-I', str(source)]
+            common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-Wall', '-Wextra', '-Werror',
+                      '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
             replacements = ('open', 'openat', 'fstat', 'close', 'closedir', 'getattrlistbulk',
                             'pthread_create', 'pthread_join')
             subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),

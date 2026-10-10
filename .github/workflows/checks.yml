@@ -112,6 +112,33 @@ jobs:
               print('Required filesystem tests were skipped.', file=sys.stderr)
           sys.exit(not result.wasSuccessful() or bool(required_skips))
           PY
+      - name: Check native code with sanitizers
+        if: matrix.python == '3.13'
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          cd "$RUNNER_TEMP"
+          python -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          import unittest
+
+          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'))
+          names = (
+              'test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
+              'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
+          )
+          for sanitizers in ('address,undefined', 'thread'):
+              print('Sanitizers:', sanitizers, flush=True)
+              os.environ['CFLAGS'] = f'-g -fno-omit-frame-pointer -fsanitize={sanitizers} -fno-sanitize-recover=all'
+              suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+              if not result.wasSuccessful() or result.skipped:
+                  sys.exit(1)
+          PY
       - run: |
           cd "$RUNNER_TEMP"
           stallionfs --root "$RUNNER_TEMP/stallionfs-smoke" doctor
