@@ -18,6 +18,7 @@
 static const char *fault;
 static pthread_t caller;
 static char outside[PATH_MAX], source[PATH_MAX];
+static struct stat destination_parent;
 static atomic_int entered, release_worker, cancelled, active, swaps, starts, created, joined;
 static int cancel(void *unused) { (void)unused; assert(pthread_equal(pthread_self(), caller)); return atomic_load(&cancelled); }
 static void pause_worker(void) {
@@ -37,6 +38,17 @@ static int copy_error(void) {
     if (!strcmp(fault, "enospc")) { errno = ENOSPC; return -1; }
     if (!strcmp(fault, "unsupported")) { errno = ENOTSUP; return -1; }
     return 0;
+}
+int stallion_test_fstat(int fd, struct stat *st) __DARWIN_INODE64(stallion_test_fstat);
+int stallion_test_fstat(int fd, struct stat *st) {
+    int result = fstat(fd, st);
+    if (!result && !strncmp(fault, "parent-", 7) &&
+        st->st_dev == destination_parent.st_dev && st->st_ino == destination_parent.st_ino) {
+        if (!strcmp(fault, "parent-stat")) { errno = EIO; return -1; }
+        st->st_mode = (st->st_mode & ~S_ISVTX) | 0022;
+        if (!strcmp(fault, "parent-device")) st->st_dev ^= 1;
+    }
+    return result;
 }
 int stallion_test_fclonefileat(int source, int destination, const char *name, uint32_t flags) {
     if (copy_error()) return -1;
@@ -110,6 +122,7 @@ static void check(const char *base, int deleting, const char *kind) {
     char root[PATH_MAX], destination[PATH_MAX], child[PATH_MAX], error_path[PATH_MAX];
     snprintf(root, sizeof(root), "%s/%s-%s", base, deleting ? "delete" : "clone", kind);
     assert(mkdir(root, 0700) == 0);
+    assert(stat(root, &destination_parent) == 0);
     snprintf(source, sizeof(source), "%s/source", root); assert(mkdir(source, 0700) == 0);
     snprintf(destination, sizeof(destination), "%s/destination", root);
     snprintf(outside, sizeof(outside), "%s/outside", root); assert(mkdir(outside, 0700) == 0); file(outside, "sentinel");
@@ -133,7 +146,14 @@ static void check(const char *base, int deleting, const char *kind) {
     assert(atomic_load(&active) == 0);
     assert(atomic_load(&created) == atomic_load(&joined));
     assert(descriptors() == before);
-    if (!strcmp(kind, "cancel")) { assert(error == EINTR); assert(pthread_join(helper, NULL) == 0); }
+    if (!strncmp(kind, "parent-", 7)) {
+        assert(error == (!strcmp(kind, "parent-stat") ? EIO : !strcmp(kind, "parent-device") ? EXDEV : EPERM));
+        struct stat st;
+        assert(lstat(destination, &st) == -1 && errno == ENOENT);
+        assert(atomic_load(&starts) == 0);
+        sentinel(child);
+    }
+    else if (!strcmp(kind, "cancel")) { assert(error == EINTR); assert(pthread_join(helper, NULL) == 0); }
     else if (!strcmp(kind, "enospc")) assert(error == ENOSPC);
     else if (!strcmp(kind, "unsupported")) assert(error == ENOTSUP);
     else if (!strncmp(kind, "thread-", 7)) assert(error == EAGAIN);
@@ -179,6 +199,9 @@ int main(int argc, char **argv) {
     check(argv[1], 0, "swap-file-fifo");
     check(argv[1], 0, "swap-destination");
     check(argv[1], 0, "enospc"); check(argv[1], 0, "unsupported");
+    check(argv[1], 0, "parent-stat");
+    check(argv[1], 0, "parent-device");
+    check(argv[1], 0, "parent-mode");
     check(argv[1], 1, "swap-postorder");
     return 0;
 }

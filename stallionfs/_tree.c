@@ -359,9 +359,10 @@ static int check_acl(int fd, uid_t owner, int private) {
 }
 
 /* Other users must not be able to replace our private staging directory. */
-static int protected_parent(int fd) {
+static int protected_parent(int fd, dev_t device) {
     struct stat st;
     if (fstat(fd, &st)) return -1;
+    if (st.st_dev != device) { errno = EXDEV; return -1; }
     if ((st.st_uid != geteuid() && st.st_uid != 0) || (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) {
         errno = EPERM; return -1;
     }
@@ -421,7 +422,7 @@ static int clone_impl(const char *source_path, const char *destination_path, int
     if (cancel && cancel(context)) { errno = EINTR; return -1; }
     struct path source = {.parent = -1}, destination = {.parent = -1};
     int input = -1, output = -1, error = 0;
-    struct stat identity, opened, parent_identity;
+    struct stat identity, opened;
     if (open_path(source_path, &source, 1)) error = errno;
     if (!error && fstatat(source.parent, source.name, &identity, AT_SYMLINK_NOFOLLOW)) error = errno;
     if (!error && ((directory_only || source.trailing_slash) && !S_ISDIR(identity.st_mode))) error = ENOTDIR;
@@ -440,9 +441,7 @@ static int clone_impl(const char *source_path, const char *destination_path, int
         else if (fclonefileat(input, destination.parent, destination.name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
         goto done;
     }
-    if (!error && fstat(destination.parent, &parent_identity)) error = errno;
-    if (!error && parent_identity.st_dev != identity.st_dev) error = EXDEV;
-    if (!error && protected_parent(destination.parent)) error = errno;
+    if (!error && protected_parent(destination.parent, identity.st_dev)) error = errno;
     if (!error && outside_source(destination.parent, &identity)) error = errno;
     if (!error && (output = open_created_directory(destination.parent, destination.name)) < 0) error = errno;
     /* Keep all children private until the final root-metadata copy. */
