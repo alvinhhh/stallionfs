@@ -1,4 +1,4 @@
-"""No daemon, database, shell evaluation, shared Git index, or hard-linked files."""
+"""No daemon, database, shell evaluation, shared Git index, or source-linked workspace files."""
 
 from __future__ import annotations
 

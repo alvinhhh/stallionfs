@@ -31,6 +31,8 @@ int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_
  * Workers are joined before return; failures can leave a partial new destination.
  * Directory-clone parents must be owned by the caller or root, non-writable by
  * other users unless sticky, and free of ACL mutation grants to other principals.
+ * Internal regular-file and symlink hardlinks remain linked within the copy,
+ * never to source inodes or aliases outside the copied tree.
  * Callers must keep the source stable during copying; this is not a tree snapshot.
  * Return 0 on success, or -1 with errno and a best-effort recovery/error path.
  */
