@@ -185,13 +185,33 @@ class NativeCorrectness(unittest.TestCase):
             shutil.copyfileobj(source, destination, 1024 * 1024)
         original, copied = checks.snapshot(sparse), checks.snapshot(dense)
         self.assertEqual(original["entries"][""]["sha256"], copied["entries"][""]["sha256"])
-        if original["entries"][""]["allocated_bytes"] == copied["entries"][""]["allocated_bytes"] and original["entries"][""]["holes"] == copied["entries"][""]["holes"]:
-            self.skipTest("Filesystem exposes no sparse/dense allocation difference")
         report = checks.compare(original, copied)
-        self.assertTrue(report["sparse_observation_differences"])
+        if original["entries"][""]["allocated_bytes"] == copied["entries"][""]["allocated_bytes"] and original["entries"][""]["holes"] == copied["entries"][""]["holes"]:
+            self.assertEqual(report["sparse_observation_differences"], [])
+        else:
+            self.assertTrue(report["sparse_observation_differences"])
         left, right = original["entries"][""]["holes"]["ranges"], copied["entries"][""]["holes"]["ranges"]
         self.assertIs(report["sparse_preserved"], None if left is None or right is None else left == right)
         self.assertIn("Not measured", original["physical_sharing"])
+
+    def test_equal_allocation_observations_do_not_establish_sharing(self):
+        source, destination = self.base / "source", self.base / "destination"
+        source.write_bytes(b"data")
+        destination.write_bytes(b"data")
+        for ranges in ([], [[1, 3]], None):
+            with self.subTest(ranges=ranges):
+                holes = {"ranges": ranges, "unavailable": "unsupported" if ranges is None else None}
+                with mock.patch.object(checks, "_holes", return_value=holes):
+                    original, copied = checks.snapshot(source), checks.snapshot(destination)
+                copied["entries"][""]["allocated_bytes"] = original["entries"][""]["allocated_bytes"]
+                report = checks.compare(original, copied)
+                self.assertEqual(report["sparse_observation_differences"], [])
+                self.assertIs(report["sparse_preserved"], None if ranges is None else True)
+                sharing = checks.clone_sharing(original, copied)
+                self.assertIsNone(sharing["full_data_stream_sharing"])
+                self.assertEqual(sharing["counts"]["unknown"], 1)
+                for observed in (original, copied):
+                    self.assertIn("Not measured", observed["physical_sharing"])
 
     def test_sparse_gate_unknown_and_loss_remain_separate_from_allocation(self):
         path = self.base / "file"
