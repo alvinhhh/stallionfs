@@ -762,6 +762,65 @@ class NativeSuite(unittest.TestCase):
         self.assertFalse(report['rows'][0]['source_unchanged'])
         self.assertEqual(len(self.measured), 1)
 
+    def test_post_command_snapshot_exception_retains_evidence(self):
+        snapshot = self.snapshot
+        cases = [('clone', 'tiny'), ('move', 'tiny'), ('delete', 'tiny'),
+                 ('clone', 'destination'), ('move', 'destination')]
+        for operation, failed_path in cases:
+            for phase, metrics in suite.native_metrics.PHASE_METRICS.items():
+                for error_type in (FileNotFoundError, OSError, RuntimeError):
+                    with self.subTest(operation=operation, path=failed_path, phase=phase, error=error_type):
+                        self.output = self.root / f'{operation}-{failed_path}-{phase}-{error_type.__name__}.json'
+                        self.measured.clear()
+                        original = error_type('post-command snapshot unavailable')
+                        def fail_after_command(path, **options):
+                            if self.measured and Path(path).name == failed_path:
+                                raise original
+                            return snapshot(path, **options)
+                        with mock.patch.object(self, 'snapshot', side_effect=fail_after_command), \
+                                mock.patch.object(suite.native_metrics, 'PHASE_METRICS', {phase: metrics}):
+                            with self.assertRaises(error_type) as caught:
+                                self.run_suite(operations=(operation,))
+                        self.assertIs(caught.exception, original)
+                        report = json.loads(self.output.read_text())
+                        self.assertEqual(report['status'], 'failed')
+                        self.assertEqual(report['error'], f'{error_type.__name__}: {original}')
+                        self.assertFalse(report.get('cleanup_passed', False))
+                        retained = Path(report['retained_fixture'])
+                        self.assertEqual((retained / 'fixtures/tiny').read_bytes(), b'tiny fixture payload')
+                        self.assertEqual((retained / 'outside-sentinel').read_bytes(), b'keep outside linked trees\n')
+                        if operation != 'delete':
+                            self.assertEqual((retained / 'destination').read_bytes(), b'tiny fixture payload')
+                        self.assertFalse((retained / 'target').exists())
+                        self.assertEqual(len(self.measured), 1)
+                        self.assertEqual(len(report['rows']), 1)
+                        row = report['rows'][0]
+                        self.assertEqual(row['argv'], self.measured[0])
+                        self.assertEqual(row['phase'], phase)
+                        self.assertEqual(row['exit_code'], 0)
+                        self.assertEqual(row['stdout_b64'], '')
+                        self.assertEqual(row['stderr_b64'], '')
+                        self.assertFalse(row['validated'])
+                        self.assertNotIn('source_verification', row)
+
+    def test_invalid_destination_with_unchanged_source_is_cleaned(self):
+        def collector(argv, **kwargs):
+            result = self.collect(argv, **kwargs)
+            Path(argv[-1]).write_bytes(b'invalid destination')
+            return result
+        for operation in ('clone', 'move'):
+            with self.subTest(operation=operation):
+                self.output = self.root / f'invalid-destination-{operation}.json'
+                self.measured.clear()
+                report = self.run_suite(operations=(operation,), collector=collector)
+                self.assertFalse(report['passed'])
+                self.assertTrue(report['cleanup_passed'])
+                self.assertNotIn('retained_fixture', report)
+                self.assertEqual(len(self.measured), 1)
+                self.assertEqual(len(report['rows']), 1)
+                self.assertFalse(report['rows'][0]['validated'])
+                self.assertTrue(report['rows'][0]['source_unchanged'])
+
     def test_clone_sharing_uses_post_copy_source_and_gates_only_clone_methods(self):
         for reference, outcome in ((reference, outcome) for reference in ('cp', 'cp-clone') for outcome in (False, None)):
             with self.subTest(reference=reference, outcome=outcome):

@@ -396,6 +396,7 @@ def main():
                                         checkpoint()
                                         release('preparation')
                                         break
+                                    uncertain = True  # Retain evidence until source and sentinel checks complete.
                                     try:
                                         receipt = native_metrics.collect(argv, timeout_s=a.timeout, phase=phase)
                                     except native_metrics.ChildCompletionUnknown as error:
@@ -436,7 +437,6 @@ def main():
                                                 row['move_identity'] = row['correctness']['move_identity']
                                             if operation == 'move' and os.path.lexists(operand):
                                                 row['correctness']['move_source_absent'] = False
-                                        row['validated'] = preserved(row['correctness'])
                                     else:
                                         row['correctness'] = {'passed': False, 'reason': 'command failed'}
                                     source_after = native_correctness.snapshot(source, observe_sharing=operation == 'clone', **snapshot_options)
@@ -444,7 +444,7 @@ def main():
                                         before if scan_mode else expected, source_after)
                                     row['source_unchanged'] = row['source_verification']['unchanged']
                                     del scan_stdout
-                                    row['validated'] &= row['source_unchanged']
+                                    row['validated'] = preserved(row['correctness']) and row['source_unchanged']
                                     if operation == 'clone' and row['exit_code'] == 0:
                                         row['data_stream_sharing'] = native_correctness.clone_sharing(source_after, after)
                                         required = method in ('stallionfs', 'cp-clone')
@@ -458,6 +458,7 @@ def main():
                                     if not row['source_unchanged']:
                                         uncertain = True
                                         raise RuntimeError('Operation changed the retained source fixture; preserved for inspection')
+                                    uncertain = False
                                     fileops.no_mounts_below(binary, base)
                                     for path in (target, dest): fileops.remove_fixture(path)
                                     checkpoint()
