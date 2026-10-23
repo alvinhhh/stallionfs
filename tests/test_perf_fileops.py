@@ -326,7 +326,8 @@ class BenchmarkFixtures(unittest.TestCase):
     def test_scan_deep_fixture_counts_and_uncertain_child_retention(self):
         spec = importlib.util.spec_from_file_location('scan_benchmark', Path(__file__).parent / 'perf/scan.py')
         scan = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, {'fileops': fileops}):
+        with mock.patch.dict(sys.modules, {'fileops': fileops}), \
+                mock.patch.object(sys, 'path', [str(Path(__file__).parent / 'perf'), *sys.path]):
             spec.loader.exec_module(scan)
         for count in (3, 41):
             with self.subTest(files=count):
@@ -344,7 +345,7 @@ class BenchmarkFixtures(unittest.TestCase):
                 fileops.remove_fixture(path)
         output = self.base / 'scan-memory.json'
         arguments = ['scan.py', '--scratch', str(self.base), '--output', str(output),
-                     '--files', '1', '--samples', '1', '--memory']
+                     '--files', '1', '--samples', '10', '--memory']
         completed = fileops.subprocess.CompletedProcess([], 0, b'24', b'')
         failure = fileops.ChildCompletionUnknown('injected scanner child interruption')
         installed_native = self.base / Path(scan._scan.__file__).name
@@ -364,14 +365,19 @@ class BenchmarkFixtures(unittest.TestCase):
         self.assertFalse(report.get('cleanup_passed', False))
         self.assertFalse(output.exists())
         rows = report['workloads']['flat']['sample_rows']
-        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(rows), 36)
         self.assertEqual(sum(row['warmup'] for row in rows), 6)
         self.assertTrue(all(set(row['order']) == set(scan.METHODS) for row in rows))
+        pending = report['workloads']['flat']['memory_rows']
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(pending[0]['validated'])
+        self.assertFalse(pending[0]['ok'])
 
     def test_workspace_report_helpers_preserve_files_and_hash_loaded_modules(self):
         spec = importlib.util.spec_from_file_location('workspace_benchmark', Path(__file__).parent / 'perf/run.py')
         workspace = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, {'fileops': fileops}):
+        with mock.patch.dict(sys.modules, {'fileops': fileops}), \
+                mock.patch.object(sys, 'path', [str(Path(__file__).parent / 'perf'), *sys.path]):
             spec.loader.exec_module(workspace)
         checkpoint = self.base / 'workspace.partial.json'
         identity = workspace.f.write_json(checkpoint, {'status': 'incomplete'})
