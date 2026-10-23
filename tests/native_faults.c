@@ -131,6 +131,12 @@ static void check(const char *base, int deleting, const char *kind) {
         snprintf(child, sizeof(child), "%s/child-%d", source, i); assert(mkdir(child, 0700) == 0); file(child, "sentinel");
     }
     if (!strcmp(kind, "swap-file-directory") || !strcmp(kind, "swap-file-fifo")) file(source, "leaf-swap");
+    if (!deleting && (!strcmp(kind, "cancel") || !strcmp(kind, "enospc") || !strcmp(kind, "unsupported"))) {
+        char first[PATH_MAX], alias[PATH_MAX];
+        snprintf(first, sizeof(first), "%s/swap-here/sentinel", source);
+        snprintf(alias, sizeof(alias), "%s/shared-sentinel", source);
+        assert(linkat(AT_FDCWD, first, AT_FDCWD, alias, 0) == 0);
+    }
     fault = kind;
     caller = pthread_self();
     atomic_store(&entered, 0); atomic_store(&release_worker, 0); atomic_store(&cancelled, 0);

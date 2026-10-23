@@ -73,7 +73,9 @@ class FileOperations(unittest.TestCase):
                     _scan.clone(source, target, jobs=jobs)
                 (target / 'directory-0/file-0').write_bytes(b'changed')
                 self.assertEqual(original.read_bytes(), b'\0' * 73)
-                self.assertEqual((target / 'hardlink').read_bytes(), b'\0' * 73)
+                self.assertEqual((target / 'hardlink').read_bytes(), b'changed')
+                self.assertEqual((target / 'hardlink').stat().st_ino, (target / 'directory-0/file-0').stat().st_ino)
+                self.assertNotEqual((target / 'hardlink').stat().st_ino, original.stat().st_ino)
                 self.assertEqual(external.read_bytes(), b'outside stays untouched')
         for source_name in ('directory-0/file-0', 'dangling'):
             target = self.base / ('single-' + Path(source_name).name)
@@ -208,6 +210,72 @@ class FileOperations(unittest.TestCase):
         self.assertEqual((self.base / '--destination').read_bytes(), b'dash filename')
         self.assertFalse(store.exists())
         self.assertEqual(source.read_bytes(), b'file')
+
+    def test_clone_preserves_cross_directory_regular_and_symlink_aliases(self):
+        source = self.base / 'linked-source'; source.mkdir()
+        for name in ('a', 'b', 'c'): (source/name).mkdir()
+        (source/'a/file').write_bytes(b'original')
+        (source/'a/link').symlink_to('absent-target')
+        for directory in ('b', 'c'):
+            for name in ('file', 'link'):
+                os.link(source/'a'/name, source/directory/name, follow_symlinks=False)
+        os.link(source/'a/file', self.base/'external-file')
+        os.link(source/'a/link', self.base/'external-link', follow_symlinks=False)
+        (source/'a').chmod(0o500)  # Destination metadata must be deferred until all aliases finish.
+        for jobs in (1, 4):
+            target = self.base / f'linked-copy-{jobs}'
+            before_fds = descriptors()
+            _scan.clone(source, target, jobs=jobs)
+            self.assertEqual(descriptors(), before_fds)
+            for name in ('file', 'link'):
+                identities = {(target/directory/name).lstat().st_ino for directory in ('a', 'b', 'c')}
+                self.assertEqual(len(identities), 1)
+                self.assertNotIn((source/'a'/name).lstat().st_ino, identities)
+                self.assertEqual((target/'a'/name).lstat().st_nlink, 3)
+                self.assertEqual((source/'a'/name).lstat().st_nlink, 4)
+            self.assertEqual((target/'a').stat().st_mode & 0o777, 0o500)
+            self.assertEqual(os.readlink(target/'b/link'), 'absent-target')
+            (target/'b/file').write_bytes(b'changed')
+            self.assertEqual((target/'c/file').read_bytes(), b'changed')
+            self.assertEqual((source/'a/file').read_bytes(), b'original')
+            self.assertEqual((self.base/'external-file').read_bytes(), b'original')
+
+    def test_external_hardlink_groups_do_not_retain_per_group_descriptors(self):
+        script = r"""
+import os, resource, sys
+from pathlib import Path
+from stallionfs import _scan
+base = Path(sys.argv[1])
+source, external = base/'many-source', base/'many-external'
+source.mkdir(); external.mkdir(); (source/'aliases').mkdir()
+for i in range(256):
+    p = source/f'file-{i}'
+    p.write_bytes(b'payload')
+    os.link(p, external/p.name)
+    if i % 32 == 0: os.link(p, source/'aliases'/p.name)
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, soft), hard))
+for jobs in (1, 4):
+    target = base/f'many-copy-{jobs}'
+    _scan.clone(source, target, jobs=jobs)
+    for i in range(256):
+        p = target/f'file-{i}'
+        assert p.read_bytes() == b'payload'
+        assert p.stat().st_ino != (source/p.name).stat().st_ino
+        if i % 32 == 0: assert p.stat().st_ino == (target/'aliases'/p.name).stat().st_ino
+"""
+        subprocess.run([sys.executable, '-c', script, str(self.base)], check=True, timeout=30)
+
+    def test_hardlink_error_paths_restore_flags_and_release_descriptors(self):
+        tests = Path(__file__).resolve().parent
+        source = tests.parent / 'stallionfs'
+        obj, exe = self.base/'hardlink-tree.o', self.base/'hardlink-faults'
+        common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+                  '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
+        subprocess.run([*common, '-Dlinkat=stallion_test_linkat', '-Dfchflags=stallion_test_fchflags', '-Dfstat=stallion_test_fstat', '-Dopenat=stallion_test_openat', '-Dsetattrlistat=stallion_test_setattrlistat', '-Dfcopyfile=stallion_test_fcopyfile',
+                        '-c', str(source/'_tree.c'), '-o', str(obj)], check=True, timeout=30)
+        subprocess.run([*common, str(tests/'hardlink_faults.c'), str(obj), '-o', str(exe)], check=True, timeout=30)
+        subprocess.run([str(exe), str(self.base)], check=True, timeout=30)
 
     def test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup(self):
         tests = Path(__file__).resolve().parent

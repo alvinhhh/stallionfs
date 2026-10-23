@@ -12,7 +12,6 @@ import platform
 import random
 import resource
 import shutil
-import statistics
 import sys
 import tempfile
 import threading
@@ -20,6 +19,7 @@ import time
 import uuid
 
 import fileops as f
+import native_metrics
 import stallionfs
 from stallionfs import core, images
 from stallionfs.core import Store, git, remove_tree, run
@@ -56,11 +56,30 @@ def digest(root):
 
 
 def summary(rows):
-    return {key: {"median": statistics.median(row[key] for row in rows),
-                  "min": min(row[key] for row in rows),
-                  "max": max(row[key] for row in rows)}
-            for key in ("ready_s", "remove_s", "reclaim_s", "total_s",
-                        "ready_cpu_s", "remove_cpu_s", "reclaim_cpu_s", "total_cpu_s")}
+    result = {}
+    for key in ("ready_s", "remove_s", "reclaim_s", "total_s",
+                "ready_cpu_s", "remove_cpu_s", "reclaim_cpu_s", "total_cpu_s"):
+        values = native_metrics.summarize(row[key] for row in rows)
+        values["min"] = values.pop("minimum")
+        values["max"] = values.pop("maximum")
+        result[key] = values
+    return result
+
+
+def paired_totals(methods):
+    baseline = "worktree_install"
+    result = {"baseline": baseline, "methods": {}, "unavailable": None}
+    if baseline not in methods:
+        result["unavailable"] = "worktree_install was not selected"
+        return result
+    projected = {method: [{**row, "wall_s": row.get("total_s"),
+                          "cpu_s": row.get("total_cpu_s")} for row in rows]
+                 for method, rows in methods.items()}
+    result["methods"] = {
+        method: {key: native_metrics.compare_paired(projected[baseline], rows, metric)
+                 for key, metric in (("total_s", "wall_s"), ("total_cpu_s", "cpu_s"))}
+        for method, rows in projected.items() if method != baseline}
+    return result
 
 
 def main():
@@ -68,7 +87,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, required=True, help="Existing writable APFS directory")
     parser.add_argument("--npm-cache", type=Path, required=True)
-    parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--node", type=Path, help="Node executable; defaults to node on PATH")
+    parser.add_argument("--npm", type=Path, help="npm CLI JavaScript entrypoint; defaults to npm on PATH")
+    parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--source-files", type=int, default=1000)
     parser.add_argument("--image-size", type=int, default=8, metavar="GIB")
@@ -76,10 +97,14 @@ def main():
     parser.add_argument("--source-only", action="store_true")
     args = parser.parse_args()
     methods = list(dict.fromkeys(args.methods))
-    if (not 1 <= args.samples <= 100 or not 1 <= args.concurrency <= 32
+    if (not 10 <= args.samples <= 100 or not 1 <= args.concurrency <= 32
             or args.source_files < 1 or not 1 <= args.image_size <= 65536):
-        parser.error("Use 1–100 samples, 1–32 workers, a positive file count and a 1–65536 GiB image")
-    node_version = run(["node", "--version"])
+        parser.error("Use 10–100 samples, 1–32 workers, a positive file count and a 1–65536 GiB image")
+    if bool(args.node) != bool(args.npm):
+        parser.error("Pass --node and --npm together")
+    node = str(args.node.resolve(strict=True)) if args.node else "node"
+    npm = [node, str(args.npm.resolve(strict=True))] if args.npm else ["npm"]
+    node_version = run([node, "--version"])
     if not args.source_only and int(node_version.removeprefix("v").split(".")[0]) < 24:
         parser.error("The locked npm fixture requires Node 24 or newer; select the supported runtime before benchmarking")
     output_arg = args.output.expanduser().absolute()
@@ -89,18 +114,19 @@ def main():
     if os.path.lexists(args.output) or os.path.lexists(partial_output):
         parser.error("Choose a new output path or archive existing results before another run")
     npm_cache = args.npm_cache.resolve()
-    setup = [] if args.source_only else ["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)]
+    setup = [] if args.source_only else [*npm, "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)]
     code = Path(__file__).resolve().parents[2] / "stallionfs"
     fingerprint_paths = {name: code / name
                          for name in ("core.py", "_scan.c", "_tree.c", "_walk.c", "_tree.h", "images.py", "__init__.py")}
     fingerprint_paths["tests/perf/run.py"] = Path(__file__).resolve()
     fingerprint_paths["tests/perf/fileops.py"] = Path(f.__file__).resolve()
+    fingerprint_paths["tests/perf/native_metrics.py"] = Path(native_metrics.__file__).resolve()
     fingerprints = {name: hashlib.sha256(path.read_bytes()).hexdigest()
                     for name, path in fingerprint_paths.items()}
     native_binary = Path(_scan.__file__)
     native_fingerprint = hashlib.sha256(native_binary.read_bytes()).hexdigest()
     installed_fingerprints = runtime_fingerprints()
-    result = {"format": 3, "version": __version__, "status": "incomplete", "timestamp": datetime.now(timezone.utc).isoformat(),
+    result = {"format": 3, "version": __version__, "status": "incomplete", "passed": False, "timestamp": datetime.now(timezone.utc).isoformat(),
               "implementation_sha256": hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode()).hexdigest(),
               "source_sha256": fingerprints,
               "installed_python_sha256": installed_fingerprints,
@@ -110,15 +136,17 @@ def main():
               "cpu": run(["sysctl", "-n", "machdep.cpu.brand_string"]),
               "memory_bytes": int(run(["sysctl", "-n", "hw.memsize"])),
               "python": platform.python_version(), "node": node_version,
-              "npm": run(["npm", "--version"]), "git": run(["git", "--version"]),
+              "npm": run([*npm, "--version"]), "git": run(["git", "--version"]),
+              "node_command": [node], "npm_command": npm,
               "samples": args.samples, "concurrency": args.concurrency,
               "methods_selected": methods,
               "setup": setup[:-1] + ["<isolated warm npm cache>"] if setup else [],
               "warmup_batches_per_method": 1, "source_files_generated": args.source_files,
               "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
               "cpu_timing": "Process CPU including worker threads plus waited child-process CPU, summed over the same ready/remove/reclaim phases as wall time. Validation is excluded.",
+              "comparison_scope": "Paired lifecycle wall and CPU totals against Git worktree plus setup. Memory and full metadata equivalence are not measured.",
               "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
-              "methods": {}, "raw": {}, "preparation": {}}
+              "methods": {}, "raw": {}, "preparation": {}, "comparisons": {}}
 
     checkpoint_identity = None
 
@@ -206,7 +234,7 @@ def main():
                 if digest(path) != expected:
                     raise RuntimeError(f"Fixture mismatch: {method}")
                 if setup:
-                    run(["node", "check.cjs"], path)
+                    run([node, "check.cjs"], path)
             cpu_start = cpu_seconds()
             start = time.perf_counter()
             with ThreadPoolExecutor(max_workers=count) as pool:
@@ -246,10 +274,16 @@ def main():
                 for method in order:
                     result['current'] = dict(workers=count, phase='measurement', sample=sample + 1, method=method)
                     row = batch(method, count)
+                    row.update(pair_id=sample + 1, phase="timing", ok=True, validated=True,
+                               precision_floor={
+                                   "wall_s": 6 * time.get_clock_info("perf_counter").resolution,
+                                   # Three phase deltas, each with parent and two child CPU counters.
+                                   "cpu_s": 3 * (2 * time.get_clock_info("process_time").resolution + 0.000004)})
                     result["raw"][label][method].append(row)
                     save()
                     print(f"workers={count} sample={sample + 1} {method}: ready={row['ready_s']:.3f}s total={row['total_s']:.3f}s", file=sys.stderr, flush=True)
             result["methods"][label] = {method: summary(rows) for method, rows in result["raw"][label].items()}
+            result["comparisons"][label] = paired_totals(result["raw"][label])
         sequential = result["methods"]["1"]
         for method in seeds:
             if "worktree_install" not in sequential or method not in sequential:
@@ -266,6 +300,8 @@ def main():
             raise RuntimeError("Installed Python modules changed during the benchmark; results are invalid")
         result["correctness"] = "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata)" + (" and passed fixture smoke test" if setup else "")
         remove_tree(base)
+        f.require(not os.path.lexists(base), "Workspace benchmark cleanup did not complete")
+        result['cleanup_passed'] = True
     except BaseException as exc:
         result['error'] = {'type': type(exc).__name__, 'message': str(exc).replace(str(base), '<benchmark>').replace(str(npm_cache), '<npm-cache>')}
         save()
@@ -273,7 +309,7 @@ def main():
         print(f"Benchmark failed; retained disposable storage for recovery: {base}", file=sys.stderr)
         raise
     result.pop('current', None)
-    result['status'] = 'complete'
+    result.update(status='complete', passed=True)
     f.write_new_json(args.output, result)
     if checkpoint_identity is not None:
         try:

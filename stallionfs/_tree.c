@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/acl.h>
+#include <sys/attr.h>
+#include <sys/unistd.h>
 #include <sys/clonefile.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -22,15 +24,30 @@
 #define DEPTH_LIMIT 512
 
 enum operation { CLONING, DELETING };
+struct object_identity { dev_t device; ino_t inode; mode_t type; };
 struct job {
     int source, destination;
     char *name;
     ino_t inode;
     struct job *parent;
     unsigned pending, depth;
+    int deferred;
+    struct object_identity source_identity, destination_identity;
+    struct job *deferred_next;
+};
+struct link_record {
+    struct stat source, destination;
+    struct job *parent;
+    char *name;
+    struct link_record *next;
 };
 struct tree {
     pthread_mutex_t mutex;
+    pthread_mutex_t links_mutex;
+    struct link_record **links;
+    size_t link_buckets, link_count;
+    struct job *deferred_head, *deferred_tail;
+    int link_source, link_destination, link_restore_error;
     pthread_cond_t available;
     struct job *queue[QUEUE_LIMIT];
     unsigned head, queued, live, exited;
@@ -82,8 +99,228 @@ static int open_created_directory(int parent, const char *name) {
     return fd;
 }
 
-static int clone_leaf(int parent, const char *name, int destination, unsigned type,
-                      ino_t expected, dev_t device) {
+/* Only multiply-linked leaves enter this map. Shared retained jobs own their
+ * path components; no per-inode descriptors or slash-joined PATH_MAX buffers. */
+static void free_link(struct link_record *record) {
+    if (record) { free(record->name); free(record); }
+}
+static struct object_identity object_identity(const struct stat *info) {
+    return (struct object_identity){info->st_dev, info->st_ino, info->st_mode & S_IFMT};
+}
+static int matches_identity(const struct stat *info, const struct object_identity *expected) {
+    return info->st_dev == expected->device && info->st_ino == expected->inode &&
+        (info->st_mode & S_IFMT) == expected->type;
+}
+static size_t link_bucket(const struct stat *info, size_t buckets) {
+    uint64_t hash = (uint64_t)info->st_ino ^ ((uint64_t)info->st_dev << 32);
+    hash ^= hash >> 33; hash *= UINT64_C(0xff51afd7ed558ccd); hash ^= hash >> 33;
+    return (size_t)hash & (buckets - 1);
+}
+/* Called under links_mutex, only for a new multiply-linked inode. */
+static int reserve_links(struct tree *state) {
+    if (state->link_buckets && state->link_count < state->link_buckets - state->link_buckets / 4) return 0;
+    if (state->link_buckets > SIZE_MAX / 2 / sizeof(*state->links)) { errno = ENOMEM; return -1; }
+    size_t capacity = state->link_buckets ? state->link_buckets * 2 : 64;
+    struct link_record **table = calloc(capacity, sizeof(*table));
+    if (!table) return -1;
+    for (size_t i = 0; i < state->link_buckets; i++) {
+        struct link_record *record = state->links[i];
+        while (record) {
+            struct link_record *next = record->next;
+            size_t bucket = link_bucket(&record->source, capacity);
+            record->next = table[bucket]; table[bucket] = record; record = next;
+        }
+    }
+    free(state->links); state->links = table; state->link_buckets = capacity;
+    return 0;
+}
+static int same_time(struct timespec a, struct timespec b) {
+    return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
+}
+static int unchanged_source(const struct stat *a, const struct stat *b) {
+    return same_object(a, b) && a->st_mode == b->st_mode && a->st_uid == b->st_uid &&
+        a->st_gid == b->st_gid && a->st_nlink == b->st_nlink && a->st_size == b->st_size &&
+        a->st_flags == b->st_flags && a->st_gen == b->st_gen &&
+        same_time(a->st_mtimespec, b->st_mtimespec) && same_time(a->st_ctimespec, b->st_ctimespec) &&
+        same_time(a->st_birthtimespec, b->st_birthtimespec);
+}
+/* The marked ancestor chain remains owned until post-join metadata completes.
+ * At most two traversal FDs exist at once, irrespective of depth/group count. */
+static int link_directory(struct tree *state, const struct job *job, int source) {
+    const struct job *parts[DEPTH_LIMIT];
+    unsigned depth = job->depth;
+    const struct job *root = job;
+    for (unsigned i = depth; i; i--) { parts[i - 1] = root; root = root->parent; }
+    int fd = fcntl(source ? state->link_source : state->link_destination, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct stat info;
+    int error = fstat(fd, &info) ? errno : 0;
+    if (!error && !matches_identity(&info, source ? &root->source_identity : &root->destination_identity)) error = ESTALE;
+    if (error) { close(fd); errno = error; return -1; }
+    for (unsigned i = 0; i < depth; i++) {
+        int child = openat(fd, parts[i]->name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        error = child < 0 ? errno : 0;
+        if (!error && fstat(child, &info)) error = errno;
+        if (!error && !matches_identity(&info, source ? &parts[i]->source_identity : &parts[i]->destination_identity)) error = ESTALE;
+        if (close(fd) && !error) error = errno;
+        if (error) { if (child >= 0) close(child); errno = error; return -1; }
+        fd = child;
+    }
+    return fd;
+}
+/* Caller holds links_mutex. The active leaf's pending references keep this
+ * whole chain alive, including live directory FDs, until marking completes. */
+static struct link_record *remember_link(struct tree *state, struct job *job,
+                                         const char *name, const struct stat *source) {
+    struct link_record *record = calloc(1, sizeof(*record));
+    if (!record) return NULL;
+    record->source = *source; record->parent = job; record->name = strdup(name);
+    if (!record->name) { free_link(record); return NULL; }
+    struct job *root = job;
+    for (struct job *ancestor = job; ancestor; ancestor = ancestor->parent) {
+        root = ancestor;
+        if (ancestor->deferred) continue;
+        struct stat info;
+        if (fstat(ancestor->source, &info)) { int error = errno; free_link(record); errno = error; return NULL; }
+        ancestor->source_identity = object_identity(&info);
+        if (fstat(ancestor->destination, &info)) { int error = errno; free_link(record); errno = error; return NULL; }
+        ancestor->destination_identity = object_identity(&info);
+    }
+    if (state->link_source < 0) {
+        state->link_source = fcntl(root->source, F_DUPFD_CLOEXEC, 0);
+        if (state->link_source < 0) { int error = errno; free_link(record); errno = error; return NULL; }
+        state->link_destination = fcntl(root->destination, F_DUPFD_CLOEXEC, 0);
+        if (state->link_destination < 0) {
+            int error = errno; close(state->link_source); state->link_source = -1;
+            free_link(record); errno = error; return NULL;
+        }
+    }
+    for (struct job *ancestor = job; ancestor; ancestor = ancestor->parent) ancestor->deferred = 1;
+    return record;
+}
+static int checked_leaf(int parent, const char *name, const struct stat *expected, unsigned flags) {
+    struct stat current;
+    if (fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW)) return -1;
+    if (!same_object(expected, &current) || current.st_uid != expected->st_uid || current.st_gid != expected->st_gid ||
+        current.st_mode != expected->st_mode || current.st_flags != flags) { errno = ESTALE; return -1; }
+    return 0;
+}
+/* Descriptor mutation remains preferred. The EACCES fallback is confined to
+ * newly cloned, owned leaves below the still-private deferred destination root.
+ * No-follow/identity guards detect replacement; they do not make pathname
+ * mutation atomic against a caller concurrently replacing its own namespace. */
+static int change_link_flags(int fd, int parent, const char *name,
+                             const struct stat *expected, unsigned before, unsigned after, int *changed) {
+    if (changed) *changed = 0;
+    if (checked_leaf(parent, name, expected, before)) return -1;
+    if (fd >= 0) {
+        struct stat current;
+        if (fstat(fd, &current)) return -1;
+        if (!same_object(expected, &current) || current.st_flags != before) { errno = ESTALE; return -1; }
+        if (fchflags(fd, after)) return -1;
+    } else {
+        if (expected->st_uid != geteuid()) { errno = EACCES; return -1; }
+        struct attrlist attrs = {.bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = ATTR_CMN_FLAGS};
+        uint32_t flags = after;
+        if (setattrlistat(parent, name, &attrs, &flags, sizeof(flags), FSOPT_NOFOLLOW)) return -1;
+    }
+    if (changed) *changed = 1;
+    return checked_leaf(parent, name, expected, after);
+}
+static int linked_clone(struct tree *state, struct job *job, const char *name,
+                         int fd, const struct stat *identity, int flags) {
+    size_t bucket = 0;
+    int error = 0, source_parent = -1, first_source = -1, destination_parent = -1, first_destination = -1;
+    struct stat current, prior, destination;
+    pthread_mutex_lock(&state->links_mutex);
+    if (state->link_buckets) bucket = link_bucket(identity, state->link_buckets);
+    struct link_record *record = state->link_buckets ? state->links[bucket] : NULL;
+    while (record && !same_object(&record->source, identity)) record = record->next;
+    if (stopped(state)) { error = ECANCELED; goto done; }
+    if (fstat(fd, &current)) { error = errno; goto done; }
+    if (!unchanged_source(identity, &current)) { error = ESTALE; goto done; }
+    if (!record) {
+        if (reserve_links(state)) { error = errno; goto done; }
+        bucket = link_bucket(identity, state->link_buckets);
+        record = remember_link(state, job, name, identity);
+        if (!record) { error = errno; goto done; }
+        if (fclonefileat(fd, job->destination, name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
+        if (!error && fstatat(job->destination, name, &record->destination, AT_SYMLINK_NOFOLLOW)) error = errno;
+        if (!error && (same_object(identity, &record->destination) ||
+            (identity->st_mode & S_IFMT) != (record->destination.st_mode & S_IFMT))) error = ESTALE;
+        if (!error && fstat(fd, &current)) error = errno;
+        if (!error && !unchanged_source(identity, &current)) error = ESTALE;
+        if (error) free_link(record);
+        else { record->next = state->links[bucket]; state->links[bucket] = record; state->link_count++; }
+        goto done;
+    }
+    if (!unchanged_source(&record->source, &current)) { error = ESTALE; goto done; }
+    if ((source_parent = link_directory(state, record->parent, 1)) < 0) { error = errno; goto done; }
+    if ((first_source = openat(source_parent, record->name, flags)) < 0) { error = errno; goto done; }
+    if (fstat(first_source, &prior)) { error = errno; goto done; }
+    if (!unchanged_source(&record->source, &prior)) { error = ESTALE; goto done; }
+    if ((destination_parent = link_directory(state, record->parent, 0)) < 0) { error = errno; goto done; }
+    if (fstatat(destination_parent, record->name, &destination, AT_SYMLINK_NOFOLLOW)) { error = errno; goto done; }
+    if (!same_object(&record->destination, &destination) || same_object(identity, &destination) ||
+        destination.st_uid != record->destination.st_uid || destination.st_gid != record->destination.st_gid ||
+        destination.st_mode != record->destination.st_mode ||
+        destination.st_flags != record->destination.st_flags) { error = ESTALE; goto done; }
+    unsigned blocking = destination.st_flags & (UF_IMMUTABLE | UF_APPEND);
+    if (blocking) {
+        first_destination = openat(destination_parent, record->name, flags);
+        if (first_destination < 0 && errno != EACCES) { error = errno; goto done; }
+        int changed = 0;
+        if (change_link_flags(first_destination, destination_parent, record->name,
+                              &destination, destination.st_flags, destination.st_flags & ~blocking, &changed)) {
+            error = errno;
+            /* A post-clear identity failure may leave the original inode clear.
+             * Restore only a verified original; never mutate a known replacement. */
+            if (changed) {
+                int restoration = 0;
+                if (first_destination >= 0) {
+                    if (fchflags(first_destination, destination.st_flags)) restoration = errno;
+                } else if (change_link_flags(-1, destination_parent, record->name, &destination,
+                                             destination.st_flags & ~blocking, destination.st_flags, NULL)) restoration = errno;
+                if (restoration && !state->link_restore_error) state->link_restore_error = restoration;
+            }
+            goto done;
+        }
+    }
+    if (checked_leaf(destination_parent, record->name, &destination, destination.st_flags & ~blocking)) error = errno;
+    else if (linkat(destination_parent, record->name, job->destination, name, 0)) error = errno;
+    if (blocking) {
+        int restoration = 0;
+        /* An open descriptor restores the original even if its pathname moved. */
+        if (first_destination >= 0) {
+            if (fchflags(first_destination, destination.st_flags)) restoration = errno;
+        } else if (change_link_flags(-1, destination_parent, record->name, &destination,
+                                     destination.st_flags & ~blocking, destination.st_flags, NULL)) restoration = errno;
+        if (restoration) {
+            if (!state->link_restore_error) state->link_restore_error = restoration;
+            if (!error) error = restoration;
+        }
+    }
+    if (!error && first_destination >= 0 && fstat(first_destination, &current)) error = errno;
+    if (!error && first_destination >= 0 && (!same_object(&destination, &current) || current.st_flags != destination.st_flags)) error = ESTALE;
+    if (!error && checked_leaf(destination_parent, record->name, &destination, destination.st_flags)) error = errno;
+    if (!error && fstatat(job->destination, name, &current, AT_SYMLINK_NOFOLLOW)) error = errno;
+    if (!error && !same_object(&destination, &current)) error = ESTALE;
+    if (!error && fstat(fd, &current)) error = errno;
+    if (!error && !unchanged_source(&record->source, &current)) error = ESTALE;
+done:
+    if (first_destination >= 0 && close(first_destination) && !error) error = errno;
+    if (destination_parent >= 0 && close(destination_parent) && !error) error = errno;
+    if (first_source >= 0 && close(first_source) && !error) error = errno;
+    if (source_parent >= 0 && close(source_parent) && !error) error = errno;
+    pthread_mutex_unlock(&state->links_mutex);
+    errno = error;
+    return error ? -1 : 0;
+}
+
+static int clone_leaf(struct tree *state, struct job *job, const char *name, unsigned type,
+                      ino_t expected) {
+    int parent = job->source, destination = job->destination;
+    dev_t device = state->device;
     int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | (type == DT_LNK ? O_SYMLINK : O_NOFOLLOW);
     int fd = openat(parent, name, flags);
     if (fd < 0) return -1;
@@ -93,6 +330,9 @@ static int clone_leaf(int parent, const char *name, int destination, unsigned ty
     else if (identity.st_dev != device) error = EXDEV;
     else if ((expected && identity.st_ino != expected) ||
              (type == DT_REG ? !S_ISREG(identity.st_mode) : !S_ISLNK(identity.st_mode))) error = ESTALE;
+    else if (identity.st_nlink > 1) {
+        if (linked_clone(state, job, name, fd, &identity, flags)) error = errno;
+    }
     else if (fclonefileat(fd, destination, name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
     if (close(fd) && !error) error = errno;
     errno = error;
@@ -105,12 +345,13 @@ static void finish(struct tree *state, struct job *job) {
         pthread_mutex_lock(&state->mutex);
         if (--job->pending) { pthread_mutex_unlock(&state->mutex); return; }
         pthread_mutex_unlock(&state->mutex);
+        int deferred = job->deferred;
         struct job *parent = job->parent;
         int parent_fd = parent ? parent->source : state->parent_fd;
         if (!stopped(state)) {
             if (state->operation == CLONING) {
                 /* Apply permissions and timestamps only after all children finish. */
-                if (fcopyfile(job->source, job->destination, NULL, COPYFILE_METADATA))
+                if (!deferred && fcopyfile(job->source, job->destination, NULL, COPYFILE_METADATA))
                     fail(state, errno, job->source, NULL);
             } else {
                 struct stat current;
@@ -123,9 +364,14 @@ static void finish(struct tree *state, struct job *job) {
         }
         if (close(job->source)) fail(state, errno, parent_fd, job->name);
         if (job->destination >= 0 && close(job->destination)) fail(state, errno, parent_fd, job->name);
-        free(job->name);
-        free(job);
+        if (deferred) job->source = job->destination = -1;
+        else { free(job->name); free(job); }
         pthread_mutex_lock(&state->mutex);
+        if (deferred) {
+            if (state->deferred_tail) state->deferred_tail->deferred_next = job;
+            else state->deferred_head = job;
+            state->deferred_tail = job;
+        }
         state->live--;
         pthread_cond_broadcast(&state->available);
         pthread_mutex_unlock(&state->mutex);
@@ -196,7 +442,7 @@ static void process(struct tree *state, struct job *job) {
         else if (state->operation == DELETING) {
             if (unlinkat(job->source, name, 0)) fail(state, errno, job->source, name);
         } else if (type == DT_REG || type == DT_LNK) {
-            if (clone_leaf(job->source, name, job->destination, type, entry->d_ino, state->device))
+            if (clone_leaf(state, job, name, type, entry->d_ino))
                 fail(state, errno, job->source, name);
         } else fail(state, ENOTSUP, job->source, name);
     }
@@ -236,6 +482,7 @@ static int run_tree(int source, int destination, int parent, const char *name,
     *root = (struct job){.source = source, .destination = destination, .name = owned_name,
                         .inode = identity->st_ino, .pending = 1};
     struct tree state = {.mutex = PTHREAD_MUTEX_INITIALIZER, .available = PTHREAD_COND_INITIALIZER,
+        .links_mutex = PTHREAD_MUTEX_INITIALIZER, .link_source = -1, .link_destination = -1,
         .parent_fd = parent, .operation = operation, .device = identity->st_dev, .live = 1, .queued = 1};
     atomic_init(&state.error, 0);
     state.queue[0] = root;
@@ -267,6 +514,36 @@ static int run_tree(int source, int destination, int parent, const char *name,
         if (result) fail(&state, result, parent, name);
     }
     if (cancel && cancel(context)) fail(&state, EINTR, parent, name);
+    /* Completion FIFO is child-before-parent. Keep all names/identities alive
+     * until every metadata reopen completes; cancellation remains root-owned. */
+    for (struct job *job = state.deferred_head; job; job = job->deferred_next) {
+        if (!stopped(&state) && cancel && cancel(context)) fail(&state, EINTR, parent, name);
+        if (stopped(&state)) continue;
+        int input = link_directory(&state, job, 1);
+        int output = input < 0 ? -1 : link_directory(&state, job, 0);
+        int error = input < 0 || output < 0 ? errno : 0;
+        if (!error && fcopyfile(input, output, NULL, COPYFILE_METADATA)) error = errno;
+        if (output >= 0 && close(output) && !error) error = errno;
+        if (input >= 0 && close(input) && !error) error = errno;
+        if (error) fail(&state, error, parent, name);
+    }
+    for (struct job *job = state.deferred_head; job;) {
+        struct job *next = job->deferred_next; free(job->name); free(job); job = next;
+    }
+    for (size_t i = 0; i < state.link_buckets; i++) {
+        struct link_record *record = state.links[i];
+        while (record) { struct link_record *next = record->next; free_link(record); record = next; }
+    }
+    free(state.links);
+    if (state.link_source >= 0 && close(state.link_source)) fail(&state, errno, parent, name);
+    if (state.link_destination >= 0 && close(state.link_destination)) fail(&state, errno, parent, name);
+    if (state.link_restore_error) {
+        size_t used = strlen(state.error_path);
+        if (used > sizeof(state.error_path) - 96) used = sizeof(state.error_path) - 96;
+        snprintf(state.error_path + used, sizeof(state.error_path) - used,
+                 " [destination flag restoration failed: errno %d]", state.link_restore_error);
+    }
+    pthread_mutex_destroy(&state.links_mutex);
     int error = atomic_load(&state.error);
     if (error) path_error(error_path, capacity, state.error_path);
     pthread_cond_destroy(&state.available);
@@ -457,7 +734,8 @@ done:
     if (output >= 0 && close(output) && !error) error = errno;
     error = close_path(&source, error);
     error = close_path(&destination, error);
-    if (error) path_error(error_path, capacity, destination_path ? destination_path : "");
+    if (error && (!error_path || !capacity || !error_path[0]))
+        path_error(error_path, capacity, destination_path ? destination_path : "");
     errno = error;
     return error ? -1 : 0;
 }

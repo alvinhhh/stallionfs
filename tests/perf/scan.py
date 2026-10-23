@@ -1,6 +1,7 @@
 """Compare the shipped bulk scanner with an equivalent native POSIX traversal."""
 import argparse
 from datetime import datetime, timezone
+import gzip
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,10 @@ import tempfile
 import time
 
 import fileops as f
+import native_correctness
+import native_fixtures
+import native_metrics
+from native_fixtures import scan_fixture as fixture
 from stallionfs import __version__, _scan
 
 
@@ -29,39 +34,11 @@ print(json.dumps({'counts': counts, 'native_binary_sha256': native}))
 '''
 
 
-def fixture(path, files, layout):
-    path.mkdir()
-    chain, parent = [], path
-    if layout == 'deep40':
-        for _ in range(40):
-            parent = parent / 'd'
-            parent.mkdir()
-            chain.append(parent)
-    for i in range(files):
-        parent = (chain[i * 40 // files] if chain else
-                  path / str(i // 100) if layout == 'nested' else path)
-        if layout == 'nested' and i % 100 == 0:
-            parent.mkdir()
-        (parent / f'file-{i}').write_bytes(bytes([i % 256]) * (i % 1024))
-    extras = chain[-1] if chain else path
-    (extras / 'empty').mkdir()
-    (extras / 'space and \n café 🐎').write_bytes(b'hello')
-    (extras / 'directory-link').symlink_to('empty', target_is_directory=True)
-    (extras / 'dangling-link').symlink_to('absent')
-    (extras / 'outside-link').symlink_to('/')
-    os.mkfifo(extras / 'pipe')
-    with (extras / 'sparse').open('wb') as stream:
-        stream.truncate(1 << 20)
-    os.link(extras / 'sparse', extras / 'hard-link')
-    return dict(files=files + 3,
-                directories=1 + (40 if chain else (files + 99) // 100 if layout == 'nested' else 0),
-                symlinks=3, other=1, logical_bytes=sum(i % 1024 for i in range(files)) + 5 + (2 << 20),
-                skipped_mounts=0)
-
-
-def memory_sample(path, method, expected, native_hash, metrics):
+def memory_sample(path, method, expected, native_hash, metrics, record=None):
     row, completed = f.measure_memory([sys.executable, '-I', '-B', '-c', CHILD, path, method,
                                        json.dumps(expected), native_hash], metrics)
+    if record is not None:
+        record.update(row)
     if row.get('completion_uncertain') or row['exit_code'] != 0:
         raise f.ChildCompletionUnknown('Memory child completion uncertain; preserve fixture')
     f.require(completed is not None and not completed.stderr, 'Memory child output unavailable or invalid')
@@ -71,20 +48,30 @@ def memory_sample(path, method, expected, native_hash, metrics):
     return {**row, **observed}
 
 
+def comparisons(rows, phase):
+    methods = {method: [row for row in rows if row['method'] == method and not row['warmup']]
+               for method in METHODS}
+    metrics = ('wall_s', 'cpu_s') if phase == 'timing' else ('rss_bytes',)
+    return {method: {metric: native_metrics.compare_paired(methods['posix'], values, metric)
+                     for metric in metrics}
+            for method, values in methods.items() if method != 'posix'}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scratch', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--files', type=int, default=20000)
     parser.add_argument('--samples', type=int, default=11)
-    parser.add_argument('--memory', action='store_true', help='Three separate Python-process peak-memory samples per method/layout')
+    parser.add_argument('--memory', action='store_true', help='Separate Python-process peak-memory samples per method/layout; uses --samples')
     args = parser.parse_args()
-    if not 1 <= args.files <= 1000000 or not 1 <= args.samples <= 100:
-        parser.error('Use 1–1,000,000 files and 1–100 samples')
+    if not 1 <= args.files <= 1000000 or not 10 <= args.samples <= 100:
+        parser.error('Use 1–1,000,000 files and 10–100 samples')
     rng = random.Random(20261006)
     package = Path(__file__).resolve().parents[2] / 'stallionfs'
     sources = [package / name for name in ('__init__.py', '_scan.c', '_walk.c', '_tree.h')]
-    sources += [Path(__file__), Path(f.__file__)]
+    sources += [Path(__file__), Path(f.__file__), Path(native_fixtures.__file__),
+                Path(native_metrics.__file__), Path(native_correctness.__file__)]
     hashes = {path.name: f.digest(path) for path in sources}
     native_binary = Path(_scan.__file__)
     f.require(native_binary.resolve().parent != package.resolve(),
@@ -106,17 +93,18 @@ def main():
               'python_binary_sha256': f.digest(Path(sys.executable)),
               'python': platform.python_version(), 'samples': args.samples, 'warmup_rounds': 2,
               'timing': 'Python API wall and process CPU time; native implementations; warm OS cache; no process startup',
+              'source_validation': 'Populated ACL, xattr/resource fork, sparse and hardlink coverage; full source snapshots before and after each attempt, outside API timing and child memory. Read-induced access times are excluded. Prechecks read all file contents; cache residency is not guaranteed.',
               'jobs': METHODS, 'status': 'running', 'passed': False,
               'layouts': 'Flat and 100-files-per-folder nested layouts; deep40 distributes files evenly along a 40-directory single-child chain, with special entries and empty directory at its deepest leaf',
               'volume': {key: volume.get(key) for key in ('filesystem', 'readonly', 'ignore_ownership')},
-              'memory_samples_per_method': 3 if args.memory else 0,
+              'memory_samples_per_method': args.samples if args.memory else 0,
               'memory_method': 'Separate fresh Python-process peak RSS/physical footprint from time -lp. Includes interpreter, import and child count/hash checks; excludes parent runner. Same startup for every method. Wrapper times are diagnostics, not API timing results or standalone C-engine memory.',
               'workloads': {}}
     if args.memory:
         result['time_sha256'] = f.digest(Path('/usr/bin/time'))
     root = Path(tempfile.mkdtemp(prefix='stallionfs-scan-', dir=scratch))
     identity = root.lstat()
-    cleanup_safe, checkpoint_identity = True, None
+    cleanup_safe, checkpoint_identity = False, None
 
     def checkpoint():
         nonlocal checkpoint_identity
@@ -127,50 +115,94 @@ def main():
             checkpoint()
             for layout in ('flat', 'nested', 'deep40'):
                 path = root / layout
-                expected = fixture(path, args.files, layout)
                 rows = {method: [] for method in METHODS}
                 cpu_rows = {method: [] for method in METHODS}
-                details = {'expected': expected, 'raw_seconds': rows, 'raw_cpu_seconds': cpu_rows,
-                           'sample_rows': [], 'memory_rows': []}
+                details = {'raw_seconds': rows, 'raw_cpu_seconds': cpu_rows,
+                           'sample_rows': [], 'memory_rows': [],
+                           'metadata': {'status': 'preparing', 'seed': {}}}
                 result['workloads'][layout] = details
+                checkpoint()
+                expected = fixture(path, args.files, layout)
+                details['expected'] = expected
+                metadata = details['metadata']
+                native_fixtures.enrich_metadata(path, receipt=metadata['seed'], scan_layout=layout)
+                checkpoint()
+                expected_source = native_correctness.snapshot(path, allow_special=True)
+                baseline = output.with_name(output.name + f'.{layout}.source.json.gz')
+                metadata['snapshot'] = str(baseline)
+                with open(baseline, 'xb', opener=lambda name, flags: os.open(name, flags, 0o600)) as raw:
+                    with gzip.open(raw, 'wt', encoding='utf-8') as stream:
+                        json.dump(expected_source, stream, sort_keys=True)
+                        stream.write('\n')
+                metadata['snapshot_sha256'] = f.digest(baseline)
+                metadata['coverage'] = native_fixtures.verify_metadata_coverage(expected_source, metadata['seed'])
+                f.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
+                metadata['status'] = 'prepared'
+                checkpoint()
                 for index in range(args.samples + 2):
                     order = list(METHODS)
                     rng.shuffle(order)
                     for method in order:
+                        row = dict(method=method, round=index, pair_id=index, order=order,
+                                   phase='timing', warmup=index < 2, ok=False, validated=False)
+                        details['sample_rows'].append(row)
+                        checkpoint()
+                        before = native_correctness.snapshot(path, allow_special=True)
+                        row['source_precheck'] = native_correctness.verify_source(expected_source, before)
+                        f.require(row['source_precheck']['unchanged'], 'Scan source changed before timing attempt')
                         cpu_start = time.process_time()
                         start = time.perf_counter()
                         observed = _scan.scan(path, bulk=method != 'posix', jobs=METHODS[method])
                         elapsed = time.perf_counter() - start
                         cpu_elapsed = time.process_time() - cpu_start
-                        f.require(observed == expected, f'{method}: expected {expected}, got {observed}')
-                        details['sample_rows'].append({'method': method, 'round': index, 'order': order,
-                                                       'warmup': index < 2, 'wall_s': elapsed, 'cpu_s': cpu_elapsed})
+                        row.update(wall_s=elapsed, cpu_s=cpu_elapsed, ok=True,
+                                   counts_validated=observed == expected, observed=observed,
+                                   precision_floor={'wall_s': 2 * time.get_clock_info('perf_counter').resolution,
+                                                    'cpu_s': 2 * time.get_clock_info('process_time').resolution})
+                        row['source_verification'] = native_correctness.verify_source(
+                            before, native_correctness.snapshot(path, allow_special=True))
+                        f.require(row['source_verification']['unchanged'], 'Scan source changed during timing attempt')
+                        row['validated'] = row['counts_validated']
+                        f.require(row['validated'], f'{method}: expected {expected}, got {observed}')
                         if index >= 2:
                             rows[method].append(elapsed)
                             cpu_rows[method].append(cpu_elapsed)
                     checkpoint()
                 medians = {method: statistics.median(samples) for method, samples in rows.items()}
                 details.update(median_seconds=medians, speedup=medians['posix'] / medians['bulk'],
-                               median_cpu_seconds={method: statistics.median(samples) for method, samples in cpu_rows.items()})
+                               median_cpu_seconds={method: statistics.median(samples) for method, samples in cpu_rows.items()},
+                               timing_comparisons=comparisons(details['sample_rows'], 'timing'))
                 if args.memory:
-                    for index in range(3):
+                    for index in range(args.samples):
                         order = list(METHODS)
                         rng.shuffle(order)
                         for method in order:
-                            cleanup_safe = False
-                            row = memory_sample(path, method, expected, result['native_binary_sha256'], root / 'memory.txt')
-                            row.update(method=method, round=index, order=order, warmup=False)
+                            row = dict(method=method, round=index, pair_id=index, order=order, warmup=False,
+                                       phase='resources', ok=False, validated=False)
                             details['memory_rows'].append(row)
-                            cleanup_safe = True
+                            checkpoint()
+                            before = native_correctness.snapshot(path, allow_special=True)
+                            row['source_precheck'] = native_correctness.verify_source(expected_source, before)
+                            f.require(row['source_precheck']['unchanged'], 'Scan source changed before memory attempt')
+                            row.update(memory_sample(path, method, expected, result['native_binary_sha256'], root / 'memory.txt', row))
+                            row['ok'] = True
+                            row['source_verification'] = native_correctness.verify_source(
+                                before, native_correctness.snapshot(path, allow_special=True))
+                            f.require(row['source_verification']['unchanged'], 'Scan source changed during memory attempt')
+                            row['validated'] = True
                             checkpoint()
                     details['memory_medians'] = {
                         method: {key: statistics.median(row[key] for row in details['memory_rows'] if row['method'] == method)
                                  if all(row[key] is not None for row in details['memory_rows'] if row['method'] == method) else None
                                  for key in ('rss_bytes', 'footprint_bytes')} for method in METHODS}
+                    details['memory_comparisons'] = comparisons(details['memory_rows'], 'resources')
                 print(layout, json.dumps(medians), flush=True)
-        except (f.ChildCompletionUnknown, KeyboardInterrupt):
-            cleanup_safe = False
-            raise
+            f.require({path.name: f.digest(path) for path in sources} == hashes and
+                      f.digest(native_binary) == result['native_binary_sha256'] and
+                      f.digest(Path(sys.executable)) == result['python_binary_sha256'] and
+                      (not args.memory or f.digest(Path('/usr/bin/time')) == result['time_sha256']),
+                      'Source, interpreter or native binary changed during measurement')
+            cleanup_safe = True
         finally:
             if cleanup_safe:
                 current = root.lstat()
@@ -183,18 +215,17 @@ def main():
                 result['cleanup_passed'] = True
             else:
                 result['retained_fixture'] = str(root)
-        f.require({path.name: f.digest(path) for path in sources} == hashes and
-                  f.digest(native_binary) == result['native_binary_sha256'] and
-                  f.digest(Path(sys.executable)) == result['python_binary_sha256'] and
-                  (not args.memory or f.digest(Path('/usr/bin/time')) == result['time_sha256']),
-                  'Source, interpreter or native binary changed during measurement')
         result.update(status='complete', passed=True)
         f.write_new_json(output, result)
     except BaseException as exc:
         result.update(status='failed', passed=False, error=f'{type(exc).__name__}: {exc}')
         if root.exists():
             result['retained_fixture'] = str(root)
-        checkpoint()
+        try:
+            checkpoint()
+        except BaseException as checkpoint_error:
+            exc.add_note(f'Failed to write checkpoint {partial}: '
+                         f'{type(checkpoint_error).__name__}: {checkpoint_error}')
         raise
     current = partial.lstat()
     if (current.st_dev, current.st_ino) == checkpoint_identity:
