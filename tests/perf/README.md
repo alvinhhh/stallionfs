@@ -4,6 +4,24 @@
 
 JSON results retain samples, validation outcomes and source/runtime hashes.
 
+## Latest native comparisons — 2026-10-24
+
+All three reports use the same packaged native binary on macOS 27 arm64. Each has
+ten valid pairs for direct timing and ten separate resource pairs. Values below
+are native / StallionFS medians; raw samples, hashes and uncertainty are linked.
+Scan downloads are JSON (XZ); decompress before using plain-JSON readers.
+
+| Warm fixture and reference | Direct wall | Direct CPU | Peak RSS | Paired screen |
+| --- | ---: | ---: | ---: | --- |
+| [4 KiB ordinary copy, `cp -Rp`](results/ordinary-copy-tiny-v0.6.3-arm64.json) | 4.857479 / 5.860917 ms | 2.5900 / 3.3275 ms | 1,032,192 / 1,671,168 B | StallionFS slower; CPU/RSS higher |
+| [Flat 20k scan, find/stat — JSON (XZ)](results/native-scan-flat-20261024-arm64.json.xz) | 14.145645 / 0.033494 s | 13.1820985 / 0.0298065 s | 5,079,040 / 1,769,472 B | StallionFS wall/CPU/RSS lower |
+| [Nested 20k scan, find/stat — JSON (XZ)](results/native-scan-nested-20261024-arm64.json.xz) | 12.784476 / 0.017051 s | 12.3910670 / 0.0505270 s | 2,703,360 / 1,933,312 B | StallionFS wall/CPU/RSS lower |
+
+Copy covers one enriched 4 KiB regular file. Scans cover `scan_flat_20k` and
+`scan_nested_20k` using the existing scanner implementation. Direct wall includes command
+startup; CPU includes waited children. Peak RSS is the largest individual process peak.
+These warm partial runs do not complete the acceptance matrix.
+
 Run from the repository with an installation outside the checkout and writable APFS scratch space. Use new output filenames:
 
 ```sh
@@ -159,7 +177,6 @@ These are comparisons on stable trees, not concurrent mutation tests.
 Raw stdout is retained losslessly in `stdout_gzip_b64`, with its original hash
 and length in `stdout_sha256` and `stdout_bytes`. Compression and validation run
 after timing. Incomplete collector receipts can retain the original raw fields.
-The publication exporter does not yet support scan reports.
 
 ## Prepared workspaces
 

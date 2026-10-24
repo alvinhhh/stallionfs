@@ -1,6 +1,6 @@
 # Native comparisons
 
-The current release does not meet the target. Existing results show faster tree operations but higher CPU or memory use in several cases; single-file commands remain slower. The full expanded suite below has not completed three consecutive runs. No new performance win is claimed.
+The full target remains unmet. The latest warm tiny-copy comparison loses wall, CPU and RSS; the warm flat and nested scans pass those paired screens. The expanded matrix remains incomplete.
 
 ## Command coverage
 
@@ -12,7 +12,7 @@ comparisons.
 | Native operation | StallionFS operation | Status |
 | --- | --- | --- |
 | `cp -cRp SRC DST` | `stallionfs clone SRC DST` | Copy-on-write comparison |
-| `cp -Rp SRC DST` | `stallionfs clone SRC DST` | Copy result; different storage strategy |
+| `cp -Rp SRC DST` | `stallionfs copy SRC DST` | [Warm 4 KiB: slower wall, higher CPU/RSS](../tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) |
 | `ditto --rsrc --extattr --acl SRC DST` | `stallionfs clone SRC DST` | Copy result; metadata losses are checked |
 | `rsync -a --extended-attributes SRC/ DST/` | `stallionfs clone SRC DST` | Fresh directory copy only; no incremental/remote counterpart |
 | `mv -n SRC DST` | `stallionfs move SRC DST` | Same filesystem, absent destination |
@@ -20,7 +20,7 @@ comparisons.
 | Atomic exchange | move with exchange | Required; native API comparison pending; a sequence of ordinary moves is not atomic exchange |
 | `rm -rf PATH` | `stallionfs delete --recursive PATH` | Permanent completed deletion |
 | Finder copy/move/delete | clone/move/delete | Scripted copy/move correctness checked below; shared-service resources and deletion unmeasured. Trash is not permanent deletion |
-| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Six-counter checks passed on flat, nested and deep fixtures; timed comparison pending |
+| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Warm [flat20k JSON (XZ)](../tests/perf/results/native-scan-flat-20261024-arm64.json.xz) and [nested20k JSON (XZ)](../tests/perf/results/native-scan-nested-20261024-arm64.json.xz): wall/CPU/RSS screens passed; deep timing pending |
 | Cached mount-record listing | `volumes` / `mounts` | Required; exact native fields and resource boundary unqualified |
 | `du -skx ROOT` | none | Allocated blocks differ from scan's logical file bytes |
 | `ls -la ROOT` | none | No directory-entry listing command; `stallionfs list` lists workspaces |
@@ -90,7 +90,7 @@ Block I/O counts are not device-byte measurements. Clone sharing is not logical 
 - External-drive runs when a suitable drive is connected. None was present in the latest inventory.
 - Three consecutive complete suites with every correctness check passing and every metric winning beyond observed variance.
 
-The original measured release results remain in [tests/perf](../tests/perf/README.md). A filtered run is not full-suite completion. Unsupported semantics, unavailable measurements and losses must not be removed from an acceptance report.
+[Current bounded results](../tests/perf/README.md#latest-native-comparisons--2026-10-24) retain the native comparisons and losses. A filtered run is not full-suite completion. Unsupported semantics, unavailable measurements and losses must not be removed from an acceptance report.
 
 Workspace commands run as the same user and are not isolated from the account.
 Separate directories and copy-on-write files do not meet isolated code-execution

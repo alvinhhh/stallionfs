@@ -284,7 +284,7 @@ for jobs in (1, 4):
         common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
                   '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
         replacements = ['openat', 'fstat', 'fclonefileat', 'fcopyfile', 'unlinkat', 'pthread_create', 'pthread_join',
-                        'acl_size', 'acl_copy_ext']
+                        'acl_size', 'acl_copy_ext', 'lseek']
         subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
                         '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)
         subprocess.run([*common, str(tests / 'native_faults.c'), str(object_file), '-o', str(executable)],

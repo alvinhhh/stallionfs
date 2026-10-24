@@ -285,6 +285,19 @@ static int ordinary_metadata(int input, int output, const struct stat *identity,
     if (copy_stopped(progress)) { errno = progress->error; return -1; }
     if (fstat(input, &before)) return -1;
     if (!unchanged_source(identity, &before)) { errno = ESTALE; return -1; }
+    /* Block allocation screens candidates; only the hole query can clear sparse copying. */
+    if ((flags & COPYFILE_DATA_SPARSE) && S_ISREG(before.st_mode) && before.st_size > 0 &&
+        before.st_blocks >= 0 && (uintmax_t)before.st_blocks >=
+        (uintmax_t)before.st_size / 512 + ((uintmax_t)before.st_size % 512 != 0)) {
+        int saved = errno;
+        off_t hole = lseek(input, 0, SEEK_HOLE);
+        if (hole >= 0) {
+            errno = 0;
+            if (lseek(input, 0, SEEK_SET) != 0) { if (!errno) errno = EIO; return -1; }
+            if (hole == before.st_size) flags &= ~COPYFILE_DATA_SPARSE;
+        }
+        errno = saved;
+    }
     copyfile_state_t copy = copyfile_state_alloc();
     if (!copy) return -1;
     if (copyfile_state_set(copy, COPYFILE_STATE_STATUS_CB, (void *)copy_status) ||

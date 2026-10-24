@@ -25,6 +25,8 @@ static pthread_t caller;
 static char outside[PATH_MAX], source[PATH_MAX];
 static struct stat destination_parent;
 static atomic_int copy_calls;
+static atomic_int preflight_probes, preflight_rewinds;
+static int preflight_saved_errno;
 static int acl_fault_call;
 static atomic_int acl_size_calls, acl_export_calls;
 static atomic_int entered, release_worker, cancelled, active, swaps, starts, created, joined;
@@ -101,6 +103,12 @@ int stallion_test_fstat(int fd, struct stat *st) {
         st->st_mode = (st->st_mode & ~S_ISVTX) | 0022;
         if (!strcmp(fault, "parent-device")) st->st_dev ^= 1;
     }
+    if (!result && !strcmp(fault, "preflight-sparse-unscreened") && S_ISREG(st->st_mode)) {
+        struct stat actual;
+        assert(stat(source, &actual) == 0);
+        if (st->st_dev == actual.st_dev && st->st_ino == actual.st_ino)
+            st->st_blocks = st->st_size / 512 + (st->st_size % 512 != 0);
+    }
     return result;
 }
 int stallion_test_fclonefileat(int source, int destination, const char *name, uint32_t flags) {
@@ -110,6 +118,16 @@ int stallion_test_fclonefileat(int source, int destination, const char *name, ui
 }
 int stallion_test_fcopyfile(int from, int to, copyfile_state_t state, copyfile_flags_t flags) {
     atomic_fetch_add(&copy_calls, 1);
+    if (!strncmp(fault, "preflight-", 10)) {
+        assert(!(flags & (COPYFILE_CLONE | COPYFILE_CLONE_FORCE)));
+        if (strcmp(fault, "preflight-symlink")) {
+            assert(lseek(from, 0, SEEK_CUR) == 0);
+            assert((flags & COPYFILE_ALL) == COPYFILE_ALL);
+            int dense = !strcmp(fault, "preflight-dense") || !strcmp(fault, "preflight-source-mutation");
+            assert(!!(flags & COPYFILE_DATA_SPARSE) == !dense);
+        } else assert(flags == COPYFILE_METADATA);
+        if (!strcmp(fault, "preflight-probe-error")) assert(errno == preflight_saved_errno);
+    }
     if (copy_error()) return -1;
     pause_worker();
     if (!strcmp(fault, "callback-error")) {
@@ -379,6 +397,81 @@ static void copy_leaf_fault(const char *base, const char *kind, int symlink_sour
     printf("PASS copy leaf %s (%s, ACL call %d): result checked, output contract respected, descriptors closed\n",
            kind, symlink_source ? "symlink" : "regular", acl_fault_call);
 }
+off_t stallion_test_lseek(int fd, off_t offset, int whence) {
+    if (!strncmp(fault, "preflight-", 10) && !atomic_load(&copy_calls)) {
+        if (whence == SEEK_HOLE && offset == 0) {
+            atomic_fetch_add(&preflight_probes, 1);
+            preflight_saved_errno = errno;
+            assert(lseek(fd, 0, SEEK_CUR) == 0);
+            if (!strcmp(fault, "preflight-probe-error")) { errno = EDQUOT; return -1; }
+            if (!strcmp(fault, "preflight-early-hole")) return lseek(fd, 0, SEEK_SET);
+        }
+        if (whence == SEEK_SET && offset == 0 && atomic_load(&preflight_probes)) {
+            atomic_fetch_add(&preflight_rewinds, 1);
+            if (!strcmp(fault, "preflight-rewind-error")) { errno = EACCES; return -1; }
+            if (!strcmp(fault, "preflight-rewind-no-errno")) { errno = 0; return -1; }
+            if (!strcmp(fault, "preflight-rewind-nonzero")) { assert(lseek(fd, 1, SEEK_SET) == 1); errno = 0; return 1; }
+            off_t result = lseek(fd, offset, whence);
+            if (!strcmp(fault, "preflight-source-mutation")) {
+                struct timespec times[2] = {{100, 0}, {100, 0}};
+                assert(futimens(fd, times) == 0);
+            }
+            return result;
+        }
+    }
+    return lseek(fd, offset, whence);
+}
+static void dense_preflight_case(const char *base, const char *kind) {
+    char root[PATH_MAX], input[PATH_MAX], output[PATH_MAX], path[PATH_MAX], name[80];
+    assert(snprintf(name, sizeof(name), "preflight-%s", kind) < (int)sizeof(name));
+    assert(snprintf(root, sizeof(root), "%s/%s", base, name) < (int)sizeof(root));
+    assert(mkdir(root, 0700) == 0);
+    snprintf(input, sizeof(input), "%s/input", root);
+    snprintf(output, sizeof(output), "%s/output", root);
+    if (!strcmp(kind, "symlink")) assert(symlink("missing-target", input) == 0);
+    else file(root, "input");
+    int fd = open(input, O_RDONLY | O_CLOEXEC | (!strcmp(kind, "symlink") ? O_SYMLINK : O_NOFOLLOW));
+    assert(fd >= 0);
+    assert(fsetxattr(fd, "user.stallion-test", "metadata", 8, 0, 0) == 0);
+    assert(close(fd) == 0);
+    if (!strcmp(kind, "empty")) assert(truncate(input, 0) == 0);
+    if (!strncmp(kind, "sparse-", 7)) {
+        fd = open(input, O_RDWR | O_CLOEXEC); assert(fd >= 0);
+        assert(lseek(fd, 1048576, SEEK_SET) == 1048576 && write(fd, "end", 3) == 3);
+        assert(fsync(fd) == 0);
+        struct fpunchhole hole = {.fp_offset = 4096, .fp_length = 1048576 - 4096};
+        assert(fcntl(fd, F_PUNCHHOLE, &hole) == 0 && fsync(fd) == 0);
+        assert(lseek(fd, 0, SEEK_HOLE) < 1048576);
+        struct stat info; assert(fstat(fd, &info) == 0);
+        assert(info.st_blocks < info.st_size / 512);
+        assert(close(fd) == 0);
+    }
+    assert(stat(root, &destination_parent) == 0);
+    assert(snprintf(source, sizeof(source), "%s", input) < (int)sizeof(source));
+    fault = name; caller = pthread_self();
+    atomic_store(&copy_calls, 0); atomic_store(&preflight_probes, 0); atomic_store(&preflight_rewinds, 0);
+    atomic_store(&starts, 0); atomic_store(&cancelled, 0);
+    int before = descriptors();
+    int result = stallion_copy(input, output, 4, cancel, NULL, path, sizeof(path));
+    int error = errno;
+    int rewind_failure = !strncmp(kind, "rewind-", 7), mutation = !strcmp(kind, "source-mutation");
+    assert(result == (rewind_failure || mutation ? -1 : 0));
+    assert(descriptors() == before);
+    assert(copy_calls == (rewind_failure ? 0 : 1));
+    int probe = strcmp(kind, "empty") && strcmp(kind, "symlink") && strcmp(kind, "sparse-screened");
+    assert(preflight_probes == probe);
+    assert(preflight_rewinds == (probe && strcmp(kind, "probe-error")));
+    if (rewind_failure) assert(error == (!strcmp(kind, "rewind-error") ? EACCES : EIO));
+    else if (mutation) assert(error == ENOTSUP || error == ESTALE);
+    else assert(error == 0);
+    struct stat info; assert(lstat(output, &info) == 0);
+    if (!rewind_failure && !mutation && strcmp(kind, "symlink") && strcmp(kind, "empty")) {
+        fd = open(output, O_RDONLY | O_CLOEXEC); assert(fd >= 0);
+        char data[8]; assert(read(fd, data, 8) == 8 && !memcmp(data, "sentinel", 8));
+        assert(close(fd) == 0);
+    }
+    printf("PASS dense preflight %s: flags, offsets, error/guards and descriptors checked\n", kind);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     int operations = 2;
@@ -419,6 +512,10 @@ int main(int argc, char **argv) {
                     copy_leaf_fault(argv[1], acl_errors[i], symlink_source);
             acl_fault_call = 0;
         }
+        const char *preflight_cases[] = {"dense", "probe-error", "rewind-error", "rewind-no-errno", "rewind-nonzero",
+                                         "empty", "symlink", "early-hole", "sparse-unscreened", "sparse-screened", "source-mutation"};
+        for (size_t i = 0; i < sizeof(preflight_cases) / sizeof(*preflight_cases); i++)
+            dense_preflight_case(argv[1], preflight_cases[i]);
     }
     return 0;
 }
