@@ -3,6 +3,7 @@
 STALLIONFS_TEST_IMAGES=1 additionally enables actual cross-volume qualification.
 """
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -446,19 +447,39 @@ class CopyFixtureSafety(unittest.TestCase):
         self.assertTrue(case.image_command_failed)
 
 
-@unittest.skipUnless(sys.platform == 'darwin' and not MACOS_13, 'Requires a pre-macOS-13 runtime')
-class OlderCopyRuntime(unittest.TestCase):
-    def test_copy_is_unavailable_without_mutation(self):
-        from stallionfs import copy
-        with tempfile.TemporaryDirectory(prefix='stallionfs-copy-old-') as directory:
-            source = Path(directory) / 'source'
-            destination = Path(directory) / 'destination'
-            source.write_bytes(b'original')
-            with self.assertRaises(OSError) as raised:
-                copy(source, destination)
-            self.assertEqual(raised.exception.errno, errno.ENOTSUP)
-            self.assertFalse(destination.exists())
-            self.assertEqual(source.read_bytes(), b'original')
+class CopyRuntimeDiscovery(unittest.TestCase):
+    def test_older_runtime_case_is_discovered_only_before_macos_13(self):
+        for system, version, expected in (('darwin', '12.7.6', True),
+                                          ('darwin', '13.0', False),
+                                          ('darwin', '26.0', False),
+                                          ('linux', '', False)):
+            with self.subTest(system=system, version=version):
+                spec = importlib.util.spec_from_file_location('copy_runtime_discovery', __file__)
+                module = importlib.util.module_from_spec(spec)
+                with mock.patch.object(sys, 'platform', system), \
+                     mock.patch.object(platform, 'mac_ver', return_value=(version, ('', '', ''), '')):
+                    spec.loader.exec_module(module)
+                cases = unittest.defaultTestLoader.loadTestsFromModule(module)
+                legacy_cases = [case for group in cases for case in group
+                                if type(case).__name__ == 'OlderCopyRuntime']
+                self.assertEqual(len(legacy_cases), int(expected))
+                if expected:
+                    self.assertFalse(getattr(type(legacy_cases[0]), '__unittest_skip__', False))
+
+
+if sys.platform == 'darwin' and not MACOS_13:
+    class OlderCopyRuntime(unittest.TestCase):
+        def test_copy_is_unavailable_without_mutation(self):
+            from stallionfs import copy
+            with tempfile.TemporaryDirectory(prefix='stallionfs-copy-old-') as directory:
+                source = Path(directory) / 'source'
+                destination = Path(directory) / 'destination'
+                source.write_bytes(b'original')
+                with self.assertRaises(OSError) as raised:
+                    copy(source, destination)
+                self.assertEqual(raised.exception.errno, errno.ENOTSUP)
+                self.assertFalse(destination.exists())
+                self.assertEqual(source.read_bytes(), b'original')
 
 
 if __name__ == '__main__':
