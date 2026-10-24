@@ -1,6 +1,6 @@
 # Native comparisons
 
-The full target remains unmet. The latest warm tiny-copy comparison loses wall, CPU and RSS; the warm flat and nested scans pass those paired screens. The expanded matrix remains incomplete.
+The full target remains unmet. The latest warm tiny-copy and tiny-move comparisons lose wall, CPU and RSS; the warm flat, nested and deep40 scans pass those paired screens. The expanded matrix remains incomplete.
 
 ## Command coverage
 
@@ -15,12 +15,12 @@ comparisons.
 | `cp -Rp SRC DST` | `stallionfs copy SRC DST` | [Warm 4 KiB: slower wall, higher CPU/RSS](../tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) |
 | `ditto --rsrc --extattr --acl SRC DST` | `stallionfs clone SRC DST` | Copy result; metadata losses are checked |
 | `rsync -a --extended-attributes SRC/ DST/` | `stallionfs clone SRC DST` | Fresh directory copy only; no incremental/remote counterpart |
-| `mv -n SRC DST` | `stallionfs move SRC DST` | Same filesystem, absent destination |
+| `mv -n SRC DST` | `stallionfs move SRC DST` | [Warm 4 KiB JSON (XZ)](../tests/perf/results/native-move-tiny-20261024-arm64.json.xz): slower direct wall, higher CPU/RSS; same filesystem, absent destination |
 | Exact-path replacement move | move with replacement | Required; exact native cases and collection pending |
 | Atomic exchange | move with exchange | Required; native API comparison pending; a sequence of ordinary moves is not atomic exchange |
 | `rm -rf PATH` | `stallionfs delete --recursive PATH` | Permanent completed deletion |
 | Finder copy/move/delete | clone/move/delete | Scripted copy/move correctness checked below; shared-service resources and deletion unmeasured. Trash is not permanent deletion |
-| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Warm [flat20k JSON (XZ)](../tests/perf/results/native-scan-flat-20261024-arm64.json.xz) and [nested20k JSON (XZ)](../tests/perf/results/native-scan-nested-20261024-arm64.json.xz): wall/CPU/RSS screens passed; deep timing pending |
+| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Warm [flat20k JSON (XZ)](../tests/perf/results/native-scan-flat-20261024-arm64.json.xz), [nested20k JSON (XZ)](../tests/perf/results/native-scan-nested-20261024-arm64.json.xz) and [deep40 JSON (XZ)](../tests/perf/results/native-scan-deep40-20261024-arm64.json.xz): wall/CPU/RSS screens passed |
 | Cached mount-record listing | `volumes` / `mounts` | Required; exact native fields and resource boundary unqualified |
 | `du -skx ROOT` | none | Allocated blocks differ from scan's logical file bytes |
 | `ls -la ROOT` | none | No directory-entry listing command; `stallionfs list` lists workspaces |
@@ -30,6 +30,8 @@ comparisons.
 | Git worktree plus locked offline setup | folder prepare/create/remove/gc | Existing create/cleanup comparison; peak simultaneous memory and full metadata equivalence unmeasured |
 | Image creation/clone/attach/detach/deletion workflow | image prepare/create/mount/unmount/remove/gc | Released capability; complete equivalent workflow and resource coverage pending |
 | Equivalent recovery and store-management workflow | restore/forget/list/diagnostics | Exact workflow/disposition pending; no single native filesystem command |
+
+Compressed report downloads are JSON (XZ); decompress before using plain-JSON readers. Tiny move wrapped wall is inconclusive; StallionFS p95 is 27.401166 ms, with no excluded samples.
 
 The FSKit prototype is separate from the released CLI. Timing native tools on that volume must also account for its serving process and deferred writes; CLI results cannot stand in for that measurement.
 
