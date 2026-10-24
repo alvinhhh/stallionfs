@@ -95,17 +95,3 @@ The original measured release results remain in [tests/perf](../tests/perf/READM
 Workspace commands run as the same user and are not isolated from the account.
 Separate directories and copy-on-write files do not meet isolated code-execution
 requirements. See the current [execution boundary](../docs/storage.md).
-
-## Initial wrapped 4 KiB copy result
-
-Three warm runs, ten pairs per run, comparing `cp -cRp` with `stallionfs clone`. All 60 operations passed content, metadata, source-preservation and independent-inode checks. This is one case, not three full suites. The generated fixtures contain no nonempty ACL or resource-fork payload; those features have separate correctness unit checks and still need workload fixtures.
-
-| Run | Native wall median | StallionFS wall median | Wall decision | Native peak RSS median | StallionFS peak RSS median | CPU |
-| --- | ---: | ---: | --- | ---: | ---: | --- |
-| 1 | 11.444 ms | 19.969 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-| 2 | 7.225 ms | 9.226 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-| 3 | 11.819 ms | 12.457 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-
-Memory is higher in all three runs. The wall gap does not exceed the declared variability threshold. CPU values rounded to zero, which establishes no CPU advantage. These results use the original resource-only collector; they do not measure the separate direct-timing phase added afterward.
-
-Raw measurements are retained locally; publication is pending.

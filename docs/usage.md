@@ -3,6 +3,7 @@
 ## File operations
 
 ```sh
+stallionfs copy source destination
 stallionfs clone source destination
 stallionfs clone source destination --jobs 1
 stallionfs move source destination
@@ -14,26 +15,32 @@ stallionfs delete --missing-ok file
 stallionfs volumes
 ```
 
+`copy` copies file data and metadata to an exact new path, using ordinary data copying without requesting APFS cloning. It requires macOS 13 or later. Regular files, directories and symlinks are supported; symlink targets are not followed. Internal regular-file and symlink hardlinks share new destination inodes, independent of the source. Existing destinations, special files, nested source volumes and destinations inside the source are rejected.
+
+Copying can cross volumes when the destination supports the required mode, ownership, modification time, flags, ACLs, extended attributes (including resource forks) and sparse hole ranges. Unsupported or unpreserved properties fail explicitly. Access, change and birth times and allocated-block counts are not equality requirements. The operation checks source stability but does not provide an atomic snapshot; keep both trees stable during copying.
+
+On failure, any partial output remains at the exact destination you requested, even if the error identifies a child path. Inspect that destination before retrying. Workers are joined and descriptors released before returning; cancellation may wait for an in-progress platform operation.
+
 `clone` creates an independent copy at an exact new path on the same APFS volume. It accepts regular files, directories and symlinks, preserves permissions, ACLs, extended attributes and timestamps, and never falls back to copying file data. Hardlink relationships between regular files or symlinks inside a copied tree are preserved. Destination aliases share one new inode with each other, never with the source or its external aliases. Changing one destination alias changes its other destination aliases without changing the source. macOS applies its normal clone ownership rules, clears setuid/setgid bits on regular files, and adds inherited destination ACL entries to cloned files. A destination inside the source is rejected.
 
 Directory copying uses up to four workers. Files are pinned before cloning, links are copied without following their targets, and nested volumes and special files are rejected. Keep the source and destination trees stable during the operation; a recursive copy is not an atomic snapshot of concurrent changes. An error may leave a partial new destination. All workers stop before the command returns.
 
-Directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last.
+Copies and directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last.
 
 `move` uses the filesystem's atomic rename operation. It treats the destination as an exact path, including when that path names a directory. The default refuses an existing destination. `--replace` replaces it; `--exchange` swaps two existing paths. Cross-volume moves fail without copying or deleting the source.
 
 `delete` removes files and symlinks. Directories require `--recursive`; mounted volumes and directories containing mounts are refused. Deletion is permanent and finishes before the command returns. It can stop after partial deletion if an entry cannot be removed. `--missing-ok` accepts an absent final entry, while other errors still fail.
 
-`--jobs` accepts 1–4 for `clone`, `delete` and `scan`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
+`--jobs` accepts 1–4 for `copy`, `clone`, `delete` and `scan`. Four prioritizes elapsed time; one reduces CPU use. Folder workspace `create` and trash `gc` accept the same option. Garbage collection shares the worker limit across directories.
 
 File operations, scans and volume listings run in the native executable, including with `--json`. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
 
 The same operations are available to Python applications:
 
 ```python
-from stallionfs import clone, delete, mounts, move, scan
+from stallionfs import clone, copy, delete, mounts, move, scan
 
-clone("source", "destination", jobs=4)
+copy("source", "destination", jobs=4)
 move("destination", "renamed")
 delete("renamed", recursive=True, jobs=1)
 print(mounts())

@@ -16,6 +16,7 @@
 #include <sys/clonefile.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
@@ -23,7 +24,12 @@
 #define QUEUE_LIMIT 24
 #define DEPTH_LIMIT 512
 
-enum operation { CLONING, DELETING };
+/* Older SDKs can still build the weak-linked, runtime-gated copy operation. */
+#if __MAC_OS_X_VERSION_MAX_ALLOWED < 130000
+extern ssize_t freadlink(int, char *, size_t) __attribute__((weak_import, availability(macos, introduced=13.0)));
+#endif
+
+enum operation { CLONING, COPYING, DELETING };
 struct object_identity { dev_t device; ino_t inode; mode_t type; };
 struct job {
     int source, destination;
@@ -33,6 +39,7 @@ struct job {
     unsigned pending, depth;
     int deferred;
     struct object_identity source_identity, destination_identity;
+    struct stat source_stat;
     struct job *deferred_next;
 };
 struct link_record {
@@ -144,6 +151,212 @@ static int unchanged_source(const struct stat *a, const struct stat *b) {
         same_time(a->st_mtimespec, b->st_mtimespec) && same_time(a->st_ctimespec, b->st_ctimespec) &&
         same_time(a->st_birthtimespec, b->st_birthtimespec);
 }
+struct copy_progress {
+    struct tree *tree;
+    stallion_cancel_fn cancel;
+    void *context;
+    int error;
+    size_t started, finished;
+};
+static int copy_stopped(struct copy_progress *progress) {
+    if (!progress->error && progress->tree && stopped(progress->tree))
+        progress->error = atomic_load(&progress->tree->error);
+    if (!progress->error && progress->cancel && progress->cancel(progress->context)) progress->error = EINTR;
+    return progress->error != 0;
+}
+static int copy_status(int what, int stage, copyfile_state_t state,
+                       const char *source, const char *destination, void *context) {
+    (void)state; (void)source; (void)destination;
+    struct copy_progress *progress = context;
+    /* libcopyfile substitutes ECANCELED after QUIT; retain the actual failure. */
+    if (stage == COPYFILE_ERR && !progress->error) progress->error = errno ? errno : EIO;
+    if (copy_stopped(progress)) return COPYFILE_QUIT;
+    if (what == COPYFILE_COPY_XATTR) {
+        if (stage == COPYFILE_START) progress->started++;
+        if (stage == COPYFILE_FINISH) progress->finished++;
+    }
+    return COPYFILE_CONTINUE;
+}
+static int same_acl(int input, int output) {
+    acl_t source = acl_get_fd_np(input, ACL_TYPE_EXTENDED);
+    if (!source && errno == ENOENT) source = acl_init(0);
+    if (!source) return -1;
+    acl_t destination = acl_get_fd_np(output, ACL_TYPE_EXTENDED);
+    if (!destination && errno == ENOENT) destination = acl_init(0);
+    int error = destination ? 0 : errno;
+    ssize_t a_length = 0, b_length = 0;
+    char *a = NULL, *b = NULL;
+    if (!error) {
+        errno = 0;
+        a_length = acl_size(source);
+        if (a_length <= 0) error = a_length < 0 && errno ? errno : EIO;
+    }
+    if (!error) {
+        errno = 0;
+        b_length = acl_size(destination);
+        if (b_length <= 0) error = b_length < 0 && errno ? errno : EIO;
+    }
+    if (!error && a_length != b_length) error = ENOTSUP;
+    if (!error && !(a = malloc((size_t)a_length))) error = errno;
+    if (!error && !(b = malloc((size_t)b_length))) error = errno;
+    /* The external representation includes ordered ACEs and flags without name lookup. */
+    if (!error) {
+        errno = 0;
+        ssize_t copied = acl_copy_ext(a, source, a_length);
+        if (copied != a_length) error = copied < 0 && errno ? errno : EIO;
+    }
+    if (!error) {
+        errno = 0;
+        ssize_t copied = acl_copy_ext(b, destination, b_length);
+        if (copied != b_length) error = copied < 0 && errno ? errno : EIO;
+    }
+    if (!error && memcmp(a, b, (size_t)a_length)) error = ENOTSUP;
+    free(a);
+    free(b);
+    acl_free(source);
+    if (destination) acl_free(destination);
+    errno = error;
+    return error ? -1 : 0;
+}
+/* Check silent xattr skips without rereading ordinary values or resource forks. */
+static int same_xattrs(int input, int output, const struct copy_progress *progress) {
+    ssize_t length = flistxattr(input, NULL, 0, XATTR_SHOWCOMPRESSION);
+    if (length < 0) return -1;
+    char *names = malloc((size_t)length + 1);
+    if (!names) return -1;
+    int error = 0;
+    size_t count = 0;
+    ssize_t actual = flistxattr(input, names, (size_t)length, XATTR_SHOWCOMPRESSION);
+    if (actual < 0) error = errno;
+    else if (actual != length) error = ESTALE;
+    ssize_t destination_length = error ? -1 : flistxattr(output, NULL, 0, XATTR_SHOWCOMPRESSION);
+    if (!error && destination_length < 0) error = errno;
+    if (!error && destination_length != length) error = ENOTSUP;
+    for (ssize_t offset = 0; !error && offset < length;) {
+        const char *name = names + offset;
+        size_t remaining = (size_t)(length - offset), size = strnlen(name, remaining);
+        if (!size || size == remaining) { error = EIO; break; }
+        offset += (ssize_t)size + 1;
+        ssize_t a = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+        if (a < 0) { error = errno; break; }
+        ssize_t b = fgetxattr(output, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+        if (b < 0) { error = errno; break; }
+        if (a != b) { error = ENOTSUP; break; }
+        if (strcmp(name, "com.apple.quarantine")) { count++; continue; }
+        /* Quarantine bypasses the xattr callbacks and may be rewritten by copyfile. */
+        if ((uintmax_t)a > (SIZE_MAX - 1) / 2) { error = EOVERFLOW; break; }
+        char *values = malloc((size_t)a * 2 + 1);
+        if (!values) { error = errno; break; }
+        if (fgetxattr(input, name, values, (size_t)a, 0, 0) != a ||
+            fgetxattr(output, name, values + a, (size_t)a, 0, 0) != a) error = errno ? errno : ESTALE;
+        else if (memcmp(values, values + a, (size_t)a)) error = ENOTSUP;
+        free(values);
+    }
+    if (!error && (progress->started != count || progress->finished != count)) error = EIO;
+    free(names);
+    errno = error;
+    return error ? -1 : 0;
+}
+static int same_sparse_ranges(int input, int output, off_t size) {
+    for (off_t position = 0; position < size;) {
+        off_t a = lseek(input, position, SEEK_DATA);
+        if (a < 0 && errno != ENXIO) return -1;
+        if (a < 0) a = size;
+        off_t b = lseek(output, position, SEEK_DATA);
+        if (b < 0 && errno != ENXIO) return -1;
+        if (b < 0) b = size;
+        if (a != b) { errno = ENOTSUP; return -1; }
+        if (a == size) break;
+        if (a < position || a > size) { errno = EIO; return -1; }
+        off_t hole = lseek(input, a, SEEK_HOLE);
+        if (hole < 0) return -1;
+        off_t other = lseek(output, b, SEEK_HOLE);
+        if (other < 0) return -1;
+        if (hole != other) { errno = ENOTSUP; return -1; }
+        if (hole <= a || hole > size) { errno = EIO; return -1; }
+        position = hole;
+    }
+    return 0;
+}
+static int ordinary_metadata(int input, int output, const struct stat *identity,
+                              copyfile_flags_t flags, struct copy_progress *progress) {
+    struct stat before, after, destination;
+    int error = 0;
+    if (copy_stopped(progress)) { errno = progress->error; return -1; }
+    if (fstat(input, &before)) return -1;
+    if (!unchanged_source(identity, &before)) { errno = ESTALE; return -1; }
+    copyfile_state_t copy = copyfile_state_alloc();
+    if (!copy) return -1;
+    if (copyfile_state_set(copy, COPYFILE_STATE_STATUS_CB, (void *)copy_status) ||
+        copyfile_state_set(copy, COPYFILE_STATE_STATUS_CTX, progress)) error = errno;
+    if (!error && fcopyfile(input, output, copy, flags)) error = progress->error ? progress->error : errno;
+    if (copyfile_state_free(copy) && !error) error = errno;
+    if (!error && copy_stopped(progress)) error = progress->error;
+    if (!error && fstat(output, &destination)) error = errno;
+    if (!error && (identity->st_mode != destination.st_mode || identity->st_uid != destination.st_uid ||
+        identity->st_gid != destination.st_gid || identity->st_flags != destination.st_flags ||
+        !same_time(identity->st_mtimespec, destination.st_mtimespec) ||
+        (!S_ISDIR(identity->st_mode) && identity->st_size != destination.st_size))) error = ENOTSUP;
+    if (!error && same_acl(input, output)) error = errno;
+    if (!error && same_xattrs(input, output, progress)) error = errno;
+    if (!error && S_ISREG(identity->st_mode) && same_sparse_ranges(input, output, identity->st_size)) error = errno;
+    if (!error && fstat(input, &after)) error = errno;
+    if (!error && !unchanged_source(identity, &after)) error = ESTALE;
+    if (!error && copy_stopped(progress)) error = progress->error;
+    errno = error;
+    return error ? -1 : 0;
+}
+static int first_inode(enum operation operation, struct tree *tree, int input, int parent,
+                        const char *name, const struct stat *identity,
+                        stallion_cancel_fn cancel, void *context) {
+    if (operation == CLONING) return fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
+    struct copy_progress progress = {.tree = tree, .cancel = cancel, .context = context};
+    if (copy_stopped(&progress)) { errno = progress.error; return -1; }
+    int output = -1, error = 0;
+    struct stat created, opened;
+    if (S_ISREG(identity->st_mode)) {
+        output = openat(parent, name, O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0600);
+        if (output < 0) return -1;
+    } else {
+        if (identity->st_size <= 0 || (uintmax_t)identity->st_size >= SIZE_MAX) { errno = EIO; return -1; }
+        size_t capacity = (size_t)identity->st_size + 1;
+        char *target = malloc(capacity);
+        if (!target) return -1;
+        ssize_t length = -1;
+        if (__builtin_available(macOS 13.0, *)) length = freadlink(input, target, capacity);
+        else errno = ENOTSUP;
+        if (length < 0) error = errno;
+        else if ((size_t)length != capacity - 1 || memchr(target, 0, (size_t)length)) error = ESTALE;
+        else {
+            target[length] = 0;
+            if (symlinkat(target, parent, name)) error = errno;
+        }
+        free(target);
+        if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
+        if (!error && (!S_ISLNK(created.st_mode) || created.st_uid != geteuid())) error = ESTALE;
+        if (!error && (output = openat(parent, name, O_RDONLY | O_SYMLINK | O_CLOEXEC)) < 0) error = errno;
+        if (!error && fstat(output, &opened)) error = errno;
+        if (!error && !same_object(&created, &opened)) error = ESTALE;
+    }
+    if (!error && fstat(output, &opened)) error = errno;
+    if (!error && (same_object(identity, &opened) ||
+        (identity->st_mode & S_IFMT) != (opened.st_mode & S_IFMT))) error = ESTALE;
+    if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
+    if (!error && !same_object(&opened, &created)) error = ESTALE;
+    if (!error && ordinary_metadata(input, output, identity,
+        S_ISREG(identity->st_mode) ? COPYFILE_ALL | COPYFILE_DATA_SPARSE : COPYFILE_METADATA, &progress)) error = errno;
+    if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
+    if (!error && !same_object(&opened, &created)) error = ESTALE;
+    if (output >= 0 && close(output) && !error) error = errno;
+    errno = error;
+    return error ? -1 : 0;
+}
+static int directory_metadata(struct tree *state, struct job *job, int input, int output,
+                               stallion_cancel_fn cancel, void *context) {
+    if (state->operation == CLONING) return fcopyfile(input, output, NULL, COPYFILE_METADATA);
+    struct copy_progress progress = {.tree = state, .cancel = cancel, .context = context};
+    return ordinary_metadata(input, output, &job->source_stat, COPYFILE_METADATA, &progress);
+}
 /* The marked ancestor chain remains owned until post-join metadata completes.
  * At most two traversal FDs exist at once, irrespective of depth/group count. */
 static int link_directory(struct tree *state, const struct job *job, int source) {
@@ -244,7 +457,7 @@ static int linked_clone(struct tree *state, struct job *job, const char *name,
         bucket = link_bucket(identity, state->link_buckets);
         record = remember_link(state, job, name, identity);
         if (!record) { error = errno; goto done; }
-        if (fclonefileat(fd, job->destination, name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
+        if (first_inode(state->operation, state, fd, job->destination, name, identity, NULL, NULL)) error = errno;
         if (!error && fstatat(job->destination, name, &record->destination, AT_SYMLINK_NOFOLLOW)) error = errno;
         if (!error && (same_object(identity, &record->destination) ||
             (identity->st_mode & S_IFMT) != (record->destination.st_mode & S_IFMT))) error = ESTALE;
@@ -333,7 +546,7 @@ static int clone_leaf(struct tree *state, struct job *job, const char *name, uns
     else if (identity.st_nlink > 1) {
         if (linked_clone(state, job, name, fd, &identity, flags)) error = errno;
     }
-    else if (fclonefileat(fd, destination, name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
+    else if (first_inode(state->operation, state, fd, destination, name, &identity, NULL, NULL)) error = errno;
     if (close(fd) && !error) error = errno;
     errno = error;
     return error ? -1 : 0;
@@ -349,9 +562,9 @@ static void finish(struct tree *state, struct job *job) {
         struct job *parent = job->parent;
         int parent_fd = parent ? parent->source : state->parent_fd;
         if (!stopped(state)) {
-            if (state->operation == CLONING) {
+            if (state->operation != DELETING) {
                 /* Apply permissions and timestamps only after all children finish. */
-                if (!deferred && fcopyfile(job->source, job->destination, NULL, COPYFILE_METADATA))
+                if (!deferred && directory_metadata(state, job, job->source, job->destination, NULL, NULL))
                     fail(state, errno, job->source, NULL);
             } else {
                 struct stat current;
@@ -388,7 +601,7 @@ static void directory(struct tree *state, struct job *parent, const char *name, 
     if (fstat(source, &identity)) error = errno;
     else if (identity.st_dev != state->device) error = EXDEV;
     else if (expected && identity.st_ino != expected) error = ESTALE;
-    else if (state->operation == CLONING &&
+    else if (state->operation != DELETING &&
              (destination = open_created_directory(parent->destination, name)) < 0) error = errno;
     struct job *child = error ? NULL : calloc(1, sizeof(*child));
     if (!error && !child) error = ENOMEM;
@@ -402,7 +615,7 @@ static void directory(struct tree *state, struct job *parent, const char *name, 
         return;
     }
     *child = (struct job){.source = source, .destination = destination, .name = owned_name,
-        .inode = identity.st_ino, .parent = parent, .pending = 1, .depth = parent->depth + 1};
+        .inode = identity.st_ino, .source_stat = identity, .parent = parent, .pending = 1, .depth = parent->depth + 1};
     pthread_mutex_lock(&state->mutex);
     parent->pending++;
     state->live++;
@@ -480,7 +693,7 @@ static int run_tree(int source, int destination, int parent, const char *name,
         errno = ENOMEM; return -1;
     }
     *root = (struct job){.source = source, .destination = destination, .name = owned_name,
-                        .inode = identity->st_ino, .pending = 1};
+                        .inode = identity->st_ino, .source_stat = *identity, .pending = 1};
     struct tree state = {.mutex = PTHREAD_MUTEX_INITIALIZER, .available = PTHREAD_COND_INITIALIZER,
         .links_mutex = PTHREAD_MUTEX_INITIALIZER, .link_source = -1, .link_destination = -1,
         .parent_fd = parent, .operation = operation, .device = identity->st_dev, .live = 1, .queued = 1};
@@ -522,7 +735,7 @@ static int run_tree(int source, int destination, int parent, const char *name,
         int input = link_directory(&state, job, 1);
         int output = input < 0 ? -1 : link_directory(&state, job, 0);
         int error = input < 0 || output < 0 ? errno : 0;
-        if (!error && fcopyfile(input, output, NULL, COPYFILE_METADATA)) error = errno;
+        if (!error && directory_metadata(&state, job, input, output, cancel, context)) error = errno;
         if (output >= 0 && close(output) && !error) error = errno;
         if (input >= 0 && close(input) && !error) error = errno;
         if (error) fail(&state, error, parent, name);
@@ -636,10 +849,10 @@ static int check_acl(int fd, uid_t owner, int private) {
 }
 
 /* Other users must not be able to replace our private staging directory. */
-static int protected_parent(int fd, dev_t device) {
+static int protected_parent(int fd, dev_t device, enum operation operation) {
     struct stat st;
     if (fstat(fd, &st)) return -1;
-    if (st.st_dev != device) { errno = EXDEV; return -1; }
+    if (operation == CLONING && st.st_dev != device) { errno = EXDEV; return -1; }
     if ((st.st_uid != geteuid() && st.st_uid != 0) || (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) {
         errno = EPERM; return -1;
     }
@@ -691,7 +904,7 @@ static int no_mounts(int fd) {
     return error ? -1 : 0;
 }
 
-static int clone_impl(const char *source_path, const char *destination_path, int directory_only,
+static int clone_impl(const char *source_path, const char *destination_path, int directory_only, enum operation operation,
                       unsigned workers, stallion_cancel_fn cancel, void *context,
                       char *error_path, size_t capacity) {
     if (error_path && capacity) error_path[0] = 0;
@@ -712,19 +925,20 @@ static int clone_impl(const char *source_path, const char *destination_path, int
     }
     if (!error && open_path(destination_path, &destination, 0)) error = errno;
     if (!error && destination.trailing_slash && !S_ISDIR(identity.st_mode)) error = ENOTDIR;
+    if (!error && operation == COPYING && protected_parent(destination.parent, identity.st_dev, operation)) error = errno;
     if (!error && !S_ISDIR(identity.st_mode)) {
-        /* A pinned leaf is created exclusively by the clone syscall itself. */
+        /* Both creation paths refuse an existing final entry. */
         if (cancel && cancel(context)) error = EINTR;
-        else if (fclonefileat(input, destination.parent, destination.name, CLONE_NOFOLLOW | CLONE_ACL)) error = errno;
+        else if (first_inode(operation, NULL, input, destination.parent, destination.name, &identity, cancel, context)) error = errno;
         goto done;
     }
-    if (!error && protected_parent(destination.parent, identity.st_dev)) error = errno;
+    if (!error && operation == CLONING && protected_parent(destination.parent, identity.st_dev, operation)) error = errno;
     if (!error && outside_source(destination.parent, &identity)) error = errno;
     if (!error && (output = open_created_directory(destination.parent, destination.name)) < 0) error = errno;
     /* Keep all children private until the final root-metadata copy. */
     if (!error && clear_acl(output)) error = errno;
     if (!error) {
-        int result = run_tree(input, output, source.parent, source.name, &identity, CLONING,
+        int result = run_tree(input, output, source.parent, source.name, &identity, operation,
                               workers, cancel, context, error_path, capacity);
         input = output = -1;
         if (result) error = errno;
@@ -739,13 +953,21 @@ done:
     errno = error;
     return error ? -1 : 0;
 }
+int stallion_copy(const char *source, const char *destination, unsigned workers,
+                  stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
+    if (__builtin_available(macOS 13.0, *))
+        return clone_impl(source, destination, 0, COPYING, workers, cancel, context, error_path, capacity);
+    path_error(error_path, capacity, destination ? destination : "");
+    errno = ENOTSUP;
+    return -1;
+}
 int stallion_clone(const char *source, const char *destination, unsigned workers,
                    stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
-    return clone_impl(source, destination, 0, workers, cancel, context, error_path, capacity);
+    return clone_impl(source, destination, 0, CLONING, workers, cancel, context, error_path, capacity);
 }
 int stallion_clone_tree(const char *source, const char *destination, unsigned workers,
                         stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
-    return clone_impl(source, destination, 1, workers, cancel, context, error_path, capacity);
+    return clone_impl(source, destination, 1, CLONING, workers, cancel, context, error_path, capacity);
 }
 int stallion_delete(const char *input, int recursive, int missing_ok, unsigned workers,
                     stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {

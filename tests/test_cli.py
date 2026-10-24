@@ -166,7 +166,7 @@ class InstalledCLI(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', '-c', """
 import sys, threading, stallionfs
 from concurrent.futures import ThreadPoolExecutor
-names = ('clone', 'delete', 'mounts', 'move', 'scan')
+names = ('clone', 'copy', 'delete', 'mounts', 'move', 'scan')
 assert stallionfs.__all__ == list(names)
 assert set(names) | {'_scan'} <= set(dir(stallionfs))
 assert not hasattr(stallionfs, 'not_an_export')

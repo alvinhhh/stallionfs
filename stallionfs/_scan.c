@@ -63,7 +63,7 @@ static PyObject *scan_tree(PyObject *self, PyObject *args, PyObject *kwargs) {
     return value;
 }
 
-static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwargs, int tree_only) {
+static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwargs, int operation) {
     (void)self;
     static char *names[] = {"source", "destination", "jobs", NULL};
     PyObject *source, *destination;
@@ -81,7 +81,7 @@ static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwarg
     char error_path[PATH_MAX] = {0};
     int result, error;
     Py_BEGIN_ALLOW_THREADS
-    result = (tree_only ? stallion_clone_tree : stallion_clone)(PyBytes_AS_STRING(source), PyBytes_AS_STRING(destination), jobs,
+    result = (operation == 2 ? stallion_copy : operation == 1 ? stallion_clone_tree : stallion_clone)(PyBytes_AS_STRING(source), PyBytes_AS_STRING(destination), jobs,
                            check_cancel, NULL, error_path, sizeof(error_path));
     error = errno;
     Py_END_ALLOW_THREADS
@@ -93,6 +93,10 @@ static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwarg
 
 static PyObject *clone_path(PyObject *self, PyObject *args, PyObject *kwargs) {
     return clone_operation(self, args, kwargs, 0);
+}
+
+static PyObject *copy_path(PyObject *self, PyObject *args, PyObject *kwargs) {
+    return clone_operation(self, args, kwargs, 2);
 }
 
 static PyObject *clone_tree(PyObject *self, PyObject *args, PyObject *kwargs) {
@@ -205,6 +209,7 @@ static PyObject *private_directory(PyObject *self, PyObject *argument) {
 static PyMethodDef methods[] = {
     {"_private_directory", private_directory, METH_O, "Validate private directory ownership, mode and ACLs without changing them."},
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},
+    {"copy", (PyCFunction)(void(*)(void))copy_path, METH_VARARGS | METH_KEYWORDS, "Copy data and metadata to an exact new path."},
     {"clone", (PyCFunction)(void(*)(void))clone_path, METH_VARARGS | METH_KEYWORDS, "Clone to an exact new path without byte-copy fallback."},
     {"_clone_tree", (PyCFunction)(void(*)(void))clone_tree, METH_VARARGS | METH_KEYWORDS, "Clone a prepared directory; reject root symlinks."},
     {"delete", (PyCFunction)(void(*)(void))delete_path, METH_VARARGS | METH_KEYWORDS, "Delete a path; directories require recursive=True and mounts are refused."},

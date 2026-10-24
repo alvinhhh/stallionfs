@@ -39,6 +39,28 @@ def report():
             'unavailable': [], 'all_metrics_won': False}
 
 
+def copy_report():
+    data = report()
+    data['selection']['operations'] = ['copy']
+    data.update(status='failed', passed=False,
+                error='Operation changed the retained source fixture; preserved for inspection',
+                retained_fixture='/Users/example/work')
+    row = data['rows'][0]
+    row.update(operation='copy', reference='cp', method='cp', exit_code=0, ok=True,
+               argv=['/bin/cp', '-Rp', '/Users/example/work/item', '/Users/example/work/destination'],
+               correctness={'strict_equal': True, 'independent_clone': True,
+                            'sparse_preserved': True, 'candidate_losses': []},
+               source_unchanged=False, source_verification={'unchanged': False, 'strict_equal': False,
+                   'candidate_losses': [{'path': 'item', 'field': 'flags', 'expected': 32768, 'actual': 0}]},
+               error='Source flags changed at /Users/example/work/item',
+               stderr_b64=base64.b64encode(b'/Users/example/work/item: flags changed\n\xff\x00').decode())
+    data['comparisons'] = [{'fixture': 'tiny_4kib', 'operation': 'copy', 'reference': 'cp',
+                           'complete': False, 'metrics': {'wall_s': {'complete_pairs': 0}}}]
+    data['unavailable'] = [{'fixture': 'tiny_4kib', 'operation': 'copy', 'reference': 'cp',
+                            'reason': 'method failed; remaining identical attempts skipped'}]
+    return data
+
+
 def sharing_record():
     attrs = exporter.native_correctness._parse_clone_attributes(
         struct.pack('<I5IQQI', 44, 0x80000000, 0, 0, 0, 0x1300, 123456789012345, 65, 2))
@@ -305,6 +327,32 @@ class ExportNative(unittest.TestCase):
             actual, _ = exporter.redact_report(data, [('/Users/example', 'HOME')])
             self.assertEqual(actual['selection']['fixtures'], [name])
 
+    def test_copy_export_preserves_failed_source_and_partial_comparison_evidence(self):
+        original = copy_report(); frozen = copy.deepcopy(original)
+        actual, _ = exporter.redact_report(original, [('/Users/example', 'HOME')])
+        for key in ('status', 'passed', 'all_metrics_won', 'source_sha256', 'comparisons', 'unavailable'):
+            self.assertEqual(actual[key], frozen[key])
+        row, before = actual['rows'][0], frozen['rows'][0]
+        for key in ('operation', 'reference', 'method', 'wall_s', 'cpu_s', 'rss_bytes', 'validated',
+                    'exit_code', 'ok', 'correctness', 'source_unchanged', 'source_verification'):
+            self.assertEqual(row[key], before[key])
+        self.assertEqual(row['argv'], ['/bin/cp', '-Rp', '${HOME}/work/item', '${HOME}/work/destination'])
+        self.assertEqual(actual['retained_fixture'], '${HOME}/work')
+        self.assertEqual(base64.b64decode(row['stderr_b64']), b'${HOME}/work/item: flags changed\n\xff\x00')
+        self.assertEqual(base64.b64decode(row['stdout_b64']), b'failed ${HOME}/work/item: permission\n\xff\x00')
+        self.assertNotIn('data_stream_sharing', row)
+        self.assertNotIn('/Users/example', json.dumps(actual))
+        self.assertEqual(original, frozen)
+
+    def test_copy_export_rejects_sharing_unknown_operations_and_scan_mixing(self):
+        for change in (lambda d: d['rows'][0].update(data_stream_sharing=sharing()),
+                       lambda d: d['selection'].update(operations=['copy', 'future']),
+                       lambda d: d['selection'].update(operations=['copy', 'scan']),
+                       lambda d: d['selection'].update(fixtures=['scan_flat_20k'])):
+            data = copy_report(); change(data)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                exporter.redact_report(data, [('/Users/example', 'HOME')])
+
     def test_path_boundaries(self):
         data = report()
         data['notes'] = ['/Users/example', '/Users/example/a', '/Users/example-other/a',
@@ -501,7 +549,7 @@ class JournalExportNative(unittest.TestCase):
         return output, writer.manifest_path, writer.journal_path
 
     def test_legacy_and_journal_export_value_parity_and_alias_counts(self):
-        for data in (sharing_report(), scan_report(), scan_report('stallionfs'), dependency_report()):
+        for data in (sharing_report(), copy_report(), scan_report(), scan_report('stallionfs'), dependency_report()):
             with self.subTest(fixture=data['selection']['fixtures']), tempfile.TemporaryDirectory() as folder:
                 data['metadata_preparation'] = [{'fixture':data['selection']['fixtures'][0],
                     'seed':{'acl_command':{'argv':['/Users/example/tool','/Users/example/file'],'exit_code':0}}}]
@@ -522,6 +570,13 @@ class JournalExportNative(unittest.TestCase):
                 self.assertNotIn('original_report_sha256', actual['export'])
                 actual.pop('export'); legacy.pop('export')
                 self.assertEqual(actual, legacy)
+                if data['selection'].get('operations') == ['copy']:
+                    for key in ('status', 'passed', 'all_metrics_won', 'source_sha256', 'comparisons', 'unavailable'):
+                        self.assertEqual(actual[key], data[key])
+                    self.assertEqual(actual['rows'][0]['source_verification'], data['rows'][0]['source_verification'])
+                    self.assertFalse(actual['rows'][0]['source_unchanged'])
+                    self.assertFalse(actual['rows'][0]['validated'])
+                    self.assertNotIn('data_stream_sharing', actual['rows'][0])
                 self.assertFalse(any('earlier' in row for row in actual['rows']))
                 self.assertEqual(original, {path:hashlib.sha256(path.read_bytes()).hexdigest() for path in original})
 

@@ -27,6 +27,15 @@ int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_
                    stallion_cancel_fn cancel, void *context,
                    char *error_path, size_t error_capacity);
 
+/* Ordinary byte copy on macOS 13+, including across volumes that can preserve
+ * the required metadata and sparse ranges. Destination must be absent. Parents
+ * must meet the directory-clone protection rules below. Failures can leave
+ * partial output at the requested destination; workers are joined before return.
+ */
+int stallion_copy(const char *source, const char *destination, unsigned workers,
+                  stallion_cancel_fn cancel, void *context,
+                  char *error_path, size_t error_capacity);
+
 /* Exact destination, which must not exist. Never falls back to byte copying.
  * Workers are joined before return; failures can leave a partial new destination.
  * Directory-clone parents must be owned by the caller or root, non-writable by

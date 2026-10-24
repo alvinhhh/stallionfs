@@ -2,7 +2,7 @@
 
 __version__ = "0.6.3"
 
-__all__ = ["clone", "delete", "mounts", "move", "scan"]
+__all__ = ["clone", "copy", "delete", "mounts", "move", "scan"]
 
 
 def __getattr__(name):
