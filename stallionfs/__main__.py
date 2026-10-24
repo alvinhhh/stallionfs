@@ -17,10 +17,12 @@ def main(argv=None):
     scan = commands.add_parser("scan", help="Count files and logical bytes using bulk metadata reads")
     scan.add_argument("path", help="Directory to scan; symlinks and nested volumes are not followed")
     scan.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
-    clone = commands.add_parser("clone", help="Clone a file or directory to an exact new path")
-    clone.add_argument("source")
-    clone.add_argument("destination")
-    clone.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
+    for action, help_text in (("clone", "Clone a file or directory to an exact new path"),
+                              ("copy", "Copy a file or directory to an exact new path")):
+        command = commands.add_parser(action, help=help_text)
+        command.add_argument("source")
+        command.add_argument("destination")
+        command.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
     delete = commands.add_parser("delete", help="Permanently delete a file or directory without following links")
     delete.add_argument("path")
     delete.add_argument("-r", "--recursive", action="store_true")
@@ -78,7 +80,7 @@ def main(argv=None):
         parser.error("Only prepare accepts a command after --")
     from .core import StallionError, Store
     try:
-        store = None if args.action in {"scan", "clone", "delete", "move", "volumes"} else Store(args.root)
+        store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)
         if args.action == "scan":
             try:
                 from ._scan import scan
@@ -88,7 +90,7 @@ def main(argv=None):
             text = (f"{result['files']} files, {result['directories']} directories, "
                     f"{result['symlinks']} symlinks, {result['other']} other entries\n"
                     f"{result['logical_bytes']} logical bytes; {result['skipped_mounts']} nested volumes skipped")
-        elif args.action in {"clone", "delete", "move", "volumes"}:
+        elif args.action in {"clone", "copy", "delete", "move", "volumes"}:
             from . import _scan
             if args.action == "volumes":
                 result = _scan.mounts()
@@ -99,8 +101,8 @@ def main(argv=None):
                 result, text = {"path": path}, ""
             else:
                 source, destination = args.source, args.destination
-                if args.action == "clone":
-                    _scan.clone(source, destination, jobs=args.jobs)
+                if args.action in {"clone", "copy"}:
+                    getattr(_scan, args.action)(source, destination, jobs=args.jobs)
                 else:
                     _scan.move(source, destination, replace=args.replace, exchange=args.exchange)
                 result, text = {"source": source, "destination": destination}, ""

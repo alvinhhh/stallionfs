@@ -304,7 +304,7 @@ def require_generated(report, *, dependency_runs=None):
         if any(name not in SCAN_FIXTURES for name in names) or selection.get('operations') != ['scan']:
             raise ValueError('Scan export requires only existing scan fixtures and the scan operation')
     elif 'operations' in selection and (not isinstance(selection['operations'], list)
-            or any(operation not in ('clone', 'move', 'delete') for operation in selection['operations'])):
+            or any(operation not in ('clone', 'copy', 'move', 'delete') for operation in selection['operations'])):
         raise ValueError('Unknown operation export policy')
     sources = report.get('source_sha256')
     if not isinstance(sources, dict) or not re.fullmatch('[0-9a-f]{64}', str(sources.get('native_suite.py', ''))):

@@ -15,7 +15,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int mode;
+static int mode, copying;
+static atomic_int copied_inodes;
 static atomic_int clears, restores, links, metadata_calls;
 static pthread_t caller;
 static int cancel_after_metadata(void *context) {
@@ -24,7 +25,11 @@ static int cancel_after_metadata(void *context) {
 }
 int stallion_test_fcopyfile(int from,int to,copyfile_state_t state,copyfile_flags_t flags) {
     int result=fcopyfile(from,to,state,flags);
-    if(!result) metadata_calls++;
+    if(!result) {
+        struct stat info; assert(fstat(from,&info)==0);
+        if(!copying || S_ISDIR(info.st_mode)) metadata_calls++;
+        if(copying && !S_ISDIR(info.st_mode)) copied_inodes++;
+    }
     return result;
 }
 static struct stat source_identity;
@@ -69,7 +74,7 @@ int stallion_test_openat(int parent,const char *name,int flags,...) {
     if(flags & O_CREAT) { va_list args; va_start(args,flags); permissions=(mode_t)va_arg(args,int); va_end(args); }
     int fd=openat(parent,name,flags,permissions);
     struct stat info;
-    if(fd>=0 && mode>=7 && mode<=9 && fstat(fd,&info)==0 && (S_ISREG(info.st_mode)||S_ISLNK(info.st_mode)) &&
+    if(fd>=0 && (!copying || copied_inodes) && mode>=7 && mode<=9 && fstat(fd,&info)==0 && (S_ISREG(info.st_mode)||S_ISLNK(info.st_mode)) &&
        !(info.st_dev==source_identity.st_dev && info.st_ino==source_identity.st_ino)) {
         assert(close(fd)==0);
         if(mode==8) replace_leaf(parent,name);
@@ -104,7 +109,9 @@ static void clear_owned(const char *path, int symlink) {
 int main(int argc, char **argv) {
     assert(argc==2);
     unsigned sequence=0;
-    for(int symlink=0;symlink<2;symlink++) for(int append=0;append<2;append++)
+    int operations=1;
+    if (__builtin_available(macOS 13.0, *)) operations=2;
+    for(copying=0;copying<operations;copying++) for(int symlink=0;symlink<2;symlink++) for(int append=0;append<2;append++)
     for(unsigned workers=1;workers<=4;workers+=3) for(mode=0;mode<11;mode++) {
         char source[PATH_MAX],target[PATH_MAX],a[PATH_MAX],b[PATH_MAX],first[PATH_MAX],second[PATH_MAX],error_path[PATH_MAX];
         assert(snprintf(source,sizeof(source),"%s/hardlink-source-%u",argv[1],sequence)<(int)sizeof(source));
@@ -121,8 +128,8 @@ int main(int argc, char **argv) {
         unsigned flags=append?UF_APPEND:UF_IMMUTABLE;
         assert(fchflags(fd,flags)==0); struct stat original,after; assert(fstat(fd,&original)==0); assert(close(fd)==0);
         source_identity=original;
-        int descriptors=descriptor_count(); clears=restores=links=metadata_calls=0; caller=pthread_self();
-        int result=stallion_clone(source,target,workers,cancel_after_metadata,NULL,error_path,sizeof(error_path)); int error=errno;
+        int descriptors=descriptor_count(); clears=restores=links=metadata_calls=copied_inodes=0; caller=pthread_self();
+        int result=(copying?stallion_copy:stallion_clone)(source,target,workers,cancel_after_metadata,NULL,error_path,sizeof(error_path)); int error=errno;
         assert(descriptor_count()==descriptors);
         assert(lstat(first,&after)==0 && after.st_ino==original.st_ino && after.st_flags==flags && after.st_nlink==2);
         if(mode==0 || mode==7) { assert(result==0 && clears==1 && restores==1 && links==1); }
