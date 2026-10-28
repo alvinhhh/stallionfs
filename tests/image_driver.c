@@ -174,6 +174,7 @@ int sfs_test_fstatat(int fd, const char *name, struct stat *st, int flags) {
     if (!rc && is("identity") && fulls >= 3) { st->st_ino++; hit++; }
     return rc;
 }
+int sfs_test_fstatfs(int fd, struct statfs *st) __DARWIN_INODE64(sfs_test_fstatfs);
 int sfs_test_fstatfs(int fd, struct statfs *st) {
     int rc = fstatfs(fd, st);
     if (!rc && is("unsupported")) { strcpy(st->f_fstypename, "not-apfs"); hit++; }
