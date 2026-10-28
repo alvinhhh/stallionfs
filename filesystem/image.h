@@ -88,6 +88,10 @@ enum sfs_status sfs_image_create(const char *directory, const char *name,
                                uint64_t capacity, sfs_image **out, sfs_result *result);
 enum sfs_status sfs_image_open(const char *directory, const char *name,
                              sfs_image **out, sfs_result *result);
+/* Normal admission with O_RDONLY: selected ROOT_ONLY, no recovery fallback.
+ * Mutations return STATE; fatal reads poison this ordinary handle. */
+enum sfs_status sfs_image_open_readonly(const char *directory, const char *name,
+                                      sfs_image **out, sfs_result *result);
 /* Inspection is read-only, never selects a candidate implicitly. */
 enum sfs_status sfs_image_inspect(const char *directory, const char *name,
                                 sfs_image **out, sfs_recovery *recovery,
@@ -124,5 +128,14 @@ enum sfs_status sfs_image_read(sfs_image *, sfs_view, sfs_inode, uint64_t offset
 /* At end, returns OK with *found=0. Returns one entry, never an allocated list. */
 enum sfs_status sfs_image_next(sfs_image *, sfs_view, sfs_inode parent,
                              sfs_cookie *, sfs_entry *, int *found, sfs_result *);
+/* Reconstruct a next cookie after a canonical child in the explicit view.
+ * Bind to the successful open/select generation and commit-root digest.
+ * Callers retain image/view identity. Failure leaves nonnull out unchanged;
+ * success reports TOUCHED, including after the directory's last child. */
+enum sfs_status sfs_image_resume_after(sfs_image *image, sfs_view view,
+                                     uint64_t expected_generation,
+                                     const uint8_t expected_root_digest[32],
+                                     sfs_inode parent, sfs_inode previous,
+                                     sfs_cookie *out, sfs_result *result);
 
 #endif

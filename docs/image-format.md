@@ -9,7 +9,8 @@ The backing object must be a current-user-owned, single-link regular file with
 private permission bits on local writable APFS. The containing directory must be
 owned by that user with mode 0700 permission bits. The final pathname component
 is opened without following symlinks; creation is exclusive, requests mode 0600,
-and never removes a failed image. Each handle, including read-only inspection,
+and never removes a failed image. Each handle, including ordinary read-only open
+and recovery inspection,
 keeps a nonblocking exclusive advisory lock on one pinned image descriptor until
 checked close. Identity, filesystem, permissions and actual EOF are checked.
 Locks coordinate cooperating callers; hashes do not authenticate an image against
@@ -37,7 +38,7 @@ start at 2, increase monotonically and are never reused. Directories and regular
 files are the only inode kinds. Holes below logical EOF read as zero.
 
 The current namespace counter cannot be below a snapshot namespace counter.
-Writable admission and publication also check the predecessor namespace counter.
+Ordinary admission and writable publication also check the predecessor namespace counter.
 These are consistency checks, not authentication against a rewritten history.
 
 ## References, envelopes and raw cells
@@ -166,19 +167,40 @@ Creation writes the empty namespace and root, finalizes the slot bytes, performs
 parent directory, then performs a final image `F_FULLFSYNC`. It checks the pinned
 parent and named image identities before acknowledging. Initial EOF is 16384.
 
-A normal writable open requires two coherent slots with equal UUID and capacity.
+A normal open, writable or read-only, requires two coherent slots with equal UUID and capacity.
 Equal generations are allowed only for identical generation-1 slots. Otherwise
 the generations are consecutive, ends increase, and the newest generation's
 parity equals its slot index. A slot failure or incoherent pair requires explicit
 read-only recovery inspection; opening never initializes or repairs an image.
 
-On an existing writable handle, verify and commit preserve a slot-read failure as
+On an existing ordinary handle, verify (and writable commit) preserves a slot-read failure as
 `SFS_IO` in the read phase, with the first slot's saved errno when both fail.
 Unsupported-format status retains precedence. These failures poison the handle
 and discard its transaction. A later budget or cancellation stop cannot hide an
 already observed fatal slot failure. Without such a failure, a controlled stop
 returns `SFS_INCOMPLETE` and preserves the otherwise unchanged transaction.
 Initial-open and read-only recovery policies remain as described above.
+
+`sfs_image_open_readonly` uses `O_RDONLY` with the same no-follow, close-on-exec,
+nonblocking descriptor and exclusive lifetime lock as normal writable open. It
+selects the newest coherent anchor and returns `ROOT_ONLY`; it performs no full
+scan, auxiliary work, image write/truncate/barrier, repair or recovery fallback.
+The existing owned/private/single-link and local writable APFS admission rules
+still apply. With nonnull `out`, every failure leaves `*out` NULL. Initial slot
+I/O or pair failure remains `RECOVERY_REQUIRED` with saved slot errno; unsupported
+format takes precedence. Load, identity and cleanup failures retain normal-open
+status/phase/errno rules. A failed close still consumes its handle exactly once.
+
+Healthy ordinary read-only handles reject all transactions and mutations with
+`STATE`, phase NONE and errno 0. Select accepts only recovery handles and returns
+`INVALID` for either ordinary policy, including poisoned handles. Other
+ready-guarded calls return `POISONED` before argument/transaction errors once an
+ordinary handle has suffered a fatal I/O, integrity, unsupported-format or
+reconciliation failure. Explicit verify freshly requires the valid pair and same
+latest anchor; it does not fall back to an older still-present slot. Recovery
+inspection/selection retains its separate nonpoisoning policy. Ordinary reads
+use existing touched-path and stable-descriptor checks, not a fresh slot scan
+per call. Explicit full verification may write only its bounded auxiliary state.
 
 Commit freshly reconciles slots and the current root, refusing an unexpected
 anchor rather than rebasing. It seals pending children, indexes and namespace,
@@ -305,8 +327,8 @@ returns `SFS_INCOMPLETE`, its reason, errno 0 and no full coverage. Allocation
 failure remains `SFS_NOMEM`. Actual auxiliary ENOSPC is `SFS_IO`, real errno
 `ENOSPC`, and `SFS_PHASE_VERIFY_AUX`; it is neither corruption nor a budget stop.
 The first failure survives auxiliary cleanup. A controlled explicit verification
-stop retains an otherwise unchanged active transaction; writable I/O/integrity
-failure discards it and poisons the handle.
+stop retains an otherwise unchanged active transaction; ordinary-handle
+I/O/integrity failure discards any transaction and poisons the handle.
 
 Directory iteration returns one entry at a time through a zero-initialized opaque
 1088-byte cookie. It binds namespace digest[32], parent u64 at 32, depth u32 at
@@ -317,6 +339,36 @@ Each path is checked again from the bound name root. Changed namespace returns
 state failure; malformed or wrong-parent cookies are invalid. Cookies contain no
 process pointers. Reads report only a verified prefix in `read_count` if a later
 cell fails, and do not copy unverified bytes.
+
+`sfs_image_resume_after(image, view, expected_generation, expected_root_digest,
+parent, previous, out, result)` reconstructs that same cookie after a canonical
+child. It checks readiness first, then requires nonnull output/digest, nonzero
+generation and a previous inode greater than root. Invalid arguments return
+`INVALID`; generation or commit-root digest mismatch returns `STATE` before I/O.
+Use the generation and root digest from the successful open or select receipt,
+not a namespace digest. The digest distinguishes independently valid recovery
+roots with the same generation. These are consistency checks, not authentication.
+
+Resume resolves the explicit committed view, validates the parent directory and
+canonical previous inode, seeks the raw `(parent, name)` key and consumes exactly
+the matching name row. Missing view or previous inode is `NOT_FOUND`; invalid,
+missing or nondirectory parent, or a child belonging to another directory, is
+`INVALID`. A missing or inconsistent canonical name mapping is `CORRUPT`. It
+uses a fixed number of indexed paths bounded by height 16 and page fanout, no
+directory-prefix scan or raw data reads. It does not consume the successor.
+Resuming after the last child succeeds; subsequent `next` reports found=0.
+
+On every failure a nonnull output cookie remains byte-for-byte unchanged. Success
+publishes a locally completed cookie with canonical padding and `TOUCHED`
+coverage/errno 0, never FULL. Late failures retain existing phase/errno and
+ordinary-versus-recovery poison rules. No budget or cancellation interface is
+added. The output remains bound to the namespace and parent for `next`; no cookie
+format changes. Active transactions expose only committed membership. Any new
+committed generation invalidates the old resume receipt even for an unchanged
+snapshot; reopening an unchanged image permits reconstruction with its fresh
+receipt. Callers retain image/volume identity and original view/verifier binding
+and serialize access. Passing another explicit view requests that view; this
+helper proves membership, not that the caller previously emitted the inode.
 
 This representation removes the earlier fixed small-file/namespace design caps.
 It does not establish target-scale performance, CPU/RSS wins, recovery under real

@@ -139,6 +139,12 @@ class ImageCore(unittest.TestCase):
     def test_exact_capacity_pre_seal_discard_and_abandoned_tail(self):
         self.scenario('capacity')
 
+    def test_ordinary_readonly_admission_policy_poison_and_budgets(self):
+        self.scenario('readonly')
+
+    def test_stateless_resume_context_output_atomicity_and_bounded_seek(self):
+        self.scenario('resume')
+
 
 class ImageDiagnostics(unittest.TestCase):
     def test_timeout_preserves_partial_output_and_reraises(self):

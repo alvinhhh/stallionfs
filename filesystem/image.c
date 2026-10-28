@@ -38,8 +38,10 @@ typedef struct { cache_entry entries[CACHE_COUNT]; uint64_t clock; unsigned coun
 typedef struct arena arena;
 typedef struct tree tree;
 typedef struct batch batch;
+enum image_policy { ORDINARY_WRITABLE, ORDINARY_READONLY, RECOVERY };
 struct sfs_image {
-    int fd, aux_parent, readonly, selected, poisoned, transaction;
+    int fd, aux_parent, selected, poisoned, transaction;
+    enum image_policy policy;
     struct stat identity, parent_identity;
     uint64_t eof, epoch, token;
     anchor current, slots[2]; enum sfs_status slot_status[2]; int slot_error[2], slot_observed[2];
@@ -81,10 +83,10 @@ static enum sfs_status result(sfs_image *h, enum sfs_status status, enum sfs_pha
 static enum sfs_status ready(sfs_image *h, int writing, int tx, sfs_result *r) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, r);
     if (h->poisoned) return result(h, SFS_POISONED, h->phase, 0, r);
-    if (!h->selected || (writing && h->readonly) || (tx && !h->transaction)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r); return SFS_OK;
+    if (!h->selected || (writing && h->policy != ORDINARY_WRITABLE) || (tx && !h->transaction)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r); return SFS_OK;
 }
 static enum sfs_status read_result(sfs_image *h, enum sfs_status code, enum sfs_phase phase, int error, sfs_result *r) {
-    if (h && !h->readonly && (code == SFS_IO || code == SFS_CORRUPT || code == SFS_RECOVERY_REQUIRED || code == SFS_UNSUPPORTED)) { h->poisoned = 1; h->phase = phase; discard(h); }
+    if (h && h->policy != RECOVERY && (code == SFS_IO || code == SFS_CORRUPT || code == SFS_RECOVERY_REQUIRED || code == SFS_UNSUPPORTED)) { h->poisoned = 1; h->phase = phase; discard(h); }
     return result(h, code, phase, error, r);
 }
 static int read_exact(int fd, void *buffer, size_t n, uint64_t at) {
@@ -119,7 +121,7 @@ static int stable(sfs_image *h) {
     if (!same_identity(&st, &h->identity) || (uint64_t)st.st_size != h->eof) { errno = ESTALE; return -1; }
     return 0;
 }
-static enum sfs_status access_image(const char *directory, const char *name, int creating, int readonly,
+static enum sfs_status access_image(const char *directory, const char *name, int creating, enum image_policy policy,
                                   sfs_image **out, int *parent, sfs_result *r) {
     *out = NULL; *parent = -1;
     if (!directory || !component(name)) return result(NULL, SFS_INVALID, SFS_PHASE_PARENT, 0, r);
@@ -131,13 +133,13 @@ static enum sfs_status access_image(const char *directory, const char *name, int
     if (!S_ISDIR(ps.st_mode) || ps.st_uid != geteuid() || (ps.st_mode & 0077) || (ps.st_mode & 0700) != 0700) { errno = EINVAL; code = SFS_INVALID; goto fail; }
     if (backing(p, &pf)) { code = errno == ENOTSUP ? SFS_UNSUPPORTED : SFS_IO; goto fail; }
     phase = creating ? SFS_PHASE_CREATE : SFS_PHASE_VALIDATE;
-    int flags = (readonly ? O_RDONLY : O_RDWR) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
+    int flags = (policy == ORDINARY_WRITABLE ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
     if (creating) flags |= O_CREAT | O_EXCL;
     int fd = openat(p, name, flags, 0600);
     if (fd < 0) { code = errno == EEXIST ? SFS_EXISTS : (errno == ELOOP ? SFS_INVALID : SFS_IO); goto fail; }
     sfs_image *h = calloc(1, sizeof(*h));
     if (!h) { error = ENOMEM; code = SFS_NOMEM; if (close(fd)) error = errno; goto fail_saved; }
-    h->fd = fd; h->aux_parent = -1; h->readonly = readonly; h->parent_identity = ps;
+    h->fd = fd; h->aux_parent = -1; h->policy = policy; h->parent_identity = ps;
     phase = SFS_PHASE_LOCK;
     if (flock(fd, LOCK_EX | LOCK_NB)) { code = errno == EWOULDBLOCK ? SFS_BUSY : SFS_IO; goto fail_handle; }
     phase = SFS_PHASE_VALIDATE;
@@ -728,13 +730,13 @@ static enum sfs_status reconcile(reader *r, state *fresh) {
     anchor a[2] = {0}; enum sfs_status code[2] = { SFS_INCOMPLETE, SFS_INCOMPLETE }; int errors[2] = {0};
     for (unsigned i = 0; i < 2; ++i) { code[i] = decode_slot(r, i, &a[i]); errors[i] = code[i] == SFS_IO ? r->error : 0; if (code[i] == SFS_INCOMPLETE) break; }
     /* A controlled stop cannot erase a fatal slot failure already observed. */
-    if (!r->h->readonly) {
+    if (r->h->policy != RECOVERY) {
         if (code[0] == SFS_UNSUPPORTED || code[1] == SFS_UNSUPPORTED) return SFS_UNSUPPORTED;
         if (code[0] == SFS_IO || code[1] == SFS_IO) { r->error = errors[0] ? errors[0] : errors[1]; r->phase = SFS_PHASE_READ; return SFS_IO; }
         if ((code[0] && code[0] != SFS_INCOMPLETE) || (code[1] && code[1] != SFS_INCOMPLETE)) return SFS_RECOVERY_REQUIRED;
     }
     if (code[0] == SFS_INCOMPLETE || code[1] == SFS_INCOMPLETE) return SFS_INCOMPLETE;
-    if (!r->h->readonly) {
+    if (r->h->policy != RECOVERY) {
         if (!pair_valid(a)) return SFS_RECOVERY_REQUIRED;
         unsigned i = a[0].generation > a[1].generation ? 0 : 1; if (!same_anchor(&a[i], &r->h->current)) return SFS_CORRUPT;
         enum sfs_status e = load_state(r, fresh); if (!e && a[1 - i].generation < a[i].generation) e = predecessor_counter(r, &a[1 - i], fresh->ns.next_inode); return e;
@@ -760,7 +762,7 @@ static enum sfs_status close_failed(sfs_image *h, int parent, enum sfs_status co
 enum sfs_status sfs_image_create(const char *directory, const char *name, uint64_t capacity, sfs_image **out, sfs_result *r) {
     if (!out) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, r); *out = NULL;
     if (capacity < 16384 || capacity % CELL || capacity > SFS_IMAGE_MAX || capacity > (uint64_t)INT64_MAX) return result(NULL, SFS_INVALID, SFS_PHASE_ADMISSION, 0, r);
-    sfs_image *h; int parent; enum sfs_status code = access_image(directory, name, 1, 0, &h, &parent, r); if (code) return code;
+    sfs_image *h; int parent; enum sfs_status code = access_image(directory, name, 1, ORDINARY_WRITABLE, &h, &parent, r); if (code) return code;
     h->current.capacity = capacity; h->live.ns.next_inode = 2; arc4random_buf(h->current.uuid, 16); if (zero(h->current.uuid, 16)) h->current.uuid[0] = 1;
     anchor next = h->current; next.generation = 1; uint64_t remaining = 2; enum sfs_phase phase = SFS_PHASE_RECORDS; int published = 0;
     code = write_namespace(h, &h->live.ns, &remaining); if (code) goto failed;
@@ -782,9 +784,10 @@ enum sfs_status sfs_image_create(const char *directory, const char *name, uint64
 io_failed: code = SFS_IO;
 failed: return close_failed(h, parent, published ? SFS_OUTCOME_UNKNOWN : code, phase, code == SFS_IO ? errno : 0, r);
 }
-static enum sfs_status open_common(const char *directory, const char *name, int inspection, sfs_image **out, sfs_recovery *report, const sfs_verify_budget *budget, sfs_result *result_out) {
+static enum sfs_status open_common(const char *directory, const char *name, enum image_policy policy, sfs_image **out, sfs_recovery *report, const sfs_verify_budget *budget, sfs_result *result_out) {
+    int inspection = policy == RECOVERY;
     if (!out || (inspection && (!report || !valid_budget(budget)))) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *out = NULL;
-    sfs_image *h; int parent; enum sfs_status e = access_image(directory, name, 0, inspection, &h, &parent, result_out); if (e) return e;
+    sfs_image *h; int parent; enum sfs_status e = access_image(directory, name, 0, policy, &h, &parent, result_out); if (e) return e;
     if (close(parent)) return close_failed(h, -1, SFS_IO, SFS_PHASE_CLOSE, errno, result_out);
     sfs_verify_budget remaining; if (inspection) remaining = *budget;
     reader r = current_reader(h, 0); if (inspection) r.budget = &remaining; enum sfs_incomplete_reason slot_incomplete[2] = {0};
@@ -810,10 +813,11 @@ static enum sfs_status open_common(const char *directory, const char *name, int 
     if (!usable) { e = close_failed(h, -1, incomplete ? SFS_INCOMPLETE : SFS_RECOVERY_REQUIRED, SFS_PHASE_READ, incomplete ? 0 : h->slot_error[0] ? h->slot_error[0] : h->slot_error[1], result_out); if (result_out && e == SFS_INCOMPLETE) result_out->incomplete_reason = incomplete; return e; }
     *out = h; return result(h, SFS_OK, SFS_PHASE_READ, 0, result_out);
 }
-enum sfs_status sfs_image_open(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, 0, out, NULL, NULL, r); }
-enum sfs_status sfs_image_inspect(const char *directory, const char *name, sfs_image **out, sfs_recovery *report, const sfs_verify_budget *budget, sfs_result *r) { return open_common(directory, name, 1, out, report, budget, r); }
+enum sfs_status sfs_image_open(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_WRITABLE, out, NULL, NULL, r); }
+enum sfs_status sfs_image_open_readonly(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_READONLY, out, NULL, NULL, r); }
+enum sfs_status sfs_image_inspect(const char *directory, const char *name, sfs_image **out, sfs_recovery *report, const sfs_verify_budget *budget, sfs_result *r) { return open_common(directory, name, RECOVERY, out, report, budget, r); }
 enum sfs_status sfs_image_select(sfs_image *h, unsigned slot, const sfs_verify_budget *budget, sfs_result *out) {
-    if (!h || !h->readonly || slot > 1 || !valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    if (!h || h->policy != RECOVERY || slot > 1 || !valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
     if (h->slot_status[slot] && h->slot_status[slot] != SFS_INCOMPLETE) return result(h, h->slot_status[slot], SFS_PHASE_READ, h->slot_error[slot], out);
     if (stable(h)) return result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
     sfs_verify_budget remaining = *budget; reader r = current_reader(h, 0); r.budget = &remaining; anchor fresh = {0}; cache_clear(h);
@@ -1224,6 +1228,24 @@ static enum sfs_status cookie_cursor(reader *r, const namespace *ns, uint64_t pa
 static void save_cookie(sfs_cookie *cookie, const namespace *ns, uint64_t parent, const cursor *c) {
     uint8_t *b = cookie->bytes; memset(b, 0, sizeof(cookie->bytes)); memcpy(b, ns->ref.digest, 32); put64(b + 32, parent); put32(b + 40, c->depth); put32(b + 44, c->depth ? 1 : 3);
     for (unsigned i = 0; i < c->depth; ++i) { uint8_t *v = b + 48 + i * 64; encode_ref(v, &c->frames[i].ref); put16(v + 56, c->frames[i].index); put16(v + 58, c->frames[i].context.level); }
+}
+enum sfs_status sfs_image_resume_after(sfs_image *h, sfs_view view, uint64_t expected_generation,
+                                     const uint8_t expected_root_digest[32], sfs_inode parent,
+                                     sfs_inode previous, sfs_cookie *out, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+    if (!out || !expected_root_digest || !expected_generation || previous <= SFS_ROOT_INODE) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    reader r = current_reader(h, 0); namespace ns; node n; cursor c; uint8_t row[352]; int found = 0;
+    e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent);
+    if (!e) e = node_get(&r, &ns, previous, 1, &n);
+    if (!e && n.e.parent != parent) e = SFS_INVALID;
+    if (!e) { key k = name_key(parent, n.e.name, n.e.name_length); e = cursor_start(&c, &r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &k); }
+    if (!e) e = cursor_next(&c, row, &found);
+    if (!e && (!found || get64(row) != parent || get32(row + 8) != n.e.name_length || memcmp(row + 12, n.e.name, n.e.name_length) || get64(row + 267) != previous)) e = SFS_CORRUPT;
+    /* Publish only the checked position; leave successor validation to next. */
+    if (!e) { sfs_cookie cookie; save_cookie(&cookie, &ns, parent, &c); memcpy(out, &cookie, sizeof(cookie)); }
+    return touched_result(&r, e, result_out);
 }
 enum sfs_status sfs_image_next(sfs_image *h, sfs_view view, sfs_inode parent, sfs_cookie *cookie, sfs_entry *out, int *found, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!cookie || !out || !found) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *found = 0;
