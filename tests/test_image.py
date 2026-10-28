@@ -36,10 +36,16 @@ class ImageCore(unittest.TestCase):
             return cls.executables[name]
         obj, exe = cls.base / f'{name}.o', cls.base / name
         replacements = ('pread', 'pwrite', 'fcntl', 'fsync', 'flock', 'close',
-                        'openat', 'fstat', 'fstatat', 'fstatfs')
+                        'openat', 'fstat', 'fstatat', 'fstatfs', 'mkdirat', 'unlinkat',
+                        'ftruncate', 'malloc', 'calloc', 'free',
+                        'CC_SHA256_Init', 'CC_SHA256_Update', 'CC_SHA256_Final')
+        shim = cls.base / 'image-copy-hook.h'
+        shim.write_text('#include <string.h>\n'
+                        'void *sfs_test_memcpy(void *, const void *, size_t);\n'
+                        '#undef memcpy\n#define memcpy sfs_test_memcpy\n')
         commands = [
             [*cls.common, *defines, *(f'-D{n}=sfs_test_{n}' for n in replacements),
-             '-c', str(cls.source / 'filesystem/image.c'), '-o', str(obj)],
+             '-include', str(shim), '-c', str(cls.source / 'filesystem/image.c'), '-o', str(obj)],
             [*cls.common, *defines, str(cls.source / 'tests/image_driver.c'), str(obj), '-o', str(exe)],
         ]
         for index, command in enumerate(commands):
@@ -47,6 +53,12 @@ class ImageCore(unittest.TestCase):
             (cls.base / f'{name}-compile-{index}.txt').write_text(result.stdout + result.stderr)
             if result.returncode:
                 raise AssertionError(f'Image compilation failed; retained {cls.base}\n{result.stderr}')
+            if index == 0:
+                symbols = subprocess.run(['/usr/bin/nm', '-u', str(obj)], capture_output=True,
+                                         text=True, timeout=60)
+                (cls.base / f'{name}-symbols.txt').write_text(symbols.stdout + symbols.stderr)
+                if symbols.returncode or '_sfs_test_memcpy' not in symbols.stdout.split():
+                    raise AssertionError(f'Image copy hook absent; retained {cls.base}')
         cls.executables[name] = exe
         return exe
 
@@ -108,17 +120,24 @@ class ImageCore(unittest.TestCase):
         self.scenario('parser')
 
     def test_admission_file_entry_snapshot_name_and_generation_limits(self):
-        self.scenario('limits')
-
-    def test_independent_metadata_and_physical_tail_capacity(self):
         try:
-            self.compile('metadata', '-DSFS_METADATA_MAX=512')
-            self.compile('capacity', '-DSFS_IMAGE_MAX=UINT64_C(131072)')
-            self.scenario('metadata', 'metadata')
-            self.scenario('capacity', 'capacity')
+            self.compile('limits', '-DSFS_FILE_MAX=UINT64_C(4194304)', '-DSFS_ENTRY_MAX=1024u')
+            self.scenario('limits', 'limits')
         except BaseException:
             type(self).failed = True
             raise
+
+    def test_recursive_indexes_split_borrow_merge_and_cookie_context(self):
+        self.scenario('indexes')
+
+    def test_streamed_partial_ranges_forced_seal_truncate_and_regrow(self):
+        self.scenario('ranges')
+
+    def test_full_budgets_cancellation_auxiliary_errors_and_cleanup(self):
+        self.scenario('budgets')
+
+    def test_exact_capacity_pre_seal_discard_and_abandoned_tail(self):
+        self.scenario('capacity')
 
 
 class ImageDiagnostics(unittest.TestCase):
