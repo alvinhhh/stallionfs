@@ -19,12 +19,14 @@ APFS copy-on-write shares unchanged data on disk. Each workspace has its own Git
 
 ## Usage
 
+Use `sfs`; `stallionfs` remains available.
+
 ```sh
-stallionfs copy source destination
-stallionfs clone project project-copy
-stallionfs move project-copy old-project
-stallionfs delete --recursive old-project
-stallionfs volumes
+sfs copy source destination
+sfs clone project project-copy
+sfs move project-copy old-project
+sfs delete --recursive old-project
+sfs volumes
 ```
 
 Destinations are exact paths. Copies, clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with copying, cloning, deletion or scanning for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
@@ -32,8 +34,8 @@ Destinations are exact paths. Copies, clones and moves refuse to overwrite exist
 Prepare a clean checkout, then start working in a copy:
 
 ```sh
-seed=$(stallionfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
-workspace=$(stallionfs create "$seed" --name fix-parser)
+seed=$(sfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
+workspace=$(sfs create "$seed" --name fix-parser)
 cd "$workspace"
 ```
 
@@ -44,8 +46,8 @@ The command after `--` runs once during preparation. Change `--key` when you cha
 To count files and their total logical size:
 
 ```sh
-stallionfs scan /path/to/folder
-stallionfs --json scan /path/to/folder
+sfs scan /path/to/folder
+sfs --json scan /path/to/folder
 ```
 
 The scanner counts symlinks without following them and skips nested volumes.
@@ -53,11 +55,11 @@ The scanner counts symlinks without following them and skips nested volumes.
 Leave the workspace and stop processes using it before removal. To remove, restore, or clear old trash:
 
 ```sh
-stallionfs list
-stallionfs remove WORKSPACE_ID
-stallionfs restore WORKSPACE_ID
-stallionfs gc                 # Preview trash older than 24 hours
-stallionfs gc --yes           # Delete that trash
+sfs list
+sfs remove WORKSPACE_ID
+sfs restore WORKSPACE_ID
+sfs gc                 # Preview trash older than 24 hours
+sfs gc --yes           # Delete that trash
 ```
 
 Files are stored in `~/Library/Application Support/stallionfs`. Set `STALLIONFS_HOME` or pass `--root` to use another location. Use `--json` before the command name for structured output.

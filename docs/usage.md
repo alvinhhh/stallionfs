@@ -3,16 +3,16 @@
 ## File operations
 
 ```sh
-stallionfs copy source destination
-stallionfs clone source destination
-stallionfs clone source destination --jobs 1
-stallionfs move source destination
-stallionfs move source destination --replace
-stallionfs move first second --exchange
-stallionfs delete file
-stallionfs delete --recursive folder
-stallionfs delete --missing-ok file
-stallionfs volumes
+sfs copy source destination
+sfs clone source destination
+sfs clone source destination --jobs 1
+sfs move source destination
+sfs move source destination --replace
+sfs move first second --exchange
+sfs delete file
+sfs delete --recursive folder
+sfs delete --missing-ok file
+sfs volumes
 ```
 
 `copy` copies file data and metadata to an exact new path, using ordinary data copying without requesting APFS cloning. It requires macOS 13 or later. Regular files, directories and symlinks are supported; symlink targets are not followed. Internal regular-file and symlink hardlinks share new destination inodes, independent of the source. Existing destinations, special files, nested source volumes and destinations inside the source are rejected.
@@ -49,9 +49,9 @@ print(mounts())
 ## Scan a folder
 
 ```sh
-stallionfs scan /path/to/folder
-stallionfs --json scan /path/to/folder
-stallionfs scan --jobs 1 /path/to/folder
+sfs scan /path/to/folder
+sfs --json scan /path/to/folder
+sfs scan --jobs 1 /path/to/folder
 ```
 
 `scan` uses `getattrlistbulk` to count regular files, subdirectories, symlinks, other entries, and regular-file logical bytes. It reads metadata, leaves files unchanged, and does not create a workspace store. Symlinks inside the tree are not followed. Nested volumes are skipped and counted in `skipped_mounts`.
@@ -65,9 +65,9 @@ This accelerates the scan command. Other applications continue using their own f
 ## Prepare a seed
 
 ```sh
-stallionfs prepare /path/to/project --key node22-npm10-v1 -- npm ci
-stallionfs prepare /path/to/project --ref release-branch --key node22-pnpm10-v1 -- pnpm install --frozen-lockfile
-stallionfs prepare /path/to/project --key source-only-v1
+sfs prepare /path/to/project --key node22-npm10-v1 -- npm ci
+sfs prepare /path/to/project --ref release-branch --key node22-pnpm10-v1 -- pnpm install --frozen-lockfile
+sfs prepare /path/to/project --key source-only-v1
 ```
 
 The source must be a clean Git checkout. Ignored local files such as `.env` and `node_modules` are not copied from it. Preparation clones the selected commit, runs the command after `--`, and saves the result. That command runs with your permissions and environment; use it only on code you trust.
@@ -83,8 +83,8 @@ Git hooks from the source are not copied. Global Git filters and explicitly requ
 For large dependency trees, prepare an APFS image:
 
 ```sh
-seed=$(stallionfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
-workspace=$(stallionfs create "$seed")
+seed=$(sfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
+workspace=$(sfs create "$seed")
 cd "$workspace"
 ```
 
@@ -92,7 +92,7 @@ cd "$workspace"
 
 These volumes have Spotlight indexing disabled. File permissions and ownership remain enabled.
 
-Images require macOS 26 or later. After restarting the Mac, run `stallionfs mount WORKSPACE_ID` to mount a workspace again. `stallionfs unmount WORKSPACE_ID` releases its mount without moving it to trash. Stop processes using the volume before unmounting; stallionfs never forces an unmount.
+Images require macOS 26 or later. After restarting the Mac, run `sfs mount WORKSPACE_ID` to mount a workspace again. `sfs unmount WORKSPACE_ID` releases its mount without moving it to trash. Stop processes using the volume before unmounting; stallionfs never forces an unmount.
 
 Image creation and file I/O are separate workloads. Use the [I/O comparison](../tests/perf/README.md#file-io-inside-a-workspace) to measure your workload before choosing images over folders.
 
@@ -101,7 +101,7 @@ Preparing the image takes longer than preparing an ordinary folder. Small source
 ## Start an agent
 
 ```sh
-workspace=$(stallionfs create "$seed" --name parser)
+workspace=$(sfs create "$seed" --name parser)
 cd "$workspace"
 codex
 # or run claude, opencode, your editor, or a shell here
@@ -110,7 +110,7 @@ codex
 Use `--json` before the command for automation:
 
 ```sh
-stallionfs --json create "$seed" --name parser
+sfs --json create "$seed" --name parser
 ```
 
 The result contains `id`, `path`, `branch`, `seed`, `commit` and `created`. The branch is `stallionfs/<name>-<unique-id>`. Stdout contains the result; preparation output and errors go to stderr. Normal errors exit 1, argument errors 2, and interrupted operations 130.
