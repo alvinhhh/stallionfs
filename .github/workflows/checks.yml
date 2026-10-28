@@ -130,6 +130,7 @@ jobs:
           names = (
               'test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
               'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
+              'test_image.ImageCore',
           )
           for sanitizers in ('address,undefined', 'thread'):
               print('Sanitizers:', sanitizers, flush=True)
