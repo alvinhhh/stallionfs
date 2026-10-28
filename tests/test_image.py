@@ -37,7 +37,7 @@ class ImageCore(unittest.TestCase):
         obj, exe = cls.base / f'{name}.o', cls.base / name
         replacements = ('pread', 'pwrite', 'fcntl', 'fsync', 'flock', 'close',
                         'openat', 'fstat', 'fstatat', 'fstatfs', 'mkdirat', 'unlinkat',
-                        'ftruncate', 'malloc', 'calloc', 'free',
+                        'ftruncate', 'malloc', 'calloc', 'free', 'clock_gettime',
                         'CC_SHA256_Init', 'CC_SHA256_Update', 'CC_SHA256_Final')
         shim = cls.base / 'image-copy-hook.h'
         shim.write_text('#include <string.h>\n'
@@ -57,8 +57,8 @@ class ImageCore(unittest.TestCase):
                 symbols = subprocess.run(['/usr/bin/nm', '-u', str(obj)], capture_output=True,
                                          text=True, timeout=60)
                 (cls.base / f'{name}-symbols.txt').write_text(symbols.stdout + symbols.stderr)
-                if symbols.returncode or '_sfs_test_memcpy' not in symbols.stdout.split():
-                    raise AssertionError(f'Image copy hook absent; retained {cls.base}')
+                if symbols.returncode or not {'_sfs_test_memcpy', '_sfs_test_clock_gettime'} <= set(symbols.stdout.split()):
+                    raise AssertionError(f'Image copy/clock hook absent; retained {cls.base}')
         cls.executables[name] = exe
         return exe
 
@@ -144,6 +144,15 @@ class ImageCore(unittest.TestCase):
 
     def test_stateless_resume_context_output_atomicity_and_bounded_seek(self):
         self.scenario('resume')
+
+    def test_metadata_legacy_compatibility_times_parents_views_and_allocation(self):
+        self.scenario('metadata')
+
+    def test_metadata_codec_semantics_shared_counts_versions_and_eviction(self):
+        self.scenario('metadata-codec')
+
+    def test_metadata_atomic_admission_clock_failures_and_bounded_getter(self):
+        self.scenario('metadata-atomic')
 
 
 class ImageDiagnostics(unittest.TestCase):

@@ -30,7 +30,8 @@ typedef uint32_t sfs_view; /* 0: current namespace; 1..32: immutable snapshots. 
 enum sfs_status {
     SFS_OK, SFS_INVALID, SFS_IO, SFS_BUSY, SFS_UNSUPPORTED, SFS_LIMIT,
     SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED,
-    SFS_NOT_FOUND, SFS_EXISTS, SFS_STATE, SFS_NOMEM, SFS_INCOMPLETE
+    SFS_NOT_FOUND, SFS_EXISTS, SFS_STATE, SFS_NOMEM, SFS_INCOMPLETE,
+    SFS_TIME_UNAVAILABLE
 };
 enum sfs_phase {
     SFS_PHASE_NONE, SFS_PHASE_PARENT, SFS_PHASE_CREATE, SFS_PHASE_LOCK,
@@ -80,6 +81,55 @@ typedef struct {
 } sfs_entry;
 typedef struct { uint8_t bytes[1088]; } sfs_cookie;
 /* Zero-initialize; cookies bind a committed namespace and parent, never pointers. */
+
+typedef struct { int64_t seconds; uint32_t nanoseconds; } sfs_timestamp;
+enum sfs_restore_field { SFS_RESTORE_BIRTH = 1, SFS_RESTORE_ACCESS = 2,
+                         SFS_RESTORE_MODIFICATION = 4 };
+enum sfs_metadata_field {
+    SFS_META_MODE = 1, SFS_META_UID = 2, SFS_META_GID = 4, SFS_META_FLAGS = 8,
+    SFS_META_BIRTH = 16, SFS_META_ACCESS = 32, SFS_META_MODIFICATION = 64
+};
+#define SFS_FLAGS_SUPPORTED UINT32_C(0x00008001) /* UF_NODUMP | UF_HIDDEN. */
+typedef struct {
+    uint32_t mode, uid, gid, flags, restore;
+    sfs_timestamp birth, access, modification;
+} sfs_metadata_initial;
+typedef struct {
+    uint32_t fields, now;
+    uint32_t mode, uid, gid, flags;
+    sfs_timestamp birth, access, modification;
+} sfs_metadata_update;
+typedef struct {
+    sfs_entry entry;
+    sfs_timestamp birth, access, modification, change;
+    uint32_t mode, uid, gid, flags;
+    uint64_t referenced_data_bytes, link_count;
+} sfs_metadata_entry;
+
+/* Explicitly creates format0.3; legacy create continues producing0.2.
+ * Initial mode includes the matching regular/directory type and07777 bits.
+ * Selected restore fields are exact inputs; other times and ctime use one
+ * current sample. Clock failure occurs before exclusive image creation. */
+enum sfs_status sfs_image_create_metadata(const char *directory, const char *name,
+                                        uint64_t capacity, const sfs_metadata_initial *root,
+                                        sfs_image **out, sfs_result *result);
+enum sfs_status sfs_image_add_metadata(sfs_image *, sfs_inode parent,
+                                     const void *name, size_t name_length,
+                                     enum sfs_kind, const sfs_metadata_initial *,
+                                     sfs_inode *out, sfs_result *);
+/* Unselected fields are OMIT. now selects a subset of selected time fields.
+ * No explicit change-time, size, kind or allocation setter exists.
+ * A nonempty request updates ctime even when supplied values equal old values. */
+enum sfs_status sfs_image_set_metadata(sfs_image *, sfs_inode,
+                                     const sfs_metadata_update *, sfs_result *);
+/* Committed checked-path lookup; no extent/directory scan or hidden atime write.
+ * referenced_data_bytes charges4096 per logical mapping, including repeats;
+ * it is not unique image/host/reclaimable allocation. link_count is1.
+ * Format0.2 capability absence returns nonpoisoning UNSUPPORTED/NONE/errno0.
+ * TIME_UNAVAILABLE is an early nonpoisoning clock failure with saved errno
+ * (zero for a malformed sample). Failure leaves nonnull getter output intact. */
+enum sfs_status sfs_image_stat_metadata(sfs_image *, sfs_view, sfs_inode,
+                                      sfs_metadata_entry *out, sfs_result *);
 
 /* directory must be owned, private, local writable APFS; name is one component.
  * create never removes a failed image. open never initializes or repairs one.

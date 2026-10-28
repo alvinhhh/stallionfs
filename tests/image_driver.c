@@ -14,9 +14,21 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static void verification(void);
+static unsigned clock_calls;
+static int clock_failure;
+static struct timespec clock_value;
+int sfs_test_clock_gettime(clockid_t clock, struct timespec *out) {
+    assert(clock == CLOCK_REALTIME); clock_calls++;
+    if (clock_failure) { errno = ENXIO; return -1; }
+    *out = clock_value; return 0;
+}
+static void clock_at(int64_t seconds, long nanos) {
+    clock_value.tv_sec = (time_t)seconds; clock_value.tv_nsec = nanos; clock_failure = 0; clock_calls = 0;
+}
 #define TEST_CAPACITY UINT64_C(67108864)
 #define CELL 4096u
 static const sfs_verify_budget generous = {
@@ -88,7 +100,7 @@ int sfs_test_CC_SHA256_Init(CC_SHA256_CTX *c) {
 }
 int sfs_test_CC_SHA256_Update(CC_SHA256_CTX *c, const void *p, CC_LONG n) {
     for (unsigned i = 0; i < 8; i++) if (hash_context[i].context == c) {
-        if (n == 36 && !memcmp(p, "SFSDAT02", 8)) hash_context[i].raw = 1;
+        if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8))) hash_context[i].raw = 1;
         if (hash_context[i].raw) raw_hash_input += n; else metadata_hash_input += n;
         return CC_SHA256_Update(c, p, n);
     }
@@ -237,7 +249,7 @@ int sfs_test_fcntl(int fd, int command, ...) {
     if (fulls == 1) {
         struct stat st; unsigned char last[CELL]; assert(!fstat(fd, &st) && st.st_size >= 16384 && !(st.st_size % CELL));
         assert(pread(fd, last, CELL, st.st_size - CELL) == CELL);
-        assert(!memcmp(last, "SFSREC02", 8) && last[8] == 4);
+        assert((!memcmp(last, "SFSREC02", 8) || !memcmp(last, "SFSREC03", 8)) && last[8] == 4);
         /* The final commit-root exists before the first publication fence. */
         for (unsigned i = 0; i < 2; i++) { const unsigned char *ref = last + 64 + i * 56; if (ref[0]) { uint64_t offset = 0; for (int j = 7; j >= 0; j--) offset = (offset << 8) | ref[8+j]; assert(offset < (uint64_t)st.st_size - CELL); } }
     }
@@ -538,7 +550,7 @@ static unsigned char *record(unsigned char *image, const unsigned char *ref, siz
 static void ref_hash(unsigned char *image, unsigned char *ref, size_t size) {
     unsigned char *p = record(image, ref, size);
     if (get32(ref) == 6) {
-        unsigned char domain[36]; memcpy(domain, "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
+        unsigned char domain[36]; memcpy(domain, get32(image + 12) == 3 ? "SFSDAT03" : "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
         put32(domain + 24, 6); put64(domain + 28, CELL); CC_SHA256_CTX c;
         CC_SHA256_Init(&c); CC_SHA256_Update(&c, domain, sizeof(domain)); CC_SHA256_Update(&c, p, CELL); CC_SHA256_Final(ref + 24, &c);
     } else CC_SHA256(p, CELL, ref + 24);
@@ -584,9 +596,9 @@ static void counters(const char *name) {
       (unsigned long long)copies, (unsigned long long)overlay_clone_bytes, (unsigned long long)overlay_clone_calls, (unsigned long long)observed_clone_size, (unsigned long long)allocated, (unsigned long long)peak_allocated); fflush(stdout);
 }
 typedef struct { unsigned char ref[56], min[263], max[263]; uint16_t min_n, max_n, level; } fixture_node;
-typedef struct { unsigned char *p; size_t n; uint64_t capacity; } fixture;
+typedef struct { unsigned char *p; size_t n; uint64_t capacity; unsigned minor; } fixture;
 static fixture fixture_start(void) {
-    fixture f = { calloc(1, 16 * 1024 * 1024), 8192, TEST_CAPACITY }; assert(f.p);
+    fixture f = { calloc(1, 16 * 1024 * 1024), 8192, TEST_CAPACITY, 2 }; assert(f.p);
     for (unsigned i = 0; i < 16; i++) f.p[24 + i] = (unsigned char)(i + 1); return f;
 }
 static fixture_node append_cell(fixture *f, unsigned type, const unsigned char *cell) {
@@ -595,7 +607,7 @@ static fixture_node append_cell(fixture *f, unsigned type, const unsigned char *
     f->n += CELL; ref_hash(f->p, node.ref, f->n); return node;
 }
 static void envelope(fixture *f, unsigned char *p, unsigned type) {
-    memset(p, 0, CELL); memcpy(p, "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
+    memset(p, 0, CELL); memcpy(p, f->minor == 3 ? "SFSREC03" : "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
 }
 static void row_key(unsigned map, const unsigned char *row, unsigned char *key, uint16_t *n) {
     if (map == 2) { *n = (uint16_t)(8 + get32(row + 8)); big64(key, get64(row)); memcpy(key + 8, row + 12, *n - 8); }
@@ -613,7 +625,7 @@ static fixture_node page(fixture *f, unsigned map, unsigned level, const unsigne
     fixture_node cell = append_cell(f, 5, p); memcpy(node.ref, cell.ref, 56); return node;
 }
 static fixture_node tree(fixture *f, unsigned map, const unsigned char *rows, unsigned count) {
-    const unsigned leaf_stride[] = {0,352,280,72,328}, leaf_max[] = {0,9,12,48,9};
+    const unsigned leaf_stride[] = {0,f->minor == 3 ? 440u : 352u,280,72,328}, leaf_max[] = {0,f->minor == 3 ? 6u : 9u,12,48,9};
     assert(count); unsigned groups = (count + leaf_max[map] - 1) / leaf_max[map];
     fixture_node *nodes = calloc(groups, sizeof(*nodes)); assert(nodes); unsigned at = 0;
     for (unsigned i = 0; i < groups; i++) { unsigned size = count / groups + (i < count % groups); nodes[i] = page(f, map, 0, rows + at * leaf_stride[map], size, leaf_stride[map], NULL); at += size; }
@@ -624,21 +636,27 @@ static fixture_node tree(fixture *f, unsigned map, const unsigned char *rows, un
     }
     fixture_node result = nodes[0]; free(nodes); return result;
 }
+static void fixture_tuple(unsigned char *p, unsigned kind, uint64_t mappings) {
+    memset(p,0,88);
+    for (unsigned i=0;i<4;i++) { put64(p+i*16,UINT64_C(1700000000)+i); put32(p+i*16+8,123+i); }
+    put32(p+64,kind==SFS_FILE?0100600:0040700); put32(p+68,1234); put32(p+72,5678); put64(p+80,mappings);
+}
 static fixture_node namespace_cell(fixture *f, fixture_node inodes, fixture_node names, uint64_t next, uint64_t count) {
-    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); return append_cell(f, 2, p);
+    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); if(f->minor==3) fixture_tuple(p+192,SFS_DIRECTORY,0); return append_cell(f, 2, p);
 }
 static void finish_fixture(fixture *f, fixture_node ns, fixture_node catalog) {
     unsigned char p[CELL]; envelope(f, p, 4); memcpy(p + 64, ns.ref, 56); memcpy(p + 120, catalog.ref, 56); fixture_node root_node = append_cell(f, 4, p);
-    for (unsigned i = 0; i < 2; i++) { unsigned char *s = f->p + i * CELL; unsigned char uuid[16]; memcpy(uuid, f->p + 24, 16); memset(s, 0, CELL); memcpy(s, "SFSIMG01", 8); put32(s + 12, 2); memcpy(s + 24, uuid, 16); put64(s + 40, 1); memcpy(s + 48, root_node.ref, 56); put64(s + 104, f->n); put64(s + 144, f->capacity); slot_hash(s); }
+    for (unsigned i = 0; i < 2; i++) { unsigned char *s = f->p + i * CELL; unsigned char uuid[16]; memcpy(uuid, f->p + 24, 16); memset(s, 0, CELL); memcpy(s, "SFSIMG01", 8); put32(s + 12, f->minor); memcpy(s + 24, uuid, 16); put64(s + 40, 1); memcpy(s + 48, root_node.ref, 56); put64(s + 104, f->n); put64(s + 144, f->capacity); slot_hash(s); }
 }
 /* Shared raw and extent graphs are deliberate; namespace rows remain independently encoded. */
-static fixture indexed_fixture(unsigned inode_count, unsigned extent_rows, unsigned snapshots) {
-    fixture f = fixture_start(); unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); fixture_node data = append_cell(&f, 6, raw), extent = {0};
+static fixture indexed_fixture_version(unsigned inode_count, unsigned extent_rows, unsigned snapshots, unsigned minor) {
+    fixture f = fixture_start(); f.minor=minor; put32(f.p+12,minor); unsigned stride=minor==3?440:352; unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); fixture_node data = append_cell(&f, 6, raw), extent = {0};
     if (extent_rows) { unsigned char *rows = calloc(extent_rows, 72); assert(rows); for (unsigned i = 0; i < extent_rows; i++) { put64(rows + i * 72, i); memcpy(rows + i * 72 + 8, data.ref, 56); put16(rows + i * 72 + 64, 6); } extent = tree(&f, 3, rows, extent_rows); free(rows); }
-    unsigned char *ir = calloc(inode_count, 352), *nr = calloc(inode_count, 280); assert(ir && nr);
+    unsigned char *ir = calloc(inode_count, stride), *nr = calloc(inode_count, 280); assert(ir && nr);
     for (unsigned i = 0; i < inode_count; i++) { char name[32]; int length = snprintf(name, sizeof(name), "f%08u", i); assert(length == 9);
-        unsigned char *a = ir + i * 352, *b = nr + i * 280; put64(a, i + 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 9); memcpy(a + 88, name, 9);
+        unsigned char *a = ir + i * stride, *b = nr + i * 280; put64(a, i + 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 9); memcpy(a + 88, name, 9);
         if (extent_rows) { put64(a + 24, (extent_rows - 1) * (uint64_t)CELL + 6); memcpy(a + 32, extent.ref, 56); }
+        if(minor==3) fixture_tuple(a+352,SFS_FILE,extent_rows);
         put64(b, 1); put32(b + 8, 9); memcpy(b + 12, name, 9); put64(b + 267, i + 2);
     }
     fixture_node inodes = tree(&f, 1, ir, inode_count), names = tree(&f, 2, nr, inode_count); free(ir); free(nr);
@@ -646,6 +664,7 @@ static fixture indexed_fixture(unsigned inode_count, unsigned extent_rows, unsig
     if (snapshots) { unsigned char rows[32 * 328] = {0}; assert(snapshots <= 32); for (unsigned i = 0; i < snapshots; i++) { char name[32]; int length = snprintf(name, sizeof(name), "snapshot-%u", i); put32(rows + i * 328, i + 1); memcpy(rows + i * 328 + 8, historical.ref, 56); put32(rows + i * 328 + 64, (uint32_t)length); memcpy(rows + i * 328 + 68, name, (size_t)length); } catalog = tree(&f, 4, rows, snapshots); }
     fixture_node current = namespace_cell(&f, inodes, names, inode_count + 3, inode_count); finish_fixture(&f, current, catalog); return f;
 }
+static fixture indexed_fixture(unsigned inodes, unsigned extents, unsigned snapshots) { return indexed_fixture_version(inodes,extents,snapshots,2); }
 static void fixture_save(fixture *f) { save("image", f->p, f->n); free(f->p); f->p = NULL; }
 /* This small parser fixture has fixed 4/3/2 row counts, even when a count is forged. */
 static void refresh_parser_ref(unsigned char *image, unsigned char *ref, const unsigned char *original, size_t n, const unsigned char *keep_bad_digest) {
@@ -1107,23 +1126,24 @@ static void file_digest(const char *name, unsigned char digest[32], uint64_t *le
 static void mapped_ref(unsigned char *ref, unsigned char *mapping, size_t cells) {
     if(!get32(ref)) return; uint64_t cell=get64(ref+8)/CELL; assert(cell<cells&&get32(mapping+cell*56)==get32(ref)); memcpy(ref,mapping+cell*56,56);
 }
-static void sparse_aux_fixture(void) {
-    fixture f=indexed_fixture(2,48*1050,2); size_t cells=f.n/CELL; unsigned char *mapping=calloc(cells,56); assert(mapping);
+static void sparse_aux_fixture_version(unsigned minor) {
+    fixture f=indexed_fixture_version(2,48*1050,2,minor); size_t cells=f.n/CELL; unsigned char *mapping=calloc(cells,56); assert(mapping);
     int fd=open("image",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600); assert(fd>=0); uint64_t end=0;
     for(size_t i=2;i<cells;i++) {
-        unsigned char *p=f.p+i*CELL; unsigned type=!memcmp(p,"SFSREC02",8)?get32(p+8):6;
+        unsigned char *p=f.p+i*CELL; unsigned type=!memcmp(p,minor==3?"SFSREC03":"SFSREC02",8)?get32(p+8):6;
         if(type==2||type==4) { mapped_ref(p+64,mapping,cells); mapped_ref(p+120,mapping,cells); }
-        if(type==5) { unsigned map=get32(p+64), level=get16(p+68), count=get16(p+70), stride=level?(map==2?328:72):(map==1?352:map==2?280:map==3?72:328);
+        if(type==5) { unsigned map=get32(p+64), level=get16(p+68), count=get16(p+70), stride=level?(map==2?328:72):(map==1?(minor==3?440:352):map==2?280:map==3?72:328);
             for(unsigned j=0;j<count;j++) { unsigned char *row=p+640+j*stride; if(level) mapped_ref(row+(map==2?271:16),mapping,cells); else if(map==1) mapped_ref(row+32,mapping,cells); else if(map==3||map==4) mapped_ref(row+8,mapping,cells); }
         }
         unsigned char *ref=mapping+i*56; put32(ref,type); uint64_t at=(2+(i-2)*32)*UINT64_C(4096); put64(ref+8,at); put64(ref+16,CELL);
-        if(type==6) { unsigned char domain[36]; memcpy(domain,"SFSDAT02",8); memcpy(domain+8,f.p+24,16); put32(domain+24,6); put64(domain+28,CELL); CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c,domain,36); CC_SHA256_Update(&c,p,CELL); CC_SHA256_Final(ref+24,&c); }
+        if(type==6) { unsigned char domain[36]; memcpy(domain,minor==3?"SFSDAT03":"SFSDAT02",8); memcpy(domain+8,f.p+24,16); put32(domain+24,6); put64(domain+28,CELL); CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c,domain,36); CC_SHA256_Update(&c,p,CELL); CC_SHA256_Final(ref+24,&c); }
         else CC_SHA256(p,CELL,ref+24); raw_write(fd,p,CELL,(off_t)at); end=at+CELL;
     }
     assert(end<UINT64_C(268435456));
     for(unsigned i=0;i<2;i++) { unsigned char *slot=f.p+i*CELL; mapped_ref(slot+48,mapping,cells); put64(slot+104,end); put64(slot+144,UINT64_C(268435456)); slot_hash(slot); raw_write(fd,slot,CELL,i*CELL); }
     assert(!close(fd)); printf("{\"case\":\"sparse-aux-layout\",\"stored_cell_bytes\":%llu,\"logical_end\":%llu,\"capacity\":268435456,\"filesystem_allocation_claim\":false}\n",(unsigned long long)(cells*CELL),(unsigned long long)end); fflush(stdout); free(mapping); free(f.p);
 }
+static void sparse_aux_fixture(void) { sparse_aux_fixture_version(2); }
 static int cancel_now(void *context) { unsigned *calls=context; (*calls)++; return 1; }
 typedef struct {
     uint64_t after_hash, hash_at_cancel;
@@ -1712,6 +1732,366 @@ static void resume(void) {
     resume_child_contexts(&canary);
 }
 
+/* Stored metadata uses independent field expectations, never host-struct serialization. */
+static int timestamp_is(sfs_timestamp t,int64_t s,uint32_t n) { return t.seconds==s&&t.nanoseconds==n; }
+static int timestamp_equal(sfs_timestamp a,sfs_timestamp b) { return timestamp_is(a,b.seconds,b.nanoseconds); }
+static void metadata_equal(const sfs_metadata_entry *a,const sfs_metadata_entry *b) {
+    assert(a->entry.inode==b->entry.inode&&a->entry.parent==b->entry.parent&&a->entry.kind==b->entry.kind&&a->entry.size==b->entry.size&&a->entry.name_length==b->entry.name_length&&!memcmp(a->entry.name,b->entry.name,a->entry.name_length));
+    assert(timestamp_equal(a->birth,b->birth)&&timestamp_equal(a->access,b->access)&&timestamp_equal(a->modification,b->modification)&&timestamp_equal(a->change,b->change));
+    assert(a->mode==b->mode&&a->uid==b->uid&&a->gid==b->gid&&a->flags==b->flags&&a->referenced_data_bytes==b->referenced_data_bytes&&a->link_count==b->link_count);
+}
+static sfs_metadata_entry metadata_get(sfs_image *h,sfs_view view,sfs_inode id) {
+    sfs_metadata_entry m; sfs_result r; unsigned calls=clock_calls;
+    OK(sfs_image_stat_metadata(h,view,id,&m,&r)); assert(r.coverage==SFS_COVERAGE_TOUCHED&&clock_calls==calls&&m.entry.inode==id&&m.link_count==1);
+    return m;
+}
+static sfs_metadata_initial metadata_input(unsigned kind) {
+    sfs_metadata_initial in={0}; in.mode=kind==SFS_FILE?0100641:0040751; in.uid=UINT32_MAX; in.gid=UINT32_MAX-1; in.flags=SFS_FLAGS_SUPPORTED;
+    in.restore=SFS_RESTORE_BIRTH|SFS_RESTORE_ACCESS|SFS_RESTORE_MODIFICATION;
+    in.birth=(sfs_timestamp){10,11}; in.access=(sfs_timestamp){20,21}; in.modification=(sfs_timestamp){30,31}; return in;
+}
+static void metadata_commit(sfs_image *h) { sfs_result r; unsigned calls=clock_calls; OK(sfs_image_commit(h,&r)); assert(clock_calls==calls); }
+static void metadata_create(sfs_image **h,uint64_t capacity) {
+    sfs_metadata_initial in=metadata_input(SFS_DIRECTORY); sfs_result r;
+    in.birth=(sfs_timestamp){INT64_MIN,0}; in.access=(sfs_timestamp){INT64_MAX,999999999}; in.modification=(sfs_timestamp){-2,3};
+    clock_at(100,101); OK(sfs_image_create_metadata(root,"image",capacity,&in,h,&r)); assert(clock_calls==1&&r.generation==1);
+    sfs_metadata_entry m=metadata_get(*h,0,1); assert(timestamp_equal(m.birth,in.birth)&&timestamp_equal(m.access,in.access)&&timestamp_equal(m.modification,in.modification)&&timestamp_is(m.change,100,101));
+    assert(m.mode==in.mode&&m.uid==in.uid&&m.gid==in.gid&&m.flags==in.flags&&!m.referenced_data_bytes&&m.entry.kind==SFS_DIRECTORY);
+}
+static void metadata_changed(const sfs_metadata_entry *m,int64_t seconds,int content) {
+    assert(timestamp_is(m->change,seconds,(uint32_t)(seconds+1)));
+    if(content) assert(timestamp_is(m->modification,seconds,(uint32_t)(seconds+1)));
+}
+static void metadata_clock(int64_t seconds) { clock_at(seconds,(long)(seconds+1)); }
+static void metadata_compatibility(void) {
+    sfs_image *h; sfs_result r; clock_at(500,501); reset("",0); create(&h); OK(sfs_image_begin(h,&r)); sfs_inode id=add(h,1,"old",SFS_FILE);
+    OK(sfs_image_write(h,id,0,"legacy",6,&r)); metadata_commit(h); expect(h,0,id,"legacy"); assert(!clock_calls);
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_write(h,id,0,"staged",6,&r)); size_t n; unsigned char *before=bytes("image",&n); reset("",0);
+    sfs_metadata_entry m,canary; memset(&canary,0xA5,sizeof(canary)); m=canary; sfs_metadata_initial in=metadata_input(SFS_FILE); sfs_metadata_update update={0}; update.fields=SFS_META_UID; update.uid=123;
+    sfs_inode output=UINT64_MAX;
+    assert(sfs_image_stat_metadata(h,0,id,&m,&r)==SFS_UNSUPPORTED&&!memcmp(&m,&canary,sizeof(m))&&r.phase==SFS_PHASE_NONE&&!r.system_errno);
+    assert(sfs_image_set_metadata(h,id,&update,&r)==SFS_UNSUPPORTED&&r.phase==SFS_PHASE_NONE&&!r.system_errno);
+    assert(sfs_image_add_metadata(h,1,"new",3,SFS_FILE,&in,&output,&r)==SFS_UNSUPPORTED&&output==UINT64_MAX&&r.phase==SFS_PHASE_NONE&&!r.system_errno);
+    assert(sfs_image_stat_metadata(h,0,id,NULL,&r)==SFS_INVALID); update.now=SFS_META_ACCESS; assert(sfs_image_set_metadata(h,id,&update,&r)==SFS_INVALID); update.now=0;
+    assert(!clock_calls); image_unwritten(); unchanged("image",before,n); free(before); metadata_commit(h); expect(h,0,id,"staged"); close_image(h); retain(1200);
+}
+static void metadata(void) {
+    metadata_compatibility(); sfs_image *h; sfs_result r; reset("",0); metadata_create(&h,TEST_CAPACITY);
+    OK(sfs_image_begin(h,&r)); metadata_clock(110); sfs_inode p=add(h,1,"p",SFS_DIRECTORY); assert(clock_calls==1); metadata_commit(h);
+    sfs_metadata_entry m=metadata_get(h,0,p); assert(m.mode==0040700&&m.uid==(uint32_t)geteuid()&&m.gid==(uint32_t)getegid()&&!m.flags&&!m.referenced_data_bytes);
+    assert(timestamp_is(m.birth,110,111)&&timestamp_equal(m.birth,m.access)&&timestamp_equal(m.birth,m.modification)&&timestamp_equal(m.birth,m.change));
+    OK(sfs_image_begin(h,&r)); metadata_clock(120); sfs_inode q=add(h,1,"q",SFS_DIRECTORY); assert(clock_calls==1); metadata_commit(h);
+    OK(sfs_image_begin(h,&r)); metadata_clock(130); sfs_metadata_initial in=metadata_input(SFS_FILE); sfs_inode a;
+    OK(sfs_image_add_metadata(h,p,"a",1,SFS_FILE,&in,&a,&r)); assert(clock_calls==1); metadata_commit(h);
+    m=metadata_get(h,0,a); assert(m.mode==in.mode&&m.uid==in.uid&&m.gid==in.gid&&m.flags==in.flags&&timestamp_equal(m.birth,in.birth)&&timestamp_equal(m.access,in.access)&&timestamp_equal(m.modification,in.modification)); metadata_changed(&m,130,0);
+    m=metadata_get(h,0,p); metadata_changed(&m,130,1); m=metadata_get(h,0,q); metadata_changed(&m,120,1); m=metadata_get(h,0,1); metadata_changed(&m,120,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(140); sfs_inode b=add(h,q,"b",SFS_FILE); assert(clock_calls==1); metadata_commit(h);
+    OK(sfs_image_begin(h,&r)); metadata_clock(150); OK(sfs_image_write(h,a,0,"abcde",5,&r)); assert(clock_calls==1); metadata_commit(h);
+    m=metadata_get(h,0,a); assert(m.entry.size==5&&m.referenced_data_bytes==CELL&&timestamp_equal(m.birth,in.birth)&&timestamp_equal(m.access,in.access)); metadata_changed(&m,150,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(151); OK(sfs_image_write(h,a,0,"abcde",5,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); metadata_changed(&m,151,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(152); OK(sfs_image_write(h,a,1,"Z",1,&r)); assert(clock_calls==1); reset("",0); clock_calls=0;
+    OK(sfs_image_write(h,a,0,NULL,0,&r)); OK(sfs_image_rename(h,a,p,"a",1,&r)); sfs_metadata_update update; memset(&update,0xA5,sizeof(update)); update.fields=update.now=0; OK(sfs_image_set_metadata(h,b,&update,&r)); assert(!clock_calls); image_unwritten();
+    /* Equal-size resize may seal the pending batch; its metadata remains a no-op. */
+    OK(sfs_image_resize(h,a,5,&r)); assert(!clock_calls); metadata_commit(h); m=metadata_get(h,0,a); metadata_changed(&m,152,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(160); memset(&update,0,sizeof(update)); update.fields=SFS_META_MODIFICATION|SFS_META_ACCESS; update.now=SFS_META_ACCESS; update.modification=(sfs_timestamp){-99,7};
+    OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(timestamp_is(m.modification,-99,7)&&timestamp_is(m.access,160,161)&&timestamp_equal(m.birth,in.birth)); metadata_changed(&m,160,0);
+    OK(sfs_image_begin(h,&r)); metadata_clock(161); update.fields=SFS_META_UID; update.now=0; update.uid=m.uid; OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); metadata_changed(&m,161,0);
+    OK(sfs_image_begin(h,&r)); clock_at(INT64_MIN,0); OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(timestamp_is(m.change,INT64_MIN,0)&&timestamp_is(m.modification,-99,7));
+    OK(sfs_image_begin(h,&r)); metadata_clock(170); OK(sfs_image_rename(h,a,q,"moved",5,&r)); assert(clock_calls==1); metadata_commit(h);
+    m=metadata_get(h,0,a); metadata_changed(&m,170,0); assert(timestamp_is(m.modification,-99,7)); m=metadata_get(h,0,p); metadata_changed(&m,170,1); m=metadata_get(h,0,q); metadata_changed(&m,170,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(171); OK(sfs_image_rename(h,a,q,"same-parent",11,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,q); metadata_changed(&m,171,1); m=metadata_get(h,0,p); metadata_changed(&m,170,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(172); OK(sfs_image_rename(h,a,1,"at-root",7,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,1); metadata_changed(&m,172,1); m=metadata_get(h,0,q); metadata_changed(&m,172,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(173); OK(sfs_image_rename(h,a,p,"back",4,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,1); metadata_changed(&m,173,1); m=metadata_get(h,0,p); metadata_changed(&m,173,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(174); OK(sfs_image_write(h,a,0,"pending",7,&r)); assert(clock_calls==1); metadata_clock(175); update.uid=77; OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); metadata_commit(h);
+    expect(h,0,a,"pending"); m=metadata_get(h,0,a); assert(m.entry.size==7&&m.referenced_data_bytes==CELL&&m.uid==77); metadata_changed(&m,175,0); assert(timestamp_is(m.modification,174,175));
+    OK(sfs_image_begin(h,&r)); metadata_clock(176); OK(sfs_image_write(h,a,0,"latest!",7,&r)); assert(clock_calls==1); metadata_clock(177); OK(sfs_image_rename(h,a,q,"latest",6,&r)); assert(clock_calls==1); metadata_commit(h); expect(h,0,a,"latest!"); m=metadata_get(h,0,a); metadata_changed(&m,177,0); assert(timestamp_is(m.modification,176,177)&&m.entry.parent==q&&m.entry.size==7&&m.referenced_data_bytes==CELL);
+    /* Move sibling p under q; the parent edits share root/index paths. */
+    OK(sfs_image_begin(h,&r)); metadata_clock(178); OK(sfs_image_rename(h,p,q,"nested-p",8,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,p); metadata_changed(&m,178,0); m=metadata_get(h,0,q); metadata_changed(&m,178,1); m=metadata_get(h,0,1); metadata_changed(&m,178,1);
+    sfs_metadata_entry saved=metadata_get(h,0,a), historical=saved, saved_root=metadata_get(h,0,1); sfs_view view;
+    OK(sfs_image_begin(h,&r)); metadata_clock(180); OK(sfs_image_write(h,a,2*CELL+1,"\0",1,&r)); assert(clock_calls==1); clock_calls=0; OK(sfs_image_snapshot(h,"before-metadata",15,&view,&r)); assert(!clock_calls); metadata_commit(h);
+    m=metadata_get(h,view,a); metadata_equal(&m,&saved); m=metadata_get(h,view,1); metadata_equal(&m,&saved_root); expect(h,view,a,"latest!");
+    m=metadata_get(h,0,a); assert(m.entry.size==2*CELL+2&&m.referenced_data_bytes==2*CELL); metadata_changed(&m,180,1);
+    OK(sfs_image_begin(h,&r)); metadata_clock(181); OK(sfs_image_write(h,a,2*CELL,"\0\0",2,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(m.referenced_data_bytes==2*CELL);
+    OK(sfs_image_begin(h,&r)); metadata_clock(182); OK(sfs_image_write(h,a,CELL,"x",1,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(m.referenced_data_bytes==3*CELL);
+    OK(sfs_image_begin(h,&r)); metadata_clock(183); OK(sfs_image_resize(h,a,5*CELL,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(m.referenced_data_bytes==3*CELL);
+    OK(sfs_image_begin(h,&r)); metadata_clock(184); OK(sfs_image_resize(h,a,CELL+1,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(m.referenced_data_bytes==2*CELL);
+    OK(sfs_image_begin(h,&r)); metadata_clock(185); OK(sfs_image_resize(h,a,0,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(!m.referenced_data_bytes);
+    OK(sfs_image_begin(h,&r)); metadata_clock(186); OK(sfs_image_resize(h,a,CELL,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(!m.referenced_data_bytes);
+    OK(sfs_image_begin(h,&r)); metadata_clock(187); OK(sfs_image_write(h,a,0,"\0",1,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,a); assert(m.referenced_data_bytes==CELL);
+    /* Metadata-only publication binds cookies/results to a different root. */
+    sfs_cookie cookie={0}, resume_cookie={0}; sfs_entry entry; int found; sfs_result anchor;
+    ok(sfs_image_stat(h,0,1,&entry,&anchor),&anchor); OK(sfs_image_next(h,0,q,&cookie,&entry,&found,&r)); assert(found);
+    OK(sfs_image_begin(h,&r)); metadata_clock(188); update.uid=78; OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); metadata_commit(h);
+    assert(sfs_image_next(h,0,q,&cookie,&entry,&found,&r)==SFS_STATE); memset(&resume_cookie,0xA5,sizeof(resume_cookie)); sfs_cookie canary=resume_cookie;
+    assert(sfs_image_resume_after(h,0,anchor.generation,anchor.root_digest,q,a,&resume_cookie,&r)==SFS_STATE&&!memcmp(&resume_cookie,&canary,sizeof(canary)));
+    saved=metadata_get(h,0,a); OK(sfs_image_begin(h,&r)); metadata_clock(189); update.uid=79; OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1); clock_calls=0; OK(sfs_image_abort(h,&r)); assert(!clock_calls); m=metadata_get(h,0,a); metadata_equal(&m,&saved);
+    OK(sfs_image_begin(h,&r)); metadata_clock(190); OK(sfs_image_remove(h,b,&r)); assert(clock_calls==1); metadata_commit(h); m=metadata_get(h,0,q); metadata_changed(&m,190,1);
+    /* Each successful setter selects one previously untested field; all other fields/data stay exact. */
+    const uint32_t setter_fields[]={SFS_META_MODE,SFS_META_GID,SFS_META_FLAGS,SFS_META_BIRTH};
+    unsigned char zero_data[CELL]={0};
+    for(unsigned i=0;i<4;i++) {
+        sfs_metadata_entry expected=metadata_get(h,0,a), parent_before=metadata_get(h,0,q);
+        memset(&update,0,sizeof(update)); update.fields=setter_fields[i];
+        if(i==0) { update.mode=0106754; expected.mode=update.mode; }
+        else if(i==1) { update.gid=UINT32_MAX; expected.gid=update.gid; }
+        else if(i==2) { update.flags=1; expected.flags=update.flags; }
+        else { update.birth=(sfs_timestamp){INT64_MAX,999999999}; expected.birth=update.birth; }
+        OK(sfs_image_begin(h,&r)); metadata_clock(191+i); OK(sfs_image_set_metadata(h,a,&update,&r)); assert(clock_calls==1);
+        expected.change=(sfs_timestamp){191+i,192+i}; metadata_commit(h); assert(clock_calls==1);
+        m=metadata_get(h,0,a); metadata_equal(&m,&expected); expect_buffer(h,0,a,zero_data,sizeof(zero_data));
+        m=metadata_get(h,0,q); metadata_equal(&m,&parent_before); m=metadata_get(h,view,a); metadata_equal(&m,&historical); expect(h,view,a,"latest!"); assert(clock_calls==1);
+        printf("{\"metadata_setter_field\":%u,\"operation_clock_calls\":%u,\"change_seconds\":%lld}\n",setter_fields[i],clock_calls,(long long)expected.change.seconds); fflush(stdout);
+        saved=expected;
+    }
+    close_image(h); open_image(&h); m=metadata_get(h,0,a); metadata_equal(&m,&saved); expect_buffer(h,0,a,zero_data,sizeof(zero_data));
+    m=metadata_get(h,view,a); metadata_equal(&m,&historical); expect(h,view,a,"latest!");
+    OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE); receipt("metadata-times-parents-allocation-full",&r); close_image(h);
+    size_t n; unsigned char *before=bytes("image",&n); assert(get32(selected_slot(before)+12)==3); reset("",0); clock_calls=0; open_readonly(&h,&r); m=metadata_get(h,view,a); metadata_equal(&m,&historical); m=metadata_get(h,0,a); metadata_equal(&m,&saved);
+    reset("",0); clock_calls=0; assert(sfs_image_set_metadata(h,a,&update,&r)==SFS_STATE&&!clock_calls); assert(sfs_image_set_metadata(h,a,NULL,&r)==SFS_STATE&&!clock_calls); sfs_inode output=UINT64_MAX; assert(sfs_image_add_metadata(h,1,"refused",7,SFS_FILE,&in,&output,&r)==SFS_STATE&&output==UINT64_MAX&&!clock_calls);
+    sfs_metadata_entry canary_m; memset(&canary_m,0xA5,sizeof(canary_m)); m=canary_m; assert(sfs_image_stat_metadata(h,0,UINT64_MAX,&m,&r)==SFS_NOT_FOUND&&!memcmp(&m,&canary_m,sizeof(m))); image_unwritten(); assert(!clock_calls); close_image(h); unchanged("image",before,n); free(before);
+    sfs_recovery recovery; reset("",0); OK(sfs_image_inspect(root,"image",&h,&recovery,&generous,&r)); assert(recovery.pair_valid); unsigned slot=recovery.slots[0].generation>recovery.slots[1].generation?0:1; OK(sfs_image_select(h,slot,&generous,&r)); m=metadata_get(h,view,a); metadata_equal(&m,&historical); reset("",0); clock_calls=0; assert(sfs_image_set_metadata(h,a,&update,&r)==SFS_STATE&&!clock_calls); image_unwritten(); close_image(h);
+    /* Recheck the held descriptor's expected EOF even when metadata is already cached. */
+    for(unsigned cached_file=0;cached_file<2;cached_file++) {
+        reset("",0); open_image(&h); m=metadata_get(h,0,1); m=metadata_get(h,0,a); metadata_equal(&m,&saved);
+        OK(sfs_image_begin(h,&r)); metadata_clock(260+cached_file); OK(sfs_image_write(h,a,0,"discarded",9,&r)); assert(clock_calls==1);
+        m=metadata_get(h,0,a); metadata_equal(&m,&saved); /* Warm the committed file path after staging. */
+        size_t staged_n; unsigned char *staged=bytes("image",&staged_n); struct stat identity,after; assert(!lstat("image",&identity));
+        int fd=open("image",O_WRONLY|O_NOFOLLOW|O_CLOEXEC); assert(fd>=0); unsigned char marker[37]; memset(marker,0xD7,sizeof(marker)); raw_write(fd,marker,sizeof(marker),(off_t)staged_n); assert(!close(fd));
+        size_t changed_n; unsigned char *changed=bytes("image",&changed_n); assert(changed_n==staged_n+sizeof(marker)&&!memcmp(changed,staged,staged_n)&&!memcmp(changed+staged_n,marker,sizeof(marker))); free(staged);
+        assert(!lstat("image",&after)&&after.st_dev==identity.st_dev&&after.st_ino==identity.st_ino&&after.st_size==identity.st_size+(off_t)sizeof(marker));
+        sfs_metadata_entry output,canary; memset(&canary,0xA5,sizeof(canary)); output=canary; reset("",0); clock_calls=0;
+        enum sfs_status status=sfs_image_stat_metadata(h,0,cached_file?a:SFS_ROOT_INODE,&output,&r);
+        assert(status==SFS_IO&&r.status==SFS_IO&&r.phase==SFS_PHASE_IDENTITY&&r.system_errno==ESTALE&&r.coverage==SFS_COVERAGE_NONE&&!memcmp(&output,&canary,sizeof(output))&&!clock_calls&&!reads); image_unwritten(); receipt(cached_file?"metadata-cached-file-eof-identity":"metadata-root-eof-identity",&r);
+        assert(sfs_image_stat_metadata(h,0,a,&output,&r)==SFS_POISONED&&!memcmp(&output,&canary,sizeof(output)));
+        assert(sfs_image_write(h,a,0,"not-published",13,&r)==SFS_POISONED&&sfs_image_commit(h,&r)==SFS_POISONED&&!clock_calls); image_unwritten(); close_image(h); unchanged("image",changed,changed_n);
+        reset("",0); open_image(&h); m=metadata_get(h,0,a); metadata_equal(&m,&saved); expect_buffer(h,0,a,zero_data,sizeof(zero_data)); m=metadata_get(h,view,a); metadata_equal(&m,&historical); expect(h,view,a,"latest!"); image_unwritten(); close_image(h); unchanged("image",changed,changed_n); free(changed);
+    }
+}
+/* Traverse only the untouched fixture topology; semantic mutations never choose repair edges. */
+static void metadata_repair_ref(unsigned char *p,const unsigned char *original,unsigned char *ref,const unsigned char *old_ref,size_t n,unsigned depth) {
+    assert(depth<32&&!memcmp(ref,old_ref,24)); if(!get32(old_ref)) return;
+    const unsigned char *old=record((unsigned char *)original,old_ref,n); unsigned char *cell=record(p,old_ref,n); unsigned type=get32(old_ref);
+    if(type==4||type==2) for(unsigned i=0;i<2;i++) metadata_repair_ref(p,original,cell+64+i*56,old+64+i*56,n,depth+1);
+    if(type==5) {
+        unsigned map=get32(old+64), level=get16(old+68), count=get16(old+70), stride=level?(map==2?328:72):(map==1?440:map==2?280:map==3?72:328);
+        for(unsigned i=0;i<count;i++) {
+            unsigned offset=level?(map==2?271:16):map==1?32:8;
+            if(level||map!=2) metadata_repair_ref(p,original,cell+640+i*stride+offset,old+640+i*stride+offset,n,depth+1);
+        }
+    }
+    ref_hash(p,ref,n);
+}
+static void metadata_repair(unsigned char *p,unsigned char *original,size_t n) {
+    for(unsigned i=0;i<2;i++) { metadata_repair_ref(p,original,p+i*CELL+48,original+i*CELL+48,n,0); slot_hash(p+i*CELL); }
+}
+/* Framing/digest guard deliberately does not validate time, flags, kinds, counters or fences. */
+static int metadata_ref_guard(unsigned char *p,unsigned char *original,const unsigned char *ref,const unsigned char *old_ref,size_t n,uint64_t parent,uint64_t end,unsigned depth) {
+    static const unsigned char zeros[56]={0};
+    if(depth>=32||memcmp(ref,old_ref,24)) return 0;
+    if(!get32(old_ref)) return !memcmp(ref,zeros,56);
+    uint64_t at=get64(ref+8); unsigned type=get32(old_ref);
+    if(at<8192||at%CELL||at>=parent||at>end||end>n||CELL>end-at||get64(ref+16)!=CELL||get32(ref+4)) return 0;
+    unsigned char *cell=p+at,*old=original+at, checked[56]; memcpy(checked,ref,56); ref_hash(p,checked,n); if(memcmp(checked+24,ref+24,32)) return 0;
+    if(type!=6&&(memcmp(cell,"SFSREC03",8)||get32(cell+8)!=type||get32(cell+12)||get64(cell+16)!=4032||memcmp(cell+24,p+24,16)||memcmp(cell+40,zeros,24))) return 0;
+    if(type==4||type==2) for(unsigned i=0;i<2;i++) if(!metadata_ref_guard(p,original,cell+64+i*56,old+64+i*56,n,at,end,depth+1)) return 0;
+    if(type==5) {
+        unsigned map=get32(old+64), level=get16(old+68), count=get16(old+70), stride=level?(map==2?328:72):(map==1?440:map==2?280:map==3?72:328);
+        for(unsigned i=0;i<count;i++) { unsigned offset=level?(map==2?271:16):map==1?32:8;
+            if((level||map!=2)&&!metadata_ref_guard(p,original,cell+640+i*stride+offset,old+640+i*stride+offset,n,at,end,depth+1)) return 0;
+        }
+    }
+    return 1;
+}
+static int metadata_guard(unsigned char *p,unsigned char *original,size_t n) {
+    for(unsigned i=0;i<2;i++) {
+        unsigned char *slot=p+i*CELL,checked[CELL]; memcpy(checked,slot,CELL); slot_hash(checked);
+        if(memcmp(slot,"SFSIMG01",8)||get32(slot+8)||get32(slot+12)!=3||get64(slot+16)||memcmp(slot+112,checked+112,32)) return 0;
+        if(!metadata_ref_guard(p,original,slot+48,original+i*CELL+48,n,get64(slot+104),get64(slot+104),0)) return 0;
+    }
+    return 1;
+}
+static void metadata_codec(void) {
+    fixture f=indexed_fixture_version(4,3,2,3); size_t n=f.n; unsigned char *baseline=malloc(n); assert(baseline); memcpy(baseline,f.p,n); assert(metadata_guard(f.p,baseline,n)); fixture_save(&f);
+    sfs_image *h; sfs_result r; reset("",0); clock_calls=0; open_image(&h); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE); receipt("metadata-codec-full-baseline",&r);
+    reset("",0); OK(sfs_image_verify(h,&generous,&r)); assert(raw_hashes==1&&raw_hash_input==4132); counters("metadata-per-mapping-versus-unique-raw");
+    for(unsigned view=0;view<=2;view++) for(unsigned id=2;id<=5;id++) { sfs_metadata_entry m=metadata_get(h,view,id); assert(m.referenced_data_bytes==3*CELL&&m.link_count==1&&m.entry.size==2*CELL+6); }
+    assert(!clock_calls); close_image(h); unchanged("image",baseline,n); retain(1210);
+    const char *cases[]={"root-nanoseconds","timestamp-padding","file-nanoseconds","mode-kind","unsupported-flags","count-over-size","count-full-mismatch","zero-count-nonempty-root","root-count","directory-mode","root-padding","negative-seconds-valid"};
+    for(unsigned kind=0;kind<sizeof(cases)/sizeof(*cases);kind++) {
+        unsigned char *p=malloc(n); assert(p); memcpy(p,baseline,n); unsigned char *ns=namespace_at(p,p,n), *row=leaf_row(p,ns+64,2,n,440), *tuple=row+352;
+        if(kind==0) put32(ns+192+8,1000000000); else if(kind==1) tuple[12]=1; else if(kind==2) put32(tuple+8,1000000000);
+        else if(kind==3) put32(tuple+64,0040600); else if(kind==4) put32(tuple+76,2); else if(kind==5) put64(tuple+80,4); else if(kind==6) { row=leaf_row(p,ns+64,5,n,440); put64(row+352+80,2); }
+        else if(kind==7) put64(tuple+80,0);
+        else if(kind==8) put64(ns+192+80,1); else if(kind==9) put32(ns+192+64,0100700); else if(kind==10) ns[280]=1;
+        else { put64(tuple,UINT64_C(0x8000000000000000)); put64(tuple+16,UINT64_C(0x7fffffffffffffff)); put32(tuple+24,999999999); }
+        metadata_repair(p,baseline,n); assert(metadata_guard(p,baseline,n)); save("image",p,n); reset("",0); h=NULL;
+        if(kind==11) { open_image(&h); sfs_metadata_entry m=metadata_get(h,0,2); assert(timestamp_is(m.birth,INT64_MIN,123)&&timestamp_is(m.access,INT64_MAX,999999999)); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE); close_image(h); }
+        else {
+            /* FULL inspection reaches all shared historical aliases; it is not masked by admission roots. */
+            sfs_recovery recovery; enum sfs_status status=sfs_image_inspect(root,"image",&h,&recovery,&generous,&r);
+            printf("{\"metadata_semantic_case\":\"%s\",\"digest_framing_valid\":true,\"status\":%d,\"slot0\":%d,\"slot1\":%d}\n",cases[kind],status,recovery.slots[0].status,recovery.slots[1].status); fflush(stdout);
+            assert(status==SFS_RECOVERY_REQUIRED&&r.status==SFS_RECOVERY_REQUIRED&&r.phase==SFS_PHASE_READ&&!r.system_errno&&!h&&recovery.slots[0].status==SFS_CORRUPT&&recovery.slots[1].status==SFS_CORRUPT); image_unwritten();
+        }
+        unchanged("image",p,n); free(p); retain(1211+(int)kind);
+    }
+    free(baseline);
+    /* Two separately FULL-valid versions are recoverable, but not an ordinary version-mixed pair. */
+    f=indexed_fixture_version(2,1,0,3); unsigned char metadata_slot[CELL]; memcpy(metadata_slot,f.p,CELL);
+    f.minor=2; fixture_node empty={0}, legacy=namespace_cell(&f,empty,empty,2,0); finish_fixture(&f,legacy,empty); memcpy(f.p,metadata_slot,CELL); fixture_save(&f);
+    reset("",0); h=NULL; assert(sfs_image_open(root,"image",&h,&r)==SFS_RECOVERY_REQUIRED&&!h); image_unwritten();
+    sfs_recovery recovery; OK(sfs_image_inspect(root,"image",&h,&recovery,&generous,&r)); assert(!recovery.pair_valid&&recovery.slots[0].status==SFS_OK&&recovery.slots[1].status==SFS_OK);
+    OK(sfs_image_select(h,0,&generous,&r)); sfs_metadata_entry m=metadata_get(h,0,2); assert(m.referenced_data_bytes==CELL);
+    size_t mixed_n; unsigned char *mixed=bytes("image",&mixed_n); memcpy(mixed,mixed+CELL,CELL); replace_image(mixed,mixed_n); reset("",0);
+    assert(sfs_image_select(h,0,&generous,&r)==SFS_CORRUPT); image_unwritten(); close_image(h); unchanged("image",mixed,mixed_n); free(mixed); retain(1223);
+    /* The established eviction graph now exercises codec3 metadata count contexts and DAT03 hashing. */
+    f=indexed_fixture_version(2,48*1201,3,3); fixture_save(&f); reset("",0); open_image(&h);
+    size_t large_n; unsigned char *large=bytes("image",&large_n), *space=namespace_at(large,selected_slot(large),large_n); watch_payload(0,space+64); watch_payload(1,raw_ref(large,leaf_row(large,space+64,2,large_n,440),0,large_n)); watch_count=2;
+    for(unsigned pass=0;pass<2;pass++) { reset("",0); watch_clear(); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE&&raw_hash_input==4132&&raw_hashes==1&&watch_bytes[1]==CELL&&watch_reads[0]>=2&&metadata_hash_input>4194304); counters("metadata-shared-evicted-full"); sfs_metadata_entry mm=metadata_get(h,3,2); assert(mm.referenced_data_bytes==48*UINT64_C(1201)*CELL); }
+    watch_count=0; large[watch_at[1]]^=1; replace_image(large,large_n); reset("",0); assert(sfs_image_verify(h,&generous,&r)==SFS_CORRUPT&&raw_hash_input>=4132); assert(sfs_image_commit(h,&r)==SFS_POISONED); image_unwritten(); close_image(h); unchanged("image",large,large_n); free(large); retain(1224);
+    sparse_aux_fixture_version(3); unsigned char digest[32],after_digest[32]; uint64_t length,after_length; file_digest("image",digest,&length); assert(length<=UINT64_C(268435456)); struct stat identity,after; assert(!lstat("image",&identity));
+    reset("",0); open_readonly(&h,&r); reset("",0); clock_calls=0; OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE&&aux_write_calls&&aux_write_bytes&&raw_hash_input==4132&&raw_hashes==1); image_unwritten(); counters("metadata-actual-aux-write-baseline");
+    reset("aux_enospc_cleanup",0); assert(sfs_image_verify(h,&generous,&r)==SFS_IO&&hit&&aux_write_calls&&r.phase==SFS_PHASE_VERIFY_AUX&&r.system_errno==ENOSPC&&!clock_calls); receipt("metadata-aux-first-error-enospc",&r); image_unwritten(); sfs_metadata_entry output; memset(&output,0xA5,sizeof(output)); sfs_metadata_entry canary=output;
+    assert(sfs_image_stat_metadata(h,0,2,&output,&r)==SFS_POISONED&&!memcmp(&output,&canary,sizeof(output))); reset("",0); close_image(h); file_digest("image",after_digest,&after_length); assert(length==after_length&&!memcmp(digest,after_digest,32)); assert(!lstat("image",&after)); identical_identity(&identity,&after);
+}
+static void metadata_indexes(void) {
+    sfs_image *h; sfs_result r; reset("",0); metadata_create(&h,TEST_CAPACITY); OK(sfs_image_begin(h,&r)); sfs_inode ids[300];
+    for(unsigned i=0;i<300;i++) { char name[24]; snprintf(name,sizeof(name),"metadata-%03u",i); metadata_clock(1000+i); ids[i]=add(h,1,name,SFS_FILE); assert(clock_calls==1); }
+    metadata_commit(h); assert(disk_level(1)>=2&&disk_level(2)>=2); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE); receipt("metadata-six-row-deep-index-full",&r);
+    sfs_view view; OK(sfs_image_begin(h,&r)); clock_calls=0; OK(sfs_image_snapshot(h,"deep",4,&view,&r)); metadata_commit(h); assert(!clock_calls); close_image(h);
+    size_t n; unsigned char *before=bytes("image",&n); struct stat identity,after; assert(!lstat("image",&identity)); reset("",0); open_readonly(&h,&r);
+    unsigned h_i=disk_level(1)+1,h_n=disk_level(2)+1, made=aux_created; reset("",0); clock_calls=0; sfs_metadata_entry m=metadata_get(h,0,ids[299]);
+    assert(m.mode==0100600&&m.uid==(uint32_t)geteuid()&&m.gid==(uint32_t)getegid()&&timestamp_is(m.birth,1299,1300)&&!m.referenced_data_bytes);
+    assert(image_read_bytes<=((uint64_t)h_i+h_n)*CELL&&!raw_hash_input&&!raw_hashes&&!aux_write_bytes&&aux_created==made&&!clock_calls); image_unwritten(); counters("metadata-cold-indexed-getter");
+    reset("",0); m=metadata_get(h,0,ids[299]); assert(!image_read_bytes&&!raw_hash_input&&!aux_write_bytes&&!clock_calls); image_unwritten();
+    reset("",0); m=metadata_get(h,0,1); assert(!raw_hash_input&&!aux_write_bytes&&!clock_calls&&!m.referenced_data_bytes); image_unwritten();
+    reset("",0); m=metadata_get(h,view,ids[299]); assert(timestamp_is(m.birth,1299,1300)&&image_read_bytes<=((uint64_t)h_i+h_n+4)*CELL&&!raw_hash_input&&!aux_write_bytes&&!clock_calls); image_unwritten(); close_image(h); unchanged("image",before,n); assert(!lstat("image",&after)); identical_identity(&identity,&after); free(before);
+    /* A cold getter failure leaves the whole combined output intact and does not sample time. */
+    for(unsigned failure=0;failure<2;failure++) {
+        reset("",0); open_readonly(&h,&r); sfs_verify_budget stop=generous; unsigned polls=0; stop.cancelled=cancel_now; stop.context=&polls;
+        assert(sfs_image_verify(h,&stop,&r)==SFS_INCOMPLETE&&polls&&!r.system_errno);
+        sfs_metadata_entry output,canary; memset(&canary,0xA5,sizeof(canary)); output=canary; reset(failure?"":"read_error",1); if(failure) fail_allocation=allocation_calls+1; clock_calls=0; clock_failure=1;
+        assert(sfs_image_stat_metadata(h,0,ids[299],&output,&r)==(failure?SFS_NOMEM:SFS_IO)&&hit&&r.phase==SFS_PHASE_READ&&r.system_errno==(failure?ENOMEM:EIO)&&!memcmp(&output,&canary,sizeof(output))&&!clock_calls); image_unwritten(); receipt("metadata-getter-failure-output-atomic",&r);
+        reset("",0); if(failure) { m=metadata_get(h,0,ids[299]); } else { assert(sfs_image_stat_metadata(h,0,ids[299],&output,&r)==SFS_POISONED&&!memcmp(&output,&canary,sizeof(output))); }
+        close_image(h);
+    }
+    clock_failure=0; open_image(&h); OK(sfs_image_begin(h,&r));
+    for(unsigned i=0;i<297;i++) { metadata_clock(2000+i); OK(sfs_image_remove(h,ids[i],&r)); assert(clock_calls==1); }
+    metadata_commit(h); assert(disk_level(1)==0); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE);
+    for(unsigned i=297;i<300;i++) { m=metadata_get(h,0,ids[i]); assert(timestamp_is(m.birth,1000+i,1001+i)); }
+    m=metadata_get(h,view,ids[0]); assert(timestamp_is(m.birth,1000,1001)); close_image(h);
+}
+static void metadata_invalid_requests(sfs_image *h,sfs_inode a,sfs_inode b) {
+    sfs_result r; sfs_metadata_update update={0}; sfs_metadata_initial in=metadata_input(SFS_FILE); size_t n; unsigned char *before=bytes("image",&n); reset("",0); clock_calls=0;
+    const unsigned fields[]={128,SFS_META_UID,SFS_META_ACCESS,SFS_META_MODE,SFS_META_MODIFICATION};
+    for(unsigned i=0;i<5;i++) {
+        memset(&update,0,sizeof(update)); update.fields=fields[i];
+        if(i==1) update.now=SFS_META_UID; if(i==2) update.now=SFS_META_BIRTH; if(i==3) update.mode=0040600; if(i==4) update.modification.nanoseconds=1000000000;
+        assert(sfs_image_set_metadata(h,a,&update,&r)==SFS_INVALID&&r.phase==SFS_PHASE_NONE&&!r.system_errno);
+    }
+    memset(&update,0,sizeof(update)); update.fields=SFS_META_FLAGS; update.flags=2;
+    assert(sfs_image_set_metadata(h,a,&update,&r)==SFS_UNSUPPORTED&&r.phase==SFS_PHASE_NONE&&!r.system_errno);
+    in.flags=2; sfs_inode out=UINT64_MAX; assert(sfs_image_add_metadata(h,1,"invalid",7,SFS_FILE,&in,&out,&r)==SFS_UNSUPPORTED&&out==UINT64_MAX);
+    in.flags=0; in.restore=8; assert(sfs_image_add_metadata(h,1,"invalid",7,SFS_FILE,&in,&out,&r)==SFS_INVALID&&out==UINT64_MAX);
+    in.restore=0; in.mode=0040700; assert(sfs_image_add_metadata(h,1,"invalid",7,SFS_FILE,&in,&out,&r)==SFS_INVALID&&out==UINT64_MAX);
+    assert(!clock_calls); image_unwritten(); unchanged("image",before,n); free(before);
+    /* Empty setter validates the other owner without flushing A; unknown inode is not a no-op. */
+    memset(&update,0,sizeof(update)); OK(sfs_image_set_metadata(h,b,&update,&r)); assert(sfs_image_set_metadata(h,UINT64_MAX,&update,&r)==SFS_NOT_FOUND); assert(!clock_calls); image_unwritten();
+}
+static void metadata_failures(void) {
+    sfs_image *h=NULL; sfs_result r; sfs_metadata_initial in=metadata_input(SFS_DIRECTORY);
+    for(unsigned failure=0;failure<3;failure++) { reset("",0); clock_at(5,failure==1?-1:failure==2?1000000000:0); clock_failure=failure==0;
+        assert(sfs_image_create_metadata(root,"image",TEST_CAPACITY,&in,&h,&r)==SFS_TIME_UNAVAILABLE&&!h&&r.phase==SFS_PHASE_NONE&&r.system_errno==(failure?0:ENXIO)&&clock_calls==1);
+        assert(access("image",F_OK)==-1&&errno==ENOENT); image_unwritten();
+    }
+    /* Invalid caller fields and unsupported flags are rejected before the source is sampled. */
+    clock_at(5,6); in.flags=2; assert(sfs_image_create_metadata(root,"image",TEST_CAPACITY,&in,&h,&r)==SFS_UNSUPPORTED&&!h&&!clock_calls); in.flags=0; in.modification.nanoseconds=1000000000;
+    assert(sfs_image_create_metadata(root,"image",TEST_CAPACITY,&in,&h,&r)==SFS_INVALID&&!h&&!clock_calls); assert(access("image",F_OK)==-1&&errno==ENOENT);
+    fixture f=indexed_fixture_version(2,1,1,3); fixture_save(&f); reset("",0); open_image(&h); OK(sfs_image_begin(h,&r)); metadata_clock(210); OK(sfs_image_write(h,2,0,"pending",7,&r)); assert(clock_calls==1);
+    metadata_invalid_requests(h,2,3); size_t n; unsigned char *before=bytes("image",&n); sfs_metadata_entry old=metadata_get(h,0,2); sfs_metadata_update update={0}; update.fields=SFS_META_UID; update.uid=77;
+    for(unsigned failure=0;failure<3;failure++) {
+        reset("",0); clock_at(7,failure==1?-1:failure==2?1000000000:0); clock_failure=failure==0;
+        assert(sfs_image_set_metadata(h,2,&update,&r)==SFS_TIME_UNAVAILABLE&&r.phase==SFS_PHASE_NONE&&r.system_errno==(failure?0:ENXIO)&&clock_calls==1); image_unwritten(); unchanged("image",before,n);
+        sfs_metadata_entry current=metadata_get(h,0,2); metadata_equal(&current,&old);
+    }
+    for(unsigned operation=0;operation<3;operation++) {
+        reset("",0); metadata_clock(219); clock_failure=1; sfs_inode output=UINT64_MAX; sfs_metadata_initial initial=metadata_input(SFS_FILE); enum sfs_status status;
+        if(operation==0) status=sfs_image_rename(h,2,1,"renamed",7,&r); else if(operation==1) status=sfs_image_remove(h,3,&r); else status=sfs_image_add_metadata(h,1,"new",3,SFS_FILE,&initial,&output,&r);
+        assert(status==SFS_TIME_UNAVAILABLE&&r.phase==SFS_PHASE_NONE&&r.system_errno==ENXIO&&clock_calls==1&&output==UINT64_MAX); image_unwritten(); unchanged("image",before,n);
+    }
+    reset("",0); metadata_clock(220); fail_allocation=allocation_calls+1;
+    assert(sfs_image_set_metadata(h,2,&update,&r)==SFS_NOMEM&&hit&&r.system_errno==ENOMEM); image_unwritten(); unchanged("image",before,n); reset("",0); metadata_commit(h); expect(h,0,2,"pending"); expect(h,1,2,"shared"); close_image(h); free(before); retain(1230);
+    /* Late NOMEM and image I/O retain tails but cannot expose a partial tuple/data edit. */
+    for(unsigned failure=0;failure<2;failure++) {
+        f=indexed_fixture_version(2,1,1,3); fixture_save(&f); reset("",0); open_image(&h); OK(sfs_image_begin(h,&r)); metadata_clock(230); OK(sfs_image_write(h,2,0,"pending",7,&r)); before=bytes("image",&n);
+        reset(failure?"write_error":"",failure?2:0); if(!failure) fail_after_append=1; metadata_clock(231);
+        enum sfs_status status=sfs_image_set_metadata(h,2,&update,&r); receipt(failure?"metadata-late-image-io":"metadata-late-nomem",&r);
+        assert(hit&&status==(failure?SFS_IO:SFS_NOMEM)&&r.system_errno==(failure?EIO:ENOMEM)&&clock_calls==1&&!fulls);
+        reset("",0); assert(sfs_image_commit(h,&r)==(failure?SFS_POISONED:SFS_STATE)); close_image(h);
+        size_t tail_n; unsigned char *tail=bytes("image",&tail_n); assert(tail_n>n&&!memcmp(tail+8192,before+8192,n-8192)); free(before); free(tail);
+        open_image(&h); expect(h,0,2,"shared"); expect(h,1,2,"shared"); sfs_metadata_entry m=metadata_get(h,0,2); assert(m.uid==1234); close_image(h); retain(1231+(int)failure);
+    }
+    f=indexed_fixture_version(2,1,1,3); fixture_save(&f); reset("",0); open_image(&h); OK(sfs_image_begin(h,&r));
+    sfs_verify_budget stop=generous; unsigned polls=0; stop.cancelled=cancel_now; stop.context=&polls; assert(sfs_image_verify(h,&stop,&r)==SFS_INCOMPLETE&&polls);
+    before=bytes("image",&n); reset("read_error",1); metadata_clock(239); clock_failure=1;
+    assert(sfs_image_set_metadata(h,2,&update,&r)==SFS_IO&&hit&&r.phase==SFS_PHASE_READ&&r.system_errno==EIO&&!clock_calls); image_unwritten(); assert(sfs_image_commit(h,&r)==SFS_POISONED); close_image(h); unchanged("image",before,n); free(before); retain(1236); clock_failure=0;
+    /* Observed image I/O remains fatal even when a later charge would stop verification. */
+    for(unsigned io=0;io<2;io++) {
+        f=indexed_fixture_version(2,1,1,3); fixture_save(&f); reset("",0); open_image(&h); OK(sfs_image_begin(h,&r)); metadata_clock(240); OK(sfs_image_write(h,2,0,"pending",7,&r)); before=bytes("image",&n);
+        sfs_verify_budget budget=generous; budget.metadata_read_bytes=CELL; reset(io?"slot_reads":"",io?1:0); clock_calls=0;
+        assert(sfs_image_verify(h,&budget,&r)==(io?SFS_IO:SFS_INCOMPLETE)&&r.system_errno==(io?EIO:0)&&r.phase==SFS_PHASE_READ&&!clock_calls); assert(io?hit:!hit); image_unwritten(); unchanged("image",before,n);
+        reset("",0); if(io) { assert(sfs_image_set_metadata(h,2,&update,&r)==SFS_POISONED&&sfs_image_commit(h,&r)==SFS_POISONED); } else { metadata_commit(h); expect(h,0,2,"pending"); }
+        close_image(h); free(before); retain(1233+(int)io);
+    }
+}
+static void metadata_capacity(void);
+static void metadata_atomic(void) { metadata_failures(); metadata_capacity(); metadata_indexes(); }
+static fixture metadata_parent_fixture(void) {
+    fixture f=indexed_fixture_version(4,1,0,3); unsigned char *space=namespace_at(f.p,f.p,f.n), *first=leaf_row(f.p,space+64,2,f.n,440), ext[56]; memcpy(ext,first+32,56);
+    unsigned char inodes[4*440]={0}, names[4*280]={0}; const char *text[]={"p","q","a","b"};
+    for(unsigned i=0;i<4;i++) {
+        unsigned char *row=inodes+i*440; put64(row,i+2); put64(row+8,i<2?1:i); put32(row+16,i<2?SFS_DIRECTORY:SFS_FILE); put32(row+20,1); row[88]=(unsigned char)text[i][0];
+        fixture_tuple(row+352,i<2?SFS_DIRECTORY:SFS_FILE,i<2?0:1); if(i>=2) { put64(row+24,6); memcpy(row+32,ext,56); }
+        row=names+i*280; put64(row,i<2?1:i); put32(row+8,1); row[12]=(unsigned char)text[i][0]; put64(row+267,i+2);
+    }
+    fixture_node ir=tree(&f,1,inodes,4), nr=tree(&f,2,names,4), historical=namespace_cell(&f,ir,nr,6,4);
+    unsigned char row[328]={0}; put32(row,1); memcpy(row+8,historical.ref,56); put32(row+64,6); memcpy(row+68,"before",6);
+    fixture_node catalog=tree(&f,4,row,1), current=namespace_cell(&f,ir,nr,6,4); finish_fixture(&f,current,catalog); return f;
+}
+static void metadata_capacity(void) {
+    const unsigned remaining[]={6,5,26,25,24,18};
+    /* Heights are one; old pending seal is3. Upper reservations are plan-derived, not timed. */
+    for(unsigned operation=0;operation<6;operation++) for(unsigned fit=0;fit<2;fit++) {
+        fixture f=metadata_parent_fixture(); size_t initial=f.n;
+        uint64_t capacity=initial+(UINT64_C(1)+remaining[operation]-(fit?0:1))*CELL;
+        for(unsigned i=0;i<2;i++) { put64(f.p+i*CELL+144,capacity); slot_hash(f.p+i*CELL); } fixture_save(&f);
+        sfs_image *h; sfs_result r; reset("",0); open_image(&h); OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE);
+        sfs_metadata_entry a=metadata_get(h,0,4), parent=metadata_get(h,0,2), other_parent=metadata_get(h,0,3), root_before=metadata_get(h,0,1);
+        OK(sfs_image_begin(h,&r)); metadata_clock(300); OK(sfs_image_write(h,4,0,"pending",7,&r)); assert(clock_calls==1);
+        size_t n; unsigned char *before=bytes("image",&n); assert(n==initial+CELL&&capacity-n==(remaining[operation]-(fit?0:1))*CELL); reset("",0); metadata_clock(301);
+        sfs_metadata_update update={0}; update.fields=SFS_META_UID; update.uid=77; sfs_metadata_initial in=metadata_input(SFS_FILE); sfs_inode output=UINT64_MAX;
+        enum sfs_status status;
+        if(operation<2) status=sfs_image_set_metadata(h,operation?1:4,&update,&r);
+        else if(operation==2) status=sfs_image_rename(h,4,3,"renamed",7,&r);
+        else if(operation==3) status=sfs_image_rename(h,4,2,"renamed",7,&r);
+        else if(operation==4) status=sfs_image_add_metadata(h,3,"new",3,SFS_FILE,&in,&output,&r);
+        else status=sfs_image_remove(h,5,&r);
+        printf("{\"metadata_capacity_operation\":%u,\"reservation_cells\":%u,\"fit\":%s,\"status\":%d,\"phase\":%d,\"appended_bytes\":%llu}\n",operation,remaining[operation],fit?"true":"false",status,r.phase,(unsigned long long)image_append_bytes); fflush(stdout);
+        if(!fit) {
+            assert(status==SFS_LIMIT&&r.phase==SFS_PHASE_ADMISSION&&!r.system_errno&&r.physical_end==n); image_unwritten(); unchanged("image",before,n);
+            assert(sfs_image_commit(h,&r)==SFS_STATE); sfs_metadata_entry m=metadata_get(h,0,4); metadata_equal(&m,&a); m=metadata_get(h,1,4); metadata_equal(&m,&a); m=metadata_get(h,0,2); metadata_equal(&m,&parent); m=metadata_get(h,0,3); metadata_equal(&m,&other_parent); m=metadata_get(h,0,1); metadata_equal(&m,&root_before); expect(h,0,4,"shared"); expect(h,1,4,"shared");
+            OK(sfs_image_begin(h,&r)); OK(sfs_image_abort(h,&r));
+        } else {
+            ok(status,&r); assert(clock_calls==1); metadata_commit(h); OK(sfs_image_stat_metadata(h,0,4,&a,&r)); assert(r.physical_end<=capacity); expect(h,0,4,"pending"); expect(h,1,4,"shared"); sfs_metadata_entry m=metadata_get(h,0,4); assert(m.entry.size==7&&m.referenced_data_bytes==CELL); assert(timestamp_is(m.modification,300,301));
+            if(operation==0) assert(m.uid==77&&timestamp_is(m.change,301,302));
+            if(operation==2||operation==3) assert(m.entry.parent==(operation==2?3:2)&&timestamp_is(m.change,301,302));
+            if(operation==1) { m=metadata_get(h,0,1); assert(m.uid==77); }
+            if(operation==4) assert(output!=UINT64_MAX);
+            OK(sfs_image_verify(h,&generous,&r)); assert(r.coverage==SFS_COVERAGE_FULL_REACHABLE);
+        }
+        close_image(h); if(!fit) unchanged("image",before,n); free(before); retain(1240+(int)(operation*2+fit));
+    }
+}
+
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -1721,7 +2101,9 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"parser")) { parser(); contexts(); type_alias_context(); } else if(!strcmp(argv[1],"limits")) limits();
     else if(!strcmp(argv[1],"indexes")) indexes(); else if(!strcmp(argv[1],"ranges")) ranges();
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
+    else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
+    if(strncmp(argv[1],"metadata",8)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }
