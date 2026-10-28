@@ -671,7 +671,11 @@ static void admission_unchanged(sfs_image *h, const unsigned char *before, size_
     if (status == SFS_OK) OK(sfs_image_abort(h, &r));
     OK(sfs_image_verify(h, &r));
 }
+static void cap_phase(const char *phase, const char *state) {
+    printf("{\"cap_phase\":\"%s\",\"state\":\"%s\"}\n", phase, state); fflush(stdout);
+}
 static void limits(void) {
+    cap_phase("file-name", "before");
     reset("", 0); sfs_image *h; sfs_result r; create(&h);
     OK(sfs_image_begin(h, &r)); char longest[SFS_NAME_MAX + 2]; memset(longest, 'x', sizeof(longest));
     sfs_inode id; OK(sfs_image_add(h, SFS_ROOT_INODE, longest, SFS_NAME_MAX, SFS_FILE, &id, &r));
@@ -684,18 +688,35 @@ static void limits(void) {
     reset("", 0); OK(sfs_image_begin(h, &r)); assert(sfs_image_add(h, SFS_ROOT_INODE, longest, SFS_NAME_MAX + 1, SFS_FILE, &id, &r) == SFS_LIMIT); admission_unchanged(h, before, n);
     reset("", 0); OK(sfs_image_begin(h, &r)); sfs_view invalid_view;
     assert(sfs_image_snapshot(h, longest, SFS_NAME_MAX + 1, &invalid_view, &r) == SFS_LIMIT); admission_unchanged(h, before, n);
-    free(before); free(payload);
+    free(before); free(payload); cap_phase("file-name", "after");
+    cap_phase("entries", "before");
     OK(sfs_image_begin(h, &r));
     for (unsigned i = 1; i < SFS_ENTRY_MAX; i++) { char name[32]; snprintf(name, sizeof(name), "file-%u", i); add(h, SFS_ROOT_INODE, name, SFS_FILE); }
     OK(sfs_image_commit(h, &r)); before = bytes("image", &n);
     reset("", 0); OK(sfs_image_begin(h, &r)); assert(sfs_image_add(h, SFS_ROOT_INODE, "over", 4, SFS_DIRECTORY, &id, &r) == SFS_LIMIT); admission_unchanged(h, before, n); free(before);
-    for (unsigned i = 0; i < SFS_SNAPSHOT_MAX; i++) {
-        char name[32]; snprintf(name, sizeof(name), "snapshot-%u", i); sfs_view view;
-        OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, i ? name : longest, i ? strlen(name) : SFS_NAME_MAX, &view, &r)); OK(sfs_image_commit(h, &r));
+    cap_phase("entries", "after");
+    cap_phase("snapshots-31", "before");
+    sfs_view view = 0, committed_view;
+    OK(sfs_image_begin(h, &r));
+    for (unsigned i = 0; i < 31; i++) {
+        char name[32]; snprintf(name, sizeof(name), "snapshot-%u", i);
+        OK(sfs_image_snapshot(h, i ? name : longest, i ? strlen(name) : SFS_NAME_MAX, &view, &r)); assert(view == i + 1);
     }
-    before = bytes("image", &n); sfs_view view;
+    assert(view == 31); OK(sfs_image_commit(h, &r));
+    OK(sfs_image_snapshot_view(h, longest, SFS_NAME_MAX, &committed_view, &r)); assert(committed_view == 1);
+    OK(sfs_image_snapshot_view(h, "snapshot-30", 11, &committed_view, &r)); assert(committed_view == 31);
+    cap_phase("snapshots-31", "after");
+    cap_phase("snapshot-32", "before");
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, "snapshot-31", 11, &view, &r)); assert(view == 32);
+    OK(sfs_image_commit(h, &r));
+    OK(sfs_image_snapshot_view(h, "snapshot-31", 11, &committed_view, &r)); assert(committed_view == 32);
+    cap_phase("snapshot-32", "after");
+    cap_phase("snapshot-33-refused", "before");
+    before = bytes("image", &n);
     reset("", 0); OK(sfs_image_begin(h, &r)); assert(sfs_image_snapshot(h, "over", 4, &view, &r) == SFS_LIMIT); admission_unchanged(h, before, n);
     OK(sfs_image_verify(h, &r)); close_image(h); unchanged("image", before, n);
+    cap_phase("snapshot-33-refused", "after");
+    cap_phase("generation-limit", "before");
     /* A valid adjacent pair at UINT64_MAX must refuse the next generation before I/O. */
     unsigned newest = get64(before + 40) > get64(before + 4096 + 40) ? 0 : 1;
     unsigned char *later = before + newest * 4096, *earlier = before + (1 - newest) * 4096;
@@ -707,6 +728,7 @@ static void limits(void) {
     if (status == SFS_OK) status = sfs_image_commit(h, &r);
     assert(status == SFS_LIMIT && writes == 0 && fulls == 0);
     admission_unchanged(h, before, n); close_image(h); free(before);
+    cap_phase("generation-limit", "after");
 }
 static void metadata(void) {
     reset("", 0); sfs_image *h; sfs_result r; create(&h); size_t n; unsigned char *before = bytes("image", &n); reset("", 0);

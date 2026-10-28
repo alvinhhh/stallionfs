@@ -1,6 +1,8 @@
 """Owned, offline APFS image qualification; no mount or hardware power-cut claim."""
 import json
+import io
 import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import shlex
 import shutil
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Offline image core requires macOS APFS')
@@ -55,15 +58,30 @@ class ImageCore(unittest.TestCase):
             shutil.rmtree(cls.base)
 
     def scenario(self, name, executable='normal'):
+        receipt = self.base / f'{executable}-{name}.json'
         try:
             result = subprocess.run([str(self.executables[executable]), name], cwd=self.base,
                                     capture_output=True, text=True, timeout=90)
-            receipt = self.base / f'{executable}-{name}.json'
             receipt.write_text(json.dumps({'scenario': name, 'returncode': result.returncode,
                                           'stdout': result.stdout, 'stderr': result.stderr}, indent=2))
             self.assertEqual(result.returncode, 0, f'{name}: {result.stderr}\n{result.stdout}\nRetained: {self.base}')
             self.assertIn(f'PASS {name}', result.stdout)
             print(result.stdout, end='', flush=True)
+        except subprocess.TimeoutExpired as error:
+            type(self).failed = True
+            details = {'scenario': name, 'returncode': None, 'timeout': True,
+                       'passed': False, 'timeout_seconds': error.timeout}
+            for stream in ('stdout', 'stderr'):
+                value = getattr(error, stream)
+                raw = value if isinstance(value, bytes) else (value or '').encode()
+                path = receipt.with_suffix(f'.{stream}.bin')
+                path.write_bytes(raw)
+                details[stream] = raw.decode(errors='backslashreplace')
+                details[f'{stream}_path'] = str(path)
+                print(f'{name} {stream} before timeout:\n{details[stream]}', file=sys.stderr, flush=True)
+            receipt.write_text(json.dumps(details, indent=2))
+            print(f'Image timeout evidence retained: {receipt}', file=sys.stderr, flush=True)
+            raise
         except BaseException:
             type(self).failed = True
             raise
@@ -101,3 +119,29 @@ class ImageCore(unittest.TestCase):
         except BaseException:
             type(self).failed = True
             raise
+
+
+class ImageDiagnostics(unittest.TestCase):
+    def test_timeout_preserves_partial_output_and_reraises(self):
+        with tempfile.TemporaryDirectory(prefix='stallionfs-image-diagnostics-') as temporary:
+            case = ImageCore('test_admission_file_entry_snapshot_name_and_generation_limits')
+            case.base = Path(temporary)
+            case.executables = {'normal': case.base / 'not-executed'}
+            output = b'{"cap_phase":"entries","state":"before"}\n\xff'
+            error = subprocess.TimeoutExpired(['normal', 'limits'], 90, output=output, stderr='partial error\n')
+            diagnostic = io.StringIO()
+            with mock.patch.object(ImageCore, 'failed', False, create=True), \
+                    mock.patch.object(subprocess, 'run', side_effect=error), redirect_stderr(diagnostic):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    case.scenario('limits')
+                self.assertIs(caught.exception, error)
+                self.assertTrue(ImageCore.failed)
+            receipt = json.loads((case.base / 'normal-limits.json').read_text())
+            self.assertTrue(receipt['timeout'])
+            self.assertFalse(receipt['passed'])
+            self.assertIsNone(receipt['returncode'])
+            self.assertEqual(receipt['timeout_seconds'], 90)
+            self.assertEqual(Path(receipt['stdout_path']).read_bytes(), output)
+            self.assertEqual(Path(receipt['stderr_path']).read_bytes(), b'partial error\n')
+            self.assertIn('cap_phase', diagnostic.getvalue())
+            self.assertNotIn('PASS limits', diagnostic.getvalue())
