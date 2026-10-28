@@ -33,12 +33,8 @@ jobs:
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
           import faulthandler
-          import json
           import os
           from pathlib import Path
-          import plistlib
-          import re
-          import subprocess
           import sys
           import unittest
           import stallionfs
@@ -47,71 +43,47 @@ jobs:
           checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
           assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
           assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
-          original = images._command
-
-          def inspect_image(args):
-              creating = args[1] == 'create'
-              image = os.path.realpath(args[-1]) if creating else None
-              device = None if creating else str(args[2])
-              response = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
-                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-              response.check_returncode()
-              records = plistlib.loads(response.stdout).get('images', [])
-              matches = [r for r in records if r.get('owner-uid') == os.getuid() and
-                         (os.path.realpath(r.get('image-path', '')) == image if creating else
-                          any(e.get('dev-entry') == device for e in r.get('system-entities', [])))]
-              devices = {e['dev-entry'] for r in matches for e in r.get('system-entities', [])
-                         if e.get('dev-entry')}
-              points = {e['mount-point'] for r in matches for e in r.get('system-entities', [])
-                        if e.get('mount-point')}
-              paths = {r['image-path'] for r in matches if r.get('image-path')}
-              raw_devices = {'/dev/r' + d[5:] for d in devices
-                             if re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', d)
-                             and os.path.exists('/dev/r' + d[5:])}
-              if image and os.path.exists(image):
-                  paths.add(image)
-              print('Image attachments:', json.dumps([{
-                  'image': r.get('image-path'), 'entities': r.get('system-entities', [])
-              } for r in matches]), file=sys.stderr, flush=True)
-              print('Matching mounts:', json.dumps([r for r in _scan.mounts()
-                    if r['device'] in devices or r['path'] in points]), file=sys.stderr, flush=True)
-              for options, names in (([], paths | devices | raw_devices), (['+f'], points)):
-                  if not names:
-                      continue
-                  result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'pcftn', *options, '--', *sorted(names)],
-                                          stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-                  print('Scoped lsof:', result.returncode, file=sys.stderr)
-                  print(result.stdout.decode(errors='replace'), file=sys.stderr)
-                  print(result.stderr.decode(errors='replace'), file=sys.stderr, flush=True)
-
-          def diagnostic_command(*args):
-              if len(args) < 2 or args[0] != '/usr/bin/hdiutil' or args[1] not in ('create', 'detach'):
-                  return original(*args)
-              try:
-                  return original(*args, '-verbose')
-              except BaseException as error:
-                  try:
-                      print('Image command failure (including intentional busy-volume checks):',
-                            repr(tuple(map(str, args))), str(error), file=sys.stderr, flush=True)
-                      inspect_image(args)
-                  except BaseException as inspection:
-                      try:
-                          print('Image diagnostics unavailable:', type(inspection).__name__,
-                                file=sys.stderr, flush=True)
-                      except BaseException:
-                          pass
-                  raise
-
-          images._command = diagnostic_command
+          sys.path.insert(0, str(checkout / 'tests'))
+          from image_failure_diagnostics import install
+          diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
           faulthandler.dump_traceback_later(300)
           suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          try:
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+          finally:
+              try:
+                  diagnostics.close()
+              except Exception as error:
+                  print('Diagnostic close failed:', type(error).__name__, file=sys.stderr)
           faulthandler.cancel_dump_traceback_later()
           required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and result.skipped
           if required_skips:
               print('Required filesystem tests were skipped.', file=sys.stderr)
           sys.exit(not result.wasSuccessful() or bool(required_skips))
           PY
+      - name: Validate bounded image diagnostic artifact
+        if: failure()
+        id: image-diagnostics
+        run: |
+          cd "$RUNNER_TEMP"
+          python -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'))
+          from image_failure_diagnostics import artifact_available
+          available = artifact_available(Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('available=' + str(available).lower() + '\n')
+          PY
+      - name: Upload bounded image failure diagnostics
+        if: failure() && steps.image-diagnostics.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-failure-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/image-failure-diagnostics/image-failures.jsonl
+          if-no-files-found: error
+          retention-days: 1
       - name: Check native code with sanitizers
         if: matrix.python == '3.13'
         env:
