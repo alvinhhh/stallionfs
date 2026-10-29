@@ -364,8 +364,8 @@ static int first_inode(enum operation operation, struct tree *tree, int input, i
         (identity->st_mode & S_IFMT) != (opened.st_mode & S_IFMT))) error = ESTALE;
     if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
     if (!error && !same_object(&opened, &created)) error = ESTALE;
-    /* Inherited read access must be removed before data or xattrs are copied. */
-    if (!error && clear_acl(output)) error = errno;
+    /* Root leaves can inherit ACLs; tree children have ACL-empty private parents. */
+    if (!error && !tree && clear_acl(output)) error = errno;
     if (!error && ordinary_metadata(input, output, identity,
         S_ISREG(identity->st_mode) ? COPYFILE_ALL | COPYFILE_DATA_SPARSE : COPYFILE_METADATA, &progress)) error = errno;
     if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;

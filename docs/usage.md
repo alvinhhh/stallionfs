@@ -27,6 +27,8 @@ Directory copying uses up to four workers. Files are pinned before cloning, link
 
 Copies and directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last.
 
+Ordinary copies of a single file or symlink also reject destination parents that grant inheritable file access to other users, before creating any output.
+
 `move` uses the filesystem's atomic rename operation. It treats the destination as an exact path, including when that path names a directory. The default refuses an existing destination. `--replace` replaces it; `--exchange` swaps two existing paths. Cross-volume moves fail without copying or deleting the source.
 
 `delete` removes files and symlinks. Directories require `--recursive`; mounted volumes and directories containing mounts are refused. Deletion is permanent and finishes before the command returns. It can stop after partial deletion if an entry cannot be removed. `--missing-ok` accepts an absent final entry, while other errors still fail.
