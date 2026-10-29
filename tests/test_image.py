@@ -7,10 +7,246 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import selectors
+import signal
+import time
 import sys
 import tempfile
 import unittest
 from unittest import mock
+
+
+_COMMAND_STREAM_CAP = 1024 * 1024
+_command_state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+
+
+def _exclusive(path, value):
+    data = value.encode() if isinstance(value, str) else value
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
+        stream.write(data)
+
+
+def _latch_command(kind, detail):
+    if _command_state['failure'] is None:
+        _command_state['failure'] = {'kind': kind, 'detail': detail}
+
+
+def _cancel_command(signum, _frame, *, state):
+    if state.get('cancellation_closed', False):
+        return
+    if state['first_signal'] is None:
+        state['first_signal'] = signum
+    state['signal_count'] += 1
+    if state['failure'] is None:
+        state['failure'] = {'kind': 'cancelled', 'detail': f'signal {signum}'}
+
+
+def _install_command_handlers():
+    state = _command_state
+
+    def cancel(signum, frame):
+        _cancel_command(signum, frame, state=state)
+
+    previous = {}
+    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous[number] = signal.signal(number, cancel)
+    return previous
+
+
+def _restore_command_handlers(previous):
+    for number, handler in previous.items():
+        signal.signal(number, handler)
+
+
+def _owned_command(argv, *, cwd, timeout, stem):
+    if _command_state['failure'] is not None:
+        raise RuntimeError(f'Further image commands refused: {_command_state["failure"]}')
+    assert _command_state['active'] is None
+    stem = Path(stem)
+    record = {'label': stem.name, 'argv': argv, 'cwd': str(cwd) if cwd else None,
+              'timeout_seconds': timeout, 'stream_cap_bytes': _COMMAND_STREAM_CAP,
+              'pid': None, 'pgid': None, 'phase': 'preparing', 'returncode': None,
+              'timeout': False, 'cap_reached': [], 'cleanup_errors': [],
+              'cleanup_uncertain': False, 'kill_attempts': 0, 'cleanup_started': False,
+              'stdout_retained_bytes': 0, 'stderr_retained_bytes': 0,
+              'stdout_discarded_bytes': 0, 'stderr_discarded_bytes': 0}
+    _command_state['active'] = record
+    proc = None
+    selector = None
+    outputs = {}
+    primary = None
+    started = time.monotonic()
+
+    def capture(cleaning=False):
+        for event, _ in selector.select(0.05):
+            name = event.data
+            try:
+                chunk = os.read(event.fileobj.fileno(), 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                selector.unregister(event.fileobj)
+                event.fileobj.close()
+                continue
+            key = name + '_retained_bytes'
+            keep = min(len(chunk), _COMMAND_STREAM_CAP - record[key])
+            written = outputs[name].write(chunk[:keep])
+            if written != keep:
+                raise OSError('Image command capture short write')
+            record[key] += written
+            record[name + '_discarded_bytes'] += len(chunk) - keep
+            if record[key] >= _COMMAND_STREAM_CAP:
+                if name not in record['cap_reached']:
+                    record['cap_reached'].append(name)
+                _latch_command('capture_limit', stem.name)
+                if not cleaning:
+                    raise RuntimeError(f'Image command capture limit: {stem}')
+
+    def cleanup_poll():
+        try:
+            return proc.poll()
+        except BaseException as error:
+            record['cleanup_errors'].append(repr(error))
+            record['cleanup_uncertain'] = True
+            return None
+
+    try:
+        selector = selectors.DefaultSelector()
+        _exclusive(str(stem) + '.started.json', json.dumps(record, indent=2) + '\n')
+        for name in ('stdout', 'stderr'):
+            path = Path(str(stem) + '.' + name + '.bin')
+            record[name + '_path'] = str(path)
+            outputs[name] = os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb', buffering=0)
+        if _command_state['failure'] is not None:
+            raise RuntimeError(f'Image command cancelled before launch: {_command_state["failure"]}')
+        record['phase'] = 'spawning'
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        record.update(pid=proc.pid, pgid=proc.pid, phase='running')
+        for name, pipe in (('stdout', proc.stdout), ('stderr', proc.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+        while selector.get_map() or proc.poll() is None:
+            if _command_state['first_signal'] is not None:
+                raise RuntimeError(f'Image command cancelled by signal {_command_state["first_signal"]}')
+            if time.monotonic() - started >= timeout:
+                record['timeout'] = True
+                raise subprocess.TimeoutExpired(argv, timeout)
+            capture()
+        if proc.returncode:
+            _latch_command('exit', f'{stem.name}: {proc.returncode}')
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise RuntimeError('Image command left an owned process group alive')
+    except BaseException as error:
+        primary = error
+        if isinstance(error, subprocess.TimeoutExpired):
+            record['timeout'] = True
+            _latch_command('timeout', stem.name)
+        else:
+            _latch_command('command_error', repr(error))
+    finally:
+        if proc is not None and (_command_state['failure'] is not None or primary is not None):
+            record['cleanup_started'] = True
+            record['phase'] = 'cleaning'
+            record['drain_deadline'] = time.monotonic() + 2
+            record['reap_deadline'] = record['drain_deadline'] + 2
+            record['kill_attempts'] += 1
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                record['cleanup_errors'].append(repr(error))
+                record['cleanup_uncertain'] = True
+            while selector is not None and selector.get_map() and time.monotonic() < record['drain_deadline']:
+                try:
+                    capture(cleaning=True)
+                except BaseException as error:
+                    record['cleanup_errors'].append(repr(error))
+                    record['cleanup_uncertain'] = True
+                    break
+            if selector is not None and selector.get_map():
+                record['cleanup_uncertain'] = True
+            if cleanup_poll() is None:
+                try:
+                    proc.wait(timeout=min(2, max(0, record['reap_deadline'] - time.monotonic())))
+                except BaseException as error:
+                    record['cleanup_errors'].append(repr(error))
+                    record['cleanup_uncertain'] = True
+            if cleanup_poll() is None:
+                record['cleanup_uncertain'] = True
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                record['group_alive_after_cleanup'] = False
+            except BaseException as error:
+                record['cleanup_errors'].append(repr(error))
+                record['cleanup_uncertain'] = True
+            else:
+                record['group_alive_after_cleanup'] = True
+                record['cleanup_uncertain'] = True
+        if proc is not None:
+            record['returncode'] = cleanup_poll()
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except BaseException as error:
+                    record['cleanup_errors'].append(repr(error))
+                    record['cleanup_uncertain'] = True
+        try:
+            if selector is not None:
+                selector.close()
+        except BaseException as error:
+            record['cleanup_errors'].append(repr(error))
+            record['cleanup_uncertain'] = True
+        for stream in outputs.values():
+            try:
+                stream.close()
+            except BaseException as error:
+                record['cleanup_errors'].append(repr(error))
+                record['cleanup_uncertain'] = True
+        record.update(phase='done', first_signal=_command_state['first_signal'],
+                      signal_count=_command_state['signal_count'], elapsed_seconds=time.monotonic() - started)
+        if record['cleanup_uncertain']:
+            _latch_command('cleanup_uncertain', stem.name)
+        record['first_failure'] = _command_state['failure']
+        record['primary_exception'] = repr(primary) if primary is not None else None
+        try:
+            _exclusive(str(stem) + '.command.json', json.dumps(record, indent=2) + '\n')
+        except BaseException as error:
+            _latch_command('receipt_error', repr(error))
+            if primary is None:
+                primary = error
+            elif hasattr(primary, 'add_note'):
+                primary.add_note(f'Command receipt capture also failed: {error!r}')
+        _command_state['active'] = None
+    try:
+        stdout = Path(record['stdout_path']).read_bytes() if 'stdout_path' in record and Path(record['stdout_path']).is_file() else b''
+        stderr = Path(record['stderr_path']).read_bytes() if 'stderr_path' in record and Path(record['stderr_path']).is_file() else b''
+    except BaseException as error:
+        _latch_command('capture_read_error', repr(error))
+        if primary is not None:
+            raise primary from error
+        raise
+    if isinstance(primary, subprocess.TimeoutExpired):
+        if primary.output is None:
+            primary.output = stdout
+        if primary.stderr is None:
+            primary.stderr = stderr
+    if primary is not None:
+        raise primary
+    if _command_state['failure'] is not None and not record['returncode']:
+        raise RuntimeError(f'Image command failed or incomplete: {_command_state["failure"]}')
+    try:
+        return subprocess.CompletedProcess(argv, record['returncode'], stdout.decode(), stderr.decode())
+    except BaseException as error:
+        _latch_command('decode_error', repr(error))
+        raise
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Offline image core requires macOS APFS')
@@ -26,7 +262,8 @@ class ImageCore(unittest.TestCase):
                       '-I', str(cls.source / 'filesystem'), *shlex.split(os.environ.get('CFLAGS', ''))]
         try:
             cls.compile('normal')
-        except BaseException:
+        except BaseException as error:
+            _latch_command('compile', repr(error))
             print(f'Image compilation evidence retained: {cls.base}', file=sys.stderr)
             raise
 
@@ -40,24 +277,29 @@ class ImageCore(unittest.TestCase):
                         'ftruncate', 'malloc', 'calloc', 'free', 'clock_gettime',
                         'CC_SHA256_Init', 'CC_SHA256_Update', 'CC_SHA256_Final')
         shim = cls.base / 'image-copy-hook.h'
-        shim.write_text('#include <string.h>\n'
+        shim_bytes = ('#include <string.h>\n'
                         'void *sfs_test_memcpy(void *, const void *, size_t);\n'
-                        '#undef memcpy\n#define memcpy sfs_test_memcpy\n')
+                        '#undef memcpy\n#define memcpy sfs_test_memcpy\n').encode()
+        if shim.exists():
+            assert shim.read_bytes() == shim_bytes
+        else:
+            _exclusive(shim, shim_bytes)
         commands = [
             [*cls.common, *defines, *(f'-D{n}=sfs_test_{n}' for n in replacements),
              '-include', str(shim), '-c', str(cls.source / 'filesystem/image.c'), '-o', str(obj)],
             [*cls.common, *defines, str(cls.source / 'tests/image_driver.c'), str(obj), '-o', str(exe)],
         ]
         for index, command in enumerate(commands):
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-            (cls.base / f'{name}-compile-{index}.txt').write_text(result.stdout + result.stderr)
+            result = _owned_command(command, cwd=None, timeout=60, stem=cls.base / f'command-{name}-compile-{index}')
+            _exclusive(cls.base / f'{name}-compile-{index}.txt', result.stdout + result.stderr)
             if result.returncode:
                 raise AssertionError(f'Image compilation failed; retained {cls.base}\n{result.stderr}')
             if index == 0:
-                symbols = subprocess.run(['/usr/bin/nm', '-u', str(obj)], capture_output=True,
-                                         text=True, timeout=60)
-                (cls.base / f'{name}-symbols.txt').write_text(symbols.stdout + symbols.stderr)
+                symbols = _owned_command(['/usr/bin/nm', '-u', str(obj)], cwd=None, timeout=60,
+                                         stem=cls.base / f'command-{name}-symbols')
+                _exclusive(cls.base / f'{name}-symbols.txt', symbols.stdout + symbols.stderr)
                 if symbols.returncode or not {'_sfs_test_memcpy', '_sfs_test_clock_gettime'} <= set(symbols.stdout.split()):
+                    _latch_command('symbols', name)
                     raise AssertionError(f'Image copy/clock hook absent; retained {cls.base}')
         cls.executables[name] = exe
         return exe
@@ -72,30 +314,40 @@ class ImageCore(unittest.TestCase):
     def scenario(self, name, executable='normal'):
         receipt = self.base / f'{executable}-{name}.json'
         try:
-            result = subprocess.run([str(self.executables[executable]), name], cwd=self.base,
-                                    capture_output=True, text=True, timeout=90)
-            receipt.write_text(json.dumps({'scenario': name, 'returncode': result.returncode,
+            result = _owned_command([str(self.executables[executable]), name], cwd=self.base,
+                                    timeout=90, stem=self.base / f'command-{executable}-{name}')
+            _exclusive(receipt, json.dumps({'scenario': name, 'returncode': result.returncode,
                                           'stdout': result.stdout, 'stderr': result.stderr}, indent=2))
             self.assertEqual(result.returncode, 0, f'{name}: {result.stderr}\n{result.stdout}\nRetained: {self.base}')
             self.assertIn(f'PASS {name}', result.stdout)
             print(result.stdout, end='', flush=True)
         except subprocess.TimeoutExpired as error:
             type(self).failed = True
-            details = {'scenario': name, 'returncode': None, 'timeout': True,
-                       'passed': False, 'timeout_seconds': error.timeout}
-            for stream in ('stdout', 'stderr'):
-                value = getattr(error, stream)
-                raw = value if isinstance(value, bytes) else (value or '').encode()
-                path = receipt.with_suffix(f'.{stream}.bin')
-                path.write_bytes(raw)
-                details[stream] = raw.decode(errors='backslashreplace')
-                details[f'{stream}_path'] = str(path)
-                print(f'{name} {stream} before timeout:\n{details[stream]}', file=sys.stderr, flush=True)
-            receipt.write_text(json.dumps(details, indent=2))
-            print(f'Image timeout evidence retained: {receipt}', file=sys.stderr, flush=True)
+            _latch_command('timeout', name)
+            try:
+                details = {'scenario': name, 'returncode': None, 'timeout': True,
+                           'passed': False, 'timeout_seconds': error.timeout}
+                for stream in ('stdout', 'stderr'):
+                    value = getattr(error, stream)
+                    raw = value if isinstance(value, bytes) else (value or '').encode()
+                    path = receipt.with_suffix(f'.{stream}.bin')
+                    _exclusive(path, raw)
+                    details[stream] = raw.decode(errors='backslashreplace')
+                    details[f'{stream}_path'] = str(path)
+                    print(f'{name} {stream} before timeout:\n{details[stream]}', file=sys.stderr, flush=True)
+                _exclusive(receipt, json.dumps(details, indent=2))
+                print(f'Image timeout evidence retained: {receipt}', file=sys.stderr, flush=True)
+            except BaseException as capture_error:
+                if hasattr(error, 'add_note'):
+                    error.add_note(f'Scenario timeout capture also failed: {capture_error!r}')
+                try:
+                    print(f'Scenario timeout capture also failed: {capture_error!r}', file=sys.stderr)
+                except BaseException:
+                    pass
             raise
-        except BaseException:
+        except BaseException as error:
             type(self).failed = True
+            _latch_command('scenario', repr(error))
             raise
 
     def test_create_reopen_atomic_snapshot_ranges_and_iteration(self):
@@ -154,9 +406,216 @@ class ImageCore(unittest.TestCase):
     def test_metadata_atomic_admission_clock_failures_and_bounded_getter(self):
         self.scenario('metadata-atomic')
 
+    def test_symlink_explicit_versions_and_legacy_capability(self):
+        self.scenario('symlink-versions')
+
+    def test_symlink_opaque_bytes_canaries_and_independent_target_bound(self):
+        try:
+            self.compile('symlink-limits', '-DSFS_FILE_MAX=UINT64_C(64)')
+            self.scenario('symlink-bytes', 'symlink-limits')
+        except BaseException:
+            type(self).failed = True
+            raise
+
+    def test_symlink_namespace_no_follow_and_canonical_resume(self):
+        self.scenario('symlink-namespace')
+
+    def test_symlink_metadata_committed_views_abort_and_recovery(self):
+        self.scenario('symlink-views')
+
+    def test_symlink_complete_reservation_faults_and_output_atomicity(self):
+        self.scenario('symlink-failures')
+
+    def test_symlink_full_semantics_shared_raw_budgets_and_eviction(self):
+        self.scenario('symlink-verify')
+
 
 class ImageDiagnostics(unittest.TestCase):
     def test_timeout_preserves_partial_output_and_reraises(self):
+        # Local pipes carry exact bytes; Popen, clocks and group signals are all synthetic.
+        profiles = [('compile-0', 'deadline'), ('compile-1', 'existing-timeout'),
+                    ('symbols', 'deadline'), ('scenario', 'deadline'), ('cap', 'cap'),
+                    ('exit', 'exit'), ('cancel', 'cancel'), ('cleanup', 'cleanup'),
+                    ('reap', 'reap'), ('launch', 'launch')]
+        for label, profile in profiles:
+            with self.subTest(command=label), tempfile.TemporaryDirectory(prefix='stallionfs-image-owned-diagnostic-') as temporary:
+                state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+                stem = Path(temporary) / label
+                output = b'partial output\n' if profile == 'exit' else b'partial \xff output\n'
+                error_output = b'partial error\n'
+                tick = [0.0]
+                killed = [False]
+                requested = [False]
+                writers = []
+                registered = {}
+                cleanup_deadlines = []
+                existing = subprocess.TimeoutExpired(['owned', label], 1)
+                fake = mock.Mock(pid=987654, returncode=None)
+                real_selector = selectors.DefaultSelector()
+                original_select = real_selector.select
+
+                def now():
+                    tick[0] += 0.25
+                    return tick[0]
+
+                def launch(argv, **kwargs):
+                    self.assertEqual(argv, ['owned', label])
+                    self.assertIs(kwargs['start_new_session'], True)
+                    self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
+                    if profile == 'launch':
+                        raise OSError('synthetic launch failure')
+                    for name, raw in (('stdout', output), ('stderr', error_output)):
+                        reader, writer = os.pipe()
+                        os.write(writer, raw)
+                        setattr(fake, name, os.fdopen(reader, 'rb', buffering=0))
+                        if profile == 'cleanup':
+                            writers.append(writer)
+                        else:
+                            os.close(writer)
+                    return fake
+
+                def poll():
+                    if profile == 'cancel' and not requested[0]:
+                        requested[0] = True
+                        registered[signal.SIGTERM](signal.SIGTERM, None)
+                    if profile == 'reap':
+                        return None
+                    if profile == 'exit':
+                        fake.returncode = 7
+                    elif killed[0]:
+                        fake.returncode = -signal.SIGKILL
+                    return fake.returncode
+
+                def group(pgid, number):
+                    self.assertEqual(pgid, fake.pid)
+                    if number == 0:
+                        if profile == 'reap':
+                            return
+                        raise ProcessLookupError()
+                    self.assertEqual(number, signal.SIGKILL)
+                    killed[0] = True
+                    self.assertEqual(state['active']['phase'], 'cleaning')
+                    cleanup_deadlines.append((state['active']['drain_deadline'], state['active']['reap_deadline']))
+                    if profile == 'cancel':
+                        registered[signal.SIGHUP](signal.SIGHUP, None)
+                        registered[signal.SIGINT](signal.SIGINT, None)
+                        self.assertEqual(cleanup_deadlines[-1], (state['active']['drain_deadline'], state['active']['reap_deadline']))
+
+                def select(timeout):
+                    active = state['active']
+                    if profile == 'cleanup' and active['phase'] == 'cleaning':
+                        raise OSError('synthetic cleanup capture failure')
+                    if profile == 'existing-timeout' and active['phase'] != 'cleaning' and active['stdout_retained_bytes'] and active['stderr_retained_bytes']:
+                        raise existing
+                    return original_select(timeout)
+
+                def install(number, handler):
+                    registered[number] = handler
+                    return signal.SIG_DFL
+
+                fake.poll.side_effect = poll
+                fake.wait.side_effect = subprocess.TimeoutExpired(['owned', label], 2)
+                cap = 8 if profile == 'cap' else _COMMAND_STREAM_CAP
+                try:
+                    with mock.patch(__name__ + '._command_state', state), \
+                            mock.patch(__name__ + '._COMMAND_STREAM_CAP', cap), \
+                            mock.patch.object(subprocess, 'Popen', side_effect=launch) as popen, \
+                            mock.patch.object(selectors, 'DefaultSelector', return_value=real_selector), \
+                            mock.patch.object(real_selector, 'select', side_effect=select), \
+                            mock.patch.object(time, 'monotonic', side_effect=now), \
+                            mock.patch.object(os, 'killpg', side_effect=group) as killpg, \
+                            mock.patch.object(signal, 'signal', side_effect=install):
+                        previous = _install_command_handlers()
+                        self.assertEqual(set(previous), {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+                        if profile == 'exit':
+                            result = _owned_command(['owned', label], cwd=temporary, timeout=1, stem=stem)
+                            self.assertEqual(result.returncode, 7)
+                        else:
+                            with self.assertRaises((subprocess.TimeoutExpired, RuntimeError, OSError)) as caught:
+                                _owned_command(['owned', label], cwd=temporary, timeout=1, stem=stem)
+                            if profile == 'existing-timeout':
+                                self.assertIs(caught.exception, existing)
+                            if isinstance(caught.exception, subprocess.TimeoutExpired):
+                                self.assertEqual(caught.exception.output, output)
+                                self.assertEqual(caught.exception.stderr, error_output)
+                        self.assertEqual(popen.call_count, 1)
+                        self.assertIsNone(state['active'])
+                        self.assertIsNotNone(state['failure'])
+                        next_stem = Path(temporary) / 'refused-next'
+                        with self.assertRaises(RuntimeError):
+                            _owned_command(['never'], cwd=temporary, timeout=1, stem=next_stem)
+                        self.assertEqual(popen.call_count, 1)
+                        self.assertFalse(list(Path(temporary).glob('refused-next*')))
+                        receipt = json.loads(Path(str(stem) + '.command.json').read_text())
+                        self.assertEqual(Path(receipt['stdout_path']).read_bytes(), b'' if profile == 'launch' else output[:cap])
+                        self.assertEqual(Path(receipt['stderr_path']).read_bytes(), b'' if profile == 'launch' else error_output[:cap])
+                        self.assertEqual(receipt['first_failure'], state['failure'])
+                        if profile == 'launch':
+                            self.assertEqual(receipt['kill_attempts'], 0)
+                            self.assertEqual(killpg.call_count, 0)
+                        else:
+                            self.assertEqual(receipt['pid'], fake.pid)
+                            self.assertEqual(receipt['pgid'], fake.pid)
+                            self.assertEqual(receipt['kill_attempts'], 1)
+                        if profile == 'cancel':
+                            self.assertEqual(receipt['first_signal'], signal.SIGTERM)
+                            self.assertEqual(receipt['signal_count'], 3)
+                            self.assertEqual(receipt['first_failure']['kind'], 'cancelled')
+                            self.assertEqual(len(cleanup_deadlines), 1)
+                            self.assertFalse(receipt['timeout'])
+                        if profile == 'cap':
+                            self.assertIn('stdout', receipt['cap_reached'])
+                            self.assertEqual(receipt['first_failure']['kind'], 'capture_limit')
+                            self.assertFalse(receipt['timeout'])
+                        if profile in ('cleanup', 'reap'):
+                            self.assertTrue(receipt['cleanup_uncertain'])
+                            self.assertTrue(receipt['cleanup_errors'])
+                            self.assertEqual(receipt['first_failure']['kind'], 'timeout')
+                        if profile == 'reap':
+                            self.assertLessEqual(fake.wait.call_args.kwargs['timeout'], 2)
+                        _restore_command_handlers(previous)
+                finally:
+                    real_selector.close()
+                    for writer in writers:
+                        os.close(writer)
+        # An installed handler keeps its state even while diagnostics replace the global.
+        qualification_state = _command_state
+        for first_failure in (None, {'kind': 'timeout', 'detail': 'earlier failure'}):
+            live = {'failure': first_failure, 'active': None, 'first_signal': None, 'signal_count': 0}
+            synthetic = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+            registered = {}
+
+            def install(number, handler):
+                registered[number] = handler
+                return signal.SIG_DFL
+
+            with mock.patch(__name__ + '._command_state', live), \
+                    mock.patch.object(signal, 'signal', side_effect=install):
+                previous = _install_command_handlers()
+                installed = registered[signal.SIGTERM]
+                with mock.patch(__name__ + '._command_state', synthetic):
+                    self.assertIsNone(synthetic['failure'])
+                    installed(signal.SIGTERM, None)
+                    installed(signal.SIGHUP, None)
+                self.assertEqual(live['first_signal'], signal.SIGTERM)
+                self.assertEqual(live['signal_count'], 2)
+                self.assertIsNone(synthetic['failure'])
+                self.assertEqual(synthetic['signal_count'], 0)
+                if first_failure is None:
+                    self.assertEqual(live['failure']['kind'], 'cancelled')
+                else:
+                    self.assertIs(live['failure'], first_failure)
+                _restore_command_handlers(previous)
+            self.assertIs(_command_state, qualification_state)
+        # A signal before admission creates neither a child nor new capture files.
+        with tempfile.TemporaryDirectory(prefix='stallionfs-image-prelaunch-diagnostic-') as temporary:
+            state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+            with mock.patch(__name__ + '._command_state', state), mock.patch.object(subprocess, 'Popen') as popen:
+                _cancel_command(signal.SIGTERM, None, state=state)
+                with self.assertRaises(RuntimeError):
+                    _owned_command(['never'], cwd=temporary, timeout=1, stem=Path(temporary) / 'refused')
+                popen.assert_not_called()
+                self.assertEqual(list(Path(temporary).iterdir()), [])
         with tempfile.TemporaryDirectory(prefix='stallionfs-image-diagnostics-') as temporary:
             case = ImageCore('test_admission_file_entry_snapshot_name_and_generation_limits')
             case.base = Path(temporary)
@@ -165,7 +624,8 @@ class ImageDiagnostics(unittest.TestCase):
             error = subprocess.TimeoutExpired(['normal', 'limits'], 90, output=output, stderr='partial error\n')
             diagnostic = io.StringIO()
             with mock.patch.object(ImageCore, 'failed', False, create=True), \
-                    mock.patch.object(subprocess, 'run', side_effect=error), redirect_stderr(diagnostic):
+                    mock.patch(__name__ + '._command_state', {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}), \
+                    mock.patch(__name__ + '._owned_command', side_effect=error), redirect_stderr(diagnostic):
                 with self.assertRaises(subprocess.TimeoutExpired) as caught:
                     case.scenario('limits')
                 self.assertIs(caught.exception, error)

@@ -11,6 +11,7 @@ typedef uint32_t sfs_view; /* 0: current namespace; 1..32: immutable snapshots. 
 
 #define SFS_ROOT_INODE UINT64_C(1)
 #define SFS_NAME_MAX 255u
+#define SFS_SYMLINK_MAX 4096u
 #ifndef SFS_IMAGE_MAX
 #define SFS_IMAGE_MAX UINT64_C(9223372036854771712)
 #endif
@@ -41,7 +42,7 @@ enum sfs_phase {
     SFS_PHASE_FINAL_BARRIER, SFS_PHASE_IDENTITY, SFS_PHASE_CLOSE,
     SFS_PHASE_VERIFY_AUX
 };
-enum sfs_kind { SFS_DIRECTORY = 1, SFS_FILE = 2 };
+enum sfs_kind { SFS_DIRECTORY = 1, SFS_FILE = 2, SFS_SYMLINK = 3 };
 enum sfs_coverage {
     SFS_COVERAGE_NONE, SFS_COVERAGE_FULL_REACHABLE,
     SFS_COVERAGE_ROOT_ONLY, SFS_COVERAGE_TOUCHED
@@ -113,6 +114,27 @@ typedef struct {
 enum sfs_status sfs_image_create_metadata(const char *directory, const char *name,
                                         uint64_t capacity, const sfs_metadata_initial *root,
                                         sfs_image **out, sfs_result *result);
+/* Explicit producer selection: only minor 3 or 4. No conversion or latest default.
+ * Unsupported requested minor returns UNSUPPORTED before clock/image creation. */
+enum sfs_status sfs_image_create_metadata_version(const char *directory, const char *name,
+                                                uint64_t capacity, uint32_t minor,
+                                                const sfs_metadata_initial *root,
+                                                sfs_image **out, sfs_result *result);
+/* Format 0.4 only. Target is 1..4096 opaque, non-NUL bytes, never followed.
+ * Mode includes S_IFLNK. Creation is atomic with the namespace edit; failure
+ * leaves the inode output unchanged. Generic add remains file/directory only. */
+enum sfs_status sfs_image_symlink_metadata(sfs_image *, sfs_inode parent,
+                                         const void *name, size_t name_length,
+                                         const void *target, size_t target_length,
+                                         const sfs_metadata_initial *, sfs_inode *out,
+                                         sfs_result *);
+/* Reads committed target bytes without a terminator or target resolution.
+ * After valid output arguments, failure sets count to zero and leaves target
+ * bytes intact. A short buffer returns LIMIT without target traversal. The
+ * 4096-byte stored-target policy is not a native import/export guarantee. */
+enum sfs_status sfs_image_readlink(sfs_image *, sfs_view, sfs_inode,
+                                 void *target, size_t capacity, size_t *read_count,
+                                 sfs_result *);
 enum sfs_status sfs_image_add_metadata(sfs_image *, sfs_inode parent,
                                      const void *name, size_t name_length,
                                      enum sfs_kind, const sfs_metadata_initial *,
