@@ -429,6 +429,29 @@ class ImageCore(unittest.TestCase):
     def test_symlink_full_semantics_shared_raw_budgets_and_eviction(self):
         self.scenario('symlink-verify')
 
+    def test_xattr_versions_legacy_refusal_and_explicit_codec(self):
+        self.scenario('xattr-versions')
+
+    def test_xattr_exact_binary_values_names_ranges_and_enumeration(self):
+        self.scenario('xattr-values')
+
+    def test_xattr_namespace_metadata_no_follow_and_large_owner_prefix(self):
+        self.scenario('xattr-namespace')
+
+    def test_xattr_committed_snapshots_readonly_recovery_and_digest_binding(self):
+        self.scenario('xattr-views')
+
+    def test_xattr_atomic_capacity_faults_zero_seal_and_checked_prefix(self):
+        try:
+            self.compile('limits', '-DSFS_FILE_MAX=UINT64_C(4194304)', '-DSFS_ENTRY_MAX=1024u')
+            self.scenario('xattr-failures', 'limits')
+        except BaseException:
+            type(self).failed = True
+            raise
+
+    def test_xattr_full_semantics_dense_contexts_budgets_and_target_memo(self):
+        self.scenario('xattr-verify')
+
 
 class ImageDiagnostics(unittest.TestCase):
     def test_timeout_preserves_partial_output_and_reraises(self):

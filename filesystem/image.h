@@ -114,13 +114,13 @@ typedef struct {
 enum sfs_status sfs_image_create_metadata(const char *directory, const char *name,
                                         uint64_t capacity, const sfs_metadata_initial *root,
                                         sfs_image **out, sfs_result *result);
-/* Explicit producer selection: only minor 3 or 4. No conversion or latest default.
+/* Explicit producer selection: only minor 3, 4 or 5. No conversion or latest default.
  * Unsupported requested minor returns UNSUPPORTED before clock/image creation. */
 enum sfs_status sfs_image_create_metadata_version(const char *directory, const char *name,
                                                 uint64_t capacity, uint32_t minor,
                                                 const sfs_metadata_initial *root,
                                                 sfs_image **out, sfs_result *result);
-/* Format 0.4 only. Target is 1..4096 opaque, non-NUL bytes, never followed.
+/* Formats 0.4/0.5. Target is 1..4096 opaque, non-NUL bytes, never followed.
  * Mode includes S_IFLNK. Creation is atomic with the namespace edit; failure
  * leaves the inode output unchanged. Generic add remains file/directory only. */
 enum sfs_status sfs_image_symlink_metadata(sfs_image *, sfs_inode parent,
@@ -152,6 +152,29 @@ enum sfs_status sfs_image_set_metadata(sfs_image *, sfs_inode,
  * (zero for a malformed sample). Failure leaves nonnull getter output intact. */
 enum sfs_status sfs_image_stat_metadata(sfs_image *, sfs_view, sfs_inode,
                                       sfs_metadata_entry *out, sfs_result *);
+
+/* Format 0.5: opaque non-NUL names, 1..255 bytes; owners are never followed.
+ * Set atomically replaces the complete binary value (NULL permits length zero).
+ * The caller keeps input stable through the call, without output overlap.
+ * Set/remove update only owner ctime. Reads use committed explicit views.
+ * Size and next outputs remain unchanged on failure. Read reports a checked
+ * prefix through read_count after valid arguments; values have no terminator.
+ * Enumeration binds the successful open/select generation and commit digest.
+ * NULL after_name with zero length starts; otherwise seek strictly after it. */
+typedef struct { uint64_t size; size_t name_length; uint8_t name[SFS_NAME_MAX]; } sfs_xattr_entry;
+enum sfs_status sfs_image_set_xattr(sfs_image *, sfs_inode,
+    const void *name, size_t name_length, const void *value, size_t length, sfs_result *);
+enum sfs_status sfs_image_remove_xattr(sfs_image *, sfs_inode,
+    const void *name, size_t name_length, sfs_result *);
+enum sfs_status sfs_image_xattr_size(sfs_image *, sfs_view, sfs_inode,
+    const void *name, size_t name_length, uint64_t *size, sfs_result *);
+enum sfs_status sfs_image_read_xattr(sfs_image *, sfs_view, sfs_inode,
+    const void *name, size_t name_length, uint64_t offset,
+    void *data, size_t capacity, size_t *read_count, sfs_result *);
+enum sfs_status sfs_image_next_xattr(sfs_image *, sfs_view,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    sfs_inode owner, const void *after_name, size_t after_length,
+    sfs_xattr_entry *out, int *found, sfs_result *);
 
 /* directory must be owned, private, local writable APFS; name is one component.
  * create never removes a failed image. open never initializes or repairs one.

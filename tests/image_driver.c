@@ -67,6 +67,7 @@ static uint64_t raw_hash_input, metadata_hash_input, raw_hashes, copies;
 static uint64_t overlay_clone_bytes, overlay_clone_calls, observed_clone_size;
 static uint64_t allocated, peak_allocated, allocation_calls;
 static uint64_t fail_allocation, fail_after_append;
+static unsigned arena_allocations, fail_arena_allocation;
 static unsigned aux_created, aux_removed;
 static struct { CC_SHA256_CTX *context; int raw; } hash_context[8];
 typedef union allocation_header allocation_header;
@@ -87,6 +88,8 @@ void *sfs_test_malloc(size_t n) {
     return p + 1;
 }
 void *sfs_test_calloc(size_t n, size_t size) {
+    /* Match only arena headers; payload, prefix and cache buffers have other sizes. */
+    if (n == 1 && size == 8272 && ++arena_allocations == fail_arena_allocation) { hit++; errno = ENOMEM; return NULL; }
     if (size && n > SIZE_MAX / size) { errno = ENOMEM; return NULL; }
     void *p = sfs_test_malloc(n * size); if (p) memset(p, 0, n * size); return p;
 }
@@ -112,7 +115,7 @@ int sfs_test_CC_SHA256_Init(CC_SHA256_CTX *c) {
 }
 int sfs_test_CC_SHA256_Update(CC_SHA256_CTX *c, const void *p, CC_LONG n) {
     for (unsigned i = 0; i < 8; i++) if (hash_context[i].context == c) {
-        if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8) || !memcmp(p, "SFSDAT04", 8))) hash_context[i].raw = 1;
+        if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8) || !memcmp(p, "SFSDAT04", 8) || !memcmp(p, "SFSDAT05", 8))) hash_context[i].raw = 1;
         if (hash_context[i].raw) raw_hash_input += n; else metadata_hash_input += n;
         return CC_SHA256_Update(c, p, n);
     }
@@ -159,7 +162,7 @@ static void reset(const char *kind, int nth) {
     aux_write_calls = image_truncates = 0; image_open_fd=-1; image_open_flags=0;
     raw_hash_input = metadata_hash_input = raw_hashes = copies = 0;
     overlay_clone_bytes = overlay_clone_calls = observed_clone_size = 0;
-    fail_allocation = fail_after_append = 0;
+    fail_allocation = fail_after_append = 0; arena_allocations = fail_arena_allocation = 0;
 }
 static int is(const char *kind) { return !strcmp(fault, kind); }
 static void event(char c) { size_t n = strlen(order); if (n + 1 < sizeof(order)) { order[n] = c; order[n + 1] = 0; } }
@@ -261,7 +264,7 @@ int sfs_test_fcntl(int fd, int command, ...) {
     if (fulls == 1) {
         struct stat st; unsigned char last[CELL]; assert(!fstat(fd, &st) && st.st_size >= 16384 && !(st.st_size % CELL));
         assert(pread(fd, last, CELL, st.st_size - CELL) == CELL);
-        assert((!memcmp(last, "SFSREC02", 8) || !memcmp(last, "SFSREC03", 8) || !memcmp(last, "SFSREC04", 8)) && last[8] == 4);
+        assert((!memcmp(last, "SFSREC02", 8) || !memcmp(last, "SFSREC03", 8) || !memcmp(last, "SFSREC04", 8) || !memcmp(last, "SFSREC05", 8)) && last[8] == 4);
         /* The final commit-root exists before the first publication fence. */
         for (unsigned i = 0; i < 2; i++) { const unsigned char *ref = last + 64 + i * 56; if (ref[0]) { uint64_t offset = 0; for (int j = 7; j >= 0; j--) offset = (offset << 8) | ref[8+j]; assert(offset < (uint64_t)st.st_size - CELL); } }
     }
@@ -591,7 +594,7 @@ static unsigned char *record(unsigned char *image, const unsigned char *ref, siz
 static void ref_hash(unsigned char *image, unsigned char *ref, size_t size) {
     unsigned char *p = record(image, ref, size);
     if (get32(ref) == 6) {
-        unsigned char domain[36]; memcpy(domain, get32(image + 12) == 4 ? "SFSDAT04" : get32(image + 12) == 3 ? "SFSDAT03" : "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
+        unsigned char domain[36]; memcpy(domain, get32(image + 12) == 5 ? "SFSDAT05" : get32(image + 12) == 4 ? "SFSDAT04" : get32(image + 12) == 3 ? "SFSDAT03" : "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
         put32(domain + 24, 6); put64(domain + 28, CELL); CC_SHA256_CTX c;
         CC_SHA256_Init(&c); CC_SHA256_Update(&c, domain, sizeof(domain)); CC_SHA256_Update(&c, p, CELL); CC_SHA256_Final(ref + 24, &c);
     } else CC_SHA256(p, CELL, ref + 24);
@@ -648,10 +651,10 @@ static fixture_node append_cell(fixture *f, unsigned type, const unsigned char *
     f->n += CELL; ref_hash(f->p, node.ref, f->n); return node;
 }
 static void envelope(fixture *f, unsigned char *p, unsigned type) {
-    memset(p, 0, CELL); memcpy(p, f->minor == 4 ? "SFSREC04" : f->minor == 3 ? "SFSREC03" : "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
+    memset(p, 0, CELL); memcpy(p, f->minor == 5 ? "SFSREC05" : f->minor == 4 ? "SFSREC04" : f->minor == 3 ? "SFSREC03" : "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
 }
 static void row_key(unsigned map, const unsigned char *row, unsigned char *key, uint16_t *n) {
-    if (map == 2) { *n = (uint16_t)(8 + get32(row + 8)); big64(key, get64(row)); memcpy(key + 8, row + 12, *n - 8); }
+    if ((map == 2 || map == 5)) { *n = (uint16_t)(8 + get32(row + 8)); big64(key, get64(row)); memcpy(key + 8, row + 12, *n - 8); }
     else { *n = 8; big64(key, map == 4 ? get32(row) : get64(row)); }
 }
 static fixture_node page(fixture *f, unsigned map, unsigned level, const unsigned char *rows, unsigned count, unsigned stride, const fixture_node *children) {
@@ -660,17 +663,17 @@ static fixture_node page(fixture *f, unsigned map, unsigned level, const unsigne
     if (level) {
         node.min_n = children[0].min_n; memcpy(node.min, children[0].min, node.min_n);
         node.max_n = children[count - 1].max_n; memcpy(node.max, children[count - 1].max, node.max_n);
-        for (unsigned i = 0; i < count; i++) { unsigned char *r = p + 640 + i * stride; put32(r, children[i].min_n); memcpy(r + 8, children[i].min, children[i].min_n); memcpy(r + (map == 2 ? 271 : 16), children[i].ref, 56); }
+        for (unsigned i = 0; i < count; i++) { unsigned char *r = p + 640 + i * stride; put32(r, children[i].min_n); memcpy(r + 8, children[i].min, children[i].min_n); memcpy(r + ((map == 2 || map == 5) ? 271 : 16), children[i].ref, 56); }
     } else { memcpy(p + 640, rows, count * stride); row_key(map, rows, node.min, &node.min_n); row_key(map, rows + (count - 1) * stride, node.max, &node.max_n); }
     put16(p + 88, node.min_n); put16(p + 90, node.max_n); memcpy(p + 112, node.min, node.min_n); memcpy(p + 375, node.max, node.max_n);
     fixture_node cell = append_cell(f, 5, p); memcpy(node.ref, cell.ref, 56); return node;
 }
 static fixture_node tree(fixture *f, unsigned map, const unsigned char *rows, unsigned count) {
-    const unsigned leaf_stride[] = {0,(f->minor == 3 || f->minor == 4) ? 440u : 352u,280,72,328}, leaf_max[] = {0,(f->minor == 3 || f->minor == 4) ? 6u : 9u,12,48,9};
+    const unsigned leaf_stride[] = {0,(f->minor == 3 || f->minor == 4 || f->minor == 5) ? 440u : 352u,280,72,328,352}, leaf_max[] = {0,(f->minor == 3 || f->minor == 4 || f->minor == 5) ? 6u : 9u,12,48,9,9};
     assert(count); unsigned groups = (count + leaf_max[map] - 1) / leaf_max[map];
     fixture_node *nodes = calloc(groups, sizeof(*nodes)); assert(nodes); unsigned at = 0;
     for (unsigned i = 0; i < groups; i++) { unsigned size = count / groups + (i < count % groups); nodes[i] = page(f, map, 0, rows + at * leaf_stride[map], size, leaf_stride[map], NULL); at += size; }
-    unsigned level = 0, max = map == 2 ? 9 : 48, stride = map == 2 ? 328 : 72;
+    unsigned level = 0, max = (map == 2 || map == 5) ? 9 : 48, stride = (map == 2 || map == 5) ? 328 : 72;
     while (groups > 1) { unsigned parents = (groups + max - 1) / max, used = 0; level++;
         for (unsigned i = 0; i < parents; i++) { unsigned size = groups / parents + (i < groups % parents); nodes[i] = page(f, map, level, NULL, size, stride, nodes + used); used += size; }
         groups = parents;
@@ -683,7 +686,7 @@ static void fixture_tuple(unsigned char *p, unsigned kind, uint64_t mappings) {
     put32(p+64,kind==SFS_FILE?0100600:0040700); put32(p+68,1234); put32(p+72,5678); put64(p+80,mappings);
 }
 static fixture_node namespace_cell(fixture *f, fixture_node inodes, fixture_node names, uint64_t next, uint64_t count) {
-    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); if(f->minor==3||f->minor==4) fixture_tuple(p+192,SFS_DIRECTORY,0); return append_cell(f, 2, p);
+    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); if(f->minor==3||f->minor==4||f->minor==5) fixture_tuple(p+192,SFS_DIRECTORY,0); return append_cell(f, 2, p);
 }
 static void finish_fixture(fixture *f, fixture_node ns, fixture_node catalog) {
     unsigned char p[CELL]; envelope(f, p, 4); memcpy(p + 64, ns.ref, 56); memcpy(p + 120, catalog.ref, 56); fixture_node root_node = append_cell(f, 4, p);
@@ -691,13 +694,13 @@ static void finish_fixture(fixture *f, fixture_node ns, fixture_node catalog) {
 }
 /* Shared raw and extent graphs are deliberate; namespace rows remain independently encoded. */
 static fixture indexed_fixture_version(unsigned inode_count, unsigned extent_rows, unsigned snapshots, unsigned minor) {
-    fixture f = fixture_start(); f.minor=minor; put32(f.p+12,minor); unsigned stride=(minor==3||minor==4)?440:352; unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); fixture_node data = append_cell(&f, 6, raw), extent = {0};
+    fixture f = fixture_start(); f.minor=minor; put32(f.p+12,minor); unsigned stride=(minor==3||minor==4||minor==5)?440:352; unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); fixture_node data = append_cell(&f, 6, raw), extent = {0};
     if (extent_rows) { unsigned char *rows = calloc(extent_rows, 72); assert(rows); for (unsigned i = 0; i < extent_rows; i++) { put64(rows + i * 72, i); memcpy(rows + i * 72 + 8, data.ref, 56); put16(rows + i * 72 + 64, 6); } extent = tree(&f, 3, rows, extent_rows); free(rows); }
     unsigned char *ir = calloc(inode_count, stride), *nr = calloc(inode_count, 280); assert(ir && nr);
     for (unsigned i = 0; i < inode_count; i++) { char name[32]; int length = snprintf(name, sizeof(name), "f%08u", i); assert(length == 9);
         unsigned char *a = ir + i * stride, *b = nr + i * 280; put64(a, i + 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 9); memcpy(a + 88, name, 9);
         if (extent_rows) { put64(a + 24, (extent_rows - 1) * (uint64_t)CELL + 6); memcpy(a + 32, extent.ref, 56); }
-        if(minor==3||minor==4) fixture_tuple(a+352,SFS_FILE,extent_rows);
+        if(minor==3||minor==4||minor==5) fixture_tuple(a+352,SFS_FILE,extent_rows);
         put64(b, 1); put32(b + 8, 9); memcpy(b + 12, name, 9); put64(b + 267, i + 2);
     }
     fixture_node inodes = tree(&f, 1, ir, inode_count), names = tree(&f, 2, nr, inode_count); free(ir); free(nr);
@@ -2163,7 +2166,7 @@ static void symlink_full(sfs_image *h) {
 }
 static void symlink_versions(void) {
     sfs_image *h = NULL; sfs_result r; sfs_metadata_initial in = metadata_input(SFS_DIRECTORY);
-    const uint32_t unsupported[] = {0, 2, 5, UINT32_MAX};
+    const uint32_t unsupported[] = {0, 2, 6, UINT32_MAX};
     for (unsigned i = 0; i < sizeof(unsupported) / sizeof(*unsupported); i++) {
         reset("", 0); metadata_clock(401); h = (sfs_image *)(uintptr_t)1; uint64_t allocations_before = allocation_calls;
         assert(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, unsupported[i], &in, &h, &r) == SFS_UNSUPPORTED);
@@ -2629,6 +2632,621 @@ static void symlink_verify(void) {
     }
 }
 
+/* Opaque attribute bytes have no path or resource-fork interpretation. */
+#define XEXPECT(call, wanted) do { enum sfs_status actual_status = (call); assert(actual_status == (wanted) && r.status == actual_status); } while (0)
+static void xattr_create(sfs_image **h, uint64_t capacity) {
+    sfs_result r; sfs_metadata_initial in = metadata_input(SFS_DIRECTORY); reset("", 0); metadata_clock(600);
+    XEXPECT(sfs_image_create_metadata_version(root, "image", capacity, 5, &in, h, &r), SFS_OK);
+    assert(clock_calls == 1 && r.coverage == SFS_COVERAGE_FULL_REACHABLE);
+}
+static sfs_result xattr_binding(sfs_image *h) {
+    sfs_result r; sfs_entry e; XEXPECT(sfs_image_stat(h, 0, 1, &e, &r), SFS_OK); return r;
+}
+static void xattr_expect(sfs_image *h, sfs_view view, sfs_inode owner, const void *name, size_t length, const void *value, size_t n) {
+    sfs_result r; uint64_t size = UINT64_MAX; unsigned calls = clock_calls;
+    XEXPECT(sfs_image_xattr_size(h, view, owner, name, length, &size, &r), SFS_OK);
+    assert(size == n && r.coverage == SFS_COVERAGE_TOUCHED);
+    unsigned char *out = malloc(n + 3); assert(out); memset(out, 0xA5, n + 3); size_t got = SIZE_MAX;
+    XEXPECT(sfs_image_read_xattr(h, view, owner, name, length, 0, out + 1, n + 1, &got, &r), SFS_OK);
+    assert(got == n && (!n || !memcmp(out + 1, value, n)) && out[0] == 0xA5 && out[n + 1] == 0xA5 && out[n + 2] == 0xA5);
+    assert(r.coverage == SFS_COVERAGE_TOUCHED && clock_calls == calls); free(out);
+}
+static void xattr_absent(sfs_image *h, sfs_view view, sfs_inode owner, const char *name) {
+    sfs_result r; uint64_t size = UINT64_MAX; unsigned char out[8], canary[8]; memset(canary, 0xA5, sizeof(canary)); memcpy(out, canary, sizeof(out)); size_t got = 99;
+    XEXPECT(sfs_image_xattr_size(h, view, owner, name, strlen(name), &size, &r), SFS_NOT_FOUND); assert(size == UINT64_MAX && !r.system_errno);
+    XEXPECT(sfs_image_read_xattr(h, view, owner, name, strlen(name), 0, out, sizeof(out), &got, &r), SFS_NOT_FOUND);
+    assert(!got && !memcmp(out, canary, sizeof(out)) && !r.system_errno);
+}
+static void xattr_versions(void) {
+    sfs_image *h; sfs_result r; sfs_metadata_initial in = metadata_input(SFS_DIRECTORY);
+    for (unsigned minor = 2; minor < 5; minor++) {
+        reset("", 0); metadata_clock(601);
+        if (minor == 2) XEXPECT(sfs_image_create(root, "image", TEST_CAPACITY, &h, &r), SFS_OK);
+        else if (minor == 3) XEXPECT(sfs_image_create_metadata(root, "image", TEST_CAPACITY, &in, &h, &r), SFS_OK);
+        else XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, minor, &in, &h, &r), SFS_OK);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode id = add(h, 1, "file", SFS_FILE);
+        XEXPECT(sfs_image_write(h, id, 0, "before", 6, &r), SFS_OK); metadata_commit(h);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, id, 0, "pending", 7, &r), SFS_OK);
+        size_t n; unsigned char *before = bytes("image", &n); sfs_result binding = xattr_binding(h); reset("", 0); clock_calls = 0;
+        uint64_t size = UINT64_MAX; size_t got = 99; unsigned char out[8]; memset(out, 0xA5, sizeof(out));
+        sfs_xattr_entry entry, canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; int found = 99;
+        XEXPECT(sfs_image_set_xattr(h, id, "key", 3, "value", 5, &r), SFS_UNSUPPORTED);
+        assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+        XEXPECT(sfs_image_remove_xattr(h, id, "key", 3, &r), SFS_UNSUPPORTED); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+        XEXPECT(sfs_image_xattr_size(h, 0, id, "key", 3, &size, &r), SFS_UNSUPPORTED); assert(size == UINT64_MAX && r.phase == SFS_PHASE_NONE && !r.system_errno);
+        XEXPECT(sfs_image_read_xattr(h, 0, id, "key", 3, 0, out, sizeof(out), &got, &r), SFS_UNSUPPORTED); assert(!got && r.phase == SFS_PHASE_NONE && !r.system_errno);
+        XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, id, NULL, 0, &entry, &found, &r), SFS_UNSUPPORTED);
+        assert(found == 99 && !memcmp(&entry, &canary, sizeof(entry)) && r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+        for (unsigned i = 0; i < sizeof(out); i++) assert(out[i] == 0xA5); image_unwritten(); unchanged("image", before, n); free(before);
+        metadata_commit(h); expect(h, 0, id, "pending"); close_image(h); open_image(&h); expect(h, 0, id, "pending"); close_image(h);
+        before = bytes("image", &n); assert(get32(before + 12) == minor && get32(before + CELL + 12) == minor); free(before); retain(2000 + (int)minor);
+    }
+    reset("", 0); metadata_clock(602); h = (sfs_image *)(uintptr_t)1; uint64_t allocations_before = allocation_calls;
+    XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, 6, &in, &h, &r), SFS_UNSUPPORTED);
+    assert(!h && !clock_calls && allocation_calls == allocations_before && r.phase == SFS_PHASE_NONE && !r.system_errno && access("image", F_OK) < 0 && errno == ENOENT); image_unwritten();
+    xattr_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    XEXPECT(sfs_image_set_xattr(h, 1, "root", 4, NULL, 0, &r), SFS_OK); metadata_commit(h); xattr_expect(h, 0, 1, "root", 4, NULL, 0); symlink_full(h);
+    size_t n; unsigned char *p = bytes("image", &n), *space = namespace_at(p, selected_slot(p), n), *attributes = record(p, space + 280, n);
+    assert(get32(p + 12) == 5 && !memcmp(space, "SFSREC05", 8) && !get64(space + 184) && get32(attributes + 64) == 5 && get16(attributes + 70) == 1);
+    assert(get64(attributes + 640) == 1 && get32(attributes + 648) == 4 && !memcmp(attributes + 652, "root", 4) && !get64(attributes + 912) && !get32(attributes + 920) && !get64(attributes + 976)); free(p);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode link = symlink_add(h, 1, "link", "../opaque", 9); metadata_commit(h); symlink_expect(h, 0, link, "../opaque", 9); xattr_expect(h, 0, 1, "root", 4, NULL, 0); symlink_full(h); close_image(h); retain(2005);
+    fixture f = indexed_fixture_version(2, 1, 0, 4); unsigned char old_slot[CELL]; memcpy(old_slot, f.p, CELL);
+    f.minor = 5; fixture_node empty = {0}, ns = namespace_cell(&f, empty, empty, 2, 0); finish_fixture(&f, ns, empty); memcpy(f.p, old_slot, CELL); fixture_save(&f);
+    reset("", 0); h = NULL; XEXPECT(sfs_image_open(root, "image", &h, &r), SFS_RECOVERY_REQUIRED); assert(!h); image_unwritten();
+    sfs_recovery recovery; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    assert(!recovery.pair_valid && recovery.slots[0].status == SFS_OK && recovery.slots[1].status == SFS_OK);
+    for (unsigned slot = 0; slot < 2; slot++) { assert(recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE); XEXPECT(sfs_image_select(h, slot, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE); }
+    close_image(h); retain(2006);
+    f = indexed_fixture_version(2, 1, 0, 5); put32(f.p + 12, 4); put32(f.p + CELL + 12, 4); slot_hash(f.p); slot_hash(f.p + CELL); fixture_save(&f);
+    reset("", 0); h = NULL; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED);
+    assert(!h && r.phase == SFS_PHASE_READ && !r.system_errno && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT); image_unwritten();
+}
+typedef struct { const unsigned char *name; size_t n; } xattr_name;
+static int xattr_name_order(const void *left, const void *right) {
+    const xattr_name *a = left, *b = right; size_t n = a->n < b->n ? a->n : b->n; int order = memcmp(a->name, b->name, n);
+    return order ? order : a->n < b->n ? -1 : a->n > b->n;
+}
+static void xattr_values(void) {
+    sfs_image *h; sfs_result r; xattr_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    sfs_inode neighbor = add(h, 1, "neighbor", SFS_FILE);
+    static const unsigned char user[] = "user attribute\0\xff", fork[] = "resource\0fork\xff", binary_name[] = {0xFF, '/', 0x80};
+    unsigned char longest[255]; memset(longest, 0x7F, sizeof(longest));
+    xattr_name names[] = {{(const unsigned char *)"user.stallionfs-test", sizeof("user.stallionfs-test") - 1}, {(const unsigned char *)"com.apple.ResourceFork", 22}, {(const unsigned char *)".", 1}, {(const unsigned char *)"..", 2}, {(const unsigned char *)"/", 1}, {(const unsigned char *)"A", 1}, {(const unsigned char *)"a", 1}, {binary_name, sizeof(binary_name)}, {longest, sizeof(longest)}};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); i++) XEXPECT(sfs_image_set_xattr(h, 1, names[i].name, names[i].n, NULL, 0, &r), SFS_OK);
+    XEXPECT(sfs_image_set_xattr(h, 1, names[0].name, names[0].n, user, sizeof(user) - 1, &r), SFS_OK);
+    XEXPECT(sfs_image_set_xattr(h, 1, names[1].name, names[1].n, fork, sizeof(fork) - 1, &r), SFS_OK);
+    XEXPECT(sfs_image_set_xattr(h, neighbor, "other-owner", 11, "neighbor", 8, &r), SFS_OK); metadata_commit(h);
+    xattr_expect(h, 0, 1, names[0].name, names[0].n, user, sizeof(user) - 1); xattr_expect(h, 0, 1, names[1].name, names[1].n, fork, sizeof(fork) - 1);
+    for (unsigned i = 2; i < sizeof(names) / sizeof(*names); i++) xattr_expect(h, 0, 1, names[i].name, names[i].n, NULL, 0);
+    qsort(names, sizeof(names) / sizeof(*names), sizeof(*names), xattr_name_order); sfs_result binding = xattr_binding(h);
+    for (unsigned i = 0; i <= sizeof(names) / sizeof(*names); i++) {
+        sfs_xattr_entry entry, canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; int found = 99;
+        XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, i ? names[i - 1].name : NULL, i ? names[i - 1].n : 0, &entry, &found, &r), SFS_OK);
+        if (i == sizeof(names) / sizeof(*names)) assert(!found && !memcmp(&entry, &canary, sizeof(entry)));
+        else assert(found == 1 && entry.name_length == names[i].n && !memcmp(entry.name, names[i].name, names[i].n));
+        assert(r.coverage == SFS_COVERAGE_TOUCHED);
+    }
+    sfs_xattr_entry entry; int found; XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, "Z", 1, &entry, &found, &r), SFS_OK);
+    assert(found == 1 && entry.name_length == 1 && entry.name[0] == 'a');
+    const size_t lengths[] = {4095, 4096, 4097, 65537};
+    for (unsigned which = 0; which < 4; which++) {
+        size_t n = lengths[which]; unsigned char *value = malloc(n), *out = malloc(n + 2); assert(value && out);
+        for (size_t i = 0; i < n; i++) value[i] = (unsigned char)(i * 73 + 19);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(650 + which); XEXPECT(sfs_image_set_xattr(h, 1, "range", 5, value, n, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h); xattr_expect(h, 0, 1, "range", 5, value, n);
+        const uint64_t offsets[] = {0, 4094, 4096, n, n + 1};
+        for (unsigned j = 0; j < 5; j++) {
+            size_t capacity = j == 0 ? 0 : 7, got = 99; memset(out, 0xA5, n + 2);
+            XEXPECT(sfs_image_read_xattr(h, 0, 1, "range", 5, offsets[j], capacity ? out + 1 : NULL, capacity, &got, &r), SFS_OK);
+            size_t expected = offsets[j] >= n ? 0 : n - (size_t)offsets[j]; if (expected > capacity) expected = capacity;
+            assert(got == expected && (!got || !memcmp(out + 1, value + offsets[j], got)) && out[0] == 0xA5 && out[expected + 1] == 0xA5);
+        }
+        free(value); free(out);
+    }
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); reset("", 0); clock_calls = 0;
+    unsigned char invalid_name[256]; memset(invalid_name, 'n', sizeof(invalid_name)); const unsigned char nul_name[] = {'a', 0, 'b'};
+    const void *bad_names[] = {NULL, "", invalid_name, nul_name}; const size_t bad_lengths[] = {1, 0, sizeof(invalid_name), sizeof(nul_name)};
+    for (unsigned i = 0; i < 4; i++) {
+        uint64_t size = UINT64_MAX; size_t got = 99; unsigned char out[8]; memset(out, 0xA5, sizeof(out));
+        XEXPECT(sfs_image_set_xattr(h, 1, bad_names[i], bad_lengths[i], "x", 1, &r), SFS_INVALID); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+        XEXPECT(sfs_image_remove_xattr(h, 1, bad_names[i], bad_lengths[i], &r), SFS_INVALID);
+        XEXPECT(sfs_image_xattr_size(h, 0, 1, bad_names[i], bad_lengths[i], &size, &r), SFS_INVALID); assert(size == UINT64_MAX);
+        XEXPECT(sfs_image_read_xattr(h, 0, 1, bad_names[i], bad_lengths[i], 0, out, sizeof(out), &got, &r), SFS_INVALID); assert(got == 99);
+    }
+    uint64_t size = UINT64_MAX; size_t got = 99; unsigned char out[8]; memset(out, 0xA5, sizeof(out));
+    XEXPECT(sfs_image_set_xattr(h, 1, "key", 3, NULL, 1, &r), SFS_INVALID);
+    XEXPECT(sfs_image_xattr_size(h, 0, 1, "range", 5, NULL, &r), SFS_INVALID);
+    XEXPECT(sfs_image_read_xattr(h, 0, 1, "range", 5, UINT64_MAX, out, 1, &got, &r), SFS_INVALID); assert(got == 99);
+    XEXPECT(sfs_image_read_xattr(h, 0, 1, "range", 5, 0, NULL, 1, &got, &r), SFS_INVALID); assert(got == 99);
+    XEXPECT(sfs_image_read_xattr(h, 0, 1, "range", 5, 0, out, sizeof(out), NULL, &r), SFS_INVALID);
+    sfs_xattr_entry canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; found = 99; binding = xattr_binding(h);
+    XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, NULL, 1, &entry, &found, &r), SFS_INVALID);
+    assert(found == 99 && !memcmp(&entry, &canary, sizeof(entry)) && size == UINT64_MAX && !clock_calls);
+    XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, NULL, 0, NULL, &found, &r), SFS_INVALID); assert(found == 99);
+    XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, NULL, 0, &entry, NULL, &r), SFS_INVALID); assert(!memcmp(&entry, &canary, sizeof(entry)));
+    XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, NULL, 1, NULL, 0, &entry, &found, &r), SFS_INVALID); assert(found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+    for (unsigned missing = 0; missing < 2; missing++) {
+        sfs_view view = missing ? 32 : 0; sfs_inode owner = missing ? 1 : UINT64_MAX; got = 99;
+        XEXPECT(sfs_image_xattr_size(h, view, owner, "range", 5, &size, &r), SFS_NOT_FOUND); assert(size == UINT64_MAX);
+        XEXPECT(sfs_image_read_xattr(h, view, owner, "range", 5, 0, out, sizeof(out), &got, &r), SFS_NOT_FOUND); assert(!got);
+        XEXPECT(sfs_image_next_xattr(h, view, binding.generation, binding.root_digest, owner, NULL, 0, &entry, &found, &r), SFS_NOT_FOUND); assert(found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+    }
+    assert(sfs_image_set_xattr(h, 1, NULL, 1, "x", 1, NULL) == SFS_INVALID);
+    assert(sfs_image_remove_xattr(h, 1, "missing", 7, NULL) == SFS_NOT_FOUND && !clock_calls);
+    assert(sfs_image_xattr_size(h, 0, 1, "missing", 7, &size, NULL) == SFS_NOT_FOUND && size == UINT64_MAX);
+    got = 99; assert(sfs_image_read_xattr(h, 0, 1, "missing", 7, 0, out, sizeof(out), &got, NULL) == SFS_NOT_FOUND && !got);
+    assert(sfs_image_next_xattr(h, 0, binding.generation + 1, binding.root_digest, 1, NULL, 0, &entry, &found, NULL) == SFS_STATE && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+    for (unsigned i = 0; i < sizeof(out); i++) assert(out[i] == 0xA5); image_unwritten();
+    assert(sfs_image_set_xattr(h, 1, "null-result", 11, NULL, 0, NULL) == SFS_OK); metadata_commit(h);
+    assert(sfs_image_xattr_size(h, 0, 1, "null-result", 11, &size, NULL) == SFS_OK && !size);
+    got = 99; assert(sfs_image_read_xattr(h, 0, 1, "null-result", 11, 0, out, sizeof(out), &got, NULL) == SFS_OK && !got);
+    binding = xattr_binding(h); found = 99; assert(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 1, "null-resuls", 11, &entry, &found, NULL) == SFS_OK && found == 1 && entry.name_length == 11 && !memcmp(entry.name, "null-result", 11));
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); assert(sfs_image_remove_xattr(h, 1, "null-result", 11, NULL) == SFS_OK); metadata_commit(h); xattr_absent(h, 0, 1, "null-result"); symlink_full(h); close_image(h);
+}
+/* Independent0.5 namespaces add exactly one attribute root at byte280. */
+static fixture_node xattr_space(fixture *f, fixture_node inodes, fixture_node names, fixture_node attrs, uint64_t next, uint64_t count) {
+    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56);
+    put64(p + 176, next); put64(p + 184, count); fixture_tuple(p + 192, SFS_DIRECTORY, 0); memcpy(p + 280, attrs.ref, 56); return append_cell(f, 2, p);
+}
+static void xattr_row(unsigned char *row, uint64_t owner, const void *name, size_t n, uint64_t size, const unsigned char *extent, uint64_t count) {
+    assert(n && n <= 255); memset(row, 0, 352); put64(row, owner); put32(row + 8, (uint32_t)n); memcpy(row + 12, name, n);
+    put64(row + 272, size); if (extent) memcpy(row + 280, extent, 56); put64(row + 336, count);
+}
+static fixture xattr_fixture(unsigned rows, unsigned primary, unsigned snapshots) {
+    assert(rows == 1 || rows == 3); fixture f = fixture_start(); f.minor = 5; put32(f.p + 12, 5);
+    unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); fixture_node data = append_cell(&f, 6, raw);
+    unsigned char extents[216] = {0};
+    for (unsigned i = 0; i < rows; i++) { put64(extents + i * 72, i); memcpy(extents + i * 72 + 8, data.ref, 56); put16(extents + i * 72 + 64, i + 1 == rows ? 6 : CELL); }
+    fixture_node extent = tree(&f, 3, extents, rows); uint64_t size = (rows - 1) * (uint64_t)CELL + 6;
+    unsigned char inodes[880] = {0}, names[560] = {0};
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *a = inodes + i * 440, *b = names + i * 280; put64(a, i ? 4 : 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 1); a[88] = (unsigned char)('a' + i);
+        if (primary & (1u << i)) { put64(a + 24, size); memcpy(a + 32, extent.ref, 56); }
+        fixture_tuple(a + 352, SFS_FILE, primary & (1u << i) ? rows : 0);
+        put64(b, 1); put32(b + 8, 1); b[12] = (unsigned char)('a' + i); put64(b + 267, i ? 4 : 2);
+    }
+    fixture_node ir = tree(&f, 1, inodes, 2), nr = tree(&f, 2, names, 2); unsigned char row[352]; xattr_row(row, 2, "key", 3, size, extent.ref, rows);
+    fixture_node attrs = tree(&f, 5, row, 1), history = xattr_space(&f, ir, nr, attrs, 5, 2), catalog = {0};
+    if (snapshots) {
+        assert(snapshots <= 2); unsigned char sr[656] = {0};
+        for (unsigned i = 0; i < snapshots; i++) { put32(sr + i * 328, i + 1); memcpy(sr + i * 328 + 8, history.ref, 56); put32(sr + i * 328 + 64, 1); sr[i * 328 + 68] = (unsigned char)('x' + i); }
+        catalog = tree(&f, 4, sr, snapshots);
+    }
+    fixture_node current = xattr_space(&f, ir, nr, attrs, 5, 2); finish_fixture(&f, current, catalog); return f;
+}
+static unsigned xattr_stride(unsigned map, unsigned level) {
+    if (level) return map == 2 || map == 5 ? 328 : 72;
+    return map == 1 ? 440 : map == 2 ? 280 : map == 3 ? 72 : map == 4 ? 328 : 352;
+}
+static unsigned xattr_edge(unsigned map, unsigned level) { return level ? (map == 2 || map == 5 ? 271 : 16) : map == 1 ? 32 : map == 5 ? 280 : 8; }
+static void xattr_fences(unsigned char *p, unsigned char *cell, unsigned map, unsigned level, size_t n) {
+    unsigned count = get16(cell + 70); assert(count && count <= 48); unsigned stride = xattr_stride(map, level); unsigned char low[263] = {0}, high[263] = {0}; uint16_t lo, hi;
+    if (level) {
+        unsigned edge = xattr_edge(map, level); unsigned char *first = record(p, cell + 640 + edge, n), *last = record(p, cell + 640 + (count - 1) * stride + edge, n);
+        lo = get16(first + 88); hi = get16(last + 90); assert(lo <= 263 && hi <= 263); memcpy(low, first + 112, lo); memcpy(high, last + 375, hi);
+    } else { row_key(map, cell + 640, low, &lo); row_key(map, cell + 640 + (count - 1) * stride, high, &hi); }
+    put16(cell + 88, lo); put16(cell + 90, hi); memset(cell + 112, 0, 526); memcpy(cell + 112, low, lo); memcpy(cell + 375, high, hi);
+}
+/* All reachable aliases are repaired using the untouched graph's edges, never a semantic parser. */
+static void xattr_repair_ref(unsigned char *p, const unsigned char *old_image, unsigned char *ref, const unsigned char *old_ref, size_t n, unsigned depth, int raw_hashes_too) {
+    assert(depth < 32); if (!get32(ref)) { assert(!memcmp(ref, (unsigned char[56]){0}, 56)); return; }
+    assert(!memcmp(ref, old_ref, 24)); unsigned char *cell = record(p, ref, n); const unsigned char *old = record((unsigned char *)old_image, old_ref, n); unsigned type = get32(ref);
+    if (type == 4 || type == 2) for (unsigned i = 0; i < 2; i++) xattr_repair_ref(p, old_image, cell + 64 + i * 56, old + 64 + i * 56, n, depth + 1, raw_hashes_too);
+    if (type == 2) xattr_repair_ref(p, old_image, cell + 280, old + 280, n, depth + 1, raw_hashes_too);
+    if (type == 5) {
+        unsigned map = get32(old + 64), level = get16(old + 68), count = get16(old + 70), stride = xattr_stride(map, level), edge = xattr_edge(map, level);
+        for (unsigned i = 0; i < count; i++) if (level || map != 2) xattr_repair_ref(p, old_image, cell + 640 + i * stride + edge, old + 640 + i * stride + edge, n, depth + 1, raw_hashes_too);
+        xattr_fences(p, cell, map, level, n);
+    }
+    if (type != 6 || raw_hashes_too) ref_hash(p, ref, n);
+}
+static void xattr_repair(unsigned char *p, const unsigned char *original, size_t n) {
+    for (unsigned i = 0; i < 2; i++) { xattr_repair_ref(p, original, p + i * CELL + 48, original + i * CELL + 48, n, 0, 1); slot_hash(p + i * CELL); }
+}
+static void xattr_repair_metadata(unsigned char *p, const unsigned char *original, size_t n) {
+    for (unsigned i = 0; i < 2; i++) { xattr_repair_ref(p, original, p + i * CELL + 48, original + i * CELL + 48, n, 0, 0); slot_hash(p + i * CELL); }
+}
+static int xattr_key_compare(const unsigned char *a, size_t an, const unsigned char *b, size_t bn) {
+    int order = memcmp(a, b, an < bn ? an : bn); return order ? order : an < bn ? -1 : an > bn;
+}
+/* Digest/framing/order/context only: not owner existence, density, time or name policy. */
+static int xattr_ref_guard(unsigned char *p, const unsigned char *old_image, const unsigned char *ref, const unsigned char *old_ref, size_t n, uint64_t parent, unsigned depth) {
+    if (!get32(ref)) return !memcmp(ref, (unsigned char[56]){0}, 56);
+    if (depth >= 32 || memcmp(ref, old_ref, 24)) return 0; uint64_t at = get64(ref + 8); unsigned type = get32(ref);
+    if (at < 8192 || at % CELL || at >= parent || at > n || CELL > n - at || get64(ref + 16) != CELL || get32(ref + 4)) return 0;
+    unsigned char checked[56]; memcpy(checked, ref, 56); ref_hash(p, checked, n); if (memcmp(checked + 24, ref + 24, 32)) return 0;
+    unsigned char *cell = p + at; const unsigned char *old = old_image + at;
+    if (type != 6 && (memcmp(cell, "SFSREC05", 8) || get32(cell + 8) != type || get32(cell + 12) || get64(cell + 16) != 4032 || memcmp(cell + 24, p + 24, 16) || memcmp(cell + 40, (unsigned char[24]){0}, 24))) return 0;
+    if (type == 4 || type == 2) for (unsigned i = 0; i < 2; i++) if (!xattr_ref_guard(p, old_image, cell + 64 + i * 56, old + 64 + i * 56, n, at, depth + 1)) return 0;
+    if (type == 2 && !xattr_ref_guard(p, old_image, cell + 280, old + 280, n, at, depth + 1)) return 0;
+    if (type == 5) {
+        unsigned map = get32(old + 64), level = get16(old + 68), count = get16(old + 70), stride = xattr_stride(map, level), edge = xattr_edge(map, level);
+        if (get16(cell + 68) != level) return 0;
+        for (unsigned i = 0; i < count; i++) {
+            const unsigned char *child_ref = cell + 640 + i * stride + edge;
+            if ((level || map != 2) && !xattr_ref_guard(p, old_image, child_ref, old + 640 + i * stride + edge, n, at, depth + 1)) return 0;
+            if (level) {
+                unsigned char *child = record(p, child_ref, n); const unsigned char *key = cell + 640 + i * stride + 8; unsigned key_n = get32(cell + 640 + i * stride);
+                if (get32(child + 64) != get32(cell + 64) || (unsigned)get16(child + 68) + 1 != level || key_n != get16(child + 88) || memcmp(key, child + 112, key_n)) return 0;
+                if (i) { unsigned char *previous = record(p, cell + 640 + (i - 1) * stride + edge, n); if (xattr_key_compare(previous + 375, get16(previous + 90), child + 112, get16(child + 88)) >= 0) return 0; }
+            }
+        }
+        unsigned actual = get16(cell + 70); if (!actual || actual > 48) return 0;
+        unsigned char low[263], high[263]; uint16_t lo, hi;
+        if (level) { unsigned char *first = record(p, cell + 640 + edge, n), *last = record(p, cell + 640 + (actual - 1) * stride + edge, n); lo = get16(first + 88); hi = get16(last + 90); memcpy(low, first + 112, lo); memcpy(high, last + 375, hi); }
+        else { row_key(map, cell + 640, low, &lo); row_key(map, cell + 640 + (actual - 1) * stride, high, &hi); }
+        if (get16(cell + 88) != lo || get16(cell + 90) != hi || memcmp(cell + 112, low, lo) || memcmp(cell + 375, high, hi)) return 0;
+    }
+    return 1;
+}
+static int xattr_guard(unsigned char *p, const unsigned char *original, size_t n) {
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *slot = p + i * CELL, checked[CELL]; memcpy(checked, slot, CELL); slot_hash(checked);
+        if (memcmp(slot, "SFSIMG01", 8) || get32(slot + 8) || get32(slot + 12) != 5 || get64(slot + 16) || memcmp(checked + 112, slot + 112, 32)) return 0;
+        if (!xattr_ref_guard(p, original, slot + 48, original + i * CELL + 48, n, get64(slot + 104), 0)) return 0;
+    }
+    return 1;
+}
+static fixture_node xattr_minimum_tree(fixture *f, const unsigned char *rows, unsigned count) {
+    assert(count == 3078); unsigned groups = 1026, at = 0; fixture_node *nodes = calloc(groups, sizeof(*nodes)); assert(nodes);
+    for (unsigned i = 0; i < groups; i++) { nodes[i] = page(f, 5, 0, rows + at * 352, 3, 352, NULL); at += 3; }
+    unsigned level = 0; const unsigned expected[] = {114, 13, 2, 1};
+    while (groups > 1) {
+        unsigned parents = (groups + 8) / 9, used = 0; assert(parents == expected[level]); level++;
+        for (unsigned i = 0; i < parents; i++) { unsigned size = groups / parents + (i < groups % parents); assert(size >= (parents == 1 ? 2u : 3u) && size <= 9); nodes[i] = page(f, 5, level, NULL, size, 328, nodes + used); used += size; }
+        groups = parents;
+    }
+    fixture_node root_node = nodes[0]; assert(root_node.level == 4); free(nodes); return root_node;
+}
+static fixture xattr_prefix_fixture(void) {
+    fixture f = fixture_start(); f.minor = 5; f.capacity = UINT64_C(268435456); put32(f.p + 12, 5);
+    unsigned char inodes[880] = {0}, names[560] = {0};
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *a = inodes + i * 440, *b = names + i * 280; put64(a, i ? 4 : 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 1); a[88] = (unsigned char)('a' + i); fixture_tuple(a + 352, SFS_FILE, 0);
+        put64(b, 1); put32(b + 8, 1); b[12] = (unsigned char)('a' + i); put64(b + 267, i ? 4 : 2);
+    }
+    fixture_node ir = tree(&f, 1, inodes, 2), nr = tree(&f, 2, names, 2); unsigned char *rows = calloc(3078, 352); assert(rows);
+    for (unsigned i = 0; i < 3078; i++) { char name[24]; int n = i < 3075 ? snprintf(name, sizeof(name), "attr-%04u", i) : snprintf(name, sizeof(name), "keep-%u", i - 3075); assert(n > 0); xattr_row(rows + i * 352, i < 3075 ? 2 : 4, name, (size_t)n, 0, NULL, 0); }
+    size_t before = f.n; fixture_node attrs = xattr_minimum_tree(&f, rows, 3078); assert(f.n - before == 1156 * CELL); free(rows);
+    fixture_node history = xattr_space(&f, ir, nr, attrs, 5, 2); unsigned char sr[328] = {0}; put32(sr, 1); memcpy(sr + 8, history.ref, 56); put32(sr + 64, 6); memcpy(sr + 68, "before", 6);
+    fixture_node catalog = tree(&f, 4, sr, 1), current = xattr_space(&f, ir, nr, attrs, 5, 2); finish_fixture(&f, current, catalog);
+    _Static_assert((UINT64_C(1164) + UINT64_C(3075) * 18 + 14) * CELL == UINT64_C(231538688), "prefix admission arithmetic");
+    assert(f.n == 1164 * CELL && f.n < f.capacity); return f;
+}
+static void xattr_only_ctime(sfs_metadata_entry before, sfs_metadata_entry after, int64_t sample) {
+    assert(timestamp_is(after.change, sample, (uint32_t)(sample + 1))); after.change = before.change; metadata_equal(&before, &after);
+}
+static void xattr_enumerate(sfs_image *h, sfs_view view, sfs_inode owner, const char *prefix, unsigned count) {
+    sfs_result r, binding = xattr_binding(h); unsigned char previous[255]; size_t previous_n = 0;
+    for (unsigned i = 0; i <= count; i++) {
+        sfs_xattr_entry entry, canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; int found = 99;
+        XEXPECT(sfs_image_next_xattr(h, view, binding.generation, binding.root_digest, owner, previous_n ? previous : NULL, previous_n, &entry, &found, &r), SFS_OK);
+        if (i == count) assert(!found && !memcmp(&entry, &canary, sizeof(entry)));
+        else {
+            char expected[32]; int n = !strcmp(prefix, "attr") ? snprintf(expected, sizeof(expected), "attr-%04u", i) : snprintf(expected, sizeof(expected), "keep-%u", i);
+            assert(found == 1 && entry.size == 0 && entry.name_length == (size_t)n && !memcmp(entry.name, expected, (size_t)n));
+            memcpy(previous, entry.name, entry.name_length); previous_n = entry.name_length;
+        }
+    }
+}
+static void xattr_namespace(void) {
+    sfs_image *h; sfs_result r; xattr_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    sfs_inode p = add(h, 1, "p", SFS_DIRECTORY), q = add(h, 1, "q", SFS_DIRECTORY), file = add(h, p, "file", SFS_FILE), link = symlink_add(h, p, "link", "file", 4);
+    XEXPECT(sfs_image_write(h, file, 0, "primary", 7, &r), SFS_OK); metadata_commit(h);
+    const sfs_inode owners[] = {1, p, file, link}; const char *values[] = {"root-value", "dir-value", "file-value", "link-value"};
+    sfs_metadata_entry old[4]; for (unsigned i = 0; i < 4; i++) old[i] = metadata_get(h, 0, owners[i]); sfs_metadata_entry q_before = metadata_get(h, 0, q);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    for (unsigned i = 0; i < 4; i++) { metadata_clock(700 + i); XEXPECT(sfs_image_set_xattr(h, owners[i], "user", 4, values[i], strlen(values[i]), &r), SFS_OK); assert(clock_calls == 1); xattr_absent(h, 0, owners[i], "user"); }
+    metadata_commit(h);
+    for (unsigned i = 0; i < 4; i++) { sfs_metadata_entry after = metadata_get(h, 0, owners[i]); xattr_only_ctime(old[i], after, 700 + i); xattr_expect(h, 0, owners[i], "user", 4, values[i], strlen(values[i])); }
+    sfs_metadata_entry after = metadata_get(h, 0, q); metadata_equal(&q_before, &after); expect(h, 0, file, "primary"); symlink_expect(h, 0, link, "file", 4);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_view view; XEXPECT(sfs_image_snapshot(h, "before", 6, &view, &r), SFS_OK); metadata_commit(h); assert(view == 1);
+    sfs_metadata_entry before = metadata_get(h, 0, file), snapshot_file = before; XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(710);
+    XEXPECT(sfs_image_set_xattr(h, file, "user", 4, "file-value", 10, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h);
+    after = metadata_get(h, 0, file); xattr_only_ctime(before, after, 710); expect(h, 0, file, "primary"); xattr_expect(h, view, file, "user", 4, "file-value", 10);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(711); XEXPECT(sfs_image_write(h, file, 0, "changed", 7, &r), SFS_OK);
+    size_t n; unsigned char *physical = bytes("image", &n); reset("", 0); clock_calls = 0;
+    XEXPECT(sfs_image_remove_xattr(h, file, "absent", 6, &r), SFS_NOT_FOUND); assert(!clock_calls && !r.system_errno); image_unwritten(); unchanged("image", physical, n); free(physical);
+    metadata_commit(h); expect(h, 0, file, "changed"); xattr_expect(h, 0, file, "user", 4, "file-value", 10);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(720); XEXPECT(sfs_image_rename(h, file, q, "moved", 5, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h);
+    xattr_expect(h, 0, file, "user", 4, "file-value", 10); expect(h, 0, file, "changed"); symlink_expect(h, 0, link, "file", 4);
+    sfs_metadata_entry parents[] = {metadata_get(h, 0, 1), metadata_get(h, 0, p), metadata_get(h, 0, q)}; before = metadata_get(h, 0, link);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(730); XEXPECT(sfs_image_remove_xattr(h, link, "user", 4, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h);
+    after = metadata_get(h, 0, link); xattr_only_ctime(before, after, 730); xattr_absent(h, 0, link, "user"); xattr_expect(h, 0, file, "user", 4, "file-value", 10);
+    after = metadata_get(h, 0, 1); metadata_equal(&parents[0], &after); after = metadata_get(h, 0, p); metadata_equal(&parents[1], &after); after = metadata_get(h, 0, q); metadata_equal(&parents[2], &after);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove(h, file, &r), SFS_OK); metadata_commit(h); sfs_entry missing;
+    XEXPECT(sfs_image_stat(h, 0, file, &missing, &r), SFS_NOT_FOUND); xattr_absent(h, 0, file, "user"); xattr_expect(h, view, file, "user", 4, "file-value", 10); after = metadata_get(h, view, file); metadata_equal(&snapshot_file, &after);
+    xattr_expect(h, 0, 1, "user", 4, "root-value", 10); xattr_expect(h, 0, p, "user", 4, "dir-value", 9); symlink_expect(h, 0, link, "file", 4); symlink_full(h); close_image(h); retain(2200);
+    /* Exactly1025 minimum-occupancy target leaves plus one neighboring-owner leaf. */
+    fixture f = xattr_prefix_fixture(); assert(xattr_guard(f.p, f.p, f.n)); fixture_save(&f); reset("", 0); open_image(&h); symlink_full(h);
+    uint64_t initial_length; unsigned char initial_digest[32]; file_digest("image", initial_digest, &initial_length); assert(initial_length == UINT64_C(1164) * CELL);
+    xattr_enumerate(h, 0, 2, "attr", 3075); xattr_enumerate(h, 0, 4, "keep", 3); XEXPECT(sfs_image_begin(h, &r), SFS_OK); reset("", 0); metadata_clock(800);
+    XEXPECT(sfs_image_remove(h, 2, &r), SFS_OK); assert(clock_calls == 1 && image_append_bytes <= UINT64_C(55364) * CELL); metadata_commit(h);
+    XEXPECT(sfs_image_stat(h, 0, 4, &missing, &r), SFS_OK); assert(r.physical_end <= UINT64_C(231538688));
+    XEXPECT(sfs_image_stat(h, 0, 2, &missing, &r), SFS_NOT_FOUND); xattr_enumerate(h, 0, 4, "keep", 3); xattr_enumerate(h, 1, 2, "attr", 3075); xattr_enumerate(h, 1, 4, "keep", 3); symlink_full(h);
+    printf("{\"case\":\"xattr-prefix-removal\",\"target_rows\":3075,\"target_leaves\":1025,\"neighbor_rows\":3,\"initial_cells\":1164,\"height\":5,\"bound_cells\":55364,\"appended_bytes\":%llu,\"fresh_arena_runtime_claim\":false}\n", (unsigned long long)image_append_bytes); fflush(stdout); counters("xattr-prefix-owned-allocations"); close_image(h);
+}
+static void xattr_views(void) {
+    sfs_image *h; sfs_result r; xattr_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode owner = add(h, 1, "owner", SFS_FILE);
+    XEXPECT(sfs_image_set_xattr(h, owner, "key", 3, "old", 3, &r), SFS_OK); metadata_commit(h); sfs_result old_binding = xattr_binding(h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_set_xattr(h, owner, "key", 3, "new", 3, &r), SFS_OK); xattr_expect(h, 0, owner, "key", 3, "old", 3);
+    sfs_view view; XEXPECT(sfs_image_snapshot(h, "before", 6, &view, &r), SFS_OK); metadata_commit(h); assert(view == 1); xattr_expect(h, 0, owner, "key", 3, "new", 3); xattr_expect(h, view, owner, "key", 3, "old", 3);
+    sfs_xattr_entry output, canary; memset(&canary, 0xA5, sizeof(canary)); output = canary; int found = 99;
+    XEXPECT(sfs_image_next_xattr(h, 0, old_binding.generation, old_binding.root_digest, owner, NULL, 0, &output, &found, &r), SFS_STATE); assert(found == 99 && !memcmp(&output, &canary, sizeof(output)));
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove_xattr(h, owner, "key", 3, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK); xattr_expect(h, 0, owner, "key", 3, "new", 3);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove(h, owner, &r), SFS_OK); metadata_commit(h); xattr_absent(h, 0, owner, "key"); xattr_expect(h, view, owner, "key", 3, "old", 3); close_image(h);
+    size_t n; unsigned char *before = bytes("image", &n); struct stat identity, after_identity; assert(!lstat("image", &identity)); reset("", 0); open_readonly(&h, &r);
+    xattr_expect(h, view, owner, "key", 3, "old", 3); reset("", 0); clock_calls = 0;
+    XEXPECT(sfs_image_set_xattr(h, 1, "key", 3, "no", 2, &r), SFS_STATE); XEXPECT(sfs_image_remove_xattr(h, 1, "key", 3, &r), SFS_STATE); assert(!clock_calls); image_unwritten(); close_image(h); unchanged("image", before, n);
+    sfs_recovery recovery; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    for (unsigned slot = 0; slot < 2; slot++) {
+        assert(recovery.slots[slot].status == SFS_OK && recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE);
+        XEXPECT(sfs_image_select(h, slot, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE);
+        xattr_expect(h, view, owner, "key", 3, "old", 3); XEXPECT(sfs_image_set_xattr(h, 1, "key", 3, NULL, 0, &r), SFS_STATE); XEXPECT(sfs_image_remove_xattr(h, 1, "key", 3, &r), SFS_STATE);
+    }
+    assert(!clock_calls); image_unwritten(); close_image(h); unchanged("image", before, n); assert(!lstat("image", &after_identity)); identical_identity(&identity, &after_identity); free(before); retain(2300);
+    /* Two FULL-valid roots at the same generation bind different attribute names/values. */
+    fixture a = xattr_fixture(1, 0, 0); size_t old_end = a.n; unsigned char slot0[CELL]; memcpy(slot0, a.p, CELL);
+    fixture b = xattr_fixture(1, 0, 0); unsigned char *ns = namespace_at(b.p, b.p, b.n), *row = record(b.p, ns + 280, b.n) + 640;
+    memcpy(row + 12, "alt", 3); xattr_repair(b.p, a.p, b.n); assert(xattr_guard(b.p, a.p, b.n));
+    /* Keep two private graph copies; relocation preserves all framing, owner and value identities. */
+    unsigned char *mapping = calloc(b.n / CELL, 56); assert(mapping);
+    for (size_t i = 2; i < b.n / CELL; i++) {
+        unsigned char *cell = b.p + i * CELL; unsigned type = !memcmp(cell, "SFSREC05", 8) ? get32(cell + 8) : 6;
+        if (type == 2 || type == 4) { mapped_ref(cell + 64, mapping, b.n / CELL); mapped_ref(cell + 120, mapping, b.n / CELL); if (type == 2) mapped_ref(cell + 280, mapping, b.n / CELL); }
+        if (type == 5) { unsigned map = get32(cell + 64), level = get16(cell + 68), count = get16(cell + 70), stride = xattr_stride(map, level), edge = xattr_edge(map, level); for (unsigned j = 0; j < count; j++) if (level || map != 2) mapped_ref(cell + 640 + j * stride + edge, mapping, b.n / CELL); }
+        fixture_node moved = append_cell(&a, type, cell); memcpy(mapping + i * 56, moved.ref, 56);
+    }
+    memcpy(a.p, slot0, CELL); mapped_ref(b.p + 48, mapping, b.n / CELL); memcpy(a.p + CELL, b.p, CELL); put64(a.p + CELL + 104, a.n); slot_hash(a.p + CELL); free(mapping); free(b.p); assert(old_end < a.n); fixture_save(&a);
+    reset("", 0); XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK); assert(!recovery.pair_valid && recovery.slots[0].status == SFS_OK && recovery.slots[1].status == SFS_OK);
+    uint64_t unselected_size = UINT64_MAX; XEXPECT(sfs_image_xattr_size(h, 0, 2, "key", 3, &unselected_size, &r), SFS_STATE); assert(unselected_size == UINT64_MAX);
+    XEXPECT(sfs_image_select(h, 0, &generous, &r), SFS_OK); sfs_result binding0 = r; xattr_expect(h, 0, 2, "key", 3, "shared", 6);
+    XEXPECT(sfs_image_select(h, 1, &generous, &r), SFS_OK); assert(r.generation == binding0.generation && memcmp(r.root_digest, binding0.root_digest, 32)); xattr_expect(h, 0, 2, "alt", 3, "shared", 6);
+    output = canary; found = 99; XEXPECT(sfs_image_next_xattr(h, 0, binding0.generation, binding0.root_digest, 2, NULL, 0, &output, &found, &r), SFS_STATE);
+    assert(found == 99 && !memcmp(&output, &canary, sizeof(output))); image_unwritten(); close_image(h);
+}
+static void xattr_capacity(void) {
+    const unsigned bound[] = {10, 18, 12, 23};
+    unsigned char replacement[4097]; memset(replacement, 'Z', sizeof(replacement)); sfs_result r; sfs_image *h;
+    for (unsigned operation = 0; operation < 4; operation++) for (unsigned fit = 0; fit < 2; fit++) {
+        fixture f = xattr_fixture(1, 3, 1); size_t initial = f.n;
+        uint64_t capacity = initial + (UINT64_C(1) + bound[operation] - (fit ? 0 : 1)) * CELL;
+        for (unsigned slot = 0; slot < 2; slot++) { put64(f.p + slot * CELL + 144, capacity); slot_hash(f.p + slot * CELL); } assert(xattr_guard(f.p, f.p, f.n)); fixture_save(&f);
+        reset("", 0); open_image(&h); symlink_full(h); sfs_metadata_entry owner_before = metadata_get(h, 0, 2), other_before = metadata_get(h, 0, 4);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode pending = operation == 0 || operation == 2 ? 2 : 4; metadata_clock(900);
+        XEXPECT(sfs_image_write(h, pending, 0, "pending", 7, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n);
+        assert(n == initial + CELL && capacity - n == (bound[operation] - (fit ? 0 : 1)) * CELL); reset("", 0); metadata_clock(901);
+        enum sfs_status status;
+        if (operation < 2) status = sfs_image_set_xattr(h, 2, operation ? "new" : "key", 3, replacement, sizeof(replacement), &r);
+        else if (operation == 2) status = sfs_image_remove_xattr(h, 2, "key", 3, &r);
+        else status = sfs_image_remove(h, 2, &r);
+        assert(status == r.status); receipt("xattr-whole-operation-admission", &r);
+        printf("{\"xattr_capacity_operation\":%u,\"bound_cells\":%u,\"fit\":%s,\"prior_raw_tail_cells\":1,\"appended_bytes\":%llu}\n", operation, bound[operation], fit ? "true" : "false", (unsigned long long)image_append_bytes); fflush(stdout);
+        if (!fit) {
+            assert(status == SFS_LIMIT && r.phase == SFS_PHASE_ADMISSION && !r.system_errno && r.physical_end == n); image_unwritten(); unchanged("image", before, n);
+            XEXPECT(sfs_image_commit(h, &r), SFS_STATE); expect(h, 0, 2, "shared"); expect(h, 0, 4, "shared"); xattr_expect(h, 0, 2, "key", 3, "shared", 6); xattr_expect(h, 1, 2, "key", 3, "shared", 6);
+            sfs_metadata_entry m = metadata_get(h, 0, 2); metadata_equal(&m, &owner_before); m = metadata_get(h, 0, 4); metadata_equal(&m, &other_before); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK);
+        } else {
+            assert(status == SFS_OK && clock_calls == 1 && image_append_bytes <= bound[operation] * UINT64_C(4096)); metadata_commit(h);
+            expect(h, 0, pending, "pending"); expect(h, 1, pending, "shared"); xattr_expect(h, 1, 2, "key", 3, "shared", 6);
+            if (operation < 2) xattr_expect(h, 0, 2, operation ? "new" : "key", 3, replacement, sizeof(replacement)); else xattr_absent(h, 0, 2, "key");
+            if (operation != 3) { sfs_metadata_entry m = metadata_get(h, 0, 2); assert(timestamp_is(m.change, 901, 902)); if (pending == 2) { assert(m.entry.size == 7 && m.referenced_data_bytes == CELL && timestamp_is(m.modification, 900, 901)); } else assert(m.entry.size == owner_before.entry.size && timestamp_equal(m.modification, owner_before.modification)); }
+            sfs_entry e; XEXPECT(sfs_image_stat(h, 0, 4, &e, &r), SFS_OK); assert(r.physical_end <= capacity); symlink_full(h);
+        }
+        close_image(h); free(before); retain(2400 + (int)(operation * 2 + fit));
+    }
+    /* Lold0 admits alignment padding after a pre-existing37-byte charged tail. */
+    for (unsigned remove = 0; remove < 2; remove++) {
+        fixture f = xattr_fixture(1, 3, 1); size_t initial = f.n; unsigned reservation = remove ? 9 : 6;
+        uint64_t capacity = initial + (UINT64_C(1) + reservation) * CELL;
+        for (unsigned i = 0; i < 2; i++) { put64(f.p + i * CELL + 144, capacity); slot_hash(f.p + i * CELL); } fixture_save(&f);
+        unsigned char tail[37]; memset(tail, 0xA7, sizeof(tail)); int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); raw_write(fd, tail, sizeof(tail), (off_t)initial); assert(!close(fd));
+        reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); assert(n == initial + 37 && n % CELL == 37); reset("", 0); metadata_clock(902);
+        if (remove) XEXPECT(sfs_image_remove_xattr(h, 2, "key", 3, &r), SFS_OK); else XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, "newval", 6, &r), SFS_OK);
+        assert(clock_calls == 1); metadata_commit(h); size_t end; unsigned char *after = bytes("image", &end);
+        assert(end <= capacity && end > n && end - n == image_append_bytes && !memcmp(before + 8192, after + 8192, n - 8192) && !memcmp(after + initial, tail, sizeof(tail)));
+        if (remove) xattr_absent(h, 0, 2, "key"); else xattr_expect(h, 0, 2, "key", 3, "newval", 6); xattr_expect(h, 1, 2, "key", 3, "shared", 6); symlink_full(h);
+        printf("{\"case\":\"xattr-unaligned-tail-no-batch\",\"tail_bytes\":37,\"padding_bytes\":4059,\"remove\":%s,\"reservation_cells\":%u,\"appended_bytes\":%llu}\n", remove ? "true" : "false", reservation, (unsigned long long)image_append_bytes); fflush(stdout);
+        free(before); free(after); close_image(h); retain(2410 + (int)remove);
+    }
+}
+static void xattr_zero_seal_nomem(void) {
+    for (unsigned remove_owner = 0; remove_owner < 2; remove_owner++) {
+        fixture f = xattr_fixture(1, 3, 1); assert(xattr_guard(f.p, f.p, f.n)); fixture_save(&f); sfs_image *h; sfs_result r; reset("", 0); open_image(&h); symlink_full(h);
+        sfs_metadata_entry original = metadata_get(h, 0, 4); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+        sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 9898; metadata_clock(910); XEXPECT(sfs_image_set_metadata(h, 4, &update, &r), SFS_OK);
+        size_t n; unsigned char *before = bytes("image", &n); reset("", 0); metadata_clock(911); fail_arena_allocation = 3;
+        enum sfs_status status = remove_owner ? sfs_image_remove(h, 2, &r) : sfs_image_remove_xattr(h, 2, "key", 3, &r);
+        assert(status == SFS_NOMEM && r.status == status && r.phase == SFS_PHASE_READ && r.system_errno == ENOMEM && hit == 1 && arena_allocations == 3 && r.physical_end == n);
+        assert(clock_calls == 1); image_unwritten(); unchanged("image", before, n); receipt(remove_owner ? "xattr-empty-prefix-third-arena" : "xattr-empty-delete-third-arena", &r);
+        reset("", 0); xattr_expect(h, 0, 2, "key", 3, "shared", 6); expect(h, 0, 2, "shared"); metadata_commit(h);
+        sfs_metadata_entry current = metadata_get(h, 0, 4); sfs_metadata_entry expected = original; expected.uid = 9898; expected.change = (sfs_timestamp){910, 911}; metadata_equal(&expected, &current);
+        current = metadata_get(h, 1, 4); metadata_equal(&original, &current); xattr_expect(h, 0, 2, "key", 3, "shared", 6); xattr_expect(h, 1, 2, "key", 3, "shared", 6); expect(h, 0, 2, "shared"); expect(h, 0, 4, "shared"); symlink_full(h); close_image(h); free(before); retain(2420 + (int)remove_owner);
+    }
+}
+static void xattr_failures(void) {
+    xattr_capacity(); xattr_zero_seal_nomem(); sfs_image *h; sfs_result r; fixture f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, 4, 0, "pending", 7, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); reset("", 0); clock_calls = 0;
+    const unsigned char one = 'x'; XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, &one, 4194305, &r), SFS_LIMIT);
+    assert(r.phase == SFS_PHASE_ADMISSION && !r.system_errno && !clock_calls); image_unwritten(); unchanged("image", before, n); XEXPECT(sfs_image_commit(h, &r), SFS_STATE); expect(h, 0, 4, "shared"); close_image(h); free(before); retain(2422);
+    f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(920); XEXPECT(sfs_image_write(h, 4, 0, "pending", 7, &r), SFS_OK); before = bytes("image", &n);
+    for (unsigned failure = 0; failure < 2; failure++) {
+        reset("", 0); metadata_clock(921); if (failure) fail_allocation = allocation_calls + 1; else clock_failure = 1;
+        XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, "new", 3, &r), failure ? SFS_NOMEM : SFS_TIME_UNAVAILABLE);
+        assert(r.system_errno == (failure ? ENOMEM : ENXIO)); if (failure) assert(hit); else assert(r.phase == SFS_PHASE_NONE && clock_calls == 1);
+        image_unwritten(); unchanged("image", before, n);
+    }
+    reset("", 0); metadata_commit(h); expect(h, 0, 4, "pending"); xattr_expect(h, 0, 2, "key", 3, "shared", 6); close_image(h); free(before); retain(2423);
+    unsigned char value[4097]; for (unsigned i = 0; i < sizeof(value); i++) value[i] = (unsigned char)(i * 17 + 3);
+    for (unsigned nth = 1; nth <= 6; nth++) {
+        f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); before = bytes("image", &n); reset("write_error", (int)nth); metadata_clock(922);
+        XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, value, sizeof(value), &r), SFS_IO);
+        assert(hit && r.phase == SFS_PHASE_RECORDS && r.system_errno == EIO && image_append_bytes == (nth - 1) * UINT64_C(4096) && !fulls && !slots);
+        receipt("xattr-producer-write-error", &r); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); reset("", 0); close_image(h);
+        size_t tail_n; unsigned char *tail = bytes("image", &tail_n); assert(tail_n == n + (nth - 1) * CELL && !memcmp(tail, before, n)); free(tail); free(before);
+        open_image(&h); xattr_expect(h, 0, 2, "key", 3, "shared", 6); xattr_expect(h, 1, 2, "key", 3, "shared", 6); close_image(h); retain(2430 + (int)nth);
+    }
+    for (unsigned failure = 0; failure < 3; failure++) {
+        f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); before = bytes("image", &n);
+        reset(failure == 0 ? "write_eintr" : failure == 1 ? "write_short" : "enospc", 2); metadata_clock(923);
+        enum sfs_status status = sfs_image_set_xattr(h, 2, "key", 3, value, sizeof(value), &r); assert(status == r.status);
+        if (failure < 2) { assert(status == SFS_OK); if (!failure) assert(hit); else assert(writes > 6); metadata_commit(h); xattr_expect(h, 0, 2, "key", 3, value, sizeof(value)); }
+        else { assert(status == SFS_IO && hit && r.phase == SFS_PHASE_RECORDS && r.system_errno == ENOSPC); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); }
+        reset("", 0); close_image(h); free(before); retain(2440 + (int)failure);
+    }
+    f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); before = bytes("image", &n); reset("", 0); fail_after_append = 1; metadata_clock(924);
+    XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, value, sizeof(value), &r), SFS_NOMEM); assert(hit && r.system_errno == ENOMEM && image_append_bytes && !fulls); receipt("xattr-late-allocation", &r);
+    XEXPECT(sfs_image_commit(h, &r), SFS_STATE); reset("", 0); xattr_expect(h, 0, 2, "key", 3, "shared", 6); close_image(h); size_t tail_n; unsigned char *tail = bytes("image", &tail_n); assert(tail_n > n && !memcmp(tail, before, n)); free(tail); free(before); retain(2443);
+    for (unsigned failure = 0; failure < 3; failure++) {
+        f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, value, sizeof(value), &r), SFS_OK);
+        reset(failure == 0 ? "slot_error" : "full", failure == 2 ? 2 : 1); clock_calls = 0;
+        enum sfs_status status = sfs_image_commit(h, &r); assert(status == r.status && hit && !clock_calls);
+        assert(status == (failure == 1 ? SFS_IO : SFS_OUTCOME_UNKNOWN) && r.system_errno == EIO && r.phase == (failure == 0 ? SFS_PHASE_SLOT0 : failure == 1 ? SFS_PHASE_RECORD_BARRIER : SFS_PHASE_COMMIT_BARRIER));
+        receipt("xattr-commit-uncertainty", &r); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); reset("", 0); close_image(h); open_image(&h);
+        xattr_expect(h, 0, 2, "key", 3, failure == 2 ? value : (const unsigned char *)"shared", failure == 2 ? sizeof(value) : 6); xattr_expect(h, 1, 2, "key", 3, "shared", 6); close_image(h); retain(2444 + (int)failure);
+    }
+    for (unsigned corrupt = 0; corrupt < 2; corrupt++) {
+        f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_set_xattr(h, 2, "key", 3, value, sizeof(value), &r), SFS_OK); metadata_commit(h); close_image(h);
+        unsigned char *image = bytes("image", &n), *ns = namespace_at(image, selected_slot(image), n), *attrs = record(image, ns + 280, n), *extent = record(image, attrs + 640 + 280, n); read_at[0] = get64(extent + 640 + 72 + 8 + 8);
+        open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 111; XEXPECT(sfs_image_set_metadata(h, 4, &update, &r), SFS_OK);
+        if (corrupt) { int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); unsigned char changed = (unsigned char)(image[read_at[0]] ^ 1); raw_write(fd, &changed, 1, (off_t)read_at[0]); assert(!close(fd)); }
+        free(image); before = bytes("image", &n); unsigned char out[4099]; memset(out, 0xA5, sizeof(out)); size_t got = 99; reset(corrupt ? "" : "candidate_reads", corrupt ? 0 : 1); clock_calls = 0;
+        XEXPECT(sfs_image_read_xattr(h, 0, 2, "key", 3, 0, out + 1, sizeof(value), &got, &r), corrupt ? SFS_CORRUPT : SFS_IO);
+        assert(got == CELL && !memcmp(out + 1, value, CELL) && out[0] == 0xA5 && out[CELL + 1] == 0xA5 && out[sizeof(out) - 1] == 0xA5 && r.phase == SFS_PHASE_READ && r.system_errno == (corrupt ? 0 : EIO) && !clock_calls); if (!corrupt) assert(hit);
+        image_unwritten(); unchanged("image", before, n); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); reset("", 0); close_image(h); free(before); retain(2450 + (int)corrupt);
+    }
+    for (unsigned operation = 0; operation < 3; operation++) {
+        f = xattr_fixture(1, 3, 1); fixture_save(&f); reset("", 0); open_image(&h); xattr_expect(h, 0, 2, "key", 3, "shared", 6); sfs_result binding = xattr_binding(h);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); struct stat st; assert(!fstat(fd, &st) && !ftruncate(fd, st.st_size + 1) && !close(fd));
+        before = bytes("image", &n); reset("", 0); uint64_t size = UINT64_MAX; size_t got = 99; unsigned char out[8]; memset(out, 0xA5, sizeof(out)); sfs_xattr_entry output, canary; memset(&canary, 0xA5, sizeof(canary)); output = canary; int found = 99;
+        if (operation == 0) XEXPECT(sfs_image_xattr_size(h, 0, 2, "key", 3, &size, &r), SFS_IO);
+        else if (operation == 1) XEXPECT(sfs_image_read_xattr(h, 0, 2, "key", 3, 0, out, sizeof(out), &got, &r), SFS_IO);
+        else XEXPECT(sfs_image_next_xattr(h, 0, binding.generation, binding.root_digest, 2, NULL, 0, &output, &found, &r), SFS_IO);
+        assert(r.phase == SFS_PHASE_IDENTITY && r.system_errno == ESTALE && size == UINT64_MAX && got == (operation == 1 ? 0u : 99u) && found == 99 && !memcmp(&output, &canary, sizeof(output)));
+        for (unsigned i = 0; i < sizeof(out); i++) assert(out[i] == 0xA5); image_unwritten(); unchanged("image", before, n); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); close_image(h); free(before); retain(2452 + (int)operation);
+    }
+}
+static fixture xattr_eviction_fixture(unsigned retained, unsigned binary, unsigned invalid_link) {
+    fixture f = fixture_start(); f.minor = 5; put32(f.p + 12, 5); unsigned char raw[CELL] = {0}; memcpy(raw, "shared", 6); if (binary) raw[2] = 0;
+    fixture_node data = append_cell(&f, 6, raw); memset(raw, 0, CELL); memcpy(raw, "filler", 6); fixture_node filler = append_cell(&f, 6, raw);
+    unsigned char one[72] = {0}; memcpy(one + 8, data.ref, 56); put16(one + 64, 6); fixture_node target = tree(&f, 3, one, 1);
+    const unsigned count = 48 * 1201; unsigned char *rows = calloc(count, 72); assert(rows);
+    for (unsigned i = 0; i < count; i++) { put64(rows + i * 72, i); memcpy(rows + i * 72 + 8, i ? filler.ref : data.ref, 56); put16(rows + i * 72 + 64, 6); }
+    fixture_node regular = tree(&f, 3, rows, count); free(rows);
+    unsigned char ir[880] = {0}, nr[560] = {0};
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *a = ir + i * 440, *b = nr + i * 280; put64(a, i + 2); put64(a + 8, 1); put32(a + 16, SFS_FILE); put32(a + 20, 1); a[88] = (unsigned char)('a' + i);
+        if (!i) { put64(a + 24, (count - 1) * (uint64_t)CELL + 6); memcpy(a + 32, regular.ref, 56); } fixture_tuple(a + 352, SFS_FILE, i ? 0 : count);
+        put64(b, 1); put32(b + 8, 1); b[12] = (unsigned char)('a' + i); put64(b + 267, i + 2);
+    }
+    fixture_node inodes = tree(&f, 1, ir, 2), names = tree(&f, 2, nr, 2); unsigned char attr[352]; xattr_row(attr, 3, "key", 3, 6, target.ref, 1); fixture_node attrs = tree(&f, 5, attr, 1);
+    fixture_node history = xattr_space(&f, inodes, names, attrs, 4, 2);
+    /* No current symlink can refresh T before the current or first retained xattr reuse. */
+    if (!binary || invalid_link) { put32(ir + 440 + 16, SFS_SYMLINK); put64(ir + 440 + 24, 6); memcpy(ir + 440 + 32, target.ref, 56); put32(ir + 440 + 416, 0120600); put64(ir + 440 + 432, 1); }
+    fixture_node later_inodes = tree(&f, 1, ir, 2), later = xattr_space(&f, later_inodes, names, attrs, 4, 2);
+    unsigned char sr[656] = {0};
+    for (unsigned i = 0; i < 2; i++) { put32(sr + i * 328, i + 1); memcpy(sr + i * 328 + 8, i ? later.ref : history.ref, 56); put32(sr + i * 328 + 64, 1); sr[i * 328 + 68] = (unsigned char)('x' + i); }
+    fixture_node catalog = tree(&f, 4, sr, 2), empty = {0}, current = xattr_space(&f, inodes, names, retained ? empty : attrs, 4, 2); finish_fixture(&f, current, catalog); return f;
+}
+static void xattr_sparse_save(fixture *f) {
+    size_t cells = f->n / CELL; unsigned char *mapping = calloc(cells, 56); assert(mapping); int fd = open("image", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600); assert(fd >= 0); uint64_t end = 0;
+    for (size_t i = 2; i < cells; i++) {
+        unsigned char *p = f->p + i * CELL; unsigned type = !memcmp(p, "SFSREC05", 8) ? get32(p + 8) : 6;
+        if (type == 2 || type == 4) { mapped_ref(p + 64, mapping, cells); mapped_ref(p + 120, mapping, cells); if (type == 2) mapped_ref(p + 280, mapping, cells); }
+        if (type == 5) { unsigned map = get32(p + 64), level = get16(p + 68), count = get16(p + 70), stride = xattr_stride(map, level), edge = xattr_edge(map, level); for (unsigned j = 0; j < count; j++) if (level || map != 2) mapped_ref(p + 640 + j * stride + edge, mapping, cells); }
+        unsigned char *ref = mapping + i * 56; put32(ref, type); uint64_t at = (2 + (i - 2) * 32) * UINT64_C(4096); put64(ref + 8, at); put64(ref + 16, CELL);
+        if (type == 6) { unsigned char domain[36]; memcpy(domain, "SFSDAT05", 8); memcpy(domain + 8, f->p + 24, 16); put32(domain + 24, 6); put64(domain + 28, CELL); CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c, domain, 36); CC_SHA256_Update(&c, p, CELL); CC_SHA256_Final(ref + 24, &c); }
+        else CC_SHA256(p, CELL, ref + 24); raw_write(fd, p, CELL, (off_t)at); end = at + CELL;
+    }
+    assert(end <= UINT64_C(268435456));
+    for (unsigned i = 0; i < 2; i++) { unsigned char *slot = f->p + i * CELL; mapped_ref(slot + 48, mapping, cells); put64(slot + 104, end); put64(slot + 144, UINT64_C(268435456)); slot_hash(slot); raw_write(fd, slot, CELL, i * CELL); }
+    assert(!close(fd)); printf("{\"case\":\"xattr-sparse-target-memo\",\"stored_cell_bytes\":%llu,\"logical_end\":%llu,\"filesystem_allocation_claim\":false}\n", (unsigned long long)(cells * CELL), (unsigned long long)end); fflush(stdout); free(mapping); free(f->p); f->p = NULL;
+}
+static void xattr_verify(void) {
+    fixture f = xattr_fixture(3, 0, 2); size_t n = f.n; unsigned char *baseline = malloc(n); assert(baseline); memcpy(baseline, f.p, n); assert(xattr_guard(f.p, baseline, n)); fixture_save(&f);
+    sfs_image *h; sfs_result r; sfs_recovery recovery; reset("", 0); open_image(&h); symlink_full(h); close_image(h); retain(2500);
+    const char *cases[] = {"owner-zero", "owner-range", "owner-missing", "wrong-map", "name-nul", "row-padding", "length-count", "empty-extent", "nonempty-null", "hole", "extra", "short-visible", "raw-suffix", "raw-digest", "namespace-padding", "wrong-raw-domain"};
+    for (unsigned kind = 0; kind < sizeof(cases) / sizeof(*cases); kind++) {
+        unsigned char *p = malloc(n); assert(p); memcpy(p, baseline, n); unsigned char *space = namespace_at(p, p, n), *attrs = record(p, space + 280, n), *row = attrs + 640;
+        unsigned char *extent = record(p, row + 280, n), *raw = record(p, extent + 648, n);
+        if (kind == 0) put64(row, 0); else if (kind == 1) put64(row, 5); else if (kind == 2) put64(row, 3);
+        else if (kind == 3) put32(attrs + 64, 4); else if (kind == 4) row[13] = 0; else if (kind == 5) row[267] = 1;
+        else if (kind == 6) put64(row + 336, 2); else if (kind == 7) { put64(row + 272, 0); put64(row + 336, 0); }
+        else if (kind == 8) memset(row + 280, 0, 56);
+        else if (kind == 9) { memcpy(extent + 712, extent + 784, 72); memset(extent + 784, 0, 72); put16(extent + 70, 2); }
+        else if (kind == 10) { memcpy(extent + 856, extent + 784, 72); put64(extent + 856, 3); put16(extent + 70, 4); }
+        else if (kind == 11) put16(extent + 704, CELL - 1); else if (kind == 12) raw[6] = 'X'; else if (kind == 14) space[336] = 1;
+        xattr_repair(p, baseline, n);
+        if (kind == 10) { unsigned char check[56]; memcpy(check, extent + 864, 56); ref_hash(p, check, n); assert(!memcmp(check, extent + 864, 56)); }
+        assert(xattr_guard(p, baseline, n));
+        if (kind == 13) raw[0] ^= 1;
+        else if (kind == 15) {
+            unsigned char domain[36], digest[32]; memcpy(domain, "SFSDAT04", 8); memcpy(domain + 8, p + 24, 16); put32(domain + 24, 6); put64(domain + 28, CELL);
+            CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c, domain, 36); CC_SHA256_Update(&c, raw, CELL); CC_SHA256_Final(digest, &c);
+            for (unsigned i = 0; i < 3; i++) memcpy(extent + 648 + i * 72 + 24, digest, 32);
+            xattr_repair_metadata(p, baseline, n);
+        }
+        if (kind == 13 || kind == 15) assert(!xattr_guard(p, baseline, n));
+        save("image", p, n); reset("", 0); h = NULL; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED);
+        assert(!h && r.phase == SFS_PHASE_READ && !r.system_errno && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT && recovery.slots[0].coverage != SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].coverage != SFS_COVERAGE_FULL_REACHABLE);
+        printf("{\"xattr_semantic_case\":\"%s\",\"digest_framing_valid\":%s,\"aggregate_status\":%d,\"slot0\":%d,\"slot1\":%d}\n", cases[kind], (kind == 13 || kind == 15) ? "false" : "true", r.status, recovery.slots[0].status, recovery.slots[1].status); fflush(stdout); image_unwritten(); unchanged("image", p, n);
+        if (kind == 9) {
+            open_image(&h); unsigned char output[8198]; memset(output, 0xA5, sizeof(output)); size_t got = 99;
+            XEXPECT(sfs_image_read_xattr(h, 0, 2, "key", 3, 0, output, sizeof(output), &got, &r), SFS_CORRUPT);
+            assert(got == CELL && !memcmp(output, "shared", 6) && output[CELL] == 0xA5 && r.phase == SFS_PHASE_READ && !r.system_errno); for (unsigned i = 6; i < CELL; i++) assert(!output[i]); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); close_image(h);
+        }
+        free(p); retain(2501 + (int)kind);
+    }
+    free(baseline);
+    /* A successful intrinsic regular-file summary cannot certify a dense attribute. */
+    f = xattr_fixture(3, 1, 2); assert(xattr_guard(f.p, f.p, f.n)); save("image", f.p, f.n); reset("", 0); open_image(&h); reset("", 0);
+    XEXPECT(sfs_image_verify(h, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE && raw_hashes == 1 && raw_hash_input == 4132); receipt("xattr-shared-regular-full-control", &r); close_image(h); retain(2519);
+    unsigned char *old = malloc(f.n); assert(old); memcpy(old, f.p, f.n); unsigned char *space = namespace_at(f.p, f.p, f.n), *attrs = record(f.p, space + 280, f.n), *extent = record(f.p, attrs + 640 + 280, f.n);
+    memcpy(extent + 712, extent + 784, 72); memset(extent + 784, 0, 72); put16(extent + 70, 2); unsigned char *inode = leaf_row(f.p, space + 64, 2, f.n, 440); put64(inode + 432, 2);
+    xattr_repair(f.p, old, f.n); assert(xattr_guard(f.p, old, f.n)); fixture_save(&f); free(old); reset("", 0); h = NULL; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED);
+    assert(!h && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT); image_unwritten(); retain(2520);
+    /* Two owners share one extent root; each L/N is checked even after the first succeeds. */
+    f = xattr_fixture(3, 1, 2); old = malloc(f.n); assert(old); memcpy(old, f.p, f.n); space = namespace_at(f.p, f.p, f.n); attrs = record(f.p, space + 280, f.n);
+    memcpy(attrs + 992, attrs + 640, 352); put64(attrs + 992, 4); put16(attrs + 70, 2); xattr_repair(f.p, old, f.n);
+    assert(xattr_ref_guard(f.p, old, attrs + 992 + 280, old + (attrs - f.p) + 640 + 280, f.n, (uint64_t)(attrs - f.p), 0)); assert(xattr_guard(f.p, old, f.n)); free(old);
+    n = f.n; baseline = malloc(n); assert(baseline); memcpy(baseline, f.p, n); fixture_save(&f); reset("", 0); open_image(&h); reset("", 0); symlink_full(h); assert(raw_hashes == 1 && raw_hash_input == 4132); close_image(h); retain(2521);
+    unsigned char *p = malloc(n); assert(p); memcpy(p, baseline, n); space = namespace_at(p, p, n); attrs = record(p, space + 280, n); put64(attrs + 992 + 272, CELL); put64(attrs + 992 + 336, 1); xattr_repair(p, baseline, n); assert(xattr_guard(p, baseline, n)); save("image", p, n);
+    reset("", 0); h = NULL; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED); assert(!h && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT); image_unwritten(); unchanged("image", p, n); free(p); free(baseline); retain(2522);
+    f = xattr_fixture(1, 0, 1); fixture_save(&f); reset("", 0); recovery_cancellation cancellation = {.after_hash = 0}; sfs_verify_budget budget = generous; budget.cancelled = cancel_recovery_once; budget.context = &cancellation;
+    XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &budget, &r), SFS_OK);
+    assert(cancellation.fired && recovery.slots[0].status == SFS_INCOMPLETE && recovery.slots[0].incomplete_reason == SFS_INCOMPLETE_CANCELLED && recovery.slots[0].coverage != SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].status == SFS_OK && recovery.slots[1].coverage == SFS_COVERAGE_FULL_REACHABLE);
+    uint64_t size = UINT64_MAX; XEXPECT(sfs_image_xattr_size(h, 0, 2, "key", 3, &size, &r), SFS_STATE); assert(size == UINT64_MAX); XEXPECT(sfs_image_select(h, 0, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE); xattr_expect(h, 0, 2, "key", 3, "shared", 6); close_image(h); retain(2523);
+    for (unsigned stop = 0; stop < 5; stop++) {
+        f = xattr_fixture(3, 0, 1); fixture_save(&f); reset("", 0); open_image(&h); budget = generous; unsigned polls = 0;
+        if (stop == 0) budget.raw_cells = 1; else if (stop == 1) budget.checks = 1; else if (stop == 2) budget.auxiliary_bytes = 1; else if (stop == 3) budget.auxiliary_io_bytes = 1; else { budget.cancelled = cancel_now; budget.context = &polls; }
+        reset("", 0); enum sfs_status status = sfs_image_verify(h, &budget, &r); assert(status == r.status);
+        if (!stop) assert(status == SFS_OK && r.coverage == SFS_COVERAGE_FULL_REACHABLE && raw_hashes == 1 && raw_hash_input == 4132);
+        else { const enum sfs_incomplete_reason why[] = {SFS_INCOMPLETE_NONE, SFS_INCOMPLETE_CHECKS, SFS_INCOMPLETE_AUX_LENGTH, SFS_INCOMPLETE_AUX_IO, SFS_INCOMPLETE_CANCELLED}; assert(status == SFS_INCOMPLETE && !r.system_errno && r.incomplete_reason == why[stop] && r.coverage != SFS_COVERAGE_FULL_REACHABLE); if (stop == 4) assert(polls); }
+        image_unwritten(); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK); close_image(h); retain(2524 + (int)stop);
+    }
+    for (unsigned io = 0; io < 2; io++) {
+        f = xattr_fixture(1, 0, 1); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 321; XEXPECT(sfs_image_set_metadata(h, 4, &update, &r), SFS_OK);
+        budget = generous; budget.metadata_read_bytes = CELL; reset(io ? "slot_reads" : "", io ? 1 : 0);
+        XEXPECT(sfs_image_verify(h, &budget, &r), io ? SFS_IO : SFS_INCOMPLETE); assert(r.phase == SFS_PHASE_READ && r.system_errno == (io ? EIO : 0)); if (io) assert(hit); else assert(r.incomplete_reason == SFS_INCOMPLETE_METADATA_READ);
+        image_unwritten(); reset("", 0); if (io) XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); else { metadata_commit(h); sfs_metadata_entry m = metadata_get(h, 0, 4); assert(m.uid == 321); xattr_expect(h, 0, 2, "key", 3, "shared", 6); }
+        close_image(h); retain(2529 + (int)io);
+    }
+    for (unsigned retained = 0; retained < 2; retained++) for (unsigned binary = 0; binary < 2; binary++) {
+        f = xattr_eviction_fixture(retained, binary, 0); assert(xattr_guard(f.p, f.p, f.n)); unsigned char target_ref[56]; space = namespace_at(f.p, f.p, f.n);
+        unsigned char *reference_space = space;
+        if (retained) { unsigned char *commit = record(f.p, f.p + 48, f.n), *catalog = record(f.p, commit + 120, f.n); reference_space = record(f.p, catalog + 648, f.n); }
+        attrs = record(f.p, reference_space + 280, f.n); extent = record(f.p, attrs + 640 + 280, f.n); memcpy(target_ref, extent + 648, 56); xattr_sparse_save(&f);
+        unsigned char digest[32], after_digest[32]; uint64_t length, after_length; file_digest("image", digest, &length); assert(length <= UINT64_C(268435456)); struct stat identity, after_identity; assert(!lstat("image", &identity));
+        reset("", 0); open_image(&h); reset("", 0); memo_target_start(target_ref, binary ? 2 : 6, 1); symlink_full(h); memo_target_check(1, 0);
+        assert(raw_hashes == 2 && raw_hash_input == 8264 && watch_bytes[0] == CELL && watch_reads[0] == 1 && aux_write_calls && aux_read_bytes); counters("xattr-target-first-zero-reloaded"); memo_target_enabled = 0;
+        unsigned char target[] = "shared"; if (binary) target[2] = 0; xattr_expect(h, retained ? 1 : 0, 3, "key", 3, target, 6); xattr_expect(h, 1, 3, "key", 3, target, 6); if (!binary) symlink_expect(h, 2, 3, "shared", 6);
+        image_unwritten(); close_image(h); watch_count = 0; file_digest("image", after_digest, &after_length); assert(length == after_length && !memcmp(digest, after_digest, 32)); assert(!lstat("image", &after_identity)); identical_identity(&identity, &after_identity); retain(2531 + (int)(retained * 2 + binary));
+    }
+    /* Binary xattrs remain valid; only the later retained symlink rejects the same NUL target. */
+    f = xattr_eviction_fixture(0, 1, 1); assert(xattr_guard(f.p, f.p, f.n)); space = namespace_at(f.p, f.p, f.n); attrs = record(f.p, space + 280, f.n); extent = record(f.p, attrs + 640 + 280, f.n); unsigned char target_ref[56]; memcpy(target_ref, extent + 648, 56); xattr_sparse_save(&f);
+    reset("", 0); memo_target_start(target_ref, 2, 1); h = NULL; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED);
+    assert(!h && r.phase == SFS_PHASE_READ && !r.system_errno && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT && raw_hashes == 4 && raw_hash_input == 16528); memo_target_check(2, 0); memo_target_enabled = 0; watch_count = 0; image_unwritten();
+}
+
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -2639,6 +3257,12 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"indexes")) indexes(); else if(!strcmp(argv[1],"ranges")) ranges();
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
+    else if(!strcmp(argv[1],"xattr-versions")) xattr_versions();
+    else if(!strcmp(argv[1],"xattr-values")) xattr_values();
+    else if(!strcmp(argv[1],"xattr-namespace")) xattr_namespace();
+    else if(!strcmp(argv[1],"xattr-views")) xattr_views();
+    else if(!strcmp(argv[1],"xattr-failures")) xattr_failures();
+    else if(!strcmp(argv[1],"xattr-verify")) xattr_verify();
     else if(!strcmp(argv[1],"symlink-versions")) symlink_versions();
     else if(!strcmp(argv[1],"symlink-bytes")) symlink_bytes();
     else if(!strcmp(argv[1],"symlink-namespace")) symlink_namespace();
@@ -2646,7 +3270,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-failures")) symlink_failures();
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)) assert(!clock_calls);
+    if(strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }
