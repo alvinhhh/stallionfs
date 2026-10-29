@@ -59,6 +59,35 @@ def main(argv=None):
     forget = commands.add_parser("forget", help="Preview or delete a regenerable seed")
     forget.add_argument("seed")
     forget.add_argument("--yes", action="store_true")
+    snapshot = commands.add_parser("snapshot", help="Capture a stopped managed workspace")
+    snapshot.add_argument("id")
+    snapshot.add_argument("--name", default="")
+    snapshot.add_argument("--quiescent", action="store_true")
+    snapshots = commands.add_parser("snapshots", help="List workspace snapshots")
+    snapshots.add_argument("id")
+    rollback = commands.add_parser("rollback", help="Restore a snapshot and retain the previous workspace")
+    rollback.add_argument("id")
+    rollback.add_argument("snapshot")
+    rollback.add_argument("--quiescent", action="store_true")
+    close = commands.add_parser("close", help="Record that all workspace writers have stopped")
+    close.add_argument("id")
+    close.add_argument("--quiescent", action="store_true")
+    enroll = commands.add_parser("enroll", help="Enroll a workspace in cooperative cleanup")
+    enroll.add_argument("id")
+    enroll.add_argument("--disable", action="store_true")
+    managed_run = commands.add_parser("run", help="Run a command while holding the managed-use lease")
+    managed_run.add_argument("id")
+    managed_run.add_argument("command", nargs=argparse.REMAINDER)
+    cleanup = commands.add_parser("cleanup", help="Preview or retire enrolled workspaces closed for seven days")
+    cleanup_mode = cleanup.add_mutually_exclusive_group()
+    cleanup_mode.add_argument("--enable", action="store_true")
+    cleanup_mode.add_argument("--disable", action="store_true")
+    cleanup_mode.add_argument("--apply", action="store_true")
+    commands.add_parser("retained", help="List snapshots, rollback recovery, and protected trash")
+    purge = commands.add_parser("purge", help="Preview or permanently delete retained data")
+    purge.add_argument("kind", choices=("snapshots", "recovery", "trash"))
+    purge.add_argument("id")
+    purge.add_argument("--yes", action="store_true")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
     raw = list(sys.argv[1:] if argv is None else argv)
     setup = []
@@ -125,15 +154,48 @@ def main(argv=None):
             items = store.gc(older_than=args.older_than * 3600, yes=args.yes, jobs=args.jobs)
             result = {"deleted" if args.yes else "would_delete": items}
             text = json.dumps(result)
+        elif args.action == "snapshot":
+            result = store.snapshot(args.id, quiescent=args.quiescent, name=args.name)
+            text = result["id"]
+        elif args.action == "snapshots":
+            result = store.snapshots(args.id)
+            text = "\n".join(f"{item['id']}\t{item['name']}" for item in result)
+        elif args.action == "rollback":
+            result = store.rollback(args.id, args.snapshot, quiescent=args.quiescent)
+            text = json.dumps(result)
+        elif args.action == "close":
+            result = store.close(args.id, quiescent=args.quiescent)
+            text = args.id
+        elif args.action == "enroll":
+            result = store.enroll(args.id, enabled=not args.disable)
+            text = args.id
+        elif args.action == "run":
+            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            result = store.run(args.id, command)
+            text = json.dumps(result) if args.json else ""
+        elif args.action == "cleanup":
+            if args.enable or args.disable:
+                result = store.cleanup_config(enabled=args.enable)
+            else:
+                result = store.cleanup(apply=args.apply)
+            text = json.dumps(result)
+        elif args.action == "retained":
+            result = store.retained()
+            text = json.dumps(result)
+        elif args.action == "purge":
+            result = store.purge(args.kind, args.id, yes=args.yes)
+            text = json.dumps(result)
         elif args.action == "forget":
             result = store.forget(args.seed, yes=args.yes)
             text = json.dumps(result)
         else:
             result = store.doctor()
             text = json.dumps(result, indent=2)
+        if args.action in {"create", "mount", "unmount", "remove", "restore", "snapshot", "rollback", "close", "enroll", "run"}:
+            store.opportunistic_cleanup()
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
-        return 0
+        return result["returncode"] if args.action == "run" else 0
     except (StallionError, OSError, shutil.Error, KeyboardInterrupt) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)

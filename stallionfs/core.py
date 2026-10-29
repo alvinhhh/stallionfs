@@ -96,13 +96,13 @@ def remove_tree(path, *, jobs=4):
 
 
 @contextlib.contextmanager
-def lock(path, *, shared=False):
+def lock(path, *, shared=False, blocking=True):
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise StallionError(f"Unsafe lock file: {path}")
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | (0 if blocking else fcntl.LOCK_NB))
         yield
     finally:
         os.close(fd)
@@ -122,7 +122,9 @@ def clone_tree(source, destination, *, jobs=4):
 def validate_tree(root):
     """Only regular files, directories, and relocatable internal symlinks are supported."""
     device = root.stat().st_dev
-    for parent, dirs, files in os.walk(root, followlinks=False):
+    def failed(error):
+        raise error
+    for parent, dirs, files in os.walk(root, followlinks=False, onerror=failed):
         for name in dirs + files:
             item = Path(parent, name)
             info = item.lstat()
@@ -142,7 +144,10 @@ def validate_tree(root):
                 raise StallionError(f"Special file is unsupported: {item.relative_to(root)}")
 
 
-class Store:
+from .lifecycle import Lifecycle
+
+
+class Store(Lifecycle):
     def __init__(self, root):
         raw = Path(root).expanduser().absolute()
         if raw.is_symlink():
@@ -158,7 +163,7 @@ class Store:
                 write_json(marker, {"application": "stallionfs"})
             if read_json(marker).get("application") != "stallionfs":
                 raise StallionError("This is not a stallionfs store")
-            for name in ("seeds", "workspaces", "trash", "staging", "locks"):
+            for name in ("seeds", "workspaces", "trash", "staging", "locks", "snapshots", "recovery", "lifecycle", "journals", "protected"):
                 child = self.root / name
                 child.mkdir(mode=0o700, exist_ok=True)
                 private_directory(child)
@@ -292,7 +297,7 @@ class Store:
             base, seed_meta = self.object("seeds", seed)
             workspace = uuid.uuid4().hex
             final = self.root / "workspaces" / workspace
-            with lock(self.root / "locks" / f"workspace-{workspace}"):
+            with self._workspace_lock(workspace):
                 with self.staging() as stage:
                     branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
                     metadata = {"id": workspace, "seed": seed, "name": name, "branch": branch,
@@ -307,6 +312,7 @@ class Store:
                         git(stage / "repo", "checkout", "-b", branch)
                     write_json(stage / "meta.json", metadata)
                     stage.rename(final)
+                self._open(workspace, final, metadata)
                 return self._mount(final, metadata)
 
     def _mount(self, path, metadata):
@@ -331,15 +337,18 @@ class Store:
 
     def mount(self, workspace):
         identifier(workspace, 32)
-        with lock(self.root / "locks" / f"workspace-{workspace}"):
-            return self._mount(*self.object("workspaces", workspace))
+        with self._workspace_lock(workspace):
+            path, metadata = self.object("workspaces", workspace)
+            self._open(workspace, path, metadata)
+            return self._mount(path, metadata)
 
     def unmount(self, workspace):
         identifier(workspace, 32)
-        with lock(self.root / "locks" / f"workspace-{workspace}"):
+        with self._workspace_lock(workspace):
             path, metadata = self.object("workspaces", workspace)
             if metadata.get("backend") != "image":
                 raise StallionError("This workspace is an ordinary folder")
+            self._open(workspace, path, metadata)
             from . import images
             images.detach(path / "workspace.sparseimage", path / "volume")
             return {"unmounted": workspace}
@@ -362,7 +371,7 @@ class Store:
     def move(self, workspace, *, restore=False):
         identifier(workspace, 32)
         source, destination = ("trash", "workspaces") if restore else ("workspaces", "trash")
-        with lock(self.root / "locks" / f"workspace-{workspace}"):
+        with self._workspace_lock(workspace):
             path, metadata = self.object(source, workspace)
             target = self.root / destination / workspace
             if target.exists() or target.is_symlink():
@@ -370,7 +379,9 @@ class Store:
             if metadata.get("backend") == "image":
                 from . import images
                 images.detach(path / "workspace.sparseimage", path / "volume")
+            self._open(workspace, path, metadata)
             path.rename(target)
+            self._open(workspace, target, metadata)
             # Directory mtime records trash age without an extra metadata transaction.
             os.utime(target, None, follow_symlinks=False)
             if restore:
@@ -385,7 +396,9 @@ class Store:
 
         def collect(entry):
             identifier(entry.name, 32)
-            with lock(self.root / "locks" / f"workspace-{entry.name}"):
+            with self._workspace_lock(entry.name):
+                if os.path.lexists(self.root / "protected" / f"{entry.name}.json"):
+                    return None
                 if not entry.exists() and not entry.is_symlink():
                     return None
                 path, metadata = self.object("trash", entry.name)

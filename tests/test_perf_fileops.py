@@ -16,6 +16,66 @@ fileops = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fileops)
 
 
+class LinuxMountAdmission(unittest.TestCase):
+    def test_mountinfo_decodes_paths_and_keeps_bind_mount_identity(self):
+        rows = fileops.linux_mounts(r'41 1 0:52 / /scratch\040space\011tab\012line\134slash rw shared:1 - zfs pool/data rw' + '\n'
+                                   r'42 41 0:52 /sub /scratch\040space\011tab\012line\134slash/bind rw - zfs pool/data rw' + '\n')
+        self.assertEqual(rows[0]['path'], '/scratch space\ttab\nline\\slash')
+        self.assertEqual(rows[0]['source'], 'pool/data')
+        self.assertEqual(rows[1]['device'], rows[0]['device'])
+        self.assertNotEqual(rows[1]['mount_id'], rows[0]['mount_id'])
+        for invalid in ('', '41 1 broken / /scratch rw - zfs pool/data rw\n',
+                        r'41 1 0:52 / /bad\099 rw - zfs pool/data rw' + '\n',
+                        '41 1 0:52 / /scratch ro,rw - zfs pool/data rw\n',
+                        '41 1 0:52 / /scratch rw - zfs pool/data rw\n' * 2):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError): fileops.linux_mounts(invalid)
+
+    def test_all_descendant_mounts_are_rejected_even_same_device_binds(self):
+        base = Path('/scratch/fixture')
+        for point in (base, base/'same-device-bind'):
+            with self.subTest(point=point), mock.patch.object(fileops, 'linux_mounts', return_value=[
+                    {'path': '/scratch', 'mount_id': 41, 'device': '0:52'},
+                    {'path': str(point), 'mount_id': 42, 'device': '0:52'}]), \
+                    self.assertRaisesRegex(RuntimeError, 'mounted filesystem'):
+                fileops.no_mounts_below(None, base)
+
+    def test_scratch_requires_live_matching_dataset_and_mount_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory).resolve()
+            device = scratch.stat().st_dev
+            row = {'mount_id': 41, 'device': f'{os.major(device)}:{os.minor(device)}', 'path': str(scratch),
+                   'root': '/', 'filesystem': 'zfs', 'source': 'pool/benchmark', 'readonly': False}
+            properties = ('type\tfilesystem\nmounted\tyes\nreadonly\toff\nmountpoint\t' + str(scratch) + '\n').encode()
+            def command(argv, **kwargs):
+                return fileops.subprocess.CompletedProcess(argv, 0, b'zfs-2.4\n' if argv[-1] == '--version' else properties, b'')
+            with mock.patch.object(fileops, 'linux_mount_id', return_value=(41, device)), \
+                 mock.patch.object(fileops.shutil, 'which', return_value='/usr/sbin/zfs'), \
+                 mock.patch.object(fileops, 'command', side_effect=command) as called:
+                volume = fileops.linux_scratch_volume([row], scratch)
+                self.assertEqual(volume['dataset'], 'pool/benchmark')
+                self.assertEqual(volume['mount_id'], 41)
+                self.assertEqual(called.call_args_list[0].args[0][-1], 'pool/benchmark')
+                for changes in ({'mount_id': 42}, {'device': '0:999'}, {'root': '/subdir'},
+                                {'readonly': True}, {'filesystem': 'ext4'}, {'source': '/dev/vda'}):
+                    with self.subTest(changes=changes), self.assertRaises(RuntimeError):
+                        fileops.linux_scratch_volume([row | changes], scratch)
+                with mock.patch.object(fileops, 'command', return_value=fileops.subprocess.CompletedProcess(
+                        [], 0, properties.replace(b'readonly\toff', b'readonly\ton'), b'')), \
+                        self.assertRaisesRegex(RuntimeError, 'admitted writable ZFS'):
+                    fileops.linux_scratch_volume([row], scratch)
+
+    def test_fdinfo_mount_identity_requires_unique_observation_and_closes_fd(self):
+        for text, valid in (('mnt_id:\t41\n', True), ('mnt_id:\t41\nmnt_id:\t42\n', False), ('pos:\t0\n', False)):
+            with self.subTest(text=text), mock.patch.object(fileops.os, 'open', return_value=9), \
+                 mock.patch.object(Path, 'read_text', return_value=text), \
+                 mock.patch.object(fileops.os, 'fstat', return_value=mock.Mock(st_dev=52)), \
+                 mock.patch.object(fileops.os, 'close') as close:
+                if valid: self.assertEqual(fileops.linux_mount_id(Path('/scratch')), (41, 52))
+                else:
+                    with self.assertRaises(RuntimeError): fileops.linux_mount_id(Path('/scratch'))
+                close.assert_called_once_with(9)
+
+
 @unittest.skipUnless(platform.system() == "Darwin", "Requires native macOS clone commands")
 class BenchmarkFixtures(unittest.TestCase):
     def setUp(self):

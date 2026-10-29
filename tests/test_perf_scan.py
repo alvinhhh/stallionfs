@@ -43,7 +43,9 @@ class ScannerStatistics(unittest.TestCase):
                      allocated_bytes=info.st_blocks * 512, holes={'ranges': []},
                      acl={'text_hex': b'group:uuid:everyone::allow:read\n'.hex(), 'unavailable': None},
                      xattrs={key.hex(): value.hex() for key, value in scan.native_fixtures.METADATA_XATTRS.items()})
-        return {'entries': {'file': entry}, 'hardlink_groups': [], 'unavailable_fields': []}
+        return {'entries': {'file': entry}, 'hardlink_groups': [], 'unavailable_fields': [],
+                'metadata_capabilities': {'platform': 'darwin', 'flags': True, 'resource_fork': True,
+                                          'acl': 'Darwin extended ACL'}}
 
     def configure(self, stack, root, *, memory=False):
         self.output = root / 'report.json'
@@ -59,7 +61,7 @@ class ScannerStatistics(unittest.TestCase):
         self.snapshots = stack.enter_context(mock.patch.object(scan.native_correctness, 'snapshot', side_effect=self.snapshot))
         self.enrich = stack.enter_context(mock.patch.object(scan.native_fixtures, 'enrich_metadata',
             side_effect=lambda path, *, receipt, scan_layout: receipt.update(
-                path='file', data_size=1, hardlinks=None, sparse=None)))
+                platform='darwin', path='file', data_size=1, hardlinks=None, sparse=None)))
         self.sampler = stack.enter_context(mock.patch.object(scan, 'memory_sample', side_effect=lambda path, method, *_: {
             'rss_bytes': 8192 if method == 'posix' else 4096,
             'footprint_bytes': 2048, 'exit_code': 0, 'counts': {'files': 1}}))

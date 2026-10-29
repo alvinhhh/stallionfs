@@ -14,6 +14,13 @@ metrics = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metrics)
 
 REPORT = b'''command diagnostic\nreal 0.25\nuser 0.04\nsys 0.02\n 16384  maximum resident set size\n 0 block input operations\n 2 block output operations\n'''
+GNU_REPORT = b'''native-time-v1 wall_s=0.25
+native-time-v1 user_s=0.04
+native-time-v1 system_s=0.02
+native-time-v1 rss_kib=16
+native-time-v1 io_input_blocks=0
+native-time-v1 io_output_blocks=2
+'''
 
 
 def process(*, code=0, effects=None):
@@ -63,6 +70,38 @@ def usage(user, system):
 
 
 class NativeCollector(unittest.TestCase):
+    def test_gnu_parser_units_missing_malformed_duplicate_and_nonfinite(self):
+        parsed = metrics.parse_gnu_time(GNU_REPORT)
+        self.assertEqual(parsed['rss_bytes'], 16384)
+        self.assertEqual((parsed['io_input_blocks'], parsed['io_output_blocks']), (0, 2))
+        self.assertEqual(parsed['parse_errors'], [])
+        for invalid in (b'', b'-1', b'0', b'NaN', b'inf', b'16 KiB', b'16.0', b'1e9'):
+            with self.subTest(invalid=invalid):
+                result = metrics.parse_gnu_time(GNU_REPORT.replace(b'rss_kib=16', b'rss_kib=' + invalid))
+                self.assertIsNone(result['rss_bytes'])
+                self.assertIn('rss_bytes', result['parse_errors'])
+        for invalid in (b'-1', b'NaN', b'inf', b'0.04s', b'1e9', b'9' * 400):
+            with self.subTest(invalid=invalid):
+                result = metrics.parse_gnu_time(GNU_REPORT.replace(b'user_s=0.04', b'user_s=' + invalid))
+                self.assertIsNone(result['user_s'])
+                self.assertIsNone(result['cpu_s'])
+        for suffix in (b'native-time-v1 user_s=0.05\n', b'native-time-v1 user_s=NaN\n'):
+            self.assertIsNone(metrics.parse_gnu_time(GNU_REPORT + suffix)['user_s'])
+        self.assertIsNone(metrics.parse_gnu_time(GNU_REPORT.replace(b'native-time-v1 rss_kib=16\n', b''))['rss_bytes'])
+
+    def test_linux_resource_wrapper_and_raw_failure_receipts(self):
+        for report, valid in ((GNU_REPORT, True), (GNU_REPORT + b'native-time-v1 rss_kib=bad\n', False)):
+            with self.subTest(valid=valid), mock.patch.object(metrics.sys, 'platform', 'linux'), \
+                 mock.patch.object(metrics.subprocess, 'Popen', return_value=process(effects=[(b'out\xff', report)])) as popen:
+                row = metrics.collect(['/bin/cp', '-a', '--reflink=never', '--', 'source', 'dest'], timeout_s=2)
+                self.assertEqual(metrics.time_diagnostics(GNU_REPORT + b'cp diagnostic\n'), ['cp diagnostic'])
+            self.assertEqual(row['ok'], valid)
+            self.assertEqual(popen.call_args.args[0], ['/usr/bin/time', '--format=' + metrics.GNU_TIME_FORMAT,
+                                                     '--', *row['argv']])
+            self.assertEqual(base64.b64decode(row['stderr_b64']), report)
+            self.assertEqual(base64.b64decode(row['stdout_b64']), b'out\xff')
+            self.assertIn('excludes ZFS ARC', row['rss_scope'])
+
     def test_parse_preserves_observed_zero_and_missing_is_none(self):
         parsed = metrics.parse_time(REPORT)
         self.assertEqual(parsed['rss_bytes'], 16384)

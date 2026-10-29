@@ -10,15 +10,20 @@ The private storage directory has mode `0700`. ACLs granting access to other use
 | `<collection>/<id>/workspace.sparseimage` | APFS image for a seed or image workspace |
 | `workspaces/<id>/volume/repo` | Repository inside a mounted image workspace |
 | `staging` | Unpublished work and interrupted permanent deletion |
-| `locks` | Advisory per-object locks |
+| `locks` | Advisory object locks and managed-use leases outside movable payloads |
+| `snapshots/<id>` | Captured repository or closed image and its record |
+| `recovery/<id>` | Permanent rollback candidate or actual previous workspace |
+| `lifecycle` | Mutable enrollment and explicit open/closed state |
+| `journals` | Pending rollback identities |
+| `protected` | Retirement protection published before moving a workspace to trash |
 
-Preparation and seed deletion take an exclusive lock on that seed. Creates take a shared lock, so independent clones can run concurrently. Workspace moves and deletion take a per-workspace lock. There is no background process.
+Preparation and seed deletion take an exclusive lock on that seed. Creates take a shared lock, so independent clones can run concurrently. Managed workspace mutations take the nonblocking exclusive use lease, then the workspace lock, then the retention lock when needed. Creation takes its seed lock before this sequence. `run` keeps the use lease while its command runs. The lease files stay outside moved directories. There is no background process.
 
 Preparation and folder creation publish by renaming a completed staging directory. Image creation publishes the closed image and metadata before mounting at its final path. If mounting or branch creation fails, the workspace is retained; `stallionfs mount ID` retries initialization. A `ready.json` marker records completed initialization, so remounting never resets the branch.
 
 Failed or interrupted preparation and creation retain unfinished directories in `staging`, since setup commands may still have running descendants. Errors report the retained path, and `doctor` lists these entries. Stop setup commands and other stallionfs processes, then inspect the directory before removing it. A failed image preparation can leave an attached volume: detach that image normally first. Recursive cleanup refuses directories containing mounted volumes. Staging entries never become cache hits.
 
-Permanent deletion moves an eligible trash object into staging first. If deletion fails, its remaining files stay there and the error reports their location. Other trash objects can still be listed, restored or collected.
+Garbage collection skips every protected trash ID, including uncertain protection records. Permanent deletion moves an eligible unprotected trash object into staging first. If deletion fails, its remaining files stay there and the error reports their location. Other trash objects can still be listed, restored or collected.
 
 This protects against ordinary process interruption. It is not a backup or a filesystem-wide crash transaction: a power loss can leave newly written file data incomplete. Keep source code in Git and back up work you need. If a seed is damaged, delete it with `forget` and prepare it again. A damaged workspace should be copied aside and recovered with ordinary Git tools before cleanup.
 
@@ -29,3 +34,7 @@ The prepared image is detached and fully flushed before publication. Each copy m
 Folder clones still create metadata for each file. Image clones share the backing file's blocks, including the filesystem metadata, until changed. Each workspace has its own Git repository. `du` and file block counts do not reliably identify unique physical space shared by APFS clones, so performance results do not infer a physical-space percentage from them.
 
 The store assumes one trusted operating-system user. Do not edit internal metadata, replace store directories with links, or modify prepared seeds while creating workspaces. Agents run as that same user and are not isolated from the rest of the account.
+
+Rollback recovery never uses staging. The selected snapshot is cloned into a permanent recovery slot before an intent record stores the current and candidate device/inode pairs. One exchange places the replacement at the working path and the actual old payload in the recovery slot. After any reported exchange failure, including interruption after native success, reconciliation compares both identities. A known before/after pair finalizes the record without swapping again; missing or unexpected identities block further managed mutations. Remount failure leaves both replacement and recovery intact.
+
+Mutable lifecycle and journal finalization use atomic replacement of a complete JSON file. Existing create-only markers still refuse overwriting. These operations provide process-interruption recovery, not a power-loss durability guarantee. Snapshots are immutable through the managed commands; the operating-system user can still modify store files directly.
