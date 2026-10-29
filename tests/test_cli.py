@@ -1,5 +1,5 @@
 """Integration checks for the installed native launcher and its Python helper."""
-from importlib.metadata import version
+from importlib.metadata import distribution, version
 import os
 import json
 from pathlib import Path
@@ -26,6 +26,9 @@ class InstalledCLI(unittest.TestCase):
             self.assertIn(stream.read(4), (bytes.fromhex('cffaedfe'), bytes.fromhex('feedfacf'),
                                           bytes.fromhex('cafebabe'), bytes.fromhex('bebafeca'),
                                           bytes.fromhex('cafebabf'), bytes.fromhex('bfbafeca')))
+        self.shortcut = self.launcher.with_name('sfs')
+        self.assertTrue(self.shortcut.is_file(), f'Installed shortcut missing: {self.shortcut}')
+        self.assertTrue(os.access(self.shortcut, os.X_OK))
         self.environment = {**os.environ, 'PATH': '/usr/bin:/bin',
                             'STALLIONFS_HOME': str(self.base / 'unused-store')}
 
@@ -35,12 +38,41 @@ class InstalledCLI(unittest.TestCase):
         self.assertEqual(result.returncode, status, result.stderr)
         return result
 
-    def native_only(self):
+    def native_only(self, name='stallionfs'):
         directory = self.base / 'without helper'; directory.mkdir(mode=0o700)
-        launcher = directory / 'stallionfs'
-        shutil.copy2(self.launcher, launcher)
+        launcher = directory / name
+        shutil.copy2(self.launcher.with_name(name), launcher)
         self.assertFalse((directory / 'stallionfs-python').exists())
         return launcher
+
+    def test_sfs_installation_native_operations_and_error_status_parity(self):
+        installed = distribution('stallionfs')
+        recorded = {Path(installed.locate_file(file)).resolve() for file in installed.files}
+        for launcher in (self.launcher, self.shortcut):
+            self.assertIn(launcher.resolve(), recorded)
+        self.assertEqual(self.shortcut.read_bytes(), self.launcher.read_bytes())
+        self.assertEqual(self.shortcut.stat().st_mode, self.launcher.stat().st_mode)
+        launcher = self.native_only('sfs')
+        source = self.base / 'source'; source.mkdir(mode=0o700)
+        (source / 'file').write_bytes(b'original')
+        self.command('clone', '--', 'source', 'copied', launcher=launcher)
+        self.assertEqual((self.base / 'copied' / 'file').read_bytes(), b'original')
+        self.assertEqual(json.loads(self.command('--json', 'scan', 'copied', launcher=launcher).stdout),
+                         dict(files=1, directories=0, symlinks=0, other=0,
+                              logical_bytes=8, skipped_mounts=0))
+        self.command('move', '--', 'copied', 'moved', launcher=launcher)
+        self.command('delete', '-r', '--', 'moved', launcher=launcher)
+        self.assertFalse((self.base / 'moved').exists())
+        self.assertEqual(self.command('--version', launcher=launcher).stdout, __version__ + '\n')
+        missing_helper = self.command('--help', launcher=launcher, status=1)
+        self.assertIn('cannot run installed Python helper', missing_helper.stderr)
+        for arguments, status in ((('--json', 'move', '--', 'missing', 'never-created'), 1),
+                                  (('clone', '--jobs=5', '--', 'source', 'never-created'), 2)):
+            old = self.command(*arguments, status=status)
+            short = self.command(*arguments, launcher=launcher, status=status)
+            self.assertEqual((short.stdout, short.stderr), (old.stdout, old.stderr))
+        self.assertFalse((self.base / 'never-created').exists())
+        self.assertFalse((self.base / 'unused-store').exists())
 
     def test_native_json_roundtrip_errors_and_no_helper(self):
         launcher = self.native_only()
@@ -166,7 +198,7 @@ class InstalledCLI(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', '-c', """
 import sys, threading, stallionfs
 from concurrent.futures import ThreadPoolExecutor
-names = ('clone', 'delete', 'mounts', 'move', 'scan')
+names = ('clone', 'copy', 'delete', 'mounts', 'move', 'scan')
 assert stallionfs.__all__ == list(names)
 assert set(names) | {'_scan'} <= set(dir(stallionfs))
 assert not hasattr(stallionfs, 'not_an_export')
@@ -221,7 +253,7 @@ for name in names:
             self.assertIn('cannot run installed Python helper', failed.stderr)
         alias = self.base / 'linked launcher'
         alias.symlink_to(self.launcher)
-        for launcher in (self.launcher, alias):
+        for launcher in (self.launcher, self.shortcut, alias):
             with self.subTest(launcher=str(launcher)):
                 self.assertEqual(self.command('--version', launcher=launcher).stdout.strip(), __version__)
                 help_text = self.command('--help', launcher=launcher).stdout

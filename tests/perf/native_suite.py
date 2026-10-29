@@ -87,24 +87,31 @@ def parse_scan_output(method, output, root_device):
     return counts
 
 
-def arguments(method, operation, binary, source, destination):
+def arguments(method, operation, binary, source, destination, jobs=None):
+    if operation not in ('clone', 'copy', 'move', 'delete', 'scan'):
+        raise ValueError('Unknown operation')
+    options = ['--jobs', str(jobs)] if jobs is not None and operation != 'move' else []
     if operation == 'scan':
         if method == 'stallionfs':
-            return [str(binary), '--json', 'scan', str(source)]
+            return [str(binary), '--json', 'scan'] + options + [str(source)]
         if method != 'find-stat': raise ValueError('Unknown scan reference')
         return ['/usr/bin/find', '-P', '-x', str(source), '-mindepth', '1',
                 '-exec', '/usr/bin/stat', '-f', '%Op%t%Dz%t%Dd', '--', '{}', '+']
     if method == 'stallionfs':
-        return ([str(binary), 'clone', str(source), str(destination)] if operation == 'clone' else
-                [str(binary), 'move', str(source), str(destination)] if operation == 'move' else
-                [str(binary), 'delete', '--recursive', str(source)])
+        return ([str(binary), operation] + options + [str(source), str(destination)] if operation in ('clone', 'copy', 'move') else
+                [str(binary), 'delete', '--recursive'] + options + [str(source)])
     if operation == 'clone':
         args = COPY_TOOLS[method] + [str(source), str(destination)]
         if method == 'rsync' and source.is_dir():
             args[-2] += '/'
         return args
-    return (['/bin/mv', '-n', str(source), str(destination)] if operation == 'move' else
-            ['/bin/rm', '-rf', str(source)])
+    if operation == 'copy' and method == 'cp':
+        return COPY_TOOLS['cp'] + [str(source), str(destination)]
+    if operation == 'move' and method == 'move':
+        return ['/bin/mv', '-n', str(source), str(destination)]
+    if operation == 'delete' and method == 'delete':
+        return ['/bin/rm', '-rf', str(source)]
+    raise ValueError('Unknown operation reference')
 
 
 def cache_prepare(mode, timeout):
@@ -174,8 +181,10 @@ def main():
     p.add_argument('--cache', nargs='+', choices=['warm', 'cold'], default=['warm', 'cold'])
     p.add_argument('--fixtures', nargs='+', choices=[*fileops.SAMPLES, *PROFILES, *native_fixtures.PROFILES, *native_fixtures.SCAN_PROFILES, 'installed_dependencies'],
                    default=list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
-    p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=list(COPY_TOOLS))
-    p.add_argument('--operations', nargs='+', choices=['clone', 'move', 'delete', 'scan'], default=['clone', 'move', 'delete'])
+    p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=list(COPY_TOOLS),
+                   help='Clone references; ordinary copy always uses cp -Rp')
+    p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['clone', 'move', 'delete'])
+    p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
     p.add_argument('--npm', type=Path, help='npm CLI JavaScript entrypoint for installed_dependencies')
     p.add_argument('--npm-cache', type=Path, help='Existing isolated offline npm cache')
@@ -325,7 +334,8 @@ def main():
                     checkpoint()
                     release('preparation')
                 for operation in a.operations:
-                    references = ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else [operation]
+                    references = (['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
+                                  ['cp'] if operation == 'copy' else [operation])
                     for reference in references:
                         for cache, phase in product(a.cache, native_metrics.PHASE_METRICS):
                             failed = [method for method in (reference, 'stallionfs')
@@ -350,7 +360,7 @@ def main():
                                     operand, setup = source, None
                                     key = dict(run=run, fixture=name, operation=operation, reference=reference,
                                                cache=cache, phase=phase, sample=sample, method=method)
-                                    if operation not in ('clone', 'scan'):
+                                    if operation in ('move', 'delete'):
                                         # Setup stays outside timing and does not prelaunch the measured candidate.
                                         setup = key | {'argv': ['/usr/bin/ditto', '--rsrc', '--extattr', '--acl', str(source), str(target)],
                                                        'exit_code': None, 'validated': False}
@@ -365,7 +375,7 @@ def main():
                                             raise RuntimeError('Operand preparation failed; receipt and fixture retained')
                                         setup['symlink_timestamp_repairs'] = restore_setup_symlink_times(target, expected)
                                         operand = target
-                                    argv = arguments(method, operation, binary, operand, dest)
+                                    argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs)
                                     report['active_operation'] = key | {'argv': argv, 'state': 'source validation, cache preparation or command pending'}
                                     checkpoint()
                                     before = native_correctness.snapshot(operand, **snapshot_options)
@@ -432,7 +442,7 @@ def main():
                                             row['correctness'] = {'passed': not os.path.lexists(operand), 'differences': []}
                                         else:
                                             after = native_correctness.snapshot(dest, observe_sharing=True) if operation == 'clone' else native_correctness.snapshot(dest)
-                                            row['correctness'] = (native_correctness.verify_clone(before, after) if operation == 'clone' else native_correctness.verify_move(before, after))
+                                            row['correctness'] = (native_correctness.verify_clone(before, after) if operation in ('clone', 'copy') else native_correctness.verify_move(before, after))
                                             if operation == 'move':
                                                 row['move_identity'] = row['correctness']['move_identity']
                                             if operation == 'move' and os.path.lexists(operand):

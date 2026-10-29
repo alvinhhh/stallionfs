@@ -9,6 +9,7 @@ stallionfs provides native file operations and prepared Git workspaces on macOS.
 ## Highlights
 
 - Clone files and folders with APFS copy-on-write.
+- Copy file data and metadata, including between compatible volumes.
 - Move, swap and delete paths, or list mounted volumes.
 - Install dependencies once and reuse them across workspaces.
 - Clone a whole APFS workspace volume without copying every file.
@@ -18,20 +19,23 @@ APFS copy-on-write shares unchanged data on disk. Each workspace has its own Git
 
 ## Usage
 
+Use `sfs`; `stallionfs` remains available.
+
 ```sh
-stallionfs clone project project-copy
-stallionfs move project-copy old-project
-stallionfs delete --recursive old-project
-stallionfs volumes
+sfs copy source destination
+sfs clone project project-copy
+sfs move project-copy old-project
+sfs delete --recursive old-project
+sfs volumes
 ```
 
-Destinations are exact paths. Clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with cloning, deletion or scanning for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
+Destinations are exact paths. Copies, clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with copying, cloning, deletion or scanning for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
 
 Prepare a clean checkout, then start working in a copy:
 
 ```sh
-seed=$(stallionfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
-workspace=$(stallionfs create "$seed" --name fix-parser)
+seed=$(sfs prepare /path/to/project --key node22-npm10-v1 --image-size 8 -- npm ci)
+workspace=$(sfs create "$seed" --name fix-parser)
 cd "$workspace"
 ```
 
@@ -42,8 +46,8 @@ The command after `--` runs once during preparation. Change `--key` when you cha
 To count files and their total logical size:
 
 ```sh
-stallionfs scan /path/to/folder
-stallionfs --json scan /path/to/folder
+sfs scan /path/to/folder
+sfs --json scan /path/to/folder
 ```
 
 The scanner counts symlinks without following them and skips nested volumes.
@@ -51,11 +55,11 @@ The scanner counts symlinks without following them and skips nested volumes.
 Leave the workspace and stop processes using it before removal. To remove, restore, or clear old trash:
 
 ```sh
-stallionfs list
-stallionfs remove WORKSPACE_ID
-stallionfs restore WORKSPACE_ID
-stallionfs gc                 # Preview trash older than 24 hours
-stallionfs gc --yes           # Delete that trash
+sfs list
+sfs remove WORKSPACE_ID
+sfs restore WORKSPACE_ID
+sfs gc                 # Preview trash older than 24 hours
+sfs gc --yes           # Delete that trash
 ```
 
 Files are stored in `~/Library/Application Support/stallionfs`. Set `STALLIONFS_HOME` or pass `--root` to use another location. Use `--json` before the command name for structured output.
@@ -74,34 +78,18 @@ source .venv/bin/activate
 
 ## Performance
 
-0.6.3 · Apple M2 · 24 GiB RAM · macOS 27. Median elapsed times.
+0.6.3 · macOS 27 arm64 · warm generated fixtures · October 24–29, 2026. Median elapsed times, including command startup, from ten timing pairs per comparison.
 
-| Operation | Baseline | stallionfs | Speedup |
-| --- | ---: | ---: | ---: |
-| Clone a 4 KiB file | 2.333 ms | 3.323 ms | 0.70× |
-| Move a 4 KiB file | 2.580 ms | 3.160 ms | 0.82× |
-| Delete a 4 KiB file | 2.848 ms | 3.179 ms | 0.90× |
-| Scan 20,000 files across 200 folders | 35.64 ms | 6.79 ms | 5.25× |
-| Scan 20,000 files in one folder | 34.84 ms | 18.06 ms | 1.93× |
-| Clone 10,000 files in nested folders | 1.229 s | 0.495 s | 2.48× |
-| Delete those 10,000 files | 0.398 s | 0.220 s | 1.81× |
-| Create and reclaim one folder workspace | 9.211 s | 5.340 s | 1.72× |
-| Create and reclaim four concurrent workspaces | 25.342 s | 10.566 s | 2.40× |
-| Clone 100,000 JavaScript files | 15.875 s | 5.481 s | 2.90× |
-| Delete 100,000 JavaScript files | 6.709 s | 6.408 s | 1.05× |
-| Clone a Git repository (50,013 files) | 7.752 s | 4.784 s | 1.62× |
-| Delete a Git repository (50,013 files) | 2.593 s | 1.627 s | 1.59× |
-| Clone a build cache (200,000 files, 10 GB) | 31.856 s | 16.308 s | 1.95× |
-| Delete a build cache (200,000 files, 10 GB) | 14.250 s | 12.982 s | 1.10× |
-| Clone 5,000 HTML and asset files | 0.597 s | 0.217 s | 2.75× |
-| Delete 5,000 HTML and asset files | 0.211 s | 0.110 s | 1.92× |
-| Clone a dataset (2,000 files, 50 GB) | 0.262 s | 0.095 s | 2.76× |
-| Delete a dataset (2,000 files, 50 GB) | 0.235 s | 0.191 s | 1.23× |
-| Scan 20,000 files along a 40-folder chain | 35.66 ms | 17.21 ms | 2.07× |
+| Operation | Native reference | Native | stallionfs |
+| --- | --- | ---: | ---: |
+| [Copy a 4 KiB file](tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) | `cp -Rp` | 4.857 ms | 5.861 ms |
+| [Move a 4 KiB file](tests/perf/results/native-move-tiny-20261024-arm64.json.xz) | `mv -n` | 3.758 ms | 4.704 ms |
+| [Scan 20,000 files in one folder](tests/perf/results/native-scan-flat-20261024-arm64.json.xz) | `find` + batched `stat` | 14.146 s | 33.494 ms |
+| [Scan 20,000 files across nested folders](tests/perf/results/native-scan-nested-20261024-arm64.json.xz) | `find` + batched `stat` | 12.784 s | 17.051 ms |
+| [Scan 20,000 files along a 40-folder chain](tests/perf/results/native-scan-deep40-20261024-arm64.json.xz) | `find` + batched `stat` | 13.018 s | 32.026 ms |
+| [Clone a document tree, 5,002 files, `--jobs 1`](tests/perf/results/native-clone-docs-jobs1-20261029-arm64.json.xz) | `ditto --rsrc --extattr --acl` | 754.396 ms | 572.289 ms |
 
-As for single file operations, I can only say I still recommend native unix commands. But for everything else, use stallion.
-
-Baselines: native POSIX scanning, `cp -cRp`, `mv -n`, `rm -rf`, and Git worktrees + offline `npm ci`. File trees are generated; workspace times include cleanup and exclude seed preparation. [Full results, CPU and memory](tests/perf/README.md).
+[CPU, memory and full results](tests/perf/README.md).
 
 ## Contributing
 

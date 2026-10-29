@@ -1,6 +1,6 @@
 # Native comparisons
 
-The current release does not meet the target. Existing results show faster tree operations but higher CPU or memory use in several cases; single-file commands remain slower. The full expanded suite below has not completed three consecutive runs. No new performance win is claimed.
+The full target remains unmet. The latest warm tiny-copy and tiny-move comparisons lose wall, CPU and RSS; the warm flat, nested and deep40 scans pass those paired screens. The expanded matrix remains incomplete.
 
 ## Command coverage
 
@@ -12,15 +12,15 @@ comparisons.
 | Native operation | StallionFS operation | Status |
 | --- | --- | --- |
 | `cp -cRp SRC DST` | `stallionfs clone SRC DST` | Copy-on-write comparison |
-| `cp -Rp SRC DST` | `stallionfs clone SRC DST` | Copy result; different storage strategy |
+| `cp -Rp SRC DST` | `stallionfs copy SRC DST` | [Warm 4 KiB: slower wall, higher CPU/RSS](../tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) |
 | `ditto --rsrc --extattr --acl SRC DST` | `stallionfs clone SRC DST` | Copy result; metadata losses are checked |
 | `rsync -a --extended-attributes SRC/ DST/` | `stallionfs clone SRC DST` | Fresh directory copy only; no incremental/remote counterpart |
-| `mv -n SRC DST` | `stallionfs move SRC DST` | Same filesystem, absent destination |
+| `mv -n SRC DST` | `stallionfs move SRC DST` | [Warm 4 KiB JSON (XZ)](../tests/perf/results/native-move-tiny-20261024-arm64.json.xz): slower direct wall, higher CPU/RSS; same filesystem, absent destination |
 | Exact-path replacement move | move with replacement | Required; exact native cases and collection pending |
 | Atomic exchange | move with exchange | Required; native API comparison pending; a sequence of ordinary moves is not atomic exchange |
 | `rm -rf PATH` | `stallionfs delete --recursive PATH` | Permanent completed deletion |
 | Finder copy/move/delete | clone/move/delete | Scripted copy/move correctness checked below; shared-service resources and deletion unmeasured. Trash is not permanent deletion |
-| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Six-counter checks passed on flat, nested and deep fixtures; timed comparison pending |
+| `find -P -x ROOT -mindepth 1 -exec stat -f '%Op%t%Dz%t%Dd' -- {} +` | `stallionfs --json scan ROOT` | Warm [flat20k JSON (XZ)](../tests/perf/results/native-scan-flat-20261024-arm64.json.xz), [nested20k JSON (XZ)](../tests/perf/results/native-scan-nested-20261024-arm64.json.xz) and [deep40 JSON (XZ)](../tests/perf/results/native-scan-deep40-20261024-arm64.json.xz): wall/CPU/RSS screens passed |
 | Cached mount-record listing | `volumes` / `mounts` | Required; exact native fields and resource boundary unqualified |
 | `du -skx ROOT` | none | Allocated blocks differ from scan's logical file bytes |
 | `ls -la ROOT` | none | No directory-entry listing command; `stallionfs list` lists workspaces |
@@ -30,6 +30,8 @@ comparisons.
 | Git worktree plus locked offline setup | folder prepare/create/remove/gc | Existing create/cleanup comparison; peak simultaneous memory and full metadata equivalence unmeasured |
 | Image creation/clone/attach/detach/deletion workflow | image prepare/create/mount/unmount/remove/gc | Released capability; complete equivalent workflow and resource coverage pending |
 | Equivalent recovery and store-management workflow | restore/forget/list/diagnostics | Exact workflow/disposition pending; no single native filesystem command |
+
+Compressed report downloads are JSON (XZ); decompress before using plain-JSON readers. Tiny move wrapped wall is inconclusive; StallionFS p95 is 27.401166 ms, with no excluded samples.
 
 The FSKit prototype is separate from the released CLI. Timing native tools on that volume must also account for its serving process and deferred writes; CLI results cannot stand in for that measurement.
 
@@ -88,24 +90,10 @@ Block I/O counts are not device-byte measurements. Clone sharing is not logical 
 - A reproducible representative photo workload; the existing noise PNG fixture is synthetic.
 - Complete suites using the populated metadata fixtures. Each fixture now includes a nonempty ACL, extended attribute and resource fork; directory fixtures also include sparse data and internal hardlinks. Setup verifies their presence before timing. Clone rows check independent destination inodes and APFS data-stream sharing. Native preservation failures remain in the report.
 - External-drive runs when a suitable drive is connected. None was present in the latest inventory.
-- Three consecutive complete suites with every correctness check passing and every metric winning beyond observed variance.
+- Three consecutive complete suites with every required comparison passing correctness, lower wall time and either lower CPU or lower peak RSS beyond observed variance.
 
-The original measured release results remain in [tests/perf](../tests/perf/README.md). A filtered run is not full-suite completion. Unsupported semantics, unavailable measurements and losses must not be removed from an acceptance report.
+[Current bounded results](../tests/perf/README.md#latest-native-comparisons--2026-10-24) retain the native comparisons and losses. A filtered run is not full-suite completion. Unsupported semantics, unavailable measurements and losses must not be removed from an acceptance report.
 
 Workspace commands run as the same user and are not isolated from the account.
 Separate directories and copy-on-write files do not meet isolated code-execution
 requirements. See the current [execution boundary](../docs/storage.md).
-
-## Initial wrapped 4 KiB copy result
-
-Three warm runs, ten pairs per run, comparing `cp -cRp` with `stallionfs clone`. All 60 operations passed content, metadata, source-preservation and independent-inode checks. This is one case, not three full suites. The generated fixtures contain no nonempty ACL or resource-fork payload; those features have separate correctness unit checks and still need workload fixtures.
-
-| Run | Native wall median | StallionFS wall median | Wall decision | Native peak RSS median | StallionFS peak RSS median | CPU |
-| --- | ---: | ---: | --- | ---: | ---: | --- |
-| 1 | 11.444 ms | 19.969 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-| 2 | 7.225 ms | 9.226 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-| 3 | 11.819 ms | 12.457 ms | Inconclusive | 1008 KiB | 1616 KiB | Below resolution |
-
-Memory is higher in all three runs. The wall gap does not exceed the declared variability threshold. CPU values rounded to zero, which establishes no CPU advantage. These results use the original resource-only collector; they do not measure the separate direct-timing phase added afterward.
-
-Raw measurements are retained locally; publication is pending.

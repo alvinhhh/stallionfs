@@ -1,4 +1,5 @@
 from pathlib import Path
+from shutil import copy2
 from setuptools import Extension, setup
 from distutils.ccompiler import new_compiler
 from distutils.command.build_scripts import build_scripts
@@ -21,9 +22,10 @@ class NativeScripts(build_scripts):
                                    macros=[("STALLIONFS_VERSION", f'"{self.distribution.get_version()}"')],
                                    depends=[HEADER, "pyproject.toml"])
         compiler.link_executable(objects, "stallionfs", output_dir=self.build_dir)
+        copy2(Path(self.build_dir) / "stallionfs", Path(self.build_dir) / "sfs")
 
     def get_outputs(self):
-        return [str(Path(self.build_dir) / "stallionfs")]
+        return [str(Path(self.build_dir) / name) for name in ("stallionfs", "sfs")]
 
     def get_source_files(self):
         return [*NATIVE, HEADER]
