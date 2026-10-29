@@ -114,13 +114,13 @@ typedef struct {
 enum sfs_status sfs_image_create_metadata(const char *directory, const char *name,
                                         uint64_t capacity, const sfs_metadata_initial *root,
                                         sfs_image **out, sfs_result *result);
-/* Explicit producer selection: only minor 3, 4 or 5. No conversion or latest default.
+/* Explicit producer selection: only minor 3, 4, 5 or 6. No conversion or latest default.
  * Unsupported requested minor returns UNSUPPORTED before clock/image creation. */
 enum sfs_status sfs_image_create_metadata_version(const char *directory, const char *name,
                                                 uint64_t capacity, uint32_t minor,
                                                 const sfs_metadata_initial *root,
                                                 sfs_image **out, sfs_result *result);
-/* Formats 0.4/0.5. Target is 1..4096 opaque, non-NUL bytes, never followed.
+/* Formats 0.4/0.5/0.6. Target is 1..4096 opaque, non-NUL bytes, never followed.
  * Mode includes S_IFLNK. Creation is atomic with the namespace edit; failure
  * leaves the inode output unchanged. Generic add remains file/directory only. */
 enum sfs_status sfs_image_symlink_metadata(sfs_image *, sfs_inode parent,
@@ -146,14 +146,15 @@ enum sfs_status sfs_image_set_metadata(sfs_image *, sfs_inode,
                                      const sfs_metadata_update *, sfs_result *);
 /* Committed checked-path lookup; no extent/directory scan or hidden atime write.
  * referenced_data_bytes charges4096 per logical mapping, including repeats;
- * it is not unique image/host/reclaimable allocation. link_count is1.
+ * it is not unique image/host/reclaimable allocation. link_count is stored
+ * nlink on format0.6 and1 on older formats, root and directories.
  * Format0.2 capability absence returns nonpoisoning UNSUPPORTED/NONE/errno0.
  * TIME_UNAVAILABLE is an early nonpoisoning clock failure with saved errno
  * (zero for a malformed sample). Failure leaves nonnull getter output intact. */
 enum sfs_status sfs_image_stat_metadata(sfs_image *, sfs_view, sfs_inode,
                                       sfs_metadata_entry *out, sfs_result *);
 
-/* Format 0.5: opaque non-NUL names, 1..255 bytes; owners are never followed.
+/* Formats 0.5/0.6: opaque non-NUL names, 1..255 bytes; owners are never followed.
  * Set atomically replaces the complete binary value (NULL permits length zero).
  * The caller keeps input stable through the call, without output overlap.
  * Set/remove update only owner ctime. Reads use committed explicit views.
@@ -175,6 +176,27 @@ enum sfs_status sfs_image_next_xattr(sfs_image *, sfs_view,
     uint64_t expected_generation, const uint8_t expected_root_digest[32],
     sfs_inode owner, const void *after_name, size_t after_length,
     sfs_xattr_entry *out, int *found, sfs_result *);
+
+/* Format 0.6: names share one regular/symlink inode, data and attributes.
+ * Directory/root links are invalid. Unlink removes one exact name; rename does
+ * not replace an occupied destination. Legacy inode-only remove/rename/resume
+ * return STATE for multiply named inodes. stat returns the first name by key;
+ * lookup/next return the actual name. Metadata link_count reports shared nlink.
+ * Mutations use component names, one clock and existing transaction semantics. */
+enum sfs_status sfs_image_link(sfs_image *, sfs_inode existing,
+    sfs_inode parent, const void *name, size_t length, sfs_result *);
+enum sfs_status sfs_image_unlink(sfs_image *, sfs_inode parent,
+    const void *name, size_t length, sfs_result *);
+enum sfs_status sfs_image_rename_entry(sfs_image *,
+    sfs_inode old_parent, const void *old_name, size_t old_length,
+    sfs_inode new_parent, const void *new_name, size_t new_length, sfs_result *);
+/* Exact existing previous name; the existing cookie layout is unchanged.
+ * Bind generation/digest from open/select. Failure preserves the output cookie;
+ * invalid/overlong names return INVALID without discarding a transaction. */
+enum sfs_status sfs_image_resume_after_name(sfs_image *, sfs_view,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    sfs_inode parent, const void *previous_name, size_t previous_length,
+    sfs_cookie *out, sfs_result *);
 
 /* directory must be owned, private, local writable APFS; name is one component.
  * create never removes a failed image. open never initializes or repairs one.

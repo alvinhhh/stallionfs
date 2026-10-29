@@ -115,7 +115,7 @@ int sfs_test_CC_SHA256_Init(CC_SHA256_CTX *c) {
 }
 int sfs_test_CC_SHA256_Update(CC_SHA256_CTX *c, const void *p, CC_LONG n) {
     for (unsigned i = 0; i < 8; i++) if (hash_context[i].context == c) {
-        if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8) || !memcmp(p, "SFSDAT04", 8) || !memcmp(p, "SFSDAT05", 8))) hash_context[i].raw = 1;
+        if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8) || !memcmp(p, "SFSDAT04", 8) || !memcmp(p, "SFSDAT05", 8) || !memcmp(p, "SFSDAT06", 8))) hash_context[i].raw = 1;
         if (hash_context[i].raw) raw_hash_input += n; else metadata_hash_input += n;
         return CC_SHA256_Update(c, p, n);
     }
@@ -264,7 +264,7 @@ int sfs_test_fcntl(int fd, int command, ...) {
     if (fulls == 1) {
         struct stat st; unsigned char last[CELL]; assert(!fstat(fd, &st) && st.st_size >= 16384 && !(st.st_size % CELL));
         assert(pread(fd, last, CELL, st.st_size - CELL) == CELL);
-        assert((!memcmp(last, "SFSREC02", 8) || !memcmp(last, "SFSREC03", 8) || !memcmp(last, "SFSREC04", 8) || !memcmp(last, "SFSREC05", 8)) && last[8] == 4);
+        assert((!memcmp(last, "SFSREC02", 8) || !memcmp(last, "SFSREC03", 8) || !memcmp(last, "SFSREC04", 8) || !memcmp(last, "SFSREC05", 8) || !memcmp(last, "SFSREC06", 8)) && last[8] == 4);
         /* The final commit-root exists before the first publication fence. */
         for (unsigned i = 0; i < 2; i++) { const unsigned char *ref = last + 64 + i * 56; if (ref[0]) { uint64_t offset = 0; for (int j = 7; j >= 0; j--) offset = (offset << 8) | ref[8+j]; assert(offset < (uint64_t)st.st_size - CELL); } }
     }
@@ -594,7 +594,7 @@ static unsigned char *record(unsigned char *image, const unsigned char *ref, siz
 static void ref_hash(unsigned char *image, unsigned char *ref, size_t size) {
     unsigned char *p = record(image, ref, size);
     if (get32(ref) == 6) {
-        unsigned char domain[36]; memcpy(domain, get32(image + 12) == 5 ? "SFSDAT05" : get32(image + 12) == 4 ? "SFSDAT04" : get32(image + 12) == 3 ? "SFSDAT03" : "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
+        unsigned char domain[36]; memcpy(domain, get32(image + 12) == 6 ? "SFSDAT06" : get32(image + 12) == 5 ? "SFSDAT05" : get32(image + 12) == 4 ? "SFSDAT04" : get32(image + 12) == 3 ? "SFSDAT03" : "SFSDAT02", 8); memcpy(domain + 8, image + 24, 16);
         put32(domain + 24, 6); put64(domain + 28, CELL); CC_SHA256_CTX c;
         CC_SHA256_Init(&c); CC_SHA256_Update(&c, domain, sizeof(domain)); CC_SHA256_Update(&c, p, CELL); CC_SHA256_Final(ref + 24, &c);
     } else CC_SHA256(p, CELL, ref + 24);
@@ -651,10 +651,10 @@ static fixture_node append_cell(fixture *f, unsigned type, const unsigned char *
     f->n += CELL; ref_hash(f->p, node.ref, f->n); return node;
 }
 static void envelope(fixture *f, unsigned char *p, unsigned type) {
-    memset(p, 0, CELL); memcpy(p, f->minor == 5 ? "SFSREC05" : f->minor == 4 ? "SFSREC04" : f->minor == 3 ? "SFSREC03" : "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
+    memset(p, 0, CELL); memcpy(p, f->minor == 6 ? "SFSREC06" : f->minor == 5 ? "SFSREC05" : f->minor == 4 ? "SFSREC04" : f->minor == 3 ? "SFSREC03" : "SFSREC02", 8); put32(p + 8, type); put64(p + 16, 4032); memcpy(p + 24, f->p + 24, 16);
 }
 static void row_key(unsigned map, const unsigned char *row, unsigned char *key, uint16_t *n) {
-    if ((map == 2 || map == 5)) { *n = (uint16_t)(8 + get32(row + 8)); big64(key, get64(row)); memcpy(key + 8, row + 12, *n - 8); }
+    if ((map == 2 || map == 5 || map == 6)) { *n = (uint16_t)(8 + get32(row + 8)); big64(key, get64(row)); memcpy(key + 8, row + 12, *n - 8); }
     else { *n = 8; big64(key, map == 4 ? get32(row) : get64(row)); }
 }
 static fixture_node page(fixture *f, unsigned map, unsigned level, const unsigned char *rows, unsigned count, unsigned stride, const fixture_node *children) {
@@ -663,17 +663,17 @@ static fixture_node page(fixture *f, unsigned map, unsigned level, const unsigne
     if (level) {
         node.min_n = children[0].min_n; memcpy(node.min, children[0].min, node.min_n);
         node.max_n = children[count - 1].max_n; memcpy(node.max, children[count - 1].max, node.max_n);
-        for (unsigned i = 0; i < count; i++) { unsigned char *r = p + 640 + i * stride; put32(r, children[i].min_n); memcpy(r + 8, children[i].min, children[i].min_n); memcpy(r + ((map == 2 || map == 5) ? 271 : 16), children[i].ref, 56); }
+        for (unsigned i = 0; i < count; i++) { unsigned char *r = p + 640 + i * stride; put32(r, children[i].min_n); memcpy(r + 8, children[i].min, children[i].min_n); memcpy(r + ((map == 2 || map == 5 || map == 6) ? 271 : 16), children[i].ref, 56); }
     } else { memcpy(p + 640, rows, count * stride); row_key(map, rows, node.min, &node.min_n); row_key(map, rows + (count - 1) * stride, node.max, &node.max_n); }
     put16(p + 88, node.min_n); put16(p + 90, node.max_n); memcpy(p + 112, node.min, node.min_n); memcpy(p + 375, node.max, node.max_n);
     fixture_node cell = append_cell(f, 5, p); memcpy(node.ref, cell.ref, 56); return node;
 }
 static fixture_node tree(fixture *f, unsigned map, const unsigned char *rows, unsigned count) {
-    const unsigned leaf_stride[] = {0,(f->minor == 3 || f->minor == 4 || f->minor == 5) ? 440u : 352u,280,72,328,352}, leaf_max[] = {0,(f->minor == 3 || f->minor == 4 || f->minor == 5) ? 6u : 9u,12,48,9,9};
+    const unsigned leaf_stride[] = {0,f->minor == 6 ? 496u : (f->minor == 3 || f->minor == 4 || f->minor == 5) ? 440u : 352u,280,72,328,352,280}, leaf_max[] = {0,f->minor >= 3 ? 6u : 9u,12,48,9,9,12};
     assert(count); unsigned groups = (count + leaf_max[map] - 1) / leaf_max[map];
     fixture_node *nodes = calloc(groups, sizeof(*nodes)); assert(nodes); unsigned at = 0;
     for (unsigned i = 0; i < groups; i++) { unsigned size = count / groups + (i < count % groups); nodes[i] = page(f, map, 0, rows + at * leaf_stride[map], size, leaf_stride[map], NULL); at += size; }
-    unsigned level = 0, max = (map == 2 || map == 5) ? 9 : 48, stride = (map == 2 || map == 5) ? 328 : 72;
+    unsigned level = 0, max = (map == 2 || map == 5 || map == 6) ? 9 : 48, stride = (map == 2 || map == 5 || map == 6) ? 328 : 72;
     while (groups > 1) { unsigned parents = (groups + max - 1) / max, used = 0; level++;
         for (unsigned i = 0; i < parents; i++) { unsigned size = groups / parents + (i < groups % parents); nodes[i] = page(f, map, level, NULL, size, stride, nodes + used); used += size; }
         groups = parents;
@@ -686,7 +686,7 @@ static void fixture_tuple(unsigned char *p, unsigned kind, uint64_t mappings) {
     put32(p+64,kind==SFS_FILE?0100600:0040700); put32(p+68,1234); put32(p+72,5678); put64(p+80,mappings);
 }
 static fixture_node namespace_cell(fixture *f, fixture_node inodes, fixture_node names, uint64_t next, uint64_t count) {
-    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); if(f->minor==3||f->minor==4||f->minor==5) fixture_tuple(p+192,SFS_DIRECTORY,0); return append_cell(f, 2, p);
+    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); put64(p + 176, next); put64(p + 184, count); if(f->minor==3||f->minor==4||f->minor==5||f->minor==6) fixture_tuple(p+192,SFS_DIRECTORY,0); if(f->minor==6) put64(p+336,count); return append_cell(f, 2, p);
 }
 static void finish_fixture(fixture *f, fixture_node ns, fixture_node catalog) {
     unsigned char p[CELL]; envelope(f, p, 4); memcpy(p + 64, ns.ref, 56); memcpy(p + 120, catalog.ref, 56); fixture_node root_node = append_cell(f, 4, p);
@@ -2166,7 +2166,7 @@ static void symlink_full(sfs_image *h) {
 }
 static void symlink_versions(void) {
     sfs_image *h = NULL; sfs_result r; sfs_metadata_initial in = metadata_input(SFS_DIRECTORY);
-    const uint32_t unsupported[] = {0, 2, 6, UINT32_MAX};
+    const uint32_t unsupported[] = {0, 2, 7, UINT32_MAX};
     for (unsigned i = 0; i < sizeof(unsupported) / sizeof(*unsupported); i++) {
         reset("", 0); metadata_clock(401); h = (sfs_image *)(uintptr_t)1; uint64_t allocations_before = allocation_calls;
         assert(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, unsupported[i], &in, &h, &r) == SFS_UNSUPPORTED);
@@ -2682,7 +2682,7 @@ static void xattr_versions(void) {
         before = bytes("image", &n); assert(get32(before + 12) == minor && get32(before + CELL + 12) == minor); free(before); retain(2000 + (int)minor);
     }
     reset("", 0); metadata_clock(602); h = (sfs_image *)(uintptr_t)1; uint64_t allocations_before = allocation_calls;
-    XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, 6, &in, &h, &r), SFS_UNSUPPORTED);
+    XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, 7, &in, &h, &r), SFS_UNSUPPORTED);
     assert(!h && !clock_calls && allocation_calls == allocations_before && r.phase == SFS_PHASE_NONE && !r.system_errno && access("image", F_OK) < 0 && errno == ENOENT); image_unwritten();
     xattr_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
     XEXPECT(sfs_image_set_xattr(h, 1, "root", 4, NULL, 0, &r), SFS_OK); metadata_commit(h); xattr_expect(h, 0, 1, "root", 4, NULL, 0); symlink_full(h);
@@ -3247,6 +3247,733 @@ static void xattr_verify(void) {
     assert(!h && r.phase == SFS_PHASE_READ && !r.system_errno && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT && raw_hashes == 4 && raw_hash_input == 16528); memo_target_check(2, 0); memo_target_enabled = 0; watch_count = 0; image_unwritten();
 }
 
+/* Separate0.6 graph helpers leave the qualified0.5 corruption guard strict. */
+static int hardlink_row_order(const void *left, const void *right) {
+    const unsigned char *a = left, *b = right;
+    if (get64(a) != get64(b)) return get64(a) < get64(b) ? -1 : 1;
+    return xattr_key_compare(a + 12, get32(a + 8), b + 12, get32(b + 8));
+}
+static void hardlink_row(unsigned char *row, sfs_inode parent, const char *name, sfs_inode id) {
+    size_t n = strlen(name); assert(n && n <= 255); memset(row, 0, 280); put64(row, parent); put32(row + 8, (uint32_t)n); memcpy(row + 12, name, n); put64(row + 267, id);
+}
+static fixture_node hardlink_space(fixture *f, fixture_node inodes, fixture_node names, fixture_node attrs, uint64_t count, uint64_t names_count, uint64_t next) {
+    unsigned char p[CELL]; envelope(f, p, 2); memcpy(p + 64, inodes.ref, 56); memcpy(p + 120, names.ref, 56); memcpy(p + 280, attrs.ref, 56);
+    put64(p + 176, next); put64(p + 184, count); put64(p + 336, names_count); fixture_tuple(p + 192, SFS_DIRECTORY, 0); return append_cell(f, 2, p);
+}
+static fixture_node hardlink_catalog(fixture *f, fixture_node history) {
+    unsigned char row[328] = {0}; put32(row, 1); memcpy(row + 8, history.ref, 56); put32(row + 64, 3); memcpy(row + 68, "old", 3); return tree(f, 4, row, 1);
+}
+static fixture hardlink_fixture(unsigned links, unsigned parents, unsigned attrs, unsigned other_links) {
+    assert(links && links <= 3 && parents <= 2 && attrs <= 2 && other_links && other_links <= 2);
+    fixture f = fixture_start(); f.minor = 6; put32(f.p + 12, 6); unsigned char raw[CELL] = {0}; memcpy(raw, "old", 3); fixture_node payload = append_cell(&f, 6, raw);
+    unsigned char extent_row[72] = {0}; memcpy(extent_row + 8, payload.ref, 56); put16(extent_row + 64, 3); fixture_node extent = tree(&f, 3, extent_row, 1);
+    unsigned char names[7 * 280], owned[3 * 280], others[2 * 280]; unsigned total = 0; hardlink_row(names + total++ * 280, 1, "p", 2); hardlink_row(names + total++ * 280, 1, "q", 3);
+    for (unsigned i = 0; i < links; i++) { const char *key = i == 0 ? "a" : i == 1 ? "b" : "c"; hardlink_row(owned + i * 280, parents ? 2 : 1, key, 4); memcpy(names + total++ * 280, owned + i * 280, 280); }
+    for (unsigned i = 0; i < other_links; i++) { hardlink_row(others + i * 280, 1, i ? "other2" : "other", 5); memcpy(names + total++ * 280, others + i * 280, 280); }
+    fixture_node reverse = {0}, reverse_other = {0}; if (links > 1) reverse = tree(&f, 6, owned, links); if (other_links > 1) reverse_other = tree(&f, 6, others, other_links);
+    unsigned char inode[4 * 496] = {0};
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *row = inode + i * 496; unsigned kind = i < 2 ? SFS_DIRECTORY : SFS_FILE; const unsigned char *name = i == 2 ? owned : i == 3 ? others : names + i * 280;
+        put64(row, i + 2); put64(row + 8, get64(name)); put32(row + 16, kind); put32(row + 20, get32(name + 8)); memcpy(row + 88, name + 12, get32(name + 8)); put64(row + 344, i == 2 ? links : i == 3 ? other_links : 1);
+        fixture_tuple(row + 352, kind, i >= 2 ? 1 : 0);
+        if (i >= 2) { put64(row + 24, 3); memcpy(row + 32, extent.ref, 56); memcpy(row + 440, i == 2 ? reverse.ref : reverse_other.ref, 56); }
+    }
+    fixture_node inodes = tree(&f, 1, inode, 4); qsort(names, total, 280, hardlink_row_order); fixture_node global = tree(&f, 2, names, total);
+    unsigned char attributes[3 * 352]; for (unsigned i = 0; i < attrs; i++) xattr_row(attributes + i * 352, 4, i ? "y" : "x", 1, 3, extent.ref, 1);
+    xattr_row(attributes + attrs * 352, 5, "keep", 4, 3, extent.ref, 1); fixture_node attribute = tree(&f, 5, attributes, attrs + 1);
+    fixture_node history = hardlink_space(&f, inodes, global, attribute, 4, total, 6), catalog = hardlink_catalog(&f, history), current = hardlink_space(&f, inodes, global, attribute, 4, total, 6);
+    finish_fixture(&f, current, catalog); return f;
+}
+static unsigned hardlink_stride(unsigned map, unsigned level) {
+    assert(map >= 1 && map <= 6);
+    return level ? (map == 2 || map == 5 || map == 6 ? 328 : 72) : map == 1 ? 496 : map == 2 || map == 6 ? 280 : map == 3 ? 72 : map == 4 ? 328 : 352;
+}
+static unsigned hardlink_edge(unsigned map, unsigned level) {
+    if (level) return map == 2 || map == 5 || map == 6 ? 271 : 16;
+    return map == 1 ? 32 : map == 5 ? 280 : 8;
+}
+static void hardlink_fences(unsigned char *p, unsigned char *cell, unsigned map, unsigned level, size_t n) {
+    unsigned count = get16(cell + 70); assert(count && count <= 48); unsigned stride = hardlink_stride(map, level); unsigned char low[263] = {0}, high[263] = {0}; uint16_t lo, hi;
+    if (level) {
+        unsigned edge = hardlink_edge(map, level); unsigned char *first = record(p, cell + 640 + edge, n), *last = record(p, cell + 640 + (count - 1) * stride + edge, n);
+        lo = get16(first + 88); hi = get16(last + 90); assert(lo <= 263 && hi <= 263); memcpy(low, first + 112, lo); memcpy(high, last + 375, hi);
+    } else { row_key(map, cell + 640, low, &lo); row_key(map, cell + 640 + (count - 1) * stride, high, &hi); }
+    put16(cell + 88, lo); put16(cell + 90, hi); memset(cell + 112, 0, 526); memcpy(cell + 112, low, lo); memcpy(cell + 375, high, hi);
+}
+static void hardlink_repair_ref(unsigned char *p, const unsigned char *topology, unsigned char *ref, const unsigned char *old_ref, size_t n, unsigned depth, int raw_hashes_too) {
+    assert(depth < 32 && !memcmp(ref, old_ref, 24)); if (!get32(ref)) { assert(!memcmp(ref, (unsigned char[56]){0}, 56)); return; }
+    assert(!memcmp(ref, old_ref, 24)); unsigned char *cell = record(p, ref, n); const unsigned char *old = record((unsigned char *)topology, old_ref, n); unsigned type = get32(ref);
+    if (type == 4 || type == 2) for (unsigned i = 0; i < 2; i++) hardlink_repair_ref(p, topology, cell + 64 + i * 56, old + 64 + i * 56, n, depth + 1, raw_hashes_too);
+    if (type == 2) hardlink_repair_ref(p, topology, cell + 280, old + 280, n, depth + 1, raw_hashes_too);
+    if (type == 5) {
+        unsigned map = get32(old + 64), level = get16(old + 68), count = get16(old + 70), stride = hardlink_stride(map, level), edge = hardlink_edge(map, level);
+        for (unsigned i = 0; i < count; i++) if (level || (map != 2 && map != 6)) hardlink_repair_ref(p, topology, cell + 640 + i * stride + edge, old + 640 + i * stride + edge, n, depth + 1, raw_hashes_too);
+        if (!level && map == 1) for (unsigned i = 0; i < count; i++) hardlink_repair_ref(p, topology, cell + 640 + i * stride + 440, old + 640 + i * stride + 440, n, depth + 1, raw_hashes_too);
+        hardlink_fences(p, cell, map, level, n);
+    }
+    if (type != 6 || raw_hashes_too) ref_hash(p, ref, n);
+}
+static void hardlink_repair(unsigned char *p, const unsigned char *topology, size_t n) {
+    for (unsigned i = 0; i < 2; i++) { hardlink_repair_ref(p, topology, p + i * CELL + 48, topology + i * CELL + 48, n, 0, 1); slot_hash(p + i * CELL); }
+}
+static int hardlink_ref_guard(unsigned char *p, const unsigned char *topology, const unsigned char *ref, const unsigned char *old_ref, size_t n, uint64_t parent, unsigned depth) {
+    if (memcmp(ref, old_ref, 24)) return 0;
+    if (!get32(ref)) return !memcmp(ref, (unsigned char[56]){0}, 56);
+    if (depth >= 32 || memcmp(ref, old_ref, 24)) return 0; uint64_t at = get64(ref + 8); unsigned type = get32(ref);
+    if (at < 8192 || at % CELL || at >= parent || at > n || CELL > n - at || get64(ref + 16) != CELL || get32(ref + 4)) return 0;
+    unsigned char checked[56]; memcpy(checked, ref, 56); ref_hash(p, checked, n); if (memcmp(checked + 24, ref + 24, 32)) return 0;
+    unsigned char *cell = p + at; const unsigned char *old = topology + at;
+    if (type != 6 && (memcmp(cell, "SFSREC06", 8) || get32(cell + 8) != type || get32(cell + 12) || get64(cell + 16) != 4032 || memcmp(cell + 24, p + 24, 16) || memcmp(cell + 40, (unsigned char[24]){0}, 24))) return 0;
+    if (type == 4 || type == 2) for (unsigned i = 0; i < 2; i++) if (!hardlink_ref_guard(p, topology, cell + 64 + i * 56, old + 64 + i * 56, n, at, depth + 1)) return 0;
+    if (type == 2 && !hardlink_ref_guard(p, topology, cell + 280, old + 280, n, at, depth + 1)) return 0;
+    if (type == 5) {
+        unsigned map = get32(old + 64), level = get16(old + 68), count = get16(old + 70), stride = hardlink_stride(map, level), edge = hardlink_edge(map, level);
+        if (get32(cell + 64) != map || get16(cell + 68) != level || get16(cell + 70) != count) return 0;
+        if (!count || count > 48 || 640 + count * stride > CELL || memcmp(cell + 640 + count * stride, (unsigned char[CELL]){0}, CELL - 640 - count * stride)) return 0;
+        for (unsigned i = 0; i < count; i++) {
+            const unsigned char *child_ref = cell + 640 + i * stride + edge;
+            if ((level || (map != 2 && map != 6)) && !hardlink_ref_guard(p, topology, child_ref, old + 640 + i * stride + edge, n, at, depth + 1)) return 0;
+            if (!level && map == 1 && !hardlink_ref_guard(p, topology, cell + 640 + i * stride + 440, old + 640 + i * stride + 440, n, at, depth + 1)) return 0;
+            if (!level && i) { unsigned char a[263], b[263]; uint16_t an, bn; row_key(map, cell + 640 + (i - 1) * stride, a, &an); row_key(map, cell + 640 + i * stride, b, &bn); if (xattr_key_compare(a, an, b, bn) >= 0) return 0; }
+            if (level) {
+                unsigned char *child = record(p, child_ref, n); const unsigned char *key = cell + 640 + i * stride + 8; unsigned key_n = get32(cell + 640 + i * stride);
+                if (get32(child + 64) != get32(cell + 64) || (unsigned)get16(child + 68) + 1 != level || key_n != get16(child + 88) || memcmp(key, child + 112, key_n)) return 0;
+                if (i) { unsigned char *previous = record(p, cell + 640 + (i - 1) * stride + edge, n); if (xattr_key_compare(previous + 375, get16(previous + 90), child + 112, get16(child + 88)) >= 0) return 0; }
+            }
+        }
+        unsigned actual = get16(cell + 70); if (!actual || actual > 48) return 0;
+        unsigned char low[263], high[263]; uint16_t lo, hi;
+        if (level) { unsigned char *first = record(p, cell + 640 + edge, n), *last = record(p, cell + 640 + (actual - 1) * stride + edge, n); lo = get16(first + 88); hi = get16(last + 90); memcpy(low, first + 112, lo); memcpy(high, last + 375, hi); }
+        else { row_key(map, cell + 640, low, &lo); row_key(map, cell + 640 + (actual - 1) * stride, high, &hi); }
+        if (get16(cell + 88) != lo || get16(cell + 90) != hi || memcmp(cell + 112, low, lo) || memcmp(cell + 375, high, hi)) return 0;
+    }
+    return 1;
+}
+static int hardlink_guard(unsigned char *p, const unsigned char *topology, size_t n) {
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *slot = p + i * CELL, checked[CELL]; memcpy(checked, slot, CELL); slot_hash(checked);
+        if (memcmp(slot, "SFSIMG01", 8) || get32(slot + 8) || get32(slot + 12) != 6 || get64(slot + 16) || memcmp(checked + 112, slot + 112, 32)) return 0;
+        if (!hardlink_ref_guard(p, topology, slot + 48, topology + i * CELL + 48, n, get64(slot + 104), 0)) return 0;
+    }
+    return 1;
+}
+/* Only the exact listed old->new edge is allowed to change physical identity. */
+static void hardlink_edge_change(unsigned char *p, unsigned char *topology, const unsigned char *control, size_t n, size_t at, const unsigned char expected[56], const unsigned char replacement[56]) {
+    assert(at + 56 <= n && !memcmp(control + at, expected, 56) && !memcmp(p + at, expected, 56) && !memcmp(topology + at, expected, 56));
+    if (get32(replacement)) {
+        assert(get32(replacement) == 5 && !get32(replacement + 4) && get64(replacement + 16) == CELL && get64(replacement + 8) < at / CELL * CELL);
+        unsigned char checked[56]; memcpy(checked, replacement, 56); ref_hash((unsigned char *)control, checked, n); assert(!memcmp(checked + 24, replacement + 24, 32));
+        unsigned char *cell = record((unsigned char *)control, replacement, n); assert(get32(cell + 64) == 6 && !get16(cell + 68));
+    } else assert(!memcmp(replacement, (unsigned char[56]){0}, 56));
+    memcpy(p + at, replacement, 56); memcpy(topology + at, replacement, 56);
+    printf("{\"case\":\"declared-hardlink-edge\",\"locator\":%llu,\"old_offset\":%llu,\"new_offset\":%llu}\n", (unsigned long long)at, (unsigned long long)get64(expected + 8), (unsigned long long)get64(replacement + 8));
+}
+static void hardlink_leaf_change(unsigned char *p, unsigned char *topology, const unsigned char *control, size_t n, size_t at, const unsigned char *rows, unsigned count) {
+    assert(at + CELL <= n && !memcmp(p + at, control + at, CELL) && !memcmp(topology + at, control + at, CELL));
+    unsigned char *cell = p + at; unsigned map = get32(cell + 64); assert((map == 2 || map == 6) && !get16(cell + 68) && count && count <= 12);
+    put16(cell + 70, (uint16_t)count); memset(cell + 640, 0, CELL - 640); memcpy(cell + 640, rows, count * 280);
+    memcpy(topology + at, cell, CELL);
+    printf("{\"case\":\"declared-hardlink-row-edit\",\"offset\":%llu,\"map\":%u,\"old_rows\":%u,\"new_rows\":%u}\n", (unsigned long long)at, map, get16(control + at + 70), count);
+}
+static fixture hardlink_name_limit_fixture(void) {
+    fixture f = fixture_start(); f.minor = 6; put32(f.p + 12, 6);
+    unsigned char *names = calloc(1024, 280); assert(names);
+    for (unsigned i = 0; i < 1024; i++) { char key[32]; snprintf(key, sizeof(key), "alias%04u", i); hardlink_row(names + i * 280, 1, key, 2); }
+    fixture_node reverse = tree(&f, 6, names, 1024), global = tree(&f, 2, names, 1024); free(names);
+    assert(reverse.level == 3 && global.level == 3);
+    unsigned char inode[496] = {0}; put64(inode, 2); put64(inode + 8, 1); put32(inode + 16, SFS_FILE); put32(inode + 20, 9); memcpy(inode + 88, "alias0000", 9); put64(inode + 344, 1024); fixture_tuple(inode + 352, SFS_FILE, 0); memcpy(inode + 440, reverse.ref, 56);
+    fixture_node inodes = tree(&f, 1, inode, 1), empty = {0}, space = hardlink_space(&f, inodes, global, empty, 1, 1024, 3); finish_fixture(&f, space, empty); return f;
+}
+static void hardlink_mixed_versions(void) {
+    fixture f = xattr_fixture(1, 0, 0); assert(xattr_guard(f.p, f.p, f.n)); unsigned char slot[CELL]; memcpy(slot, f.p, CELL); size_t old_n = f.n;
+    f.minor = 6; fixture_node empty = {0}, space = namespace_cell(&f, empty, empty, 2, 0); finish_fixture(&f, space, empty); memcpy(f.p, slot, CELL);
+    assert(xattr_ref_guard(f.p, f.p, f.p + 48, slot + 48, f.n, old_n, 0));
+    assert(hardlink_ref_guard(f.p, f.p, f.p + CELL + 48, f.p + CELL + 48, f.n, f.n, 0)); fixture_save(&f);
+    sfs_image *h = NULL; sfs_result r; sfs_recovery recovery; reset("", 0);
+    XEXPECT(sfs_image_open(root, "image", &h, &r), SFS_RECOVERY_REQUIRED); assert(!h); image_unwritten();
+    XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    assert(!recovery.pair_valid && recovery.slots[0].status == SFS_OK && recovery.slots[1].status == SFS_OK && recovery.slots[0].coverage == SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].coverage == SFS_COVERAGE_FULL_REACHABLE);
+    for (unsigned slot_id = 0; slot_id < 2; slot_id++) { XEXPECT(sfs_image_select(h, slot_id, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE); sfs_metadata_entry m; XEXPECT(sfs_image_stat_metadata(h, 0, 1, &m, &r), SFS_OK); assert(m.link_count == 1); }
+    image_unwritten(); close_image(h); retain(3008);
+}
+
+/* Format0.6 identity is independent of the name used to resolve it. */
+static void hardlink_create(sfs_image **h, uint64_t capacity) {
+    sfs_result r; sfs_metadata_initial initial = metadata_input(SFS_DIRECTORY);
+    reset("", 0); metadata_clock(1100);
+    XEXPECT(sfs_image_create_metadata_version(root, "image", capacity, 6, &initial, h, &r), SFS_OK);
+    assert(clock_calls == 1 && r.coverage == SFS_COVERAGE_FULL_REACHABLE);
+}
+static sfs_metadata_entry hardlink_get(sfs_image *h, sfs_view view, sfs_inode id, uint64_t links) {
+    sfs_result r; sfs_metadata_entry m; unsigned calls = clock_calls;
+    XEXPECT(sfs_image_stat_metadata(h, view, id, &m, &r), SFS_OK);
+    assert(m.entry.inode == id && m.link_count == links && r.coverage == SFS_COVERAGE_TOUCHED && calls == clock_calls);
+    return m;
+}
+static void hardlink_name(sfs_image *h, sfs_view view, sfs_inode parent, const char *name, sfs_inode id) {
+    sfs_result r; sfs_entry e;
+    XEXPECT(sfs_image_lookup(h, view, parent, name, strlen(name), &e, &r), SFS_OK);
+    assert(e.inode == id && e.parent == parent && e.name_length == strlen(name) && !memcmp(e.name, name, e.name_length));
+}
+static void hardlink_absent(sfs_image *h, sfs_view view, sfs_inode parent, const char *name) {
+    sfs_result r; sfs_entry e, canary; memset(&canary, 0xA5, sizeof(canary)); e = canary;
+    XEXPECT(sfs_image_lookup(h, view, parent, name, strlen(name), &e, &r), SFS_NOT_FOUND);
+    assert(!memcmp(&e, &canary, sizeof(e)));
+}
+static void hardlink_owner_times(sfs_metadata_entry before, sfs_metadata_entry after, int64_t now) {
+    assert(timestamp_is(after.change, now, (uint32_t)(now + 1)));
+    before.entry = after.entry; before.link_count = after.link_count; before.change = after.change;
+    metadata_equal(&before, &after);
+}
+static void hardlink_parent_times(sfs_metadata_entry before, sfs_metadata_entry after, int64_t now) {
+    assert(timestamp_is(after.change, now, (uint32_t)(now + 1)) && timestamp_equal(after.change, after.modification));
+    before.change = after.change; before.modification = after.modification; metadata_equal(&before, &after);
+}
+static void hardlink_counts(uint64_t inodes, uint64_t names, uint64_t next) {
+    size_t n; unsigned char *p = bytes("image", &n), *space = namespace_at(p, selected_slot(p), n);
+    assert(get32(selected_slot(p) + 12) == 6 && get64(space + 184) == inodes && get64(space + 336) == names && get64(space + 176) == next); free(p);
+}
+static void hardlink_versions(void) {
+    sfs_image *h; sfs_result r; sfs_metadata_initial initial = metadata_input(SFS_DIRECTORY);
+    for (unsigned minor = 2; minor <= 6; minor++) {
+        reset("", 0); metadata_clock(1101);
+        if (minor == 2) XEXPECT(sfs_image_create(root, "image", TEST_CAPACITY, &h, &r), SFS_OK);
+        else if (minor == 3) XEXPECT(sfs_image_create_metadata(root, "image", TEST_CAPACITY, &initial, &h, &r), SFS_OK);
+        else XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, minor, &initial, &h, &r), SFS_OK);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode id = add(h, 1, "file", SFS_FILE);
+        XEXPECT(sfs_image_write(h, id, 0, "old", 3, &r), SFS_OK); metadata_commit(h); symlink_full(h);
+        if (minor >= 3) { hardlink_get(h, 0, id, 1); hardlink_get(h, 0, 1, 1); }
+        size_t n; unsigned char *p = bytes("image", &n), *space = namespace_at(p, selected_slot(p), n);
+        unsigned stride = minor == 2 ? 352 : minor == 6 ? 496 : 440;
+        unsigned char *row = leaf_row(p, space + 64, id, n, stride), *leaf = record(p, space + 64, n);
+        assert(!memcmp(leaf + 640, row, stride) && !memcmp(row + stride, (unsigned char[496]){0}, stride));
+        assert(get64(row + 344) == (minor == 6 ? 1 : 0));
+        if (minor == 6) assert(!get32(row + 440) && get64(space + 336) == 1); else assert(!get64(space + 336)); free(p);
+        sfs_result binding = xattr_binding(h); sfs_cookie cookie, canary; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, id, 0, "pending", 7, &r), SFS_OK);
+        p = bytes("image", &n); reset("", 0); clock_calls = 0;
+        if (minor < 6) {
+            XEXPECT(sfs_image_link(h, id, 1, "alias", 5, &r), SFS_UNSUPPORTED); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+            XEXPECT(sfs_image_unlink(h, 1, "file", 4, &r), SFS_UNSUPPORTED); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+            XEXPECT(sfs_image_rename_entry(h, 1, "file", 4, 1, "new", 3, &r), SFS_UNSUPPORTED); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+            XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 1, "file", 4, &cookie, &r), SFS_UNSUPPORTED);
+            assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !memcmp(&cookie, &canary, sizeof(cookie)) && !clock_calls); image_unwritten(); unchanged("image", p, n);
+        }
+        free(p); metadata_commit(h); expect(h, 0, id, "pending");
+        binding = xattr_binding(h); XEXPECT(sfs_image_resume_after(h, 0, binding.generation, binding.root_digest, 1, id, &cookie, &r), SFS_OK);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_rename(h, id, 1, "renamed", 7, &r), SFS_OK); metadata_commit(h); hardlink_name(h, 0, 1, "renamed", id);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove(h, id, &r), SFS_OK); metadata_commit(h); close_image(h);
+        open_image(&h); symlink_full(h); close_image(h); p = bytes("image", &n); assert(get32(selected_slot(p) + 12) == minor); free(p); retain(3000 + (int)minor);
+    }
+    reset("", 0); metadata_clock(1102); h = (sfs_image *)(uintptr_t)1; uint64_t calls = allocation_calls;
+    XEXPECT(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, 7, &initial, &h, &r), SFS_UNSUPPORTED);
+    assert(!h && !clock_calls && allocation_calls == calls && r.phase == SFS_PHASE_NONE && !r.system_errno && access("image", F_OK) < 0 && errno == ENOENT); image_unwritten();
+    hardlink_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode link = symlink_add(h, 1, "link", "../opaque", 9);
+    XEXPECT(sfs_image_set_xattr(h, link, "key", 3, "value", 5, &r), SFS_OK); metadata_commit(h); symlink_expect(h, 0, link, "../opaque", 9); xattr_expect(h, 0, link, "key", 3, "value", 5); symlink_full(h);
+    unsigned char maximal[255]; memset(maximal, 'z', sizeof(maximal)); maximal[0] = 1;
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, link, 1, maximal, sizeof(maximal), &r), SFS_OK); metadata_commit(h);
+    sfs_metadata_entry linked = hardlink_get(h, 0, link, 2); assert(linked.entry.parent == 1 && linked.entry.name_length == sizeof(maximal) && !memcmp(linked.entry.name, maximal, sizeof(maximal))); symlink_expect(h, 0, link, "../opaque", 9);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, 1, maximal, sizeof(maximal), &r), SFS_OK); metadata_commit(h); hardlink_get(h, 0, link, 1); symlink_full(h); close_image(h); retain(3007); hardlink_mixed_versions();
+}
+static void hardlink_shared(void) {
+    sfs_image *h; sfs_result r; hardlink_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    sfs_inode p = add(h, 1, "p", SFS_DIRECTORY), q = add(h, 1, "q", SFS_DIRECTORY), id; sfs_metadata_initial initial = metadata_input(SFS_FILE);
+    XEXPECT(sfs_image_add_metadata(h, p, "source", 6, SFS_FILE, &initial, &id, &r), SFS_OK);
+    XEXPECT(sfs_image_resize(h, id, 2 * CELL + 3, &r), SFS_OK);
+    XEXPECT(sfs_image_write(h, id, 0, "abc", 3, &r), SFS_OK); XEXPECT(sfs_image_write(h, id, 2 * CELL, "XYZ", 3, &r), SFS_OK);
+    static const unsigned char user[] = "user attribute\0\xff", fork[] = "resource\0fork\xff";
+    XEXPECT(sfs_image_set_xattr(h, id, "user.stallionfs-test", 20, user, sizeof(user) - 1, &r), SFS_OK);
+    XEXPECT(sfs_image_set_xattr(h, id, "com.apple.ResourceFork", 22, fork, sizeof(fork) - 1, &r), SFS_OK); metadata_commit(h);
+    sfs_metadata_entry old = hardlink_get(h, 0, id, 1), pa = hardlink_get(h, 0, p, 1), pb = hardlink_get(h, 0, q, 1);
+    assert(old.referenced_data_bytes == 2 * CELL && old.entry.size == 2 * CELL + 3 && old.mode == initial.mode && old.uid == initial.uid && old.gid == initial.gid && old.flags == initial.flags && timestamp_equal(old.birth, initial.birth) && timestamp_equal(old.access, initial.access));
+    sfs_view before, after; XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "before", 6, &before, &r), SFS_OK);
+    metadata_clock(1120); XEXPECT(sfs_image_link(h, id, q, "alias", 5, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h);
+    hardlink_name(h, 0, p, "source", id); hardlink_name(h, 0, q, "alias", id); sfs_metadata_entry m = hardlink_get(h, 0, id, 2); hardlink_owner_times(old, m, 1120);
+    sfs_metadata_entry parent = hardlink_get(h, 0, q, 1); hardlink_parent_times(pb, parent, 1120); parent = hardlink_get(h, 0, p, 1); metadata_equal(&pa, &parent); hardlink_get(h, before, id, 1); hardlink_absent(h, before, q, "alias");
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "after", 5, &after, &r), SFS_OK); metadata_commit(h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, p, "source", 6, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK); hardlink_get(h, 0, id, 2);
+    sfs_entry alias; XEXPECT(sfs_image_lookup(h, 0, q, "alias", 5, &alias, &r), SFS_OK);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(1121); XEXPECT(sfs_image_write(h, alias.inode, 1, "new", 3, &r), SFS_OK); XEXPECT(sfs_image_resize(h, id, CELL + 5, &r), SFS_OK);
+    sfs_metadata_update update = {0}; update.fields = SFS_META_UID | SFS_META_FLAGS; update.uid = 77; update.flags = 1;
+    XEXPECT(sfs_image_set_metadata(h, alias.inode, &update, &r), SFS_OK); XEXPECT(sfs_image_set_xattr(h, alias.inode, "user.stallionfs-test", 20, "changed", 7, &r), SFS_OK); metadata_commit(h);
+    unsigned char expected[CELL + 5] = {0}, actual[sizeof(expected)]; memcpy(expected, "anew", 4); size_t got = 0;
+    XEXPECT(sfs_image_read(h, 0, id, 0, actual, sizeof(actual), &got, &r), SFS_OK); assert(got == sizeof(actual) && !memcmp(actual, expected, got));
+    m = hardlink_get(h, 0, id, 2); assert(m.uid == 77 && m.flags == 1 && m.referenced_data_bytes == CELL);
+    xattr_expect(h, 0, id, "user.stallionfs-test", 20, "changed", 7); xattr_expect(h, after, id, "user.stallionfs-test", 20, user, sizeof(user) - 1);
+    xattr_expect(h, 0, id, "com.apple.ResourceFork", 22, fork, sizeof(fork) - 1);
+    parent = hardlink_get(h, 0, p, 1); metadata_equal(&pa, &parent); parent = hardlink_get(h, 0, q, 1); hardlink_parent_times(pb, parent, 1120);
+    unsigned char *historical = calloc(2 * CELL + 3, 1), *historical_read = malloc(2 * CELL + 3); assert(historical && historical_read); memcpy(historical, "abc", 3); memcpy(historical + 2 * CELL, "XYZ", 3);
+    for (unsigned i = 0; i < 2; i++) { XEXPECT(sfs_image_read(h, i ? after : before, id, 0, historical_read, 2 * CELL + 3, &got, &r), SFS_OK); assert(got == 2 * CELL + 3 && !memcmp(historical, historical_read, got)); } free(historical); free(historical_read);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_inode sl = symlink_add(h, p, "symbol", "source", 6);
+    XEXPECT(sfs_image_set_xattr(h, sl, "target-meta", 11, "opaque", 6, &r), SFS_OK); XEXPECT(sfs_image_link(h, sl, q, "symbol-alias", 12, &r), SFS_OK); metadata_commit(h);
+    hardlink_name(h, 0, q, "symbol-alias", sl); hardlink_get(h, 0, sl, 2); symlink_expect(h, 0, sl, "source", 6); xattr_expect(h, 0, sl, "target-meta", 11, "opaque", 6);
+    m = hardlink_get(h, 0, id, 2); assert(m.entry.size == sizeof(expected) && m.uid == 77); symlink_full(h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, p, "source", 6, &r), SFS_OK); metadata_commit(h); hardlink_get(h, 0, id, 1); hardlink_absent(h, 0, p, "source"); xattr_expect(h, 0, id, "user.stallionfs-test", 20, "changed", 7); xattr_expect(h, 0, id, "com.apple.ResourceFork", 22, fork, sizeof(fork) - 1);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, q, "alias", 5, &r), SFS_OK); metadata_commit(h);
+    hardlink_absent(h, 0, q, "alias"); hardlink_name(h, after, p, "source", id); hardlink_name(h, after, q, "alias", id); hardlink_get(h, before, id, 1); hardlink_get(h, after, id, 2);
+    xattr_expect(h, after, id, "com.apple.ResourceFork", 22, fork, sizeof(fork) - 1); symlink_full(h); close_image(h);
+    open_image(&h); hardlink_get(h, after, id, 2); symlink_expect(h, 0, sl, "source", 6); symlink_full(h); close_image(h);
+}
+/* Small independent expected-name set; order is parent big-endian then raw name bytes. */
+typedef struct { sfs_inode parent; char name[32]; } hardlink_key;
+static int hardlink_key_order(const void *left, const void *right) {
+    const hardlink_key *a = left, *b = right;
+    return a->parent < b->parent ? -1 : a->parent > b->parent ? 1 : strcmp(a->name, b->name);
+}
+static void hardlink_group(sfs_image *h, sfs_inode owner, hardlink_key *keys, unsigned count, uint64_t inodes, uint64_t next) {
+    qsort(keys, count, sizeof(*keys), hardlink_key_order); sfs_result r; sfs_entry e;
+    sfs_metadata_entry m = hardlink_get(h, 0, owner, count);
+    assert(m.entry.parent == keys[0].parent && m.entry.name_length == strlen(keys[0].name) && !memcmp(m.entry.name, keys[0].name, m.entry.name_length));
+    XEXPECT(sfs_image_stat(h, 0, owner, &e, &r), SFS_OK); assert(e.parent == m.entry.parent && e.name_length == m.entry.name_length && !memcmp(e.name, m.entry.name, e.name_length));
+    for (unsigned i = 0; i < count; i++) hardlink_name(h, 0, keys[i].parent, keys[i].name, owner);
+    hardlink_counts(inodes, inodes - 1 + count, next);
+    size_t n; unsigned char *image = bytes("image", &n), *space = namespace_at(image, selected_slot(image), n), *row = leaf_row(image, space + 64, owner, n, 496);
+    if (count == 1) assert(!memcmp(row + 440, (unsigned char[56]){0}, 56));
+    else { unsigned char *reverse = record(image, row + 440, n); assert(get32(reverse + 64) == 6); if (count == 2) assert(!get16(reverse + 68) && get16(reverse + 70) == 2); if (count == 13) assert(get16(reverse + 68) == 1); }
+    free(image); xattr_expect(h, 0, owner, "owned", 5, "one", 3); symlink_full(h);
+}
+static void hardlink_transitions(void) {
+    sfs_image *h; sfs_result r; hardlink_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    sfs_inode p = add(h, 1, "p", SFS_DIRECTORY), q = add(h, 1, "q", SFS_DIRECTORY), owner = add(h, q, "z", SFS_FILE), other = add(h, 1, "other", SFS_FILE);
+    XEXPECT(sfs_image_set_xattr(h, owner, "owned", 5, "one", 3, &r), SFS_OK); XEXPECT(sfs_image_set_xattr(h, other, "keep", 4, "two", 3, &r), SFS_OK); metadata_commit(h);
+    hardlink_key keys[13] = {{q, "z"}}; unsigned count = 1; hardlink_group(h, owner, keys, count, 4, 6);
+    const hardlink_key added[] = {{p, "z"}, {p, "a"}};
+    for (unsigned i = 0; i < 2; i++) { XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, added[i].parent, added[i].name, 1, &r), SFS_OK); metadata_commit(h); keys[count++] = added[i]; hardlink_group(h, owner, keys, count, 4, 6); }
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_rename_entry(h, q, "z", 1, p, "0", 1, &r), SFS_OK); metadata_commit(h);
+    for (unsigned i = 0; i < count; i++) if (keys[i].parent == q) keys[i] = (hardlink_key){p, "0"}; hardlink_group(h, owner, keys, count, 4, 6);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_rename_entry(h, p, "0", 1, q, "zz", 2, &r), SFS_OK); metadata_commit(h);
+    for (unsigned i = 0; i < count; i++) if (!strcmp(keys[i].name, "0")) keys[i] = (hardlink_key){q, "zz"}; hardlink_group(h, owner, keys, count, 4, 6);
+    for (unsigned i = 0; i < 10; i++) {
+        hardlink_key k = {q, ""}; snprintf(k.name, sizeof(k.name), "alias%02u", i);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, q, k.name, strlen(k.name), &r), SFS_OK); metadata_commit(h);
+        keys[count++] = k; hardlink_group(h, owner, keys, count, 4, 6);
+    }
+    sfs_view history; XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "thirteen", 8, &history, &r), SFS_OK); metadata_commit(h);
+    while (count > 1) {
+        qsort(keys, count, sizeof(*keys), hardlink_key_order); hardlink_key k = keys[0]; memmove(keys, keys + 1, (--count) * sizeof(*keys));
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, k.parent, k.name, strlen(k.name), &r), SFS_OK); metadata_commit(h); hardlink_group(h, owner, keys, count, 4, 6);
+    }
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, keys[0].parent, keys[0].name, strlen(keys[0].name), &r), SFS_OK); metadata_commit(h); hardlink_counts(3, 3, 6);
+    sfs_entry e; XEXPECT(sfs_image_stat(h, 0, owner, &e, &r), SFS_NOT_FOUND); xattr_absent(h, 0, owner, "owned"); xattr_expect(h, 0, other, "keep", 4, "two", 3);
+    hardlink_get(h, history, owner, 13); xattr_expect(h, history, owner, "owned", 5, "one", 3); symlink_full(h); close_image(h);
+}
+static void hardlink_names(void) {
+    sfs_image *h; sfs_result r; hardlink_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+    sfs_inode p = add(h, 1, "p", SFS_DIRECTORY), q = add(h, p, "child", SFS_DIRECTORY), empty = add(h, 1, "empty", SFS_DIRECTORY), owner = add(h, 1, "file", SFS_FILE);
+    XEXPECT(sfs_image_write(h, owner, 0, "old", 3, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, q, "a", 1, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, q, "b", 1, &r), SFS_OK); metadata_commit(h);
+    sfs_result binding = xattr_binding(h); sfs_cookie canary, cookie; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, owner, 0, "pending", 7, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); reset("", 0); clock_calls = 0;
+    XEXPECT(sfs_image_link(h, 1, 1, "root", 4, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_link(h, p, 1, "dir-alias", 9, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_link(h, UINT64_MAX, 1, "missing", 7, &r), SFS_NOT_FOUND);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_link(h, owner, owner, "bad-parent", 10, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_link(h, owner, UINT64_MAX, "missing-parent", 14, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_link(h, owner, q, "a", 1, &r), SFS_EXISTS);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_unlink(h, q, "absent", 6, &r), SFS_NOT_FOUND);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_unlink(h, 1, "p", 1, &r), SFS_STATE);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_rename_entry(h, 1, "p", 1, q, "cycle", 5, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_rename_entry(h, q, "a", 1, q, "b", 1, &r), SFS_EXISTS);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_rename_entry(h, q, "absent", 6, q, "absent", 6, &r), SFS_NOT_FOUND);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
+    XEXPECT(sfs_image_rename_entry(h, q, "a", 1, q, "a", 1, &r), SFS_OK);
+    XEXPECT(sfs_image_remove(h, owner, &r), SFS_STATE); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+    XEXPECT(sfs_image_rename(h, owner, UINT64_MAX, "new", 3, &r), SFS_STATE); assert(r.phase == SFS_PHASE_NONE && !r.system_errno);
+    XEXPECT(sfs_image_resume_after(h, 0, binding.generation, binding.root_digest, q, owner, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    unsigned char too_long[256]; memset(too_long, 'z', sizeof(too_long)); const void *bad[] = {NULL, "", ".", "..", "a/b", "a\0b", too_long}; const size_t lengths[] = {1, 0, 1, 2, 3, 3, 256};
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+        cookie = canary;
+        XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, q, bad[i], lengths[i], &cookie, &r), SFS_INVALID);
+        assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !memcmp(&cookie, &canary, sizeof(cookie)));
+        if (i < 6) {
+            XEXPECT(sfs_image_link(h, owner, q, bad[i], lengths[i], &r), SFS_INVALID);
+            XEXPECT(sfs_image_unlink(h, q, bad[i], lengths[i], &r), SFS_INVALID);
+            XEXPECT(sfs_image_rename_entry(h, q, "a", 1, q, bad[i], lengths[i], &r), SFS_INVALID);
+        }
+    }
+    cookie = canary;
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, q, "aa", 2, &cookie, &r), SFS_NOT_FOUND); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    XEXPECT(sfs_image_resume_after_name(h, 99, binding.generation, binding.root_digest, q, "a", 1, &cookie, &r), SFS_NOT_FOUND); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, owner, "a", 1, &cookie, &r), SFS_INVALID); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation + 1, binding.root_digest, q, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    unsigned char wrong[32]; memcpy(wrong, binding.root_digest, 32); wrong[0] ^= 1;
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, wrong, q, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    assert(!clock_calls); image_unwritten(); unchanged("image", before, n); free(before); metadata_commit(h); expect(h, 0, owner, "pending"); hardlink_get(h, 0, owner, 3);
+    binding = xattr_binding(h); XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, q, "a", 1, &cookie, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_TOUCHED);
+    sfs_entry entry; int found = 99; XEXPECT(sfs_image_next(h, 0, q, &cookie, &entry, &found, &r), SFS_OK); assert(found == 1 && entry.inode == owner && entry.parent == q && entry.name_length == 1 && entry.name[0] == 'b');
+    XEXPECT(sfs_image_next(h, 0, q, &cookie, &entry, &found, &r), SFS_OK); assert(!found);
+    memset(&cookie, 0, sizeof(cookie));
+    for (unsigned i = 0; i < 2; i++) { XEXPECT(sfs_image_next(h, 0, q, &cookie, &entry, &found, &r), SFS_OK); assert(found && entry.inode == owner && entry.name_length == 1 && entry.name[0] == 'a' + i); }
+    /* NULL diagnostics use only returned statuses, including failure paths. */
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); assert(sfs_image_link(h, owner, q, "null", 4, NULL) == SFS_OK);
+    assert(sfs_image_rename_entry(h, q, "null", 4, q, "null2", 5, NULL) == SFS_OK); assert(sfs_image_unlink(h, q, "null2", 5, NULL) == SFS_OK);
+    assert(sfs_image_link(h, 1, q, "invalid", 7, NULL) == SFS_INVALID); assert(sfs_image_unlink(h, q, "missing", 7, NULL) == SFS_NOT_FOUND); assert(sfs_image_rename_entry(h, q, "a", 1, q, "b", 1, NULL) == SFS_EXISTS);
+    cookie = canary; assert(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, q, "missing", 7, &cookie, NULL) == SFS_NOT_FOUND && !memcmp(&cookie, &canary, sizeof(cookie)));
+    assert(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, q, "a", 1, &cookie, NULL) == SFS_OK); metadata_commit(h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, 1, "empty", 5, &r), SFS_OK); metadata_commit(h); XEXPECT(sfs_image_stat(h, 0, empty, &entry, &r), SFS_NOT_FOUND);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_rename(h, owner, 1, "bad/name", 8, &r), SFS_INVALID);
+    XEXPECT(sfs_image_link(h, owner, 1, too_long, sizeof(too_long), &r), SFS_LIMIT); assert(r.phase == SFS_PHASE_ADMISSION && !r.system_errno); XEXPECT(sfs_image_commit(h, &r), SFS_STATE);
+    for (unsigned operation = 0; operation < 3; operation++) {
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, owner, 0, "discard", 7, &r), SFS_OK); size_t z; unsigned char *saved = bytes("image", &z); reset("", 0); clock_calls = 0;
+        if (operation == 0) XEXPECT(sfs_image_unlink(h, q, too_long, sizeof(too_long), &r), SFS_LIMIT);
+        else if (operation == 1) XEXPECT(sfs_image_rename_entry(h, q, "a", 1, q, too_long, sizeof(too_long), &r), SFS_LIMIT);
+        else XEXPECT(sfs_image_rename(h, owner, 1, too_long, sizeof(too_long), &r), SFS_LIMIT);
+        assert(r.phase == SFS_PHASE_ADMISSION && !r.system_errno && !clock_calls); image_unwritten(); unchanged("image", saved, z); free(saved); XEXPECT(sfs_image_commit(h, &r), SFS_STATE); expect(h, 0, owner, "pending");
+    }
+    sfs_view view; XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "names", 5, &view, &r), SFS_OK); metadata_commit(h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_commit(h); symlink_full(h); close_image(h);
+    before = bytes("image", &n); struct stat identity, later; assert(!lstat("image", &identity)); reset("", 0); open_readonly(&h, &binding);
+    XEXPECT(sfs_image_resume_after_name(h, view, binding.generation, binding.root_digest, q, "a", 1, &cookie, &r), SFS_OK);
+    XEXPECT(sfs_image_next(h, view, q, &cookie, &entry, &found, &r), SFS_OK); assert(found && entry.name[0] == 'b'); reset("", 0);
+    XEXPECT(sfs_image_link(h, owner, 1, "readonly", 8, &r), SFS_STATE); XEXPECT(sfs_image_unlink(h, q, "a", 1, &r), SFS_STATE); XEXPECT(sfs_image_rename_entry(h, q, "a", 1, q, "b", 1, &r), SFS_STATE);
+    image_unwritten(); close_image(h); sfs_recovery recovery;
+    XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    cookie = canary; XEXPECT(sfs_image_resume_after_name(h, view, binding.generation, binding.root_digest, q, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    for (unsigned slot = 0; slot < 2; slot++) {
+        assert(recovery.slots[slot].status == SFS_OK && recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE);
+        ok(sfs_image_select(h, slot, &generous, &binding), &binding);
+        XEXPECT(sfs_image_resume_after_name(h, view, binding.generation, binding.root_digest, q, "a", 1, &cookie, &r), SFS_OK);
+        XEXPECT(sfs_image_next(h, view, q, &cookie, &entry, &found, &r), SFS_OK); assert(found && entry.inode == owner && entry.name[0] == 'b');
+        XEXPECT(sfs_image_link(h, owner, 1, "recovery", 8, &r), SFS_STATE);
+    }
+    image_unwritten(); close_image(h); unchanged("image", before, n); assert(!lstat("image", &later)); identical_identity(&identity, &later); free(before);
+}
+
+/* API setup remains small; reservation numbers come from the admitted table. */
+static void hardlink_failure_setup(unsigned links, unsigned parent_count, unsigned attributes, sfs_image **handle) {
+    sfs_image *h; fixture f = hardlink_fixture(links, parent_count, attributes, 1); assert(hardlink_guard(f.p, f.p, f.n)); fixture_save(&f); reset("", 0); open_image(&h); symlink_full(h); *handle = h;
+}
+static enum sfs_status hardlink_edit(sfs_image *h, unsigned operation, unsigned parents, sfs_result *r) {
+    sfs_inode parent = parents ? 2 : 1, destination = parents == 2 ? 3 : parent;
+    if (operation < 2) return sfs_image_link(h, 4, parent, "new", 3, r);
+    if (operation < 5) return sfs_image_unlink(h, parent, "a", 1, r);
+    return sfs_image_rename_entry(h, parent, "a", 1, destination, "new", 3, r);
+}
+static void hardlink_reservation_case(unsigned operation, unsigned parents, unsigned pending, unsigned attrs, unsigned fit, unsigned serial) {
+    static const unsigned base[] = {13, 21, 9, 15, 14, 18, 33};
+    static const unsigned links[] = {1, 2, 2, 3, 1, 1, 2};
+    unsigned bound = base[operation] + parents + (pending ? 3 : 0) + (attrs ? 12 : 0);
+    if (parents == 2) assert((operation == 5 && bound == (pending ? 23 : 20)) || (operation == 6 && bound == (pending ? 38 : 35)));
+    sfs_image *h; sfs_result r; hardlink_failure_setup(links[operation], parents, attrs, &h); close_image(h);
+    size_t n; unsigned char *p = bytes("image", &n), *space = namespace_at(p, selected_slot(p), n), *inode = record(p, space + 64, n), *names = record(p, space + 120, n);
+    assert(!get16(inode + 68) && get16(inode + 70) == 4 && !get16(names + 68));
+    unsigned char *owner = leaf_row(p, space + 64, 4, n, 496);
+    if (links[operation] > 1) { unsigned char *reverse = record(p, owner + 440, n); assert(!get16(reverse + 68)); }
+    if (attrs) { unsigned char *attributes = record(p, space + 280, n); assert(!get16(attributes + 68)); }
+    uint64_t capacity = n + (bound + (pending ? 1 : 0) - (fit ? 0 : 1)) * UINT64_C(4096);
+    for (unsigned slot = 0; slot < 2; slot++) { put64(p + slot * CELL + 144, capacity); slot_hash(p + slot * CELL); }
+    replace_image(p, n); free(p); reset("", 0); open_image(&h); symlink_full(h);
+    sfs_metadata_entry original = hardlink_get(h, 0, 4, links[operation]), parent[2] = {hardlink_get(h, 0, parents ? 2 : 1, 1), hardlink_get(h, 0, 3, 1)};
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); metadata_clock(1199); if (pending) XEXPECT(sfs_image_write(h, pending == 1 ? 4 : 5, 0, "pending", 7, &r), SFS_OK);
+    p = bytes("image", &n); assert(capacity - n == (bound - (fit ? 0 : 1)) * UINT64_C(4096)); reset("", 0); metadata_clock(1200);
+    enum sfs_status status = hardlink_edit(h, operation, parents, &r); assert(status == r.status); receipt("hardlink-whole-reservation", &r);
+    printf("{\"operation\":%u,\"nonroot_parents\":%u,\"pending\":%u,\"owner_xattrs\":%u,\"required_cells\":%u,\"fit\":%s,\"appended_bytes\":%llu}\n", operation, parents, pending, attrs, bound, fit ? "true" : "false", (unsigned long long)image_append_bytes); fflush(stdout);
+    if (!fit) {
+        assert(status == SFS_LIMIT && r.phase == SFS_PHASE_ADMISSION && !r.system_errno && clock_calls == 1 && r.physical_end == n); image_unwritten(); unchanged("image", p, n);
+        XEXPECT(sfs_image_commit(h, &r), SFS_STATE); hardlink_name(h, 0, parents ? 2 : 1, "a", 4); expect(h, 0, 4, "old"); expect(h, 0, 5, "old");
+        sfs_metadata_entry after = hardlink_get(h, 0, 4, links[operation]); metadata_equal(&original, &after); after = hardlink_get(h, 0, parents ? 2 : 1, 1); metadata_equal(&parent[0], &after); after = hardlink_get(h, 0, 3, 1); metadata_equal(&parent[1], &after); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK);
+    } else {
+        assert(status == SFS_OK && r.coverage == SFS_COVERAGE_TOUCHED && clock_calls == 1 && image_append_bytes <= (bound - 1) * UINT64_C(4096)); metadata_commit(h); assert(clock_calls == 1);
+        if (operation == 4) { sfs_entry e; XEXPECT(sfs_image_stat(h, 0, 4, &e, &r), SFS_NOT_FOUND); for (unsigned i = 0; i < attrs; i++) xattr_absent(h, 0, 4, i ? "y" : "x"); }
+        else {
+            uint64_t expected_links = operation < 2 ? links[operation] + 1 : operation < 4 ? links[operation] - 1 : links[operation];
+            sfs_metadata_entry after = hardlink_get(h, 0, 4, expected_links);
+            if (!pending || pending == 2) hardlink_owner_times(original, after, 1200); else assert(after.entry.size == 7 && after.referenced_data_bytes == CELL && timestamp_is(after.change, 1200, 1201) && timestamp_is(after.modification, 1199, 1200));
+            expect(h, 0, 4, pending == 1 ? "pending" : "old");
+            if (operation < 2 || operation >= 5) hardlink_name(h, 0, parents == 2 ? 3 : parents ? 2 : 1, "new", 4);
+        }
+        sfs_metadata_entry after = hardlink_get(h, 0, parents ? 2 : 1, 1); hardlink_parent_times(parent[0], after, 1200);
+        after = hardlink_get(h, 0, 3, 1); if (parents == 2) hardlink_parent_times(parent[1], after, 1200); else metadata_equal(&parent[1], &after);
+        hardlink_counts(operation == 4 ? 3 : 4, 3 + links[operation] + (operation < 2 ? 1 : operation < 5 ? -1 : 0), 6);
+        expect(h, 0, 5, pending == 2 ? "pending" : "old"); xattr_expect(h, 0, 5, "keep", 4, "old", 3); symlink_full(h);
+    }
+    hardlink_get(h, 1, 4, links[operation]); hardlink_name(h, 1, parents ? 2 : 1, "a", 4); expect(h, 1, 4, "old"); expect(h, 1, 5, "old");
+    for (unsigned i = 0; i < attrs; i++) xattr_expect(h, 1, 4, i ? "y" : "x", 1, "old", 3);
+    close_image(h); free(p); retain(3200 + (int)serial);
+}
+static void hardlink_capacity(void) {
+    unsigned serial = 0;
+    for (unsigned op = 0; op < 7; op++) for (unsigned parents = 0; parents < 2; parents++) for (unsigned pending = 0; pending < 3; pending++)
+        for (unsigned attrs = 0; attrs <= (op == 4 ? 2u : 0u); attrs += 2) for (unsigned fit = 0; fit < 2; fit++) hardlink_reservation_case(op, parents, pending, attrs, fit, serial++);
+    for (unsigned op = 5; op <= 6; op++) for (unsigned pending = 0; pending <= 2; pending += 2) for (unsigned fit = 0; fit < 2; fit++) hardlink_reservation_case(op, 2, pending, 0, fit, serial++);
+    assert(serial == 104);
+}
+static void hardlink_mutation_faults(void) {
+    sfs_image *h; sfs_result r;
+    for (unsigned operation = 0; operation < 3; operation++) {
+        hardlink_failure_setup(1, 0, 0, &h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, 5, 0, "pending", 7, &r), SFS_OK);
+        size_t n; unsigned char *before = bytes("image", &n);
+        for (unsigned allocation = 0; allocation < 2; allocation++) {
+            reset("", 0); metadata_clock(1210); if (allocation) fail_allocation = allocation_calls + 1; else clock_failure = 1;
+            enum sfs_status status = hardlink_edit(h, operation == 0 ? 0 : operation == 1 ? 4 : 5, 0, &r);
+            assert(status == r.status && status == (allocation ? SFS_NOMEM : SFS_TIME_UNAVAILABLE) && r.system_errno == (allocation ? ENOMEM : ENXIO));
+            if (allocation) assert(hit); else assert(clock_calls == 1 && r.phase == SFS_PHASE_NONE);
+            image_unwritten(); unchanged("image", before, n);
+        }
+        reset("", 0); metadata_commit(h); expect(h, 0, 5, "pending"); hardlink_name(h, 0, 1, "a", 4); hardlink_absent(h, 0, 1, "new"); hardlink_get(h, 0, 4, 1); close_image(h); free(before); retain(3320 + (int)operation);
+    }
+    hardlink_failure_setup(2, 0, 0, &h); sfs_result binding = xattr_binding(h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, 5, 0, "pending", 7, &r), SFS_OK);
+    size_t saved_n; unsigned char *saved_bytes = bytes("image", &saved_n); sfs_cookie read_cookie, read_canary; memset(&read_canary, 0xA5, sizeof(read_canary)); read_cookie = read_canary; reset("", 0); fail_allocation = allocation_calls + 1;
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 1, "a", 1, &read_cookie, &r), SFS_NOMEM);
+    assert(hit && r.phase == SFS_PHASE_READ && r.system_errno == ENOMEM && !memcmp(&read_cookie, &read_canary, sizeof(read_cookie))); image_unwritten(); unchanged("image", saved_bytes, saved_n); reset("", 0); metadata_commit(h); expect(h, 0, 5, "pending"); hardlink_get(h, 0, 4, 2); close_image(h); free(saved_bytes); retain(3327);
+    for (unsigned operation = 0; operation < 4; operation++) {
+        hardlink_failure_setup(2, 0, 0, &h); sfs_result binding = xattr_binding(h); sfs_cookie cookie, canary; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, 5, 0, "pending", 7, &r), SFS_OK);
+        size_t n; unsigned char *before = bytes("image", &n); int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); unsigned char tail[37]; memset(tail, 0xA7, sizeof(tail)); raw_write(fd, tail, sizeof(tail), (off_t)n); assert(!close(fd)); free(before); before = bytes("image", &n); reset("", 0);
+        enum sfs_status status;
+        if (operation == 3) status = sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 1, "a", 1, &cookie, &r);
+        else status = hardlink_edit(h, operation == 0 ? 1 : operation == 1 ? 2 : 6, 0, &r);
+        assert(status == SFS_IO && r.status == status && r.phase == SFS_PHASE_IDENTITY && r.system_errno == ESTALE && !memcmp(&cookie, &canary, sizeof(cookie))); image_unwritten(); unchanged("image", before, n);
+        XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); close_image(h); free(before); retain(3323 + (int)operation);
+    }
+}
+static void hardlink_name_limit(void) {
+    fixture f = hardlink_name_limit_fixture(); assert(hardlink_guard(f.p, f.p, f.n)); fixture_save(&f); sfs_image *h; sfs_result r; reset("", 0); open_image(&h); symlink_full(h); close_image(h);
+    reset("", 0); open_image(&h); sfs_result binding = xattr_binding(h); reset("", 0); sfs_cookie cookie = {{0}};
+    XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 1, "alias1022", 9, &cookie, &r), SFS_OK);
+    assert(r.coverage == SFS_COVERAGE_TOUCHED && !raw_hashes && image_read_bytes <= 17 * UINT64_C(4096)); counters("hardlink-name-resume-bounded-seek");
+    sfs_entry e; int found = 99; XEXPECT(sfs_image_next(h, 0, 1, &cookie, &e, &found, &r), SFS_OK); assert(found && e.inode == 2 && e.name_length == 9 && !memcmp(e.name, "alias1023", 9));
+    XEXPECT(sfs_image_next(h, 0, 1, &cookie, &e, &found, &r), SFS_OK); assert(!found);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, 2, 0, "pending", 7, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); reset("", 0); clock_calls = 0;
+    XEXPECT(sfs_image_link(h, 2, 1, "overflow", 8, &r), SFS_LIMIT); assert(r.phase == SFS_PHASE_ADMISSION && !r.system_errno && !clock_calls); image_unwritten(); unchanged("image", before, n); XEXPECT(sfs_image_commit(h, &r), SFS_STATE);
+    hardlink_counts(1, 1024, 3); hardlink_get(h, 0, 2, 1024); expect(h, 0, 2, ""); close_image(h); free(before); retain(3330);
+}
+static void hardlink_unaligned(void) {
+    for (unsigned fit = 0; fit < 2; fit++) {
+        fixture f = hardlink_fixture(1, 0, 0, 1); size_t initial = f.n; uint64_t capacity = initial + (fit ? 14 : 13) * UINT64_C(4096);
+        for (unsigned slot = 0; slot < 2; slot++) { put64(f.p + slot * CELL + 144, capacity); slot_hash(f.p + slot * CELL); } assert(hardlink_guard(f.p, f.p, f.n)); fixture_save(&f);
+        unsigned char tail[37]; memset(tail, 0xA7, sizeof(tail)); int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); raw_write(fd, tail, sizeof(tail), (off_t)initial); assert(!close(fd));
+        sfs_image *h; sfs_result r; reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); assert(n == initial + 37); reset("", 0); metadata_clock(1220);
+        XEXPECT(sfs_image_link(h, 4, 1, "new", 3, &r), fit ? SFS_OK : SFS_LIMIT); assert(clock_calls == 1);
+        if (!fit) { assert(r.phase == SFS_PHASE_ADMISSION && !r.system_errno); image_unwritten(); unchanged("image", before, n); XEXPECT(sfs_image_commit(h, &r), SFS_STATE); hardlink_get(h, 0, 4, 1); }
+        else { metadata_commit(h); assert(image_append_bytes <= 13 * UINT64_C(4096) + 4059 && r.physical_end <= capacity); hardlink_name(h, 0, 1, "new", 4); hardlink_get(h, 0, 4, 2); symlink_full(h); }
+        size_t after_n; unsigned char *after = bytes("image", &after_n); assert(after_n <= capacity && after_n >= n && !memcmp(after + 8192, before + 8192, n - 8192) && !memcmp(after + initial, tail, sizeof(tail)));
+        printf("{\"case\":\"hardlink-unaligned-complete-reservation\",\"tail_bytes\":37,\"gap_bytes\":4059,\"required_cells\":13,\"available_aligned_cells\":%u,\"fit\":%s}\n", fit ? 13 : 12, fit ? "true" : "false"); fflush(stdout);
+        close_image(h); free(before); free(after); retain(3331 + (int)fit);
+    }
+}
+static void hardlink_record_faults(void) {
+    sfs_image *h; sfs_result r;
+    /* Frozen order: global leaf, two-row reverse leaf, owner leaf, namespace. */
+    for (unsigned nth = 1; nth <= 4; nth++) {
+        hardlink_failure_setup(1, 0, 0, &h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); assert(!(n % CELL)); reset("write_error", (int)nth); metadata_clock(1230);
+        XEXPECT(sfs_image_link(h, 4, 1, "new", 3, &r), SFS_IO); assert(hit && r.phase == SFS_PHASE_RECORDS && r.system_errno == EIO && image_append_bytes == (nth - 1) * UINT64_C(4096) && !slots && !fulls && clock_calls == 1);
+        receipt("hardlink-producer-write-error", &r); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); reset("", 0); close_image(h);
+        size_t end; unsigned char *after = bytes("image", &end); assert(end == n + (nth - 1) * CELL && !memcmp(before, after, n)); free(before); free(after);
+        open_image(&h); hardlink_get(h, 0, 4, 1); hardlink_absent(h, 0, 1, "new"); close_image(h); retain(3340 + (int)nth);
+    }
+    for (unsigned failure = 0; failure < 4; failure++) {
+        hardlink_failure_setup(1, 0, 0, &h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n);
+        reset(failure == 0 ? "write_eintr" : failure == 1 ? "write_short" : failure == 2 ? "enospc" : "", 2); if (failure == 3) fail_after_append = 1; metadata_clock(1231);
+        enum sfs_status status = sfs_image_link(h, 4, 1, "new", 3, &r); assert(status == r.status);
+        if (failure < 2) { assert(status == SFS_OK); if (!failure) assert(hit); else assert(writes > 4); metadata_commit(h); hardlink_get(h, 0, 4, 2); hardlink_name(h, 0, 1, "new", 4); }
+        else if (failure == 2) { assert(status == SFS_IO && hit && r.system_errno == ENOSPC && r.phase == SFS_PHASE_RECORDS); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); }
+        else { assert(status == SFS_NOMEM && hit && r.system_errno == ENOMEM && image_append_bytes && !slots && !fulls); XEXPECT(sfs_image_commit(h, &r), SFS_STATE); hardlink_get(h, 0, 4, 1); }
+        reset("", 0); close_image(h); if (failure >= 2) { size_t end; unsigned char *after = bytes("image", &end); assert(end >= n && !memcmp(after, before, n)); free(after); } free(before); retain(3345 + (int)failure);
+    }
+    for (unsigned fence = 1; fence <= 2; fence++) {
+        hardlink_failure_setup(1, 0, 0, &h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, 4, 1, "new", 3, &r), SFS_OK); reset("full", (int)fence);
+        XEXPECT(sfs_image_commit(h, &r), fence == 1 ? SFS_IO : SFS_OUTCOME_UNKNOWN); assert(hit && r.system_errno == EIO); receipt("hardlink-commit-fence", &r); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); reset("", 0); close_image(h);
+        sfs_recovery recovery; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+        for (unsigned slot = 0; slot < 2; slot++) { assert(recovery.slots[slot].status == SFS_OK && recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE); XEXPECT(sfs_image_select(h, slot, &generous, &r), SFS_OK); hardlink_get(h, 0, 4, fence == 2 && recovery.slots[slot].generation == 2 ? 2 : 1); }
+        image_unwritten(); close_image(h); retain(3350 + (int)fence);
+    }
+}
+static void hardlink_failures(void) { hardlink_capacity(); hardlink_mutation_faults(); hardlink_name_limit(); hardlink_unaligned(); hardlink_record_faults(); }
+
+static void hardlink_full_control(fixture *f) {
+    assert(hardlink_guard(f->p, f->p, f->n)); save("image", f->p, f->n); sfs_image *h; sfs_result r; reset("", 0); open_image(&h); reset("", 0);
+    XEXPECT(sfs_image_verify(h, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE && raw_hashes == 1 && raw_hash_input == 4132); image_unwritten(); close_image(h);
+}
+static void hardlink_semantic_negatives(void) {
+    const char *labels[] = {"zero-nlink", "nlink-overflow", "name-count", "inode-count", "single-with-reverse", "multiple-null-reverse", "missing-reverse-row", "extra-reverse-row", "reverse-owner", "global-retarget", "global-missing-row", "nonminimal-representative", "non-directory-parent", "directory-multiple-links", "directory-reverse", "other-owner-shared-reverse", "single-null-multiple-global"};
+    fixture f = hardlink_fixture(2, 1, 2, 2); hardlink_full_control(&f); assert(!rename("image", "hardlink-full-control"));
+    size_t n = f.n; const unsigned char *control = f.p; unsigned char *space = namespace_at(f.p, f.p, n), *inode = record(f.p, space + 64, n), *owner = leaf_row(f.p, space + 64, 4, n, 496), *other = leaf_row(f.p, space + 64, 5, n, 496), *reverse = record(f.p, owner + 440, n), *global = record(f.p, space + 120, n);
+    unsigned char *commit = record(f.p, f.p + 48, n), *catalog = record(f.p, commit + 120, n), *history = record(f.p, catalog + 648, n);
+    assert(!memcmp(space + 64, history + 64, 56) && !get16(inode + 68) && get16(inode + 70) == 4 && !get16(reverse + 68) && get16(reverse + 70) == 2 && get16(global + 70) == 6 && memcmp(owner + 440, other + 440, 24));
+    size_t ns_at = (size_t)(space - f.p), owner_at = (size_t)(owner - f.p), other_at = (size_t)(other - f.p), reverse_at = (size_t)(reverse - f.p), global_at = (size_t)(global - f.p), directory_at = (size_t)(inode + 640 - f.p);
+    for (unsigned kind = 0; kind < sizeof(labels) / sizeof(*labels); kind++) {
+        unsigned char *p = malloc(n), *topology = malloc(n); assert(p && topology); memcpy(p, control, n); memcpy(topology, control, n);
+        if (kind == 0 || kind == 1) put64(p + owner_at + 344, kind ? UINT64_MAX : 0);
+        else if (kind == 2) put64(p + ns_at + 336, 7);
+        else if (kind == 3) put64(p + ns_at + 184, 5);
+        else if (kind == 4) put64(p + owner_at + 344, 1);
+        else if (kind == 5 || kind == 16) {
+            hardlink_edge_change(p, topology, control, n, owner_at + 440, control + owner_at + 440, (unsigned char[56]){0});
+            if (kind == 16) put64(p + owner_at + 344, 1);
+        } else if (kind == 6 || kind == 7) {
+            unsigned char rows[3 * 280]; memcpy(rows, control + reverse_at + 640, 560);
+            if (kind == 7) hardlink_row(rows + 560, 2, "c", 4);
+            hardlink_leaf_change(p, topology, control, n, reverse_at, rows, kind == 6 ? 1 : 3);
+        } else if (kind == 8) put64(p + reverse_at + 640 + 267, 5);
+        else if (kind == 9 || kind == 10) {
+            unsigned char rows[6 * 280]; memcpy(rows, control + global_at + 640, sizeof(rows));
+            /* The two parent2 names follow all four root names. */
+            assert(get64(rows + 4 * 280) == 2 && rows[4 * 280 + 12] == 'a' && rows[5 * 280 + 12] == 'b');
+            if (kind == 9) { put64(rows + 5 * 280 + 267, 5); hardlink_leaf_change(p, topology, control, n, global_at, rows, 6); }
+            else hardlink_leaf_change(p, topology, control, n, global_at, rows, 5);
+        } else if (kind == 11) p[owner_at + 88] = 'b';
+        else if (kind == 12) { put32(p + directory_at + 16, SFS_FILE); put32(p + directory_at + 352 + 64, 0100600); }
+        else if (kind == 13) {
+            put32(p + owner_at + 16, SFS_DIRECTORY); put64(p + owner_at + 24, 0); put32(p + owner_at + 352 + 64, 0040700); put64(p + owner_at + 432, 0);
+            hardlink_edge_change(p, topology, control, n, owner_at + 32, control + owner_at + 32, (unsigned char[56]){0});
+        } else if (kind == 14) hardlink_edge_change(p, topology, control, n, directory_at + 440, control + directory_at + 440, control + owner_at + 440);
+        else { assert(kind == 15); hardlink_edge_change(p, topology, control, n, other_at + 440, control + other_at + 440, control + owner_at + 440); }
+        hardlink_repair(p, topology, n); assert(hardlink_guard(p, topology, n)); save("image", p, n); reset("", 0);
+        sfs_image *h = NULL; sfs_result r; sfs_recovery recovery; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_RECOVERY_REQUIRED);
+        assert(!h && r.phase == SFS_PHASE_READ && !r.system_errno && r.coverage != SFS_COVERAGE_FULL_REACHABLE);
+        for (unsigned slot = 0; slot < 2; slot++) assert(recovery.slots[slot].status == SFS_CORRUPT && recovery.slots[slot].coverage != SFS_COVERAGE_FULL_REACHABLE && !recovery.slots[slot].system_errno);
+        receipt(labels[kind], &r); image_unwritten(); unchanged("image", p, n); free(p); free(topology); retain(3400 + (int)kind);
+    }
+    free(f.p);
+}
+static void hardlink_touched_failures(void) {
+    fixture f = hardlink_fixture(2, 1, 0, 2); hardlink_full_control(&f); retain(3420); size_t n = f.n;
+    unsigned char *original = malloc(n); assert(original); memcpy(original, f.p, n);
+    unsigned char *space = namespace_at(f.p, f.p, n), *names = record(f.p, space + 120, n); assert(get64(names + 640 + 5 * 280) == 2 && names[640 + 5 * 280 + 12] == 'b'); put64(names + 640 + 5 * 280 + 267, 5);
+    hardlink_repair(f.p, original, n); assert(hardlink_guard(f.p, original, n));
+    for (unsigned operation = 0; operation < 5; operation++) {
+        save("image", f.p, n); sfs_image *h; sfs_result r, binding; reset("", 0); open_readonly(&h, &binding); assert(binding.coverage == SFS_COVERAGE_ROOT_ONLY);
+        sfs_entry entry, canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; sfs_cookie cookie, saved; memset(&cookie, 0xA5, sizeof(cookie)); saved = cookie; int found = 99;
+        if (operation == 0) XEXPECT(sfs_image_lookup(h, 0, 2, "b", 1, &entry, &r), SFS_CORRUPT);
+        else if (operation == 1) {
+            XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); saved = cookie;
+            XEXPECT(sfs_image_next(h, 0, 2, &cookie, &entry, &found, &r), SFS_CORRUPT); assert(!found);
+        } else if (operation == 2) XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 2, "b", 1, &cookie, &r), SFS_CORRUPT);
+        else {
+            close_image(h); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
+            if (operation == 3) XEXPECT(sfs_image_rename_entry(h, 2, "a", 1, 2, "b", 1, &r), SFS_CORRUPT);
+            else XEXPECT(sfs_image_link(h, 4, 2, "b", 1, &r), SFS_CORRUPT); /* An occupied corrupt destination must not become EXISTS. */
+        }
+        assert(r.phase == SFS_PHASE_READ && !r.system_errno && !memcmp(&entry, &canary, sizeof(entry)) && !memcmp(&cookie, &saved, sizeof(cookie)));
+        if (operation < 3) poisoned_readonly(h, r.phase); else XEXPECT(sfs_image_commit(h, &r), SFS_POISONED);
+        image_unwritten(); close_image(h); unchanged("image", f.p, n); retain(3421 + (int)operation);
+    }
+    /* A separately rehashed nonminimal representative is reached by stat. */
+    memcpy(f.p, original, n); space = namespace_at(f.p, f.p, n); unsigned char *owner = leaf_row(f.p, space + 64, 4, n, 496); owner[88] = 'b'; hardlink_repair(f.p, original, n); assert(hardlink_guard(f.p, original, n)); save("image", f.p, n);
+    sfs_image *h; sfs_result r; reset("", 0); open_image(&h); sfs_metadata_entry output, canary; memset(&canary, 0xA5, sizeof(canary)); output = canary; XEXPECT(sfs_image_stat_metadata(h, 0, 4, &output, &r), SFS_CORRUPT); assert(!memcmp(&output, &canary, sizeof(output))); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); image_unwritten(); close_image(h); unchanged("image", f.p, n);
+    open_image(&h); sfs_entry entry, entry_canary; memset(&entry_canary, 0xA5, sizeof(entry_canary)); entry = entry_canary; XEXPECT(sfs_image_stat(h, 0, 4, &entry, &r), SFS_CORRUPT); assert(!memcmp(&entry, &entry_canary, sizeof(entry))); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); image_unwritten(); close_image(h); unchanged("image", f.p, n); free(f.p); free(original); retain(3426);
+}
+static void hardlink_verify_budgets(void) {
+    sfs_image *h; sfs_result r; sfs_recovery recovery; fixture f = hardlink_fixture(2, 1, 0, 2); assert(hardlink_guard(f.p, f.p, f.n)); fixture_save(&f); reset("", 0);
+    recovery_cancellation cancellation = {.after_hash = 0}; sfs_verify_budget budget = generous; budget.cancelled = cancel_recovery_once; budget.context = &cancellation;
+    XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &budget, &r), SFS_OK);
+    assert(cancellation.fired && recovery.slots[0].status == SFS_INCOMPLETE && recovery.slots[0].incomplete_reason == SFS_INCOMPLETE_CANCELLED && recovery.slots[0].coverage != SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].status == SFS_OK && recovery.slots[1].coverage == SFS_COVERAGE_FULL_REACHABLE);
+    sfs_cookie cookie, canary; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+    XEXPECT(sfs_image_resume_after_name(h, 0, 1, recovery.slots[1].root_digest, 2, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    XEXPECT(sfs_image_select(h, 0, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE); hardlink_name(h, 0, 2, "b", 4); image_unwritten(); close_image(h); retain(3430);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        f = hardlink_fixture(2, 1, 0, 2); fixture_save(&f); reset("", 0); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 31337; XEXPECT(sfs_image_set_metadata(h, 5, &update, &r), SFS_OK);
+        size_t n; unsigned char *before = bytes("image", &n); budget = generous; unsigned polls = 0;
+        if (mode < 2) budget.metadata_read_bytes = CELL; else if (mode == 2) budget.checks = 1; else { budget.cancelled = cancel_now; budget.context = &polls; }
+        reset(mode == 1 ? "slot_reads" : "", mode == 1 ? 1 : 0);
+        XEXPECT(sfs_image_verify(h, &budget, &r), mode == 1 ? SFS_IO : SFS_INCOMPLETE);
+        assert(r.coverage != SFS_COVERAGE_FULL_REACHABLE && r.phase == SFS_PHASE_READ && r.system_errno == (mode == 1 ? EIO : 0));
+        if (mode == 1) assert(hit); else assert(r.incomplete_reason == (mode == 0 ? SFS_INCOMPLETE_METADATA_READ : mode == 2 ? SFS_INCOMPLETE_CHECKS : SFS_INCOMPLETE_CANCELLED));
+        image_unwritten(); unchanged("image", before, n); reset("", 0);
+        if (mode == 1) XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); else { metadata_commit(h); sfs_metadata_entry m = hardlink_get(h, 0, 5, 2); assert(m.uid == 31337); hardlink_get(h, 0, 4, 2); symlink_full(h); }
+        free(before); close_image(h); retain(3431 + (int)mode);
+    }
+}
+/* Security control: a->2, b->3; optional c->2 has an exact owner2 reverse. */
+static fixture hardlink_creation_fixture(unsigned multi) {
+    fixture f = fixture_start(); f.minor = 6; put32(f.p + 12, 6); unsigned char raw[CELL] = {0}; memcpy(raw, "old", 3); fixture_node data = append_cell(&f, 6, raw);
+    unsigned char extent_row[72] = {0}; memcpy(extent_row + 8, data.ref, 56); put16(extent_row + 64, 3); fixture_node extent = tree(&f, 3, extent_row, 1);
+    unsigned char names[3 * 280], reverse_rows[2 * 280]; hardlink_row(names, 1, "a", 2); hardlink_row(names + 280, 1, "b", 3); fixture_node reverse = {0}, empty = {0};
+    if (multi) { hardlink_row(names + 560, 1, "c", 2); memcpy(reverse_rows, names, 280); memcpy(reverse_rows + 280, names + 560, 280); reverse = tree(&f, 6, reverse_rows, 2); }
+    unsigned char inode[2 * 496] = {0};
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *row = inode + i * 496; put64(row, i + 2); put64(row + 8, 1); put32(row + 16, SFS_FILE); put32(row + 20, 1); row[88] = (unsigned char)('a' + i); put64(row + 344, i ? 1 : multi ? 2 : 1); fixture_tuple(row + 352, SFS_FILE, i ? 0 : 1);
+        if (!i) { put64(row + 24, 3); memcpy(row + 32, extent.ref, 56); memcpy(row + 440, reverse.ref, 56); }
+    }
+    fixture_node inodes = tree(&f, 1, inode, 2), global = tree(&f, 2, names, 2 + multi), space = hardlink_space(&f, inodes, global, empty, 2, 2 + multi, 6); finish_fixture(&f, space, empty); return f;
+}
+static void hardlink_creation_collisions(void) {
+    sfs_metadata_initial initial = metadata_input(SFS_FILE), symbol = symlink_input();
+    for (unsigned multi = 0; multi < 2; multi++) {
+        fixture control = hardlink_creation_fixture(multi); hardlink_full_control(&control); retain(3450 + (int)multi);
+        size_t n = control.n; unsigned char *space = namespace_at(control.p, control.p, n), *global = record(control.p, space + 120, n), *owner = leaf_row(control.p, space + 64, 2, n, 496); size_t row_at = (size_t)(global + 640 + 280 - control.p);
+        assert(get64(control.p + row_at + 267) == 3 && control.p[row_at + 12] == 'b' && get64(owner + 344) == (multi ? 2 : 1));
+        for (unsigned mode = 0; mode < (multi ? 5u : 3u); mode++) for (unsigned api = 0; api < 3; api++) {
+            /* mode0 valid sole b; mode1 checked b->2; mode2 checked b->missing5;
+             * mode3 valid multi c; mode4 the same multi destination with cold reverse I/O. */
+            unsigned char *p = malloc(n); assert(p); memcpy(p, control.p, n);
+            if (mode == 1 || mode == 2) {
+                assert(get64(p + row_at + 267) == 3); put64(p + row_at + 267, mode == 1 ? 2 : 5); hardlink_repair(p, control.p, n); assert(hardlink_guard(p, control.p, n));
+            } else assert(hardlink_guard(p, control.p, n));
+            save("image", p, n); sfs_image *h; sfs_result r; reset("", 0); open_image(&h);
+            /* open_image asserts ROOT_ONLY. Root-only staging leaves the cold
+             * owner2 reverse tree untouched for the descriptor-targeted fault. */
+            XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 777;
+            XEXPECT(sfs_image_set_metadata(h, 1, &update, &r), SFS_OK); size_t before_n; unsigned char *before = bytes("image", &before_n); assert(before_n >= n);
+            if (mode == 4) {
+                /* Reuse the qualified cold-getter setup: a controlled stop clears
+                 * metadata cache, retains root staging, and never certifies FULL. */
+                sfs_verify_budget stop = generous; unsigned polls = 0; stop.cancelled = cancel_now; stop.context = &polls;
+                XEXPECT(sfs_image_verify(h, &stop, &r), SFS_INCOMPLETE); assert(polls && r.incomplete_reason == SFS_INCOMPLETE_CANCELLED && !r.system_errno && r.coverage != SFS_COVERAGE_FULL_REACHABLE);
+            }
+            reset("", 0); clock_calls = 0; if (mode == 4) { read_at[0] = get64(owner + 440 + 8); assert(read_at[0] >= 8192); reset("candidate_reads", 1); }
+            sfs_inode output = UINT64_MAX; const char *name = mode >= 3 ? "c" : "b"; enum sfs_status status;
+            if (api == 0) status = sfs_image_add(h, 1, name, 1, SFS_FILE, &output, &r);
+            else if (api == 1) status = sfs_image_add_metadata(h, 1, name, 1, SFS_FILE, &initial, &output, &r);
+            else status = sfs_image_symlink_metadata(h, 1, name, 1, "opaque", 6, &symbol, &output, &r);
+            enum sfs_status expected = mode == 1 || mode == 2 ? SFS_CORRUPT : mode == 4 ? SFS_IO : SFS_EXISTS;
+            assert(status == expected && r.status == status && r.phase == SFS_PHASE_READ && r.system_errno == (mode == 4 ? EIO : 0) && output == UINT64_MAX && r.physical_end == before_n && !clock_calls);
+            if (mode == 4) assert(hit); image_unwritten(); unchanged("image", before, before_n); receipt("hardlink-creation-collision", &r);
+            printf("{\"case\":\"hardlink-creation-collision\",\"multi\":%u,\"mode\":%u,\"api\":%u,\"status\":%d,\"fault_hit\":%d}\n", multi, mode, api, status, hit); fflush(stdout); reset("", 0);
+            if (expected == SFS_EXISTS) {
+                metadata_commit(h); sfs_metadata_entry root_metadata = hardlink_get(h, 0, 1, 1); assert(root_metadata.uid == 777); hardlink_get(h, 0, 2, multi ? 2 : 1); symlink_full(h);
+            } else {
+                XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); assert(r.phase == SFS_PHASE_READ && !r.system_errno); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); close_image(h); open_image(&h);
+                sfs_metadata_entry root_metadata = hardlink_get(h, 0, 1, 1); assert(root_metadata.uid == 1234);
+            }
+            close_image(h); free(before); free(p); retain(3460 + (int)(multi * 15 + mode * 3 + api));
+        }
+        free(control.p);
+    }
+}
+
+static void hardlink_conflicting_roots(void) {
+    fixture a = hardlink_fixture(2, 1, 0, 2), b = hardlink_fixture(2, 1, 0, 2); hardlink_full_control(&a); retain(3440);
+    unsigned char *space = namespace_at(b.p, b.p, b.n), *owner = leaf_row(b.p, space + 64, 4, b.n, 496), *reverse = record(b.p, owner + 440, b.n), *names = record(b.p, space + 120, b.n);
+    assert(reverse[640 + 280 + 12] == 'b' && names[640 + 5 * 280 + 12] == 'b'); reverse[640 + 280 + 12] = 'z'; names[640 + 5 * 280 + 12] = 'z'; hardlink_repair(b.p, a.p, b.n); assert(hardlink_guard(b.p, a.p, b.n)); hardlink_full_control(&b); retain(3441);
+    unsigned char slot[CELL]; memcpy(slot, a.p, CELL); unsigned char *mapping = calloc(b.n / CELL, 56); assert(mapping);
+    for (size_t i = 2; i < b.n / CELL; i++) {
+        unsigned char *cell = b.p + i * CELL; unsigned type = !memcmp(cell, "SFSREC06", 8) ? get32(cell + 8) : 6;
+        if (type == 2 || type == 4) { mapped_ref(cell + 64, mapping, b.n / CELL); mapped_ref(cell + 120, mapping, b.n / CELL); if (type == 2) mapped_ref(cell + 280, mapping, b.n / CELL); }
+        if (type == 5) {
+            unsigned map = get32(cell + 64), level = get16(cell + 68), count = get16(cell + 70), stride = hardlink_stride(map, level), edge = hardlink_edge(map, level);
+            for (unsigned j = 0; j < count; j++) {
+                if (level || (map != 2 && map != 6)) mapped_ref(cell + 640 + j * stride + edge, mapping, b.n / CELL);
+                if (!level && map == 1) mapped_ref(cell + 640 + j * stride + 440, mapping, b.n / CELL);
+            }
+        }
+        fixture_node relocated = append_cell(&a, type, cell); memcpy(mapping + i * 56, relocated.ref, 56);
+    }
+    memcpy(a.p, slot, CELL); mapped_ref(b.p + 48, mapping, b.n / CELL); memcpy(a.p + CELL, b.p, CELL); put64(a.p + CELL + 104, a.n); slot_hash(a.p + CELL); free(mapping); free(b.p); fixture_save(&a);
+    size_t n; unsigned char *before = bytes("image", &n); sfs_image *h = NULL; sfs_result r, first, second; sfs_recovery recovery; reset("", 0);
+    XEXPECT(sfs_image_open(root, "image", &h, &r), SFS_RECOVERY_REQUIRED); assert(!h); XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    assert(!recovery.pair_valid && recovery.slots[0].status == SFS_OK && recovery.slots[1].status == SFS_OK && recovery.slots[0].coverage == SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].coverage == SFS_COVERAGE_FULL_REACHABLE);
+    ok(sfs_image_select(h, 0, &generous, &first), &first); sfs_cookie cookie, saved, canary; memset(&canary, 0xA5, sizeof(canary));
+    XEXPECT(sfs_image_resume_after_name(h, 1, first.generation, first.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); saved = cookie;
+    sfs_entry e, entry_canary; memset(&entry_canary, 0xA5, sizeof(entry_canary)); e = entry_canary; int found = 99;
+    ok(sfs_image_select(h, 1, &generous, &second), &second); assert(first.generation == second.generation && memcmp(first.root_digest, second.root_digest, 32)); cookie = canary;
+    XEXPECT(sfs_image_resume_after_name(h, 1, first.generation, first.root_digest, 2, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    cookie = saved; XEXPECT(sfs_image_next(h, 1, 2, &cookie, &e, &found, &r), SFS_STATE); assert(!found && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &entry_canary, sizeof(e)));
+    XEXPECT(sfs_image_resume_after_name(h, 1, second.generation, second.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); XEXPECT(sfs_image_next(h, 1, 2, &cookie, &e, &found, &r), SFS_OK); assert(found && e.inode == 4 && e.name_length == 1 && e.name[0] == 'z');
+    image_unwritten(); close_image(h); unchanged("image", before, n); free(before);
+}
+static void hardlink_verify(void) { hardlink_semantic_negatives(); hardlink_touched_failures(); hardlink_verify_budgets(); hardlink_creation_collisions(); hardlink_conflicting_roots(); }
+
+
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -3257,6 +3984,12 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"indexes")) indexes(); else if(!strcmp(argv[1],"ranges")) ranges();
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
+    else if(!strcmp(argv[1],"hardlink-versions")) hardlink_versions();
+    else if(!strcmp(argv[1],"hardlink-shared")) hardlink_shared();
+    else if(!strcmp(argv[1],"hardlink-transitions")) hardlink_transitions();
+    else if(!strcmp(argv[1],"hardlink-names")) hardlink_names();
+    else if(!strcmp(argv[1],"hardlink-failures")) hardlink_failures();
+    else if(!strcmp(argv[1],"hardlink-verify")) hardlink_verify();
     else if(!strcmp(argv[1],"xattr-versions")) xattr_versions();
     else if(!strcmp(argv[1],"xattr-values")) xattr_values();
     else if(!strcmp(argv[1],"xattr-namespace")) xattr_namespace();
@@ -3270,7 +4003,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-failures")) symlink_failures();
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)) assert(!clock_calls);
+    if(strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }

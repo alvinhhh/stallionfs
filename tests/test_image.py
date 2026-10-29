@@ -452,6 +452,29 @@ class ImageCore(unittest.TestCase):
     def test_xattr_full_semantics_dense_contexts_budgets_and_target_memo(self):
         self.scenario('xattr-verify')
 
+    def test_hardlink_versions_legacy_refusal_and_explicit_codec(self):
+        self.scenario('hardlink-versions')
+
+    def test_hardlink_shared_regular_symlink_identity_and_historical_views(self):
+        self.scenario('hardlink-shared')
+
+    def test_hardlink_representative_transitions_reverse_split_merge_and_counts(self):
+        self.scenario('hardlink-transitions')
+
+    def test_hardlink_exact_names_errors_cookie_binding_and_readonly_policy(self):
+        self.scenario('hardlink-names')
+
+    def test_hardlink_whole_reservation_faults_pending_batch_and_name_limit(self):
+        try:
+            self.compile('limits', '-DSFS_FILE_MAX=UINT64_C(4194304)', '-DSFS_ENTRY_MAX=1024u')
+            self.scenario('hardlink-failures', 'limits')
+        except BaseException:
+            type(self).failed = True
+            raise
+
+    def test_hardlink_full_reverse_owner_global_semantics_and_budgets(self):
+        self.scenario('hardlink-verify')
+
 
 class ImageDiagnostics(unittest.TestCase):
     def test_timeout_preserves_partial_output_and_reraises(self):

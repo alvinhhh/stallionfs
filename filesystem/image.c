@@ -23,11 +23,11 @@
 #define ARENA_COUNT 1024u
 #define NO_CHILD UINT16_MAX
 #define ARENA_BYTES (5u * 1024u * 1024u)
-#define MAX_ROW 440u
+#define MAX_ROW 496u
 _Static_assert(sizeof(off_t) >= 8, "64-bit file offsets required");
 _Static_assert(SFS_SNAPSHOT_MAX > 0 && SFS_SNAPSHOT_MAX <= 32, "snapshot limit");
 enum { NAMESPACE = 2, ROOT = 4, INDEX = 5, RAW = 6 };
-enum { MAP_INODE = 1, MAP_NAME = 2, MAP_EXTENT = 3, MAP_SNAPSHOT = 4, MAP_XATTR = 5 };
+enum { MAP_INODE = 1, MAP_NAME = 2, MAP_EXTENT = 3, MAP_SNAPSHOT = 4, MAP_XATTR = 5, MAP_BACKREF = 6 };
 typedef struct { uint32_t type; uint64_t offset, length; uint8_t digest[32]; } reference;
 typedef struct { uint16_t length; uint8_t bytes[263]; } key;
 typedef struct {
@@ -35,8 +35,8 @@ typedef struct {
     uint32_t mode, uid, gid, flags;
     uint64_t extents;
 } attributes;
-typedef struct { sfs_entry e; reference extent; attributes attributes; } node;
-typedef struct { uint64_t count, next_inode; reference inodes, names, ref; attributes attributes; reference xattrs; } namespace;
+typedef struct { sfs_entry e; reference extent; attributes attributes; uint64_t nlink; reference reverse; } node;
+typedef struct { uint64_t count, next_inode; reference inodes, names, ref; attributes attributes; reference xattrs; uint64_t name_count; } namespace;
 typedef struct { uint32_t view, length; uint8_t name[SFS_NAME_MAX]; reference ns; } snapshot;
 typedef struct { uint64_t generation, end, capacity; uint8_t uuid[16]; reference root; uint32_t minor; } anchor;
 typedef struct { namespace ns; uint32_t count; snapshot snapshots[SFS_SNAPSHOT_MAX]; reference catalog; } state;
@@ -66,7 +66,8 @@ typedef struct {
 typedef struct { unsigned map, level; int root, last; unsigned minor; key lower, upper; uint64_t next_inode, eof; } context;
 _Static_assert(sizeof(attributes) == 88 && _Alignof(attributes) == 8, "metadata tuple layout");
 _Static_assert(sizeof(sfs_timestamp) == 16 && _Alignof(sfs_timestamp) == 8, "timestamp layout");
-_Static_assert(sizeof(node) == 440 && sizeof(namespace) == 328 && sizeof(anchor) == 104, "metadata state layout");
+_Static_assert(sizeof(node) == 504 && sizeof(namespace) == 336 && sizeof(anchor) == 104, "metadata state layout");
+_Static_assert(PAGE_HEAD + 6u * 496u <= CELL && PAGE_HEAD + 12u * 280u <= CELL, "hardlink row capacity");
 _Static_assert(PAGE_HEAD + 9u * 352u <= CELL && PAGE_HEAD + 9u * 328u <= CELL, "xattr row capacity");
 _Static_assert(sizeof(state) == sizeof(namespace) + 8 + SFS_SNAPSHOT_MAX * sizeof(snapshot) + sizeof(reference), "namespace state accounting");
 _Static_assert(sizeof(context) == 568, "context format uses existing alignment space");
@@ -88,10 +89,11 @@ static void encode_ref(uint8_t *p, const reference *r) { memset(p, 0, REF_SIZE);
 static int decode_ref(const uint8_t *p, reference *r) { if (get32(p + 4)) return 0; memset(r, 0, sizeof(*r)); r->type = get32(p); r->offset = get64(p + 8); r->length = get64(p + 16); memcpy(r->digest, p + 24, 32); return r->type || zero(p, REF_SIZE); }
 static int same_ref(const reference *a, const reference *b) { return a->type == b->type && a->offset == b->offset && a->length == b->length && !memcmp(a->digest, b->digest, 32); }
 static int valid_time(sfs_timestamp t) { return t.nanoseconds < UINT32_C(1000000000); }
-static int metadata_capable(unsigned minor) { return minor == 3 || minor == 4 || minor == 5; }
-static int symlink_capable(unsigned minor) { return minor == 4 || minor == 5; }
-static const char *record_magic(unsigned minor) { return minor == 2 ? "SFSREC02" : minor == 3 ? "SFSREC03" : minor == 4 ? "SFSREC04" : minor == 5 ? "SFSREC05" : "SFSBAD00"; }
-static const char *raw_domain(unsigned minor) { return minor == 2 ? "SFSDAT02" : minor == 3 ? "SFSDAT03" : minor == 4 ? "SFSDAT04" : minor == 5 ? "SFSDAT05" : "SFSBAD00"; }
+static int metadata_capable(unsigned minor) { return minor == 3 || minor == 4 || minor == 5 || minor == 6; }
+static int symlink_capable(unsigned minor) { return minor == 4 || minor == 5 || minor == 6; }
+static int xattr_capable(unsigned minor) { return minor == 5 || minor == 6; }
+static const char *record_magic(unsigned minor) { return minor == 2 ? "SFSREC02" : minor == 3 ? "SFSREC03" : minor == 4 ? "SFSREC04" : minor == 5 ? "SFSREC05" : minor == 6 ? "SFSREC06" : "SFSBAD00"; }
+static const char *raw_domain(unsigned minor) { return minor == 2 ? "SFSDAT02" : minor == 3 ? "SFSDAT03" : minor == 4 ? "SFSDAT04" : minor == 5 ? "SFSDAT05" : minor == 6 ? "SFSDAT06" : "SFSBAD00"; }
 static int valid_mode(uint32_t mode, unsigned kind) {
     uint32_t type = kind == SFS_DIRECTORY ? UINT32_C(0040000) : kind == SFS_FILE ? UINT32_C(0100000) : kind == SFS_SYMLINK ? UINT32_C(0120000) : 0;
     return type && !(mode & ~UINT32_C(0177777)) && (mode & UINT32_C(0170000)) == type;
@@ -355,9 +357,9 @@ static key number_key(uint64_t v) { key k = { .length = 8 }; big64(k.bytes, v); 
 static key name_key(uint64_t parent, const void *name, size_t length) { key k = { .length = (uint16_t)(8 + length) }; big64(k.bytes, parent); if (length) memcpy(k.bytes + 8, name, length); return k; }
 static unsigned page_level(const uint8_t *b) { return get16(b + 68); }
 static unsigned page_count(const uint8_t *b) { return get16(b + 70); }
-static int variable_key(unsigned map) { return map == MAP_NAME || map == MAP_XATTR; }
-static unsigned stride(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 328 : 72) : map == MAP_INODE ? (metadata_capable(minor) ? MAX_ROW : 352) : map == MAP_NAME ? 280 : map == MAP_EXTENT ? 72 : map == MAP_XATTR ? 352 : map == MAP_SNAPSHOT ? 328 : 0; }
-static unsigned minimum(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 3 : 16) : map == MAP_INODE ? (metadata_capable(minor) ? 2 : 3) : (map == MAP_SNAPSHOT || map == MAP_XATTR) ? 3 : map == MAP_NAME ? 4 : map == MAP_EXTENT ? 16 : 0; }
+static int variable_key(unsigned map) { return map == MAP_NAME || map == MAP_XATTR || map == MAP_BACKREF; }
+static unsigned stride(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 328 : 72) : map == MAP_INODE ? (minor == 6 ? 496 : metadata_capable(minor) ? 440 : 352) : (map == MAP_NAME || map == MAP_BACKREF) ? 280 : map == MAP_EXTENT ? 72 : map == MAP_XATTR ? 352 : map == MAP_SNAPSHOT ? 328 : 0; }
+static unsigned minimum(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 3 : 16) : map == MAP_INODE ? (metadata_capable(minor) ? 2 : 3) : (map == MAP_SNAPSHOT || map == MAP_XATTR) ? 3 : (map == MAP_NAME || map == MAP_BACKREF) ? 4 : map == MAP_EXTENT ? 16 : 0; }
 static unsigned maximum(unsigned map, unsigned level, unsigned minor) { return 3 * minimum(map, level, minor); }
 static const uint8_t *row_at(const uint8_t *b, unsigned map, unsigned i, unsigned minor) { return b + PAGE_HEAD + stride(map, page_level(b), minor) * i; }
 static key page_min(const uint8_t *b) { key k = { .length = get16(b + 88) }; if (k.length <= 263) memcpy(k.bytes, b + 112, k.length); return k; }
@@ -372,7 +374,7 @@ static enum sfs_status page_read(reader *r, const reference *ref, uint64_t befor
     enum sfs_status e = metadata(r, ref, INDEX, before, out); if (e) return e;
     e = charge(r, SFS_INCOMPLETE_CHECKS, 1); if (e) return e;
     const uint8_t *b = *out; unsigned n = page_count(b), level = page_level(b); key min = page_min(b), max = page_max(b);
-    if (c.map < MAP_INODE || c.map > MAP_XATTR || (c.map == MAP_XATTR && r->a.minor != 5) || get32(b + 64) != c.map || level != c.level || level >= MAX_HEIGHT || !n || n > maximum(c.map, level, r->a.minor) || n < (c.root ? (level ? 2 : 1) : minimum(c.map, level, r->a.minor)) || !get64(b + 72) || get64(b + 72) > r->a.generation || !zero(b + 80, 8) || !zero(b + 92, 20) || !zero(b + 638, 2)) return SFS_CORRUPT;
+    if (c.map < MAP_INODE || c.map > MAP_BACKREF || (c.map == MAP_BACKREF && r->a.minor != 6) || (c.map == MAP_XATTR && !xattr_capable(r->a.minor)) || get32(b + 64) != c.map || level != c.level || level >= MAX_HEIGHT || !n || n > maximum(c.map, level, r->a.minor) || n < (c.root ? (level ? 2 : 1) : minimum(c.map, level, r->a.minor)) || !get64(b + 72) || get64(b + 72) > r->a.generation || !zero(b + 80, 8) || !zero(b + 92, 20) || !zero(b + 638, 2)) return SFS_CORRUPT;
     if (min.length < (variable_key(c.map) ? 9 : 8) || min.length > (variable_key(c.map) ? 263 : 8) || max.length < (variable_key(c.map) ? 9 : 8) || max.length > (variable_key(c.map) ? 263 : 8) || !zero(b + 112 + min.length, 263 - min.length) || !zero(b + 375 + max.length, 263 - max.length) || keycmp(&min, &max) > 0) return SFS_CORRUPT;
     if (!c.root && (keycmp(&min, &c.lower) || (c.last ? keycmp(&max, &c.upper) != 0 : keycmp(&max, &c.upper) >= 0))) return SFS_CORRUPT;
     unsigned step = stride(c.map, level, r->a.minor); if (!zero(b + PAGE_HEAD + step * n, CELL - PAGE_HEAD - step * n)) return SFS_CORRUPT;
@@ -388,11 +390,15 @@ static enum sfs_status page_read(reader *r, const reference *ref, uint64_t befor
             if (!decode_ref(v + 8, &data) || !visible || visible > CELL || !zero(v + 66, 6) || block > UINT64_MAX / CELL || block * CELL >= c.eof || visible > c.eof - block * CELL) return SFS_CORRUPT;
             e = bounds(r, &data, RAW, ref->offset); if (e) return e;
         } else if (c.map == MAP_INODE) { reference ext; uint64_t id = get64(v), parent = get64(v + 8), size = get64(v + 24); unsigned kind = get32(v + 16), len = get32(v + 20);
-            if (id < 2 || id >= c.next_inode || !parent || parent >= c.next_inode || (kind != SFS_FILE && kind != SFS_DIRECTORY && !(kind == SFS_SYMLINK && symlink_capable(r->a.minor))) || !valid_name(v + 88, len) || !zero(v + 88 + len, 264 - len) || (kind == SFS_FILE && size > SFS_FILE_MAX) || (kind == SFS_SYMLINK && (!size || size > SFS_SYMLINK_MAX)) || !decode_ref(v + 32, &ext) || ((kind == SFS_DIRECTORY || !size) && ext.type) || (kind == SFS_DIRECTORY && size)) return SFS_CORRUPT;
+            if (id < 2 || id >= c.next_inode || !parent || parent >= c.next_inode || (kind != SFS_FILE && kind != SFS_DIRECTORY && !(kind == SFS_SYMLINK && symlink_capable(r->a.minor))) || !valid_name(v + 88, len) || !zero(v + 88 + len, (r->a.minor == 6 ? 256u : 264u) - len) || (kind == SFS_FILE && size > SFS_FILE_MAX) || (kind == SFS_SYMLINK && (!size || size > SFS_SYMLINK_MAX)) || !decode_ref(v + 32, &ext) || ((kind == SFS_DIRECTORY || !size) && ext.type) || (kind == SFS_DIRECTORY && size)) return SFS_CORRUPT;
+            if (r->a.minor == 6) { reference reverse; uint64_t links = get64(v + 344);
+                if (!links || links > c.eof || !decode_ref(v + 440, &reverse) || (kind == SFS_DIRECTORY ? links != 1 || reverse.type : (!!reverse.type != (links > 1)))) return SFS_CORRUPT;
+                if (reverse.type) { e = bounds(r, &reverse, INDEX, ref->offset); if (e) return e; }
+            }
             if (ext.type) { e = bounds(r, &ext, INDEX, ref->offset); if (e) return e; }
             if (metadata_capable(r->a.minor) && !valid_attributes(v + 352, kind, size, ext.type, r->a.end)) return SFS_CORRUPT;
-        } else if (c.map == MAP_NAME) { uint64_t parent = get64(v), id = get64(v + 267); unsigned len = get32(v + 8);
-            if (!parent || parent >= c.next_inode || id < 2 || id >= c.next_inode || !valid_name(v + 12, len) || !zero(v + 12 + len, 255 - len) || !zero(v + 275, 5)) return SFS_CORRUPT;
+        } else if (c.map == MAP_NAME || c.map == MAP_BACKREF) { uint64_t parent = get64(v), id = get64(v + 267); unsigned len = get32(v + 8);
+            if (!parent || parent >= c.next_inode || id < 2 || id >= c.next_inode || !valid_name(v + 12, len) || !zero(v + 12 + len, 255 - len) || !zero(v + 275, 5) || (c.map == MAP_BACKREF && id != c.eof)) return SFS_CORRUPT;
         } else if (c.map == MAP_XATTR) { reference ext; uint64_t owner = get64(v), size = get64(v + 272), count = get64(v + 336); unsigned len = get32(v + 8);
             if (!owner || owner >= c.next_inode || !valid_xattr_name(v + 12, len) || !zero(v + 12 + len, 255 - len) || !zero(v + 267, 5) || size > SFS_FILE_MAX || count != dense_count(size) || !decode_ref(v + 280, &ext) || (!!count != !!ext.type) || get64(v + 344)) return SFS_CORRUPT;
             if (ext.type) { e = bounds(r, &ext, INDEX, ref->offset); if (e) return e; }
@@ -421,6 +427,7 @@ static enum sfs_status link_target(reader *r, const node *n, uint8_t *out) {
 
 typedef struct { reference ref; uint64_t before; context context; unsigned index; } cursor_frame;
 typedef struct { reader *reader; cursor_frame frames[MAX_HEIGHT]; unsigned depth, map; uint64_t next_inode, eof; } cursor;
+_Static_assert(sizeof(cursor) == 10272, "bounded reusable cursor");
 static enum sfs_status cursor_start(cursor *c, reader *r, reference root, unsigned map, uint64_t next, uint64_t eof, const key *seek) {
     memset(c, 0, sizeof(*c)); c->reader = r; c->map = map; c->next_inode = next; c->eof = eof;
     if (!root.type) return SFS_OK;
@@ -460,11 +467,13 @@ static enum sfs_status index_get(reader *r, reference root, unsigned map, uint64
 static enum sfs_status namespace_read(reader *r, reference ref, uint64_t before, namespace *ns) {
     const uint8_t *b; enum sfs_status e = metadata(r, &ref, NAMESPACE, before, &b); if (e) return e;
     namespace n = { .ref = ref, .next_inode = get64(b + 176), .count = get64(b + 184) };
-    if (!decode_ref(b + 64, &n.inodes) || !decode_ref(b + 120, &n.names) || !zero(b + (r->a.minor == 5 ? 336 : metadata_capable(r->a.minor) ? 280 : 192), CELL - (r->a.minor == 5 ? 336 : metadata_capable(r->a.minor) ? 280 : 192)) || n.next_inode < 2 || n.count > SFS_ENTRY_MAX || n.count > maximum(MAP_INODE, 0, r->a.minor) * (r->a.end / CELL) || (!!n.count != !!n.inodes.type) || (!!n.count != !!n.names.type)) return SFS_CORRUPT;
+    n.name_count = r->a.minor == 6 ? get64(b + 336) : n.count;
+    unsigned tail = r->a.minor == 6 ? 344 : xattr_capable(r->a.minor) ? 336 : metadata_capable(r->a.minor) ? 280 : 192;
+    if (!decode_ref(b + 64, &n.inodes) || !decode_ref(b + 120, &n.names) || !zero(b + tail, CELL - tail) || n.next_inode < 2 || n.count > n.name_count || n.name_count > SFS_ENTRY_MAX || n.count > maximum(MAP_INODE, 0, r->a.minor) * (r->a.end / CELL) || n.name_count > maximum(MAP_NAME, 0, r->a.minor) * (r->a.end / CELL) || (!!n.count != !!n.inodes.type) || (!!n.count != !!n.names.type) || (!!n.name_count != !!n.names.type)) return SFS_CORRUPT;
     if (metadata_capable(r->a.minor)) { if (!valid_attributes(b + 192, SFS_DIRECTORY, 0, 0, r->a.end)) return SFS_CORRUPT; decode_attributes(b + 192, &n.attributes); }
-    if (r->a.minor == 5 && !decode_ref(b + 280, &n.xattrs)) return SFS_CORRUPT;
+    if (xattr_capable(r->a.minor) && !decode_ref(b + 280, &n.xattrs)) return SFS_CORRUPT;
     if (n.count) { e = bounds(r, &n.inodes, INDEX, ref.offset); if (e) return e; e = bounds(r, &n.names, INDEX, ref.offset); if (e) return e;
-        e = root_page(r, &n.inodes, MAP_INODE, n.next_inode, UINT64_MAX, &b); if (e) return e;
+        e = root_page(r, &n.inodes, MAP_INODE, n.next_inode, n.name_count, &b); if (e) return e;
         e = root_page(r, &n.names, MAP_NAME, n.next_inode, UINT64_MAX, &b); if (e) return e;
     }
     if (n.xattrs.type) { e = bounds(r, &n.xattrs, INDEX, ref.offset); if (e) return e; e = root_page(r, &n.xattrs, MAP_XATTR, n.next_inode, UINT64_MAX, &b); if (e) return e; }
@@ -489,18 +498,44 @@ static enum sfs_status load_state(reader *r, state *s) {
         if (view.next_inode > s->ns.next_inode) return SFS_CORRUPT; s->count++;
     } return e;
 }
-static void decode_node(const uint8_t row[MAX_ROW], node *n) {
-    memset(n, 0, sizeof(*n)); n->e.inode = get64(row); n->e.parent = get64(row + 8); n->e.kind = (enum sfs_kind)get32(row + 16); n->e.name_length = get32(row + 20); n->e.size = get64(row + 24); decode_ref(row + 32, &n->extent); memcpy(n->e.name, row + 88, n->e.name_length); decode_attributes(row + 352, &n->attributes);
+static void decode_node(const uint8_t row[MAX_ROW], node *n, unsigned minor) {
+    memset(n, 0, sizeof(*n)); n->e.inode = get64(row); n->e.parent = get64(row + 8); n->e.kind = (enum sfs_kind)get32(row + 16); n->e.name_length = get32(row + 20); n->e.size = get64(row + 24); decode_ref(row + 32, &n->extent); memcpy(n->e.name, row + 88, n->e.name_length); if (metadata_capable(minor)) decode_attributes(row + 352, &n->attributes); n->nlink = minor == 6 ? get64(row + 344) : 1; if (minor == 6) decode_ref(row + 440, &n->reverse);
 }
-static void encode_node(uint8_t row[MAX_ROW], const node *n) {
-    memset(row, 0, MAX_ROW); put64(row, n->e.inode); put64(row + 8, n->e.parent); put32(row + 16, n->e.kind); put32(row + 20, (uint32_t)n->e.name_length); put64(row + 24, n->e.size); encode_ref(row + 32, &n->extent); memcpy(row + 88, n->e.name, n->e.name_length); encode_attributes(row + 352, &n->attributes);
+static void encode_node(uint8_t row[MAX_ROW], const node *n, unsigned minor) {
+    memset(row, 0, MAX_ROW); put64(row, n->e.inode); put64(row + 8, n->e.parent); put32(row + 16, n->e.kind); put32(row + 20, (uint32_t)n->e.name_length); put64(row + 24, n->e.size); encode_ref(row + 32, &n->extent); memcpy(row + 88, n->e.name, n->e.name_length); if (metadata_capable(minor)) encode_attributes(row + 352, &n->attributes); if (minor == 6) { put64(row + 344, n->nlink); encode_ref(row + 440, &n->reverse); }
 }
 static void encode_name(uint8_t row[MAX_ROW], const node *n) { memset(row, 0, MAX_ROW); put64(row, n->e.parent); put32(row + 8, (uint32_t)n->e.name_length); memcpy(row + 12, n->e.name, n->e.name_length); put64(row + 267, n->e.inode); }
+static void entry_name(node *n, const uint8_t row[MAX_ROW]) {
+    n->e.parent = get64(row); n->e.name_length = get32(row + 8); memset(n->e.name, 0, sizeof(n->e.name)); memcpy(n->e.name, row + 12, n->e.name_length);
+}
+static enum sfs_status name_member(reader *r, const namespace *ns, const node *n, const key *k) {
+    enum sfs_status e = charge(r, SFS_INCOMPLETE_CHECKS, 1); if (e) return e;
+    uint8_t row[MAX_ROW]; int found;
+    e = index_get(r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, k, row, &found); if (e) return e;
+    if (!found || get64(row + 267) != n->e.inode) return SFS_CORRUPT;
+    if (n->nlink == 1) { key sole = name_key(n->e.parent, n->e.name, n->e.name_length); if (n->reverse.type || keycmp(&sole, k)) return SFS_CORRUPT; }
+    else {
+        e = index_get(r, n->reverse, MAP_BACKREF, ns->next_inode, n->e.inode, k, row, &found); if (e) return e;
+        if (!found || get64(row + 267) != n->e.inode) return SFS_CORRUPT;
+    }
+    uint64_t parent = from_big(k->bytes); if (parent == 1) return SFS_OK;
+    key pk = number_key(parent); e = index_get(r, ns->inodes, MAP_INODE, ns->next_inode, ns->name_count, &pk, row, &found); if (e) return e;
+    return found && get32(row + 16) == SFS_DIRECTORY ? SFS_OK : SFS_CORRUPT;
+}
+static enum sfs_status reverse_first(reader *r, const namespace *ns, const node *n, uint8_t row[MAX_ROW]) {
+    const uint8_t *b; enum sfs_status e = root_page(r, &n->reverse, MAP_BACKREF, ns->next_inode, n->e.inode, &b); if (e) return e;
+    if (n->nlink == 2 && (page_level(b) || page_count(b) != 2)) return SFS_CORRUPT;
+    key k = page_min(b); int found; e = index_get(r, n->reverse, MAP_BACKREF, ns->next_inode, n->e.inode, &k, row, &found);
+    return e ? e : found && get64(row + 267) == n->e.inode ? SFS_OK : SFS_CORRUPT;
+}
 static enum sfs_status node_get(reader *r, const namespace *ns, sfs_inode id, int canonical, node *out) {
-    if (id == 1) { memset(out, 0, sizeof(*out)); out->e.inode = out->e.parent = 1; out->e.kind = SFS_DIRECTORY; out->attributes = ns->attributes; return SFS_OK; }
-    key k = number_key(id); uint8_t row[MAX_ROW]; int found; enum sfs_status e = index_get(r, ns->inodes, MAP_INODE, ns->next_inode, UINT64_MAX, &k, row, &found); if (e) return e; if (!found) return SFS_NOT_FOUND;
-    decode_node(row, out);
-    if (canonical) { k = name_key(out->e.parent, out->e.name, out->e.name_length); e = index_get(r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, &k, row, &found); if (e) return e; if (!found || get64(row + 267) != id) return SFS_CORRUPT; }
+    if (id == 1) { memset(out, 0, sizeof(*out)); out->e.inode = out->e.parent = 1; out->e.kind = SFS_DIRECTORY; out->attributes = ns->attributes; out->nlink = 1; return SFS_OK; }
+    key k = number_key(id); uint8_t row[MAX_ROW]; int found; enum sfs_status e = index_get(r, ns->inodes, MAP_INODE, ns->next_inode, ns->name_count, &k, row, &found); if (e) return e; if (!found) return SFS_NOT_FOUND;
+    decode_node(row, out, r->a.minor);
+    if (canonical) { k = name_key(out->e.parent, out->e.name, out->e.name_length);
+        if (r->a.minor == 6) { e = name_member(r, ns, out, &k); if (e) return e; if (out->nlink > 1) { e = reverse_first(r, ns, out, row); if (e) return e; key first = row_key(row, MAP_BACKREF, 0); if (keycmp(&first, &k)) return SFS_CORRUPT; } }
+        else { e = index_get(r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, &k, row, &found); if (e) return e; if (!found || get64(row + 267) != id) return SFS_CORRUPT; }
+    }
     return SFS_OK;
 }
 static enum sfs_status directory_check(reader *r, const namespace *ns, sfs_inode id) { node n; enum sfs_status e = node_get(r, ns, id, 1, &n); if (e) return e == SFS_NOT_FOUND ? SFS_INVALID : e; return n.e.kind == SFS_DIRECTORY ? SFS_OK : SFS_INVALID; }
@@ -530,6 +565,7 @@ typedef struct { uint8_t bytes[CELL]; reference source; uint64_t owner, token; u
 struct arena { overlay_page *pages[ARENA_COUNT]; unsigned used; uint64_t epoch, batch; reference lineage; };
 struct tree { arena *arena; reader *reader; reference source; int root; unsigned map; uint64_t owner, next_inode, eof; };
 struct batch { arena *arena; tree extent; node inode; uint64_t low, high, number; };
+_Static_assert(sizeof(batch) == 640, "bounded primary batch");
 _Static_assert(sizeof(arena) + ARENA_COUNT * sizeof(overlay_page) + 17 * CELL <= ARENA_BYTES, "bounded overlay including merge cells");
 static void arena_free(arena *a) { if (!a) return; for (unsigned i = 0; i < a->used; ++i) free(a->pages[i]); free(a); }
 static arena *arena_new(sfs_image *h, uint64_t batch_number) { arena *a = calloc(1, sizeof(*a)); if (a) { a->epoch = h->epoch; a->batch = batch_number; a->lineage = h->staged.ns.ref; } return a; }
@@ -725,7 +761,7 @@ static enum sfs_status mutation_failure(sfs_image *h, enum sfs_status e, enum sf
     return result(h, e, e == SFS_LIMIT ? SFS_PHASE_ADMISSION : phase, e == SFS_IO || e == SFS_RECOVERY_REQUIRED ? error : e == SFS_NOMEM ? ENOMEM : 0, result_out);
 }
 static enum sfs_status write_namespace(sfs_image *h, namespace *ns, uint64_t *remaining) {
-    uint8_t b[CELL]; envelope(b, NAMESPACE, h->current.uuid, h->current.minor); encode_ref(b + 64, &ns->inodes); encode_ref(b + 120, &ns->names); put64(b + 176, ns->next_inode); put64(b + 184, ns->count); if (metadata_capable(h->current.minor)) encode_attributes(b + 192, &ns->attributes); if (h->current.minor == 5) encode_ref(b + 280, &ns->xattrs); return append_cell(h, NAMESPACE, b, &ns->ref, remaining);
+    uint8_t b[CELL]; envelope(b, NAMESPACE, h->current.uuid, h->current.minor); encode_ref(b + 64, &ns->inodes); encode_ref(b + 120, &ns->names); put64(b + 176, ns->next_inode); put64(b + 184, ns->count); if (metadata_capable(h->current.minor)) encode_attributes(b + 192, &ns->attributes); if (xattr_capable(h->current.minor)) encode_ref(b + 280, &ns->xattrs); if (h->current.minor == 6) put64(b + 336, ns->name_count); return append_cell(h, NAMESPACE, b, &ns->ref, remaining);
 }
 
 typedef struct { uint64_t count, max_inode, max_end; } summary;
@@ -734,8 +770,8 @@ static enum sfs_status intrinsic(reader *r, reference ref, uint64_t before, cont
     uint8_t entry[128]; e = memo(r, &ref, entry, 0); if (e) return e;
     if (get32(entry) == 1) return SFS_CORRUPT;
     if (get32(entry) & 2) { *out = (summary){ get64(entry + 40), get64(entry + 48), get64(entry + 56) };
-        if ((ctx.map == MAP_INODE || ctx.map == MAP_NAME || ctx.map == MAP_XATTR) && out->max_inode >= ctx.next_inode) return SFS_CORRUPT;
-        if (ctx.map == MAP_EXTENT && out->max_end > ctx.eof) return SFS_CORRUPT; return SFS_OK;
+        if ((ctx.map == MAP_INODE || ctx.map == MAP_NAME || ctx.map == MAP_XATTR || ctx.map == MAP_BACKREF) && out->max_inode >= ctx.next_inode) return SFS_CORRUPT;
+        if ((ctx.map == MAP_EXTENT || (ctx.map == MAP_INODE && r->a.minor == 6)) && out->max_end > ctx.eof) return SFS_CORRUPT; return SFS_OK;
     }
     memset(entry, 0, sizeof(entry)); put32(entry, 1); put32(entry + 4, INDEX); memcpy(entry + 8, ref.digest, 32); e = memo(r, &ref, entry, 1); if (e) return e;
     uint8_t b[CELL]; memcpy(b, source, CELL); summary s = {0}; unsigned n = page_count(b);
@@ -746,7 +782,8 @@ static enum sfs_status intrinsic(reader *r, reference ref, uint64_t before, cont
             if (!add64(s.count, cs.count, &s.count)) return SFS_CORRUPT; if (cs.max_inode > s.max_inode) s.max_inode = cs.max_inode; if (cs.max_end > s.max_end) s.max_end = cs.max_end;
         } else {
             s.count++;
-            if (ctx.map == MAP_INODE || ctx.map == MAP_NAME) { uint64_t id = ctx.map == MAP_INODE ? get64(v) : get64(v + 267), parent = get64(v + (ctx.map == MAP_INODE ? 8 : 0)); if (id > s.max_inode) s.max_inode = id; if (parent > s.max_inode) s.max_inode = parent; }
+            if (ctx.map == MAP_INODE || ctx.map == MAP_NAME || ctx.map == MAP_BACKREF) { uint64_t id = ctx.map == MAP_INODE ? get64(v) : get64(v + 267), parent = get64(v + (ctx.map == MAP_INODE ? 8 : 0)); if (id > s.max_inode) s.max_inode = id; if (parent > s.max_inode) s.max_inode = parent; }
+            if (ctx.map == MAP_INODE && r->a.minor == 6 && get64(v + 344) > s.max_end) s.max_end = get64(v + 344);
             if (ctx.map == MAP_XATTR && get64(v) > s.max_inode) s.max_inode = get64(v);
             if (ctx.map == MAP_EXTENT) { reference data; if (!decode_ref(v + 8, &data)) return SFS_CORRUPT; e = raw_read(r, &data, ref.offset, get16(v + 64), 0, NULL); if (e) return e;
                 uint64_t end; if (!add64(get64(v) * CELL, get16(v + 64), &end)) return SFS_CORRUPT; if (end > s.max_end) s.max_end = end;
@@ -781,23 +818,58 @@ static enum sfs_status full_xattrs(reader *r, const namespace *ns) {
     }
     return e;
 }
+static enum sfs_status full_hardlinks(reader *r, const namespace *ns) {
+    cursor *c = malloc(sizeof(*c)); if (!c) return SFS_NOMEM;
+    uint64_t next = 2, total = 0; uint8_t row[MAX_ROW]; int found; enum sfs_status e = SFS_OK; node n;
+    for (;;) {
+        key seek = number_key(next); e = cursor_start(c, r, ns->inodes, MAP_INODE, ns->next_inode, ns->name_count, &seek); if (e) break;
+        e = cursor_next(c, row, &found); if (e || !found) break; decode_node(row, &n, r->a.minor); next = n.e.inode + 1;
+        e = charge(r, SFS_INCOMPLETE_CHECKS, 1); if (e) break;
+        if (!add64(total, n.nlink, &total) || total > ns->name_count) { e = SFS_CORRUPT; break; }
+        key representative = name_key(n.e.parent, n.e.name, n.e.name_length);
+        e = name_member(r, ns, &n, &representative); if (e) break;
+        if (n.nlink == 1) continue;
+        summary reverse; e = intrinsic_root(r, n.reverse, MAP_BACKREF, ns->next_inode, n.e.inode, &reverse); if (e) break;
+        if (reverse.count != n.nlink) { e = SFS_CORRUPT; break; }
+        e = reverse_first(r, ns, &n, row); if (e) break; key first = row_key(row, MAP_BACKREF, 0);
+        if (keycmp(&first, &representative)) { e = SFS_CORRUPT; break; }
+        e = cursor_start(c, r, n.reverse, MAP_BACKREF, ns->next_inode, n.e.inode, NULL); if (e) break;
+        uint64_t count = 0;
+        while (!(e = cursor_next(c, row, &found)) && found) {
+            e = charge(r, SFS_INCOMPLETE_CHECKS, 1); if (e) break;
+            if (!add64(count, 1, &count) || count > n.nlink || get64(row + 267) != n.e.inode) { e = SFS_CORRUPT; break; }
+            key k = row_key(row, MAP_BACKREF, 0); e = name_member(r, ns, &n, &k); if (!e) e = parent_chain(r, ns, get64(row), 0); if (e) break;
+        }
+        if (e) break; if (count != n.nlink) { e = SFS_CORRUPT; break; }
+    }
+    if (!e && total != ns->name_count) e = SFS_CORRUPT;
+    if (!e) e = cursor_start(c, r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, NULL);
+    while (!e && !(e = cursor_next(c, row, &found)) && found) {
+        e = charge(r, SFS_INCOMPLETE_CHECKS, 1); if (e) break;
+        key k = row_key(row, MAP_NAME, 0); uint64_t parent = get64(row);
+        e = node_get(r, ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
+        if (!e) e = name_member(r, ns, &n, &k); if (!e) e = parent_chain(r, ns, parent, 0);
+    }
+    free(c); return e;
+}
 static enum sfs_status full_namespace(reader *r, namespace ns) {
     const uint8_t *b; enum sfs_status e = metadata(r, &ns.ref, NAMESPACE, r->a.end, &b); if (e) return e;
     uint8_t entry[128]; e = memo(r, &ns.ref, entry, 0); if (e) return e; if (get32(entry) & 4) return SFS_OK; if (get32(entry) == 1) return SFS_CORRUPT;
     memset(entry, 0, sizeof(entry)); put32(entry, 1); put32(entry + 4, NAMESPACE); memcpy(entry + 8, ns.ref.digest, 32); e = memo(r, &ns.ref, entry, 1); if (e) return e;
-    summary inodes, names; e = intrinsic_root(r, ns.inodes, MAP_INODE, ns.next_inode, UINT64_MAX, &inodes); if (e) return e;
+    summary inodes, names; e = intrinsic_root(r, ns.inodes, MAP_INODE, ns.next_inode, ns.name_count, &inodes); if (e) return e;
     e = intrinsic_root(r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &names); if (e) return e;
-    if (inodes.count != ns.count || names.count != ns.count) return SFS_CORRUPT;
-    cursor c; e = cursor_start(&c, r, ns.inodes, MAP_INODE, ns.next_inode, UINT64_MAX, NULL); if (e) return e;
+    if (inodes.count != ns.count || names.count != ns.name_count) return SFS_CORRUPT;
+    cursor c; e = cursor_start(&c, r, ns.inodes, MAP_INODE, ns.next_inode, ns.name_count, NULL); if (e) return e;
     uint8_t row[MAX_ROW]; int found;
     while (!(e = cursor_next(&c, row, &found)) && found) {
-        node n; decode_node(row, &n); key k = name_key(n.e.parent, n.e.name, n.e.name_length); uint8_t name[MAX_ROW]; int matched;
+        node n; decode_node(row, &n, r->a.minor); key k = name_key(n.e.parent, n.e.name, n.e.name_length); uint8_t name[MAX_ROW]; int matched;
         e = index_get(r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &k, name, &matched); if (e) return e; if (!matched || get64(name + 267) != n.e.inode) return SFS_CORRUPT;
         e = parent_chain(r, &ns, n.e.parent, 0); if (e) return e;
         if (n.e.kind == SFS_FILE) { summary ext; e = intrinsic_root(r, n.extent, MAP_EXTENT, UINT64_MAX, n.e.size, &ext); if (e) return e; if (metadata_capable(r->a.minor) && ext.count != n.attributes.extents) return SFS_CORRUPT; }
         else if (n.e.kind == SFS_SYMLINK) { e = link_target(r, &n, NULL); if (e) return e; }
     }
-    if (!e && r->a.minor == 5) e = full_xattrs(r, &ns);
+    if (!e && r->a.minor == 6) e = full_hardlinks(r, &ns);
+    if (!e && xattr_capable(r->a.minor)) e = full_xattrs(r, &ns);
     if (e) return e; put32(entry, 6); put64(entry + 40, ns.count); put64(entry + 48, inodes.max_inode); return memo(r, &ns.ref, entry, 1);
 }
 static enum sfs_status full_state(reader *r, state *s) {
@@ -816,7 +888,7 @@ static enum sfs_status decode_slot(reader *r, unsigned slot, anchor *a) {
     if (read_exact(r->h->fd, b, CELL, slot * ALIGNMENT)) return io_failure(r, SFS_PHASE_READ);
     memcpy(expected, b + SLOT_HASH, 32); memset(b + SLOT_HASH, 0, 32); hash_cell(b, ROOT, b + 24, digest, get32(b + 12));
     if (memcmp(b, "SFSIMG01", 8) || memcmp(digest, expected, 32)) return SFS_CORRUPT;
-    if (get32(b + 8) || (get32(b + 12) != 2 && get32(b + 12) != 3 && get32(b + 12) != 4 && get32(b + 12) != 5) || get64(b + 16)) return SFS_UNSUPPORTED;
+    if (get32(b + 8) || (get32(b + 12) != 2 && get32(b + 12) != 3 && get32(b + 12) != 4 && get32(b + 12) != 5 && get32(b + 12) != 6) || get64(b + 16)) return SFS_UNSUPPORTED;
     if (!zero(b + 152, CELL - 152) || !decode_ref(b + 48, &a->root)) return SFS_CORRUPT;
     a->minor = get32(b + 12); memcpy(a->uuid, b + 24, 16); a->generation = get64(b + 40); a->end = get64(b + 104); a->capacity = get64(b + 144);
     uint64_t end;
@@ -992,7 +1064,7 @@ enum sfs_status sfs_image_stat_metadata(sfs_image *h, sfs_view view, sfs_inode i
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; node n; e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n);
     if (!e && n.attributes.extents > UINT64_MAX / CELL) e = SFS_CORRUPT;
-    if (!e) { sfs_metadata_entry v = {0}; v.entry = n.e; v.birth = n.attributes.birth; v.access = n.attributes.access; v.modification = n.attributes.modification; v.change = n.attributes.change; v.mode = n.attributes.mode; v.uid = n.attributes.uid; v.gid = n.attributes.gid; v.flags = n.attributes.flags; v.referenced_data_bytes = n.attributes.extents * CELL; v.link_count = 1; *out = v; }
+    if (!e) { sfs_metadata_entry v = {0}; v.entry = n.e; v.birth = n.attributes.birth; v.access = n.attributes.access; v.modification = n.attributes.modification; v.change = n.attributes.change; v.mode = n.attributes.mode; v.uid = n.attributes.uid; v.gid = n.attributes.gid; v.flags = n.attributes.flags; v.referenced_data_bytes = n.attributes.extents * CELL; v.link_count = n.nlink; *out = v; }
     return touched_result(&r, e, result_out);
 }
 enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, const void *name, size_t length, sfs_entry *out, sfs_result *result_out) {
@@ -1001,7 +1073,7 @@ enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, 
     reader r = current_reader(h, 0); namespace ns; e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent);
     uint8_t row[MAX_ROW]; int found; key k = name_key(parent, name, length); node n;
     if (!e) { e = index_get(&r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &k, row, &found); if (!e && !found) e = SFS_NOT_FOUND; }
-    if (!e) { e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT; if (!e && (n.e.parent != parent || n.e.name_length != length || memcmp(n.e.name, name, length))) e = SFS_CORRUPT; }
+    if (!e) { e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT; if (!e) { e = r.a.minor == 6 ? name_member(&r, &ns, &n, &k) : (n.e.parent != parent || n.e.name_length != length || memcmp(n.e.name, name, length)) ? SFS_CORRUPT : SFS_OK; if (!e) { n.e.parent = parent; n.e.name_length = length; memset(n.e.name, 0, sizeof(n.e.name)); memcpy(n.e.name, name, length); } } }
     if (!e) *out = n.e; return touched_result(&r, e, result_out);
 }
 enum sfs_status sfs_image_read(sfs_image *h, sfs_view view, sfs_inode id, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
@@ -1043,7 +1115,7 @@ static enum sfs_status xattr_get(reader *r, const namespace *ns, sfs_inode id, c
 enum sfs_status sfs_image_xattr_size(sfs_image *h, sfs_view view, sfs_inode id, const void *name, size_t length, uint64_t *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
     if (!out || !valid_xattr_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
-    if (h->current.minor != 5) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; uint8_t row[MAX_ROW];
     e = selected_namespace(&r, view, &ns); if (!e) e = xattr_get(&r, &ns, id, name, length, row);
@@ -1052,7 +1124,7 @@ enum sfs_status sfs_image_xattr_size(sfs_image *h, sfs_view view, sfs_inode id, 
 enum sfs_status sfs_image_read_xattr(sfs_image *h, sfs_view view, sfs_inode id, const void *name, size_t length, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; uint64_t end;
     if (!read_count || (capacity && !data) || !valid_xattr_name(name, length) || !add64(offset, capacity, &end)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *read_count = 0;
-    if (h->current.minor != 5) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; uint8_t row[MAX_ROW]; reference extent;
     e = selected_namespace(&r, view, &ns); if (!e) e = xattr_get(&r, &ns, id, name, length, row); if (e) return touched_result(&r, e, result_out);
@@ -1072,7 +1144,7 @@ enum sfs_status sfs_image_read_xattr(sfs_image *h, sfs_view view, sfs_inode id, 
 enum sfs_status sfs_image_next_xattr(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode owner, const void *after_name, size_t after_length, sfs_xattr_entry *out, int *found, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
     if (!out || !found || !expected_root_digest || !expected_generation || (after_name || after_length ? !valid_xattr_name(after_name, after_length) : 0)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
-    if (h->current.minor != 5) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; node n; cursor c; uint8_t row[MAX_ROW]; int present = 0; key k = name_key(owner, after_name, after_length);
@@ -1088,20 +1160,20 @@ static enum sfs_status index_height(reader *r, reference ref, unsigned map, uint
     *height = 0; if (!ref.type) return SFS_OK; const uint8_t *b; enum sfs_status e = root_page(r, &ref, map, next, eof, &b); if (!e) *height = page_level(b) + 1; return e;
 }
 static enum sfs_status batch_cost(reader *r, uint64_t *cost) {
-    *cost = 0; if (!r->h->batch) return SFS_OK; unsigned hi; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, UINT64_MAX, &hi); if (e) return e;
+    *cost = 0; if (!r->h->batch) return SFS_OK; unsigned hi; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, r->h->staged.ns.name_count, &hi); if (e) return e;
     *cost = pending_cells(&r->h->batch->extent) + hi + 1; return SFS_OK;
 }
 static enum sfs_status flush_batch(reader *r, int *wrote) {
     sfs_image *h = r->h; if (!h->batch) return SFS_OK; batch *b = h->batch;
     uint64_t liability; enum sfs_status e = batch_cost(r, &liability); if (e) return e; if (!reserve_cells(h, liability + 1)) return SFS_LIMIT;
     arena *a = arena_new(h, b->number); if (!a) return SFS_NOMEM;
-    tree inodes = make_tree(a, r, h->staged.ns.inodes, MAP_INODE, 0, h->staged.ns.next_inode, UINT64_MAX); uint8_t row[MAX_ROW]; encode_node(row, &b->inode);
+    tree inodes = make_tree(a, r, h->staged.ns.inodes, MAP_INODE, 0, h->staged.ns.next_inode, h->staged.ns.name_count); uint8_t row[MAX_ROW]; encode_node(row, &b->inode, r->a.minor);
     e = tree_put(&inodes, row); if (e) { arena_free(a); return e; }
     uint64_t remaining = pending_cells(&b->extent) + pending_cells(&inodes) + 1;
     if (remaining > liability) { arena_free(a); return SFS_CORRUPT; }
     reference extent; b->extent.reader = r; *wrote = 1; r->phase = SFS_PHASE_RECORDS;
     e = seal_tree(&b->extent, &extent, &remaining);
-    if (!e) { b->inode.extent = extent; encode_node(row, &b->inode); e = tree_put(&inodes, row); }
+    if (!e) { b->inode.extent = extent; encode_node(row, &b->inode, r->a.minor); e = tree_put(&inodes, row); }
     namespace ns = h->staged.ns;
     if (!e) e = seal_tree(&inodes, &ns.inodes, &remaining);
     if (!e) e = write_namespace(h, &ns, &remaining);
@@ -1127,6 +1199,10 @@ static enum sfs_status input_name(sfs_image *h, const void *name, size_t length,
 }
 static enum sfs_status name_absent(reader *r, const namespace *ns, uint64_t parent, const void *name, size_t length, uint64_t except) {
     uint8_t row[MAX_ROW]; int found; key k = name_key(parent, name, length); enum sfs_status e = index_get(r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, &k, row, &found); if (e) return e;
+    if (found && r->a.minor == 6) {
+        node owner; e = node_get(r, ns, get64(row + 267), 1, &owner); if (e) return e == SFS_NOT_FOUND ? SFS_CORRUPT : e;
+        e = name_member(r, ns, &owner, &k); if (e) return e;
+    }
     return found && get64(row + 267) != except ? SFS_EXISTS : SFS_OK;
 }
 static enum sfs_status write_metadata_trees(reader *r, tree *inodes, tree *names, namespace *ns, int *late) {
@@ -1145,20 +1221,21 @@ enum sfs_status sfs_image_abort(sfs_image *h, sfs_result *out) { enum sfs_status
 /* Probe the exact metadata edit before a pending batch can consume append space. */
 static enum sfs_status probe_metadata(reader *r, unsigned operation, const node *before, const node *after) {
     if (!r->h->batch) return SFS_OK;
-    namespace ns = r->h->staged.ns; if (operation == 1) ns.next_inode++;
+    namespace ns = r->h->staged.ns; if (operation == 1) { ns.next_inode++; ns.name_count++; }
     arena *a = arena_new(r->h, 0); if (!a) return SFS_NOMEM;
-    tree inodes = make_tree(a, r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX), names = make_tree(a, r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
+    tree inodes = make_tree(a, r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count), names = make_tree(a, r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
     uint8_t row[MAX_ROW]; enum sfs_status e = SFS_OK;
     if (before) { key nk = name_key(before->e.parent, before->e.name, before->e.name_length); e = tree_delete(&names, &nk); }
     if (!e && operation == 2) { key ik = number_key(before->e.inode); e = tree_delete(&inodes, &ik); }
-    if (!e && after) { encode_node(row, after); e = tree_put(&inodes, row); if (!e) { encode_name(row, after); e = tree_put(&names, row); } }
+    if (!e && after) { encode_node(row, after, r->a.minor); e = tree_put(&inodes, row); if (!e) { encode_name(row, after); e = tree_put(&names, row); } }
     arena_free(a); return e;
 }
 enum edit_operation { EDIT_ADD = 1, EDIT_REMOVE, EDIT_RENAME, EDIT_SET, EDIT_LINK };
 typedef struct {
     node before[3], after[3]; unsigned count; int root_parent;
-    namespace ns; attributes base_root; uint64_t base_count, base_next;
+    namespace ns; attributes base_root; uint64_t base_count, base_next, base_names; key old_key, new_key;
 } metadata_edit;
+_Static_assert(sizeof(metadata_edit) <= 4096, "bounded heap metadata edit");
 static enum sfs_status update_valid(const sfs_metadata_update *v, unsigned kind) {
     const unsigned times = SFS_META_BIRTH | SFS_META_ACCESS | SFS_META_MODIFICATION;
     if (!v || (v->fields & ~127u) || (v->now & ~(v->fields & times))) return SFS_INVALID;
@@ -1176,7 +1253,7 @@ static void update_attributes(attributes *a, const sfs_metadata_update *v, sfs_t
 }
 static int same_attributes(const attributes *a, const attributes *b) { uint8_t x[88], y[88]; encode_attributes(x, a); encode_attributes(y, b); return !memcmp(x, y, sizeof(x)); }
 static int same_logical_node(const node *a, const node *b) {
-    return a->e.inode == b->e.inode && a->e.parent == b->e.parent && a->e.kind == b->e.kind && a->e.size == b->e.size && a->e.name_length == b->e.name_length && !memcmp(a->e.name, b->e.name, a->e.name_length) && same_attributes(&a->attributes, &b->attributes);
+    return a->e.inode == b->e.inode && a->e.parent == b->e.parent && a->e.kind == b->e.kind && a->e.size == b->e.size && a->e.name_length == b->e.name_length && !memcmp(a->e.name, b->e.name, a->e.name_length) && same_attributes(&a->attributes, &b->attributes) && a->nlink == b->nlink && same_ref(&a->reverse, &b->reverse);
 }
 static enum sfs_status edit_parent(reader *r, metadata_edit *edit, sfs_inode id) {
     if (id == 1) { edit->root_parent = 1; return SFS_OK; }
@@ -1189,16 +1266,16 @@ static enum sfs_status edit_parent(reader *r, metadata_edit *edit, sfs_inode id)
 static enum sfs_status apply_edit(tree *inodes, tree *names, const metadata_edit *edit, unsigned operation) {
     uint8_t row[MAX_ROW]; enum sfs_status e;
     /* Replace existing parents before a structural target insertion/deletion. */
-    for (unsigned i = 1; i < edit->count; ++i) { encode_node(row, &edit->after[i]); e = tree_put(inodes, row); if (e) return e; }
+    for (unsigned i = 1; i < edit->count; ++i) { encode_node(row, &edit->after[i], inodes->reader->a.minor); e = tree_put(inodes, row); if (e) return e; }
     const node *old = &edit->before[0], *next = &edit->after[0];
     if (operation == EDIT_REMOVE || operation == EDIT_RENAME) { key k = name_key(old->e.parent, old->e.name, old->e.name_length); e = tree_delete(names, &k); if (e) return e; }
     if (operation == EDIT_REMOVE) { key k = number_key(old->e.inode); return tree_delete(inodes, &k); }
-    if (next->e.inode != 1) { encode_node(row, next); e = tree_put(inodes, row); if (e) return e; }
+    if (next->e.inode != 1) { encode_node(row, next, inodes->reader->a.minor); e = tree_put(inodes, row); if (e) return e; }
     if (operation == EDIT_ADD || operation == EDIT_RENAME) { encode_name(row, next); return tree_put(names, row); }
     return SFS_OK;
 }
 static enum sfs_status edit_bound(reader *r, const metadata_edit *edit, unsigned operation, uint64_t *out) {
-    unsigned hi, hn; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, UINT64_MAX, &hi); if (e) return e;
+    unsigned hi, hn; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, r->h->staged.ns.name_count, &hi); if (e) return e;
     if (operation == EDIT_SET) { *out = edit->after[0].e.inode == 1 ? 2 : hi + 2; return SFS_OK; }
     e = index_height(r, r->h->staged.ns.names, MAP_NAME, r->h->staged.ns.next_inode, UINT64_MAX, &hn); if (e) return e;
     unsigned ip = hi < MAX_HEIGHT ? hi + 1 : hi, np = hn < MAX_HEIGHT ? hn + 1 : hn;
@@ -1248,6 +1325,152 @@ static enum sfs_status remove_owner_xattrs(reader *r, namespace *ns, sfs_inode o
         r->a.end = r->h->eof; r->phase = SFS_PHASE_READ;
     }
 }
+enum name_operation { NAME_LINK, NAME_UNLINK, NAME_RENAME };
+static void encode_named(uint8_t row[MAX_ROW], const key *k, uint64_t owner) {
+    memset(row, 0, MAX_ROW); put64(row, from_big(k->bytes)); put32(row + 8, k->length - 8); memcpy(row + 12, k->bytes + 8, k->length - 8); put64(row + 267, owner);
+}
+static enum sfs_status reverse_pair(reader *r, const namespace *ns, const node *n, const key *removed, uint8_t survivor[MAX_ROW]) {
+    const uint8_t *b; enum sfs_status e = root_page(r, &n->reverse, MAP_BACKREF, ns->next_inode, n->e.inode, &b); if (e) return e;
+    if (n->nlink != 2 || page_level(b) || page_count(b) != 2) return SFS_CORRUPT;
+    uint8_t rows[2][MAX_ROW] = {{0}}; memcpy(rows[0], row_at(b, MAP_BACKREF, 0, r->a.minor), 280); memcpy(rows[1], row_at(b, MAP_BACKREF, 1, r->a.minor), 280); int matched = 0;
+    for (unsigned i = 0; i < 2; ++i) { key k = row_key(rows[i], MAP_BACKREF, 0); e = name_member(r, ns, n, &k); if (e) return e;
+        if (removed && !keycmp(&k, removed)) matched++; else if (survivor) memcpy(survivor, rows[i], MAX_ROW);
+    }
+    return removed && matched != 1 ? SFS_CORRUPT : SFS_OK;
+}
+/* Each real name-tree edit owns one arena and publishes only a private root. */
+static enum sfs_status seal_name_edit(reader *r, const namespace *ns, reference *root, unsigned map, uint64_t owner, const key *remove, const uint8_t *put, uint64_t bound, int *late) {
+    arena *a = arena_new(r->h, 0); if (!a) return SFS_NOMEM;
+    tree t = make_tree(a, r, *root, map, owner, ns->next_inode, map == MAP_BACKREF ? owner : UINT64_MAX);
+    enum sfs_status e = remove ? tree_delete(&t, remove) : tree_put(&t, put); uint64_t remaining = pending_cells(&t);
+    if (!e && remaining > bound) e = SFS_CORRUPT;
+    if (!e) { if (remaining) *late = 1; r->phase = SFS_PHASE_RECORDS; e = seal_tree(&t, root, &remaining); if (e == SFS_IO) r->error = errno; }
+    arena_free(a); if (!e && remaining) e = SFS_CORRUPT; r->a.end = r->h->eof; if (!e) r->phase = SFS_PHASE_READ; return e;
+}
+static enum sfs_status name_mutation(sfs_image *h, unsigned operation, sfs_inode existing, sfs_inode old_parent, const void *old_name, size_t old_length, sfs_inode new_parent, const void *new_name, size_t new_length, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 1, 1, result_out); if (e) return e;
+    if (operation != NAME_LINK) { e = input_name(h, old_name, old_length, result_out); if (e) return e; }
+    if (operation != NAME_UNLINK) { e = input_name(h, new_name, new_length, result_out); if (e) return e; }
+    if (h->current.minor != 6) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    e = mutation_start(h, result_out); if (e) return e;
+    reader r = current_reader(h, 1); metadata_edit *edit = calloc(1, sizeof(*edit)); cursor *c = NULL; arena *a = NULL; int late = 0;
+    if (!edit) { e = SFS_NOMEM; goto failed; } c = malloc(sizeof(*c)); if (!c) { e = SFS_NOMEM; goto failed; }
+    edit->ns = h->staged.ns; edit->base_count = edit->ns.count; edit->base_names = edit->ns.name_count; edit->base_next = edit->ns.next_inode; edit->base_root = edit->ns.attributes; edit->count = 1;
+    edit->old_key = name_key(old_parent, old_name, old_length); edit->new_key = name_key(new_parent, new_name, new_length);
+    uint8_t row[MAX_ROW]; int found; node *before = &edit->before[0], *after = &edit->after[0];
+    if (operation != NAME_LINK) {
+        e = directory_check(&r, &h->staged.ns, old_parent); if (e) goto failed;
+        e = cursor_start(c, &r, edit->ns.names, MAP_NAME, edit->ns.next_inode, UINT64_MAX, &edit->old_key); if (!e) e = cursor_next(c, row, &found); if (e) goto failed;
+        key actual = found ? row_key(row, MAP_NAME, 0) : (key){0}; if (!found || keycmp(&actual, &edit->old_key)) { e = SFS_NOT_FOUND; goto failed; } existing = get64(row + 267);
+    }
+    e = node_get(&r, &h->staged.ns, existing, 1, before); if (e) { if (operation != NAME_LINK && e == SFS_NOT_FOUND) e = SFS_CORRUPT; goto failed; }
+    if (operation == NAME_LINK && (existing == 1 || before->e.kind == SFS_DIRECTORY)) { e = SFS_INVALID; goto failed; }
+    if (operation != NAME_LINK) { e = name_member(&r, &h->staged.ns, before, &edit->old_key); if (e) goto failed; }
+    if (operation == NAME_RENAME && !keycmp(&edit->old_key, &edit->new_key)) goto success;
+    if (h->batch && h->batch->inode.e.inode == existing) *before = h->batch->inode; *after = *before;
+    if (operation == NAME_UNLINK && before->e.kind == SFS_DIRECTORY) {
+        key prefix = name_key(existing, NULL, 0); e = cursor_start(c, &r, edit->ns.names, MAP_NAME, edit->ns.next_inode, UINT64_MAX, &prefix); if (!e) e = cursor_next(c, row, &found); if (e) goto failed;
+        if (found && get64(row) == existing) { e = SFS_STATE; goto failed; }
+    }
+    if (operation != NAME_UNLINK) {
+        e = directory_check(&r, &h->staged.ns, new_parent); if (!e) e = parent_chain(&r, &h->staged.ns, new_parent, before->e.kind == SFS_DIRECTORY ? existing : 0);
+        if (!e) e = cursor_start(c, &r, edit->ns.names, MAP_NAME, edit->base_next, UINT64_MAX, &edit->new_key); if (!e) e = cursor_next(c, row, &found); if (e) goto failed;
+        if (found) { key actual = row_key(row, MAP_NAME, 0); if (!keycmp(&actual, &edit->new_key)) {
+            node destination; e = node_get(&r, &h->staged.ns, get64(row + 267), 1, &destination); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
+            if (!e) e = name_member(&r, &h->staged.ns, &destination, &edit->new_key); if (!e) e = SFS_EXISTS; goto failed;
+        } }
+
+    }
+    if (before->nlink == 2) { e = reverse_pair(&r, &h->staged.ns, before, operation == NAME_UNLINK ? &edit->old_key : NULL, row); if (e) goto failed; if (operation == NAME_UNLINK) entry_name(after, row); }
+    if (operation == NAME_LINK) {
+        if (edit->ns.name_count == SFS_ENTRY_MAX || !add64(edit->ns.name_count, 1, &edit->ns.name_count) || !add64(before->nlink, 1, &after->nlink)) { e = SFS_LIMIT; goto failed; }
+    } else if (operation == NAME_UNLINK) {
+        if (!edit->ns.name_count || !before->nlink || !edit->ns.count) { e = SFS_CORRUPT; goto failed; }
+        edit->ns.name_count--; after->nlink--; if (!after->nlink) edit->ns.count--; if (after->nlink == 1) after->reverse = (reference){0};
+    } else if (before->nlink == 1) { encode_named(row, &edit->new_key, existing); entry_name(after, row); }
+    if (operation != NAME_LINK) { e = edit_parent(&r, edit, old_parent); if (e) goto failed; }
+    if (operation != NAME_UNLINK) { e = edit_parent(&r, edit, new_parent); if (e) goto failed; }
+    unsigned hi, hn, hb, ha; uint64_t old_cost, attrs = 0;
+    e = index_height(&r, h->staged.ns.inodes, MAP_INODE, edit->base_next, edit->base_names, &hi);
+    if (!e) e = index_height(&r, h->staged.ns.names, MAP_NAME, edit->base_next, UINT64_MAX, &hn);
+    if (!e) e = index_height(&r, before->reverse, MAP_BACKREF, edit->base_next, existing, &hb);
+    if (!e) e = index_height(&r, h->staged.ns.xattrs, MAP_XATTR, edit->base_next, UINT64_MAX, &ha);
+    if (!e) e = batch_cost(&r, &old_cost); if (!e && !after->nlink) e = xattr_prefix_count(&r, &h->staged.ns, existing, &attrs); if (e) goto failed;
+    uint64_t gd = operation == NAME_LINK ? 0 : 3u * hn + 3u, gi = operation == NAME_UNLINK ? 0 : 3u * (hn < MAX_HEIGHT ? hn + 1 : hn) + 3u;
+    uint64_t rd = before->nlink > 1 && after->nlink > 1 && operation != NAME_LINK ? 3u * hb + 3u : 0;
+    uint64_t ri = after->nlink > 1 && operation != NAME_UNLINK ? (before->nlink == 1 ? 1 : 3u * (hb < MAX_HEIGHT ? hb + 1 : hb) + 3u) : 0;
+    uint64_t ib = after->nlink ? hi : 3u * hi + 3u, ab = 3u * ha + 3u, total = old_cost, start;
+    uint64_t terms[] = { gd, gi, rd, ri, ib, (edit->count - 1) * (uint64_t)hi, 2 };
+    for (unsigned i = 0; i < sizeof(terms) / sizeof(terms[0]); ++i) if (!add64(total, terms[i], &total)) { e = SFS_LIMIT; goto failed; }
+    if (attrs > UINT64_MAX / ab || !add64(total, attrs * ab, &total) || !aligned(h->eof, &start)) { e = SFS_LIMIT; goto failed; }
+    /* Probe exact global and reverse delete/insert sequences before any seal. */
+    for (unsigned which = 0; which < 2; ++which) {
+        if (which && !(rd || ri)) continue;
+        a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
+        tree t = make_tree(a, &r, which ? before->reverse : edit->ns.names, which ? MAP_BACKREF : MAP_NAME, which ? existing : 0, edit->base_next, which ? existing : UINT64_MAX);
+        if (which && before->nlink == 1) { encode_name(row, before); e = tree_put(&t, row); }
+        if (!e && (which ? rd : gd)) e = tree_delete(&t, &edit->old_key);
+        if (!e && (which ? ri : gi)) { encode_named(row, &edit->new_key, existing); e = tree_put(&t, row); }
+        if (!e && pending_cells(&t) > (which ? rd + ri : gd + gi)) e = SFS_CORRUPT;
+        arena_free(a); a = NULL; if (e) goto failed;
+    }
+    a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
+    uint64_t context_names = edit->base_names > edit->ns.name_count ? edit->base_names : edit->ns.name_count;
+    tree inodes = make_tree(a, &r, edit->ns.inodes, MAP_INODE, 0, edit->base_next, context_names);
+    for (unsigned i = 1; i < edit->count && !e; ++i) { encode_node(row, &edit->after[i], r.a.minor); e = tree_put(&inodes, row); }
+    if (!e) { if (!after->nlink) { key k = number_key(existing); e = tree_delete(&inodes, &k); } else { encode_node(row, before, r.a.minor); e = tree_put(&inodes, row); } }
+    if (!e && pending_cells(&inodes) > ib + (edit->count - 1) * (uint64_t)hi) e = SFS_CORRUPT;
+    arena_free(a); a = NULL; if (e) goto failed;
+    sfs_timestamp t; int clock_error; e = clock_sample(&t, &clock_error); if (e) { free(c); free(edit); return result(h, e, SFS_PHASE_NONE, clock_error, result_out); }
+    if (!reserve_cells(h, total)) { e = SFS_LIMIT; goto failed; }
+    after->attributes.change = t;
+    for (unsigned i = 1; i < edit->count; ++i) edit->after[i].attributes.modification = edit->after[i].attributes.change = t;
+    if (edit->root_parent) edit->ns.attributes.modification = edit->ns.attributes.change = t;
+    e = flush_batch(&r, &late); if (e) goto failed;
+    if ((old_cost && (h->eof < start || (h->eof - start) / CELL > old_cost)) || h->staged.ns.count != edit->base_count || h->staged.ns.name_count != edit->base_names || h->staged.ns.next_inode != edit->base_next || !same_attributes(&h->staged.ns.attributes, &edit->base_root) || !same_ref(&h->staged.ns.xattrs, &edit->ns.xattrs)) { e = SFS_CORRUPT; goto failed; }
+    for (unsigned i = 0; i < edit->count; ++i) { node n; e = node_get(&r, &h->staged.ns, edit->before[i].e.inode, 1, &n); if (e) goto failed; if (!same_logical_node(&n, &edit->before[i])) { e = SFS_CORRUPT; goto failed; } edit->after[i].extent = n.extent; }
+    edit->ns.inodes = h->staged.ns.inodes; edit->ns.names = h->staged.ns.names; edit->ns.ref = h->staged.ns.ref;
+    if (gd) { e = seal_name_edit(&r, &edit->ns, &edit->ns.names, MAP_NAME, 0, &edit->old_key, NULL, gd, &late); if (e) goto failed; }
+    if (gi) { encode_named(row, &edit->new_key, existing); e = seal_name_edit(&r, &edit->ns, &edit->ns.names, MAP_NAME, 0, NULL, row, gi, &late); if (e) goto failed; }
+    if (ri && before->nlink == 1) {
+        a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
+        tree reverse = make_tree(a, &r, (reference){0}, MAP_BACKREF, existing, edit->base_next, existing);
+        encode_name(row, before); e = tree_put(&reverse, row); if (!e) { encode_named(row, &edit->new_key, existing); e = tree_put(&reverse, row); }
+        uint64_t remaining = pending_cells(&reverse); if (!e && remaining != 1) e = SFS_CORRUPT;
+        if (!e) { late = 1; r.phase = SFS_PHASE_RECORDS; e = seal_tree(&reverse, &after->reverse, &remaining); if (e == SFS_IO) r.error = errno; }
+        arena_free(a); a = NULL; if (e) goto failed; if (remaining) { e = SFS_CORRUPT; goto failed; } r.a.end = h->eof; r.phase = SFS_PHASE_READ;
+    } else {
+        if (rd) { e = seal_name_edit(&r, &edit->ns, &after->reverse, MAP_BACKREF, existing, &edit->old_key, NULL, rd, &late); if (e) goto failed; }
+        if (ri) { encode_named(row, &edit->new_key, existing); e = seal_name_edit(&r, &edit->ns, &after->reverse, MAP_BACKREF, existing, NULL, row, ri, &late); if (e) goto failed; }
+    }
+    if (after->nlink) {
+        if (after->nlink > 1) { e = reverse_first(&r, &edit->ns, after, row); if (e) goto failed; entry_name(after, row); if (after->nlink == 2) { e = reverse_pair(&r, &edit->ns, after, NULL, NULL); if (e) goto failed; } }
+        key representative = name_key(after->e.parent, after->e.name, after->e.name_length); e = name_member(&r, &edit->ns, after, &representative); if (e) goto failed;
+    } else if (attrs) { e = remove_owner_xattrs(&r, &edit->ns, existing, attrs, ab, &late); if (e) goto failed; }
+    /* Parents precede final owner deletion; each replacement has its own arena. */
+    for (unsigned phase = 0; phase < edit->count; ++phase) {
+        unsigned i = phase + 1 == edit->count ? 0 : phase + 1;
+        a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
+        inodes = make_tree(a, &r, edit->ns.inodes, MAP_INODE, 0, edit->base_next, context_names);
+        if (!i && !after->nlink) { key k = number_key(existing); e = tree_delete(&inodes, &k); }
+        else { encode_node(row, &edit->after[i], r.a.minor); e = tree_put(&inodes, row); }
+        uint64_t remaining = pending_cells(&inodes); if (!e && remaining > (i ? hi : ib)) e = SFS_CORRUPT;
+        if (!e) { if (remaining) late = 1; r.phase = SFS_PHASE_RECORDS; e = seal_tree(&inodes, &edit->ns.inodes, &remaining); if (e == SFS_IO) r.error = errno; }
+        arena_free(a); a = NULL; if (e) goto failed; if (remaining) { e = SFS_CORRUPT; goto failed; } r.a.end = h->eof; r.phase = SFS_PHASE_READ;
+    }
+    uint64_t remaining = 1; late = 1; r.phase = SFS_PHASE_RECORDS; e = write_namespace(h, &edit->ns, &remaining); if (e == SFS_IO) r.error = errno; if (e) goto failed;
+    if (remaining || h->eof < start || (h->eof - start) / CELL >= total) { e = SFS_CORRUPT; goto failed; } h->staged.ns = edit->ns;
+success:
+    free(c); free(edit); result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+failed:
+    arena_free(a); free(c); free(edit);
+    if (!late && (e == SFS_INVALID || e == SFS_NOT_FOUND || e == SFS_EXISTS || e == SFS_STATE)) return result(h, e, SFS_PHASE_NONE, 0, result_out);
+    return mutation_failure(h, e, r.phase, r.error, late, result_out);
+}
+enum sfs_status sfs_image_link(sfs_image *h, sfs_inode existing, sfs_inode parent, const void *name, size_t length, sfs_result *out) { return name_mutation(h, NAME_LINK, existing, 0, NULL, 0, parent, name, length, out); }
+enum sfs_status sfs_image_unlink(sfs_image *h, sfs_inode parent, const void *name, size_t length, sfs_result *out) { return name_mutation(h, NAME_UNLINK, 0, parent, name, length, 0, NULL, 0, out); }
+enum sfs_status sfs_image_rename_entry(sfs_image *h, sfs_inode old_parent, const void *old_name, size_t old_length, sfs_inode new_parent, const void *new_name, size_t new_length, sfs_result *out) { return name_mutation(h, NAME_RENAME, 0, old_parent, old_name, old_length, new_parent, new_name, new_length, out); }
+
 static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_inode id, sfs_inode parent, const void *name, size_t length, enum sfs_kind kind, const sfs_metadata_initial *initial, int supplied, const sfs_metadata_update *update, const void *target, size_t target_length, sfs_inode *out, sfs_result *result_out) {
     enum sfs_status e = mutation_start(h, result_out); if (e) return e;
     int link = operation == EDIT_LINK; if (link) operation = EDIT_ADD;
@@ -1257,18 +1480,18 @@ static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_i
     if ((operation == EDIT_REMOVE || operation == EDIT_RENAME) && id == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (operation == EDIT_SET) { e = update_valid(update, 0); if (e) return result(h, e, SFS_PHASE_NONE, 0, result_out); }
     if (link ? !symlink_capable(h->current.minor) : !metadata_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
-    reader r = current_reader(h, 1); metadata_edit edit = {0}; edit.ns = h->staged.ns; edit.base_root = edit.ns.attributes; edit.base_count = edit.ns.count; edit.base_next = edit.ns.next_inode; edit.count = 1;
+    reader r = current_reader(h, 1); metadata_edit edit = {0}; edit.ns = h->staged.ns; edit.base_root = edit.ns.attributes; edit.base_count = edit.ns.count; edit.base_next = edit.ns.next_inode; edit.base_names = edit.ns.name_count; edit.count = 1;
     arena *a = NULL; uint8_t *link_bytes = NULL; reference link_raw = {0}; int late = 0; uint64_t xattr_count = 0, xattr_bound = 0, remove_total = 0, remove_start = 0; node *old = &edit.before[0], *next = &edit.after[0];
     if (operation != EDIT_ADD) { if (h->batch && h->batch->inode.e.inode == id) *old = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, old); if (e) goto failed; } *next = *old; }
     if (operation == EDIT_ADD || operation == EDIT_RENAME) { e = directory_check(&r, &h->staged.ns, parent); if (!e) e = parent_chain(&r, &h->staged.ns, parent, operation == EDIT_RENAME ? id : 0); if (!e) e = name_absent(&r, &h->staged.ns, parent, name, length, operation == EDIT_RENAME ? id : 0); if (e) goto failed; }
     if (operation == EDIT_REMOVE && old->e.kind == SFS_DIRECTORY) { key prefix = name_key(id, NULL, 0); cursor c; e = cursor_start(&c, &r, edit.ns.names, MAP_NAME, edit.ns.next_inode, UINT64_MAX, &prefix); uint8_t row[MAX_ROW]; int found; if (!e) { e = cursor_next(&c, row, &found); if (!e && found && get64(row) == id) e = SFS_STATE; } if (e) goto failed; }
     if (operation == EDIT_RENAME && old->e.parent == parent && old->e.name_length == length && !memcmp(old->e.name, name, length)) return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out);
     if (operation == EDIT_SET) { e = update_valid(update, old->e.kind); if (e) return result(h, e, SFS_PHASE_NONE, 0, result_out); if (!update->fields) return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); }
-    if (operation == EDIT_ADD) { if (edit.ns.count >= SFS_ENTRY_MAX || edit.ns.next_inode == UINT64_MAX) { e = SFS_LIMIT; goto failed; } next->e.inode = edit.ns.next_inode++; next->e.kind = kind; if (link) next->e.size = target_length; edit.ns.count++; }
-    if (operation == EDIT_REMOVE) { if (!edit.ns.count) { e = SFS_CORRUPT; goto failed; } edit.ns.count--; }
+    if (operation == EDIT_ADD) { if (edit.ns.name_count >= SFS_ENTRY_MAX || edit.ns.next_inode == UINT64_MAX) { e = SFS_LIMIT; goto failed; } next->nlink = 1; next->e.inode = edit.ns.next_inode++; next->e.kind = kind; if (link) next->e.size = target_length; edit.ns.count++; edit.ns.name_count++; }
+    if (operation == EDIT_REMOVE) { if (!edit.ns.count) { e = SFS_CORRUPT; goto failed; } edit.ns.count--; edit.ns.name_count--; }
     if (operation == EDIT_ADD || operation == EDIT_RENAME) { next->e.parent = parent; next->e.name_length = length; memset(next->e.name, 0, sizeof(next->e.name)); memcpy(next->e.name, name, length); e = edit_parent(&r, &edit, parent); if (e) goto failed; }
     if (operation == EDIT_REMOVE || operation == EDIT_RENAME) { e = edit_parent(&r, &edit, old->e.parent); if (e) goto failed; }
-    if (operation == EDIT_REMOVE && h->current.minor == 5) {
+    if (operation == EDIT_REMOVE && xattr_capable(h->current.minor)) {
         unsigned ha; e = xattr_prefix_count(&r, &edit.ns, id, &xattr_count); if (!e) e = index_height(&r, edit.ns.xattrs, MAP_XATTR, edit.ns.next_inode, UINT64_MAX, &ha); if (e) goto failed;
         xattr_bound = 3u * ha + 3u;
     }
@@ -1280,7 +1503,7 @@ static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_i
     for (unsigned i = 1; i < edit.count; ++i) edit.after[i].attributes.modification = edit.after[i].attributes.change = t;
     if (edit.root_parent) edit.ns.attributes.modification = edit.ns.attributes.change = t;
     a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
-    tree inodes = make_tree(a, &r, edit.ns.inodes, MAP_INODE, 0, edit.ns.next_inode, UINT64_MAX), names = make_tree(a, &r, edit.ns.names, MAP_NAME, 0, edit.ns.next_inode, UINT64_MAX);
+    tree inodes = make_tree(a, &r, edit.ns.inodes, MAP_INODE, 0, edit.ns.next_inode, edit.ns.name_count), names = make_tree(a, &r, edit.ns.names, MAP_NAME, 0, edit.ns.next_inode, UINT64_MAX);
     tree extent = make_tree(a, &r, (reference){0}, MAP_EXTENT, next->e.inode, UINT64_MAX, next->e.size);
     if (link) { e = prepare_link(&extent, next, link_bytes, !!h->batch, &link_raw); if (e) goto failed; }
     e = apply_edit(&inodes, &names, &edit, operation); if (e) goto failed;
@@ -1290,13 +1513,13 @@ static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_i
         if (!add64(old_cost, bound, &total) || (xattr_count && xattr_count > UINT64_MAX / xattr_bound) || !add64(total, xattr_count * xattr_bound, &total) || !reserve_cells(h, total)) { e = SFS_LIMIT; goto failed; }
         if (xattr_count) { remove_total = total; if (!aligned(h->eof, &remove_start)) { e = SFS_LIMIT; goto failed; } }
         arena_free(a); a = NULL; e = flush_batch(&r, &late); if (e) goto failed;
-        if (h->staged.ns.count != edit.base_count || h->staged.ns.next_inode != edit.base_next || !same_attributes(&h->staged.ns.attributes, &edit.base_root)) { e = SFS_CORRUPT; goto failed; }
+        if (h->staged.ns.count != edit.base_count || h->staged.ns.name_count != edit.base_names || h->staged.ns.next_inode != edit.base_next || !same_attributes(&h->staged.ns.attributes, &edit.base_root)) { e = SFS_CORRUPT; goto failed; }
         for (unsigned i = 0; i < edit.count; ++i) if (edit.before[i].e.inode) { node n; e = node_get(&r, &h->staged.ns, edit.before[i].e.inode, 1, &n); if (e) goto failed; if (!same_logical_node(&n, &edit.before[i])) { e = SFS_CORRUPT; goto failed; } edit.after[i].extent = n.extent; }
         if (!same_ref(&edit.ns.xattrs, &h->staged.ns.xattrs)) { e = SFS_CORRUPT; goto failed; }
         edit.ns.inodes = h->staged.ns.inodes; edit.ns.names = h->staged.ns.names; edit.ns.ref = h->staged.ns.ref;
         if (xattr_count) { e = remove_owner_xattrs(&r, &edit.ns, id, xattr_count, xattr_bound, &late); if (e) goto failed; }
         a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
-        inodes = make_tree(a, &r, edit.ns.inodes, MAP_INODE, 0, edit.ns.next_inode, UINT64_MAX); names = make_tree(a, &r, edit.ns.names, MAP_NAME, 0, edit.ns.next_inode, UINT64_MAX);
+        inodes = make_tree(a, &r, edit.ns.inodes, MAP_INODE, 0, edit.ns.next_inode, edit.ns.name_count); names = make_tree(a, &r, edit.ns.names, MAP_NAME, 0, edit.ns.next_inode, UINT64_MAX);
         if (link) { extent = make_tree(a, &r, (reference){0}, MAP_EXTENT, next->e.inode, UINT64_MAX, next->e.size); e = prepare_link(&extent, next, link_bytes, 0, &link_raw); if (e) goto failed; }
         e = apply_edit(&inodes, &names, &edit, operation); if (e) goto failed;
         if (pending_cells(&inodes) + pending_cells(&names) + 2 + (link ? 2u : 0u) > bound) { e = SFS_CORRUPT; goto failed; }
@@ -1331,27 +1554,40 @@ enum sfs_status sfs_image_add(sfs_image *h, sfs_inode parent, const void *name, 
     if (!e && h->batch) { node proposed = {0}; proposed.e.inode = ns.next_inode; proposed.e.parent = parent; proposed.e.kind = kind; proposed.e.name_length = length; memcpy(proposed.e.name, name, length); e = probe_metadata(&r, 1, NULL, &proposed); }
     if (!e) e = prepare_metadata(&r, 1, 1, 0, &late);
     if (e) return mutation_failure(h, e, r.phase, r.error, late, result_out);
-    ns = h->staged.ns; node n = {0}; n.e.inode = ns.next_inode++; n.e.parent = parent; n.e.kind = kind; n.e.name_length = length; memcpy(n.e.name, name, length); ns.count++;
+    ns = h->staged.ns; node n = { .nlink = 1 }; n.e.inode = ns.next_inode++; n.e.parent = parent; n.e.kind = kind; n.e.name_length = length; memcpy(n.e.name, name, length); ns.count++; ns.name_count++;
     arena *a = arena_new(h, 0); if (!a) return mutation_failure(h, SFS_NOMEM, SFS_PHASE_NONE, 0, late, result_out);
-    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
-    uint8_t row[MAX_ROW]; encode_node(row, &n); e = tree_put(&inodes, row); if (!e) { encode_name(row, &n); e = tree_put(&names, row); }
+    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
+    uint8_t row[MAX_ROW]; encode_node(row, &n, h->current.minor); e = tree_put(&inodes, row); if (!e) { encode_name(row, &n); e = tree_put(&names, row); }
     if (!e) e = write_metadata_trees(&r, &inodes, &names, &ns, &late); int error = r.error; arena_free(a);
     if (e) return mutation_failure(h, e, r.phase, error, late, result_out); *out = n.e.inode; result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 }
 enum sfs_status sfs_image_remove(sfs_image *h, sfs_inode id, sfs_result *result_out) {
+    if (h && h->current.minor == 6) {
+        enum sfs_status e = mutation_start(h, result_out); if (e) return e; if (id == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+        reader r = current_reader(h, 1); node n; e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) return mutation_failure(h, e, r.phase, r.error, 0, result_out);
+        if (n.nlink > 1) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+        return sfs_image_unlink(h, n.e.parent, n.e.name, n.e.name_length, result_out);
+    }
     if (h && metadata_capable(h->current.minor)) return metadata_mutation(h, EDIT_REMOVE, id, 0, NULL, 0, 0, NULL, 0, NULL, NULL, 0, NULL, result_out);
     enum sfs_status e = mutation_start(h, result_out); if (e) return e; if (id == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     reader r = current_reader(h, 1); namespace ns = h->staged.ns; node n; int late = 0; e = node_get(&r, &ns, id, 1, &n);
     if (!e && n.e.kind == SFS_DIRECTORY) { key prefix = name_key(id, NULL, 0); cursor c; e = cursor_start(&c, &r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &prefix); uint8_t row[MAX_ROW]; int found; if (!e) { e = cursor_next(&c, row, &found); if (!e && found && get64(row) == id) e = SFS_STATE; } }
     if (!e) e = probe_metadata(&r, 2, &n, NULL);
     if (!e) e = prepare_metadata(&r, 1, 1, 0, &late); if (e) return mutation_failure(h, e, r.phase, r.error, late, result_out);
-    ns = h->staged.ns; e = node_get(&r, &ns, id, 1, &n); if (e) return mutation_failure(h, e, r.phase, r.error, late, result_out); if (!ns.count) return mutation_failure(h, SFS_CORRUPT, r.phase, 0, late, result_out); ns.count--;
+    ns = h->staged.ns; e = node_get(&r, &ns, id, 1, &n); if (e) return mutation_failure(h, e, r.phase, r.error, late, result_out); if (!ns.count) return mutation_failure(h, SFS_CORRUPT, r.phase, 0, late, result_out); ns.count--; ns.name_count--;
     arena *a = arena_new(h, 0); if (!a) return mutation_failure(h, SFS_NOMEM, SFS_PHASE_NONE, 0, late, result_out);
-    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
+    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX);
     key ik = number_key(id), nk = name_key(n.e.parent, n.e.name, n.e.name_length); e = tree_delete(&inodes, &ik); if (!e) e = tree_delete(&names, &nk); if (!e) e = write_metadata_trees(&r, &inodes, &names, &ns, &late);
     int error = r.error; arena_free(a); if (e) return mutation_failure(h, e, r.phase, error, late, result_out); result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 }
 enum sfs_status sfs_image_rename(sfs_image *h, sfs_inode id, sfs_inode parent, const void *name, size_t length, sfs_result *result_out) {
+    if (h && h->current.minor == 6) {
+        enum sfs_status e = mutation_start(h, result_out); if (e) return e; e = input_name(h, name, length, result_out); if (e) return e;
+        if (id == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+        reader r = current_reader(h, 1); node n; e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) return mutation_failure(h, e, r.phase, r.error, 0, result_out);
+        if (n.nlink > 1) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+        return sfs_image_rename_entry(h, n.e.parent, n.e.name, n.e.name_length, parent, name, length, result_out);
+    }
     if (h && metadata_capable(h->current.minor)) return metadata_mutation(h, EDIT_RENAME, id, parent, name, length, 0, NULL, 0, NULL, NULL, 0, NULL, result_out);
     enum sfs_status e = mutation_start(h, result_out); if (e) return e; e = input_name(h, name, length, result_out); if (e) return e; if (id == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     reader r = current_reader(h, 1); namespace ns = h->staged.ns; node n; int late = 0;
@@ -1362,8 +1598,8 @@ enum sfs_status sfs_image_rename(sfs_image *h, sfs_inode id, sfs_inode parent, c
     ns = h->staged.ns; e = node_get(&r, &ns, id, 1, &n); if (e) return mutation_failure(h, e, r.phase, r.error, late, result_out);
     key old = name_key(n.e.parent, n.e.name, n.e.name_length); n.e.parent = parent; n.e.name_length = length; memset(n.e.name, 0, sizeof(n.e.name)); memcpy(n.e.name, name, length);
     arena *a = arena_new(h, 0); if (!a) return mutation_failure(h, SFS_NOMEM, SFS_PHASE_NONE, 0, late, result_out);
-    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX); uint8_t row[MAX_ROW];
-    e = tree_delete(&names, &old); if (!e) { encode_name(row, &n); e = tree_put(&names, row); } if (!e) { encode_node(row, &n); e = tree_put(&inodes, row); } if (!e) e = write_metadata_trees(&r, &inodes, &names, &ns, &late);
+    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count), names = make_tree(a, &r, ns.names, MAP_NAME, 0, ns.next_inode, UINT64_MAX); uint8_t row[MAX_ROW];
+    e = tree_delete(&names, &old); if (!e) { encode_name(row, &n); e = tree_put(&names, row); } if (!e) { encode_node(row, &n, h->current.minor); e = tree_put(&inodes, row); } if (!e) e = write_metadata_trees(&r, &inodes, &names, &ns, &late);
     int error = r.error; arena_free(a); if (e) return mutation_failure(h, e, r.phase, error, late, result_out); result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 }
 enum sfs_status sfs_image_snapshot(sfs_image *h, const void *name, size_t length, sfs_view *out, sfs_result *result_out) {
@@ -1433,7 +1669,7 @@ enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, con
         memcpy(merge + i * CELL + (size_t)(begin - base), (const uint8_t *)data + (size_t)(begin - offset), (size_t)(finish - begin));
     }
     if (metadata_capable(h->current.minor) && extent_count > new_size / CELL + !!(new_size % CELL)) { e = SFS_CORRUPT; goto failed; }
-    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, UINT64_MAX, &hi); if (e) goto failed;
+    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
     if (rollover) {
         unsigned he; if (same) { e = tree_root(&ext); if (e) goto failed; he = page_level(owned_page(&ext, (unsigned)ext.root)->bytes) + 1; }
         else { e = index_height(&r, n.extent, MAP_EXTENT, UINT64_MAX, n.e.size, &he); if (e) goto failed; }
@@ -1519,7 +1755,7 @@ static void encode_xattr(uint8_t row[MAX_ROW], sfs_inode owner, const void *name
 static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *name, size_t name_length, const void *value, size_t length, int remove, sfs_result *result_out) {
     enum sfs_status e = ready(h, 1, 1, result_out); if (e) return e;
     if (!valid_xattr_name(name, name_length) || (!remove && length && !value)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
-    if (h->current.minor != 5) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     e = mutation_start(h, result_out); if (e) return e;
     reader r = current_reader(h, 1); namespace ns = h->staged.ns; node before, owner;
     arena *a = NULL; prefix_builder *builder = NULL; int late = 0, found; uint8_t row[MAX_ROW];
@@ -1530,7 +1766,7 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
     if (remove && !found) { e = SFS_NOT_FOUND; goto failed; }
     if (length > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
     unsigned hi, ha, levels; uint64_t pages[MAX_HEIGHT] = {0}, page_total, count = remove ? 0 : dense_count(length), old_cost;
-    e = index_height(&r, ns.inodes, MAP_INODE, ns.next_inode, UINT64_MAX, &hi);
+    e = index_height(&r, ns.inodes, MAP_INODE, ns.next_inode, ns.name_count, &hi);
     if (!e) e = index_height(&r, ns.xattrs, MAP_XATTR, ns.next_inode, UINT64_MAX, &ha);
     if (!e) e = prefix_shape(count, pages, &levels, &page_total);
     if (!e) e = batch_cost(&r, &old_cost); if (e) goto failed;
@@ -1549,13 +1785,13 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
     if (remove) e = tree_delete(&attrs, &k);
     else { encode_xattr(row, id, name, name_length, length, extent); e = tree_put(&attrs, row); }
     if (!e && pending_cells(&attrs) > attr_bound) e = SFS_CORRUPT;
-    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX);
-    if (!e && id != 1) { encode_node(row, &before); e = tree_put(&inodes, row); if (!e && pending_cells(&inodes) > inode_bound) e = SFS_CORRUPT; }
+    tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count);
+    if (!e && id != 1) { encode_node(row, &before, h->current.minor); e = tree_put(&inodes, row); if (!e && pending_cells(&inodes) > inode_bound) e = SFS_CORRUPT; }
     arena_free(a); a = NULL; if (e) goto failed;
     sfs_timestamp t; int clock_error; e = clock_sample(&t, &clock_error);
     if (e) { free(builder); return result(h, e, SFS_PHASE_NONE, clock_error, result_out); }
     e = flush_batch(&r, &late); if (e) goto failed;
-    if ((old_cost && (h->eof < start || (h->eof - start) / CELL > old_cost)) || h->staged.ns.count != ns.count || h->staged.ns.next_inode != ns.next_inode || !same_attributes(&h->staged.ns.attributes, &ns.attributes) || !same_ref(&h->staged.ns.xattrs, &ns.xattrs)) { e = SFS_CORRUPT; goto failed; }
+    if ((old_cost && (h->eof < start || (h->eof - start) / CELL > old_cost)) || h->staged.ns.count != ns.count || h->staged.ns.name_count != ns.name_count || h->staged.ns.next_inode != ns.next_inode || !same_attributes(&h->staged.ns.attributes, &ns.attributes) || !same_ref(&h->staged.ns.xattrs, &ns.xattrs)) { e = SFS_CORRUPT; goto failed; }
     e = node_get(&r, &h->staged.ns, id, 1, &owner); if (e) goto failed;
     if (!same_logical_node(&owner, &before)) { e = SFS_CORRUPT; goto failed; }
     ns = h->staged.ns; owner.attributes.change = t; extent = (reference){0};
@@ -1584,7 +1820,7 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
     if (id == 1) ns.attributes = owner.attributes;
     else {
         a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
-        inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX); encode_node(row, &owner); e = tree_put(&inodes, row);
+        inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count); encode_node(row, &owner, h->current.minor); e = tree_put(&inodes, row);
         remaining = pending_cells(&inodes); if (!e && remaining > inode_bound) e = SFS_CORRUPT;
         if (!e) { late = 1; r.phase = SFS_PHASE_RECORDS; e = seal_tree(&inodes, &ns.inodes, &remaining); if (e == SFS_IO) r.error = errno; }
         arena_free(a); a = NULL; if (e) goto failed; if (remaining) { e = SFS_CORRUPT; goto failed; }
@@ -1600,7 +1836,7 @@ enum sfs_status sfs_image_remove_xattr(sfs_image *h, sfs_inode id, const void *n
 
 static enum sfs_status replace_inode(reader *r, node *n, int *late) {
     arena *a = arena_new(r->h, 0); if (!a) return SFS_NOMEM; namespace ns = r->h->staged.ns;
-    tree inodes = make_tree(a, r, ns.inodes, MAP_INODE, 0, ns.next_inode, UINT64_MAX); uint8_t row[MAX_ROW]; encode_node(row, n); enum sfs_status e = tree_put(&inodes, row); uint64_t remaining = pending_cells(&inodes) + 1;
+    tree inodes = make_tree(a, r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count); uint8_t row[MAX_ROW]; encode_node(row, n, r->a.minor); enum sfs_status e = tree_put(&inodes, row); uint64_t remaining = pending_cells(&inodes) + 1;
     if (!e && !reserve_cells(r->h, remaining + 1)) e = SFS_LIMIT;
     if (!e) { *late = 1; r->phase = SFS_PHASE_RECORDS; e = seal_tree(&inodes, &ns.inodes, &remaining); if (!e) e = write_namespace(r->h, &ns, &remaining); if (e == SFS_IO) r->error = errno; }
     arena_free(a); if (!e && remaining) e = SFS_CORRUPT; if (!e) r->h->staged.ns = ns; return e;
@@ -1625,7 +1861,7 @@ enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_
         if (retained) { builder = calloc(1, sizeof(*builder)); if (!builder) { e = SFS_NOMEM; goto failed; } builder->h = h; builder->generation = r.a.generation; builder->levels = levels; memcpy(builder->pages, pages, sizeof(pages)); builder->input[0] = retained; for (unsigned i = 1; i < levels; ++i) builder->input[i] = pages[i - 1]; }
     }
     if (metadata_capable(h->current.minor) && size < old_size && retained > n.attributes.extents) { e = SFS_CORRUPT; goto failed; }
-    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, UINT64_MAX, &hi); if (e) goto failed;
+    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
     uint64_t old; e = batch_cost(&r, &old); if (e) goto failed;
     uint64_t required = old + (size == old_size ? 1 : total + boundary + hi + 2); if (!reserve_cells(h, required)) { e = SFS_LIMIT; goto failed; }
     e = flush_batch(&r, &late); if (e) goto failed; if (size == old_size) { free(builder); return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); }
@@ -1693,6 +1929,21 @@ static void save_cookie(sfs_cookie *cookie, const namespace *ns, uint64_t parent
     uint8_t *b = cookie->bytes; memset(b, 0, sizeof(cookie->bytes)); memcpy(b, ns->ref.digest, 32); put64(b + 32, parent); put32(b + 40, c->depth); put32(b + 44, c->depth ? 1 : 3);
     for (unsigned i = 0; i < c->depth; ++i) { uint8_t *v = b + 48 + i * 64; encode_ref(v, &c->frames[i].ref); put16(v + 56, c->frames[i].index); put16(v + 58, c->frames[i].context.level); }
 }
+enum sfs_status sfs_image_resume_after_name(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode parent, const void *previous_name, size_t previous_length, sfs_cookie *out, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+    if (!out || !expected_root_digest || !expected_generation || !valid_name(previous_name, previous_length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (h->current.minor != 6) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
+    if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    reader r = current_reader(h, 0); namespace ns; node n; uint8_t row[MAX_ROW]; int found;
+    e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent); if (e) return touched_result(&r, e, result_out);
+    cursor *c = malloc(sizeof(*c)); if (!c) return touched_result(&r, SFS_NOMEM, result_out);
+    key k = name_key(parent, previous_name, previous_length); e = cursor_start(c, &r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &k); if (!e) e = cursor_next(c, row, &found);
+    if (!e) { key actual = found ? row_key(row, MAP_NAME, 0) : (key){0}; if (!found || keycmp(&actual, &k)) e = SFS_NOT_FOUND; }
+    if (!e) { e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT; }
+    if (!e) e = name_member(&r, &ns, &n, &k);
+    if (!e) { sfs_cookie cookie; save_cookie(&cookie, &ns, parent, c); *out = cookie; } free(c); return touched_result(&r, e, result_out);
+}
 enum sfs_status sfs_image_resume_after(sfs_image *h, sfs_view view, uint64_t expected_generation,
                                      const uint8_t expected_root_digest[32], sfs_inode parent,
                                      sfs_inode previous, sfs_cookie *out, sfs_result *result_out) {
@@ -1701,7 +1952,15 @@ enum sfs_status sfs_image_resume_after(sfs_image *h, sfs_view view, uint64_t exp
     if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; node n; cursor c; uint8_t row[MAX_ROW]; int found = 0;
-    e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent);
+    e = selected_namespace(&r, view, &ns);
+    if (!e && r.a.minor == 6) {
+        e = node_get(&r, &ns, previous, 1, &n); if (e) return touched_result(&r, e, result_out);
+        if (n.nlink > 1) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+        e = directory_check(&r, &ns, parent); if (e) return touched_result(&r, e, result_out);
+        if (n.e.parent != parent) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+        return sfs_image_resume_after_name(h, view, expected_generation, expected_root_digest, parent, n.e.name, n.e.name_length, out, result_out);
+    }
+    if (!e) e = directory_check(&r, &ns, parent);
     if (!e) e = node_get(&r, &ns, previous, 1, &n);
     if (!e && n.e.parent != parent) e = SFS_INVALID;
     if (!e) { key k = name_key(parent, n.e.name, n.e.name_length); e = cursor_start(&c, &r, ns.names, MAP_NAME, ns.next_inode, UINT64_MAX, &k); }
@@ -1719,7 +1978,7 @@ enum sfs_status sfs_image_next(sfs_image *h, sfs_view view, sfs_inode parent, sf
     if (!e) e = cursor_next(&c, row, &exists);
     if (!e && exists && get64(row) != parent) { c.depth = 0; exists = 0; }
     if (!e && exists) { node n; e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
-        if (!e && (n.e.parent != parent || n.e.name_length != get32(row + 8) || memcmp(n.e.name, row + 12, n.e.name_length))) e = SFS_CORRUPT;
+        if (!e) { key k = row_key(row, MAP_NAME, 0); e = r.a.minor == 6 ? name_member(&r, &ns, &n, &k) : (n.e.parent != parent || n.e.name_length != get32(row + 8) || memcmp(n.e.name, row + 12, n.e.name_length)) ? SFS_CORRUPT : SFS_OK; if (!e) entry_name(&n, row); }
         if (!e) { *out = n.e; *found = 1; }
     }
     if (!e) save_cookie(cookie, &ns, parent, &c); return touched_result(&r, e, result_out);

@@ -1,11 +1,11 @@
-# Experimental image formats 0.2, 0.3, 0.4 and 0.5
+# Experimental image formats 0.2, 0.3, 0.4, 0.5 and 0.6
 
 This internal C core stores an offline filesystem image. The public `sfs` and
 `stallionfs` commands do not use it. This is an incompatible replacement for
 format 0.1, not a mounted filesystem or a stable compatibility promise.
-Exactly minors 2, 3, 4 and 5 remain supported; unknown versions and feature bits are refused.
+Exactly minors 2, 3, 4, 5 and 6 remain supported; unknown versions and feature bits are refused.
 Legacy create produces 0.2. `sfs_image_create_metadata` explicitly creates 0.3.
-`sfs_image_create_metadata_version` accepts an explicit minor 3, 4 or 5.
+`sfs_image_create_metadata_version` accepts an explicit minor 3, 4, 5 or 6.
 There is no migration, conversion-on-open or automatic repair.
 
 The backing object must be a current-user-owned, single-link regular file with
@@ -30,7 +30,7 @@ on a handle, including avoiding reentry from a cancellation callback.
 | Ordered index height | At most 16, with leaf level 0 |
 | Named snapshots | At most 32; catalog height at most 2 |
 | Name | 1–255 bytes |
-| Symlink target, formats 0.4/0.5 | 1–4096 non-NUL bytes; independent of the regular-file cap |
+| Symlink target, formats 0.4/0.5/0.6 | 1–4096 non-NUL bytes; independent of the regular-file cap |
 | One write call | At most 65536 bytes; at most 17 affected raw cells |
 | One active write batch | One inode, inclusive touched-block span at most 256 |
 
@@ -38,7 +38,7 @@ Integers are unsigned little-endian unless described as keys or signed times. Re
 bytes are zero, structures and pointers are never serialized, and hashing uses
 CommonCrypto SHA-256. Names are case-sensitive raw bytes without normalization;
 NUL, slash, `.` and `..` are invalid. Root inode 1 is implicit. Other inode IDs
-start at 2, increase monotonically and are never reused. Kinds are directory 1 and regular file 2; formats 0.4/0.5 also admit symlink 3.
+start at 2, increase monotonically and are never reused. Kinds are directory 1 and regular file 2; formats 0.4/0.5/0.6 also admit symlink 3.
 Holes below regular-file logical EOF read as zero. Link targets are never followed.
 
 The current namespace counter cannot be below a snapshot namespace counter.
@@ -60,7 +60,7 @@ Metadata cells have this 64-byte envelope:
 
 | Offset | Bytes | Value |
 | --- | --- | --- |
-| 0 | 8 | `SFSREC02` / `SFSREC03` / `SFSREC04` / `SFSREC05` for the exact minor |
+| 0 | 8 | `SFSREC02` / `SFSREC03` / `SFSREC04` / `SFSREC05` / `SFSREC06` for the exact minor |
 | 8 | 4 | Type |
 | 12 | 4 | Zero |
 | 16 | 8 | 4032, the body length |
@@ -69,7 +69,7 @@ Metadata cells have this 64-byte envelope:
 
 Their digest covers all 4096 bytes. Raw cells contain exactly 4096 logical data
 bytes, with no envelope. Their parent extent row carries the digest of a 36-byte
-domain followed by the raw cell: `SFSDAT02`, `SFSDAT03`, `SFSDAT04` or `SFSDAT05` at 0 for the candidate
+domain followed by the raw cell: `SFSDAT02`, `SFSDAT03`, `SFSDAT04`, `SFSDAT05` or `SFSDAT06` at 0 for the candidate
 version, UUID at 8, u32 type 6 at 24,
 u64 length 4096 at 28. Raw hash input is therefore 4132 bytes. Bytes after an
 extent row's visible length must be zero. Missing extents and the zero suffix of
@@ -77,13 +77,14 @@ a short visible extent do not expose retained contents when a file grows.
 
 A namespace cell contains inode-index reference at 64, name-index reference at
 120, next inode u64 at 176 and entry count u64 at 184. Format 0.2 has zero bytes
-from 192. Formats 0.3/0.4/0.5 store the root metadata tuple at 192.
-Formats 0.3/0.4 have zero bytes from 280. Format 0.5 stores an xattr-index
-reference at 280..335 and zero bytes from 336; this root is independent of the
+from 192. Formats 0.3/0.4/0.5/0.6 store the root metadata tuple at 192.
+Formats 0.3/0.4 have zero bytes from 280. Formats 0.5/0.6 store an xattr-index
+reference at 280..335. Format0.5 has zero bytes from336; format0.6 stores
+name_count at336..343 and has zero bytes from344. The xattr root is independent of the
 inode/name count, and root-owned attributes are legal when that count is zero.
 Zero entry count requires both indexes to be zero; otherwise both exist. The
 implicit root is excluded from the count. The count is also bounded by the inode
-leaf maximum (nine for 0.2, six for 0.3/0.4/0.5) times the candidate's physical cell count
+leaf maximum (nine for 0.2, six for 0.3/0.4/0.5/0.6) times the candidate's physical cell count
 before it bounds parent walks.
 
 A commit-root cell contains current namespace reference at 64, optional snapshot
@@ -92,8 +93,8 @@ immutable namespaces; they never own mutable pages.
 
 ## Ordered index cells
 
-Map kinds are inode 1, name 2, extent 3, snapshot 4 and xattr 5.
-Map 5 is admitted only in minor 5. Every index uses this header:
+Map kinds are inode 1, name 2, extent 3, snapshot 4, xattr 5 and reverse name 6.
+Map 5 is admitted in minors 5/6; map 6 only in minor 6. Every index uses this header:
 
 | Offset | Bytes | Field |
 | --- | --- | --- |
@@ -122,10 +123,12 @@ cache hits as well as misses. All leaves have equal depth.
 | --- | --- | --- | --- | --- |
 | Inode, 0.2 | 352 | 3–9 | 72 | 16–48 |
 | Inode, 0.3/0.4/0.5 | 440 | 2–6 | 72 | 16–48 |
+| Inode, 0.6 | 496 | 2–6 | 72 | 16–48 |
 | Name | 280 | 4–12 | 328 | 3–9 |
 | Extent | 72 | 16–48 | 72 | 16–48 |
 | Snapshot | 328 | 3–9 | 72 | 16–48 |
-| Xattr, 0.5 | 352 | 3–9 | 328 | 3–9 |
+| Xattr, 0.5/0.6 | 352 | 3–9 | 328 | 3–9 |
+| Reverse name, 0.6 | 280 | 4–12 | 328 | 3–9 |
 
 An empty tree is a zero reference. A root leaf has 1 through the stated maximum
 rows; an internal root has 2 through the maximum children. There are no sibling
@@ -159,7 +162,7 @@ Changed extrema and ancestor minima are recomputed from checked child headers.
 Growth beyond height 16 is refused before image writes, including any required
 batch seal.
 
-## Format 0.3/0.4/0.5 metadata
+## Format 0.3/0.4/0.5/0.6 metadata
 
 The root namespace and every inode row carry this 88-byte tuple. Offsets are
 relative to namespace byte 192 or inode-row byte 352:
@@ -177,7 +180,7 @@ and restored values are not clamped, rounded or made monotonic. Public C structs
 are encoded field by field; their padding is not persisted or validated as input.
 
 Mode includes matching regular-file `0100000`, directory `0040000`, or
-format-0.4/0.5 symlink `0120000` type bits
+format-0.4/0.5/0.6 symlink `0120000` type bits
 plus permission/special bits `07777`; other type or high bits are invalid. UID/GID
 are literal u32 values. The supported flag mask is `0x8001` (`UF_NODUMP|UF_HIDDEN`),
 both caller-controlled advisory attributes. Other caller flags return early,
@@ -197,11 +200,11 @@ repeated mapping is charged independently. It excludes indexes, image tails,
 host allocation and global uniqueness/reclaimability. It is primary-data mapping
 accounting, not an established FSKit all-fork allocation mapping.
 
-`link_count` is the explicit SFS convention 1 for files, symlinks, directories and root.
-There are no hardlinks or stored child-directory link counters. Snapshot sharing
-does not add a canonical name. This convention does not equate all Darwin stat,
-getattrlist and FSKit representations. A future hardlink feature would also need
-to revise canonical-name and resume-after-inode assumptions.
+`link_count` is stored nlink for format0.6 regular files/symlinks. Older formats,
+root and directories retain the SFS convention1. Snapshot sharing does not add
+links. These are core storage semantics, not native directory nlink or mounted
+getattrlist/FSKit behavior. `sfs_entry` remains unchanged.
+
 
 ### Producers, setters and time rules
 
@@ -209,11 +212,11 @@ Legacy create still makes 0.2 and all legacy operations keep their 0.2 behavior,
 without sampling a metadata clock or inventing old history. Explicit
 `create_metadata` makes 0.3, with required root attributes. `add_metadata` accepts
 required mode/UID/GID/flags and optional exact birth/access/modification
-restorations. Legacy add also works on 0.3/0.4/0.5: fresh files use type+0600, directories
+restorations. Legacy add also works on 0.3/0.4/0.5/0.6: fresh files use type+0600, directories
 type+0700, actual effective process UID/GID and flags 0. These defaults are not
 preserved source attributes or native permission-inheritance policy.
 
-One validated `CLOCK_REALTIME` sample supplies each effectful 0.3/0.4/0.5 operation before
+One validated `CLOCK_REALTIME` sample supplies each effectful 0.3/0.4/0.5/0.6 operation before
 any required pending-batch seal or image append. Explicit create samples before
 exclusive image creation. All four fresh times default to that sample; selected
 restorations replace only birth/access/modification. Source ctime is not
@@ -292,10 +295,10 @@ identity, lock, counter, recovery and publication rules remain in force.
 
 The inode leaf maximum falls from 9 to 6, increasing inode-page storage at similar
 occupancy. The cache and arena caps do not grow. This is not a measured speed or
-memory improvement. Complete native attributes, behavioral flags, native fork import/export, hardlinks,
+memory improvement. Complete native attributes, behavioral flags, native fork import/export,
 clone import and mounted permission/SDK mapping remain separate unfinished work.
 
-## Formats 0.4/0.5 symlinks
+## Formats 0.4/0.5/0.6 symlinks
 
 A symlink inode has size L in 1–4096, mode type `0120000`, the same 88-byte
 metadata tuple as format 0.3, extent count 1, and a nonzero extent root. Its root
@@ -311,7 +314,7 @@ establish native import/export fidelity: the Darwin/XNU symlink interface has it
 own path-length constraints. No 4096-byte OS export or mounted behavior is claimed.
 
 `create_metadata_version(directory, name, capacity, minor, root, out, result)`
-accepts only 3, 4 or 5. After validating the output, capacity, directory/component
+accepts only 3, 4, 5 or 6. After validating the output, capacity, directory/component
 and required root pointer, an unsupported requested minor returns direct
 `UNSUPPORTED/NONE/errno0`, before clock, allocation or image creation. Every
 failure with a valid output pointer sets it NULL. Supported versions then validate
@@ -370,7 +373,7 @@ policy. There is no read clock or atime mutation.
 Every FULL link visit validates the one-row shape and no-NUL semantics, even when
 a regular inode already completed an intrinsic extent summary. A separate shape
 check is charged before loading, and a semantic check before raw/memo examination.
-Every checked minor-4/5 raw fetch, including a regular file's, computes first-zero
+Every checked minor-4/5/6 raw fetch, including a regular file's, computes first-zero
 and last-nonzero together. A completed raw memo may satisfy no-output link checks
 only when first-zero>=L and last-nonzero<=L. It never supplies output payload.
 Thus shared raw or whole-extent references are safe in either regular/link order;
@@ -384,9 +387,10 @@ Generic add remains file/directory only. Generic regular read/write/resize rejec
 links even for zero-length/equal-size calls. Rename/remove and metadata setters
 operate on the link itself; snapshots preserve its target and attributes. Links
 cannot be directory parents. Canonical-name, resume and cookie contracts remain
-unchanged; there are no hardlinked symlinks or new scan APIs.
+unchanged in older formats. Format0.6 permits shared symlink inodes without
+following their targets, using the explicit name APIs described below.
 
-## Format 0.5 xattrs
+## Formats 0.5/0.6 xattrs
 
 An attribute key is big-endian owner inode followed by its exact name bytes.
 Names are 1..255 non-NUL bytes; slash, dot, dot-dot, case and non-UTF8 bytes are
@@ -487,15 +491,173 @@ ROOT_ONLY binds/checks the attribute root without certifying complete values.
 FULL walks all attribute rows, rechecks owner existence, and checks each specific
 L/N dense stream, independently of intrinsic extent memo success. Each owner/length
 and dense mapping semantic check consumes CHECKS. RAW verification uses binary
-semantics while preserving minor-4/5 first-zero summaries for later symlink use.
+semantics while preserving minor-4/5/6 first-zero summaries for later symlink use.
 Shared raw memo may skip repeated no-output hashing, never per-value density
 checks or output-byte fetching. Namespace semantic completion is memoized only
 after these checks succeed, for current state, snapshots and recovery candidates.
 
-Decoded namespace size is 328 bytes (56 more than minors 2/3/4 implementation
-state); the live/staged pair grows 112 bytes. Node 440, anchor 104 and context
-568 byte layouts, CELL4096, PAGE_HEAD640, MAX_ROW440, MAX_HEIGHT16 and arena caps
-are unchanged. These are structural sizes, not measured process memory.
+The format0.5 disk namespace adds only the56-byte xattr reference. The current
+decoded node/namespace sizes and row buffer maximum are listed under0.6 below.
+CELL4096, PAGE_HEAD640, MAX_HEIGHT16 and arena caps remain unchanged; these are
+structural limits, not measured process memory.
+
+## Format 0.6 shared inodes and names
+
+Regular files and symlinks may have multiple names referencing one inode. Data,
+symlink target, metadata and inode-keyed xattrs belong to that inode. Directory
+and root hardlinks are invalid. Root/directories keep logical nlink1 and no
+reverse root, under the existing core convention. This is not native directory
+nlink, mounted access enforcement, replacement rename or open-unlinked lifetime.
+
+Minor6 uses SFSREC06/SFSDAT06 and the same major0, SFSIMG01, feature bits0 and
+reference encoding. Supported sets are exactly2/3/4/5/6, metadata3/4/5/6,
+symlink4/5/6, xattr5/6 and hardlink6. Old create wrappers still produce2/3.
+There is no conversion, automatic latest version or mixed-version graph.
+
+Minor6 inode leaf rows are496 bytes. Existing parent/name/kind/size/primary
+reference offsets remain. Name bytes start88; their zero suffix ends342,
+byte343 is zero, u64 nlink is at344, metadata remains88 bytes at352, and a56-byte
+reverse INDEX reference is at440. Old minors2 and3/4/5 retain352/440-byte disk
+strides and their original zero suffix through351. Codecs are minor-aware,
+field-by-field; old decode supplies nlink1/null reverse and never reads new
+fields. MAX_ROW496 is only a buffer maximum. Inode leaf occupancy stays2..6
+for metadata formats, so640+6*496=3616 fits a4096-byte cell.
+
+Namespace inode count stays184 and xattr reference280. Minor6 adds name_count
+u64 at336 and zero tail from344; older formats decode name_count=count and
+retain their prior encoded tails. Require count<=name_count<=SFS_ENTRY_MAX,
+count0 iff both inode/global-name roots are null, and nonzero name_count iff the
+global-name root exists. Both counts have their map's physical-row upper bound.
+Root-owned xattrs remain independent. Parent walks use inode count, not name_count.
+New inode creation increments both counters and next_inode; link/nonfinal unlink
+changes only name_count; final unlink decrements both counts; rename changes
+neither. IDs are never reused or allocated for an alias.
+
+MAP_BACKREF6 is owner-specific reverse membership, admitted only in minor6. It
+uses the same280-byte leaf encoding as ordinary names: parent at0, length at8,
+name at12, owner inode at267 and zero275..279. Keys are big-endian parent plus
+valid component name. Leaf occupancy is4..12 (root1..12); variable-key internal
+rows are328 bytes, children3..9 (root2..9), reference at271 and final zero327.
+Each row must name its reverse tree's owner. The reverse root precedes its inode
+leaf. Files/symlinks require positive nlink<=name_count, null reverse for nlink1,
+and nonnull reverse for nlink>1. Directories require nlink1/null reverse. Root1
+is synthetic and excluded from stored-inode nlink sums.
+
+The representative is the first parent/name key. stat and stat_metadata.entry
+return it; only stat_metadata.link_count exposes stored nlink. sfs_entry is
+unchanged. Lookup and next return the actual requested/enumerated name, plus the
+shared inode/kind/size. Touched names check global membership, inode identity,
+owner-specific reverse membership (or exact sole name), and directory parent.
+Stat checks representative membership and first-key equality with bounded seeks.
+A reverse root for nlink2 must be exactly a level0 two-row leaf when checking the
+group. Owner-specific checks are not replaced by intrinsic memo success.
+
+Link1->2 builds one sorted two-row reverse leaf. LinkN->N+1 inserts one reverse
+key and reselects the minimum, including when the added alias sorts earlier.
+Unlink2->1 checks both source rows and their global memberships/parents, keeps
+the other exact name and drops the reverse root without a reverse write.
+UnlinkN->N-1 deletes one key and reselects the minimum; a resulting nlink2 group
+must have the exact two-row leaf. Last unlink removes the inode and cleans up its
+xattrs once. Nonfinal unlink preserves xattrs. Rename of a multiply named inode
+deletes/inserts reverse keys and reselects the minimum, including noncanonical
+names moving ahead of the former representative. All ordinary transitions use
+indexed paths, at most the exact two-row group, and permitted final-unlink xattr
+prefix traversal; they do not scan the global namespace or entire link group.
+
+The four new APIs are link(existing,parent,name), unlink(parent,name),
+rename_entry(old_parent,old_name,new_parent,new_name), and resume_after_name.
+New mutations require a writable active transaction, valid component names and
+exact minor6 before identity/clock/seal. Invalid component names return INVALID;
+length>255 uses existing admission LIMIT/discard. Valid calls on2/3/4/5 return
+nonpoisoning UNSUPPORTED/NONE/0. Missing source is NOT_FOUND; missing/nondirectory
+parent or directory/root link source is INVALID. Unlink of a nonempty directory
+is STATE. Rename validates source membership before accepting an exact same-name
+no-op. A distinct occupied destination is EXISTS even for the same inode, after
+checking that destination's owner and reverse membership. It never replaces or
+collapses an alias. Directory moves retain cycle/descendant checks. Domain
+refusals use NONE/0 except admission LIMIT; corruption/I/O retain actual phase
+and poisoning behavior.
+
+Legacy inode-only remove/rename/resume preserve older-format behavior. On6,
+after their existing argument checks and checked inode lookup, nlink>1 returns
+STATE/NONE/0 before parent/destination/clock/seal work. Single-link mutations
+resolve the sole name and use the same explicit-entry implementation. Inode-based
+read/write/resize/readlink/metadata/xattr calls remain shared; batch reconciliation
+preserves nlink/reverse and intentionally permits only primary extent-reference
+replacement. Primary referenced_data_bytes is not multiplied by aliases.
+
+Name-based resume requires valid output/digest/nonzero generation and a valid
+previous component, then minor6 capability, generation/commit-root binding,
+identity, selected view, directory, exact previous name and membership. Absent
+previous names are NOT_FOUND, never a lower-bound continuation. Invalid/overlong
+names return INVALID without discarding staging or changing the cookie. Binding
+mismatch is STATE. Success publishes the existing1088-byte cookie after that
+exact checked row with TOUCHED coverage; every failure leaves it unchanged.
+There is no new cookie, entry ID or cross-commit continuity promise. next retains
+its existing found0 initialization and unchanged entry/cookie on later failure.
+
+Successful edits sample one clock for owner ctime and distinct affected parents'
+mtime/ctime, deduplicating same parent/root. Owner birth/atime/mtime, primary data,
+target and xattrs remain. Early absence/collision/ambiguity/no-op/validation
+refusals attempt no clock. Clock failure itself attempts the clock; later failures
+may sample once and leave charged tails without publishing metadata.
+
+Let Hi/Hn/Hb/Ha be checked inode/global-name/reverse/xattr heights through16,
+D(H)=3H+3, B(H)=3*min(H+1,16)+3, P the distinct nonroot parents updated, and
+U=(1+P)*Hi. Lold is the prior pending batch seal liability. K is the owner's
+xattr count only for final unlink. Complete conservative reservation is:
+
+| Operation | Cells, including namespace and eventual commit root |
+| --- | --- |
+| Link1->2 | Lold+B(Hn)+1+U+2 |
+| LinkN->N+1 | Lold+B(Hn)+B(Hb)+U+2 |
+| Unlink2->1 | Lold+D(Hn)+U+2 |
+| UnlinkN->N-1, N>=3 | Lold+D(Hn)+D(Hb)+U+2 |
+| Last unlink | Lold+D(Hn)+D(Hi)+P*Hi+K*D(Ha)+2 |
+| Rename nlink1 | Lold+D(Hn)+B(Hn)+U+2 |
+| Rename nlink>=2 | Lold+D(Hn)+B(Hn)+D(Hb)+B(Hb)+U+2 |
+
+All sums/products and counter updates are checked. These bounds can reject a
+near-full image; they are not minimum requirements. Exact structural probes
+include delete-then-insert and reject actual height overflow before old sealing.
+After admission, flush/reconcile pending primary work including both namespace
+counters, nlink/reverse, parent/root metadata and new primary references. Each
+name/reverse tree edit seals a private root with its own fresh work arena and
+refreshes reader EOF before subsequent traversal. The1->2 reverse pair is one
+leaf;2->1 drops its root without writing. Distinct parent/owner inode edits also
+seal sequentially, with parents before final owner deletion. Every phase checks
+its dirty-cell bound. A final namespace alone publishes all roots, and total
+appends leave one admitted commit cell. Preexisting unaligned tails are allowed;
+old-flush accounting applies only for nonzero Lold. No intermediate namespace
+publishes part of a link transition.
+
+Late begins with a real old-batch seal or private append. An empty-tree seal
+without pending cells does not turn an early operation late. Pre-late NOMEM and
+TIME_UNAVAILABLE preserve staging; domain errors preserve it, LIMIT discards,
+and all post-late failures discard with charged tails retained. Existing fatal
+I/O/integrity poison and commit uncertainty rules remain. Snapshots keep all
+old immutable roots; no reclamation or open-unlinked lifetime is added.
+
+Decoded node is504 bytes, namespace336, primary batch640, and metadata_edit4016
+in the supported64-bit builds. Node/namespace gains are64/8 bytes over0.5;
+live/staged namespace storage grows16 bytes. The new edit record is heap-owned
+and asserted<=4096. One reusable10272-byte heap cursor avoids a cursor-sized
+new mutation/resume frame. One pending-primary arena and one work arena may
+coexist, never simultaneous reverse/global/inode work arenas;1024-page/5MiB caps
+remain. Single-edit resident charging A(H)=9H+8<=152 and compound two-edit probes
+<=304 remain within that arena; dirty-cell bounds are independent. No allocation
+scales with total names/link count. Compiler stack reports and later runtime
+qualification are still required; these structural sizes are not measured RSS.
+
+FULL checks stored inode count, global name_count and the checked sum of stored
+inode nlinks excluding root. It checks every global name's owner/directory parent,
+every reverse row's owner/global membership, exact reverse count and canonical
+minimum, and absence of directory aliases. Per-owner reverse traversal remains
+mandatory even after a shared intrinsic summary. Semantic work charges CHECKS;
+raw/memo/cache budgets, cancellation/error precedence and per-snapshot/recovery
+namespace validation are preserved. Ordinary touched operations do not claim
+FULL coverage. Native import/export, access control, replacement rename, mounted
+semantics and installation remain separate requirements.
 
 ## Slots and publication
 
@@ -504,7 +666,7 @@ Slots occupy bytes 0–4095 and 4096–8191. Their layout is:
 | Offset | Bytes | Field |
 | --- | --- | --- |
 | 0 | 8 | `SFSIMG01` |
-| 8, 12 | 4 each | Major 0, minor 2, 3, 4 or 5 |
+| 8, 12 | 4 each | Major 0, minor 2, 3, 4, 5 or 6 |
 | 16 | 8 | Feature bits, zero |
 | 24 | 16 | Nonzero UUID |
 | 40 | 8 | Positive generation |
@@ -656,8 +818,8 @@ known anchor. Capturing an anchor alone never selects or verifies the candidate.
 A fresh pass uses a new owned mode-0600 auxiliary `memo` file in an owned
 mode-0700 temporary directory below the retained image parent. It has one 128-byte
 entry per physical cell at actual EOF, including tails: state u32, type u32,
-digest[32], subtree count u64, maximum inode u64, maximum file end or raw last
-nonzero position u64, and 64 zero bytes. Completed RAW entries in minors 4/5 use
+digest[32], subtree count u64, maximum inode u64, maximum file end, minor6 inode maximum nlink, or raw last
+nonzero position u64, and 64 zero bytes. Completed RAW entries in minors 4/5/6 use
 the count slot at byte 40 for first-zero index (4096 if absent), byte 48 is zero,
 and byte 56 is last-nonzero-plus-one. Both positions are at most 4096 and
 first-zero is at most last-nonzero. RAW state is exactly 2 with matching type and
@@ -668,7 +830,7 @@ not persistent trust or an image sidecar; length budget and actual free-space
 headroom are checked before creating it. Cache-miss reads and dirty eviction
 writes consume the auxiliary I/O budget. Cleanup errors prevent full coverage.
 
-Full verification may reuse a completed raw digest/last-nonzero summary (plus first-zero for minors 4/5) and
+Full verification may reuse a completed raw digest/last-nonzero summary (plus first-zero for minors 4/5/6) and
 intrinsic subtree counts. Every metadata reference still obtains the whole
 checked cell and revalidates its current context. Distinct namespace semantics
 read actual inode/name rows again. Cache eviction therefore permits and charges
