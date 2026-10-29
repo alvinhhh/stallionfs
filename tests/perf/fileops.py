@@ -271,9 +271,83 @@ def fixture_totals(root, snapshot):
     return result
 
 
+def linux_mounts(text=None):
+    """Read this process's mount namespace, including same-device bind mounts."""
+    if text is None:
+        text = Path('/proc/self/mountinfo').read_text(errors='surrogateescape')
+    def unescape(value):
+        require(not re.search(r'\\(?!040|011|012|134)', value), 'Invalid mountinfo escape')
+        return re.sub(r'\\(040|011|012|134)', lambda match: chr(int(match[1], 8)), value)
+    records, identifiers = [], set()
+    for line in text.splitlines():
+        fields = line.split(' ')
+        require(fields.count('-') == 1, 'Invalid mountinfo separator')
+        separator = fields.index('-')
+        require(separator >= 6 and len(fields) == separator + 4 and all(fields), 'Invalid mountinfo fields')
+        require(all(re.fullmatch(r'[0-9]+', fields[index]) for index in (0, 1))
+                and re.fullmatch(r'[0-9]+:[0-9]+', fields[2]), 'Invalid mountinfo identity')
+        identifier = int(fields[0])
+        require(identifier > 0 and identifier not in identifiers, 'Duplicate or invalid mount ID')
+        identifiers.add(identifier)
+        root, point, source = map(unescape, (fields[3], fields[4], fields[separator + 2]))
+        require(Path(root).is_absolute() and Path(point).is_absolute(), 'Invalid mountpoint')
+        options, super_options = fields[5].split(','), fields[-1].split(',')
+        require(all(('ro' in value) != ('rw' in value) for value in (options, super_options)),
+                'Missing or ambiguous mount write policy')
+        records.append({'mount_id': identifier, 'parent_id': int(fields[1]),
+                        'device': fields[2], 'root': root, 'path': point,
+                        'filesystem': fields[separator + 1], 'source': source,
+                        'mount_options': options, 'super_options': super_options,
+                        'readonly': 'ro' in options or 'ro' in super_options})
+    require(records, 'Mounted-filesystem inventory is unavailable')
+    return records
+
+
+def linux_mount_id(scratch):
+    fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        text = Path(f'/proc/self/fdinfo/{fd}').read_text()
+        matches = re.findall(r'^mnt_id:\s*([0-9]+)\s*$', text, flags=re.MULTILINE)
+        require(len(matches) == 1, 'Scratch mount ID is unavailable')
+        return int(matches[0]), os.fstat(fd).st_dev
+    finally:
+        os.close(fd)
+
+
+def linux_scratch_volume(inventory, scratch):
+    """Admit an actual writable dataset mount, never an inferred block device."""
+    mount_id, device = linux_mount_id(scratch)
+    matches = [row for row in inventory if row['mount_id'] == mount_id]
+    require(len(matches) == 1, 'Scratch mount could not be uniquely identified')
+    volume = matches[0].copy()
+    point = Path(volume['path'])
+    require(volume['device'] == f'{os.major(device)}:{os.minor(device)}'
+            and scratch.stat().st_dev == device and (scratch == point or point in scratch.parents),
+            'Scratch mount identity differs')
+    require(volume['filesystem'] == 'zfs' and volume['root'] == '/' and not volume['readonly']
+            and os.access(scratch, os.W_OK), 'Scratch must be a writable ZFS dataset mount')
+    dataset = volume['source']
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]*', dataset) is not None, 'Invalid ZFS dataset name')
+    zfs = shutil.which('zfs')
+    require(zfs is not None, 'The installed ZFS command is required')
+    environment = {**os.environ, 'LC_ALL': 'C'}
+    properties = command([zfs, 'get', '-H', '-p', '-o', 'property,value',
+                          'type,mounted,readonly,mountpoint', dataset], environment=environment).stdout.decode().splitlines()
+    values = {}
+    for line in properties:
+        fields = line.split('\t')
+        require(len(fields) == 2 and fields[0] not in values, 'Invalid ZFS dataset properties')
+        values[fields[0]] = fields[1]
+    require(values == {'type': 'filesystem', 'mounted': 'yes', 'readonly': 'off', 'mountpoint': str(point)},
+            'Scratch is not the admitted writable ZFS dataset mount')
+    volume.update(dataset=dataset, dataset_properties=values, zfs_executable=zfs,
+                  zfs_version=command([zfs, '--version'], environment=environment).stdout.decode(errors='replace').strip())
+    return volume
+
+
 def no_mounts_below(binary, base):
-    # Use the installed package's native mount inventory, not a disk-device inventory.
-    records = json.loads(command([binary, "--json", "volumes"]).stdout)
+    # A native-only Linux run has no installed product binary.
+    records = linux_mounts() if binary is None else json.loads(command([binary, "--json", "volumes"]).stdout)
     require(isinstance(records, list) and records, "Mounted-filesystem inventory is unavailable")
     for row in records:
         require(isinstance(row, dict) and isinstance(row.get("path"), str), "Invalid mount inventory")

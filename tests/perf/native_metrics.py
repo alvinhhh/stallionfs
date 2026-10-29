@@ -1,6 +1,6 @@
-"""Native macOS command receipts and conservative paired comparison statistics.
+"""Native command receipts and conservative paired comparison statistics.
 
-Resources runs under /usr/bin/time -lp; timing executes the command directly
+Resources use Darwin time -lp or a fixed GNU time format; timing executes directly
 with blocking reaping and an owned alarm deadline. Both include process startup.
 Timing CPU is the serialized RUSAGE_CHILDREN delta, excluding harness CPU. The
 microsecond representation floor is not a guarantee of accounting accuracy.
@@ -27,11 +27,18 @@ import resource
 import signal
 import statistics
 import subprocess
+import sys
 import threading
 import time
 
 
 TIME = '/usr/bin/time'
+GNU_TIME_FIELDS = {'time_wall_s': ('wall_s', '%e'), 'user_s': ('user_s', '%U'),
+                   'system_s': ('system_s', '%S'), 'rss_bytes': ('rss_kib', '%M'),
+                   'io_input_blocks': ('io_input_blocks', '%I'),
+                   'io_output_blocks': ('io_output_blocks', '%O')}
+GNU_TIME_FORMAT = '\n'.join(f'native-time-v1 {name}={specifier}'
+                            for name, specifier in GNU_TIME_FIELDS.values())
 METRICS = ('wall_s', 'user_s', 'system_s', 'cpu_s', 'rss_bytes',
            'io_input_blocks', 'io_output_blocks')
 TIME_PRECISION = {'user_s': 0.01, 'system_s': 0.01, 'cpu_s': 0.02}
@@ -129,8 +136,13 @@ def _retain_on_failure(receipt, child, alarm, grace_s):
 
 
 def time_diagnostics(stderr):
-    """Return lines outside the supported native time -lp numeric footer."""
+    """Return diagnostics outside this platform's supported numeric footer."""
     text = stderr.decode('utf-8', errors='replace') if isinstance(stderr, bytes) else stderr
+    if sys.platform == 'linux':
+        patterns = [r'native-time-v1 ' + label + '=' + (r'[0-9]+(?:\.[0-9]+)?' if key.endswith('_s') else r'[0-9]+')
+                    for key, (label, _) in GNU_TIME_FIELDS.items()]
+        return [line for line in text.splitlines() if line.strip()
+                and not any(re.fullmatch(pattern, line) for pattern in patterns)]
     labels = (
         'maximum resident set size', 'average shared memory size',
         'average unshared data size', 'average unshared stack size',
@@ -168,6 +180,34 @@ def parse_time(stderr):
         if value is None: errors.append(key)
     result['cpu_s'] = (result['user_s'] + result['system_s']
                        if result['user_s'] is not None and result['system_s'] is not None else None)
+    result['parse_errors'] = errors
+    return result
+
+
+def parse_gnu_time(stderr):
+    """Parse the fixed GNU time format; RSS is KiB, block I/O stays counts."""
+    text = stderr.decode('utf-8', errors='replace') if isinstance(stderr, bytes) else stderr
+    result, errors = {}, []
+    for key, (label, _) in GNU_TIME_FIELDS.items():
+        prefix = f'native-time-v1 {label}='
+        lines = [line for line in text.splitlines() if line.startswith(prefix)]
+        token = lines[0][len(prefix):] if len(lines) == 1 else ''
+        numeric = r'[0-9]+(?:\.[0-9]+)?' if key.endswith('_s') else r'[0-9]+'
+        value = None
+        try:
+            if re.fullmatch(numeric, token):
+                value = float(token) if key.endswith('_s') else int(token)
+                if key == 'rss_bytes': value *= 1024
+                if not math.isfinite(value) or (key == 'rss_bytes' and value == 0): value = None
+        except (ValueError, OverflowError):
+            value = None
+        result[key] = value
+        if value is None: errors.append(key)
+    result['cpu_s'] = (result['user_s'] + result['system_s']
+                       if result['user_s'] is not None and result['system_s'] is not None else None)
+    if result['cpu_s'] is not None and not math.isfinite(result['cpu_s']):
+        result['cpu_s'] = None
+        errors.append('cpu_s')
     result['parse_errors'] = errors
     return result
 
@@ -228,7 +268,9 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
         raise ValueError('Unknown measurement phase')
     environment = dict(os.environ if env is None else env)
     environment['LC_ALL'] = 'C'
-    wrapped = [TIME, '-lp', *arguments] if phase == 'resources' else None
+    linux = sys.platform == 'linux'
+    wrapped = ([TIME, '--format=' + GNU_TIME_FORMAT, '--', *arguments] if linux else
+               [TIME, '-lp', *arguments]) if phase == 'resources' else None
     executed = wrapped if wrapped is not None else arguments
     precision = TIME_PRECISION if phase == 'resources' else TIMING_PRECISION
     receipt = {'phase': phase, 'argv': arguments, 'wrapped_argv': wrapped, 'executed_argv': executed,
@@ -243,6 +285,12 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
                               else 'direct command startup, pipe collection and blocking reap; includes deadline arming'),
                'parse_errors': [],
                **{key: None for key in METRICS}}
+    if linux:
+        receipt['cpu_scope'] = ('command CPU reported by GNU time, rounded per component' if phase == 'resources'
+                                else receipt['cpu_scope'])
+        receipt['rss_scope'] = 'measured process peak; excludes ZFS ARC, kernel and host caches'
+        receipt['resource_units'] = {'rss_bytes': 'GNU time KiB multiplied by 1024',
+                                     'io_input_blocks': 'count', 'io_output_blocks': 'count'}
     alarm = _Alarm() if phase == 'timing' else None  # Reject unsuitable signal ownership before spawning.
     process = None
     interrupted = False
@@ -317,7 +365,7 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
             receipt['stderr_b64'] = base64.b64encode(_bytes(stderr)).decode('ascii')
             receipt['stdout'] = _bytes(stdout).decode('utf-8', errors='replace')
             receipt['stderr'] = _bytes(stderr).decode('utf-8', errors='replace')
-            if phase == 'resources': receipt.update(parse_time(_bytes(stderr)))
+            if phase == 'resources': receipt.update((parse_gnu_time if linux else parse_time)(_bytes(stderr)))
             receipt['ok'] = (receipt['exit_code'] == 0 and not receipt['completion_uncertain']
                              and not receipt['parse_errors'] and not receipt.get('cpu_error') and 'error' not in receipt)
     if interrupted: raise ChildCompletionUnknown(receipt)

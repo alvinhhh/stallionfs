@@ -7,6 +7,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('native_fixtures', Path(__file__).parent/'perf/native_fixtures.py')
 fixtures = importlib.util.module_from_spec(spec)
@@ -76,6 +77,70 @@ class NativeFixtures(unittest.TestCase):
                 self.assertEqual((extras / 'sparse').stat().st_ino, (extras / 'hard-link').stat().st_ino)
                 self.assertEqual((extras / 'space and \n café 🐎').read_bytes(), b'hello')
                 self.assertEqual(os.readlink(extras / 'outside-link'), '/')
+
+
+class LinuxMetadataCoverage(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent/'perf'))
+
+    def test_linux_preparation_keeps_payload_layout_and_uses_posix_acl_and_hole_punch(self):
+        import ctypes
+        import fcntl
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'tree'; root.mkdir()
+            libc = mock.Mock(); libc.fallocate.return_value = 0
+            with mock.patch.object(fixtures.sys, 'platform', 'linux'), \
+                 mock.patch.object(ctypes, 'CDLL', return_value=libc), \
+                 mock.patch.object(fcntl, 'fcntl') as darwin_punch, \
+                 mock.patch.object(os, 'setxattr', create=True) as xattr:
+                receipt = fixtures.enrich_metadata(root, receipt={})
+            data = root/receipt['path']
+            self.assertEqual(data.stat().st_size, 8*1024*1024)
+            with data.open('rb') as stream:
+                self.assertEqual(stream.read(1), b'x')
+                stream.seek(-1, 2); self.assertEqual(stream.read(1), b'y')
+            self.assertEqual((root/'metadata-fixture/subdir/alias').stat().st_ino, data.stat().st_ino)
+            self.assertEqual(receipt['sparse']['interior'], [1024*1024, 7*1024*1024])
+            self.assertIsNone(receipt['resource_fork_bytes'])
+            darwin_punch.assert_not_called()
+            self.assertEqual(libc.fallocate.call_args.args[1:], (3, 1024*1024, 6*1024*1024))
+            self.assertEqual([call.args[1] for call in xattr.call_args_list],
+                             [b'user.stallionfs-test', b'system.posix_acl_access'])
+            acl = bytes.fromhex(receipt['posix_acl_access_hex'])
+            self.assertEqual(struct.unpack_from('<I', acl)[0], 2)
+            self.assertEqual([struct.unpack_from('<HHI', acl, offset)[0] for offset in range(4, len(acl), 8)],
+                             [1, 2, 4, 16, 32])
+
+    def test_linux_coverage_requires_acl_xattr_links_observed_hole_and_allocation(self):
+        import copy
+        import hashlib
+        size = 8*1024*1024
+        receipt = {'platform': 'linux', 'path': 'sparse', 'data_size': size,
+                   'posix_acl_access_hex': '0200000002000400feff0000', 'hardlinks': ['alias', 'sparse'],
+                   'sparse': {'size': size, 'interior': [1024*1024, 7*1024*1024], 'endpoints': True}}
+        entry = {'kind': 'file', 'size': size, 'device_inode': [1, 2], 'allocated_bytes': 8192,
+                 'acl': {'access_hex': receipt['posix_acl_access_hex'], 'unavailable': None},
+                 'xattrs': {b'user.stallionfs-test'.hex(): fixtures.METADATA_XATTRS[b'user.stallionfs-test'].hex()},
+                 'holes': {'ranges': [[4096, size-4096]], 'unavailable': None},
+                 'sha256': hashlib.sha256(b'x' + bytes(size-2) + b'y').hexdigest()}
+        observed = {'entries': {'sparse': entry, 'alias': copy.deepcopy(entry)}, 'unavailable_fields': [],
+                    'metadata_capabilities': {'platform': 'linux'}, 'hardlink_groups': [['alias', 'sparse']]}
+        self.assertTrue(fixtures.verify_metadata_coverage(observed, receipt)['populated'])
+        for defect in ('acl', 'xattr', 'links', 'inode', 'holes', 'unknown_holes', 'allocation', 'payload', 'unavailable'):
+            changed = copy.deepcopy(observed); row = changed['entries']['sparse']
+            if defect == 'acl': row['acl']['access_hex'] = None
+            elif defect == 'xattr': row['xattrs'] = {}
+            elif defect == 'links': changed['hardlink_groups'] = []
+            elif defect == 'inode': row['device_inode'] = [2, 3]
+            elif defect == 'holes': row['holes']['ranges'] = []
+            elif defect == 'unknown_holes': row['holes']['ranges'] = None
+            elif defect == 'allocation': row['allocated_bytes'] = size
+            elif defect == 'payload': row['sha256'] = '0'*64
+            elif defect == 'unavailable': changed['unavailable_fields'] = ['acl']
+            with self.subTest(defect=defect), self.assertRaises(RuntimeError):
+                fixtures.verify_metadata_coverage(changed, receipt)
 
 
 class MetadataCoverage(unittest.TestCase):

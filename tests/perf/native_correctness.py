@@ -95,6 +95,22 @@ def _darwin_metadata_api():
 
 def _acl(path):
     """Read the final entry's extended ACL, including a symlink's own ACL."""
+    if sys.platform == "linux":
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return {"unavailable": None, "unsupported": "Linux symlinks do not have POSIX ACLs"}
+        result = {"access_hex": None, "unavailable": None}
+        names = [("access_hex", "system.posix_acl_access")]
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            result["default_hex"] = None
+            names.append(("default_hex", "system.posix_acl_default"))
+        for key, name in names:
+            try:
+                result[key] = os.getxattr(path, name, follow_symlinks=False).hex()
+            except OSError as error:
+                if error.errno == errno.ENODATA: continue
+                if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}: raise
+                result["unavailable"] = f"POSIX ACL xattr: errno {error.errno}"
+        return result
     if sys.platform != "darwin":
         return {"text_hex": None, "unavailable": "No supported no-follow ACL reader on this platform"}
     libc = _darwin_metadata_api()
@@ -254,18 +270,33 @@ def snapshot(root, *, allow_special=False, observe_sharing=False):
         entries[os.fsdecode(relative)] = row
 
     visit(root, b"")
+    capabilities = {"platform": sys.platform,
+                    "flags": sys.platform == "darwin", "resource_fork": sys.platform == "darwin",
+                    "acl": ("Darwin extended ACL" if sys.platform == "darwin" else
+                            "Linux POSIX access/default ACL xattrs; no symlink ACL" if sys.platform == "linux" else None)}
     return {"entries": dict(sorted(entries.items())),
+            "metadata_capabilities": capabilities,
+            "unsupported_fields": ({"flags": "Darwin st_flags is not a Linux copy property",
+                                     "resource_fork": "User xattrs are not Darwin resource forks",
+                                     "symlink_acl": "Linux symlinks do not have POSIX ACLs"}
+                                    if sys.platform == "linux" else {}),
             "hardlink_groups": sorted(sorted(group) for group in links.values() if len(group) > 1),
-            "unavailable_fields": (["flags"] if any(row["flags"] is None for row in entries.values()) else [])
+            "unavailable_fields": (["flags"] if sys.platform != "linux" and any(row["flags"] is None for row in entries.values()) else [])
                                   + (["acl"] if any(row["acl"]["unavailable"] for row in entries.values()) else []),
             "excluded_from_copy_equality": EXCLUDED.copy(),
-            "physical_sharing": ("Data-stream clone attributes recorded; resource-fork sharing and disk savings are not measured."
+            "physical_sharing": ("Not measured; inode and st_blocks do not establish physical sharing."
+                                 if sys.platform == "linux" else
+                                 "Data-stream clone attributes recorded; resource-fork sharing and disk savings are not measured."
                                  if observe_sharing else
                                  "Not measured; inode and st_blocks do not establish APFS extent sharing.")}
 
 
 def _differences(expected, actual):
     differences = []
+    if expected.get("metadata_capabilities") != actual.get("metadata_capabilities"):
+        differences.append({"path": None, "field": "metadata_capabilities",
+                            "expected": expected.get("metadata_capabilities"),
+                            "actual": actual.get("metadata_capabilities")})
     for path in sorted(expected["entries"].keys() | actual["entries"].keys()):
         left, right = expected["entries"].get(path), actual["entries"].get(path)
         if left is None or right is None:

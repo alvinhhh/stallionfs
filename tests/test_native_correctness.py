@@ -28,6 +28,56 @@ class NativeCorrectness(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_linux_capabilities_allow_unsupported_flags_but_require_observed_acl(self):
+        path = self.base / 'linux-file'; path.write_bytes(b'contents')
+        acl = {'access_hex': '02000000', 'unavailable': None}
+        with mock.patch.object(checks.sys, 'platform', 'linux'), \
+             mock.patch.object(checks, '_acl', return_value=acl), mock.patch.object(checks, '_xattrs', return_value={}):
+            observed = checks.snapshot(path)
+            observed['entries']['']['flags'] = None
+            self.assertNotIn('flags', observed['unavailable_fields'])
+            self.assertFalse(observed['metadata_capabilities']['flags'])
+            self.assertFalse(observed['metadata_capabilities']['resource_fork'])
+            self.assertTrue(checks.compare(observed, deepcopy(observed))['strict_equal'])
+            changed = deepcopy(observed)
+            changed['entries']['']['acl']['access_hex'] = None
+            self.assertFalse(checks.compare(observed, changed)['strict_equal'])
+            with mock.patch.object(checks, '_acl', return_value={'access_hex': None, 'unavailable': 'unsupported'}):
+                unavailable = checks.snapshot(path)
+            self.assertFalse(checks.compare(unavailable, unavailable)['strict_equal'])
+            self.assertIn('acl', unavailable['unavailable_fields'])
+        with mock.patch.object(checks.sys, 'platform', 'darwin'), \
+             mock.patch.object(checks, '_acl', return_value={'text_hex': None, 'unavailable': None}), \
+             mock.patch.object(checks, '_xattrs', return_value={}):
+            darwin = checks.snapshot(path)
+        self.assertTrue(darwin['metadata_capabilities']['flags'])
+        self.assertTrue(darwin['metadata_capabilities']['resource_fork'])
+        self.assertFalse(checks.compare(observed, darwin)['strict_equal'])
+
+    def test_linux_acl_reads_access_and_default_xattrs_without_following_links(self):
+        path = self.base / 'directory'; path.mkdir()
+        link = self.base / 'link'; link.symlink_to(path)
+        with mock.patch.object(checks.sys, 'platform', 'linux'), \
+             mock.patch.object(checks.os, 'getxattr', create=True, side_effect=[b'access', b'default']) as get:
+            acl = checks._acl(path)
+            self.assertEqual((acl['access_hex'], acl['default_hex']), (b'access'.hex(), b'default'.hex()))
+            self.assertEqual(get.call_args_list, [mock.call(path, 'system.posix_acl_access', follow_symlinks=False),
+                                                 mock.call(path, 'system.posix_acl_default', follow_symlinks=False)])
+            get.reset_mock()
+            self.assertIsNone(checks._acl(link)['unavailable'])
+            self.assertIn('unsupported', checks._acl(link))
+            get.assert_not_called()
+        file = self.base / 'file'; file.touch()
+        for code, unavailable in ((errno.ENODATA, False), (errno.ENOTSUP, True)):
+            with mock.patch.object(checks.sys, 'platform', 'linux'), \
+                 mock.patch.object(checks.os, 'getxattr', create=True, side_effect=OSError(code, 'test')):
+                acl = checks._acl(file)
+                self.assertIsNone(acl['access_hex'])
+                self.assertEqual(bool(acl['unavailable']), unavailable)
+        with mock.patch.object(checks.sys, 'platform', 'linux'), \
+             mock.patch.object(checks.os, 'getxattr', create=True, side_effect=PermissionError(errno.EACCES, 'denied')), \
+             self.assertRaises(PermissionError): checks._acl(file)
+
     def test_content_metadata_symlink_bytes_and_access_time_exclusion(self):
         root = self.base / "source"
         root.mkdir()
