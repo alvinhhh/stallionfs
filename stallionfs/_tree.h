@@ -29,7 +29,8 @@ int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_
 
 /* Ordinary byte copy on macOS 13+, including across volumes that can preserve
  * the required metadata and sparse ranges. Destination must be absent. Parents
- * must meet the directory-clone protection rules below. Failures can leave
+ * must meet the directory-clone protection rules below. Leaf-copy parents must
+ * not grant inheritable file access to other principals. Failures can leave
  * partial output at the requested destination; workers are joined before return.
  */
 int stallion_copy(const char *source, const char *destination, unsigned workers,

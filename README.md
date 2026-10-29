@@ -76,6 +76,21 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+## Performance
+
+0.6.3 · macOS 27 arm64 · warm generated fixtures · October 24–29, 2026. Median elapsed times, including command startup, from ten timing pairs per comparison.
+
+| Operation | Native reference | Native | stallionfs |
+| --- | --- | ---: | ---: |
+| [Copy a 4 KiB file](tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) | `cp -Rp` | 4.857 ms | 5.861 ms |
+| [Move a 4 KiB file](tests/perf/results/native-move-tiny-20261024-arm64.json.xz) | `mv -n` | 3.758 ms | 4.704 ms |
+| [Scan 20,000 files in one folder](tests/perf/results/native-scan-flat-20261024-arm64.json.xz) | `find` + batched `stat` | 14.146 s | 33.494 ms |
+| [Scan 20,000 files across nested folders](tests/perf/results/native-scan-nested-20261024-arm64.json.xz) | `find` + batched `stat` | 12.784 s | 17.051 ms |
+| [Scan 20,000 files along a 40-folder chain](tests/perf/results/native-scan-deep40-20261024-arm64.json.xz) | `find` + batched `stat` | 13.018 s | 32.026 ms |
+| [Clone a document tree, 5,002 files, `--jobs 1`](tests/perf/results/native-clone-docs-jobs1-20261029-arm64.json.xz) | `ditto --rsrc --extattr --acl` | 754.396 ms | 572.289 ms |
+
+[CPU, memory and full results](tests/perf/README.md).
+
 ## Contributing
 
 [Open an issue](https://github.com/alvinhhh/stallionfs/issues) for bugs or feature requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions and tests, or [SECURITY.md](SECURITY.md) to report a vulnerability.

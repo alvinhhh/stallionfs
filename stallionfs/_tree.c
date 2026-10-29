@@ -319,6 +319,14 @@ static int ordinary_metadata(int input, int output, const struct stat *identity,
     errno = error;
     return error ? -1 : 0;
 }
+static int clear_acl(int fd) {
+    acl_t acl = acl_init(0);
+    if (!acl) return -1;
+    int result = acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED), error = errno;
+    acl_free(acl);
+    errno = error;
+    return result;
+}
 static int first_inode(enum operation operation, struct tree *tree, int input, int parent,
                         const char *name, const struct stat *identity,
                         stallion_cancel_fn cancel, void *context) {
@@ -356,6 +364,8 @@ static int first_inode(enum operation operation, struct tree *tree, int input, i
         (identity->st_mode & S_IFMT) != (opened.st_mode & S_IFMT))) error = ESTALE;
     if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
     if (!error && !same_object(&opened, &created)) error = ESTALE;
+    /* Inherited read access must be removed before data or xattrs are copied. */
+    if (!error && clear_acl(output)) error = errno;
     if (!error && ordinary_metadata(input, output, identity,
         S_ISREG(identity->st_mode) ? COPYFILE_ALL | COPYFILE_DATA_SPARSE : COPYFILE_METADATA, &progress)) error = errno;
     if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
@@ -821,7 +831,7 @@ static int outside_source(int parent, const struct stat *source) {
     return error ? -1 : 0;
 }
 
-static int check_acl(int fd, uid_t owner, int private) {
+static int check_acl(int fd, uid_t owner, int private, int leaf_copy) {
     acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
     /* Darwin reports ENOENT when a pinned directory has no extended ACL. */
     if (!acl) { if (errno == ENOENT) { errno = 0; return 0; } if (!errno) errno = EIO; return -1; }
@@ -845,7 +855,15 @@ static int check_acl(int fd, uid_t owner, int private) {
         if (permissions & ~known) { error = EINVAL; break; }
         if (tag == ACL_EXTENDED_DENY) continue;
         if (tag != ACL_EXTENDED_ALLOW) { error = EINVAL; break; }
-        if (!(private ? permissions : permissions & mutations)) continue;
+        int inherited = 0;
+        /* An inherited grant can open a leaf before its ACL is cleared. */
+        if (leaf_copy && permissions) {
+            acl_flagset_t flags;
+            if (acl_get_flagset_np(entry, &flags)) { error = errno ? errno : EIO; break; }
+            inherited = acl_get_flag_np(flags, ACL_ENTRY_FILE_INHERIT);
+            if (inherited < 0) { error = errno ? errno : EIO; break; }
+        }
+        if (!(private ? permissions : permissions & mutations) && !inherited) continue;
         if (!have_user) {
             error = mbr_uid_to_uuid(owner, user);
             if (error) break;
@@ -862,14 +880,14 @@ static int check_acl(int fd, uid_t owner, int private) {
 }
 
 /* Other users must not be able to replace our private staging directory. */
-static int protected_parent(int fd, dev_t device, enum operation operation) {
+static int protected_parent(int fd, dev_t device, enum operation operation, int leaf_copy) {
     struct stat st;
     if (fstat(fd, &st)) return -1;
     if (operation == CLONING && st.st_dev != device) { errno = EXDEV; return -1; }
     if ((st.st_uid != geteuid() && st.st_uid != 0) || (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) {
         errno = EPERM; return -1;
     }
-    return check_acl(fd, geteuid(), 0);
+    return check_acl(fd, geteuid(), 0, leaf_copy);
 }
 
 int stallion_private_directory(const char *path) {
@@ -887,18 +905,10 @@ int stallion_private_directory(const char *path) {
     int error = 0;
     if (fstat(fd, &st)) error = errno;
     else if (st.st_uid != getuid() || (st.st_mode & 0077)) error = EPERM;
-    else if (check_acl(fd, getuid(), 1)) error = errno;
+    else if (check_acl(fd, getuid(), 1, 0)) error = errno;
     if (close(fd) && !error) error = errno;
     errno = error;
     return error ? -1 : 0;
-}
-static int clear_acl(int fd) {
-    acl_t acl = acl_init(0);
-    if (!acl) return -1;
-    int result = acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED), error = errno;
-    acl_free(acl);
-    errno = error;
-    return result;
 }
 static int no_mounts(int fd) {
     char canonical[PATH_MAX];
@@ -938,14 +948,15 @@ static int clone_impl(const char *source_path, const char *destination_path, int
     }
     if (!error && open_path(destination_path, &destination, 0)) error = errno;
     if (!error && destination.trailing_slash && !S_ISDIR(identity.st_mode)) error = ENOTDIR;
-    if (!error && operation == COPYING && protected_parent(destination.parent, identity.st_dev, operation)) error = errno;
+    if (!error && operation == COPYING && protected_parent(destination.parent, identity.st_dev, operation,
+                                                          !S_ISDIR(identity.st_mode))) error = errno;
     if (!error && !S_ISDIR(identity.st_mode)) {
         /* Both creation paths refuse an existing final entry. */
         if (cancel && cancel(context)) error = EINTR;
         else if (first_inode(operation, NULL, input, destination.parent, destination.name, &identity, cancel, context)) error = errno;
         goto done;
     }
-    if (!error && operation == CLONING && protected_parent(destination.parent, identity.st_dev, operation)) error = errno;
+    if (!error && operation == CLONING && protected_parent(destination.parent, identity.st_dev, operation, 0)) error = errno;
     if (!error && outside_source(destination.parent, &identity)) error = errno;
     if (!error && (output = open_created_directory(destination.parent, destination.name)) < 0) error = errno;
     /* Keep all children private until the final root-metadata copy. */

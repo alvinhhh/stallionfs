@@ -107,6 +107,36 @@ class OrdinaryCopy(unittest.TestCase):
         self.copy(source, destination)
         self.assert_preserved(before, destination)
 
+    def test_root_file_parent_acl_guards_data_and_resource_fork_before_creation(self):
+        source = self.base / 'private-source'
+        source.write_bytes(b'private content')
+        source.chmod(0o600)
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.ResourceFork', 'private resource fork', str(source)],
+                       check=True, capture_output=True, timeout=15)
+        before = self.checks.snapshot(source)
+        user = pwd.getpwuid(os.getuid()).pw_name
+        cases = [('clean', None, True),
+                 ('parent-read', 'everyone allow read,readextattr', True),
+                 ('owner-inherit', f'user:{user} allow read,readextattr,file_inherit', True),
+                 ('foreign-read-inherit', 'everyone allow read,file_inherit', False),
+                 ('foreign-xattr-inherit', 'everyone allow readextattr,file_inherit', False)]
+        for name, acl, allowed in cases:
+            with self.subTest(parent=name):
+                parent = self.base / name
+                parent.mkdir(mode=0o755)
+                if acl:
+                    subprocess.run(['/bin/chmod', '+a', acl, str(parent)],
+                                   check=True, capture_output=True, timeout=15)
+                destination = parent / 'copy'
+                if allowed:
+                    self.copy(source, destination, jobs=1)
+                    self.assert_preserved(before, destination)
+                else:
+                    with self.assertRaises(PermissionError):
+                        self.copy(source, destination, jobs=1)
+                    self.assertFalse(os.path.lexists(destination))
+        self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
+
     def test_root_symlink_copies_its_own_metadata_without_following(self):
         outside = self.base / 'outside'
         outside.write_bytes(b'outside stays untouched')
