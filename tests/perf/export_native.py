@@ -27,7 +27,7 @@ MAX_SCAN_BYTES = 4 * 1024 * 1024
 MAX_SCAN_COMPRESSED = 1024 * 1024
 JOURNAL_KINDS = ('rows', 'preparation', 'metadata_preparation', 'comparisons', 'unavailable')
 SELECTION_FIELDS = frozenset({'binary', 'scratch', 'output', 'samples', 'runs',
-                             'cache', 'fixtures', 'copy_tools', 'operations', 'timeout'})
+                             'cache', 'fixtures', 'copy_tools', 'operations', 'timeout', 'jobs'})
 DEPENDENCY_SELECTION_FIELDS = frozenset({'node', 'npm', 'npm_cache'})
 LOCKED_DEPENDENCY_INPUTS = {
     'package.json': '6c0c343e91ab0689397ad98e0c52417f6f71024582856b376cec5b33f7afd160',
@@ -296,6 +296,9 @@ def require_generated(report, *, dependency_runs=None):
     allowed_selection = SELECTION_FIELDS | (DEPENDENCY_SELECTION_FIELDS if installed else set())
     if set(selection) - allowed_selection:
         raise ValueError('Unknown selection fields; input policy needs review')
+    jobs = selection.get('jobs')
+    if jobs is not None and (type(jobs) is not int or not 1 <= jobs <= 4):
+        raise ValueError('Invalid jobs selection')
     allowed_fixtures = GENERATED_FIXTURES | SCAN_FIXTURES | {'installed_dependencies'}
     if not isinstance(names, list) or not names or any(name not in allowed_fixtures for name in names):
         raise ValueError('Only explicitly allowed generated fixtures may be exported')
@@ -304,7 +307,7 @@ def require_generated(report, *, dependency_runs=None):
         if any(name not in SCAN_FIXTURES for name in names) or selection.get('operations') != ['scan']:
             raise ValueError('Scan export requires only existing scan fixtures and the scan operation')
     elif 'operations' in selection and (not isinstance(selection['operations'], list)
-            or any(operation not in ('clone', 'move', 'delete') for operation in selection['operations'])):
+            or any(operation not in ('clone', 'copy', 'move', 'delete') for operation in selection['operations'])):
         raise ValueError('Unknown operation export policy')
     sources = report.get('source_sha256')
     if not isinstance(sources, dict) or not re.fullmatch('[0-9a-f]{64}', str(sources.get('native_suite.py', ''))):

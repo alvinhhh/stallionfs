@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -30,8 +31,10 @@ def _command(*args):
     result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077)
     if result.returncode:
-        raise _error(f"{args[0]} failed ({result.returncode}): "
-                           + result.stderr.decode(errors="replace").strip())
+        error = _error(f"{args[0]} failed ({result.returncode}): "
+                       + result.stderr.decode(errors="replace").strip())
+        error.returncode = result.returncode
+        raise error
     return result.stdout
 
 
@@ -175,8 +178,10 @@ def attach(image, mountpoint):
 
 def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
+    from .core import StallionError
     image, point = _image(image), _path(mountpoint)
     _directory(point.parent)
+    identity = image.stat()
     current = mounted(image)
     if not current:
         if os.path.ismount(point):
@@ -184,7 +189,27 @@ def detach(image, mountpoint):
         return
     if current['mountpoint'] not in (None, str(point)):
         raise _error(f"Image is mounted at a different path: {current['mountpoint']}")
-    _command('/usr/bin/hdiutil', 'detach', current['device'])
+    try:
+        _command('/usr/bin/hdiutil', 'detach', current['device'])
+    except StallionError as original:
+        if getattr(original, 'returncode', None) != errno.EBUSY:
+            raise
+        try:
+            remaining = mounted(image)
+            from ._scan import mounts
+            unmounted = (remaining is not None and remaining['device'] == current['device'] and
+                         remaining['mountpoint'] is None and remaining['volume_device'] is None and
+                         not os.path.ismount(point) and
+                         not any(m['device'] in (current['device'], current['volume_device']) or
+                                 Path(m['path']).is_relative_to(point) for m in mounts()))
+            after = image.stat()
+            unchanged = (identity.st_dev, identity.st_ino) == (after.st_dev, after.st_ino)
+        except (OSError, StallionError) as inspection:
+            raise original from inspection
+        if not unmounted or not unchanged:
+            raise
+        # A normal detach may unmount successfully but fail at the final image eject.
+        _command('/usr/bin/hdiutil', 'detach', remaining['device'])
     if mounted(image) is not None or os.path.ismount(point):
         raise _error(f"Image remains attached; keep its files: {image}")
 

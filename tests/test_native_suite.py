@@ -159,7 +159,7 @@ class NativeSuite(unittest.TestCase):
         operation = ('scan' if argv[0] == '/usr/bin/find' or (candidate and argv[1:3] == ['--json', 'scan']) else
                      argv[1] if candidate else 'move' if argv[0] == '/bin/mv' else 'delete' if argv[0] == '/bin/rm' else 'clone')
         stdout = b''
-        if operation == 'clone': shutil.copy2(argv[-2], argv[-1])
+        if operation in ('clone', 'copy'): shutil.copy2(argv[-2], argv[-1])
         elif operation == 'move': Path(argv[-2]).rename(argv[-1])
         elif operation == 'delete': Path(argv[-1]).unlink()
         elif operation == 'scan':
@@ -231,6 +231,24 @@ class NativeSuite(unittest.TestCase):
             self.assertFalse(self.output.with_name(self.output.name + '.journal').exists())
         self.assertEqual(self.measured, [])
 
+    def test_unknown_operation_fails_before_creating_or_removing_operands(self):
+        source = self.root / 'source'; source.write_bytes(b'keep source')
+        destination = self.root / 'destination'; destination.write_bytes(b'keep destination')
+        for method in ('stallionfs', 'cp', 'delete'):
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, 'Unknown operation'):
+                suite.arguments(method, 'unsupported', self.binary, source, destination)
+        with self.assertRaises(SystemExit) as caught, redirect_stdout(io.StringIO()), \
+                mock.patch.object(sys, 'stderr', io.StringIO()):
+            self.run_suite(operations=('unsupported',))
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(source.read_bytes(), b'keep source')
+        self.assertEqual(destination.read_bytes(), b'keep destination')
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.fixture_calls, [])
+        self.assertEqual(self.measured, [])
+        self.assertFalse(list(self.root.glob('native-suite-*')))
+        self.assertFalse(self.output.exists())
+
     def test_scratch_creation_failure_closes_and_finalizes_failed_report(self):
         with mock.patch.object(suite.tempfile, 'mkdtemp', side_effect=OSError('scratch denied')):
             with self.assertRaisesRegex(OSError, 'scratch denied'):
@@ -294,12 +312,47 @@ class NativeSuite(unittest.TestCase):
     def test_single_run_is_partial_collection_with_ten_pairs(self):
         report = self.run_suite(extra=('--runs', '1'))
         self.assertEqual(report['selection']['runs'], 1)
+        self.assertNotIn('jobs', report['selection'])
+        self.assertTrue(all('--jobs' not in row['argv'] for row in report['rows']))
         self.assertEqual(len(self.fixture_calls), 1)
         self.assertEqual(len(report['rows']), 40)
         self.assertTrue(report['passed'])
         self.assertFalse(report['all_metrics_won'])
         self.assertIn('three consecutive complete campaigns', report['limits'][0])
         self.assertTrue(report['cleanup_passed'])
+
+    def test_jobs_selection_reaches_collector_and_report(self):
+        for jobs in range(1, 5):
+            for scan in (False, True):
+                with self.subTest(jobs=jobs, scan=scan):
+                    self.output = self.root / f'jobs-{jobs}-scan-{scan}.json'
+                    self.measured.clear()
+                    report = self.run_suite(
+                        operations=('scan',) if scan else ('clone', 'copy', 'move', 'delete'),
+                        fixture='scan_flat_20k' if scan else 'tiny_4kib',
+                        extra=('--runs', '1', '--jobs', str(jobs)))
+                    self.assertEqual(self.exit_code, 0)
+                    self.assertTrue(report['passed'])
+                    self.assertTrue(report['cleanup_passed'])
+                    self.assertEqual(report['selection']['jobs'], jobs)
+                    self.assertEqual([row['argv'] for row in report['rows']], self.measured)
+                    self.assertEqual(len(report['rows']), 40 if scan else 160)
+                    for row in report['rows']:
+                        if row['method'] == 'stallionfs' and row['operation'] != 'move':
+                            index = {'clone': 2, 'copy': 2, 'delete': 3, 'scan': 3}[row['operation']]
+                            self.assertEqual(row['argv'][index:index + 2], ['--jobs', str(jobs)])
+                        else:
+                            self.assertNotIn('--jobs', row['argv'])
+
+    def test_jobs_outside_supported_bounds_fail_before_creating_evidence(self):
+        for jobs in ('0', '5', '-1'):
+            with self.subTest(jobs=jobs), mock.patch.object(sys, 'stderr', io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_suite(extra=('--jobs', jobs))
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(self.output.exists())
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.measured, [])
 
     def test_three_runs_ten_pairs_keep_selection_and_source_validation(self):
         report = self.run_suite()
@@ -341,6 +394,79 @@ class NativeSuite(unittest.TestCase):
             self.assertEqual('rss_bytes' in comparison['metrics'], comparison['phase'] == 'resources')
         self.assertTrue(all(row['metrics']['wall_s']['complete_pairs'] == 10 for row in report['comparisons']))
         self.assertFalse(list(self.root.glob('native-suite-*')))
+
+    def test_copy_uses_ordinary_cp_and_existing_pairs_without_clone_sharing(self):
+        def no_sharing(*args):
+            self.fail('Ordinary copy must not require COW sharing')
+        report = self.run_suite(operations=('copy',), sharing=no_sharing)
+        self.assertEqual(self.exit_code, 0)
+        self.assertTrue(report['passed'])
+        self.assertTrue(report['cleanup_passed'])
+        self.assertEqual(report['selection']['operations'], ['copy'])
+        self.assertEqual(len(self.fixture_calls), 3)
+        self.assertEqual(len(self.metadata_calls), 3)
+        self.assertEqual(len(self.coverage_calls), 3)
+        self.assertEqual(report['preparation'], [])
+        self.assertEqual(len(report['rows']), 120)
+        self.assertEqual({row['reference'] for row in report['rows']}, {'cp'})
+        self.assertEqual({row['operation'] for row in report['rows']}, {'copy'})
+        self.assertTrue(all(not options.get('observe_sharing', False) for options in self.snapshot_options))
+        self.assertFalse(any(argv[0] == '/usr/bin/ditto' for argv in self.commands))
+        for run in range(3):
+            for phase in ('timing', 'resources'):
+                for pair in range(10):
+                    rows = [row for row in report['rows'] if (row['run'], row['phase'], row['pair_id']) == (run, phase, pair)]
+                    self.assertEqual({row['method'] for row in rows}, {'cp', 'stallionfs'})
+                    self.assertEqual(len(rows), 2)
+                    for row in rows:
+                        prefix = [str(self.binary), 'copy'] if row['method'] == 'stallionfs' else ['/bin/cp', '-Rp']
+                        self.assertEqual(row['argv'][:2], prefix)
+                        self.assertEqual(Path(row['argv'][-2]).name, 'tiny')
+                        self.assertTrue(row['validated'] and row['source_unchanged'])
+                        self.assertTrue(row['correctness']['independent_clone'])
+                        self.assertNotIn('data_stream_sharing', row)
+        self.assertEqual(report['comparisons'], suite.summarize_report(report['rows'], 10))
+        self.assertEqual(len(report['comparisons']), 6)
+        self.assertTrue(all(item['metrics']['wall_s']['complete_pairs'] == 10 for item in report['comparisons']))
+
+    def test_copy_requires_existing_metadata_hardlink_and_sparse_oracle(self):
+        verify = self.verify_clone
+        for failure in ('metadata', 'hardlink_groups', 'sparse_lost', 'sparse_unknown'):
+            with self.subTest(failure=failure):
+                self.output = self.root / f'copy-{failure}.json'
+                self.measured.clear()
+                def reject(before, after):
+                    result = verify(before, after)
+                    if failure.startswith('sparse'):
+                        result['sparse_preserved'] = False if failure == 'sparse_lost' else None
+                    else:
+                        result.update(strict_equal=False, candidate_losses=[{'field': failure}])
+                    return result
+                with mock.patch.object(self, 'verify_clone', side_effect=reject), \
+                        mock.patch.object(suite.random.Random, 'shuffle', side_effect=lambda methods: None):
+                    report = self.run_suite(operations=('copy',))
+                self.assertFalse(report['passed'])
+                self.assertEqual(self.exit_code, 1)
+                self.assertEqual(len(self.measured), 1)
+                self.assertEqual(report['rows'][0]['method'], 'cp')
+                self.assertFalse(report['rows'][0]['validated'])
+                if not failure.startswith('sparse'):
+                    self.assertEqual(report['rows'][0]['correctness']['candidate_losses'], [{'field': failure}])
+                self.assertTrue(report['rows'][0]['source_unchanged'])
+                self.assertTrue(report['unavailable'])
+                self.assertFalse(any(item['complete'] for item in report['comparisons']))
+
+    def test_copy_source_alias_is_rejected(self):
+        def alias(argv, **kwargs):
+            receipt = self.collect(argv, **kwargs)
+            Path(argv[-1]).unlink()
+            os.link(argv[-2], argv[-1])
+            return receipt
+        report = self.run_suite(operations=('copy',), collector=alias)
+        self.assertFalse(report['passed'])
+        self.assertEqual(len(self.measured), 1)
+        self.assertFalse(report['rows'][0]['correctness']['independent_clone'])
+        self.assertFalse(report['rows'][0]['validated'])
 
     def test_enrichment_failure_retains_partial_fixture_before_measurement(self):
         def enrich(root, **options):
@@ -515,9 +641,38 @@ class NativeSuite(unittest.TestCase):
                 expected_source = str(source) + ('/' if method == 'rsync' and source == directory else '')
                 self.assertEqual(suite.arguments(method, 'clone', self.binary, source, destination),
                                  prefix + [expected_source, str(destination)])
+        link = self.root / 'link'; link.symlink_to('missing')
+        for source in (directory, file, link):
+            self.assertEqual(suite.arguments('cp', 'copy', self.binary, source, destination),
+                             ['/bin/cp', '-Rp', str(source), str(destination)])
+            self.assertEqual(suite.arguments('stallionfs', 'copy', self.binary, source, destination),
+                             [str(self.binary), 'copy', str(source), str(destination)])
+        for operation, method in (('copy', 'cp-clone'), ('copy', 'rsync'), ('move', 'cp'), ('delete', 'cp')):
+            with self.subTest(operation=operation, method=method), self.assertRaisesRegex(ValueError, 'Unknown operation reference'):
+                suite.arguments(method, operation, self.binary, file, destination)
         self.assertEqual(suite.arguments('move', 'move', self.binary, file, destination), ['/bin/mv', '-n', str(file), str(destination)])
         self.assertEqual(suite.arguments('delete', 'delete', self.binary, file, destination), ['/bin/rm', '-rf', str(file)])
         self.assertEqual(suite.arguments('stallionfs', 'delete', self.binary, file, destination), [str(self.binary), 'delete', '--recursive', str(file)])
+
+    def test_jobs_argument_placement_and_unchanged_native_and_move_commands(self):
+        source, destination = self.root / 'source', self.root / 'destination'
+        unchanged = [(method, 'clone') for method in suite.COPY_TOOLS] + [
+            ('cp', 'copy'), ('move', 'move'), ('delete', 'delete'),
+            ('find-stat', 'scan'), ('stallionfs', 'move')]
+        for jobs in (None, 1, 2, 3, 4):
+            options = [] if jobs is None else ['--jobs', str(jobs)]
+            commands = {'clone': [str(self.binary), 'clone', *options, str(source), str(destination)],
+                        'copy': [str(self.binary), 'copy', *options, str(source), str(destination)],
+                        'delete': [str(self.binary), 'delete', '--recursive', *options, str(source)],
+                        'scan': [str(self.binary), '--json', 'scan', *options, str(source)]}
+            for operation, expected in commands.items():
+                with self.subTest(jobs=jobs, operation=operation):
+                    self.assertEqual(suite.arguments('stallionfs', operation, self.binary, source, destination, jobs=jobs),
+                                     expected)
+            for method, operation in unchanged:
+                with self.subTest(jobs=jobs, method=method, operation=operation):
+                    self.assertEqual(suite.arguments(method, operation, self.binary, source, destination, jobs=jobs),
+                                     suite.arguments(method, operation, self.binary, source, destination))
 
     def test_cold_purge_failure_is_attempted_once_and_never_relabelled_warm(self):
         report = self.run_suite(cache=('cold', 'warm'))
@@ -764,8 +919,8 @@ class NativeSuite(unittest.TestCase):
 
     def test_post_command_snapshot_exception_retains_evidence(self):
         snapshot = self.snapshot
-        cases = [('clone', 'tiny'), ('move', 'tiny'), ('delete', 'tiny'),
-                 ('clone', 'destination'), ('move', 'destination')]
+        cases = [('clone', 'tiny'), ('copy', 'tiny'), ('move', 'tiny'), ('delete', 'tiny'),
+                 ('clone', 'destination'), ('copy', 'destination'), ('move', 'destination')]
         for operation, failed_path in cases:
             for phase, metrics in suite.native_metrics.PHASE_METRICS.items():
                 for error_type in (FileNotFoundError, OSError, RuntimeError):
@@ -808,7 +963,7 @@ class NativeSuite(unittest.TestCase):
             result = self.collect(argv, **kwargs)
             Path(argv[-1]).write_bytes(b'invalid destination')
             return result
-        for operation in ('clone', 'move'):
+        for operation in ('clone', 'copy', 'move'):
             with self.subTest(operation=operation):
                 self.output = self.root / f'invalid-destination-{operation}.json'
                 self.measured.clear()
