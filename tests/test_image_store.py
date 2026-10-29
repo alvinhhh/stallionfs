@@ -1,10 +1,12 @@
 """Real disk-image lifecycle checks; enable with STALLIONFS_TEST_IMAGES=1."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 import tempfile
 import traceback
 import unittest
@@ -103,6 +105,91 @@ def image_fixture(store, base):
 
 
 class ImageRecoveryTests(unittest.TestCase):
+    def test_image_command_preserves_machine_status(self):
+        from stallionfs import images
+        result = subprocess.CompletedProcess(['owned-command'], errno.EBUSY, b'', b'localized busy message')
+        with patch.object(images.subprocess, 'run', return_value=result):
+            with self.assertRaises(StallionError) as raised:
+                images._command('owned-command')
+        self.assertEqual(raised.exception.returncode, errno.EBUSY)
+        self.assertIn('localized busy message', str(raised.exception))
+
+    def test_detach_completes_only_verified_unmounted_busy_attachment_once(self):
+        from stallionfs import images, _scan
+        cases = ('success', 'still-mounted', 'changed-device', 'changed-image', 'inspection-error',
+                 'mount-inventory-error', 'unrelated-mountpoint', 'volume-still-mounted',
+                 'unrelated-volume', 'already-detached', 'second-busy', 'still-attached',
+                 'nonbusy', 'unstructured-error', 'interrupt', 'first-success')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                image, point = base / 'workspace.sparseimage', base / 'volume'
+                image.write_bytes(b'owned image')
+                image.chmod(0o600)
+                point.mkdir(mode=0o700)
+                initial = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
+                               volume_device='/dev/disk1000s1')
+                remaining = {**initial, 'mountpoint': None, 'volume_device': None}
+                first = StallionError('first detach failed')
+                first.returncode = errno.EPERM if case == 'nonbusy' else errno.EBUSY
+                if case == 'unstructured-error':
+                    first = StallionError('no machine status')
+                if case == 'interrupt':
+                    first = KeyboardInterrupt()
+                second = StallionError('second detach failed')
+                second.returncode = errno.EBUSY
+                inspection = OSError('inspection failed')
+                if case == 'still-mounted':
+                    remaining = initial
+                elif case == 'changed-device':
+                    remaining = {**remaining, 'device': '/dev/disk998'}
+                elif case == 'inspection-error':
+                    remaining = inspection
+                elif case == 'already-detached':
+                    remaining = None
+                states = [initial, remaining, remaining if case == 'still-attached' else None]
+                if case == 'first-success':
+                    states = [initial, None]
+                commands = []
+                def command(*args):
+                    commands.append(args)
+                    if len(commands) == 1:
+                        if case == 'changed-image':
+                            image.rename(base / 'original.sparseimage')
+                            image.write_bytes(b'replacement image')
+                            image.chmod(0o600)
+                        if case != 'first-success':
+                            raise first
+                    elif case == 'second-busy':
+                        raise second
+                    return b''
+                native = []
+                if case == 'volume-still-mounted':
+                    native = [dict(device=initial['volume_device'], path=str(base / 'elsewhere'))]
+                elif case == 'unrelated-volume':
+                    native = [dict(device='/dev/disk998s1', path=str(point))]
+                options = {'side_effect': inspection} if case == 'mount-inventory-error' else {'return_value': native}
+                with patch.object(images, 'mounted', side_effect=states), \
+                     patch.object(images, '_command', side_effect=command), \
+                     patch.object(images.os.path, 'ismount', return_value=case == 'unrelated-mountpoint'), \
+                     patch.object(_scan, 'mounts', **options):
+                    if case in ('success', 'first-success'):
+                        images.detach(image, point)
+                    else:
+                        with self.assertRaises(KeyboardInterrupt if case == 'interrupt' else StallionError) as raised:
+                            images.detach(image, point)
+                        if case == 'still-attached':
+                            self.assertIn('remains attached', str(raised.exception))
+                        else:
+                            self.assertIs(raised.exception, second if case == 'second-busy' else first)
+                        if case in ('inspection-error', 'mount-inventory-error'):
+                            self.assertIs(raised.exception.__cause__, inspection)
+                        if case == 'second-busy':
+                            self.assertIs(raised.exception.__context__, first)
+                attempts = 2 if case in ('success', 'second-busy', 'still-attached') else 1
+                self.assertEqual(commands, [('/usr/bin/hdiutil', 'detach', initial['device'])] * attempts)
+                self.assertTrue(image.exists())
+
     def test_staging_retains_attached_or_uninspectable_image(self):
         from stallionfs import images
         for state in ({"device": "/dev/disk999", "mountpoint": None}, OSError("inspection failed")):
