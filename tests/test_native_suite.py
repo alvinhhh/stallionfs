@@ -312,12 +312,47 @@ class NativeSuite(unittest.TestCase):
     def test_single_run_is_partial_collection_with_ten_pairs(self):
         report = self.run_suite(extra=('--runs', '1'))
         self.assertEqual(report['selection']['runs'], 1)
+        self.assertNotIn('jobs', report['selection'])
+        self.assertTrue(all('--jobs' not in row['argv'] for row in report['rows']))
         self.assertEqual(len(self.fixture_calls), 1)
         self.assertEqual(len(report['rows']), 40)
         self.assertTrue(report['passed'])
         self.assertFalse(report['all_metrics_won'])
         self.assertIn('three consecutive complete campaigns', report['limits'][0])
         self.assertTrue(report['cleanup_passed'])
+
+    def test_jobs_selection_reaches_collector_and_report(self):
+        for jobs in range(1, 5):
+            for scan in (False, True):
+                with self.subTest(jobs=jobs, scan=scan):
+                    self.output = self.root / f'jobs-{jobs}-scan-{scan}.json'
+                    self.measured.clear()
+                    report = self.run_suite(
+                        operations=('scan',) if scan else ('clone', 'copy', 'move', 'delete'),
+                        fixture='scan_flat_20k' if scan else 'tiny_4kib',
+                        extra=('--runs', '1', '--jobs', str(jobs)))
+                    self.assertEqual(self.exit_code, 0)
+                    self.assertTrue(report['passed'])
+                    self.assertTrue(report['cleanup_passed'])
+                    self.assertEqual(report['selection']['jobs'], jobs)
+                    self.assertEqual([row['argv'] for row in report['rows']], self.measured)
+                    self.assertEqual(len(report['rows']), 40 if scan else 160)
+                    for row in report['rows']:
+                        if row['method'] == 'stallionfs' and row['operation'] != 'move':
+                            index = {'clone': 2, 'copy': 2, 'delete': 3, 'scan': 3}[row['operation']]
+                            self.assertEqual(row['argv'][index:index + 2], ['--jobs', str(jobs)])
+                        else:
+                            self.assertNotIn('--jobs', row['argv'])
+
+    def test_jobs_outside_supported_bounds_fail_before_creating_evidence(self):
+        for jobs in ('0', '5', '-1'):
+            with self.subTest(jobs=jobs), mock.patch.object(sys, 'stderr', io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_suite(extra=('--jobs', jobs))
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(self.output.exists())
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.measured, [])
 
     def test_three_runs_ten_pairs_keep_selection_and_source_validation(self):
         report = self.run_suite()
@@ -618,6 +653,26 @@ class NativeSuite(unittest.TestCase):
         self.assertEqual(suite.arguments('move', 'move', self.binary, file, destination), ['/bin/mv', '-n', str(file), str(destination)])
         self.assertEqual(suite.arguments('delete', 'delete', self.binary, file, destination), ['/bin/rm', '-rf', str(file)])
         self.assertEqual(suite.arguments('stallionfs', 'delete', self.binary, file, destination), [str(self.binary), 'delete', '--recursive', str(file)])
+
+    def test_jobs_argument_placement_and_unchanged_native_and_move_commands(self):
+        source, destination = self.root / 'source', self.root / 'destination'
+        unchanged = [(method, 'clone') for method in suite.COPY_TOOLS] + [
+            ('cp', 'copy'), ('move', 'move'), ('delete', 'delete'),
+            ('find-stat', 'scan'), ('stallionfs', 'move')]
+        for jobs in (None, 1, 2, 3, 4):
+            options = [] if jobs is None else ['--jobs', str(jobs)]
+            commands = {'clone': [str(self.binary), 'clone', *options, str(source), str(destination)],
+                        'copy': [str(self.binary), 'copy', *options, str(source), str(destination)],
+                        'delete': [str(self.binary), 'delete', '--recursive', *options, str(source)],
+                        'scan': [str(self.binary), '--json', 'scan', *options, str(source)]}
+            for operation, expected in commands.items():
+                with self.subTest(jobs=jobs, operation=operation):
+                    self.assertEqual(suite.arguments('stallionfs', operation, self.binary, source, destination, jobs=jobs),
+                                     expected)
+            for method, operation in unchanged:
+                with self.subTest(jobs=jobs, method=method, operation=operation):
+                    self.assertEqual(suite.arguments(method, operation, self.binary, source, destination, jobs=jobs),
+                                     suite.arguments(method, operation, self.binary, source, destination))
 
     def test_cold_purge_failure_is_attempted_once_and_never_relabelled_warm(self):
         report = self.run_suite(cache=('cold', 'warm'))

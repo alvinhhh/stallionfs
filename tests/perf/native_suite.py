@@ -87,18 +87,19 @@ def parse_scan_output(method, output, root_device):
     return counts
 
 
-def arguments(method, operation, binary, source, destination):
+def arguments(method, operation, binary, source, destination, jobs=None):
     if operation not in ('clone', 'copy', 'move', 'delete', 'scan'):
         raise ValueError('Unknown operation')
+    options = ['--jobs', str(jobs)] if jobs is not None and operation != 'move' else []
     if operation == 'scan':
         if method == 'stallionfs':
-            return [str(binary), '--json', 'scan', str(source)]
+            return [str(binary), '--json', 'scan'] + options + [str(source)]
         if method != 'find-stat': raise ValueError('Unknown scan reference')
         return ['/usr/bin/find', '-P', '-x', str(source), '-mindepth', '1',
                 '-exec', '/usr/bin/stat', '-f', '%Op%t%Dz%t%Dd', '--', '{}', '+']
     if method == 'stallionfs':
-        return ([str(binary), operation, str(source), str(destination)] if operation in ('clone', 'copy', 'move') else
-                [str(binary), 'delete', '--recursive', str(source)])
+        return ([str(binary), operation] + options + [str(source), str(destination)] if operation in ('clone', 'copy', 'move') else
+                [str(binary), 'delete', '--recursive'] + options + [str(source)])
     if operation == 'clone':
         args = COPY_TOOLS[method] + [str(source), str(destination)]
         if method == 'rsync' and source.is_dir():
@@ -183,6 +184,7 @@ def main():
     p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=list(COPY_TOOLS),
                    help='Clone references; ordinary copy always uses cp -Rp')
     p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['clone', 'move', 'delete'])
+    p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
     p.add_argument('--npm', type=Path, help='npm CLI JavaScript entrypoint for installed_dependencies')
     p.add_argument('--npm-cache', type=Path, help='Existing isolated offline npm cache')
@@ -373,7 +375,7 @@ def main():
                                             raise RuntimeError('Operand preparation failed; receipt and fixture retained')
                                         setup['symlink_timestamp_repairs'] = restore_setup_symlink_times(target, expected)
                                         operand = target
-                                    argv = arguments(method, operation, binary, operand, dest)
+                                    argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs)
                                     report['active_operation'] = key | {'argv': argv, 'state': 'source validation, cache preparation or command pending'}
                                     checkpoint()
                                     before = native_correctness.snapshot(operand, **snapshot_options)

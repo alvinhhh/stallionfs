@@ -27,6 +27,28 @@ with no excluded samples. Scans cover `scan_flat_20k`, `scan_nested_20k` and
 command startup; CPU includes waited children. Peak RSS is the largest individual
 process peak. These warm partial runs do not complete the acceptance matrix.
 
+## One-worker clone comparison — 2026-10-29
+
+[Warm document-tree report — JSON (XZ)](results/native-clone-docs-jobs1-20261029-arm64.json.xz)
+compares `stallionfs clone SRC DST --jobs 1` with
+`ditto --rsrc --extattr --acl SRC DST` on macOS 27 arm64, using the existing
+0.6.3 native binary. Ten timing pairs and ten separate resource pairs completed;
+all 40 commands passed strict correctness and source-stability checks. Candidate
+clones also passed required data-stream sharing checks. No pairs were excluded.
+
+| Metric | ditto median | StallionFS median |
+| --- | ---: | ---: |
+| Direct wall | 0.754396375 s | 0.572289292 s |
+| Direct CPU | 0.736711500 s | 0.559444500 s |
+| Peak RSS | 1,818,624 B | 1,867,776 B |
+
+Wall and CPU pass the paired screens; RSS is 48 KiB higher. After metadata enrichment,
+the fixture contains 5,002 regular files, 105 directories including root, and
+116,777,216 logical bytes; the base generator is 5,000 files/100 MB. This measures
+the existing explicit one-worker option, with no default-four-worker control or
+default change. The required `cp -cRp` comparison is still missing. One warm
+case and one repetition do not establish full release acceptance.
+
 Run from the repository with an installation outside the checkout and writable APFS scratch space. Use new output filenames:
 
 ```sh
@@ -73,8 +95,11 @@ campaign and allow later stages only after confirmed cleanup. Failed, incomplete
 or uncertain completion stops the driver. Existing evidence is never resumed or
 replaced.
 
-Exit zero means the selected collection completed its checks, not that every
-metric won; `all_metrics_won` remains false. Finder, mounted FSKit resources,
+Exit zero means the selected collection completed its correctness checks.
+Release acceptance requires three consecutive complete suites with every required
+comparison correct and lower wall time plus lower CPU or lower peak RSS, beyond
+precision and observed variation. `all_metrics_won` remains a placeholder, not
+an implemented release decision. Finder, mounted FSKit resources,
 workspace peak memory/full metadata equivalence, external-drive repeats,
 replacement/exchange moves, mount listing, image/recovery workflows and
 CLI JSON/startup-only cases remain outside this campaign, as does mounted-image

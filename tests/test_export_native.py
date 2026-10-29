@@ -548,6 +548,49 @@ class JournalExportNative(unittest.TestCase):
             writer.close()
         return output, writer.manifest_path, writer.journal_path
 
+    def test_optional_jobs_preserves_plain_and_journal_values_and_exclusive_outputs(self):
+        for selection in ({}, {'jobs': None}, *({'jobs': jobs} for jobs in range(1, 5))):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as folder:
+                data = copy_report(); data['selection'].update(selection)
+                options = [] if selection.get('jobs') is None else ['--jobs', str(selection['jobs'])]
+                data['rows'][0].update(method='stallionfs', argv=[
+                    '/Users/example/bin/stallionfs', 'copy', *options,
+                    '/Users/example/work/item', '/Users/example/work/destination'])
+                source, manifest, journal = self.journal(folder, data)
+                original = {path: path.read_bytes() for path in (source, manifest, journal)}
+                outputs = (Path(folder)/'plain.json', Path(folder)/'streamed.json')
+                for input_path, output in zip((source, manifest), outputs):
+                    exporter.export_report(input_path, output, [('/Users/example', 'HOME')])
+                    before = output.read_bytes()
+                    with self.assertRaises(FileExistsError):
+                        exporter.export_report(input_path, output, [('/Users/example', 'HOME')])
+                    self.assertEqual(output.read_bytes(), before)
+                plain, streamed = (json.loads(output.read_text()) for output in outputs)
+                plain.pop('export'); streamed.pop('export')
+                self.assertEqual(plain, streamed)
+                self.assertEqual({key: value for key, value in plain['selection'].items() if key == 'jobs'}, selection)
+                self.assertEqual(plain['rows'][0]['argv'], [value.replace('/Users/example', '${HOME}')
+                                                          for value in data['rows'][0]['argv']])
+                for key in ('status', 'passed', 'all_metrics_won', 'source_sha256', 'comparisons', 'unavailable'):
+                    self.assertEqual(plain[key], data[key])
+                for key in ('wall_s', 'cpu_s', 'rss_bytes', 'validated', 'source_unchanged', 'source_verification'):
+                    self.assertEqual(plain['rows'][0][key], data['rows'][0][key])
+                self.assertEqual(original, {path: path.read_bytes() for path in original})
+
+    def test_invalid_jobs_rejects_plain_and_journal_without_changing_sources(self):
+        for jobs in (-1, 0, 5, True, False, 1.0, '1', [], {}):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as folder:
+                data = report(); data['selection']['jobs'] = jobs
+                source, manifest, journal = self.journal(folder, data)
+                original = {path: path.read_bytes() for path in (source, manifest, journal)}
+                for index, input_path in enumerate((source, manifest)):
+                    output = Path(folder)/f'rejected-{index}.json'
+                    with self.assertRaisesRegex(ValueError, 'Invalid jobs selection'):
+                        exporter.export_report(input_path, output, [('/Users/example', 'HOME')])
+                    self.assertFalse(output.exists())
+                    self.assertEqual(list(Path(folder).glob('.native-export-*')), [])
+                self.assertEqual(original, {path: path.read_bytes() for path in original})
+
     def test_legacy_and_journal_export_value_parity_and_alias_counts(self):
         for data in (sharing_report(), copy_report(), scan_report(), scan_report('stallionfs'), dependency_report()):
             with self.subTest(fixture=data['selection']['fixtures']), tempfile.TemporaryDirectory() as folder:

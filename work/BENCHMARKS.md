@@ -90,7 +90,7 @@ Block I/O counts are not device-byte measurements. Clone sharing is not logical 
 - A reproducible representative photo workload; the existing noise PNG fixture is synthetic.
 - Complete suites using the populated metadata fixtures. Each fixture now includes a nonempty ACL, extended attribute and resource fork; directory fixtures also include sparse data and internal hardlinks. Setup verifies their presence before timing. Clone rows check independent destination inodes and APFS data-stream sharing. Native preservation failures remain in the report.
 - External-drive runs when a suitable drive is connected. None was present in the latest inventory.
-- Three consecutive complete suites with every correctness check passing and every metric winning beyond observed variance.
+- Three consecutive complete suites with every required comparison passing correctness, lower wall time and either lower CPU or lower peak RSS beyond observed variance.
 
 [Current bounded results](../tests/perf/README.md#latest-native-comparisons--2026-10-24) retain the native comparisons and losses. A filtered run is not full-suite completion. Unsupported semantics, unavailable measurements and losses must not be removed from an acceptance report.
 
