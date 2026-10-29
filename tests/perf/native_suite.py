@@ -91,6 +91,8 @@ def arguments(method, operation, binary, source, destination, jobs=None):
     if operation not in ('clone', 'copy', 'move', 'delete', 'scan'):
         raise ValueError('Unknown operation')
     options = ['--jobs', str(jobs)] if jobs is not None and operation != 'move' else []
+    if method == 'gnu-cp' and operation == 'copy':
+        return ['/bin/cp', '-a', '--reflink=never', '--', str(source), str(destination)]
     if operation == 'scan':
         if method == 'stallionfs':
             return [str(binary), '--json', 'scan'] + options + [str(source)]
@@ -154,13 +156,24 @@ def preserved(result):
             and result.get('move_source_absent', True) is True)
 
 
-def summarize_report(rows, required_samples):
+def summarize_report(rows, required_samples, *, native_only=False):
     groups = {}
     for row in rows:
         key = tuple(row[field] for field in ('run', 'fixture', 'operation', 'reference', 'cache', 'phase'))
         groups.setdefault(key, []).append(row)
     result = []
     for key, values in groups.items():
+        if native_only:
+            valid = [row for row in values if row.get('ok') is True and row.get('validated') is True
+                     and not row.get('completion_uncertain')]
+            result.append(dict(zip(('run', 'fixture', 'operation', 'reference', 'cache', 'phase'), key)) | {
+                'kind': 'descriptive', 'method': 'gnu-cp', 'expected_samples': required_samples,
+                'complete': (len(valid) == len(values) == required_samples
+                             and {row['sample'] for row in valid} == set(range(required_samples))),
+                'excluded_samples': [row['sample'] for row in values if row not in valid],
+                'metrics': {metric: native_metrics.summarize(row[metric] for row in valid) if len(valid) >= 10 else None
+                            for metric in native_metrics.PHASE_METRICS[key[-1]]}})
+            continue
         native = [row for row in values if row['method'] != 'stallionfs']
         candidate = [row for row in values if row['method'] == 'stallionfs']
         comparisons = {metric: native_metrics.compare_paired(native, candidate, metric)
@@ -172,18 +185,20 @@ def summarize_report(rows, required_samples):
 
 
 def main():
+    system = platform.system()
+    linux = system == 'Linux'
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--binary', type=Path, required=True)
+    p.add_argument('--binary', type=Path, required=not linux)
     p.add_argument('--scratch', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--samples', type=int, default=10)
-    p.add_argument('--runs', type=int, default=3, help='Collection repetitions; fewer than three is a partial campaign')
-    p.add_argument('--cache', nargs='+', choices=['warm', 'cold'], default=['warm', 'cold'])
+    p.add_argument('--runs', type=int, default=1 if linux else 3, help='Collection repetitions; Linux admits one native-only run')
+    p.add_argument('--cache', nargs='+', choices=['warm', 'cold'], default=['warm'] if linux else ['warm', 'cold'])
     p.add_argument('--fixtures', nargs='+', choices=[*fileops.SAMPLES, *PROFILES, *native_fixtures.PROFILES, *native_fixtures.SCAN_PROFILES, 'installed_dependencies'],
-                   default=list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
-    p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=list(COPY_TOOLS),
-                   help='Clone references; ordinary copy always uses cp -Rp')
-    p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['clone', 'move', 'delete'])
+                   default=['docs_5k_100mb'] if linux else list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
+    p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=['cp'] if linux else list(COPY_TOOLS),
+                   help='Linux admits only cp; macOS clone references and ordinary cp -Rp')
+    p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['copy'] if linux else ['clone', 'move', 'delete'])
     p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
     p.add_argument('--npm', type=Path, help='npm CLI JavaScript entrypoint for installed_dependencies')
@@ -192,7 +207,14 @@ def main():
     a = p.parse_args()
     for selection in (a.fixtures, a.operations, a.cache, a.copy_tools):
         fileops.require(len(selection) == len(set(selection)), 'Duplicate benchmark selectors are not allowed')
-    fileops.require(platform.system() == 'Darwin', 'macOS is required')
+    fileops.require(system in ('Darwin', 'Linux'), 'macOS or Linux is required')
+    if linux:
+        fileops.require(a.fixtures == ['docs_5k_100mb'] and a.operations == ['copy'] and a.cache == ['warm']
+                        and a.copy_tools == ['cp'] and a.samples == 10 and a.runs == 1
+                        and all(value is None for value in (a.binary, a.jobs, a.node, a.npm, a.npm_cache)),
+                        'Linux admits only docs_5k_100mb, warm GNU cp -a --reflink=never, 10 samples per phase, one run and no binary or jobs')
+    else:
+        fileops.require(a.binary is not None, 'An installed executable is required')
     fileops.require(a.samples >= 10 and a.runs >= 1, 'At least 10 samples and 1 collection run are required')
     fileops.require(0 < a.timeout < float('inf'), 'Timeout must be finite and positive')
     scan_mode = 'scan' in a.operations
@@ -200,30 +222,38 @@ def main():
     fileops.require((scan_mode and a.operations == ['scan'] and all(scan_fixtures)) or
                     (not scan_mode and not any(scan_fixtures)),
                     'Select --operations scan only with scan_flat_20k, scan_nested_20k or scan_deep40_20k')
-    binary, scratch = a.binary.resolve(strict=True), a.scratch.resolve(strict=True)
-    fileops.require(binary.is_file() and os.access(binary, os.X_OK), 'An installed executable is required')
+    binary, scratch = (None if linux else a.binary.resolve(strict=True)), a.scratch.resolve(strict=True)
+    if binary is not None:
+        fileops.require(binary.is_file() and os.access(binary, os.X_OK), 'An installed executable is required')
     if 'installed_dependencies' in a.fixtures:
         fileops.require(all((a.node, a.npm, a.npm_cache)), 'installed_dependencies requires --node, --npm and --npm-cache')
     output = a.output.absolute()
     fileops.require(output.parent.is_dir() and not os.path.lexists(output), 'Use a new output file')
-    inventory = json.loads(fileops.command([binary, '--json', 'volumes']).stdout)
-    volume = fileops.scratch_volume(inventory, scratch)
+    inventory = fileops.linux_mounts() if linux else json.loads(fileops.command([binary, '--json', 'volumes']).stdout)
+    volume = (fileops.linux_scratch_volume(inventory, scratch) if linux else fileops.scratch_volume(inventory, scratch))
     sources = fileops.fingerprint_sources()
     sources.update({x.name: fileops.digest(x) for x in Path(__file__).parent.glob('native_*.py')})
     if 'installed_dependencies' in a.fixtures:
         sources.update({'tests/perf/fixture/'+name: fileops.digest(Path(__file__).parent/'fixture'/name) for name in native_fixtures.LOCKED_FILES})
-    helper = binary.with_name('stallionfs-python')
-    fileops.require(helper.is_file(), 'Installed Python helper is missing')
-    executables = {str(binary): fileops.digest(binary), str(helper): fileops.digest(helper)}
-    for tool in [*COPY_TOOLS.values(), ['/bin/mv'], ['/bin/rm'], ['/usr/bin/time'], ['/bin/chmod']]:
-        executables[tool[0]] = fileops.digest(Path(tool[0]))
+    if linux:
+        executables = {path: fileops.digest(Path(path)) for path in ('/bin/cp', '/usr/bin/time', volume['zfs_executable'])}
+        versions = {path: fileops.command([path, '--version'], environment={**os.environ, 'LC_ALL': 'C'}).stdout.decode(errors='replace').strip()
+                    for path in ('/bin/cp', '/usr/bin/time')}
+        fileops.require(versions['/bin/cp'].startswith('cp (GNU coreutils)')
+                        and 'GNU Time' in versions['/usr/bin/time'], 'GNU cp and GNU time are required')
+    else:
+        helper = binary.with_name('stallionfs-python')
+        fileops.require(helper.is_file(), 'Installed Python helper is missing')
+        executables = {str(binary): fileops.digest(binary), str(helper): fileops.digest(helper)}
+        for tool in [*COPY_TOOLS.values(), ['/bin/mv'], ['/bin/rm'], ['/usr/bin/time'], ['/bin/chmod']]:
+            executables[tool[0]] = fileops.digest(Path(tool[0]))
     if scan_mode:
         executables.update({path: fileops.digest(Path(path)) for path in ('/usr/bin/find', '/usr/bin/stat')})
-    report = {'schema': 1, 'version': fileops.command([binary, '--version']).stdout.decode().strip(), 'status': 'running', 'passed': False, 'all_metrics_won': False,
+    report = {'schema': 1, 'version': None if linux else fileops.command([binary, '--version']).stdout.decode().strip(), 'status': 'running', 'passed': False, 'all_metrics_won': False,
               'cold_cache_unavailable': None,
               'timestamp': datetime.now(timezone.utc).isoformat(), 'system': platform.platform(),
               'source_sha256': sources, 'executables': executables, 'volume': volume,
-              'selection': {key: str(value) if isinstance(value, Path) else value for key, value in vars(a).items() if value is not None} | {'binary': str(binary), 'scratch': str(scratch), 'output': str(output)},
+              'selection': {key: str(value) if isinstance(value, Path) else value for key, value in vars(a).items() if value is not None} | {'scratch': str(scratch), 'output': str(output)},
               'limits': [
                   'A collection run is not full-suite acceptance; three consecutive complete campaigns are required.',
                   'Direct timing and wrapped resource samples are separate phases; read-only scans reuse a verified source.',
@@ -233,6 +263,24 @@ def main():
                   'Block I/O counters are not physical device byte counts or APFS sharing measurements.',
                   'Source hashing may change access times, which are excluded; source identity and change times remain checked.',
                   'This runner covers copy, move, delete and opt-in scans, not the whole native-tool matrix.']}
+    if binary is not None: report['selection']['binary'] = str(binary)
+    if linux:
+        memory = re.findall(r'^MemTotal:\s+([0-9]+) kB$', Path('/proc/meminfo').read_text(), flags=re.MULTILINE)
+        fileops.require(len(memory) == 1 and int(memory[0]) > 0, 'Guest memory inventory unavailable')
+        report.pop('version'); report.pop('all_metrics_won')
+        report.update(benchmark='Linux/OpenZFS native ordinary copy', tool_versions=versions,
+                      environment={'kernel': platform.release(), 'machine': platform.machine(),
+                                   'cpu_count': os.cpu_count(), 'memory_bytes': int(memory[0]) * 1024,
+                                   'host_storage': 'unobserved by guest', 'whole_system_memory': 'unobserved'},
+                      limits=[
+                          'One native GNU cp method; descriptive statistics only, with no paired verdict or product comparison.',
+                          'Direct timing and GNU time resource samples are separate phases; both include process startup.',
+                          'Warm means the preceding validated snapshot read every byte; residency is not guaranteed.',
+                          'RSS is the measured process peak and excludes ZFS ARC, kernel and host caches.',
+                          'Block I/O values remain operation counts, not physical device bytes.',
+                          'Allocation is observed with st_blocks; it is not assumed dense or exclusive physical storage.',
+                          'Linux POSIX ACLs and user xattrs do not establish Darwin ACL or resource-fork preservation.',
+                          'Guest measurements do not establish host storage backing or whole-system memory usage.'])
     if scan_mode:
         report['limits'].extend([
             'Scan fixtures reuse scan.py\'s flat, nested and deep40 layouts with 20,000 generated files and unchanged special entries.',
@@ -334,23 +382,25 @@ def main():
                     checkpoint()
                     release('preparation')
                 for operation in a.operations:
-                    references = (['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
+                    references = (['gnu-cp'] if linux else ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
                                   ['cp'] if operation == 'copy' else [operation])
                     for reference in references:
                         for cache, phase in product(a.cache, native_metrics.PHASE_METRICS):
-                            failed = [method for method in (reference, 'stallionfs')
+                            selected_methods = [reference] if linux else [reference, 'stallionfs']
+                            failed = [method for method in selected_methods
                                       if (name, operation, method) in blocked_methods]
                             if failed:
                                 record('unavailable', dict(run=run, fixture=name, operation=operation,
                                     reference=reference, cache=cache, phase=phase, failed_methods=failed,
-                                    reason='pair unavailable after a method failed; neither side repeated'))
+                                    reason=('method unavailable after failure; no retry' if linux else
+                                            'pair unavailable after a method failed; neither side repeated')))
                                 continue
                             if cache == 'cold' and cold_unavailable is not None:
                                 record('unavailable', dict(run=run, fixture=name, operation=operation, reference=reference, cache=cache, phase=phase, reason=cold_unavailable))
                                 continue
                             group_rows = []
                             for sample in range(a.samples):
-                                methods = [reference, 'stallionfs']; rng.shuffle(methods)
+                                methods = selected_methods.copy(); rng.shuffle(methods)
                                 for method in methods:
                                     case = (name, operation, method)
                                     if any((name, operation, member) in blocked_methods for member in methods):
@@ -415,7 +465,7 @@ def main():
                                         raise
                                     row = key | receipt
                                     del receipt
-                                    row['pair_id'] = sample
+                                    if not linux: row['pair_id'] = sample
                                     row.update(validated=False, cache_receipt=conditioning)
                                     scan_stdout = (compress_scan_stdout(row) if operation == 'scan'
                                                    and not row.get('completion_uncertain') else None)
@@ -481,7 +531,7 @@ def main():
                                 if ((cold_unavailable is not None and cache == 'cold') or
                                         any((name, operation, member) in blocked_methods for member in methods)):
                                     break
-                            for comparison in summarize_report(group_rows, a.samples):
+                            for comparison in summarize_report(group_rows, a.samples, native_only=linux):
                                 record('comparisons', comparison)
                             checkpoint()
                             print(json.dumps({'run': run, 'fixture': name, 'operation': operation,

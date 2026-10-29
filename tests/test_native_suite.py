@@ -141,6 +141,10 @@ class NativeSuite(unittest.TestCase):
     def command(self, argv, **kwargs):
         argv = [os.fspath(value) for value in argv]
         self.commands.append(argv)
+        if argv == ['/bin/cp', '--version']:
+            return subprocess.CompletedProcess(argv, 0, b'cp (GNU coreutils) 9.7\n', b'')
+        if argv == ['/usr/bin/time', '--version']:
+            return subprocess.CompletedProcess(argv, 0, b'time (GNU Time) 1.9\n', b'')
         if argv[:1] == [str(self.binary)] and argv[1:] == ['--json', 'volumes']:
             return subprocess.CompletedProcess(argv, 0, b'{}', b'')
         if argv == [str(self.binary), '--version']:
@@ -178,11 +182,11 @@ class NativeSuite(unittest.TestCase):
                 'cpu_s': 0.2, 'rss_bytes': 16384, 'io_input_blocks': 0, 'io_output_blocks': 1,
                 'precision_floor': {'wall_s': 1e-9, 'user_s': 0.01, 'system_s': 0.01, 'cpu_s': 0.02}}
 
-    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None):
+    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, system='Darwin'):
         fixture_names = (fixture,) if fixture_names is None else fixture_names
-        argv = ['native_suite.py', '--binary', str(self.binary), '--scratch', str(self.root),
+        argv = ['native_suite.py', *([] if system == 'Linux' else ['--binary', str(self.binary)]), '--scratch', str(self.root),
                 '--output', str(self.output), '--fixtures', *fixture_names, '--copy-tools', *copy_tools,
-                '--operations', *operations, '--cache', *cache, '--runs', '3', '--samples', '10', *extra]
+                '--operations', *operations, '--cache', *cache, '--runs', '1' if system == 'Linux' else '3', '--samples', '10', *extra]
         def warm_manifest(path):
             self.cache_calls.append(str(path))
             return {'hash': Path(path).read_bytes().hex()}
@@ -195,7 +199,7 @@ class NativeSuite(unittest.TestCase):
             patches = [
                 mock.patch.object(suite.native_report, 'ReportJournal', CapturingJournal),
                 mock.patch.object(sys, 'argv', argv),
-                mock.patch.object(suite.platform, 'system', return_value='Darwin'),
+                mock.patch.object(suite.platform, 'system', return_value=system),
                 mock.patch.object(suite.fileops, 'command', side_effect=command or self.command),
                 mock.patch.object(suite, 'restore_setup_symlink_times', return_value=[]),
                 mock.patch.object(suite.fileops, 'scratch_volume', return_value={'fstype': 'apfs'}),
@@ -218,9 +222,98 @@ class NativeSuite(unittest.TestCase):
                 mock.patch.object(suite.native_correctness, 'verify_source', side_effect=self.verify_source),
             ]
             for patch in patches: stack.enter_context(patch)
+            if system == 'Linux':
+                def tiny_large(base, name, specification):
+                    path = base/name; path.write_bytes(b'tiny Linux coordinator fixture')
+                    return path
+                read_text = Path.read_text
+                stack.enter_context(mock.patch.object(suite.fileops, 'linux_mounts', return_value=[]))
+                stack.enter_context(mock.patch.object(suite.fileops, 'linux_scratch_volume',
+                    return_value={'filesystem': 'zfs', 'zfs_executable': '/usr/sbin/zfs'}))
+                stack.enter_context(mock.patch.object(suite.fileops, 'large_fixture', side_effect=tiny_large))
+                stack.enter_context(mock.patch.object(Path, 'read_text', autospec=True,
+                    side_effect=lambda path, *args, **kwargs: 'MemTotal:       4194304 kB\n' if str(path) == '/proc/meminfo'
+                    else read_text(path, *args, **kwargs)))
             stack.enter_context(redirect_stdout(io.StringIO()))
             self.exit_code = suite.main()
         return json.loads(self.output.read_text())
+
+    def test_linux_single_native_method_has_twenty_rows_and_descriptive_summaries(self):
+        with mock.patch.object(suite.native_metrics, 'compare_paired', side_effect=AssertionError('Linux must not compare pairs')):
+            report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb')
+        self.assertEqual(self.exit_code, 0)
+        self.assertTrue(report['passed'])
+        self.assertNotIn('all_metrics_won', report)
+        self.assertNotIn('binary', report['selection'])
+        self.assertNotIn('version', report)
+        self.assertEqual(len(report['rows']), 20)
+        for phase in ('timing', 'resources'):
+            rows = [row for row in report['rows'] if row['phase'] == phase]
+            self.assertEqual([row['sample'] for row in rows], list(range(10)))
+            self.assertEqual({row['method'] for row in rows}, {'gnu-cp'})
+            self.assertTrue(all('pair_id' not in row for row in rows))
+        self.assertTrue(all(argv[:4] == ['/bin/cp', '-a', '--reflink=never', '--'] and len(argv) == 6 for argv in self.measured))
+        self.assertEqual(len(report['comparisons']), 2)
+        self.assertTrue(all(row['complete'] and row['kind'] == 'descriptive' for row in report['comparisons']))
+        self.assertEqual(report['comparisons'][0]['metrics']['wall_s']['n'], 10)
+        self.assertEqual(set(report['executables']), {'/bin/cp', '/usr/bin/time', '/usr/sbin/zfs'})
+        self.assertEqual(report['environment']['memory_bytes'], 4*1024**3)
+        self.assertEqual(report['environment']['host_storage'], 'unobserved by guest')
+        self.assertFalse(any(str(self.binary) in argv for argv in self.commands))
+
+    def test_linux_unsupported_selections_fail_before_artifacts_or_commands(self):
+        for options in ({'fixture': 'tiny_4kib'}, {'operations': ('scan',)}, {'operations': ('clone',)},
+                        {'operations': ('move',)}, {'operations': ('delete',)}, {'cache': ('cold',)},
+                        {'copy_tools': ('cp-clone',)}, {'extra': ('--jobs', '1')},
+                        {'extra': ('--runs', '2')}, {'extra': ('--samples', '11')},
+                        {'extra': ('--binary', str(self.binary))}):
+            defaults = {'system': 'Linux', 'operations': ('copy',), 'copy_tools': ('cp',), 'fixture': 'docs_5k_100mb'}
+            with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, 'Linux admits only'):
+                self.run_suite(**(defaults | options))
+            self.assertFalse(self.output.exists())
+            self.assertFalse(self.output.with_name(self.output.name + '.journal').exists())
+            self.assertFalse(list(self.root.glob('native-suite-*')))
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.measured, [])
+
+    def test_linux_failure_is_retained_once_and_not_given_a_complete_summary(self):
+        collect = self.collect
+        def failure(argv, **kwargs):
+            row = collect(argv, **kwargs)
+            row['ok'] = False
+            return row
+        report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', collector=failure)
+        self.assertEqual(self.exit_code, 1)
+        self.assertFalse(report['passed'])
+        self.assertEqual(len(report['rows']), 1)
+        self.assertEqual(len(self.measured), 1)
+        self.assertFalse(report['comparisons'][0]['complete'])
+        self.assertIsNone(report['comparisons'][0]['metrics']['wall_s'])
+
+    def test_linux_qualification_failure_retains_fixture_before_measurement(self):
+        def unavailable(*_args): raise RuntimeError('POSIX ACL or sparse hole unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'POSIX ACL or sparse hole unavailable'):
+            self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', coverage=unavailable)
+        report = json.loads(self.output.read_text())
+        self.assertTrue(Path(report['retained_fixture']).is_dir())
+        self.assertFalse(report['passed'])
+        self.assertEqual(self.measured, [])
+
+    def test_linux_timeout_or_source_mutation_retains_fixture_without_retry(self):
+        for failure in ('timeout', 'source mutation'):
+            self.output = self.root/(failure + '.json'); self.measured.clear()
+            def collect(argv, **kwargs):
+                row = self.collect(argv, **kwargs)
+                if failure == 'timeout': row.update(ok=False, completion_uncertain=True, timed_out=True)
+                else: Path(argv[-2]).write_bytes(b'source changed')
+                return row
+            with self.subTest(failure=failure), self.assertRaises(RuntimeError):
+                self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', collector=collect)
+            report = json.loads(self.output.read_text())
+            self.assertTrue(Path(report['retained_fixture']).is_dir())
+            self.assertFalse(report.get('cleanup_passed', False))
+            self.assertFalse(report['passed'])
+            self.assertEqual(len(self.measured), 1)
 
     def test_duplicate_selectors_fail_before_creating_evidence(self):
         for options in ({'cache': ('warm', 'warm')}, {'copy_tools': ('cp', 'cp')},

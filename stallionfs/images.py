@@ -214,6 +214,25 @@ def detach(image, mountpoint):
         raise _error(f"Image remains attached; keep its files: {image}")
 
 
+def flush(image):
+    """Flush a verified closed backing image without attaching it."""
+    image = _image(image)
+    before = image.stat()
+    if mounted(image) is not None:
+        raise _error(f'Detach the image before flushing: {image}')
+    fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise _error(f'Image changed before flushing: {image}')
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    finally:
+        os.close(fd)
+    after = image.stat()
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) or mounted(image) is not None:
+        raise _error(f'Image changed while flushing: {image}')
+
+
 def clone(source_image, dest_image):
     """Clone one closed image using APFS COW; never substitute a full byte copy."""
     source, destination = _image(source_image), _image(dest_image, new=True)
@@ -249,11 +268,7 @@ def build(source_repo, destination_image, capacity_gib):
         _directory(point)
         _command('/usr/bin/ditto', source, repo)
         detach(destination, point)
-        fd = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-        finally:
-            os.close(fd)
+        flush(destination)
         return destination
     except BaseException as original:
         if destination.exists():

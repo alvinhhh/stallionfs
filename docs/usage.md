@@ -128,3 +128,48 @@ Stop processes using a workspace before moving or deleting it. `remove` moves th
 `gc` previews trash older than 24 hours. `gc --yes` permanently deletes eligible trash; `--older-than 0` includes all trash. Save or push any work you need first.
 
 `forget SEED_ID` previews removal of a seed. Add `--yes` to delete it. Existing workspaces remain usable. Prepare again to rebuild the cache.
+
+## Snapshots and rollback
+
+```sh
+sfs snapshot WORKSPACE_ID --quiescent --name before-change
+sfs snapshots WORKSPACE_ID
+sfs rollback WORKSPACE_ID SNAPSHOT_ID --quiescent
+sfs retained
+```
+
+Stop all writers before using `--quiescent`. Folder snapshots capture the complete repository, including HEAD, branch, index, staged and unstaged changes, untracked and ignored files, supported metadata, and internal hardlinks. They use the same clone rules described above. Capture is not atomic while external programs are writing. The managed-use lease coordinates stallionfs commands; it cannot detect or stop unrelated writers. Linked worktrees, shared/external Git storage, Git configuration includes, and active Git locks are rejected; external Git files are not captured.
+
+Image snapshots check standalone Git metadata, normally detach and flush the owned image, clone it while closed, publish the snapshot, then remount if it was attached. An initially closed image is briefly mounted for the Git check and left closed afterward. Busy or uncertain attachments fail without force-detaching. Image snapshot and rollback do not require `--quiescent`, but all volume users must release it for normal detachment to succeed. A failure after detachment can leave the workspace unmounted; use `sfs mount WORKSPACE_ID` after resolving the error.
+
+Rollback clones the selected snapshot into a permanent recovery directory and atomically exchanges it with the current repository or backing image. The actual previous workspace remains in `recovery/RECOVERY_ID`; the selected snapshot stays unchanged. The command returns the recovery ID. An interrupted exchange is reconciled from recorded file identities before another managed mutation. Uncertain identities block mutation and retain both paths for inspection.
+
+## Managed use and cleanup
+
+```sh
+sfs run WORKSPACE_ID -- codex
+sfs enroll WORKSPACE_ID
+# After all commands, descendants, editors, and shells have stopped using it:
+sfs close WORKSPACE_ID --quiescent
+sfs cleanup --enable
+sfs cleanup
+sfs cleanup --apply
+sfs cleanup --disable
+```
+
+Cleanup is off by default. Both global enablement and workspace enrollment are required. `enroll --disable WORKSPACE_ID` removes enrollment. `run` holds an exclusive managed-use lease and records the workspace as open before starting the command. The command's exit, a dead process, or a released lease never means closed. Only explicit `close --quiescent` records closure. It also normally detaches and flushes image workspaces. Running commands does not contain their descendants or restrict filesystem access.
+
+Enabled cleanup retires eligible workspaces seven days after their recorded closure. It skips open, legacy, unknown, busy, mounted, corrupt, or identity-changed workspaces and invalid or future closure times. Explicit preview and apply inspect the full workspace collection. Managed CLI mutations also attempt a nonblocking pass over at most eight entries after completing the requested operation. Ordinary file operations never run cleanup. This is opportunistic maintenance; there is no scheduled service and no guarantee every old workspace is visited.
+
+Retirement moves the whole workspace into protected trash. It does not permanently delete data or free the retained blocks. `gc --yes`, including `--older-than 0`, skips protected trash. Restore with `sfs restore WORKSPACE_ID`; restoration marks it open so it cannot immediately be retired again. An interrupted retirement before the move leaves the workspace in place with protection; explicitly reopening it with `run`, `mount`, or `enroll` cancels a verified source-only retirement intent.
+
+Snapshots, rollback recovery, and protected retirement share a limit of 32 retained objects, including incomplete objects. The limit stops new retention; it never evicts existing data. There is no logical-size quota. APFS clones can still run out of disk space as files change.
+
+```sh
+sfs purge snapshots SNAPSHOT_ID
+sfs purge recovery RECOVERY_ID
+sfs purge trash WORKSPACE_ID
+# Add --yes to permanently delete the listed retained data.
+```
+
+`purge` is deliberate permanent deletion. Inspect the data first. Interrupted deletion retains its remainder in staging and reports that path, keeping usable snapshot listings clear of partial entries. Pending rollback journals and mounted images prevent purging. Keep any previous rollback repository you need by copying `recovery/RECOVERY_ID/repo` to a new path before purging its slot; image recovery remains a closed `workspace.sparseimage` backing file.

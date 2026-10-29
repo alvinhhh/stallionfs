@@ -3,6 +3,7 @@ import json
 import os
 import random
 import struct
+import sys
 import zlib
 
 
@@ -150,10 +151,15 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
     import stat
     import fileops
 
+    fileops.require(sys.platform in ('darwin', 'linux'), 'Unsupported metadata preparation platform')
+    linux = sys.platform == 'linux'
+    fileops.require(not linux or hasattr(os, 'setxattr'), 'Linux no-follow xattr preparation is unavailable')
+    xattrs = {name: value for name, value in METADATA_XATTRS.items()
+              if not linux or name.startswith(b'user.')}
     info = root.lstat()
-    receipt.update(added_directories=0, added_regular_entries=0, added_logical_bytes=0,
-                   added_unique_data_bytes=0, added_xattr_value_bytes=sum(map(len, METADATA_XATTRS.values())),
-                   resource_fork_bytes=len(METADATA_XATTRS[b'com.apple.ResourceFork']))
+    receipt.update(platform=sys.platform, added_directories=0, added_regular_entries=0, added_logical_bytes=0,
+                   added_unique_data_bytes=0, added_xattr_value_bytes=sum(map(len, xattrs.values())),
+                   resource_fork_bytes=None if linux else len(METADATA_XATTRS[b'com.apple.ResourceFork']))
     if stat.S_ISREG(info.st_mode):
         data, relative, alias = root, '', None
         receipt.update(data_size=info.st_size, sparse=None, hardlinks=None)
@@ -174,7 +180,15 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
                 if stream.write(b'y') != 1: raise OSError('Short fixture write')
                 stream.flush(); os.fsync(stream.fileno())
                 # Punch an aligned interior hole; seeking alone does not prove sparse coverage.
-                fcntl.fcntl(stream.fileno(), 99, struct.pack('=IIqq', 0, 0, 1024*1024, 6*1024*1024))
+                if linux:
+                    libc = ctypes.CDLL(None, use_errno=True)
+                    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+                    libc.fallocate.restype = ctypes.c_int
+                    if libc.fallocate(stream.fileno(), 0x03, 1024*1024, 6*1024*1024):  # KEEP_SIZE | PUNCH_HOLE
+                        error = ctypes.get_errno()
+                        raise OSError(error, os.strerror(error), str(data))
+                else:
+                    fcntl.fcntl(stream.fileno(), 99, struct.pack('=IIqq', 0, 0, 1024*1024, 6*1024*1024))
                 os.fsync(stream.fileno())
             data.chmod(0o640)
             os.link(data, alias)
@@ -188,7 +202,7 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
         raise ValueError('Metadata fixture must be a regular file or directory')
     receipt['path'] = relative
     fileops.require(stat.S_ISREG(data.lstat().st_mode), 'Metadata target must be a regular file')
-    for name, value in METADATA_XATTRS.items():
+    for name, value in xattrs.items():
         if hasattr(os, 'setxattr'):
             os.setxattr(data, name, value, follow_symlinks=False)
         else:
@@ -198,6 +212,15 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
             libc.setxattr.restype = ctypes.c_int
             if libc.setxattr(os.fsencode(data), name, value, len(value), 0, 1):
                 error = ctypes.get_errno(); raise OSError(error, os.strerror(error), str(data))
+    if linux:
+        # Linux's version-2 POSIX ACL xattr: owner, named user, group, mask, other.
+        named_uid = 65534 if os.getuid() != 65534 else 65533
+        acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', tag, permissions, identifier)
+            for tag, permissions, identifier in ((1, 6, 0xffffffff), (2, 4, named_uid),
+                (4, 4, 0xffffffff), (16, 4, 0xffffffff), (32, 0, 0xffffffff)))
+        receipt['posix_acl_access_hex'] = acl.hex()
+        os.setxattr(data, b'system.posix_acl_access', acl, follow_symlinks=False)
+        return receipt
     receipt['acl_command'] = {'argv': ['/bin/chmod', '+a', 'everyone allow read', str(data)],
                               'exit_code': None}
     result = fileops.command(receipt['acl_command']['argv'], check=False)
@@ -213,15 +236,23 @@ def verify_metadata_coverage(observed, receipt):
     import fileops
 
     fileops.require(not observed['unavailable_fields'], 'Metadata observation unavailable')
+    linux = receipt.get('platform') == 'linux'
+    fileops.require(observed.get('metadata_capabilities', {}).get('platform') == receipt.get('platform'),
+                    'Metadata platform differs from preparation')
     entry = observed['entries'][receipt['path']]
     fileops.require(entry['kind'] == 'file' and entry['size'] == receipt['data_size'], 'Metadata file size changed')
     acl = entry['acl']
-    text = bytes.fromhex(acl['text_hex']) if acl['text_hex'] else b''
-    fileops.require(acl['unavailable'] is None and any(
-        len(parts := line.split(b':')) >= 6 and parts[0] == b'group' and parts[2] == b'everyone'
-        and parts[-2:] == [b'allow', b'read'] for line in text.splitlines()), 'Seeded ACL entry missing')
+    text = bytes.fromhex(acl.get('text_hex') or '')
+    if linux:
+        fileops.require(acl['unavailable'] is None and bool(receipt.get('posix_acl_access_hex'))
+                        and acl.get('access_hex') == receipt['posix_acl_access_hex'], 'Seeded POSIX ACL entry missing')
+    else:
+        fileops.require(acl['unavailable'] is None and any(
+            len(parts := line.split(b':')) >= 6 and parts[0] == b'group' and parts[2] == b'everyone'
+            and parts[-2:] == [b'allow', b'read'] for line in text.splitlines()), 'Seeded ACL entry missing')
     fileops.require(all(entry['xattrs'].get(name.hex()) == value.hex()
-                        for name, value in METADATA_XATTRS.items()), 'Seeded xattr or resource fork missing')
+                        for name, value in METADATA_XATTRS.items() if not linux or name.startswith(b'user.')),
+                    'Seeded xattr or resource fork missing')
     group = receipt['hardlinks']
     if group is not None:
         fileops.require(group in observed['hardlink_groups'] and all(
@@ -237,6 +268,12 @@ def verify_metadata_coverage(observed, receipt):
         fileops.require(entry['sha256'] == hashlib.sha256(payload).hexdigest(), 'Sparse payload changed')
     entries = observed['entries'].values()
     return {'populated': True, 'seeded_acl_text_bytes': len(text),
+            'seeded_posix_acl_bytes': len(bytes.fromhex(receipt['posix_acl_access_hex'])) if linux else None,
+            'metadata_capabilities': observed['metadata_capabilities'],
+            'sparse_file': ({'logical_bytes': entry['size'], 'allocated_bytes': entry['allocated_bytes'],
+                             'holes': entry['holes']} if sparse is not None else None),
+            'allocated_bytes': sum(row['allocated_bytes'] for row in entries),
+            'allocation_scope': 'sum of st_blocks * 512, including hardlink aliases; not exclusive physical storage',
             'counts_include_root': True,
             'regular_files': sum(row['kind'] == 'file' for row in entries),
             'directories': sum(row['kind'] == 'directory' for row in entries),

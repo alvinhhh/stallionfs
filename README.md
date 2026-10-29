@@ -13,6 +13,8 @@ stallionfs provides native file operations and prepared Git workspaces on macOS.
 - Move, swap and delete paths, or list mounted volumes.
 - Install dependencies once and reuse them across workspaces.
 - Clone a whole APFS workspace volume without copying every file.
+- Snapshot managed workspaces and roll back while retaining the previous state.
+- Opt into recoverable cleanup of explicitly closed workspaces.
 - Count files and sizes with native bulk metadata reads.
 
 APFS copy-on-write shares unchanged data on disk. Each workspace has its own Git repository and branch; edits in one don't affect the others.

@@ -223,6 +223,49 @@ class ImageRecoveryTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "darwin" and os.environ.get("STALLIONFS_TEST_IMAGES") == "1",
                      "requires macOS disk-image access and explicit test selection")
 class ImageStoreTests(unittest.TestCase):
+    def test_snapshot_rollback_and_protected_retirement(self):
+        from stallionfs import lifecycle
+        base = Path(tempfile.mkdtemp(prefix="stallionfs-image-lifecycle-test-")).resolve()
+        store = Store(base / "store")
+        with image_fixture(store, base) as fixture:
+            source = base / "source"
+            source.mkdir()
+            git(source, "init", "-b", "main")
+            (source / "file").write_text("original\n")
+            git(source, "add", ".")
+            git(source, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Fixture")
+            seed = fixture.call(store.prepare, source, key="image-lifecycle", image_size=1)
+            workspace = fixture.call(store.create, seed["id"])
+            value, repo = workspace["id"], Path(workspace["path"])
+            (repo / "file").write_text("snapshot state\n")
+            (repo / "untracked").write_text("preserved\n")
+            git(repo, "config", "--local", "include.path", str(base / "external-config"))
+            with self.assertRaisesRegex(StallionError, "external worktree"):
+                fixture.call(store.snapshot, value, workspace=value, expected=True)
+            git(repo, "config", "--local", "--unset", "include.path")
+            fixture.call(store.unmount, value, workspace=value)
+            closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
+            self.assertFalse(repo.exists())
+            fixture.call(store.mount, value, workspace=value)
+            snapshot = fixture.call(store.snapshot, value, workspace=value)
+            self.assertEqual((repo / "file").read_text(), "snapshot state\n")
+            (repo / "file").write_text("later state\n")
+            result = fixture.call(store.rollback, value, snapshot["id"], workspace=value)
+            self.assertEqual((repo / "file").read_text(), "snapshot state\n")
+            self.assertEqual((repo / "untracked").read_text(), "preserved\n")
+            self.assertTrue((store.root / "recovery" / result["recovery"] / "workspace.sparseimage").exists())
+            fixture.call(store.enroll, value, workspace=value)
+            closed = fixture.call(store.close, value, quiescent=True, workspace=value)
+            closed["closed_at"] -= lifecycle.STALE_SECONDS + 10
+            lifecycle.replace_json(store._state(value), closed)
+            fixture.call(store.cleanup_config, enabled=True)
+            retired = fixture.call(store.cleanup, apply=True)
+            self.assertEqual(retired["retired"], [value])
+            self.assertEqual(fixture.call(store.gc, older_than=0, yes=True), [])
+            restored = fixture.call(store.move, value, restore=True, workspace=value)
+            self.assertEqual((Path(restored["path"]) / "file").read_text(), "snapshot state\n")
+            self.assertEqual(read_json(store._state(value))["status"], "open")
+
     def test_lifecycle_and_interrupted_mount(self):
         from stallionfs import images
         # Resolve /var and /tmp aliases before comparing native mount paths.
