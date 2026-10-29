@@ -17,11 +17,14 @@
 #include <time.h>
 #include <unistd.h>
 
+static int clearing_cache;
+static unsigned cache_frees;
 static void verification(void);
 static unsigned clock_calls;
 static int clock_failure;
 static struct timespec clock_value;
 int sfs_test_clock_gettime(clockid_t clock, struct timespec *out) {
+    assert(!clearing_cache);
     assert(clock == CLOCK_REALTIME); clock_calls++;
     if (clock_failure) { errno = ENXIO; return -1; }
     *out = clock_value; return 0;
@@ -75,6 +78,7 @@ union allocation_header { max_align_t alignment; struct { size_t bytes; allocati
 static allocation_header *allocations;
 
 void *sfs_test_malloc(size_t n) {
+    assert(!clearing_cache);
     assert(n <= 5u * 1024u * 1024u);
     allocation_calls++;
     if (allocation_calls == fail_allocation || (fail_after_append && image_append_bytes >= fail_after_append)) {
@@ -88,12 +92,14 @@ void *sfs_test_malloc(size_t n) {
     return p + 1;
 }
 void *sfs_test_calloc(size_t n, size_t size) {
+    assert(!clearing_cache);
     /* Match only arena headers; payload, prefix and cache buffers have other sizes. */
     if (n == 1 && size == 8272 && ++arena_allocations == fail_arena_allocation) { hit++; errno = ENOMEM; return NULL; }
     if (size && n > SIZE_MAX / size) { errno = ENOMEM; return NULL; }
     void *p = sfs_test_malloc(n * size); if (p) memset(p, 0, n * size); return p;
 }
 void sfs_test_free(void *p) {
+    if (clearing_cache && p) cache_frees++;
     if (p) { allocation_header *h = (allocation_header *)p - 1; assert(allocated >= h->value.bytes); allocated -= h->value.bytes;
         if (h->value.previous) h->value.previous->value.next = h->value.next; else allocations = h->value.next;
         if (h->value.next) h->value.next->value.previous = h->value.previous; free(h); }
@@ -108,12 +114,14 @@ void *sfs_test_memcpy(void *dst, const void *src, size_t n) {
     return memcpy(dst, src, n);
 }
 int sfs_test_CC_SHA256_Init(CC_SHA256_CTX *c) {
+    assert(!clearing_cache);
     for (unsigned i = 0; i < 8; i++) if (!hash_context[i].context) {
         hash_context[i].context = c; hash_context[i].raw = 0; return CC_SHA256_Init(c);
     }
     assert(0); return 0;
 }
 int sfs_test_CC_SHA256_Update(CC_SHA256_CTX *c, const void *p, CC_LONG n) {
+    assert(!clearing_cache);
     for (unsigned i = 0; i < 8; i++) if (hash_context[i].context == c) {
         if (n == 36 && (!memcmp(p, "SFSDAT02", 8) || !memcmp(p, "SFSDAT03", 8) || !memcmp(p, "SFSDAT04", 8) || !memcmp(p, "SFSDAT05", 8) || !memcmp(p, "SFSDAT06", 8))) hash_context[i].raw = 1;
         if (hash_context[i].raw) raw_hash_input += n; else metadata_hash_input += n;
@@ -122,6 +130,7 @@ int sfs_test_CC_SHA256_Update(CC_SHA256_CTX *c, const void *p, CC_LONG n) {
     assert(0); return 0;
 }
 int sfs_test_CC_SHA256_Final(unsigned char *sum, CC_SHA256_CTX *c) {
+    assert(!clearing_cache);
     for (unsigned i = 0; i < 8; i++) if (hash_context[i].context == c) {
         if (hash_context[i].raw) raw_hashes++;
         hash_context[i].context = NULL; return CC_SHA256_Final(sum, c);
@@ -193,6 +202,7 @@ static void competitor(void) {
     int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 ssize_t sfs_test_pread(int fd, void *p, size_t n, off_t at) {
+    assert(!clearing_cache);
     assert(fd >= 0 && fd < (int)sizeof(auxiliary));
     if (auxiliary[fd]) {
         aux_attempt_bytes += n;
@@ -226,6 +236,7 @@ ssize_t sfs_test_pread(int fd, void *p, size_t n, off_t at) {
     return result;
 }
 ssize_t sfs_test_pwrite(int fd, const void *p, size_t n, off_t at) {
+    assert(!clearing_cache);
     assert(fd >= 0 && fd < (int)sizeof(auxiliary));
     if (auxiliary[fd]) {
         aux_attempt_bytes += n; aux_write_calls++;
@@ -255,6 +266,7 @@ ssize_t sfs_test_pwrite(int fd, const void *p, size_t n, off_t at) {
     return result;
 }
 int sfs_test_fcntl(int fd, int command, ...) {
+    assert(!clearing_cache);
     if (command == F_DUPFD_CLOEXEC) {
         va_list ap; va_start(ap, command); int minimum = va_arg(ap, int); va_end(ap);
         return fcntl(fd, command, minimum);
@@ -276,11 +288,13 @@ int sfs_test_fcntl(int fd, int command, ...) {
     return result;
 }
 int sfs_test_fsync(int fd) {
+    assert(!clearing_cache);
     syncs++; event('D');
     if (is("parent_sync")) { hit++; errno = EIO; return -1; }
     return fsync(fd);
 }
 int sfs_test_flock(int fd, int operation) {
+    assert(!clearing_cache);
     locks++; tracked_fd = fd;
     if (is("lock")) { hit++; errno = EWOULDBLOCK; return -1; }
     if (competing && locks == 1 && writes == 0) competitor();
@@ -289,6 +303,7 @@ int sfs_test_flock(int fd, int operation) {
     return rc;
 }
 int sfs_test_close(int fd) {
+    assert(!clearing_cache);
     closes++; struct stat st; assert(fstat(fd, &st) == 0);
     int fail = (is("close") && closes == target) || (is("parent_close") && S_ISDIR(st.st_mode)) || ((is("aux_close") || is("aux_enospc_cleanup")) && auxiliary[fd]);
     int result = close(fd);
@@ -298,6 +313,7 @@ int sfs_test_close(int fd) {
     return result;
 }
 int sfs_test_openat(int fd, const char *name, int flags, ...) {
+    assert(!clearing_cache);
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     if (is("create") && (flags & O_CREAT)) { hit++; errno = EACCES; return -1; }
@@ -310,14 +326,17 @@ int sfs_test_openat(int fd, const char *name, int flags, ...) {
     return result;
 }
 int sfs_test_ftruncate(int fd, off_t size) {
+    assert(!clearing_cache);
     if (!auxiliary[fd]) image_truncates++;
     if (auxiliary[fd] && is("aux_length_enospc")) { hit++; errno = ENOSPC; return -1; }
     return ftruncate(fd, size);
 }
 int sfs_test_mkdirat(int fd, const char *name, mode_t mode) {
+    assert(!clearing_cache);
     assert(mode == 0700); return mkdirat(fd, name, mode);
 }
 int sfs_test_unlinkat(int fd, const char *name, int flags) {
+    assert(!clearing_cache);
     if (!strcmp(name, "memo")) {
         if (is("aux_unlink")) { hit++; errno = EACCES; return -1; }
         int rc = unlinkat(fd, name, flags); if (!rc) aux_removed++; return rc;
@@ -326,18 +345,21 @@ int sfs_test_unlinkat(int fd, const char *name, int flags) {
 }
 int sfs_test_fstat(int fd, struct stat *st) __DARWIN_INODE64(sfs_test_fstat);
 int sfs_test_fstat(int fd, struct stat *st) {
+    assert(!clearing_cache);
     int rc=fstat(fd,st);
     if(!rc&&((is("owner")&&S_ISREG(st->st_mode))||(is("parent_owner")&&S_ISDIR(st->st_mode)))) { st->st_uid^=1; hit++; }
     return rc;
 }
 int sfs_test_fstatat(int fd, const char *name, struct stat *st, int flags) __DARWIN_INODE64(sfs_test_fstatat);
 int sfs_test_fstatat(int fd, const char *name, struct stat *st, int flags) {
+    assert(!clearing_cache);
     int rc = fstatat(fd, name, st, flags);
     if (!rc && is("identity") && fulls >= 3) { st->st_ino++; hit++; }
     return rc;
 }
 int sfs_test_fstatfs(int fd, struct statfs *st) __DARWIN_INODE64(sfs_test_fstatfs);
 int sfs_test_fstatfs(int fd, struct statfs *st) {
+    assert(!clearing_cache);
     int rc = fstatfs(fd, st);
     if (!rc && is("unsupported")) { strcpy(st->f_fstypename, "not-apfs"); hit++; }
     if (!rc && is("readonly")) { st->f_flags |= MNT_RDONLY; hit++; }
@@ -3433,6 +3455,38 @@ static void hardlink_counts(uint64_t inodes, uint64_t names, uint64_t next) {
     size_t n; unsigned char *p = bytes("image", &n), *space = namespace_at(p, selected_slot(p), n);
     assert(get32(selected_slot(p) + 12) == 6 && get64(space + 184) == inodes && get64(space + 336) == names && get64(space + 176) == next); free(p);
 }
+static void cache_release(sfs_image *h);
+/* Numeric positions are checked against legacy cookies, never decoded from them. */
+static unsigned position_equivalence(sfs_image *h, sfs_view view, sfs_inode parent, const sfs_result *binding, unsigned minor) {
+    sfs_cookie legacy = {0}, numeric = {0}; sfs_result r, old; unsigned count = 0; size_t n;
+    unsigned char *before = bytes("image", &n); unsigned made = aux_created; reset("", 0); clock_calls = 0;
+    for (;;) {
+        sfs_entry a, b, canary; memset(&canary, 0xA5, sizeof(canary)); a = b = canary; int fa = 99, fb = 99; uint64_t position = UINT64_MAX;
+        ok(sfs_image_next(h, view, parent, &legacy, &a, &fa, &old), &old);
+        XEXPECT(sfs_image_next_position(h, view, parent, &numeric, &b, &position, &fb, &r), SFS_OK);
+        assert(fa == fb && old.status == r.status && old.coverage == r.coverage && !r.system_errno);
+        assert(!memcmp(&legacy, &numeric, sizeof(legacy)));
+        if (!fb) { assert(position == UINT64_MAX && !memcmp(&a, &canary, sizeof(a)) && !memcmp(&b, &canary, sizeof(b))); break; }
+        equal_entry(&a, &b);
+        assert(position >= 17); count++;
+        sfs_cookie reconstructed, expected;
+        XEXPECT(sfs_image_resume_after_position(h, view, binding->generation, binding->root_digest, parent, position, &reconstructed, &r), SFS_OK);
+        assert(r.coverage == SFS_COVERAGE_TOUCHED && !r.system_errno && !memcmp(&numeric, &reconstructed, sizeof(numeric)));
+        if (minor == 6) XEXPECT(sfs_image_resume_after_name(h, view, binding->generation, binding->root_digest, parent, b.name, b.name_length, &expected, &r), SFS_OK);
+        else XEXPECT(sfs_image_resume_after(h, view, binding->generation, binding->root_digest, parent, b.inode, &expected, &r), SFS_OK);
+        assert(!memcmp(&expected, &reconstructed, sizeof(expected)));
+        assert(sfs_image_resume_after_position(h, view, binding->generation, binding->root_digest, parent, position, &reconstructed, NULL) == SFS_OK);
+    }
+    assert(!clock_calls && !raw_hash_input && !aux_write_calls && aux_created == made); image_unwritten(); unchanged("image", before, n); free(before); return count;
+}
+static void position_failure(sfs_image *h, sfs_view view, const sfs_result *binding, sfs_inode parent, uint64_t position,
+                             enum sfs_status expected, enum sfs_phase phase, int error) {
+    sfs_result r; sfs_cookie output, canary; memset(&canary, 0xA5, sizeof(canary)); output = canary;
+    XEXPECT(sfs_image_resume_after_position(h, view, binding->generation, binding->root_digest, parent, position, &output, &r), expected);
+    assert(r.phase == phase && r.system_errno == error && !memcmp(&output, &canary, sizeof(output)) && r.coverage != SFS_COVERAGE_FULL_REACHABLE);
+    image_unwritten();
+}
+
 static void hardlink_versions(void) {
     sfs_image *h; sfs_result r; sfs_metadata_initial initial = metadata_input(SFS_DIRECTORY);
     for (unsigned minor = 2; minor <= 6; minor++) {
@@ -3448,8 +3502,15 @@ static void hardlink_versions(void) {
         unsigned char *row = leaf_row(p, space + 64, id, n, stride), *leaf = record(p, space + 64, n);
         assert(!memcmp(leaf + 640, row, stride) && !memcmp(row + stride, (unsigned char[496]){0}, stride));
         assert(get64(row + 344) == (minor == 6 ? 1 : 0));
-        if (minor == 6) assert(!get32(row + 440) && get64(space + 336) == 1); else assert(!get64(space + 336)); free(p);
-        sfs_result binding = xattr_binding(h); sfs_cookie cookie, canary; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+        if (minor == 6) assert(!get32(row + 440) && get64(space + 336) == 1); else assert(!get64(space + 336)); assert(!get16(leaf + 68) && get16(leaf + 70) == 1); free(p);
+        sfs_result binding = xattr_binding(h); assert(position_equivalence(h, 0, 1, &binding, minor) == 1);
+        sfs_cookie first_cookie = {0}; sfs_entry first_entry; uint64_t first_position = 0; int first_found = 99;
+        XEXPECT(sfs_image_next_position(h, 0, 1, &first_cookie, &first_entry, &first_position, &first_found, &r), SFS_OK);
+        assert(first_found && first_entry.inode == id && first_position == 17);
+        p = bytes("image", &n); space = namespace_at(p, selected_slot(p), n); watch_payload(0, raw_ref(p, leaf_row(p, space + 64, id, n, stride), 0, n)); watch_count = 1;
+        uint64_t raw_as_position = watch_at[0] + 1; read_at[0] = watch_at[0]; free(p); cache_release(h); reset("candidate_reads", 1); watch_clear();
+        position_failure(h, 0, &binding, 1, raw_as_position, SFS_INVALID, SFS_PHASE_READ, 0); assert(!hit && !watch_reads[0] && !raw_hash_input); watch_count = 0; reset("", 0);
+        sfs_cookie cookie, canary; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
         XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, id, 0, "pending", 7, &r), SFS_OK);
         p = bytes("image", &n); reset("", 0); clock_calls = 0;
         if (minor < 6) {
@@ -3462,7 +3523,8 @@ static void hardlink_versions(void) {
         free(p); metadata_commit(h); expect(h, 0, id, "pending");
         binding = xattr_binding(h); XEXPECT(sfs_image_resume_after(h, 0, binding.generation, binding.root_digest, 1, id, &cookie, &r), SFS_OK);
         XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_rename(h, id, 1, "renamed", 7, &r), SFS_OK); metadata_commit(h); hardlink_name(h, 0, 1, "renamed", id);
-        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove(h, id, &r), SFS_OK); metadata_commit(h); close_image(h);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_remove(h, id, &r), SFS_OK); metadata_commit(h);
+        binding = xattr_binding(h); assert(!position_equivalence(h, 0, 1, &binding, minor)); position_failure(h, 0, &binding, 1, 17, SFS_INVALID, SFS_PHASE_READ, 0); close_image(h);
         open_image(&h); symlink_full(h); close_image(h); p = bytes("image", &n); assert(get32(selected_slot(p) + 12) == minor); free(p); retain(3000 + (int)minor);
     }
     reset("", 0); metadata_clock(1102); h = (sfs_image *)(uintptr_t)1; uint64_t calls = allocation_calls;
@@ -3473,6 +3535,7 @@ static void hardlink_versions(void) {
     unsigned char maximal[255]; memset(maximal, 'z', sizeof(maximal)); maximal[0] = 1;
     XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, link, 1, maximal, sizeof(maximal), &r), SFS_OK); metadata_commit(h);
     sfs_metadata_entry linked = hardlink_get(h, 0, link, 2); assert(linked.entry.parent == 1 && linked.entry.name_length == sizeof(maximal) && !memcmp(linked.entry.name, maximal, sizeof(maximal))); symlink_expect(h, 0, link, "../opaque", 9);
+    sfs_result long_binding = xattr_binding(h); assert(position_equivalence(h, 0, 1, &long_binding, 6) == 2);
     XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, 1, maximal, sizeof(maximal), &r), SFS_OK); metadata_commit(h); hardlink_get(h, 0, link, 1); symlink_full(h); close_image(h); retain(3007); hardlink_mixed_versions();
 }
 static void hardlink_shared(void) {
@@ -3484,12 +3547,14 @@ static void hardlink_shared(void) {
     static const unsigned char user[] = "user attribute\0\xff", fork[] = "resource\0fork\xff";
     XEXPECT(sfs_image_set_xattr(h, id, "user.stallionfs-test", 20, user, sizeof(user) - 1, &r), SFS_OK);
     XEXPECT(sfs_image_set_xattr(h, id, "com.apple.ResourceFork", 22, fork, sizeof(fork) - 1, &r), SFS_OK); metadata_commit(h);
+    sfs_result position_binding = xattr_binding(h); assert(position_equivalence(h, 0, p, &position_binding, 6) == 1);
     sfs_metadata_entry old = hardlink_get(h, 0, id, 1), pa = hardlink_get(h, 0, p, 1), pb = hardlink_get(h, 0, q, 1);
     assert(old.referenced_data_bytes == 2 * CELL && old.entry.size == 2 * CELL + 3 && old.mode == initial.mode && old.uid == initial.uid && old.gid == initial.gid && old.flags == initial.flags && timestamp_equal(old.birth, initial.birth) && timestamp_equal(old.access, initial.access));
     sfs_view before, after; XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "before", 6, &before, &r), SFS_OK);
     metadata_clock(1120); XEXPECT(sfs_image_link(h, id, q, "alias", 5, &r), SFS_OK); assert(clock_calls == 1); metadata_commit(h);
     hardlink_name(h, 0, p, "source", id); hardlink_name(h, 0, q, "alias", id); sfs_metadata_entry m = hardlink_get(h, 0, id, 2); hardlink_owner_times(old, m, 1120);
     sfs_metadata_entry parent = hardlink_get(h, 0, q, 1); hardlink_parent_times(pb, parent, 1120); parent = hardlink_get(h, 0, p, 1); metadata_equal(&pa, &parent); hardlink_get(h, before, id, 1); hardlink_absent(h, before, q, "alias");
+    position_binding = xattr_binding(h); assert(position_equivalence(h, 0, q, &position_binding, 6) == 1); assert(position_equivalence(h, before, q, &position_binding, 6) == 0);
     XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_snapshot(h, "after", 5, &after, &r), SFS_OK); metadata_commit(h);
     XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_unlink(h, p, "source", 6, &r), SFS_OK); XEXPECT(sfs_image_abort(h, &r), SFS_OK); hardlink_get(h, 0, id, 2);
     sfs_entry alias; XEXPECT(sfs_image_lookup(h, 0, q, "alias", 5, &alias, &r), SFS_OK);
@@ -3561,7 +3626,7 @@ static void hardlink_names(void) {
     sfs_image *h; sfs_result r; hardlink_create(&h, TEST_CAPACITY); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
     sfs_inode p = add(h, 1, "p", SFS_DIRECTORY), q = add(h, p, "child", SFS_DIRECTORY), empty = add(h, 1, "empty", SFS_DIRECTORY), owner = add(h, 1, "file", SFS_FILE);
     XEXPECT(sfs_image_write(h, owner, 0, "old", 3, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, q, "a", 1, &r), SFS_OK); XEXPECT(sfs_image_link(h, owner, q, "b", 1, &r), SFS_OK); metadata_commit(h);
-    sfs_result binding = xattr_binding(h); sfs_cookie canary, cookie; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
+    sfs_result binding = xattr_binding(h); assert(position_equivalence(h, 0, q, &binding, 6) == 2); sfs_cookie canary, cookie; memset(&canary, 0xA5, sizeof(canary)); cookie = canary;
     XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_write(h, owner, 0, "pending", 7, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n); reset("", 0); clock_calls = 0;
     XEXPECT(sfs_image_link(h, 1, 1, "root", 4, &r), SFS_INVALID);
     assert(r.phase == SFS_PHASE_NONE && !r.system_errno && !clock_calls);
@@ -3835,32 +3900,66 @@ static void hardlink_semantic_negatives(void) {
     }
     free(f.p);
 }
+static fixture position_fixture(fixture_node leaves[6]);
 static void hardlink_touched_failures(void) {
     fixture f = hardlink_fixture(2, 1, 0, 2); hardlink_full_control(&f); retain(3420); size_t n = f.n;
     unsigned char *original = malloc(n); assert(original); memcpy(original, f.p, n);
     unsigned char *space = namespace_at(f.p, f.p, n), *names = record(f.p, space + 120, n); assert(get64(names + 640 + 5 * 280) == 2 && names[640 + 5 * 280 + 12] == 'b'); put64(names + 640 + 5 * 280 + 267, 5);
     hardlink_repair(f.p, original, n); assert(hardlink_guard(f.p, original, n));
-    for (unsigned operation = 0; operation < 5; operation++) {
+    for (unsigned operation = 0; operation < 9; operation++) {
+        if (operation == 7) {
+            memcpy(f.p, original, n); hardlink_full_control(&f); retain(3550);
+            unsigned char *commit = record(f.p, f.p + 48, n), *catalog = record(f.p, commit + 120, n), *history = record(f.p, catalog + 648, n), *inodes = record(f.p, space + 64, n);
+            assert(get64(space + 176) == 6 && get64(history + 176) == 6 && !get16(inodes + 68) && get16(inodes + 70) == 4 && get64(inodes + 640 + 3 * 496) == 5);
+            /* Missing owner6 is within next_inode7, so row range checks cannot mask node_get. */
+            put64(space + 176, 7); put64(history + 176, 7); put64(names + 640 + 5 * 280 + 267, 6);
+            hardlink_repair(f.p, original, n); assert(hardlink_guard(f.p, original, n));
+        }
         save("image", f.p, n); sfs_image *h; sfs_result r, binding; reset("", 0); open_readonly(&h, &binding); assert(binding.coverage == SFS_COVERAGE_ROOT_ONLY);
+        if (operation >= 7) clock_calls = 0;
         sfs_entry entry, canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary; sfs_cookie cookie, saved; memset(&cookie, 0xA5, sizeof(cookie)); saved = cookie; int found = 99;
         if (operation == 0) XEXPECT(sfs_image_lookup(h, 0, 2, "b", 1, &entry, &r), SFS_CORRUPT);
         else if (operation == 1) {
             XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); saved = cookie;
             XEXPECT(sfs_image_next(h, 0, 2, &cookie, &entry, &found, &r), SFS_CORRUPT); assert(!found);
         } else if (operation == 2) XEXPECT(sfs_image_resume_after_name(h, 0, binding.generation, binding.root_digest, 2, "b", 1, &cookie, &r), SFS_CORRUPT);
-        else {
+        else if (operation == 5 || operation == 7) XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 2, 22, &cookie, &r), SFS_CORRUPT);
+        else if (operation == 6 || operation == 8) {
+            XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 2, 21, &cookie, &r), SFS_OK); saved = cookie;
+            uint64_t position = UINT64_MAX;
+            XEXPECT(sfs_image_next_position(h, 0, 2, &cookie, &entry, &position, &found, &r), SFS_CORRUPT); assert(!found && position == UINT64_MAX);
+        } else {
             close_image(h); open_image(&h); XEXPECT(sfs_image_begin(h, &r), SFS_OK);
             if (operation == 3) XEXPECT(sfs_image_rename_entry(h, 2, "a", 1, 2, "b", 1, &r), SFS_CORRUPT);
             else XEXPECT(sfs_image_link(h, 4, 2, "b", 1, &r), SFS_CORRUPT); /* An occupied corrupt destination must not become EXISTS. */
         }
         assert(r.phase == SFS_PHASE_READ && !r.system_errno && !memcmp(&entry, &canary, sizeof(entry)) && !memcmp(&cookie, &saved, sizeof(cookie)));
-        if (operation < 3) poisoned_readonly(h, r.phase); else XEXPECT(sfs_image_commit(h, &r), SFS_POISONED);
-        image_unwritten(); close_image(h); unchanged("image", f.p, n); retain(3421 + (int)operation);
+        if (operation >= 7) assert(!clock_calls && r.coverage != SFS_COVERAGE_FULL_REACHABLE);
+        if (operation < 3 || operation >= 5) poisoned_readonly(h, r.phase); else XEXPECT(sfs_image_commit(h, &r), SFS_POISONED);
+        image_unwritten(); close_image(h); unchanged("image", f.p, n); retain(operation < 5 ? 3421 + (int)operation : operation < 7 ? 3520 + (int)operation : 3544 + (int)operation);
     }
     /* A separately rehashed nonminimal representative is reached by stat. */
     memcpy(f.p, original, n); space = namespace_at(f.p, f.p, n); unsigned char *owner = leaf_row(f.p, space + 64, 4, n, 496); owner[88] = 'b'; hardlink_repair(f.p, original, n); assert(hardlink_guard(f.p, original, n)); save("image", f.p, n);
     sfs_image *h; sfs_result r; reset("", 0); open_image(&h); sfs_metadata_entry output, canary; memset(&canary, 0xA5, sizeof(canary)); output = canary; XEXPECT(sfs_image_stat_metadata(h, 0, 4, &output, &r), SFS_CORRUPT); assert(!memcmp(&output, &canary, sizeof(output))); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); image_unwritten(); close_image(h); unchanged("image", f.p, n);
     open_image(&h); sfs_entry entry, entry_canary; memset(&entry_canary, 0xA5, sizeof(entry_canary)); entry = entry_canary; XEXPECT(sfs_image_stat(h, 0, 4, &entry, &r), SFS_CORRUPT); assert(!memcmp(&entry, &entry_canary, sizeof(entry))); XEXPECT(sfs_image_begin(h, &r), SFS_POISONED); image_unwritten(); close_image(h); unchanged("image", f.p, n); free(f.p); free(original); retain(3426);
+    fixture_node leaves[6]; f = position_fixture(leaves); n = f.n; save("image", f.p, n); reset("", 0); open_image(&h); reset("", 0);
+    XEXPECT(sfs_image_verify(h, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE && !raw_hash_input); image_unwritten(); close_image(h); unchanged("image", f.p, n); retain(3553);
+    original = malloc(n); unsigned char *topology = malloc(n); assert(original && topology); memcpy(original, f.p, n); memcpy(topology, f.p, n);
+    size_t leaf_at = (size_t)get64(leaves[3].ref + 8); assert(get16(f.p + leaf_at + 70) == 4 && get32(f.p + leaf_at + 648) == 5 && !memcmp(f.p + leaf_at + 652, "n0011", 5));
+    /* Declare four->three rows: framing stays valid, but a nonroot name leaf requires four. */
+    hardlink_leaf_change(f.p, topology, original, n, leaf_at, original + leaf_at + 640, 3);
+    hardlink_repair(f.p, topology, n); assert(hardlink_guard(f.p, topology, n) && !hardlink_guard(f.p, original, n));
+    for (unsigned next = 0; next < 2; next++) {
+        save("image", f.p, n); sfs_result binding; reset("", 0); open_readonly(&h, &binding); assert(binding.coverage == SFS_COVERAGE_ROOT_ONLY); clock_calls = 0;
+        sfs_cookie cookie, saved; memset(&saved, 0xA5, sizeof(saved)); cookie = saved; entry = entry_canary; uint64_t position = UINT64_MAX; int found = 99;
+        if (next) {
+            XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 1, 1332, &cookie, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_TOUCHED && !r.system_errno); saved = cookie;
+            XEXPECT(sfs_image_next_position(h, 0, 1, &cookie, &entry, &position, &found, &r), SFS_CORRUPT); assert(!found);
+        } else XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 1, 1441, &cookie, &r), SFS_CORRUPT);
+        assert(r.phase == SFS_PHASE_READ && !r.system_errno && r.coverage != SFS_COVERAGE_FULL_REACHABLE && !clock_calls && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&entry, &entry_canary, sizeof(entry)) && position == UINT64_MAX);
+        poisoned_readonly(h, r.phase); image_unwritten(); close_image(h); unchanged("image", f.p, n); retain(3554 + (int)next);
+    }
+    free(f.p); free(original); free(topology);
 }
 static void hardlink_verify_budgets(void) {
     sfs_image *h; sfs_result r; sfs_recovery recovery; fixture f = hardlink_fixture(2, 1, 0, 2); assert(hardlink_guard(f.p, f.p, f.n)); fixture_save(&f); reset("", 0);
@@ -3879,7 +3978,13 @@ static void hardlink_verify_budgets(void) {
         assert(r.coverage != SFS_COVERAGE_FULL_REACHABLE && r.phase == SFS_PHASE_READ && r.system_errno == (mode == 1 ? EIO : 0));
         if (mode == 1) assert(hit); else assert(r.incomplete_reason == (mode == 0 ? SFS_INCOMPLETE_METADATA_READ : mode == 2 ? SFS_INCOMPLETE_CHECKS : SFS_INCOMPLETE_CANCELLED));
         image_unwritten(); unchanged("image", before, n); reset("", 0);
-        if (mode == 1) XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); else { metadata_commit(h); sfs_metadata_entry m = hardlink_get(h, 0, 5, 2); assert(m.uid == 31337); hardlink_get(h, 0, 4, 2); symlink_full(h); }
+        sfs_result position_binding; sfs_cookie position_cookie;
+        if (mode == 1) { position_binding.generation = 1; memset(position_binding.root_digest, 0, 32);
+            position_failure(h, 0, &position_binding, 1, 0, SFS_POISONED, SFS_PHASE_READ, 0);
+            sfs_entry pe; uint64_t pp = UINT64_MAX; int pf = 99; position_cookie = (sfs_cookie){0};
+            XEXPECT(sfs_image_next_position(h, 0, 1, &position_cookie, &pe, &pp, &pf, &r), SFS_POISONED); assert(pf == 99 && pp == UINT64_MAX);
+            XEXPECT(sfs_image_commit(h, &r), SFS_POISONED);
+        } else { position_binding = xattr_binding(h); assert(position_equivalence(h, 0, 2, &position_binding, 6) == 2); metadata_commit(h); sfs_metadata_entry m = hardlink_get(h, 0, 5, 2); assert(m.uid == 31337); hardlink_get(h, 0, 4, 2); symlink_full(h); }
         free(before); close_image(h); retain(3431 + (int)mode);
     }
 }
@@ -3962,17 +4067,314 @@ static void hardlink_conflicting_roots(void) {
     size_t n; unsigned char *before = bytes("image", &n); sfs_image *h = NULL; sfs_result r, first, second; sfs_recovery recovery; reset("", 0);
     XEXPECT(sfs_image_open(root, "image", &h, &r), SFS_RECOVERY_REQUIRED); assert(!h); XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
     assert(!recovery.pair_valid && recovery.slots[0].status == SFS_OK && recovery.slots[1].status == SFS_OK && recovery.slots[0].coverage == SFS_COVERAGE_FULL_REACHABLE && recovery.slots[1].coverage == SFS_COVERAGE_FULL_REACHABLE);
-    ok(sfs_image_select(h, 0, &generous, &first), &first); sfs_cookie cookie, saved, canary; memset(&canary, 0xA5, sizeof(canary));
+    ok(sfs_image_select(h, 0, &generous, &first), &first); sfs_cookie numeric;
+    XEXPECT(sfs_image_resume_after_position(h, 1, first.generation, first.root_digest, 2, 21, &numeric, &r), SFS_OK);
+    sfs_cookie cookie, saved, canary; memset(&canary, 0xA5, sizeof(canary));
     XEXPECT(sfs_image_resume_after_name(h, 1, first.generation, first.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); saved = cookie;
     sfs_entry e, entry_canary; memset(&entry_canary, 0xA5, sizeof(entry_canary)); e = entry_canary; int found = 99;
     ok(sfs_image_select(h, 1, &generous, &second), &second); assert(first.generation == second.generation && memcmp(first.root_digest, second.root_digest, 32)); cookie = canary;
     XEXPECT(sfs_image_resume_after_name(h, 1, first.generation, first.root_digest, 2, "a", 1, &cookie, &r), SFS_STATE); assert(!memcmp(&cookie, &canary, sizeof(cookie)));
+    position_failure(h, 1, &first, 2, 21, SFS_STATE, SFS_PHASE_NONE, 0);
+    uint64_t numeric_position = UINT64_MAX; sfs_cookie old_numeric = numeric;
+    XEXPECT(sfs_image_next_position(h, 1, 2, &numeric, &e, &numeric_position, &found, &r), SFS_STATE);
+    assert(!found && numeric_position == UINT64_MAX && !memcmp(&numeric, &old_numeric, sizeof(numeric)) && !memcmp(&e, &entry_canary, sizeof(e)));
+    XEXPECT(sfs_image_resume_after_position(h, 1, second.generation, second.root_digest, 2, 21, &numeric, &r), SFS_OK);
+    XEXPECT(sfs_image_next_position(h, 1, 2, &numeric, &e, &numeric_position, &found, &r), SFS_OK); assert(found && e.name_length == 1 && e.name[0] == 'z' && numeric_position == 22); e = entry_canary;
     cookie = saved; XEXPECT(sfs_image_next(h, 1, 2, &cookie, &e, &found, &r), SFS_STATE); assert(!found && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &entry_canary, sizeof(e)));
     XEXPECT(sfs_image_resume_after_name(h, 1, second.generation, second.root_digest, 2, "a", 1, &cookie, &r), SFS_OK); XEXPECT(sfs_image_next(h, 1, 2, &cookie, &e, &found, &r), SFS_OK); assert(found && e.inode == 4 && e.name_length == 1 && e.name[0] == 'z');
     image_unwritten(); close_image(h); unchanged("image", before, n); free(before);
 }
 static void hardlink_verify(void) { hardlink_semantic_negatives(); hardlink_touched_failures(); hardlink_verify_budgets(); hardlink_creation_collisions(); hardlink_conflicting_roots(); }
 
+
+/* A separate finite group lets cache changes run without replaying unrelated campaigns. */
+static uint64_t cache_handle_bytes(sfs_image *h) {
+    for (allocation_header *p = allocations; p; p = p->value.next) if (p + 1 == (void *)h) return p->value.bytes;
+    assert(0); return 0;
+}
+static void cache_release(sfs_image *h) {
+    assert(!clearing_cache); cache_frees = 0; clearing_cache = 1;
+    sfs_image_clear_read_cache(h);
+    clearing_cache = 0; assert(cache_frees <= 1001);
+}
+static void cache_binding(const sfs_result *a, const sfs_result *b) {
+    assert(a->generation == b->generation && a->committed_end == b->committed_end && a->physical_end == b->physical_end);
+    assert(a->device == b->device && a->inode == b->inode && !memcmp(a->uuid, b->uuid, 16) && !memcmp(a->root_digest, b->root_digest, 32));
+}
+static void cache_purge(void) {
+    reset("", 0); cache_release(NULL); assert(!cache_frees && !allocated);
+    fixture f = indexed_fixture(32, 1, 2); fixture_save(&f);
+    size_t n; unsigned char *baseline = bytes("image", &n); sfs_image *h; sfs_result r, binding;
+    struct stat identity, after; assert(!lstat("image", &identity)); open_readonly(&h, &binding);
+    int owned = image_open_fd, fd_count = descriptors(); uint64_t handle = cache_handle_bytes(h);
+    sfs_entry entry; OK(sfs_image_lookup(h, 0, 1, "f00000000", 9, &entry, &r)); expect(h, 0, 2, "shared");
+    sfs_cookie cookie = {0}; int found;
+    for (unsigned i = 0; i < 11; i++) { OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r)); assert(found && entry.inode == i + 2); }
+    sfs_cookie saved = cookie; assert(allocated > handle); uint64_t warm = allocated;
+    fail_allocation = allocation_calls + 1; uint64_t attempts = allocation_calls;
+    cache_release(h); assert(cache_frees && allocated == handle && allocation_calls == attempts && !memcmp(&cookie, &saved, sizeof(cookie)));
+    cache_release(h); assert(!cache_frees && allocated == handle && allocation_calls == attempts);
+    sfs_entry canary; memset(&canary, 0xA5, sizeof(canary)); entry = canary;
+    assert(sfs_image_lookup(h, 0, 1, "f00000000", 9, &entry, &r) == SFS_NOMEM && hit && r.phase == SFS_PHASE_READ && r.system_errno == ENOMEM && !memcmp(&entry, &canary, sizeof(entry)));
+    fail_allocation = 0; reset("", 0);
+    OK(sfs_image_lookup(h, 0, 1, "f00000000", 9, &entry, &r)); assert(entry.inode == 2 && image_read_bytes && metadata_hash_input); cache_binding(&binding, &r);
+    expect(h, 0, 2, "shared"); assert(raw_hashes);
+    for (unsigned i = 11; i < 32; i++) { OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r)); assert(found && entry.inode == i + 2); }
+    saved = cookie; cache_release(h); assert(!memcmp(&cookie, &saved, sizeof(cookie)));
+    OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r)); assert(!found);
+    cache_release(h); OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r)); assert(!found);
+    sfs_view view; OK(sfs_image_snapshot_view(h, "snapshot-0", 10, &view, &r)); assert(view == 1); cache_binding(&binding, &r);
+    expect(h, view, 2, "shared"); OK(sfs_image_resume_after(h, view, binding.generation, binding.root_digest, 1, 13, &cookie, &r));
+    saved = cookie; cache_release(h); assert(!memcmp(&cookie, &saved, sizeof(cookie)));
+    sfs_cookie numeric_cookie = {0}; uint64_t numeric_position = 0;
+    OK(sfs_image_next_position(h, view, 1, &numeric_cookie, &entry, &numeric_position, &found, &r)); assert(found && entry.inode == 2);
+    uint64_t accepted_position = numeric_position; sfs_cookie accepted_cookie = numeric_cookie;
+    cache_release(h); OK(sfs_image_resume_after_position(h, view, binding.generation, binding.root_digest, 1, accepted_position, &numeric_cookie, &r));
+    assert(!memcmp(&numeric_cookie, &accepted_cookie, sizeof(numeric_cookie))); cache_binding(&binding, &r);
+    cache_release(h); OK(sfs_image_next_position(h, view, 1, &numeric_cookie, &entry, &numeric_position, &found, &r)); assert(found && entry.inode == 3);
+    assert(position_equivalence(h, 0, 1, &binding, 2) == 32); assert(position_equivalence(h, view, 1, &binding, 2) == 32);
+    OK(sfs_image_next(h, view, 1, &cookie, &entry, &found, &r)); assert(found && entry.inode == 14);
+    sfs_result stale = binding; stale.generation++; resume_failure(h, view, &stale, 1, 13, SFS_STATE);
+    stale = binding; stale.root_digest[0] ^= 1; resume_failure(h, view, &stale, 1, 13, SFS_STATE);
+    cookie = saved; assert(sfs_image_next(h, view, 2, &cookie, &entry, &found, &r) == SFS_INVALID);
+    assert(fcntl(owned, F_GETFD) >= 0 && (fcntl(owned, F_GETFL) & O_ACCMODE) == O_RDONLY && descriptors() == fd_count);
+    assert(!fstat(owned, &after)); identical_identity(&identity, &after);
+    sfs_image *other = NULL; sfs_recovery recovery;
+    assert(sfs_image_open(root, "image", &other, &r) == SFS_BUSY && !other);
+    assert(sfs_image_inspect(root, "image", &other, &recovery, &generous, &r) == SFS_BUSY && !other);
+    readonly_refusals(h, SFS_STATE, SFS_PHASE_NONE); close_image(h); assert(!allocated); unchanged("image", baseline, n);
+    printf("{\"case\":\"cache-owned-release-refill-cookie\",\"released_requested_bytes\":%llu,\"rss_claim\":false}\n", (unsigned long long)(warm - handle));
+
+    /* A failed page read leaves an allocated cache body which must also be freed. */
+    reset("", 0); open_readonly(&h, &r); handle = cache_handle_bytes(h); cache_release(h); reset("read_error", 1);
+    assert(sfs_image_lookup(h, 0, 1, "f00000000", 9, &entry, &r) == SFS_IO && hit && r.phase == SFS_PHASE_READ && r.system_errno == EIO);
+    assert(allocated > handle); cache_release(h); assert(allocated == handle && cache_frees);
+    poisoned_readonly(h, SFS_PHASE_READ); cache_release(h); assert(!cache_frees); reset("", 0); close_image(h); assert(!allocated);
+
+    /* Neither unselected cleanup nor selected cleanup resets observed anchors. */
+    recovery_cancellation observed = {.after_hash = 2 * CELL}; sfs_verify_budget budget = generous;
+    budget.cancelled = cancel_recovery_once; budget.context = &observed; reset("", 0);
+    OK(sfs_image_inspect(root, "image", &h, &recovery, &budget, &r));
+    assert(observed.fired && observed.hash_at_cancel == 2 * CELL && recovery.slots[0].status == SFS_INCOMPLETE && recovery.slots[1].status == SFS_OK);
+    cache_release(h); assert(sfs_image_stat(h, 0, 1, &entry, &r) == SFS_STATE);
+    ok(sfs_image_select(h, 1, &generous, &binding), &binding); cache_release(h); expect(h, 1, 2, "shared");
+    OK(sfs_image_stat(h, 0, 1, &entry, &r)); cache_binding(&binding, &r); assert(sfs_image_begin(h, &r) == SFS_STATE);
+    unsigned char *changed = malloc(n); assert(changed); memcpy(changed, baseline, n); put64(changed + 40, 2); slot_hash(changed);
+    cache_release(h); replace_image(changed, n); reset("", 0);
+    assert(sfs_image_select(h, 0, &generous, &r) == SFS_CORRUPT && r.phase == SFS_PHASE_READ && !r.system_errno);
+    replace_image(baseline, n); OK(sfs_image_select(h, 0, &generous, &r)); cache_release(h); expect(h, 0, 2, "shared");
+    close_image(h); assert(!allocated); unchanged("image", baseline, n); free(changed); free(baseline); retain(1300);
+
+    /* Minor6 retains pending overlays, shared owners, views and charged tail. */
+    f = hardlink_fixture(2, 0, 1, 1); fixture_save(&f); reset("", 0); open_image(&h);
+    metadata_clock(1500); OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, 4, 0, "new", 3, &r));
+    expect(h, 0, 4, "old"); handle = cache_handle_bytes(h); cache_release(h); assert(allocated > handle);
+    expect(h, 0, 4, "old"); sfs_metadata_entry m = hardlink_get(h, 0, 4, 2); assert(m.entry.size == 3);
+    ok(sfs_image_commit(h, &binding), &binding); expect(h, 0, 4, "new"); expect(h, 1, 4, "old"); hardlink_name(h, 0, 1, "b", 4);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, 4, 0, "bad", 3, &r)); expect(h, 0, 4, "new");
+    ok(sfs_image_stat(h, 0, 4, &entry, &binding), &binding); uint64_t charged = binding.physical_end; cache_release(h);
+    OK(sfs_image_stat(h, 0, 4, &entry, &r)); cache_binding(&binding, &r); expect(h, 0, 4, "new");
+    OK(sfs_image_abort(h, &r)); assert(r.physical_end == charged && r.generation == binding.generation && !memcmp(r.root_digest, binding.root_digest, 32));
+    cache_release(h); expect(h, 0, 4, "new"); expect(h, 1, 4, "old");
+    close_image(h); assert(!allocated); open_image(&h); expect(h, 0, 4, "new"); close_image(h); retain(1301);
+}
+
+/* One legal height-three global tree; the literal table is independent of cookies. */
+static const uint64_t position_table[24] = {
+    1297,1298,1299,1300, 1313,1314,1315,1316, 1329,1330,1331,1332,
+    1441,1442,1443,1444, 1457,1458,1459,1460, 1473,1474,1475,1476
+};
+static fixture position_fixture(fixture_node leaves[6]) {
+    fixture f = fixture_start(); f.minor = 6; put32(f.p + 12, 6);
+    unsigned char names[24 * 280], inodes[2 * 496] = {0};
+    hardlink_row(names, 1, "dir", 2);
+    for (unsigned i = 0; i < 23; i++) { char name[16]; assert(snprintf(name, sizeof(name), "n%04u", i) == 5); hardlink_row(names + (i + 1) * 280, 1, name, 3); }
+    fixture_node reverse = tree(&f, 6, names + 280, 23);
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned char *row = inodes + i * 496, *name = names + i * 280; unsigned kind = i ? SFS_FILE : SFS_DIRECTORY;
+        put64(row, i + 2); put64(row + 8, 1); put32(row + 16, kind); put32(row + 20, get32(name + 8)); memcpy(row + 88, name + 12, get32(name + 8)); put64(row + 344, i ? 23 : 1); fixture_tuple(row + 352, kind, 0);
+        if (i) memcpy(row + 440, reverse.ref, 56);
+    }
+    fixture_node inode = tree(&f, 1, inodes, 2), middle[2];
+    for (unsigned i = 0; i < 6; i++) leaves[i] = page(&f, 2, 0, names + i * 4 * 280, 4, 280, NULL);
+    for (unsigned i = 0; i < 2; i++) middle[i] = page(&f, 2, 1, NULL, 3, 328, leaves + i * 3);
+    fixture_node global = page(&f, 2, 2, NULL, 2, 328, middle), zero = {0};
+    fixture_node space = hardlink_space(&f, inode, global, zero, 2, 24, 4), catalog = hardlink_catalog(&f, space);
+    finish_fixture(&f, space, catalog); assert(hardlink_guard(f.p, f.p, f.n));
+    unsigned char *root_page = record(f.p, global.ref, f.n); assert(get16(root_page + 68) == 2 && get16(root_page + 70) == 2);
+    for (unsigned i = 0; i < 2; i++) { unsigned char *p = record(f.p, middle[i].ref, f.n); assert(get16(p + 68) == 1 && get16(p + 70) == 3); }
+    for (unsigned i = 0; i < 6; i++) { unsigned char *p = record(f.p, leaves[i].ref, f.n); assert(!get16(p + 68) && get16(p + 70) == 4); }
+    return f;
+}
+static void position_outputs(sfs_image *h, const sfs_result *binding) {
+    sfs_cookie cookie, saved; memset(&saved, 0xA5, sizeof(saved)); sfs_entry e, canary; memset(&canary, 0xA5, sizeof(canary)); sfs_result r;
+    cookie = saved; e = canary; uint64_t unavailable_position = UINT64_MAX; int unavailable_found = 99;
+    XEXPECT(sfs_image_next_position(NULL, 0, 1, &cookie, &e, &unavailable_position, &unavailable_found, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && unavailable_found == 99 && unavailable_position == UINT64_MAX && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &canary, sizeof(e)));
+    position_failure(NULL, 0, binding, 1, 1297, SFS_INVALID, SFS_PHASE_NONE, 0);
+    for (unsigned missing = 0; missing < 4; missing++) {
+        cookie = saved; e = canary; uint64_t position = UINT64_MAX; int found = 99;
+        XEXPECT(sfs_image_next_position(h, 0, 1, missing == 0 ? NULL : &cookie, missing == 1 ? NULL : &e,
+            missing == 2 ? NULL : &position, missing == 3 ? NULL : &found, &r), SFS_INVALID);
+        assert(found == 99 && position == UINT64_MAX && !memcmp(&e, &canary, sizeof(e)) && !memcmp(&cookie, &saved, sizeof(cookie)));
+        assert(!r.system_errno && r.phase == SFS_PHASE_NONE);
+    }
+    /* The inherited malformed-cookie refusal is identical, including provenance. */
+    sfs_cookie legacy_cookie = saved; sfs_entry legacy_entry = canary; int legacy_found = 99; sfs_result legacy_result;
+    enum sfs_status legacy_status = sfs_image_next(h, 0, 1, &legacy_cookie, &legacy_entry, &legacy_found, &legacy_result);
+    cookie = saved; e = canary; uint64_t malformed_position = UINT64_MAX; int malformed_found = 99;
+    enum sfs_status numeric_status = sfs_image_next_position(h, 0, 1, &cookie, &e, &malformed_position, &malformed_found, &r);
+    assert(legacy_status != SFS_OK && legacy_result.status == legacy_status && numeric_status == legacy_status && r.status == numeric_status);
+    assert(r.phase == legacy_result.phase && r.system_errno == legacy_result.system_errno && r.coverage == legacy_result.coverage);
+    assert(!legacy_found && !malformed_found && malformed_position == UINT64_MAX && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&legacy_cookie, &saved, sizeof(saved)) && !memcmp(&e, &canary, sizeof(e)) && !memcmp(&legacy_entry, &canary, sizeof(canary)));
+    cookie = saved;
+    XEXPECT(sfs_image_resume_after_position(h, 0, 0, binding->root_digest, 1, 1297, &cookie, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !memcmp(&cookie, &saved, sizeof(cookie)));
+    XEXPECT(sfs_image_resume_after_position(h, 0, binding->generation, NULL, 1, 1297, &cookie, &r), SFS_INVALID);
+    assert(r.phase == SFS_PHASE_NONE && !memcmp(&cookie, &saved, sizeof(cookie)));
+    XEXPECT(sfs_image_resume_after_position(h, 0, binding->generation, binding->root_digest, 1, 1297, NULL, &r), SFS_INVALID); assert(r.phase == SFS_PHASE_NONE);
+    assert(sfs_image_resume_after_position(h, 0, binding->generation, binding->root_digest, 1, 0, &cookie, NULL) == SFS_INVALID && !memcmp(&cookie, &saved, sizeof(cookie)));
+    cookie = saved; e = canary; int refused_found = 99;
+    assert(sfs_image_next_position(h, 0, 1, &cookie, &e, NULL, &refused_found, NULL) == SFS_INVALID && refused_found == 99 && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &canary, sizeof(e)));
+    cookie = (sfs_cookie){0}; e = canary; uint64_t position = 0; int found = 99;
+    assert(sfs_image_next_position(h, 0, 1, &cookie, &e, &position, &found, NULL) == SFS_OK && found && position == 1297 && e.inode == 2);
+    assert(!clock_calls); image_unwritten();
+}
+static void position_names(void) {
+    retain(3500); fixture_node leaves[6]; fixture f = position_fixture(leaves); save("image", f.p, f.n);
+    sfs_image *h; sfs_result r, binding; reset("", 0); open_image(&h); reset("", 0);
+    XEXPECT(sfs_image_verify(h, &generous, &r), SFS_OK); assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE && !raw_hash_input); image_unwritten(); close_image(h); retain(3501); save("image", f.p, f.n); reset("", 0); open_readonly(&h, &binding); int fd = image_open_fd; struct stat identity, after; assert(!fstat(fd, &identity));
+    assert(position_equivalence(h, 0, 1, &binding, 6) == 24); assert(position_equivalence(h, 1, 1, &binding, 6) == 24);
+    assert(position_equivalence(h, 0, 2, &binding, 6) == 0);
+    sfs_cookie cookies[24], cursor = {0}; sfs_entry e; int found; uint64_t position;
+    reset("", 0); clock_calls = 0;
+    for (unsigned i = 0; i < 24; i++) {
+        XEXPECT(sfs_image_next_position(h, 0, 1, &cursor, &e, &position, &found, &r), SFS_OK);
+        assert(found && position == position_table[i] && e.parent == 1 && e.inode == (i ? 3 : 2));
+        if (!i) assert(e.name_length == 3 && !memcmp(e.name, "dir", 3));
+        else { char name[16]; assert(snprintf(name, sizeof(name), "n%04u", i - 1) == 5); assert(e.name_length == 5 && !memcmp(e.name, name, 5)); }
+        cookies[i] = cursor; sfs_cookie resumed;
+        XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 1, position_table[i], &resumed, &r), SFS_OK);
+        assert(!memcmp(&resumed, &cursor, sizeof(cursor)));
+    }
+    /* Speculative advances are local: reconstruct the accepted position twice. */
+    for (unsigned pass = 0; pass < 2; pass++) {
+        unsigned previous = pass ? 2 : 11; cursor = cookies[previous];
+        XEXPECT(sfs_image_next_position(h, 0, 1, &cursor, &e, &position, &found, &r), SFS_OK); assert(found && position == position_table[previous + 1]);
+        XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 1, position_table[previous], &cursor, &r), SFS_OK);
+        XEXPECT(sfs_image_next_position(h, 0, 1, &cursor, &e, &position, &found, &r), SFS_OK); assert(found && position == position_table[previous + 1]);
+    }
+    cache_release(h); watch_payload(0, leaves[2].ref); watch_payload(1, leaves[3].ref); watch_count = 2; watch_clear(); cursor = cookies[11];
+    XEXPECT(sfs_image_next_position(h, 0, 1, &cursor, &e, &position, &found, &r), SFS_OK);
+    assert(found && position == 1441 && e.name_length == 5 && !memcmp(e.name, "n0011", 5));
+    assert(watch_reads[0] && watch_reads[1] && !raw_hash_input); watch_count = 0;
+    /* Five distinct traversal pages, independent of extra membership lookups. */
+    unsigned char *ns = namespace_at(f.p, selected_slot(f.p), f.n), *name_root = record(f.p, ns + 120, f.n);
+    uint64_t union_offsets[5] = {get64(ns + 128), get64(name_root + 640 + 271 + 8), get64(name_root + 640 + 328 + 271 + 8), get64(leaves[2].ref + 8), get64(leaves[3].ref + 8)};
+    for (unsigned i = 0; i < 5; i++) for (unsigned j = i + 1; j < 5; j++) assert(union_offsets[i] != union_offsets[j]);
+    uint64_t power = 1; for (unsigned i = 0; i < 15; i++) power *= 9;
+    uint64_t maximum = (2 * power - 1) * 16 + 12; assert(maximum == UINT64_C(6588516227028764) && maximum < (UINT64_C(1) << 53));
+    uint64_t inverse = maximum / 16; assert(maximum % 16 == 12);
+    for (unsigned i = 0; i < 15; i++) { assert(inverse % 9 == 8); inverse /= 9; } assert(inverse == 1);
+    const uint64_t invalid[] = {0,1,2,3,16,1296,1301,1309,1311,17,145,11665,2593,1585,2449,1345,1425,UINT64_MAX-14,UINT64_MAX,UINT64_C(6588516227028764)};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) position_failure(h, 0, &binding, 1, invalid[i], SFS_INVALID, SFS_PHASE_READ, 0);
+    position_failure(h, 0, &binding, 2, 1297, SFS_INVALID, SFS_PHASE_READ, 0);
+    position_failure(h, 99, &binding, 1, 1297, SFS_NOT_FOUND, SFS_PHASE_READ, 0);
+    position_failure(h, 0, &binding, 3, 1297, SFS_INVALID, SFS_PHASE_READ, 0);
+    position_failure(h, 0, &binding, 0, 1297, SFS_INVALID, SFS_PHASE_READ, 0);
+    position_failure(h, 0, &binding, UINT64_MAX, 1297, SFS_INVALID, SFS_PHASE_READ, 0);
+    sfs_result stale = binding; stale.generation++; position_failure(h, 0, &stale, 1, 1297, SFS_STATE, SFS_PHASE_NONE, 0);
+    stale = binding; stale.root_digest[0] ^= 1; position_failure(h, 0, &stale, 1, 1297, SFS_STATE, SFS_PHASE_NONE, 0);
+    position_outputs(h, &binding);
+    assert(fcntl(fd, F_GETFL) >= 0 && (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY && !fstat(fd, &after)); identical_identity(&identity, &after);
+    image_unwritten(); close_image(h); unchanged("image", f.p, f.n); free(f.p); retain(3502);
+}
+static void position_failures(void) {
+    sfs_result r, binding; sfs_image *h; fixture_node leaves[6];
+    fixture f = position_fixture(leaves); fixture_save(&f); reset("", 0); open_image(&h); binding = xattr_binding(h);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); sfs_metadata_update update = {0}; update.fields = SFS_META_UID; update.uid = 777;
+    XEXPECT(sfs_image_set_metadata(h, 3, &update, &r), SFS_OK); size_t n; unsigned char *before = bytes("image", &n);
+    reset("", 0); clock_calls = 0; fail_allocation = allocation_calls + 1;
+    position_failure(h, 0, &binding, 1, 1297, SFS_NOMEM, SFS_PHASE_READ, ENOMEM); assert(hit); fail_allocation = 0;
+    position_failure(h, 0, &binding, 1, 0, SFS_INVALID, SFS_PHASE_READ, 0);
+    sfs_result stale_binding = binding; stale_binding.generation++; position_failure(h, 0, &stale_binding, 1, 1297, SFS_STATE, SFS_PHASE_NONE, 0);
+    position_failure(h, 99, &binding, 1, 1297, SFS_NOT_FOUND, SFS_PHASE_READ, 0); unchanged("image", before, n);
+    sfs_cookie cookie = {0}, saved = cookie; sfs_entry e, canary; memset(&canary, 0xA5, sizeof(canary)); e = canary; int found = 99; uint64_t position = UINT64_MAX;
+    cache_release(h); reset("", 0); fail_allocation = allocation_calls + 1;
+    XEXPECT(sfs_image_next_position(h, 0, 1, &cookie, &e, &position, &found, &r), SFS_NOMEM);
+    assert(hit && !found && r.phase == SFS_PHASE_READ && r.system_errno == ENOMEM && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &canary, sizeof(e)) && position == UINT64_MAX);
+    fail_allocation = 0; image_unwritten(); unchanged("image", before, n); free(before); assert(!clock_calls); metadata_commit(h); sfs_metadata_entry m = hardlink_get(h, 0, 3, 23); assert(m.uid == 777); close_image(h); retain(3511);
+    for (unsigned policy = 0; policy < 3; policy++) for (unsigned next = 0; next < 2; next++) {
+        f = position_fixture(leaves); fixture_save(&f); reset("", 0);
+        if (policy == 1) open_readonly(&h, &binding);
+        else if (policy == 2) { sfs_recovery recovery; XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK); ok(sfs_image_select(h, 1, &generous, &binding), &binding); }
+        else { open_image(&h); binding = xattr_binding(h); XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_set_metadata(h, 3, &update, &r), SFS_OK); }
+        XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 1, 1332, &cookie, &r), SFS_OK); saved = cookie;
+        before = bytes("image", &n); cache_release(h); read_at[0] = get64(leaves[3].ref + 8); reset("candidate_reads", 1); clock_calls = 0;
+        if (next) {
+            e = canary; position = UINT64_MAX; found = 99;
+            XEXPECT(sfs_image_next_position(h, 0, 1, &cookie, &e, &position, &found, &r), SFS_IO);
+            assert(!found && r.phase == SFS_PHASE_READ && r.system_errno == EIO && !memcmp(&cookie, &saved, sizeof(cookie)) && !memcmp(&e, &canary, sizeof(e)) && position == UINT64_MAX);
+        } else position_failure(h, 0, &binding, 1, 1441, SFS_IO, SFS_PHASE_READ, EIO);
+        assert(hit && !clock_calls); image_unwritten(); unchanged("image", before, n); reset("", 0);
+        if (policy == 2) { cache_release(h); assert(position_equivalence(h, 0, 1, &binding, 6) == 24); }
+        else {
+            position_failure(h, 0, &binding, 1, 0, SFS_POISONED, SFS_PHASE_READ, 0);
+            e = canary; cookie = saved; position = UINT64_MAX; found = 99;
+            XEXPECT(sfs_image_next_position(h, 0, 1, &cookie, &e, &position, &found, &r), SFS_POISONED);
+            assert(found == 99 && !memcmp(&e, &canary, sizeof(e)) && !memcmp(&cookie, &saved, sizeof(cookie)) && position == UINT64_MAX);
+            if (!policy) XEXPECT(sfs_image_commit(h, &r), SFS_POISONED);
+        }
+        close_image(h); unchanged("image", before, n); free(before); retain(3540 + (int)(policy * 2 + next));
+    }
+    /* Identity precedes missing view/malformed token, but follows binding. */
+    for (unsigned next = 0; next < 2; next++) {
+        f = position_fixture(leaves); fixture_save(&f); reset("", 0); open_image(&h); binding = xattr_binding(h);
+        XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_set_metadata(h, 3, &update, &r), SFS_OK);
+        int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); struct stat st; assert(!fstat(fd, &st)); raw_write(fd, "!", 1, st.st_size); assert(!close(fd)); before = bytes("image", &n);
+        reset("", 0); clock_calls = 0; sfs_result stale = binding; stale.generation++;
+        position_failure(h, 99, &stale, 1, 0, SFS_STATE, SFS_PHASE_NONE, 0);
+        if (!next) position_failure(h, 99, &binding, 1, 0, SFS_IO, SFS_PHASE_IDENTITY, ESTALE);
+        else { cookie = (sfs_cookie){0}; saved = cookie; e = canary; position = UINT64_MAX; found = 99;
+            XEXPECT(sfs_image_next_position(h, 0, 1, &cookie, &e, &position, &found, &r), SFS_IO);
+            assert(!found && r.phase == SFS_PHASE_IDENTITY && r.system_errno == ESTALE && !memcmp(&e, &canary, sizeof(e)) && !memcmp(&cookie, &saved, sizeof(cookie)) && position == UINT64_MAX);
+        }
+        assert(!clock_calls); image_unwritten(); XEXPECT(sfs_image_commit(h, &r), SFS_POISONED); close_image(h); unchanged("image", before, n); free(before); retain(3516 + (int)next);
+    }
+}
+
+static void position_views(void) {
+    retain(3530); fixture f = hardlink_fixture(2, 1, 0, 1); fixture_save(&f); sfs_image *h; sfs_result r, binding; reset("", 0); open_image(&h); binding = xattr_binding(h);
+    sfs_cookie cookie = {0}, committed, proposed; sfs_entry e; uint64_t position = 0; int found;
+    XEXPECT(sfs_image_next_position(h, 0, 2, &cookie, &e, &position, &found, &r), SFS_OK); assert(found && e.inode == 4 && e.name[0] == 'a' && position == 20); committed = cookie;
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, 4, 1, "aaa", 3, &r), SFS_OK);
+    assert(position_equivalence(h, 0, 2, &binding, 6) == 2);
+    XEXPECT(sfs_image_resume_after_position(h, 0, binding.generation, binding.root_digest, 2, 20, &proposed, &r), SFS_OK); assert(!memcmp(&proposed, &committed, sizeof(proposed)));
+    XEXPECT(sfs_image_abort(h, &r), SFS_OK); assert(position_equivalence(h, 0, 2, &binding, 6) == 2);
+    XEXPECT(sfs_image_begin(h, &r), SFS_OK); XEXPECT(sfs_image_link(h, 4, 1, "aaa", 3, &r), SFS_OK); metadata_commit(h);
+    sfs_result fresh = xattr_binding(h); reset("", 0); clock_calls = 0;
+    position_failure(h, 0, &binding, 2, 20, SFS_STATE, SFS_PHASE_NONE, 0);
+    position_failure(h, 1, &binding, 2, 20, SFS_STATE, SFS_PHASE_NONE, 0);
+    sfs_entry canary; memset(&canary, 0xA5, sizeof(canary)); e = canary; cookie = committed; position = UINT64_MAX; found = 99;
+    XEXPECT(sfs_image_next_position(h, 0, 2, &cookie, &e, &position, &found, &r), SFS_STATE);
+    assert(!found && position == UINT64_MAX && !memcmp(&cookie, &committed, sizeof(cookie)) && !memcmp(&e, &canary, sizeof(e)));
+    /* Same numeric seek, two explicitly authorized views, different preceding rows. */
+    for (unsigned view = 0; view < 2; view++) {
+        cookie = (sfs_cookie){0}; XEXPECT(sfs_image_next_position(h, view, 1, &cookie, &e, &position, &found, &r), SFS_OK);
+        assert(found && position == 17 && e.inode == (view ? 5 : 4)); assert(e.name_length == (view ? 5u : 3u) && !memcmp(e.name, view ? "other" : "aaa", e.name_length));
+        XEXPECT(sfs_image_resume_after_position(h, view, fresh.generation, fresh.root_digest, 1, 17, &proposed, &r), SFS_OK); assert(!memcmp(&cookie, &proposed, sizeof(cookie)));
+    }
+    close_image(h); size_t n; unsigned char *before = bytes("image", &n); reset("", 0); open_readonly(&h, &binding);
+    assert(!memcmp(binding.root_digest, fresh.root_digest, 32) && binding.generation == fresh.generation);
+    assert(position_equivalence(h, 0, 2, &binding, 6) == 2); assert(position_equivalence(h, 1, 2, &binding, 6) == 2); close_image(h);
+    sfs_recovery recovery; reset("", 0); XEXPECT(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r), SFS_OK);
+    position_failure(h, 0, &binding, 1, 17, SFS_STATE, SFS_PHASE_NONE, 0);
+    for (unsigned slot = 0; slot < 2; slot++) {
+        assert(recovery.slots[slot].status == SFS_OK && recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE);
+        ok(sfs_image_select(h, slot, &generous, &binding), &binding); assert(position_equivalence(h, 1, 2, &binding, 6) == 2);
+    }
+    image_unwritten(); close_image(h); unchanged("image", before, n); free(before); retain(3531);
+}
 
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
@@ -3985,10 +4387,10 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
     else if(!strcmp(argv[1],"hardlink-versions")) hardlink_versions();
-    else if(!strcmp(argv[1],"hardlink-shared")) hardlink_shared();
+    else if(!strcmp(argv[1],"hardlink-shared")) { hardlink_shared(); position_views(); }
     else if(!strcmp(argv[1],"hardlink-transitions")) hardlink_transitions();
-    else if(!strcmp(argv[1],"hardlink-names")) hardlink_names();
-    else if(!strcmp(argv[1],"hardlink-failures")) hardlink_failures();
+    else if(!strcmp(argv[1],"hardlink-names")) { hardlink_names(); position_names(); }
+    else if(!strcmp(argv[1],"hardlink-failures")) { hardlink_failures(); position_failures(); }
     else if(!strcmp(argv[1],"hardlink-verify")) hardlink_verify();
     else if(!strcmp(argv[1],"xattr-versions")) xattr_versions();
     else if(!strcmp(argv[1],"xattr-values")) xattr_values();
@@ -4002,8 +4404,9 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-views")) symlink_views();
     else if(!strcmp(argv[1],"symlink-failures")) symlink_failures();
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
+    else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
+    if(strcmp(argv[1],"cache")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }

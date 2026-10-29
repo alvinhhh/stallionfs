@@ -215,6 +215,12 @@ enum sfs_status sfs_image_inspect(const char *directory, const char *name,
                                 const sfs_verify_budget *budget, sfs_result *result);
 enum sfs_status sfs_image_select(sfs_image *, unsigned slot,
                                  const sfs_verify_budget *, sfs_result *);
+/* Free cached metadata pages only; NULL and repeated calls are no-ops.
+ * Call only on a still-owned quiescent handle, serialized with all operations
+ * and close, never from a verification cancellation callback. No image I/O.
+ * Retains descriptors/locks, selection/inline views, observations, poison and
+ * transactions. Later reads refill through the existing checked accessors. */
+void sfs_image_clear_read_cache(sfs_image *image);
 enum sfs_status sfs_image_close(sfs_image *, sfs_result *);
 enum sfs_status sfs_image_verify(sfs_image *, const sfs_verify_budget *, sfs_result *);
 
@@ -245,6 +251,23 @@ enum sfs_status sfs_image_read(sfs_image *, sfs_view, sfs_inode, uint64_t offset
 /* At end, returns OK with *found=0. Returns one entry, never an allocated list. */
 enum sfs_status sfs_image_next(sfs_image *, sfs_view, sfs_inode parent,
                              sfs_cookie *, sfs_entry *, int *found, sfs_result *);
+/* Like next, with a required position output distinguishing each actual name.
+ * On OK/found=1, publish entry, cookie and position together. End/error leaves
+ * entry and position unchanged; cookie and found follow next's existing rules.
+ * Positions encode a checked name-tree path, not an inode or physical offset. */
+enum sfs_status sfs_image_next_position(sfs_image *, sfs_view, sfs_inode parent,
+    sfs_cookie *, sfs_entry *out, uint64_t *position, int *found, sfs_result *);
+/* Reconstruct after a position in an explicit committed view (formats 2..6).
+ * Use the successful open/select generation and commit-root digest, retaining
+ * image/view identity. Readiness precedes argument/binding/identity/view/parent
+ * checks. Missing view is NOT_FOUND; binding mismatch is STATE; malformed
+ * position or wrong parent is INVALID. Trusted-path/inode membership failures
+ * retain CORRUPT/IO and normal poison rules. Failure leaves out unchanged;
+ * success reports TOUCHED, including after the directory's last child.
+ * No clock sample, directory scan or persistent token state is introduced. */
+enum sfs_status sfs_image_resume_after_position(sfs_image *, sfs_view,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    sfs_inode parent, uint64_t position, sfs_cookie *out, sfs_result *);
 /* Reconstruct a next cookie after a canonical child in the explicit view.
  * Bind to the successful open/select generation and commit-root digest.
  * Callers retain image/view identity. Failure leaves nonnull out unchanged;

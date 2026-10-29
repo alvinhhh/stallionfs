@@ -20,6 +20,21 @@ Locks coordinate cooperating callers; hashes do not authenticate an image agains
 an attacker rewriting the file and all its hashes. Callers serialize operations
 on a handle, including avoiding reentry from a cancellation callback.
 
+`sfs_image_clear_read_cache` releases the heap metadata page cache without image
+or auxiliary I/O, hashing, allocation, closing or revalidation. NULL, an empty
+cache and repeated calls are no-ops. The caller must own a quiescent handle and
+serialize the call with all operations and close; cancellation-callback reentry
+is invalid. The operation accepts selected, unselected, recovery, poisoned and
+transactional handles without changing their authority or health.
+
+Descriptors, locks, anchors, observed errors, poison, inline loaded views and
+staged transactions remain intact. Inline snapshot names/counts/references,
+caller-owned cookies and transaction overlays are not page-cache allocations
+and are retained. Cookies keep their existing validity rules; later reads
+refill and validate the cache, with their usual allocation/error contracts.
+The void cleanup operation provides no verification result, ambient errno
+promise, secure erasure, RSS reduction or OS cache eviction guarantee.
+
 ## Limits and ordering
 
 | Quantity | Format or API limit |
@@ -887,6 +902,68 @@ snapshot; reopening an unchanged image permits reconstruction with its fresh
 receipt. Callers retain image/volume identity and original view/verifier binding
 and serialize access. Passing another explicit view requests that view; this
 helper proves membership, not that the caller previously emitted the inode.
+
+`sfs_image_next_position(image, view, parent, cookie, entry, position, found,
+result)` shares the existing `next` engine. It requires a nonnull position
+output. A successful found entry publishes its actual alias name, cookie and
+numeric position together; end or failure leaves entry and position unchanged.
+Readiness and required-output checks precede the existing found=0 initialization.
+As with `next`, failure leaves the cookie unchanged; a successful end saves the
+finished cookie. The ordinary iterator remains available with unchanged behavior.
+
+`sfs_image_resume_after_position(image, view, expected_generation,
+expected_root_digest, parent, position, out, result)` reconstructs the same
+opaque cookie from a checked structural position in formats 2 through 6. It
+checks readiness, nonnull output/digest and nonzero expected generation, then
+generation/commit-root binding, descriptor identity, explicit committed view,
+parent directory and position, in that order. Binding mismatch returns STATE;
+missing view returns NOT_FOUND; malformed numeric depth/index/sentinel, an empty
+name tree or a prior row belonging to another parent returns INVALID. These
+input errors do not poison or discard staging. Trusted-path digest/topology or
+inode/global/reverse membership failures retain CORRUPT and I/O failures retain
+their phase/errno and ordinary-versus-recovery poison rules. Allocation failure
+preserves outputs and staging. Success publishes the cookie only after all
+checks and reports TOUCHED. Result pointers may be NULL. Neither API samples
+the clock, writes, flushes staging or changes the disk format or cookie layout.
+
+The numeric position uses the checked global name-tree path. Starting at p=1,
+for each root-to-leaf internal frame set p=9*p+chosen_child_index (0..8), then
+position=16*p+leaf_next_index (1..12). The sentinel 1 identifies the depth;
+leaf-root positions start at 17. The current height limit 16, nine internal
+children and twelve leaf rows give maximum 6,588,516,227,028,764. Arithmetic is
+integer-only with overflow checks. Those structural limits are part of this
+position contract; changing them requires a reviewed contract change.
+
+Decoding takes the low four bits as leaf-next index, divides the remaining
+integer by 9 exactly root.level times, and requires sentinel 1 remains. It
+checks every chosen index against its trusted page, reconstructs parent frame
+indices as chosen child+1 and the leaf frame as leaf-next, and validates the
+prior row at leaf-next-1. Old formats retain sole-name checks; format 6 retains
+canonical inode and exact alias membership checks. The value never supplies a
+physical offset. Adjacent aliases sharing an inode therefore have distinct
+positions. A leaf boundary or last-child position needs no special end token:
+normal `next` reaches the successor or end after resume.
+
+The decoder follows at most 16 distinct name-tree path pages. A complete
+`next_position` may reconstruct a prior cursor path and traverse a successor
+in another root branch, for at most 31 distinct pages in that path union.
+Directory/inode/canonical-name/reverse membership lookups are additional bounded
+indexed work; repeated page validation calls and read/hash counters are not
+counts of distinct path pages. Encoding adds arithmetic without reads. Decoder
+storage is one existing 10,272-byte heap cursor, at most 15 branch bytes and
+fixed row/node buffers; inherited indexed lookups also use automatic cursors.
+These are structural bounds, not a whole-call stack/RSS or performance claim.
+No registry, prefix scan or storage proportional to the number of aliases is
+introduced.
+
+Callers retain image, view and verifier identity and serialize calls. Numeric
+positions refer to the explicit immutable namespace, not inode identity or
+cross-commit continuity. The expected receipt binds the current committed root,
+even for an old snapshot. A valid numeric position in another explicitly
+requested view seeks that view; it is not proof of a prior emission or an
+authorization token. Cache release does not change the binding. Platform alias
+parent/cache behavior and native continuation acceptance require separate
+qualification; this API defines no FSKit parentID policy.
 
 This representation removes the earlier fixed small-file/namespace design caps.
 It does not establish target-scale performance, CPU/RSS wins, recovery under real

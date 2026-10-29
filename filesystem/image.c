@@ -19,6 +19,7 @@
 #define SLOT_HASH 112u
 #define PAGE_HEAD 640u
 #define MAX_HEIGHT 16u
+_Static_assert(MAX_HEIGHT == 16, "directory position depth contract");
 #define CACHE_COUNT 1000u
 #define ARENA_COUNT 1024u
 #define NO_CHILD UINT16_MAX
@@ -134,6 +135,7 @@ static attributes initial_attributes(const sfs_metadata_initial *a, sfs_timestam
 }
 static void discard(sfs_image *h);
 static void cache_clear(sfs_image *h) { if (!h->cache) return; for (unsigned i = 0; i < h->cache->count; ++i) free(h->cache->entries[i].bytes); free(h->cache); h->cache = NULL; }
+void sfs_image_clear_read_cache(sfs_image *h) { if (h) cache_clear(h); }
 static enum sfs_status result(sfs_image *h, enum sfs_status status, enum sfs_phase phase, int error, sfs_result *r) {
     if (r) { memset(r, 0, sizeof(*r)); r->status = status; r->phase = phase; r->system_errno = error;
         if (h) { r->generation = h->current.generation; r->committed_end = h->current.end; r->physical_end = h->eof; r->device = (uint64_t)h->identity.st_dev; r->inode = (uint64_t)h->identity.st_ino; memcpy(r->uuid, h->current.uuid, 16); memcpy(r->root_digest, h->current.root.digest, 32); }
@@ -359,6 +361,8 @@ static unsigned page_level(const uint8_t *b) { return get16(b + 68); }
 static unsigned page_count(const uint8_t *b) { return get16(b + 70); }
 static int variable_key(unsigned map) { return map == MAP_NAME || map == MAP_XATTR || map == MAP_BACKREF; }
 static unsigned stride(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 328 : 72) : map == MAP_INODE ? (minor == 6 ? 496 : metadata_capable(minor) ? 440 : 352) : (map == MAP_NAME || map == MAP_BACKREF) ? 280 : map == MAP_EXTENT ? 72 : map == MAP_XATTR ? 352 : map == MAP_SNAPSHOT ? 328 : 0; }
+/* Numeric directory positions require MAP_NAME fanout 9, leaf capacity 12 and
+ * MAX_HEIGHT 16. Changing these limits requires a new position contract. */
 static unsigned minimum(unsigned map, unsigned level, unsigned minor) { return level ? (variable_key(map) ? 3 : 16) : map == MAP_INODE ? (metadata_capable(minor) ? 2 : 3) : (map == MAP_SNAPSHOT || map == MAP_XATTR) ? 3 : (map == MAP_NAME || map == MAP_BACKREF) ? 4 : map == MAP_EXTENT ? 16 : 0; }
 static unsigned maximum(unsigned map, unsigned level, unsigned minor) { return 3 * minimum(map, level, minor); }
 static const uint8_t *row_at(const uint8_t *b, unsigned map, unsigned i, unsigned minor) { return b + PAGE_HEAD + stride(map, page_level(b), minor) * i; }
@@ -1929,6 +1933,56 @@ static void save_cookie(sfs_cookie *cookie, const namespace *ns, uint64_t parent
     uint8_t *b = cookie->bytes; memset(b, 0, sizeof(cookie->bytes)); memcpy(b, ns->ref.digest, 32); put64(b + 32, parent); put32(b + 40, c->depth); put32(b + 44, c->depth ? 1 : 3);
     for (unsigned i = 0; i < c->depth; ++i) { uint8_t *v = b + 48 + i * 64; encode_ref(v, &c->frames[i].ref); put16(v + 56, c->frames[i].index); put16(v + 58, c->frames[i].context.level); }
 }
+/* Only encode frames left by a successfully checked name row. */
+static enum sfs_status cursor_position(const cursor *c, uint64_t *out) {
+    if (!c->depth || c->depth > MAX_HEIGHT) return SFS_CORRUPT;
+    uint64_t p = 1;
+    for (unsigned i = 0; i + 1 < c->depth; ++i) {
+        unsigned index = c->frames[i].index;
+        if (!index || index > 9 || c->frames[i].context.level != c->depth - i - 1 || p > (UINT64_MAX - (index - 1)) / 9) return SFS_CORRUPT;
+        p = 9 * p + index - 1;
+    }
+    const cursor_frame *leaf = &c->frames[c->depth - 1];
+    if (leaf->context.level || !leaf->index || leaf->index > 12 || p > (UINT64_MAX - leaf->index) / 16) return SFS_CORRUPT;
+    *out = 16 * p + leaf->index; return SFS_OK;
+}
+static enum sfs_status position_cursor(reader *r, const namespace *ns, uint64_t parent, uint64_t position, cursor *c) {
+    unsigned next = (unsigned)(position & 15); uint64_t p = position / 16;
+    if (!ns->names.type || !next || next > 12) return SFS_INVALID;
+    const uint8_t *page; enum sfs_status e = root_page(r, &ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, &page); if (e) return e;
+    unsigned level = page_level(page); uint8_t branches[MAX_HEIGHT - 1];
+    for (unsigned i = level; i; --i) { branches[i - 1] = (uint8_t)(p % 9); p /= 9; }
+    if (p != 1) return SFS_INVALID;
+    memset(c, 0, sizeof(*c)); c->reader = r; c->map = MAP_NAME; c->next_inode = ns->next_inode; c->eof = UINT64_MAX;
+    reference ref = ns->names; uint64_t before = r->a.end; context ctx = root_context(MAP_NAME, level, ns->next_inode, UINT64_MAX, r->a.minor);
+    for (unsigned i = 0; i <= level; ++i) {
+        e = page_read(r, &ref, before, ctx, &page); if (e) return e;
+        unsigned index = ctx.level ? branches[i] : next;
+        if (ctx.level ? index >= page_count(page) : index > page_count(page)) return SFS_INVALID;
+        c->frames[c->depth++] = (cursor_frame){ .ref = ref, .before = before, .context = ctx, .index = ctx.level ? index + 1 : index };
+        if (!ctx.level) break;
+        reference child; if (!child_ref(row_at(page, MAP_NAME, index, r->a.minor), MAP_NAME, &child)) return SFS_CORRUPT;
+        before = ref.offset; ref = child; ctx = child_context(page, index, ctx);
+    }
+    const uint8_t *row = row_at(page, MAP_NAME, next - 1, r->a.minor);
+    if (get64(row) != parent) return SFS_INVALID;
+    /* Copy before indexed membership reads can reuse cache storage. */
+    uint8_t saved[MAX_ROW]; memset(saved, 0, sizeof(saved)); memcpy(saved, row, stride(MAP_NAME, 0, r->a.minor));
+    node n; e = node_get(r, ns, get64(saved + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
+    if (!e) { key k = row_key(saved, MAP_NAME, 0); e = r->a.minor == 6 ? name_member(r, ns, &n, &k) : (n.e.parent != parent || n.e.name_length != get32(saved + 8) || memcmp(n.e.name, saved + 12, n.e.name_length)) ? SFS_CORRUPT : SFS_OK; }
+    return e;
+}
+enum sfs_status sfs_image_resume_after_position(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode parent, uint64_t position, sfs_cookie *out, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+    if (!out || !expected_root_digest || !expected_generation) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    reader r = current_reader(h, 0); namespace ns;
+    e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent); if (e) return touched_result(&r, e, result_out);
+    cursor *c = malloc(sizeof(*c)); if (!c) return touched_result(&r, SFS_NOMEM, result_out);
+    e = position_cursor(&r, &ns, parent, position, c);
+    if (!e) { sfs_cookie cookie; save_cookie(&cookie, &ns, parent, c); *out = cookie; } free(c); return touched_result(&r, e, result_out);
+}
 enum sfs_status sfs_image_resume_after_name(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode parent, const void *previous_name, size_t previous_length, sfs_cookie *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
     if (!out || !expected_root_digest || !expected_generation || !valid_name(previous_name, previous_length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
@@ -1970,7 +2024,7 @@ enum sfs_status sfs_image_resume_after(sfs_image *h, sfs_view view, uint64_t exp
     if (!e) { sfs_cookie cookie; save_cookie(&cookie, &ns, parent, &c); memcpy(out, &cookie, sizeof(cookie)); }
     return touched_result(&r, e, result_out);
 }
-enum sfs_status sfs_image_next(sfs_image *h, sfs_view view, sfs_inode parent, sfs_cookie *cookie, sfs_entry *out, int *found, sfs_result *result_out) {
+static enum sfs_status next_entry(sfs_image *h, sfs_view view, sfs_inode parent, sfs_cookie *cookie, sfs_entry *out, uint64_t *position, int *found, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!cookie || !out || !found) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *found = 0;
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; e = selected_namespace(&r, view, &ns); if (!e) e = directory_check(&r, &ns, parent); cursor c;
@@ -1979,7 +2033,15 @@ enum sfs_status sfs_image_next(sfs_image *h, sfs_view view, sfs_inode parent, sf
     if (!e && exists && get64(row) != parent) { c.depth = 0; exists = 0; }
     if (!e && exists) { node n; e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
         if (!e) { key k = row_key(row, MAP_NAME, 0); e = r.a.minor == 6 ? name_member(&r, &ns, &n, &k) : (n.e.parent != parent || n.e.name_length != get32(row + 8) || memcmp(n.e.name, row + 12, n.e.name_length)) ? SFS_CORRUPT : SFS_OK; if (!e) entry_name(&n, row); }
-        if (!e) { *out = n.e; *found = 1; }
+        uint64_t encoded = 0; if (!e && position) e = cursor_position(&c, &encoded);
+        if (!e) { *out = n.e; *found = 1; if (position) *position = encoded; }
     }
     if (!e) save_cookie(cookie, &ns, parent, &c); return touched_result(&r, e, result_out);
+}
+enum sfs_status sfs_image_next(sfs_image *h, sfs_view view, sfs_inode parent, sfs_cookie *cookie, sfs_entry *out, int *found, sfs_result *result_out) {
+    return next_entry(h, view, parent, cookie, out, NULL, found, result_out);
+}
+enum sfs_status sfs_image_next_position(sfs_image *h, sfs_view view, sfs_inode parent, sfs_cookie *cookie, sfs_entry *out, uint64_t *position, int *found, sfs_result *result_out) {
+    if (!position) { enum sfs_status e = ready(h, 0, 0, result_out); return e ? e : result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); }
+    return next_entry(h, view, parent, cookie, out, position, found, result_out);
 }

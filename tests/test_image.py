@@ -91,10 +91,12 @@ def _owned_command(argv, *, cwd, timeout, stem):
             key = name + '_retained_bytes'
             keep = min(len(chunk), _COMMAND_STREAM_CAP - record[key])
             written = outputs[name].write(chunk[:keep])
-            if written != keep:
+            valid_write = type(written) is int and 0 <= written <= keep
+            retained = written if valid_write else 0
+            record[key] += retained
+            record[name + '_discarded_bytes'] += len(chunk) - retained
+            if not valid_write or written != keep:
                 raise OSError('Image command capture short write')
-            record[key] += written
-            record[name + '_discarded_bytes'] += len(chunk) - keep
             if record[key] >= _COMMAND_STREAM_CAP:
                 if name not in record['cap_reached']:
                     record['cap_reached'].append(name)
@@ -391,6 +393,9 @@ class ImageCore(unittest.TestCase):
     def test_exact_capacity_pre_seal_discard_and_abandoned_tail(self):
         self.scenario('capacity')
 
+    def test_memory_only_cache_release_refill_authority_and_transactions(self):
+        self.scenario('cache')
+
     def test_ordinary_readonly_admission_policy_poison_and_budgets(self):
         self.scenario('readonly')
 
@@ -482,13 +487,21 @@ class ImageDiagnostics(unittest.TestCase):
         profiles = [('compile-0', 'deadline'), ('compile-1', 'existing-timeout'),
                     ('symbols', 'deadline'), ('scenario', 'deadline'), ('cap', 'cap'),
                     ('exit', 'exit'), ('cancel', 'cancel'), ('cleanup', 'cleanup'),
-                    ('reap', 'reap'), ('launch', 'launch')]
+                    ('reap', 'reap'), ('launch', 'launch'),
+                    ('short-write', 'short-write'), ('zero-write', 'zero-write'),
+                    ('none-write', 'none-write')]
         for label, profile in profiles:
             with self.subTest(command=label), tempfile.TemporaryDirectory(prefix='stallionfs-image-owned-diagnostic-') as temporary:
                 state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
                 stem = Path(temporary) / label
-                output = b'partial output\n' if profile == 'exit' else b'partial \xff output\n'
-                error_output = b'partial error\n'
+                write_profile = profile in ('short-write', 'zero-write', 'none-write')
+                output = b'prefix' if write_profile else b'partial output\n' if profile == 'exit' else b'partial \xff output\n'
+                error_output = b'err' if write_profile else b'partial error\n'
+                cleanup_output = b'cleanup!'
+                sink_wrapped = [False]
+                sink_written = [False]
+                checked_prefix = [False]
+                original_fdopen = os.fdopen
                 tick = [0.0]
                 killed = [False]
                 requested = [False]
@@ -514,11 +527,31 @@ class ImageDiagnostics(unittest.TestCase):
                         reader, writer = os.pipe()
                         os.write(writer, raw)
                         setattr(fake, name, os.fdopen(reader, 'rb', buffering=0))
-                        if profile == 'cleanup':
+                        if profile == 'cleanup' or (write_profile and name == 'stdout'):
                             writers.append(writer)
                         else:
                             os.close(writer)
                     return fake
+
+                def capture_open(fd, mode, *args, **kwargs):
+                    stream = original_fdopen(fd, mode, *args, **kwargs)
+                    if write_profile and mode == 'wb' and kwargs.get('buffering') == 0 and not sink_wrapped[0]:
+                        sink_wrapped[0] = True
+                        wrapped = mock.Mock(wraps=stream)
+
+                        def write(data):
+                            if not sink_written[0]:
+                                sink_written[0] = True
+                                self.assertEqual(data, output)
+                                count = 3 if profile == 'short-write' else 0
+                                if count:
+                                    self.assertEqual(stream.write(data[:count]), count)
+                                return None if profile == 'none-write' else count
+                            return stream.write(data)
+
+                        wrapped.write.side_effect = write
+                        return wrapped
+                    return stream
 
                 def poll():
                     if profile == 'cancel' and not requested[0]:
@@ -542,6 +575,16 @@ class ImageDiagnostics(unittest.TestCase):
                     killed[0] = True
                     self.assertEqual(state['active']['phase'], 'cleaning')
                     cleanup_deadlines.append((state['active']['drain_deadline'], state['active']['reap_deadline']))
+                    if write_profile:
+                        active = state['active']
+                        count = 3 if profile == 'short-write' else 0
+                        self.assertEqual(active['stdout_retained_bytes'], count)
+                        self.assertEqual(active['stdout_discarded_bytes'], len(output) - count)
+                        self.assertEqual(Path(active['stdout_path']).read_bytes(), output[:count])
+                        checked_prefix[0] = True
+                        writer = writers.pop()
+                        self.assertEqual(os.write(writer, cleanup_output), len(cleanup_output))
+                        os.close(writer)
                     if profile == 'cancel':
                         registered[signal.SIGHUP](signal.SIGHUP, None)
                         registered[signal.SIGINT](signal.SIGINT, None)
@@ -561,7 +604,7 @@ class ImageDiagnostics(unittest.TestCase):
 
                 fake.poll.side_effect = poll
                 fake.wait.side_effect = subprocess.TimeoutExpired(['owned', label], 2)
-                cap = 8 if profile == 'cap' else _COMMAND_STREAM_CAP
+                cap = 8 if profile == 'cap' or write_profile else _COMMAND_STREAM_CAP
                 try:
                     with mock.patch(__name__ + '._command_state', state), \
                             mock.patch(__name__ + '._COMMAND_STREAM_CAP', cap), \
@@ -570,6 +613,7 @@ class ImageDiagnostics(unittest.TestCase):
                             mock.patch.object(real_selector, 'select', side_effect=select), \
                             mock.patch.object(time, 'monotonic', side_effect=now), \
                             mock.patch.object(os, 'killpg', side_effect=group) as killpg, \
+                            mock.patch.object(os, 'fdopen', side_effect=capture_open), \
                             mock.patch.object(signal, 'signal', side_effect=install):
                         previous = _install_command_handlers()
                         self.assertEqual(set(previous), {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
@@ -581,6 +625,9 @@ class ImageDiagnostics(unittest.TestCase):
                                 _owned_command(['owned', label], cwd=temporary, timeout=1, stem=stem)
                             if profile == 'existing-timeout':
                                 self.assertIs(caught.exception, existing)
+                            if write_profile:
+                                self.assertIsInstance(caught.exception, OSError)
+                                self.assertEqual(str(caught.exception), 'Image command capture short write')
                             if isinstance(caught.exception, subprocess.TimeoutExpired):
                                 self.assertEqual(caught.exception.output, output)
                                 self.assertEqual(caught.exception.stderr, error_output)
@@ -593,9 +640,24 @@ class ImageDiagnostics(unittest.TestCase):
                         self.assertEqual(popen.call_count, 1)
                         self.assertFalse(list(Path(temporary).glob('refused-next*')))
                         receipt = json.loads(Path(str(stem) + '.command.json').read_text())
-                        self.assertEqual(Path(receipt['stdout_path']).read_bytes(), b'' if profile == 'launch' else output[:cap])
+                        expected_output = b'' if profile == 'launch' else output[:cap]
+                        if write_profile:
+                            prefix = output[:3] if profile == 'short-write' else b''
+                            expected_output = prefix + cleanup_output[:cap - len(prefix)]
+                        self.assertEqual(Path(receipt['stdout_path']).read_bytes(), expected_output)
                         self.assertEqual(Path(receipt['stderr_path']).read_bytes(), b'' if profile == 'launch' else error_output[:cap])
                         self.assertEqual(receipt['first_failure'], state['failure'])
+                        if write_profile:
+                            self.assertTrue(sink_written[0] and checked_prefix[0])
+                            self.assertEqual(receipt['first_failure']['kind'], 'command_error')
+                            self.assertIn('Image command capture short write', receipt['primary_exception'])
+                            self.assertFalse(receipt['timeout'] or receipt['cleanup_uncertain'])
+                            self.assertIn('stdout', receipt['cap_reached'])
+                            for name, supplied in (('stdout', len(output) + len(cleanup_output)), ('stderr', len(error_output))):
+                                actual = len(Path(receipt[name + '_path']).read_bytes())
+                                self.assertEqual(receipt[name + '_retained_bytes'], actual)
+                                self.assertLessEqual(actual, cap)
+                                self.assertEqual(receipt[name + '_discarded_bytes'], supplied - actual)
                         if profile == 'launch':
                             self.assertEqual(receipt['kill_attempts'], 0)
                             self.assertEqual(killpg.call_count, 0)
