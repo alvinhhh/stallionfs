@@ -1017,6 +1017,19 @@ static enum sfs_status open_common(const char *directory, const char *name, enum
 }
 enum sfs_status sfs_image_open(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_WRITABLE, out, NULL, NULL, r); }
 enum sfs_status sfs_image_open_readonly(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_READONLY, out, NULL, NULL, r); }
+enum sfs_status sfs_image_get_information(sfs_image *h, sfs_image_information *out, sfs_result *r) {
+    enum sfs_status e = ready(h, 0, 0, r); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, r);
+    sfs_image_information information = {0}; uint64_t tail;
+    information.minor = h->current.minor; information.capacity = h->current.capacity;
+    information.root_inode = SFS_ROOT_INODE;
+    if (aligned(h->eof, &tail) && tail < h->current.capacity)
+        information.append_headroom = h->current.capacity - tail;
+    result(h, SFS_OK, SFS_PHASE_NONE, 0, &information.committed);
+    information.committed.coverage = SFS_COVERAGE_ROOT_ONLY;
+    *out = information; if (r) *r = information.committed; return SFS_OK;
+}
 enum sfs_status sfs_image_inspect(const char *directory, const char *name, sfs_image **out, sfs_recovery *report, const sfs_verify_budget *budget, sfs_result *r) { return open_common(directory, name, RECOVERY, out, report, budget, r); }
 enum sfs_status sfs_image_select(sfs_image *h, unsigned slot, const sfs_verify_budget *budget, sfs_result *out) {
     if (!h || h->policy != RECOVERY || slot > 1 || !valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);

@@ -11,6 +11,10 @@ import unittest
 from unittest.mock import patch
 
 from stallionfs import images
+if __package__:
+    from .image_failure_diagnostics import failure_scope
+else:
+    from image_failure_diagnostics import failure_scope
 from stallionfs.core import StallionError
 
 
@@ -64,8 +68,9 @@ class Images(unittest.TestCase):
         (repo / 'file').write_bytes(b'changed')
         self.assertEqual((sibling / 'file').read_bytes(), b'original')
         with (repo / 'file').open('rb') as busy:
-            with self.assertRaises(StallionError):
-                images.detach(first, first_mount)
+            with failure_scope(self.base, first, mountpoint=first_mount, stage='body', expected=True):
+                with self.assertRaises(StallionError):
+                    images.detach(first, first_mount)
             self.assertEqual(busy.read(), b'changed')
             self.assertIsNotNone(images.mounted(first))
         images.detach(first, first_mount)

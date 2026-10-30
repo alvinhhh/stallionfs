@@ -10,20 +10,72 @@ func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOEN
     let code: Int32
     switch status {
     case SFS_NOT_FOUND: code = missing
+    case SFS_EXISTS: code = EEXIST
     case SFS_INVALID: code = EINVAL
     case SFS_BUSY: code = EBUSY
     case SFS_UNSUPPORTED: code = ENOTSUP
     case SFS_NOMEM: code = ENOMEM
-    case SFS_LIMIT: code = EFBIG
+    // Read callbacks translate their known buffer limits at the call site.
+    // An unspecified core limit does not establish a file-size failure.
+    case SFS_LIMIT: code = EOVERFLOW
     case SFS_IO: code = result.system_errno > 0 ? result.system_errno : EIO
     default: code = EIO
     }
     return NSError(domain: NSPOSIXErrorDomain, code: Int(code))
 }
 func rawBytes<T>(_ tuple: T) -> [UInt8] { withUnsafeBytes(of: tuple) { Array($0) } }
-func anchorMatches(_ result: sfs_result) -> Bool {
-    rawBytes(result.uuid) == FixtureIdentity.uuid && result.generation == FixtureIdentity.generation &&
-    rawBytes(result.root_digest) == FixtureIdentity.digest
+func anchorMatches(_ result: sfs_result, _ anchor: sfs_result) -> Bool {
+    rawBytes(result.uuid) == rawBytes(anchor.uuid) && result.device == anchor.device && result.inode == anchor.inode &&
+    result.generation == anchor.generation && result.committed_end == anchor.committed_end &&
+    rawBytes(result.root_digest) == rawBytes(anchor.root_digest)
+}
+enum ReadOnlyLimits {
+    static let xattrValue = 1024 * 1024
+    static let xattrListBytes = 64 * 1024
+    static let xattrListCount = 1024
+    static let activeItems = 4096
+    static let callbacks = 256
+    static let retainedBytes = 8 * 1024 * 1024
+    static let callbackOverhead = 4096
+}
+// Admission happens on the caller's thread before a DispatchWorkItem exists.
+// The charge includes payload bytes plus a conservative per-callback allowance;
+// it is an adapter budget, not a bound on opaque FSKit/kernel allocations.
+final class CallbackBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0, bytes = 0
+    func acquire(_ payload: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard payload >= 0, payload <= ReadOnlyLimits.retainedBytes - ReadOnlyLimits.callbackOverhead else { return false }
+        let charge = payload + ReadOnlyLimits.callbackOverhead
+        guard count < ReadOnlyLimits.callbacks, charge <= ReadOnlyLimits.retainedBytes - bytes else { return false }
+        count += 1; bytes += charge; return true
+    }
+    func release(_ payload: Int) {
+        lock.lock(); defer { lock.unlock() }
+        count -= 1; bytes -= payload + ReadOnlyLimits.callbackOverhead
+        precondition(count >= 0 && bytes >= 0)
+    }
+    var isEmpty: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return count == 0
+    }
+}
+func checkedXattrLength(_ size: UInt64) throws -> Int {
+    guard size <= UInt64(ReadOnlyLimits.xattrValue) else { throw POSIXError(.E2BIG) }
+    return Int(size)
+}
+func checkedXattrListTotal(_ total: Int, count: Int, next: Int) throws -> Int {
+    guard count < ReadOnlyLimits.xattrListCount, next > 0,
+        next < ReadOnlyLimits.xattrListBytes, total <= ReadOnlyLimits.xattrListBytes - next - 1 else { throw POSIXError(.E2BIG) }
+    return total + next + 1
+}
+func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSVolume.AccessMask) throws {
+    guard uid == Int(owner) && m.uid == owner else { throw POSIXError(.EACCES) }
+    var allowed: FSVolume.AccessMask = [.readAttributes]
+    if m.mode & 0o400 != 0 { allowed.formUnion([.readData, .readXattr]) }
+    if m.entry.kind == SFS_DIRECTORY && m.mode & 0o100 != 0 { allowed.insert(.search) }
+    guard access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
 }
 func component(_ data: Data, xattr: Bool = false) throws {
     guard data.count <= 255 else { throw POSIXError(.ENAMETOOLONG) }
@@ -66,11 +118,20 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         let accepted: Int64, reclaim: Int64
     }
     let queue: DispatchQueue
+    private enum Admission { case open, draining, unmounted, terminal }
+    private let submissionLock = NSLock()
+    private var admission = Admission.open
+    private var pendingUnmountReplies = 0
     private var handle: OpaquePointer?
     private let resource: FSPathURLResource
     private var scope: Bool
     let owner: uid_t
     let anchor: sfs_result
+    private let callbacks = CallbackBudget()
+    private let itemLimit: Int
+#if STALLION_ADAPTER_CHECK
+    private(set) var xattrAllocations = 0
+#endif
     private var state = State.inactive
     private var failure: Error?
     private var items: [UInt64: StallionItem] = [:]
@@ -79,15 +140,32 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     private var sequence: UInt64 = 0
     private var overflow = false
     private var emitted = false
-    init(handle: OpaquePointer, resource: FSPathURLResource, scope: Bool, anchor: sfs_result, queue: DispatchQueue) {
+    init(handle: OpaquePointer, resource: FSPathURLResource, scope: Bool, anchor: sfs_result, queue: DispatchQueue,
+         itemLimit: Int = ReadOnlyLimits.activeItems) {
+        precondition(itemLimit > 0 && itemLimit <= ReadOnlyLimits.activeItems)
+        self.itemLimit = itemLimit
         self.handle = handle; self.resource = resource; self.scope = scope; self.anchor = anchor
         self.queue = queue; owner = geteuid()
-        let bytes = FixtureIdentity.uuid
+        let bytes = rawBytes(anchor.uuid)
         let uuid = UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]))
-        super.init(volumeID: .init(uuid: uuid), volumeName: FSFileName(string: "SFS read-only experiment"))
+        super.init(volumeID: .init(uuid: uuid), volumeName: FSFileName(string: "StallionFS"))
         records.reserveCapacity(4096); record(0)
     }
+    func enqueue(retainedBytes: Int = 0, maintenance: Bool = false, rejected: (Error) -> Void, _ block: @escaping () -> Void) {
+        submissionLock.lock()
+        let error: POSIXError?
+        if admission == .terminal { error = POSIXError(.ENXIO) }
+        else if !maintenance && admission != .open { error = POSIXError(admission == .draining ? .EAGAIN : .ENXIO) }
+        else if !callbacks.acquire(retainedBytes) { error = POSIXError(.EAGAIN) }
+        else { error = nil }
+        guard error == nil else { submissionLock.unlock(); rejected(error!); return }
+        // Reservation and submission are atomic against the unmount cutoff.
+        queue.async(execute: DispatchWorkItem { defer { self.callbacks.release(retainedBytes) }; block() })
+        submissionLock.unlock()
+    }
+#if STALLION_ADAPTER_CHECK
     func enqueue(_ block: @escaping () -> Void) { queue.async(execute: DispatchWorkItem(block: block)) }
+#endif
     private func record(_ op: UInt64, _ inode: UInt64 = 0, mask: UInt64 = 0, allocation: UInt64 = 0, uid: Int64 = -1, error: Error? = nil,
                         cookie: UInt64 = 0, verifier: UInt64 = 0, returnedVerifier: UInt64 = 0,
                         acceptedCookie: UInt64 = 0, stop: UInt64 = 0,
@@ -119,7 +197,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             if [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED].contains(status) { latch(error) }
             throw error
         }
-        guard anchorMatches(result) else { let error = POSIXError(.EACCES); latch(error); throw error }
+        guard anchorMatches(result, anchor) else { let error = POSIXError(.ESTALE); latch(error); throw error }
     }
     private func ready(mounted: Bool = false) throws -> OpaquePointer {
         if let failure { throw failure }
@@ -131,26 +209,26 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         guard let own = item as? StallionItem, items[own.inode] === own else { throw POSIXError(.EINVAL) }
         return own.inode
     }
-    private func canonical(_ inode: UInt64) -> StallionItem {
+    private func canonical(_ inode: UInt64) throws -> StallionItem {
         if let item = items[inode] { return item }
+        guard items.count < itemLimit else { throw POSIXError(.ENFILE) }
         let item = StallionItem(inode); items[inode] = item; return item
     }
     private func metadata(_ inode: UInt64) throws -> sfs_metadata_entry {
         let h = try ready(); var m = sfs_metadata_entry(), r = sfs_result()
         try check(sfs_image_stat_metadata(h, 0, inode, &m, &r), r)
-        guard let expected = FixtureIdentity.entries.first(where: { $0.inode == inode }),
-            m.entry.inode == inode && m.link_count == expected.links && m.entry.kind.rawValue == expected.kind &&
-            m.entry.parent == expected.parent && (inode == 1 ||
-                Data(rawBytes(m.entry.name).prefix(m.entry.name_length)) == Data(expected.name.utf8)) else {
+        guard m.entry.inode == inode && m.link_count > 0 else {
             let error = POSIXError(.EIO); latch(error); throw error
         }
         return m
     }
     private func checkedAlias(_ entry: sfs_entry, parent: UInt64) throws {
         let name = Data(rawBytes(entry.name).prefix(entry.name_length))
-        guard entry.parent == parent && FixtureIdentity.names.contains(where: {
-            $0.parent == parent && $0.inode == entry.inode && $0.kind == entry.kind.rawValue && Data($0.name.utf8) == name
-        }) else { let error = POSIXError(.EIO); latch(error); throw error }
+        guard entry.parent == parent && entry.inode > 1 && entry.name_length <= 255 &&
+            name != Data(".".utf8) && name != Data("..".utf8) else { let error = POSIXError(.EIO); latch(error); throw error }
+        try component(name)
+        _ = try type(entry.kind)
+        // Core lookup/next_position checks exact name membership, including aliases.
     }
     private func type(_ kind: sfs_kind) throws -> FSItem.ItemType {
         switch kind { case SFS_FILE: return .file; case SFS_DIRECTORY: return .directory; case SFS_SYMLINK: return .symlink; default: throw POSIXError(.EIO) }
@@ -167,7 +245,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         if request.isAttributeWanted(.gid) { a.gid = m.gid }
         if request.isAttributeWanted(.flags) { a.flags = m.flags }
         if request.isAttributeWanted(.size) { a.size = m.entry.size }
-        // shortcut: fixed-fixture allocation hypothesis, replace only after native observation review.
+        // Referenced data cells only: excludes metadata and xattrs, and can be shared.
         if request.isAttributeWanted(.allocSize) { a.allocSize = m.referenced_data_bytes }
         if request.isAttributeWanted(.fileID) { a.fileID = try itemIdentifier(inode) }
         if request.isAttributeWanted(.parentID) { a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent) }
@@ -185,7 +263,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
     var maximumFileSize: UInt64 { UInt64(sfs_fskit_file_max()) }
-    var maximumXattrSize: Int { Int(sfs_fskit_file_max()) }
+    var maximumXattrSize: Int { ReadOnlyLimits.xattrValue }
     var isOpenCloseInhibited: Bool { false }
     var isAccessCheckInhibited: Bool { false }
     var requestedMountOptions: FSVolume.MountOptions { [.readOnly] }
@@ -200,52 +278,81 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         let s = FSStatFSResult(fileSystemTypeName: "sfsro27"); s.blockSize = 4096; s.ioSize = 4096; return s
     }
     func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activate(replyHandler: replyHandler) }
-    func activate(replyHandler: @escaping (FSItem?, Error?) -> Void) { enqueue {
+    func activate(replyHandler: @escaping (FSItem?, Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler(nil, $0) }) {
         let previous = self.state
         do {
             if let failure = self.failure { throw failure }
             guard self.state != .terminal && self.handle != nil else { throw POSIXError(.ENXIO) }
             if self.state == .inactive { self.state = .active }
-            _ = try self.metadata(1); let root = self.canonical(1); self.record(1); replyHandler(root, nil)
+            _ = try self.metadata(1); let root = try self.canonical(1); self.record(1); replyHandler(root, nil)
         } catch { if previous == .inactive { self.state = .inactive }; self.record(1, error: error); replyHandler(nil, error) }
     } }
     func mount(options: FSTaskOptions, replyHandler: @escaping (Error?) -> Void) { mount(arguments: options.taskOptions, replyHandler: replyHandler) }
-    func mount(arguments: [String], replyHandler: @escaping (Error?) -> Void) { enqueue {
+    func mount(arguments: [String], replyHandler: @escaping (Error?) -> Void) {
+        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(POSIXError(.E2BIG)); return }
+        enqueue(retainedBytes: arguments.reduce(0) { $0 + $1.utf8.count }, maintenance: true, rejected: { replyHandler($0) }) {
         do {
             guard !arguments.contains("-f") else { throw POSIXError(.ENOTSUP) }
             guard self.state != .inactive else { throw POSIXError(.EINVAL) }
             _ = try self.ready()
+            var bytes = [UInt8](repeating: 0, count: 16)
             if self.state != .mounted {
-                var bytes = [UInt8](repeating: 0, count: 16)
                 guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw POSIXError(.EIO) }
-                self.nonce = bytes; self.state = .mounted
             }
+            self.submissionLock.lock()
+            guard self.pendingUnmountReplies == 0 && self.admission != .terminal else {
+                self.submissionLock.unlock(); throw POSIXError(.EBUSY)
+            }
+            if self.state != .mounted { self.nonce = bytes; self.state = .mounted }
+            self.admission = .open; self.submissionLock.unlock()
             self.record(2); replyHandler(nil)
         } catch { self.record(2, error: error); replyHandler(error) }
     } }
-    func unmount(replyHandler: @escaping () -> Void) { enqueue {
-        self.nonce.removeAll(keepingCapacity: false)
-        sfs_image_clear_read_cache(self.handle)
-        if self.state == .mounted { self.state = .active }
-        self.record(3, error: self.failure); replyHandler()
-    } }
-    func deactivate(options: FSDeactivateOptions, replyHandler: @escaping (Error?) -> Void) { enqueue {
-        let error = self.failure ?? (self.state == .mounted ? POSIXError(.EBUSY) : nil)
+    // Framework lifecycle completions are separate control work: O(pending
+    // unmounts), not part of the bounded ordinary/maintenance request budget.
+    // Each reply runs after all earlier accepted work, including reentrant calls.
+    func unmount(replyHandler: @escaping () -> Void) {
+        submissionLock.lock()
+        pendingUnmountReplies += 1
+        if admission != .terminal { admission = .draining }
+        queue.async(execute: DispatchWorkItem {
+            if self.state != .terminal {
+                self.nonce.removeAll(keepingCapacity: false)
+                sfs_image_clear_read_cache(self.handle)
+                if self.state == .mounted { self.state = .active }
+            }
+            self.submissionLock.lock()
+            self.pendingUnmountReplies -= 1
+            if self.pendingUnmountReplies == 0 && self.admission != .terminal { self.admission = .unmounted }
+            self.submissionLock.unlock()
+            self.record(3, error: self.failure); replyHandler()
+        })
+        submissionLock.unlock()
+    }
+    func deactivate(options: FSDeactivateOptions, replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
+        self.submissionLock.lock()
+        let error = self.failure ?? (self.state == .mounted || self.pendingUnmountReplies != 0 ? POSIXError(.EBUSY) : nil)
         if error == nil && self.state != .terminal { self.state = .inactive }
+        self.submissionLock.unlock()
         self.record(4, error: error); replyHandler(error)
     } }
-    func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) { enqueue {
+    func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         self.record(5, error: self.failure); replyHandler(self.failure)
     } }
-    // The unary owner calls this on the same queue; close consumes even on error.
-    func unload() -> Error? {
-        if state == .terminal { return failure }
+    // Queue-only. Busy is nonconsuming; a close error still consumes ownership.
+    func unload() -> (consumed: Bool, error: Error?) {
+        submissionLock.lock()
+        if state == .terminal { submissionLock.unlock(); return (true, failure) }
+        guard pendingUnmountReplies == 0 && callbacks.isEmpty else {
+            submissionLock.unlock(); return (false, POSIXError(.EBUSY))
+        }
+        admission = .terminal; submissionLock.unlock()
         state = .terminal; nonce.removeAll(); let owned = handle; handle = nil
         if let owned { var r = sfs_result(); let status = sfs_image_close(owned, &r); if status != SFS_OK { latch(sfsError(status, r)) } }
         if scope { scope = false; resource.url.stopAccessingSecurityScopedResource() }
-        items.removeAll(); record(6, error: failure); emit(); return failure
+        items.removeAll(); record(6, error: failure); emit(); return (true, failure)
     }
-    func getAttributes(_ request: FSItem.GetAttributesRequest, of item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) { enqueue {
+    func getAttributes(_ request: FSItem.GetAttributesRequest, of item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
         var parents = ParentEvidence(), inode: UInt64 = 0
         let mask = UInt64(bitPattern: Int64(request.wantedAttributes.rawValue))
         do {
@@ -254,7 +361,9 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             replyHandler(a, nil)
         } catch { parents.mapped = nil; self.record(10, inode, mask: mask, error: error, parents: parents); replyHandler(nil, error) }
     } }
-    func lookupItem(named name: FSFileName, inDirectory directory: FSItem, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) { enqueue {
+    func lookupItem(named name: FSFileName, inDirectory directory: FSItem, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        do { try component(name.data) } catch { replyHandler(nil, nil, error); return }
+        enqueue(retainedBytes: name.data.count, rejected: { replyHandler(nil, nil, $0) }) {
         do {
             let parent = try self.id(directory), m = try self.metadata(parent)
             guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
@@ -269,17 +378,27 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 try self.checkedAlias(e, parent: parent)
                 returned = FSFileName(data: Data(rawBytes(e.name).prefix(e.name_length)))
             }
-            _ = try self.metadata(inode); self.record(11, inode); replyHandler(self.canonical(inode), returned, nil)
+            _ = try self.metadata(inode); let item = try self.canonical(inode); self.record(11, inode); replyHandler(item, returned, nil)
         } catch { self.record(11, error: error); replyHandler(nil, nil, error) }
     } }
-    func reclaimItem(_ item: FSItem, replyHandler: @escaping (Error?) -> Void) { enqueue {
+    func reclaimItem(_ item: FSItem, replyHandler: @escaping (Error?) -> Void) {
+        reclaim(item, attempt: { item.tryReclaim($0) }, replyHandler: replyHandler)
+    }
+    private func reclaim(_ item: FSItem, attempt: @escaping (@escaping () -> Void) -> Bool,
+                         replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         do {
             let inode = try self.id(item)
-            let eligible = item.tryReclaim { if inode != 1 && self.items[inode] === item { self.items.removeValue(forKey: inode) } }
+            let eligible = attempt { if inode != 1 && self.items[inode] === item { self.items.removeValue(forKey: inode) } }
             self.record(12, inode, reclaim: eligible ? 1 : 0); replyHandler(nil)
         } catch { self.record(12, error: error); replyHandler(error) }
     } }
-    func readSymbolicLink(_ item: FSItem, replyHandler: @escaping (FSFileName?, Error?) -> Void) { enqueue {
+#if STALLION_ADAPTER_CHECK
+    // Exercises adapter cleanup without claiming an installed SDK reclaim.
+    func reclaimForTesting(_ item: FSItem, eligible: Bool, replyHandler: @escaping (Error?) -> Void) {
+        reclaim(item, attempt: { cleanup in if eligible { cleanup() }; return eligible }, replyHandler: replyHandler)
+    }
+#endif
+    func readSymbolicLink(_ item: FSItem, replyHandler: @escaping (FSFileName?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
         do {
             let inode = try self.id(item); _ = try self.ready(mounted: true)
             let m = try self.metadata(inode); guard m.entry.kind == SFS_SYMLINK else { throw POSIXError(.EINVAL) }
@@ -293,10 +412,10 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     private func directoryVerifier(_ parent: UInt64, attributes: Bool) throws -> UInt64 {
         guard nonce.count == 16 else { throw POSIXError(.ENXIO) }
         var bytes = Data("SFS-RO27-DIR-V2".utf8); bytes.append(contentsOf: nonce)
-        bytes.append(contentsOf: FixtureIdentity.uuid)
+        bytes.append(contentsOf: rawBytes(anchor.uuid))
         var generation = anchor.generation.bigEndian
         withUnsafeBytes(of: &generation) { bytes.append(contentsOf: $0) }
-        bytes.append(contentsOf: FixtureIdentity.digest)
+        bytes.append(contentsOf: rawBytes(anchor.root_digest))
         var view: UInt64 = 0
         withUnsafeBytes(of: &view) { bytes.append(contentsOf: $0) }
         var directory = parent.bigEndian
@@ -316,7 +435,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     // Both callers enter the same serialized body; the packing closure is synchronous.
     func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie,
                             verifier: FSDirectoryVerifier, attributes request: FSItem.GetAttributesRequest?,
-                            pack: @escaping DirectoryPack, replyHandler: @escaping (FSDirectoryVerifier, Error?) -> Void) { enqueue {
+                            pack: @escaping DirectoryPack, replyHandler: @escaping (FSDirectoryVerifier, Error?) -> Void) { enqueue(rejected: { replyHandler(.initial, $0) }) {
         var returned: UInt64 = 0, accepted: UInt64 = 0, parent: UInt64 = 0
         let mask = UInt64(bitPattern: Int64(request?.wantedAttributes.rawValue ?? 0))
         func finish(_ reason: EnumerationStop, _ error: Error? = nil) {
@@ -347,14 +466,13 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             }
             var cursor = sfs_cookie(), r = sfs_result()
             if start > 2 {
-                let status = FixtureIdentity.digest.withUnsafeBufferPointer {
+                let status = rawBytes(self.anchor.root_digest).withUnsafeBufferPointer {
                     sfs_image_resume_after_position(h, 0, self.anchor.generation, $0.baseAddress, parent, start, &cursor, &r)
                 }
                 if [SFS_INVALID, SFS_NOT_FOUND, SFS_STATE].contains(status) { throw FSError(.invalidDirectoryCookie) }
                 try self.check(status, r)
             }
-            let bound = FixtureIdentity.names.filter { $0.parent == parent }.count
-            for _ in 0...bound {
+            while true {
                 var e = sfs_entry(), found: Int32 = 0, position: UInt64 = 0
                 let status = sfs_image_next_position(h, 0, parent, &cursor, &e, &position, &found, &r)
                 try self.check(status, r)
@@ -373,22 +491,23 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                     throw error
                 }
             }
-            let error = POSIXError(.EIO); self.latch(error); throw error
         } catch { finish(.error, error) }
     } }
 #if STALLION_ADAPTER_CHECK
     func capturedRecords() -> [Record] { records }
+    func activeItemCount() -> Int { items.count }
 #endif
-    func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue {
+    func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue(rejected: { replyHandler($0) }) {
         do {
             _ = try self.ready(mounted: true); let inode = try self.id(item), m = try self.metadata(inode)
             guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
             if modes.contains(.write) { throw POSIXError(.EROFS) }
             guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+            try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID)
             self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
     } }
-    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue {
+    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         do {
             _ = try self.ready(); let inode = try self.id(item)
             guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
@@ -397,18 +516,28 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         } catch { self.record(16, uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
     } }
     func checkAccess(to item: FSItem, requestedAccess access: FSVolume.AccessMask, context: FSContext,
-                     replyHandler: @escaping @Sendable (FSCheckAccessResult?, Error?) -> Void) { enqueue {
+                     replyHandler: @escaping @Sendable (FSCheckAccessResult?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
         do {
             let inode = try self.id(item), m = try self.metadata(inode)
-            var allowed: FSVolume.AccessMask = [.readData, .readAttributes, .readXattr]
-            if m.entry.kind == SFS_DIRECTORY { allowed.insert(.search) }
-            guard context.effectiveUserID == Int(self.owner) && access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
+            try self.ownerAccess(m, inode: inode, access: access, uid: context.effectiveUserID)
             guard let result = FSCheckAccessResult(accessAllowed: true) else { throw POSIXError(.EIO) }
             self.record(17, inode, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(result, nil)
         } catch { self.record(17, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(nil, error) }
     } }
+    private func ownerAccess(_ m: sfs_metadata_entry, inode: UInt64, access: FSVolume.AccessMask, uid: Int) throws {
+        try checkOwnerMode(m, owner: owner, uid: uid, access: access)
+        // Opaque ACL storage is not ACL evaluation. Refuse rather than grant an
+        // owner-mode shortcut when the native security descriptor is present.
+        let name = Data("com.apple.system.Security".utf8)
+        var size: UInt64 = 0, r = sfs_result(); let h = try ready()
+        let status = name.withUnsafeBytes { sfs_image_xattr_size(h, 0, inode, $0.baseAddress, $0.count, &size, &r) }
+        if status == SFS_NOT_FOUND { return }
+        try check(status, r); throw POSIXError(.ENOTSUP)
+    }
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
-              replyHandler: @escaping (Int, Error?) -> Void) { enqueue {
+              replyHandler: @escaping (Int, Error?) -> Void) {
+        guard length >= 0 && offset >= 0 && length <= buffer.length else { replyHandler(0, POSIXError(.EINVAL)); return }
+        enqueue(retainedBytes: buffer.length, rejected: { replyHandler(0, $0) }) {
         var count = 0
         do {
             let h = try self.ready(mounted: true), inode = try self.id(item), m = try self.metadata(inode)
@@ -422,14 +551,19 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             try self.check(status, r); self.record(18, inode); replyHandler(count, nil)
         } catch { self.record(18, error: error); replyHandler(count, error) }
     } }
-    func getXattr(named name: FSFileName, of item: FSItem, replyHandler: @escaping (Data?, Error?) -> Void) { enqueue {
+    func getXattr(named name: FSFileName, of item: FSItem, replyHandler: @escaping (Data?, Error?) -> Void) {
+        do { try component(name.data, xattr: true) } catch { replyHandler(nil, error); return }
+        enqueue(retainedBytes: name.data.count, rejected: { replyHandler(nil, $0) }) {
         do {
             let h = try self.ready(mounted: true), inode = try self.id(item); _ = try self.metadata(inode); try component(name.data, xattr: true)
             var size: UInt64 = 0, r = sfs_result()
             let status = name.data.withUnsafeBytes { sfs_image_xattr_size(h, 0, inode, $0.baseAddress, $0.count, &size, &r) }
             try self.check(status, r, missing: ENOATTR)
-            guard let length = Int(exactly: size) else { throw POSIXError(.E2BIG) }
+            let length = try checkedXattrLength(size)
             if length == 0 { self.record(19, inode); replyHandler(Data(), nil); return }
+#if STALLION_ADAPTER_CHECK
+            self.xattrAllocations += 1
+#endif
             guard let memory = malloc(length) else { throw POSIXError(.ENOMEM) }
             var transferred = false; defer { if !transferred { free(memory) } }
             var count = 0
@@ -440,13 +574,13 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             self.record(19, inode); replyHandler(value, nil)
         } catch { self.record(19, error: error); replyHandler(nil, error) }
     } }
-    func listXattrs(of item: FSItem, replyHandler: @escaping ([FSFileName]?, Error?) -> Void) { enqueue {
+    func listXattrs(of item: FSItem, replyHandler: @escaping ([FSFileName]?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
         do {
             let h = try self.ready(mounted: true), inode = try self.id(item); _ = try self.metadata(inode)
             var names: [FSFileName] = [], after = Data(), total = 0, r = sfs_result()
             while true {
                 var entry = sfs_xattr_entry(), found: Int32 = 0
-                let status = FixtureIdentity.digest.withUnsafeBufferPointer { digest in after.withUnsafeBytes {
+                let status = rawBytes(self.anchor.root_digest).withUnsafeBufferPointer { digest in after.withUnsafeBytes {
                     sfs_image_next_xattr(h, 0, self.anchor.generation, digest.baseAddress, inode,
                         after.isEmpty ? nil : $0.baseAddress, $0.count, &entry, &found, &r)
                 } }
@@ -454,14 +588,14 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 guard entry.name_length > 0 && entry.name_length <= 255 else { throw POSIXError(.EIO) }
                 let next = Data(rawBytes(entry.name).prefix(entry.name_length)); try component(next, xattr: true)
                 guard after.isEmpty || after.lexicographicallyPrecedes(next) else { throw POSIXError(.EIO) }
-                let (newTotal, overflow) = total.addingReportingOverflow(next.count + 1)
-                guard !overflow else { throw POSIXError(.E2BIG) }; total = newTotal
+                total = try checkedXattrListTotal(total, count: names.count, next: next.count)
                 names.append(FSFileName(data: next)); after = next
             }
             self.record(20, inode); replyHandler(names, nil)
         } catch { self.record(20, error: error); replyHandler(nil, error) }
     } }
-    private func refuse(_ reply: @escaping (Error) -> Void) { enqueue { let error = POSIXError(.EROFS); self.record(21, error: error); reply(error) } }
+    // Refusal retains no caller payload and never waits for queue capacity.
+    private func refuse(_ reply: (Error) -> Void) { reply(POSIXError(.EROFS)) }
     func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func createItem(named name: FSFileName, type: FSItem.ItemType, inDirectory directory: FSItem, attributes: FSItem.SetAttributesRequest, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, nil, $0) } }
     func createSymbolicLink(named name: FSFileName, inDirectory directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, nil, $0) } }

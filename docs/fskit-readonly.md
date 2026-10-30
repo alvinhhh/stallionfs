@@ -1,15 +1,19 @@
-# Experimental read-only FSKit adapter
+# Read-only FSKit build and helper
 
-This fixed-fixture experiment connects the SFS 0.6 image core to FSKit and
-provides a native offline integration test. It reads primary data, symbolic
-links, opaque extended attributes and resource-fork bytes; mutation requests
-return EROFS. Shared inode items and directory continuation tokens are tested
-against one synthetic image.
+The current adapter reads format 0.6 images using their checked UUID and
+committed namespace. It reads file data, symbolic links and bounded opaque
+xattrs; mutations return EROFS. See [namespace semantics and limits](fskit-namespace.md).
+This recipe validates source and helper behavior; it does not qualify installation.
 
-The workflow below builds the production extension and a separate test helper.
+The recipe below builds current production source and a separate offline helper.
 It does not install, register, launch or mount an extension. It is separate from
 the CLI and Python wheel. Existing macOS15/26 CI covers the CLI and C tests;
-it does not build or run this SDK27 experiment.
+it does not build or run this SDK27 adapter.
+
+The earlier fixture-restricted source and recipe are at commit
+`31f7e57cea323cfc0fb41370280731b3f189fcb3`. That historical source accepted only
+its generated fixture identity. Existing compiled and signed trial evidence
+belongs to its original source; this recipe does not reproduce or replace it.
 
 ## Prerequisites
 
@@ -52,7 +56,7 @@ inputs=(filesystem/image.c filesystem/image.h docs/image-format.md
         filesystem/fskit/Extension.swift filesystem/fskit/Volume.swift
         filesystem/fskit/SFSImageBridge.h filesystem/fskit/module.modulemap
         tests/fskit_fixture.c tests/fskit_image_hooks.c
-        tests/fskit_adapter_driver.swift docs/fskit-readonly.md)
+        tests/fskit_adapter_driver.swift docs/fskit-readonly.md docs/fskit-namespace.md)
 /usr/bin/shasum -a 256 -- "${inputs[@]}" > "$experiment_out/sources.before.sha256"
 check_warnings() {
     while IFS= read -r line || test -n "$line"; do
@@ -79,7 +83,7 @@ identity="$experiment_out/fixture/FixtureIdentity.swift"
     "$experiment_out/fixture/manifest.json" "$identity" > "$experiment_out/fixture.before.sha256"
 # 06: production extension; compiled only
 "${swift[@]}" -parse-as-library -application-extension \
-    -Xlinker -e -Xlinker _NSExtensionMain "${adapter[@]}" "$identity" \
+    -Xlinker -e -Xlinker _NSExtensionMain "${adapter[@]}" \
     "$experiment_out/image.o" -o "$experiment_out/readonly-extension" \
     2> "$experiment_out/extension.stderr"
 check_warnings "$experiment_out/extension.stderr"
@@ -98,7 +102,7 @@ check_warnings "$experiment_out/helper-build.stderr"
 "$experiment_bin/nm" "$experiment_out/readonly-extension" > "$experiment_out/production.symbols"
 /usr/bin/grep -Eq '[[:space:]]U[[:space:]]+_NSExtensionMain$' "$experiment_out/production.symbols"
 symbol_status=0
-/usr/bin/grep -Eiq '(sfs_hooks|sfs_test_|adapter_check|sqlite)' "$experiment_out/production.symbols" || symbol_status=$?
+/usr/bin/grep -Eiq '(sfs_hooks|sfs_test_|adapter_check|FixtureIdentity|reclaimForTesting|sqlite)' "$experiment_out/production.symbols" || symbol_status=$?
 case "$symbol_status" in
     0) printf '%s\n' 'Unexpected production test symbol' >&2; exit 1 ;;
     1) ;;
@@ -108,8 +112,8 @@ esac
 "$experiment_out/adapter-check" "$experiment_out/fixture" \
     > "$experiment_out/helper.stdout" 2> "$experiment_out/helper.stderr"
 printf '%s\n' \
-    'PASS: real-core helper admission, alias positions/packing/projection diagnostics, attributes, lookup, xattrs, readonly refusal, purge/remount and consumed close' \
-    'UNTESTED: kernel context dispatch, packer/buffer delivery, tryReclaim return counts, acquired security scope and signed lifecycle' \
+    'PASS: real-core namespace, aliases, pagination, resource limits, reclaim, lifecycle ordering, read-only refusal and consumed close' \
+    'UNTESTED: kernel access routing, packer/buffer delivery, kernel reclaim counts, acquired security scope and signed lifecycle' \
     > "$experiment_out/helper.expected"
 /usr/bin/cmp "$experiment_out/helper.expected" "$experiment_out/helper.stdout"
 test ! -s "$experiment_out/helper.stderr"
@@ -120,31 +124,35 @@ test ! -s "$experiment_out/helper.stderr"
 /usr/bin/cmp "$experiment_out/sources.before.sha256" "$experiment_out/sources.after.sha256"
 ```
 
-The helper must exit successfully with exactly the two expected lines (291
-bytes) and no stderr. Its individual callback waits are ten seconds; the manual
+The helper must exit successfully with exactly the two expected lines and no
+stderr. Its individual callback waits are ten seconds; the manual
 shell recipe does not impose an overall process deadline or output-size cap.
 Keep generated files outside the checkout. They contain the fresh image identity
 and local uid/gid and are not source files to commit.
 
-## What the test establishes
+## Helper coverage
 
 The producer creates ten inodes with eleven names in an image configured for
 8MiB capacity, supplies 49,226 payload bytes, performs full image verification
 and consumes its handle before writing the manifest and identity. The backing
 file can be smaller than capacity. One inode has three names, including a
-cross-parent alias. The adapter accepts only that generated identity and fixed
-topology; it is not a general image mounter.
+cross-parent alias. Its generated identity is compiled only into the helper's
+historical fixture assertions, never the production extension.
 
 The helper directly calls the adapter with the real image core. It checks
 metadata, reads, symlinks, xattrs, canonical alias items, directory pagination and
 refused packing, continuation/session validation, read-only refusal, injected
 read failures, cache release, remount helper state, retained errors and consuming
-close/lock release. Methods named mount/unmount change helper state without an
-OS filesystem mount. The test packing closure is separate from the kernel's
+close/lock release. It also creates two independent images with arbitrary UUIDs
+and 81 root names, tests value/list/item/callback limits and reclaim capacity,
+checks unsupported-format and corrupt-root refusal, and tests unmount ordering
+from packing/reply callbacks with accepted work and a full request queue. Methods named
+mount/unmount change helper state without an OS filesystem mount. The test
+packing closure is separate from the kernel's
 FSDirectoryEntryPacker. Finite assertions are not independent syscall counts.
 
 Parent projection for aliases and primary-only `referenced_data_bytes` allocation
 remain experimental hypotheses. Kernel/caller dispatch, cold/warm foreign-user
 denial, real directory buffer delivery, acquired security scope, reclaim return
-counts, signed lifecycle and mounted fidelity remain unproved. This demonstration
-makes no performance, memory-use or production-readiness claim.
+counts, signed lifecycle and mounted fidelity remain separate qualification.
+Test source alone is not a passing result or a performance measurement.

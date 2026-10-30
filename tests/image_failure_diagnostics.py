@@ -1,6 +1,8 @@
 """Bounded image-test observations around explicitly selected detach operations."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,8 @@ import time
 
 ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64 * 1024
 BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
+EJECT_SECONDS, EJECT_CAPTURE_BYTES, EJECT_RETAINED_BYTES = 3, 16 * 1024, 2048
+DA_SUBSYSTEM = 'com.apple.DiskArbitration.diskarbitrationd'
 REPORT = "image-failures.jsonl"
 _metadata = {'operation_id', 'phase', 'timestamp_ns'}
 _fields = {
@@ -23,6 +27,8 @@ _fields = {
     'unavailable': {'reason'},
     'mapping': {'image', 'devices', 'mountpoint', 'volume_device', 'expected_mountpoint', 'mountpoint_matches', 'backing_device', 'backing_inode', 'backing_identity_matches_first'},
     'lsof': {'returncode', 'stdout', 'stderr', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error', 'display_truncated', 'backing_identity_status', 'backing_device_after', 'backing_inode_after'},
+    'eject_log': {'target', 'window_start_ns', 'window_end_ns', 'query_status', 'records',
+                  'returncode', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error', 'reason'},
 }
 _fields['observation'] = _fields['failure']
 _scope = ContextVar("image_failure_scope", default=None)
@@ -44,9 +50,22 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
 @contextmanager
 def observe_detach():
     """Observe only the first detach command in this explicit test operation."""
-    token = _detach_observation.set(dict(started=False, operation_id=None))
+    observation = dict(started=False, operation_id=None)
+    token = _detach_observation.set(observation)
     try:
         yield
+    except Exception as error:
+        reporter = observation.get('diagnostics')
+        if (reporter is not None and getattr(error, 'returncode', None) == errno.EBUSY and
+                not (observation.get('scope') or {}).get('expected', False)):
+            try:
+                reporter.eject_log(observation)
+            except Exception as unavailable:
+                try:
+                    error.add_note('Eject log unavailable: ' + type(unavailable).__name__)
+                except Exception:
+                    pass
+        raise
     finally:
         _detach_observation.reset(token)
 
@@ -96,6 +115,22 @@ def artifact_available(directory):
             if value['kind'] == 'lsof' and value['backing_identity_status'] not in (
                     'matched', 'mismatch', 'changed', 'unavailable', 'not_queried'):
                 return False
+            if value['kind'] == 'eject_log':
+                target, records = value['target'], value['records']
+                if (value['query_status'] not in ('matched', 'empty', 'unavailable', 'incomplete') or
+                        not isinstance(records, str) or len(records.encode()) > EJECT_RETAINED_BYTES or
+                        (target is not None and (not isinstance(target, str) or not re.fullmatch(r'/dev/disk[0-9]+', target))) or
+                        any(value[name] is not None and (type(value[name]) is not int or value[name] <= 0)
+                            for name in ('window_start_ns', 'window_end_ns')) or
+                        any(type(value[name]) is not bool for name in ('timeout', 'truncated', 'reaped')) or
+                        (value['query_status'] == 'matched' and not records) or
+                        (value['query_status'] in ('empty', 'unavailable') and records)):
+                    return False
+                for record in records.splitlines(keepends=True):
+                    if target is None or not re.fullmatch(
+                            r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00 '
+                            r'(?:native_eject_failed|approval_dissent) ' + re.escape(target) + r' 0x[0-9A-Fa-f]{8}\n', record):
+                        return False
             if len(line) > 8192:
                 return False
             for name, item in value.items():
@@ -115,6 +150,59 @@ def _message(value):
     return "\n".join("[path-bearing diagnostic omitted]" if "/" in s else s for s in lines)
 
 
+def _eject_records(raw, target, start_ns, end_ns):
+    """Retain only documented daemon stage/status formats, never raw log text."""
+    records, reason, limited = [], None, False
+    try:
+        lines = raw.decode('utf-8').splitlines()
+    except UnicodeDecodeError:
+        return '', 'malformed_output', False
+    for line in lines:
+        try:
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError('not a record')
+            if 'finished' in value:
+                continue
+            if (value.get('subsystem') != DA_SUBSYSTEM or
+                    Path(value.get('processImagePath', '')).name != 'diskarbitrationd'):
+                continue
+            if not isinstance(value['timestamp'], str):
+                raise ValueError('timestamp is not text')
+            stamp = datetime.fromisoformat(value['timestamp'].replace('Z', '+00:00'))
+            if stamp.tzinfo is None:
+                raise ValueError('timestamp has no zone')
+            stamp = stamp.astimezone(timezone.utc)
+            delta = stamp - datetime(1970, 1, 1, tzinfo=timezone.utc)
+            event_ns = (delta.days * 86400 + delta.seconds) * 10**9 + delta.microseconds * 1000
+            if not start_ns <= event_ns <= end_ns:
+                continue
+            message = value['eventMessage']
+            if not isinstance(message, str):
+                raise ValueError('message is not text')
+            if '<private>' in message:
+                reason = 'redacted_records'
+                continue
+            native = re.fullmatch(r'unable to eject (/dev/disk[0-9]+) \(status code (0x[0-9A-Fa-f]{8})\)\.', message)
+            approval = re.fullmatch(r'\s*dispatched response, id = [0-9A-Fa-f]{16}:[0-9A-Fa-f]{16}, '
+                r'kind = ([A-Za-z0-9_ ]{1,64}), disk = (/dev/disk[0-9]+), dissented, status = (0x[0-9A-Fa-f]{8})\.', message)
+            if native and native[1] == target:
+                stage, code = 'native_eject_failed', native[2]
+            elif (approval and approval[2] == target and
+                    all(word in approval[1].lower() for word in ('eject', 'approval'))):
+                stage, code = 'approval_dissent', approval[3]
+            else:
+                continue
+            record = f'{stamp.isoformat(timespec="microseconds")} {stage} {target} {code}\n'
+            if len((''.join(records) + record).encode()) > EJECT_RETAINED_BYTES:
+                limited = True
+                break
+            records.append(record)
+        except (KeyError, TypeError, ValueError):
+            reason = 'malformed_records'
+    return ''.join(records), reason, limited
+
+
 class Diagnostics:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -127,6 +215,8 @@ class Diagnostics:
         self.operation_id, self.phase = 0, 'standalone'
         self.before_events = self.before_written = 0
         self.backing_identities = {}
+        self.eject_contexts = {}
+        self.eject_log_attempted = False
 
     def close(self):
         if self.fd is not None:
@@ -320,6 +410,94 @@ class Diagnostics:
             return 'unavailable'
         return 'matched' if all(value == identity for value in matches) else 'mismatch'
 
+    def eject_log(self, observation):
+        """Query once after the public detach operation has failed, never between attempts."""
+        deadline = time.monotonic() + EJECT_SECONDS
+        if not self.lock.acquire(timeout=EJECT_SECONDS):
+            return
+        raw_target = observation.get('target')
+        event = dict(target=raw_target if isinstance(raw_target, str) and re.fullmatch(r'/dev/disk[0-9]+', raw_target) else None,
+                     window_start_ns=observation.get('start_ns') if type(observation.get('start_ns')) is int else None,
+                     window_end_ns=observation.get('end_ns') if type(observation.get('end_ns')) is int else None,
+                     query_status='unavailable', records='',
+                     returncode=None, timeout=False, truncated=False, reaped=False,
+                     capture_error=None, cleanup_error=None, reason=None)
+        saved_remaining = None
+        try:
+            if self.eject_log_attempted:
+                return
+            self.eject_log_attempted = True
+            self.operation_id, self.phase = observation.get('operation_id') or 0, 'after'
+            context = self.eject_contexts.get(self.operation_id)
+            scope = observation.get('scope')
+            target, start, end = event['target'], event['window_start_ns'], event['window_end_ns']
+            if not scope or scope['expected']:
+                event['reason'] = 'no_unexpected_owned_scope'
+                return
+            if observation.get('target_changed') or not context or context['target'] != target or context['image'] != str(scope['image']):
+                event['reason'] = 'no_verified_attachment_mapping'
+                return
+            deadline = min(deadline, context['deadline'])
+            if not isinstance(target, str) or not re.fullmatch(r'/dev/disk[0-9]+', target):
+                event['reason'] = 'invalid_eject_target'
+                return
+            elapsed = observation.get('end_mono', -1) - observation.get('start_mono', 0)
+            if (type(start) is not int or type(end) is not int or not 0 < start <= end or
+                    not 0 <= elapsed <= 30 or not 0 <= end - start <= 30 * 10**9 or
+                    abs((end - start) / 10**9 - elapsed) > 1):
+                event['reason'] = 'unavailable_command_window'
+                return
+            first, last = start // 10**9, (end + 10**9 - 1) // 10**9
+            if last - first > 30:
+                event['reason'] = 'command_window_exceeds_bound'
+                return
+            if (self.capture_disabled or self.remaining <= 0 or time.monotonic() >= deadline - 1 or
+                    self.events >= EVENTS or self.written + 8192 > FILE_BYTES):
+                event['reason'] = 'diagnostic_budget_exhausted'
+                return
+            identity = _private(Path(context['image']))
+            if (identity.st_dev, identity.st_ino) != context['identity']:
+                event['reason'] = 'backing_identity_changed'
+                return
+            dates = [datetime.fromtimestamp(second, timezone.utc).strftime('%Y-%m-%d %H:%M:%S+0000')
+                     for second in (first, last)]
+            predicate = (f'process == "diskarbitrationd" AND subsystem == "{DA_SUBSYSTEM}" AND '
+                         f'(eventMessage CONTAINS "{target}," OR eventMessage CONTAINS "{target} (")')
+            argv = ['/usr/bin/log', 'show', '--style', 'ndjson', '--start', dates[0], '--end', dates[1],
+                    '--timezone', 'UTC', '--no-pager', '--no-info', '--no-debug', '--no-signpost',
+                    '--no-loss', '--predicate', predicate]
+            saved_remaining = self.remaining
+            allowance = min(saved_remaining, EJECT_CAPTURE_BYTES)
+            self.remaining = allowance
+            value = self._capture(argv, deadline)
+            for name in ('returncode', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error'):
+                event[name] = value[name]
+            records, parse_reason, limited = _eject_records(value['stdout'], target, start, end)
+            incomplete = (value['timeout'] or value['truncated'] or not value['reaped'] or
+                          value['capture_error'] or value['cleanup_error'] or parse_reason or limited)
+            if value['returncode'] != 0:
+                event['reason'] = 'log_query_failed'
+            else:
+                event.update(records=records, query_status='incomplete' if incomplete else 'matched' if records else 'empty',
+                             reason=parse_reason or ('retained_output_limit' if limited else
+                                    'incomplete_capture' if incomplete else 'public_status_records' if records else
+                                    'no_matching_public_status_records'))
+            identity = _private(Path(context['image']))
+            if (identity.st_dev, identity.st_ino) != context['identity']:
+                event.update(records='', query_status='unavailable', reason='backing_identity_changed')
+        except Exception as error:
+            event.update(records='', query_status='unavailable', reason='log_query_unavailable',
+                         capture_error=type(error).__name__)
+        finally:
+            if saved_remaining is not None:
+                self.remaining = 0 if self.capture_disabled else saved_remaining - (allowance - self.remaining)
+            try:
+                if event['reason'] is not None:
+                    self._emit(deadline, 'eject_log', **event)
+            finally:
+                self.operation_id, self.phase = 0, 'standalone'
+                self.lock.release()
+
     def before(self, args, scope, observation=None):
         return self._observe(args, None, scope, phase='before', observation=observation)
 
@@ -381,6 +559,9 @@ class Diagnostics:
             matches = point is not None and point == expected_point
             first_identity = self.backing_identities.setdefault(operation_id, identity)
             same_backing = first_identity == identity
+            if not before and same_backing:
+                self.eject_contexts[operation_id] = dict(image=image, target=args[2],
+                                                        identity=identity, deadline=deadline)
             self._emit(deadline, 'mapping', image=image, devices=devices, mountpoint=point, volume_device=volume,
                        expected_mountpoint=expected_point, mountpoint_matches=matches,
                        backing_device=identity[0], backing_inode=identity[1],
@@ -464,9 +645,19 @@ def install(images, directory):
                 diagnostics.before(args, _scope.get(), observation)
             except Exception:
                 pass  # Observation failure cannot prevent the requested detach.
+        if observation is not None:
+            observation['diagnostics'] = diagnostics
+            observation.setdefault('scope', _scope.get())
+            observation.setdefault('target', args[2])
+            observation['target_changed'] = observation.get('target_changed', False) or observation['target'] != args[2]
+            diagnostics.eject_contexts.pop(observation['operation_id'], None)
+            if 'start_ns' not in observation:
+                observation['start_ns'], observation['start_mono'] = time.time_ns(), time.monotonic()
         try:
             return original(*args, '-verbose')
         except Exception as error:
+            if observation is not None:
+                observation['end_ns'], observation['end_mono'] = time.time_ns(), time.monotonic()
             try:
                 diagnostics.report(args, error, _scope.get(),
                                    operation_id=observation['operation_id'] if observation else None)

@@ -4376,6 +4376,53 @@ static void position_views(void) {
     image_unwritten(); close_image(h); unchanged("image", before, n); free(before); retain(3531);
 }
 
+static void metadata_information(void) {
+    sfs_image *h = NULL; sfs_result r; sfs_image_information first, pending, current;
+    sfs_metadata_initial initial = { .mode = S_IFDIR | 0700, .uid = geteuid(), .gid = getegid() };
+    clock_at(1700000000, 0);
+    assert(sfs_image_create_metadata_version(root, "information", TEST_CAPACITY, 6, &initial, &h, &r) == SFS_OK);
+    uint64_t allocations_before = allocation_calls, reads_before = image_read_attempts;
+    assert(sfs_image_get_information(h, &first, &r) == SFS_OK);
+    assert(allocation_calls == allocations_before && image_read_attempts == reads_before);
+    assert(first.major == 0 && first.minor == 6 && first.root_inode == 1 && first.capacity == TEST_CAPACITY);
+    assert(first.committed.generation == 1 && first.committed.coverage == SFS_COVERAGE_ROOT_ONLY);
+    assert(first.append_headroom == TEST_CAPACITY - first.committed.physical_end);
+    assert(sfs_image_begin(h, &r) == SFS_OK);
+    sfs_inode inode; initial.mode = S_IFREG | 0600;
+    assert(sfs_image_add_metadata(h, 1, "unrelated", 9, SFS_FILE, &initial, &inode, &r) == SFS_OK);
+    assert(sfs_image_get_information(h, &pending, &r) == SFS_OK);
+    assert(pending.committed.generation == first.committed.generation);
+    assert(!memcmp(pending.committed.root_digest, first.committed.root_digest, 32));
+    assert(pending.append_headroom <= first.append_headroom);
+    assert(sfs_image_commit(h, &r) == SFS_OK);
+    assert(sfs_image_get_information(h, &current, &r) == SFS_OK);
+    assert(current.committed.generation == first.committed.generation + 1);
+    assert(!memcmp(current.committed.uuid, first.committed.uuid, 16));
+    assert(current.committed.device == first.committed.device && current.committed.inode == first.committed.inode);
+    assert(memcmp(current.committed.root_digest, first.committed.root_digest, 32));
+    sfs_cookie cookie = {0}; sfs_entry entry; uint64_t position; int found;
+    assert(sfs_image_next_position(h, 0, 1, &cookie, &entry, &position, &found, &r) == SFS_OK && found);
+    assert(sfs_image_begin(h, &r) == SFS_OK);
+    assert(sfs_image_add_metadata(h, 1, "second", 6, SFS_FILE, &initial, &inode, &r) == SFS_OK);
+    assert(sfs_image_commit(h, &r) == SFS_OK);
+    sfs_cookie unchanged_cookie = cookie;
+    assert(sfs_image_resume_after_position(h, 0, current.committed.generation, current.committed.root_digest,
+                                          1, position, &cookie, &r) == SFS_STATE);
+    assert(!memcmp(&cookie, &unchanged_cookie, sizeof(cookie)));
+    assert(sfs_image_get_information(h, &current, &r) == SFS_OK);
+    assert(sfs_image_get_information(h, NULL, &r) == SFS_INVALID);
+    memset(&pending, 0xa5, sizeof(pending)); sfs_image_information unchanged_info = pending;
+    assert(sfs_image_get_information(NULL, &pending, &r) == SFS_INVALID);
+    assert(!memcmp(&pending, &unchanged_info, sizeof(pending)));
+    assert(sfs_image_close(h, &r) == SFS_OK);
+    assert(sfs_image_open_readonly(root, "information", &h, &r) == SFS_OK);
+    allocations_before = allocation_calls; reads_before = image_read_attempts;
+    assert(sfs_image_get_information(h, &pending, &r) == SFS_OK);
+    assert(allocation_calls == allocations_before && image_read_attempts == reads_before);
+    assert(pending.committed.generation == current.committed.generation);
+    assert(sfs_image_close(h, &r) == SFS_OK);
+}
+
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -4386,6 +4433,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"indexes")) indexes(); else if(!strcmp(argv[1],"ranges")) ranges();
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
+    else if(!strcmp(argv[1],"metadata-information")) metadata_information();
     else if(!strcmp(argv[1],"hardlink-versions")) hardlink_versions();
     else if(!strcmp(argv[1],"hardlink-shared")) { hardlink_shared(); position_views(); }
     else if(!strcmp(argv[1],"hardlink-transitions")) hardlink_transitions();

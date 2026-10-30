@@ -9,6 +9,7 @@ import Darwin
 @_silgen_name("sfs_hooks_closes") func hooksCloses() -> UInt64
 @_silgen_name("sfs_hooks_fail_close") func hooksFailClose()
 @_silgen_name("sfs_hooks_fail_read") func hooksFailRead()
+@_silgen_name("sfs_hooks_fixture_writes") func hooksFixtureWrites(_ allowed: Int32)
 
 func need(_ ok: @autoclosure () -> Bool, _ label: String) {
     guard ok() else { fatalError(label) }
@@ -21,6 +22,357 @@ func wait<T>(_ call: (@escaping (T) -> Void) -> Void) -> T {
     return result!
 }
 func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
+// Historical fixture assertions are test inputs, never production admission.
+func anchorMatches(_ result: sfs_result) -> Bool {
+    rawBytes(result.uuid) == FixtureIdentity.uuid && result.generation == FixtureIdentity.generation &&
+    rawBytes(result.root_digest) == FixtureIdentity.digest
+}
+// Direct source regression schedules; no OS mount or SDK routing is involved.
+func unmountOrderingChecks(_ volume: StallionVolume, root: FSItem) {
+    func remount() {
+        let error: Error? = wait { volume.mount(arguments: [], replyHandler: $0) }
+        need(error == nil, "lifecycle regression remount")
+    }
+    let attributes = FSItem.GetAttributesRequest(); attributes.wantedAttributes = [.fileID]
+    let finished = DispatchGroup()
+    var operationReplied = false, queuedReplied = false, unmountReplies = 0
+    let lifecycleCount = ReadOnlyLimits.callbacks + 1
+    for _ in 0..<lifecycleCount { finished.enter() }
+    let first: (FSDirectoryVerifier, Error?) = wait { done in
+        volume.enumerateDirectory(root, startingAt: .initial, verifier: .initial, attributes: attributes,
+            pack: { _, _, _, _, _ in
+                // This mounted callback is admitted before either unmount.
+                volume.enumerateDirectory(root, startingAt: .initial, verifier: .initial, attributes: attributes,
+                    pack: { _, _, _, _, _ in false }) { _, error in
+                        need(error == nil, "accepted mounted callback completes before drain")
+                        queuedReplied = true
+                    }
+                for _ in 0..<lifecycleCount {
+                    volume.unmount {
+                        need(operationReplied && queuedReplied, "no unmount acknowledgement inside unfinished pack or before accepted work")
+                        unmountReplies += 1; finished.leave()
+                    }
+                }
+                need(unmountReplies == 0, "packer reentry defers every lifecycle reply")
+                return false
+            }) { verifier, error in
+                operationReplied = true; done((verifier, error))
+            }
+    }
+    need(first.1 == nil && finished.wait(timeout: .now() + 10) == .success, "packer reentry drains")
+    let _: Bool = wait { done in volume.enqueue { need(unmountReplies == lifecycleCount, "more than ordinary budget lifecycle exact replies"); done(true) } }
+    let closedAdmission: (FSItem.Attributes?, Error?) = wait { done in volume.getAttributes(attributes, of: root) { done(($0, $1)) } }
+    need(closedAdmission.0 == nil && code(closedAdmission.1) == Int(ENXIO), "ordinary admission stays closed after unmount")
+    let sync: Error? = wait { volume.synchronize(flags: .wait, replyHandler: $0) }
+    let reclaim: Error? = wait { volume.reclaimItem(root, replyHandler: $0) }
+    need(sync == nil && reclaim == nil, "bounded sync and reclaim remain usable after unmount")
+    remount()
+
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), drained = DispatchSemaphore(value: 0)
+    volume.enqueue { held.signal(); release.wait() }
+    need(held.wait(timeout: .now() + 10) == .success, "lifecycle saturation queue held")
+    var acceptedReplies = 0, lifecycleReply = false
+    volume.getAttributes(attributes, of: root) { _, error in
+        need(error == nil, "reply reentry operation completed")
+        acceptedReplies += 1
+        volume.unmount {
+            need(acceptedReplies == ReadOnlyLimits.callbacks, "saturated accepted callbacks all precede drain")
+            lifecycleReply = true; drained.signal()
+        }
+        need(!lifecycleReply, "reply reentry never acknowledges inline")
+    }
+    for _ in 1..<ReadOnlyLimits.callbacks {
+        volume.getAttributes(attributes, of: root) { _, error in
+            need(error == nil, "pre-drain accepted callback remains admitted"); acceptedReplies += 1
+        }
+    }
+    var overflowReplies = 0
+    volume.getAttributes(attributes, of: root) { _, error in
+        need(code(error) == Int(EAGAIN), "ordinary budget saturation remains bounded"); overflowReplies += 1
+    }
+    need(overflowReplies == 1, "saturation rejected before queue submission")
+    release.signal(); need(drained.wait(timeout: .now() + 10) == .success, "lifecycle barrier bypasses saturated ordinary budget")
+    let _: Bool = wait { done in volume.enqueue { need(overflowReplies == 1, "no delayed overflow duplicate"); done(true) } }
+    remount()
+
+    let offQueueHeld = DispatchSemaphore(value: 0), offQueueRelease = DispatchSemaphore(value: 0)
+    let pendingReplied = DispatchSemaphore(value: 0), unmountStarted = DispatchSemaphore(value: 0)
+    let offQueueDone = DispatchSemaphore(value: 0)
+    volume.enqueue { offQueueHeld.signal(); offQueueRelease.wait() }
+    need(offQueueHeld.wait(timeout: .now() + 10) == .success, "offqueue drain held")
+    volume.enumerateDirectory(root, startingAt: .initial, verifier: .initial, attributes: attributes,
+        pack: { _, _, _, _, _ in false }) { _, error in
+            need(error == nil, "offqueue accepted mounted callback finishes"); pendingReplied.signal()
+        }
+    DispatchQueue(label: "sfs.offqueue.unmount").async(execute: DispatchWorkItem {
+        unmountStarted.signal()
+        volume.unmount {
+            need(pendingReplied.wait(timeout: .now()) == .success, "offqueue unmount replies after accepted work")
+            offQueueDone.signal()
+        }
+    })
+    need(unmountStarted.wait(timeout: .now() + 10) == .success, "offqueue unmount started")
+    need(offQueueDone.wait(timeout: .now()) == .timedOut, "offqueue unmount cannot reply past held operation")
+    offQueueRelease.signal(); need(offQueueDone.wait(timeout: .now() + 10) == .success, "offqueue drain completes")
+    remount()
+
+    let crossing = DispatchGroup(); crossing.enter(); crossing.enter()
+    let entered: Bool = wait { done in volume.getAttributes(attributes, of: root) { _, error in
+        need(error == nil, "crossing callback admitted")
+        volume.mount(arguments: []) { error in
+            need(code(error) == Int(EBUSY), "older queued mount cannot reopen past newer unmount"); crossing.leave()
+        }
+        volume.unmount { crossing.leave() }
+        let busy = volume.unload()
+        need(!busy.consumed && code(busy.error) == Int(EBUSY), "inline unload cannot consume a pending drain or callback")
+        volume.getAttributes(attributes, of: root) { value, error in
+            need(value == nil && code(error) == Int(EAGAIN), "cutoff refuses new ordinary work before queue submission")
+        }
+        done(true)
+    } }
+    need(entered && crossing.wait(timeout: .now() + 10) == .success, "mount/unload crossing drains")
+    remount()
+
+    // Concurrent submitters race the same admission lock as unmount. Every
+    // accepted mounted callback must finish before acknowledgement; others fail
+    // before scheduling. No timing-based assumption selects a winning thread.
+    let raceHeld = DispatchSemaphore(value: 0), raceRelease = DispatchSemaphore(value: 0)
+    volume.enqueue { raceHeld.signal(); raceRelease.wait() }
+    need(raceHeld.wait(timeout: .now() + 10) == .success, "admission race held")
+    let submitters = DispatchGroup(), replies = DispatchGroup(), start = DispatchSemaphore(value: 0), raceLock = NSLock()
+    var acknowledged = false, replyCount = 0
+    for _ in 0..<4 {
+        submitters.enter()
+        DispatchQueue(label: "sfs.admission.race").async(execute: DispatchWorkItem {
+            start.wait()
+            for _ in 0..<16 {
+                replies.enter()
+                volume.enumerateDirectory(root, startingAt: .initial, verifier: .initial, attributes: attributes,
+                    pack: { _, _, _, _, _ in false }) { _, error in
+                        raceLock.lock()
+                        if error == nil { need(!acknowledged, "accepted race callback precedes unmount acknowledgement") }
+                        else { need([Int(EAGAIN), Int(ENXIO)].contains(code(error)), "race refusal is an admission error") }
+                        replyCount += 1; raceLock.unlock(); replies.leave()
+                    }
+            }
+            submitters.leave()
+        })
+    }
+    for _ in 0..<4 { start.signal() }
+    let raceUnmount = DispatchSemaphore(value: 0)
+    volume.unmount { raceLock.lock(); acknowledged = true; raceLock.unlock(); raceUnmount.signal() }
+    raceRelease.signal()
+    need(submitters.wait(timeout: .now() + 10) == .success && replies.wait(timeout: .now() + 10) == .success &&
+         raceUnmount.wait(timeout: .now() + 10) == .success, "admission race completes")
+    need(replyCount == 64, "admission race replies exactly once")
+    remount()
+}
+
+func resourceUnloadChecks(_ url: URL) {
+    let owner = StallionFileSystem(), path = FSPathURLResource(url: url, writable: false)
+    let loaded: (FSVolume?, Error?) = wait { done in owner.loadResource(resource: path, force: false) { done(($0, $1)) } }
+    need(loaded.1 == nil && loaded.0 is StallionVolume, "resource owner loads real image")
+    let volume = loaded.0 as! StallionVolume
+    let root: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
+    let mounted: Error? = wait { volume.mount(arguments: [], replyHandler: $0) }
+    need(root.0 != nil && root.1 == nil && mounted == nil, "owned resource mounted helper")
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.fileID]
+    hooksReset()
+    let busyInReply: Bool = wait { done in volume.getAttributes(request, of: root.0!) { _, error in
+        let result = volume.unload()
+        need(error == nil && !result.consumed && code(result.error) == Int(EBUSY) && hooksCloses() == 0,
+             "callback budget alone makes unload nonconsuming")
+        done(true)
+    } }
+    need(busyInReply, "resource retained inside reply")
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), busyReply = DispatchSemaphore(value: 0)
+    let ordinaryReply = DispatchSemaphore(value: 0), unmounted = DispatchSemaphore(value: 0)
+    volume.enqueue { held.signal(); release.wait() }
+    need(held.wait(timeout: .now() + 10) == .success, "owned queue held")
+    owner.unloadResource(resource: path) { error in
+        need(code(error) == Int(EBUSY) && hooksCloses() == 0, "owner busy unload retains handle and scope")
+        busyReply.signal()
+    }
+    volume.getAttributes(request, of: root.0!) { _, error in need(error == nil, "accepted owned work survives busy unload"); ordinaryReply.signal() }
+    volume.unmount { unmounted.signal() }
+    release.signal()
+    need(busyReply.wait(timeout: .now() + 10) == .success && ordinaryReply.wait(timeout: .now() + 10) == .success &&
+         unmounted.wait(timeout: .now() + 10) == .success, "owner busy crossing drains")
+    var competing: OpaquePointer?, result = sfs_result()
+    need(sfs_image_open_readonly(url.path, "image.sfs", &competing, &result) == SFS_BUSY && competing == nil,
+         "nonconsumed owner retains exclusive resource lock")
+    let beforeClose = hooksCloses()
+    let closed: Error? = wait { owner.unloadResource(resource: path, replyHandler: $0) }
+    need(closed == nil && hooksCloses() == beforeClose + 2, "retry owner unload consumes once")
+    let duplicate: Error? = wait { owner.unloadResource(resource: path, replyHandler: $0) }
+    need(duplicate == nil && hooksCloses() == beforeClose + 2, "owner disposition retained without duplicate close")
+    hooksReset()
+    let _: Bool = wait { done in volume.unmount { done(true) } }
+    need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "terminal unmount replies without touching consumed handle")
+}
+
+func generalNamespaceChecks(_ parent: URL) throws {
+    var permissions = sfs_metadata_entry(); permissions.uid = geteuid(); permissions.entry.kind = SFS_FILE
+    do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .readData); fatalError("mode 000 owner grant") }
+    catch { need(code(error) == Int(EACCES), "stored read mode enforced") }
+    permissions.mode = 0o400
+    try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .readData)
+    do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .execute); fatalError("unqualified execute grant") }
+    catch { need(code(error) == Int(EACCES), "file execution denied") }
+    permissions.entry.kind = SFS_DIRECTORY; permissions.mode = 0o100
+    try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .search)
+    do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()) + 1, access: .search); fatalError("foreign owner grant") }
+    catch { need(code(error) == Int(EACCES), "foreign user denied") }
+    // All images are fresh, real 0.6 core images; no FixtureIdentity input.
+    func make(_ label: String, minor: UInt32 = 6) throws -> URL {
+        hooksReset(); hooksFixtureWrites(1); defer { hooksFixtureWrites(0) }
+        let url = parent.appendingPathComponent(label, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        var h: OpaquePointer?, r = sfs_result(), m = sfs_metadata_initial()
+        m.mode = UInt32(S_IFDIR) | 0o700; m.uid = geteuid(); m.gid = getegid()
+        need(sfs_image_create_metadata_version(url.path, "image.sfs", 64 * 1024 * 1024, minor, &m, &h, &r) == SFS_OK, "general image create")
+        if minor == 6 {
+            need(sfs_image_begin(h, &r) == SFS_OK, "general begin")
+            m.mode = UInt32(S_IFREG) | 0o600
+            var first: UInt64 = 0
+            for i in 0..<80 {
+                var inode: UInt64 = 0; let name = Data(String(format: "ordinary-%03d", i).utf8)
+                need(name.withUnsafeBytes { sfs_image_add_metadata(h, 1, $0.baseAddress, $0.count, SFS_FILE, &m, &inode, &r) } == SFS_OK, "general add")
+                if i == 0 { first = inode }
+            }
+            let alias = Data("another-alias".utf8)
+            need(alias.withUnsafeBytes { sfs_image_link(h, first, 1, $0.baseAddress, $0.count, &r) } == SFS_OK, "general alias")
+            need(sfs_image_commit(h, &r) == SFS_OK, "general namespace commit")
+            need(sfs_image_begin(h, &r) == SFS_OK, "duplicate transaction")
+            need(alias.withUnsafeBytes { sfs_image_link(h, first, 1, $0.baseAddress, $0.count, &r) } == SFS_EXISTS, "duplicate exact alias")
+            need(sfs_image_abort(h, &r) == SFS_OK, "duplicate transaction abort")
+            need(sfs_image_begin(h, &r) == SFS_OK, "general xattr begin")
+            let large = Data(repeating: 7, count: ReadOnlyLimits.xattrValue + 1)
+            let key = Data("large".utf8)
+            need(key.withUnsafeBytes { k in large.withUnsafeBytes {
+                sfs_image_set_xattr(h, first, k.baseAddress, k.count, $0.baseAddress, $0.count, &r)
+            } } == SFS_OK, "large real xattr")
+            for i in 0..<300 {
+                let name = Data((String(format: "list-%04d-", i) + String(repeating: "q", count: 240)).utf8)
+                need(name.withUnsafeBytes { sfs_image_set_xattr(h, first, $0.baseAddress, $0.count, nil, 0, &r) } == SFS_OK, "aggregate real xattrs")
+            }
+            need(sfs_image_commit(h, &r) == SFS_OK, "general xattr commit")
+        }
+        need(sfs_image_close(h, &r) == SFS_OK, "general producer close")
+        return url
+    }
+    let urls = try [make("general-a"), make("general-b")]
+    hooksReset()
+    var volumes: [StallionVolume] = [], roots: [FSItem] = [], anchors: [sfs_result] = []
+    for url in urls {
+        var h: OpaquePointer?, r = sfs_result(), info = sfs_image_information()
+        need(sfs_image_open_readonly(url.path, "image.sfs", &h, &r) == SFS_OK, "general open")
+        need(sfs_image_get_information(h, &info, &r) == SFS_OK && info.minor == 6, "general information")
+        let v = StallionVolume(handle: h!, resource: FSPathURLResource(url: url, writable: false), scope: false,
+                              anchor: info.committed, queue: DispatchQueue(label: "sfs.general"), itemLimit: 2)
+        let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
+        need(activated.0 != nil && activated.1 == nil, "general activation")
+        let mounted: Error? = wait { v.mount(arguments: [], replyHandler: $0) }; need(mounted == nil, "general mount")
+        volumes.append(v); roots.append(activated.0!); anchors.append(info.committed)
+    }
+    need(rawBytes(anchors[0].uuid) != rawBytes(anchors[1].uuid), "independent UUIDs admitted")
+    need(anchors[0].generation != FixtureIdentity.generation || rawBytes(anchors[0].root_digest) != FixtureIdentity.digest, "nonfixture receipt")
+    let v = volumes[0], root = roots[0]
+    func lookup(_ name: String) -> (FSItem?, FSFileName?, Error?) {
+        wait { done in v.lookupItem(named: FSFileName(string: name), inDirectory: root) { done(($0, $1, $2)) } }
+    }
+    let file = lookup("ordinary-000"); need(file.0 != nil && file.2 == nil, "arbitrary name admitted")
+    let alias = lookup("another-alias"); need(alias.0 === file.0 && alias.2 == nil, "canonical generic alias at item cap")
+    let saturated = lookup("ordinary-001"); need(saturated.0 == nil && code(saturated.2) == Int(ENFILE), "item cap before publication")
+    need(code(lookup("missing").2) == Int(ENOENT), "missing exact name")
+    need(code(lookup("a/b").2) == Int(EINVAL), "invalid component before scheduling")
+    let before: Int = wait { done in v.enqueue { done(v.xattrAllocations) } }
+    let large: (Data?, Error?) = wait { done in v.getXattr(named: FSFileName(string: "large"), of: file.0!) { done(($0, $1)) } }
+    let after: Int = wait { done in v.enqueue { done(v.xattrAllocations) } }
+    need(large.0 == nil && code(large.1) == Int(E2BIG) && before == after, "large value rejected before allocation")
+    let list: ([FSFileName]?, Error?) = wait { done in v.listXattrs(of: file.0!) { done(($0, $1)) } }
+    need(list.0 == nil && code(list.1) == Int(E2BIG), "aggregate list cap no partial publication")
+    do { _ = try checkedXattrListTotal(1024, count: ReadOnlyLimits.xattrListCount, next: 1); fatalError("count cap bypass") } catch { need(code(error) == Int(E2BIG), "count cap error") }
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.fileID]
+    var cookie: UInt64 = 0, verifier: UInt64 = 0, names: [Data] = []
+    for _ in 0..<83 {
+        var page: [Data] = []
+        let reply: (FSDirectoryVerifier, Error?) = wait { done in
+            v.enumerateDirectory(root, startingAt: FSDirectoryCookie(cookie), verifier: FSDirectoryVerifier(verifier), attributes: request,
+                pack: { name, _, _, next, _ in
+                    if !page.isEmpty { return false }; page.append(name.data); cookie = next.rawValue; return true
+                }) { done(($0, $1)) }
+        }
+        need(reply.1 == nil, "multi-page generic enumeration"); verifier = reply.0.rawValue
+        if page.isEmpty { break }; names += page
+    }
+    need(names.count == 81 && Set(names).count == 81, "streamed directory beyond fixture count")
+    let foreign: (FSDirectoryVerifier, Error?) = wait { done in
+        volumes[1].enumerateDirectory(roots[1], startingAt: FSDirectoryCookie(cookie), verifier: FSDirectoryVerifier(verifier), attributes: request,
+                                     pack: { _, _, _, _, _ in fatalError("foreign cookie packed") }) { done(($0, $1)) }
+    }
+    need(foreign.1 != nil, "cross-image cookie refused")
+    // Hold the queue, fill its real admission budget, and verify exactly one
+    // synchronous rejection with no delayed duplicate callback after drain.
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    v.enqueue { entered.signal(); release.wait() }
+    need(entered.wait(timeout: .now() + 10) == .success, "queue held")
+    let group = DispatchGroup(), lock = NSLock(); var replies = 0, rejected = 0
+    for _ in 0...ReadOnlyLimits.callbacks {
+        group.enter()
+        v.getAttributes(request, of: root) { _, error in
+            lock.lock(); replies += 1; if code(error) == Int(EAGAIN) { rejected += 1 }; lock.unlock(); group.leave()
+        }
+    }
+    need(replies == 1 && rejected == 1, "one immediate queue saturation reply")
+    release.signal(); need(group.wait(timeout: .now() + 10) == .success, "queue drained")
+    let drained: Bool = wait { done in v.enqueue { done(true) } }; need(drained && replies == ReadOnlyLimits.callbacks + 1 && rejected == 1, "exact replies after drain")
+    let budget = CallbackBudget()
+    need(budget.acquire(ReadOnlyLimits.retainedBytes - ReadOnlyLimits.callbackOverhead), "byte budget admitted")
+    need(!budget.acquire(0), "byte saturation independently enforced")
+    budget.release(ReadOnlyLimits.retainedBytes - ReadOnlyLimits.callbackOverhead)
+    need(budget.acquire(0), "byte budget released"); budget.release(0)
+    unmountOrderingChecks(v, root: root)
+    let reclaim: Error? = wait { v.reclaimItem(file.0!, replyHandler: $0) }; need(reclaim == nil, "reclaim callback")
+    let count: Int = wait { done in v.enqueue { done(v.activeItemCount()) } }
+    let reclaimed: StallionVolume.Record = wait { done in v.enqueue { done(v.capturedRecords().last!) } }
+    need(count == (reclaimed.reclaim == 1 ? 1 : 2), "capacity released only after successful tryReclaim")
+    // A direct FSItem need not be SDK-reclaimable without kernel bookkeeping.
+    // Keep that observed branch, then exercise the same adapter cleanup through
+    // a controlled SDK boundary. This is not a successful installed reclaim.
+    if reclaimed.reclaim == 0 {
+        need(code(lookup("ordinary-001").2) == Int(ENFILE), "SDK refusal retains item capacity")
+        let refused: Error? = wait { volumeDone in v.reclaimForTesting(file.0!, eligible: false, replyHandler: volumeDone) }
+        need(refused == nil && code(lookup("ordinary-001").2) == Int(ENFILE), "controlled refusal retains capacity")
+        let released: Error? = wait { volumeDone in v.reclaimForTesting(file.0!, eligible: true, replyHandler: volumeDone) }
+        need(released == nil, "controlled successful reclaim reply")
+    }
+    need(lookup("ordinary-001").2 == nil, "successful cleanup restores item capacity")
+    for volume in volumes {
+        let _: Bool = wait { done in volume.unmount { done(true) } }
+        let closed = wait { done in volume.enqueue { done(volume.unload()) } }; need(closed.consumed && closed.error == nil, "general consumed close")
+    }
+    need(hooksWrites() == 0, "general mounted callbacks never write")
+    resourceUnloadChecks(urls[0])
+    // Damage the selected commit's final root cell, preserving the slot pair.
+    let damaged = try FileHandle(forUpdating: urls[1].appendingPathComponent("image.sfs"))
+    try damaged.seek(toOffset: anchors[1].committed_end - 1)
+    let original = try damaged.read(upToCount: 1)!
+    try damaged.seek(toOffset: anchors[1].committed_end - 1)
+    try damaged.write(contentsOf: Data([original[0] ^ 0xff])); try damaged.close()
+    let corruptFS = StallionFileSystem()
+    let corrupt: (FSProbeResult?, Error?) = wait { done in
+        corruptFS.probeResource(resource: FSPathURLResource(url: urls[1], writable: false)) { done(($0, $1)) }
+    }
+    need(corrupt.0 == nil && code(corrupt.1) == Int(EIO), "corrupt root refused without fixture fallback")
+    let legacy = try make("general-legacy", minor: 5), fs = StallionFileSystem()
+    let unsupported: (FSProbeResult?, Error?) = wait { done in fs.probeResource(resource: FSPathURLResource(url: legacy, writable: false)) { done(($0, $1)) } }
+    need(unsupported.0 == nil && code(unsupported.1) == Int(ENOTSUP), "unsupported mounted format refused")
+    need(code(sfsError(SFS_EXISTS, sfs_result())) == Int(EEXIST), "exact duplicate error")
+    need(code(sfsError(SFS_LIMIT, sfs_result())) == Int(EOVERFLOW), "unclassified limit does not invent EFBIG")
+}
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "one fixture parent")
@@ -114,6 +466,10 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
                         return true
                     }) { done(($0, $1)) }
             }
+            if [Int(EAGAIN), Int(ENXIO)].contains(code(reply.1)) {
+                need(packed.isEmpty && reply.0.rawValue == 0, "admission rejection has no packing or verifier")
+                return (packed, reply.0.rawValue, reply.1)
+            }
             let diagnostic: StallionVolume.Record = wait { done in volume.enqueue { done(volume.capturedRecords().last!) } }
             need(diagnostic.operation == 14 && diagnostic.cookie == start && diagnostic.verifier == verifier &&
                  diagnostic.returnedVerifier == reply.0.rawValue && diagnostic.acceptedCookie == (packed.last?.cookie ?? 0),
@@ -193,10 +549,10 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
         let reactivate: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
         need(reactivate.0 === root && reactivate.1 == nil, "root retained across activation")
         hooksReset(); hooksFailClose()
-        let closed: Error? = wait { done in volume.enqueue { done(volume.unload()) } }
+        let closed: Error? = wait { done in volume.enqueue { done(volume.unload().error) } }
         need(code(closed) == Int(EIO), "consumed close failure")
         let closeCount = hooksCloses()
-        let again: Error? = wait { done in volume.enqueue { done(volume.unload()) } }
+        let again: Error? = wait { done in volume.enqueue { done(volume.unload().error) } }
         need(code(again) == Int(EIO) && hooksCloses() == closeCount, "duplicate unload no retry")
         need(sfs_image_open_readonly(url.path, "image.sfs", &competitor, &busy) == SFS_OK, "lock released after close error")
         need(sfs_image_close(competitor, &busy) == SFS_OK, "competitor close")
@@ -216,6 +572,8 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
         }
         need(poisonFile.0 != nil && poisonFile.2 == nil, "fatal case real child lookup")
         let _: Bool = wait { done in poisoned.unmount { done(true) } }
+        let poisonAfterPurge: Error? = wait { poisoned.mount(arguments: [], replyHandler: $0) }
+        need(poisonAfterPurge == nil, "poison test remount before uncached read")
         hooksReset(); hooksFailRead()
         let readFailure: (FSItem.Attributes?, Error?) = wait { done in
             poisoned.getAttributes(request, of: poisonFile.0!) { done(($0, $1)) }
@@ -234,9 +592,9 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
         need(code(poisonDeactivate) == Int(EIO) && poisonActivate.0 == nil && code(poisonActivate.1) == Int(EIO) &&
              code(poisonRemount) == Int(EIO) && code(poisonSync) == Int(EIO), "first fatal error retained")
         need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "purge cannot revive or perform I/O")
-        let poisonClose: Error? = wait { done in poisoned.enqueue { done(poisoned.unload()) } }
+        let poisonClose: Error? = wait { done in poisoned.enqueue { done(poisoned.unload().error) } }
         let poisonCloseCount = hooksCloses()
-        let poisonDuplicate: Error? = wait { done in poisoned.enqueue { done(poisoned.unload()) } }
+        let poisonDuplicate: Error? = wait { done in poisoned.enqueue { done(poisoned.unload().error) } }
         need(code(poisonClose) == Int(EIO) && code(poisonDuplicate) == Int(EIO) &&
              poisonCloseCount > 0 && hooksCloses() == poisonCloseCount, "fatal case consumed terminal close")
         competitor = nil
@@ -299,7 +657,7 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
              hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "fatal prefix error remains latched before I/O or packing")
         let prefixClose: ([StallionVolume.Record], Error?, [StallionVolume.Record]) = wait { done in prefixVolume.enqueue {
             let before = prefixVolume.capturedRecords()
-            let error = prefixVolume.unload() // One consuming API call closes image and auxiliary-parent descriptors.
+            let error = prefixVolume.unload().error // One consuming API call closes image and auxiliary-parent descriptors.
             done((before, error, prefixVolume.capturedRecords()))
         } }
         prefixHandle = nil // The borrowed pointer is never used after consuming unload.
@@ -315,7 +673,8 @@ func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
         try component(Data([255, 46])); try component(Data([47, 255]), xattr: true)
         do { try component(Data([47])); fatalError("slash accepted") } catch {}
         do { _ = try itemIdentifier(UInt64.max); fatalError("ID overflow accepted") } catch {}
-        print("PASS: real-core helper admission, alias positions/packing/projection diagnostics, attributes, lookup, xattrs, readonly refusal, purge/remount and consumed close")
-        print("UNTESTED: kernel context dispatch, packer/buffer delivery, tryReclaim return counts, acquired security scope and signed lifecycle")
+        try generalNamespaceChecks(url)
+        print("PASS: real-core namespace, aliases, pagination, resource limits, reclaim, lifecycle ordering, read-only refusal and consumed close")
+        print("UNTESTED: kernel access routing, packer/buffer delivery, kernel reclaim counts, acquired security scope and signed lifecycle")
     }
 }

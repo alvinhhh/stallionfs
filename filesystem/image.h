@@ -70,6 +70,18 @@ typedef struct {
     enum sfs_incomplete_reason incomplete_reason;
 } sfs_result;
 typedef struct {
+    uint32_t major, minor;
+    uint64_t capacity, append_headroom;
+    sfs_inode root_inode;
+    sfs_result committed;
+} sfs_image_information;
+/* Constant-work selected-state receipt: checks the open file identity, but does
+ * not walk the namespace or revalidate every record. Output is unchanged on
+ * failure. The committed receipt excludes staged edits. Append headroom starts
+ * after the aligned physical tail, including aborted appends; it is neither
+ * logical free space nor host free space, and reserves no future commit cost. */
+enum sfs_status sfs_image_get_information(sfs_image *, sfs_image_information *, sfs_result *);
+typedef struct {
     sfs_result slots[2]; /* Each OK candidate has passed full reachable verification. */
     int pair_valid, latest_may_be_unknown;
 } sfs_recovery;
