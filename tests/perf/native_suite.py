@@ -33,6 +33,62 @@ COPY_TOOLS = {
     'rsync': ['/usr/bin/rsync', '-a', '--extended-attributes'],
 }
 SCAN_FIELDS = ('files', 'directories', 'symlinks', 'other', 'logical_bytes', 'skipped_mounts')
+ZPOOL = '/usr/sbin/zpool'
+
+
+def clone_pool_observation(pool, timeout):
+    """Read aggregate counters outside measurement; failures remain observations."""
+    fields = ('guid', 'feature@block_cloning', 'bcloneused', 'bclonesaved', 'bcloneratio')
+    argv = [ZPOOL, 'get', '-Hp', '-o', 'property,value', ','.join(fields), pool]
+    result = {'argv': argv, 'observed_utc': datetime.now(timezone.utc).isoformat(), 'valid': False}
+    try:
+        command = fileops.command(argv, check=False, timeout=min(timeout, 30))
+        result.update(exit_code=command.returncode,
+                      stdout_b64=base64.b64encode(command.stdout).decode('ascii'),
+                      stderr_b64=base64.b64encode(command.stderr).decode('ascii'))
+        guid_rows = [line.split(b'\t') for line in command.stdout.splitlines()
+                     if line.split(b'\t', 1)[0] == b'guid']
+        if (len(guid_rows) == 1 and len(guid_rows[0]) == 2
+                and re.fullmatch(rb'[0-9]+', guid_rows[0][1]) and int(guid_rows[0][1]) > 0):
+            result['guid'] = str(int(guid_rows[0][1]))
+        if command.returncode or command.stderr:
+            return result
+        rows = [line.split('\t') for line in command.stdout.decode('ascii').splitlines()]
+        if (len(rows) != len(fields) or any(len(row) != 2 for row in rows)
+                or {row[0] for row in rows} != set(fields)):
+            return result
+        values = dict(rows)
+        if ('guid' not in result
+                or not all(re.fullmatch(r'[0-9]+', values[key]) for key in ('bcloneused', 'bclonesaved'))
+                or values['feature@block_cloning'] not in ('enabled', 'active')):
+            return result
+        result.update(valid=True, feature=values['feature@block_cloning'],
+                      bcloneused=int(values['bcloneused']), bclonesaved=int(values['bclonesaved']),
+                      bcloneratio=values['bcloneratio'])
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        result['error'] = f'{type(error).__name__}: {error}'
+        if isinstance(error, subprocess.TimeoutExpired):
+            for name in ('stdout', 'stderr'):
+                raw = getattr(error, name) or b''
+                if isinstance(raw, str): raw = raw.encode()
+                result[name + '_b64'] = base64.b64encode(raw).decode('ascii')
+    return result
+
+
+def clone_pool_corroboration(before, after):
+    """Counter changes corroborate one pool interval, never individual extents."""
+    result = {'status': 'inconclusive', 'same_pool_guid': None,
+              'full_data_stream_sharing': None,
+              'scope': 'First validated clone destination still present; aggregate pool counters only.'}
+    if before.get('guid') is not None and after.get('guid') is not None:
+        result['same_pool_guid'] = before['guid'] == after['guid']
+    if (result['same_pool_guid'] is not True
+            or not before.get('valid') or not after.get('valid')):
+        return result
+    result['delta'] = {key: after[key] - before[key] for key in ('bcloneused', 'bclonesaved')}
+    if after['feature'] == 'active' and all(value > 0 for value in result['delta'].values()):
+        result['status'] = 'corroborated'
+    return result
 
 
 def compress_scan_stdout(row):
@@ -93,6 +149,8 @@ def arguments(method, operation, binary, source, destination, jobs=None):
     options = ['--jobs', str(jobs)] if jobs is not None and operation != 'move' else []
     if method == 'gnu-cp' and operation == 'copy':
         return ['/bin/cp', '-a', '--reflink=never', '--', str(source), str(destination)]
+    if method == 'gnu-cp-reflink' and operation == 'clone':
+        return ['/bin/cp', '-a', '--reflink=always', '--', str(source), str(destination)]
     if operation == 'scan':
         if method == 'stallionfs':
             return [str(binary), '--json', 'scan'] + options + [str(source)]
@@ -167,7 +225,7 @@ def summarize_report(rows, required_samples, *, native_only=False):
             valid = [row for row in values if row.get('ok') is True and row.get('validated') is True
                      and not row.get('completion_uncertain')]
             result.append(dict(zip(('run', 'fixture', 'operation', 'reference', 'cache', 'phase'), key)) | {
-                'kind': 'descriptive', 'method': 'gnu-cp', 'expected_samples': required_samples,
+                'kind': 'descriptive', 'method': key[3], 'expected_samples': required_samples,
                 'complete': (len(valid) == len(values) == required_samples
                              and {row['sample'] for row in valid} == set(range(required_samples))),
                 'excluded_samples': [row['sample'] for row in values if row not in valid],
@@ -197,7 +255,7 @@ def main():
     p.add_argument('--fixtures', nargs='+', choices=[*fileops.SAMPLES, *PROFILES, *native_fixtures.PROFILES, *native_fixtures.SCAN_PROFILES, 'installed_dependencies'],
                    default=['docs_5k_100mb'] if linux else list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
     p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=['cp'] if linux else list(COPY_TOOLS),
-                   help='Linux admits only cp; macOS clone references and ordinary cp -Rp')
+                   help='Linux admits copy/cp or clone/cp-clone; macOS clone references and ordinary cp -Rp')
     p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['copy'] if linux else ['clone', 'move', 'delete'])
     p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
@@ -209,14 +267,16 @@ def main():
         fileops.require(len(selection) == len(set(selection)), 'Duplicate benchmark selectors are not allowed')
     fileops.require(system in ('Darwin', 'Linux'), 'macOS or Linux is required')
     if linux:
-        fileops.require(a.fixtures == ['docs_5k_100mb'] and a.operations == ['copy'] and a.cache == ['warm']
-                        and a.copy_tools == ['cp'] and a.samples == 10 and a.runs == 1
+        fileops.require(a.fixtures == ['docs_5k_100mb'] and a.cache == ['warm']
+                        and (a.operations, a.copy_tools) in ((['copy'], ['cp']), (['clone'], ['cp-clone']))
+                        and a.samples == 10 and a.runs == 1
                         and all(value is None for value in (a.binary, a.jobs, a.node, a.npm, a.npm_cache)),
-                        'Linux admits only docs_5k_100mb, warm GNU cp -a --reflink=never, 10 samples per phase, one run and no binary or jobs')
+                        'Linux admits only docs_5k_100mb, warm copy/cp or clone/cp-clone, 10 samples per phase, one run and no binary or jobs')
     else:
         fileops.require(a.binary is not None, 'An installed executable is required')
     fileops.require(a.samples >= 10 and a.runs >= 1, 'At least 10 samples and 1 collection run are required')
     fileops.require(0 < a.timeout < float('inf'), 'Timeout must be finite and positive')
+    linux_clone = linux and a.operations == ['clone']
     scan_mode = 'scan' in a.operations
     scan_fixtures = [name in native_fixtures.SCAN_PROFILES for name in a.fixtures]
     fileops.require((scan_mode and a.operations == ['scan'] and all(scan_fixtures)) or
@@ -237,6 +297,7 @@ def main():
         sources.update({'tests/perf/fixture/'+name: fileops.digest(Path(__file__).parent/'fixture'/name) for name in native_fixtures.LOCKED_FILES})
     if linux:
         executables = {path: fileops.digest(Path(path)) for path in ('/bin/cp', '/usr/bin/time', volume['zfs_executable'])}
+        if linux_clone: executables[ZPOOL] = fileops.digest(Path(ZPOOL))
         versions = {path: fileops.command([path, '--version'], environment={**os.environ, 'LC_ALL': 'C'}).stdout.decode(errors='replace').strip()
                     for path in ('/bin/cp', '/usr/bin/time')}
         fileops.require(versions['/bin/cp'].startswith('cp (GNU coreutils)')
@@ -268,7 +329,8 @@ def main():
         memory = re.findall(r'^MemTotal:\s+([0-9]+) kB$', Path('/proc/meminfo').read_text(), flags=re.MULTILINE)
         fileops.require(len(memory) == 1 and int(memory[0]) > 0, 'Guest memory inventory unavailable')
         report.pop('version'); report.pop('all_metrics_won')
-        report.update(benchmark='Linux/OpenZFS native ordinary copy', tool_versions=versions,
+        report.update(benchmark=('Linux/OpenZFS native required-reflink clone' if linux_clone else
+                                 'Linux/OpenZFS native ordinary copy'), tool_versions=versions,
                       environment={'kernel': platform.release(), 'machine': platform.machine(),
                                    'cpu_count': os.cpu_count(), 'memory_bytes': int(memory[0]) * 1024,
                                    'host_storage': 'unobserved by guest', 'whole_system_memory': 'unobserved'},
@@ -281,6 +343,11 @@ def main():
                           'Allocation is observed with st_blocks; it is not assumed dense or exclusive physical storage.',
                           'Linux POSIX ACLs and user xattrs do not establish Darwin ACL or resource-fork preservation.',
                           'Guest measurements do not establish host storage backing or whole-system memory usage.'])
+        if linux_clone:
+            report['limits'].extend([
+                'Required-reflink API acceptance and strict copy correctness are separate from aggregate pool-counter corroboration.',
+                'Stale or unavailable pool counters do not negate API acceptance; physical optimization remains inconclusive without corroboration.',
+                'Pool counters do not establish per-file full physical sharing, exclusive storage savings or causal performance benefits.'])
     if scan_mode:
         report['limits'].extend([
             'Scan fixtures reuse scan.py\'s flat, nested and deep40 layouts with 20,000 generated files and unchanged special entries.',
@@ -382,7 +449,7 @@ def main():
                     checkpoint()
                     release('preparation')
                 for operation in a.operations:
-                    references = (['gnu-cp'] if linux else ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
+                    references = (['gnu-cp-reflink' if linux_clone else 'gnu-cp'] if linux else ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
                                   ['cp'] if operation == 'copy' else [operation])
                     for reference in references:
                         for cache, phase in product(a.cache, native_metrics.PHASE_METRICS):
@@ -428,6 +495,7 @@ def main():
                                     argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs)
                                     report['active_operation'] = key | {'argv': argv, 'state': 'source validation, cache preparation or command pending'}
                                     checkpoint()
+                                    if linux_clone: uncertain = True
                                     before = native_correctness.snapshot(operand, **snapshot_options)
                                     setup_correctness = (native_correctness.verify_source(expected, before) if scan_mode else
                                                          native_correctness.verify_clone(expected, before) if setup else
@@ -456,17 +524,34 @@ def main():
                                         checkpoint()
                                         release('preparation')
                                         break
+                                    if linux_clone and 'clone_pool_evidence' not in report:
+                                        pool = volume['dataset'].split('/', 1)[0]
+                                        report['clone_pool_evidence'] = {
+                                            'pool': pool, 'sample': sample, 'phase': phase,
+                                            'before': clone_pool_observation(pool, a.timeout), 'after': None,
+                                            'corroboration': {'status': 'inconclusive', 'same_pool_guid': None,
+                                                              'full_data_stream_sharing': None}}
+                                        checkpoint()
                                     uncertain = True  # Retain evidence until source and sentinel checks complete.
                                     try:
                                         receipt = native_metrics.collect(argv, timeout_s=a.timeout, phase=phase)
                                     except native_metrics.ChildCompletionUnknown as error:
                                         uncertain = True
-                                        record('rows', key | error.receipt | {'validated': False}, active=True)
+                                        failed = key | error.receipt | {'validated': False}
+                                        if linux_clone:
+                                            failed['clone_evidence'] = {'required_reflink': True, 'api_accepted': None,
+                                                                        'full_data_stream_sharing': None}
+                                        record('rows', failed, active=True)
                                         raise
                                     row = key | receipt
                                     del receipt
                                     if not linux: row['pair_id'] = sample
                                     row.update(validated=False, cache_receipt=conditioning)
+                                    if linux_clone:
+                                        row['clone_evidence'] = {'required_reflink': True,
+                                            'api_accepted': (row['exit_code'] == 0 if row['exit_code'] is not None
+                                                             and not row.get('completion_uncertain') else None),
+                                            'full_data_stream_sharing': None}
                                     scan_stdout = (compress_scan_stdout(row) if operation == 'scan'
                                                    and not row.get('completion_uncertain') else None)
                                     record('rows', row, active=True)
@@ -476,6 +561,10 @@ def main():
                                     if row.get('completion_uncertain'):
                                         uncertain = True
                                         raise fileops.ChildCompletionUnknown('Command completion uncertain; fixture retained')
+                                    if linux_clone and not row.get('ok'):
+                                        row['correctness'] = {'passed': False, 'reason': 'command or raw measurement failed'}
+                                        checkpoint()
+                                        raise RuntimeError('Required-reflink command or raw measurement failed; fixture retained')
                                     if row['exit_code'] == 0:
                                         if operation == 'scan':
                                             try:
@@ -491,7 +580,7 @@ def main():
                                         elif operation == 'delete':
                                             row['correctness'] = {'passed': not os.path.lexists(operand), 'differences': []}
                                         else:
-                                            after = native_correctness.snapshot(dest, observe_sharing=True) if operation == 'clone' else native_correctness.snapshot(dest)
+                                            after = native_correctness.snapshot(dest, observe_sharing=True) if operation == 'clone' and not linux else native_correctness.snapshot(dest)
                                             row['correctness'] = (native_correctness.verify_clone(before, after) if operation in ('clone', 'copy') else native_correctness.verify_move(before, after))
                                             if operation == 'move':
                                                 row['move_identity'] = row['correctness']['move_identity']
@@ -499,18 +588,30 @@ def main():
                                                 row['correctness']['move_source_absent'] = False
                                     else:
                                         row['correctness'] = {'passed': False, 'reason': 'command failed'}
-                                    source_after = native_correctness.snapshot(source, observe_sharing=operation == 'clone', **snapshot_options)
+                                    source_after = native_correctness.snapshot(source, observe_sharing=operation == 'clone' and not linux, **snapshot_options)
                                     row['source_verification'] = native_correctness.verify_source(
                                         before if scan_mode else expected, source_after)
                                     row['source_unchanged'] = row['source_verification']['unchanged']
                                     del scan_stdout
                                     row['validated'] = preserved(row['correctness']) and row['source_unchanged']
-                                    if operation == 'clone' and row['exit_code'] == 0:
+                                    if operation == 'clone' and not linux and row['exit_code'] == 0:
                                         row['data_stream_sharing'] = native_correctness.clone_sharing(source_after, after)
                                         required = method in ('stallionfs', 'cp-clone')
                                         row['data_stream_sharing']['required'] = required
                                         if required:
                                             row['validated'] &= row['data_stream_sharing']['full_data_stream_sharing'] is True
+                                    if linux_clone:
+                                        if not row['validated']:
+                                            checkpoint()
+                                            raise RuntimeError('Required-reflink validation failed; fixture retained')
+                                        evidence = report['clone_pool_evidence']
+                                        if evidence['after'] is None:
+                                            checkpoint()
+                                            evidence['after'] = clone_pool_observation(evidence['pool'], a.timeout)
+                                            evidence['corroboration'] = clone_pool_corroboration(evidence['before'], evidence['after'])
+                                            checkpoint()
+                                            fileops.require(evidence['corroboration']['same_pool_guid'] is not False,
+                                                            'Clone observation pool GUID changed; fixture retained')
                                     if not row['validated'] or not row.get('ok'):
                                         blocked_methods.add(case)
                                         record('unavailable', key | {'reason': 'method failed; remaining identical attempts skipped'})
@@ -518,9 +619,10 @@ def main():
                                     if not row['source_unchanged']:
                                         uncertain = True
                                         raise RuntimeError('Operation changed the retained source fixture; preserved for inspection')
-                                    uncertain = False
+                                    if not linux_clone: uncertain = False
                                     fileops.no_mounts_below(binary, base)
                                     for path in (target, dest): fileops.remove_fixture(path)
+                                    uncertain = False
                                     checkpoint()
                                     all_rows_valid &= row['validated'] and bool(row.get('ok'))
                                     projection_fields = (*key, 'pair_id', 'ok', 'validated', 'completion_uncertain',
@@ -536,7 +638,9 @@ def main():
                             checkpoint()
                             print(json.dumps({'run': run, 'fixture': name, 'operation': operation,
                                               'reference': reference, 'cache': cache, 'phase': phase}), flush=True)
-                fileops.remove_fixture(base / 'fixtures' if name in fileops.SAMPLES else base/name if name == 'installed_dependencies' else source)
+                if not linux_clone:
+                    fileops.remove_fixture(base / 'fixtures' if name in fileops.SAMPLES else base/name if name == 'installed_dependencies' else source)
+        if linux_clone: uncertain = True
         fileops.require(all(fileops.digest(Path(path)) == value for path, value in executables.items()), 'Executable changed')
         current_sources = fileops.fingerprint_sources()
         current_sources.update({x.name: fileops.digest(x) for x in Path(__file__).parent.glob('native_*.py')})
@@ -545,6 +649,7 @@ def main():
         fileops.require(current_sources == sources, 'Harness or product source changed')
         report['status'] = 'complete'
         report['passed'] = bool(counts['rows']) and not counts['unavailable'] and all_rows_valid
+        if linux_clone: uncertain = False
     except BaseException as error:
         if scan_mode or isinstance(error, (fileops.ChildCompletionUnknown, native_metrics.ChildCompletionUnknown, subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit)):
             uncertain = True

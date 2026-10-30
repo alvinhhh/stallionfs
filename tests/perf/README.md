@@ -4,50 +4,54 @@
 
 JSON results retain samples, validation outcomes and source/runtime hashes.
 
-## Latest native comparisons — 2026-10-24
+## Current native comparisons — October 29–30, 2026 (UTC)
 
-All five reports use the same packaged native binary on macOS 27 arm64. Each has
-ten valid pairs for direct timing and ten separate resource pairs. Values below
-are native / StallionFS medians; raw samples, hashes and uncertainty are linked.
-Compressed downloads are JSON (XZ); decompress before using plain-JSON readers.
+macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource pairs per row. Values are native / StallionFS medians. Linked JSON (XZ) retains all samples, actual commands, CPU, reported RSS, p95, sample variance, precision floors, correctness and paired decisions; decompress before using a plain-JSON reader.
 
-| Warm fixture and reference | Direct wall | Direct CPU | Peak RSS | Paired screen |
+| Fixture and reference | Direct wall | Direct CPU | Reported RSS | Paired screen |
 | --- | ---: | ---: | ---: | --- |
-| [4 KiB ordinary copy, `cp -Rp`](results/ordinary-copy-tiny-v0.6.3-arm64.json) | 4.857479 / 5.860917 ms | 2.5900 / 3.3275 ms | 1,032,192 / 1,671,168 B | StallionFS slower; CPU/RSS higher |
-| [4 KiB move, `mv -n` — JSON (XZ)](results/native-move-tiny-20261024-arm64.json.xz) | 3.758250 / 4.704146 ms | 1.801 / 2.417 ms | 1,032,192 / 1,654,784 B | StallionFS slower; CPU/RSS higher |
-| [Flat 20k scan, find/stat — JSON (XZ)](results/native-scan-flat-20261024-arm64.json.xz) | 14.145645 / 0.033494 s | 13.1820985 / 0.0298065 s | 5,079,040 / 1,769,472 B | StallionFS wall/CPU/RSS lower |
-| [Nested 20k scan, find/stat — JSON (XZ)](results/native-scan-nested-20261024-arm64.json.xz) | 12.784476 / 0.017051 s | 12.3910670 / 0.0505270 s | 2,703,360 / 1,933,312 B | StallionFS wall/CPU/RSS lower |
-| [Deep40 20k scan, find/stat — JSON (XZ)](results/native-scan-deep40-20261024-arm64.json.xz) | 13.018228 / 0.032026 s | 12.7617735 / 0.0286840 s | 4,063,232 / 1,769,472 B | StallionFS wall/CPU/RSS lower |
+| [4 KiB ordinary copy, `cp -Rp`](results/ordinary-copy-tiny-20261030-arm64.json.xz) | 7.156500 / 9.539208 ms | 4.207000 / 5.710000 ms | 1,081,344 / 1,671,168 B | Wall gap inconclusive; CPU/RSS higher |
+| [4 KiB move, `mv -n`](results/native-move-tiny-direct-controls-20261030-arm64.json.xz) | 3.730521 / 4.360750 ms | 1.854000 / 2.422000 ms | 1,032,192 / 1,654,784 B | Slower; CPU inconclusive; RSS higher |
+| [Flat 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 11.416478 / 0.033169 s | 11.182524 / 0.029916 s | 5,111,808 / 1,769,472 B | Wall/CPU/RSS lower |
+| [Nested 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.136531 / 0.017766 s | 11.955517 / 0.054096 s | 2,588,672 / 1,933,312 B | Wall/CPU/RSS lower |
+| [Deep40 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.614668 / 0.034431 s | 12.410770 / 0.031100 s | 3,997,696 / 1,769,472 B | Wall/CPU/RSS lower |
+| [Document clone, explicit `--jobs 2`, ditto](results/native-clone-docs-jobs2-20261029-arm64.json.xz) | 0.763839 / 0.356793 s | 0.741951 / 0.661337 s | 1,818,624 / 1,916,928 B | Wall/CPU lower; RSS higher |
+| [Document clone, default 4 workers (`--jobs 4`), ditto](results/native-clone-docs-default4-20261029-arm64.json.xz) | 0.738710 / 0.219446 s | 0.709180 / 0.778186 s | 1,818,624 / 1,998,848 B | Wall lower; CPU/RSS higher |
 
-Copy and move each cover one enriched 4 KiB regular file. Move uses an absent
-exact destination on the same volume and checks preserved inode identity. Its
-wrapped-wall result is inconclusive; StallionFS wrapped-wall p95 is 27.401166 ms,
-with no excluded samples. Scans cover `scan_flat_20k`, `scan_nested_20k` and
-`scan_deep40_20k` using the existing scanner implementation. Direct wall includes
-command startup; CPU includes waited children. Peak RSS is the largest individual
-process peak. These warm partial runs do not complete the acceptance matrix.
+RSS means `/usr/bin/time -lp reported maximum RSS`: a reported process peak, not whole-system or aggregate descendant memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
 
-## One-worker clone comparison — 2026-10-29
+The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`). Its five native C/header hashes match current source. This is native-content equivalence, not a new build of the newer main or managed Python lifecycle. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
 
-[Warm document-tree report — JSON (XZ)](results/native-clone-docs-jobs1-20261029-arm64.json.xz)
-compares `stallionfs clone SRC DST --jobs 1` with
-`ditto --rsrc --extattr --acl SRC DST` on macOS 27 arm64, using the existing
-0.6.3 native binary. Ten timing pairs and ten separate resource pairs completed;
-all 40 commands passed strict correctness and source-stability checks. Candidate
-clones also passed required data-stream sharing checks. No pairs were excluded.
+### Measured commands and inputs
 
-| Metric | ditto median | StallionFS median |
-| --- | ---: | ---: |
-| Direct wall | 0.754396375 s | 0.572289292 s |
-| Direct CPU | 0.736711500 s | 0.559444500 s |
-| Peak RSS | 1,818,624 B | 1,867,776 B |
+Recorded native command templates use the exact flags below; the data files retain each actual path and resource wrapper after explicit path redaction:
 
-Wall and CPU pass the paired screens; RSS is 48 KiB higher. After metadata enrichment,
-the fixture contains 5,002 regular files, 105 directories including root, and
-116,777,216 logical bytes; the base generator is 5,000 files/100 MB. This measures
-the existing explicit one-worker option, with no default-four-worker control or
-default change. The required `cp -cRp` comparison is still missing. One warm
-case and one repetition do not establish full release acceptance.
+```sh
+/bin/cp -Rp SOURCE DESTINATION
+/bin/mv -n SOURCE DESTINATION
+/usr/bin/ditto --rsrc --extattr --acl SOURCE DESTINATION
+stallionfs copy SOURCE DESTINATION
+stallionfs move SOURCE DESTINATION
+stallionfs clone --jobs 2 SOURCE DESTINATION
+stallionfs clone --jobs 4 SOURCE DESTINATION
+/usr/bin/find -P -x ROOT -mindepth 1 -exec /usr/bin/stat -f '%Op%t%Dz%t%Dd' -- '{}' +
+stallionfs --json scan ROOT
+```
+
+Scan comparisons apply only to that find/stat numeric-output recipe, not native scanners generally. Both sides count six stable-tree fields; content-read throughput is not measured. The enriched scan fixtures contain 20,003 regular-file names and 12,196,597 logical bytes, plus three symlinks and one special entry. Directory counts including root are 2 flat, 202 nested and 42 deep40. Copy and move each use one enriched 4,096-byte file. The document tree contains 5,002 regular files, 105 directories including root and 116,777,216 logical bytes. Generated ACL/xattr, hardlink, sparse, source-stability and command-specific correctness observations remain in the data.
+
+The clone configurations are the same workload. Two workers are explicit; the four-worker row records `--jobs 4`, matching the default setting. Both preserve the observed RSS increase. No worker default was changed. Older raw result files remain available.
+
+### Linux/OpenZFS descriptive references
+
+Separate warm document-tree cells, ten direct and ten GNU Time resource samples each; these are unpaired native references, with no StallionFS comparison.
+
+| Method | Direct wall median | Direct CPU median | Reported RSS median |
+| --- | ---: | ---: | ---: |
+| [GNU cp `--reflink=never`](results/linux-openzfs-docs-ordinary-20261030.json.xz) | 1.340353690 s | 0.864389000 s | 1,728,512 B |
+| [GNU cp `--reflink=always`](results/linux-openzfs-docs-required-reflink-20261030.json.xz) | 0.714952497 s | 0.713276500 s | 1,728,512 B |
+
+Linux VM on a macOS APFS-backed disk file. GNU Time reports per-process maximum RSS, converted from KiB to bytes once, excluding ARC, kernel and guest/host caches. Required-reflink API acceptance and the first validated destination's aggregate pool-counter corroboration are distinct; full per-file physical sharing and exclusive storage savings remain unknown. These descriptive cells establish no causal filesystem/product win.
 
 Run from the repository with an installation outside the checkout and writable APFS scratch space. Use new output filenames:
 
@@ -270,7 +274,7 @@ Both npm version inspection and installation use the disposable project prefix a
 
 ## Native clone sharing
 
-The native suite observes regular-file data-stream clone attributes through the
+On macOS, the native suite observes regular-file data-stream clone attributes through the
 already-open validation descriptors. Destination attributes are compared with
 the post-copy source. StallionFS and `cp -cRp` require positive sharing evidence
 for every data-bearing regular-file stream; ordinary `cp`, `ditto` and `rsync`
@@ -285,6 +289,71 @@ with an uncompressed SHA-256 and byte length. Encoding occurs outside timing
 and streams directly into compressed storage. The exporter validates these
 records before replacing explicitly selected path prefixes. Numeric scan output
 is also validated and preserved byte for byte.
+
+## Linux/OpenZFS native references
+
+Linux admits one existing workload, `docs_5k_100mb`, with warm cache, ten direct
+and ten resource samples, one run, and no StallionFS binary or worker-count
+option. Select one method per new report:
+
+```sh
+python tests/perf/native_suite.py --scratch /path/on/zfs \
+  --output /path/to/new-copy.json --fixtures docs_5k_100mb \
+  --operations copy --copy-tools cp --cache warm --samples 10 --runs 1 --timeout 120
+
+python tests/perf/native_suite.py --scratch /path/on/zfs \
+  --output /path/to/new-clone.json --fixtures docs_5k_100mb \
+  --operations clone --copy-tools cp-clone --cache warm --samples 10 --runs 1 --timeout 120
+```
+
+`gnu-cp` executes `/bin/cp -a --reflink=never -- SOURCE DESTINATION`.
+`gnu-cp-reflink` executes `/bin/cp -a --reflink=always -- SOURCE DESTINATION`;
+an unsupported clone fails rather than falling back to byte copy. Both retain
+the same content, metadata, POSIX ACL/xattr, hardlink, sparse, independent-inode,
+unchanged-source and sentinel checks. A clone command, raw measurement or
+semantic failure stops the cell and retains the owned fixture and journal.
+Changed source or executable pins also retain the clone fixture. Do not resume
+or rerun a failed cell.
+
+Clone evidence has separate outcomes:
+
+- Each row records required-reflink API acceptance from the exact command's exit
+  status. Exit zero remains API evidence even if resource parsing or subsequent
+  semantic validation fails; it does not make that measurement valid.
+- Read-only `zpool get` observations bracket the first command and its strict
+  validation, outside timing and before removing the first destination. The
+  `zpool` executable is pinned before and after collection. Positive changes in
+  both `bcloneused` and `bclonesaved`, on the same pool GUID with the feature
+  active, corroborate that pool interval. A changed GUID stops the cell and
+  retains the destination. Missing, stale, malformed or decreasing counters
+  remain inconclusive; feature state or ratio alone is insufficient. There is
+  no polling, forced transaction sync, property change or fallback.
+- Per-file full physical sharing remains unknown. Aggregate pool counters do
+  not identify every shared extent or establish exclusive storage savings.
+  Linux does not use Darwin clone attributes, and unavailable FIEMAP/FIBMAP
+  observations are not required. The macOS sharing gates above are unchanged.
+
+Report `passed` describes collection and semantic validity, independently of
+pool corroboration. Stale aggregate counters do not negate API acceptance; any
+physical-optimization claim remains inconclusive without corroboration. GNU
+documents required-reflink behavior in its [coreutils source](https://github.com/coreutils/coreutils/blob/v9.7/src/copy.c);
+OpenZFS documents the aggregate [pool counters](https://openzfs.github.io/openzfs-docs/man/v2.4/7/zpoolprops.7.html).
+
+The two methods produce separate descriptive summaries, with no paired verdict
+or product comparison. Keep an existing ordinary-copy reference intact when
+adding clone evidence; do not pool statistics or recollect ordinary copy merely
+because other source changed. No clone results are implied by these instructions.
+Any published reference needs its measured source identity, raw evidence hashes,
+host/guest context and independent verification, with private paths removed.
+
+GNU Time resource samples retain raw output and convert RSS KiB to bytes exactly
+once. Process RSS excludes ARC, kernel and guest/host caches; ARC/meminfo are
+context rather than whole-system peak memory. Warm validation reads do not
+guarantee residency. A Linux VM backed by a macOS APFS disk file is a VM reference,
+not bare-metal or causal filesystem performance evidence. Linux ACLs and user
+xattrs do not establish Darwin ACL/resource-fork equality. The macOS
+`/usr/bin/time -lp` host-access readiness issue does not change the Linux GNU Time
+wrapper or authorize broader permissions.
 
 ## Native report storage
 
