@@ -270,7 +270,7 @@ Both npm version inspection and installation use the disposable project prefix a
 
 ## Native clone sharing
 
-The native suite observes regular-file data-stream clone attributes through the
+On macOS, the native suite observes regular-file data-stream clone attributes through the
 already-open validation descriptors. Destination attributes are compared with
 the post-copy source. StallionFS and `cp -cRp` require positive sharing evidence
 for every data-bearing regular-file stream; ordinary `cp`, `ditto` and `rsync`
@@ -285,6 +285,71 @@ with an uncompressed SHA-256 and byte length. Encoding occurs outside timing
 and streams directly into compressed storage. The exporter validates these
 records before replacing explicitly selected path prefixes. Numeric scan output
 is also validated and preserved byte for byte.
+
+## Linux/OpenZFS native references
+
+Linux admits one existing workload, `docs_5k_100mb`, with warm cache, ten direct
+and ten resource samples, one run, and no StallionFS binary or worker-count
+option. Select one method per new report:
+
+```sh
+python tests/perf/native_suite.py --scratch /path/on/zfs \
+  --output /path/to/new-copy.json --fixtures docs_5k_100mb \
+  --operations copy --copy-tools cp --cache warm --samples 10 --runs 1 --timeout 120
+
+python tests/perf/native_suite.py --scratch /path/on/zfs \
+  --output /path/to/new-clone.json --fixtures docs_5k_100mb \
+  --operations clone --copy-tools cp-clone --cache warm --samples 10 --runs 1 --timeout 120
+```
+
+`gnu-cp` executes `/bin/cp -a --reflink=never -- SOURCE DESTINATION`.
+`gnu-cp-reflink` executes `/bin/cp -a --reflink=always -- SOURCE DESTINATION`;
+an unsupported clone fails rather than falling back to byte copy. Both retain
+the same content, metadata, POSIX ACL/xattr, hardlink, sparse, independent-inode,
+unchanged-source and sentinel checks. A clone command, raw measurement or
+semantic failure stops the cell and retains the owned fixture and journal.
+Changed source or executable pins also retain the clone fixture. Do not resume
+or rerun a failed cell.
+
+Clone evidence has separate outcomes:
+
+- Each row records required-reflink API acceptance from the exact command's exit
+  status. Exit zero remains API evidence even if resource parsing or subsequent
+  semantic validation fails; it does not make that measurement valid.
+- Read-only `zpool get` observations bracket the first command and its strict
+  validation, outside timing and before removing the first destination. The
+  `zpool` executable is pinned before and after collection. Positive changes in
+  both `bcloneused` and `bclonesaved`, on the same pool GUID with the feature
+  active, corroborate that pool interval. A changed GUID stops the cell and
+  retains the destination. Missing, stale, malformed or decreasing counters
+  remain inconclusive; feature state or ratio alone is insufficient. There is
+  no polling, forced transaction sync, property change or fallback.
+- Per-file full physical sharing remains unknown. Aggregate pool counters do
+  not identify every shared extent or establish exclusive storage savings.
+  Linux does not use Darwin clone attributes, and unavailable FIEMAP/FIBMAP
+  observations are not required. The macOS sharing gates above are unchanged.
+
+Report `passed` describes collection and semantic validity, independently of
+pool corroboration. Stale aggregate counters do not negate API acceptance; any
+physical-optimization claim remains inconclusive without corroboration. GNU
+documents required-reflink behavior in its [coreutils source](https://github.com/coreutils/coreutils/blob/v9.7/src/copy.c);
+OpenZFS documents the aggregate [pool counters](https://openzfs.github.io/openzfs-docs/man/v2.4/7/zpoolprops.7.html).
+
+The two methods produce separate descriptive summaries, with no paired verdict
+or product comparison. Keep an existing ordinary-copy reference intact when
+adding clone evidence; do not pool statistics or recollect ordinary copy merely
+because other source changed. No clone results are implied by these instructions.
+Any published reference needs its measured source identity, raw evidence hashes,
+host/guest context and independent verification, with private paths removed.
+
+GNU Time resource samples retain raw output and convert RSS KiB to bytes exactly
+once. Process RSS excludes ARC, kernel and guest/host caches; ARC/meminfo are
+context rather than whole-system peak memory. Warm validation reads do not
+guarantee residency. A Linux VM backed by a macOS APFS disk file is a VM reference,
+not bare-metal or causal filesystem performance evidence. Linux ACLs and user
+xattrs do not establish Darwin ACL/resource-fork equality. The macOS
+`/usr/bin/time -lp` host-access readiness issue does not change the Linux GNU Time
+wrapper or authorize broader permissions.
 
 ## Native report storage
 
