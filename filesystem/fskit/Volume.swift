@@ -19,7 +19,8 @@ func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOEN
     // An unspecified core limit does not establish a file-size failure.
     case SFS_LIMIT:
         code = result.limit_reason == SFS_LIMIT_APPEND_CAPACITY ? ENOSPC :
-            result.limit_reason == SFS_LIMIT_FILE_SIZE ? EFBIG : EOVERFLOW
+            result.limit_reason == SFS_LIMIT_FILE_SIZE ? EFBIG :
+            result.limit_reason == SFS_LIMIT_PIN_RESOURCES ? ENFILE : EOVERFLOW
     case SFS_IO, SFS_OUTCOME_UNKNOWN, SFS_TIME_UNAVAILABLE:
         code = result.system_errno > 0 ? result.system_errno : EIO
     default: code = EIO
@@ -27,10 +28,15 @@ func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOEN
     return NSError(domain: NSPOSIXErrorDomain, code: Int(code))
 }
 func rawBytes<T>(_ tuple: T) -> [UInt8] { withUnsafeBytes(of: tuple) { Array($0) } }
+func sameBytes<T>(_ lhs: T, _ rhs: T) -> Bool {
+    withUnsafeBytes(of: lhs) { a in withUnsafeBytes(of: rhs) { b in
+        memcmp(a.baseAddress!, b.baseAddress!, a.count) == 0
+    } }
+}
 func anchorMatches(_ result: sfs_result, _ anchor: sfs_result) -> Bool {
-    rawBytes(result.uuid) == rawBytes(anchor.uuid) && result.device == anchor.device && result.inode == anchor.inode &&
+    sameBytes(result.uuid, anchor.uuid) && result.device == anchor.device && result.inode == anchor.inode &&
     result.generation == anchor.generation && result.committed_end == anchor.committed_end &&
-    rawBytes(result.root_digest) == rawBytes(anchor.root_digest)
+    sameBytes(result.root_digest, anchor.root_digest)
 }
 enum ReadOnlyLimits {
     static let xattrValue = 1024 * 1024
@@ -107,6 +113,8 @@ final class StallionItem: FSItem {
     let inode: UInt64
 #if STALLION_WRITE_DIAGNOSTIC
     var retainedModes: FSVolume.OpenModes = []
+    var pin: sfs_pin?
+    var reclaimed = false
 #endif
     init(_ inode: UInt64) { self.inode = inode; super.init() }
 }
@@ -135,6 +143,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     private(set) var anchor: sfs_result
 #if STALLION_WRITE_DIAGNOSTIC
     // Only the private diagnostic build can enable writing; even it defaults RO.
+    private static let diagnosticPinBytes: UInt64 = 8 * 1024 * 1024
     private(set) var diagnosticWritable = false
     struct DeliveryFailure {
         let code: Int, sequence: UInt64, durableGeneration: UInt64
@@ -197,7 +206,11 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     func enableWriteDiagnostic(expectedUUID: UUID) throws {
         guard state == .inactive, rawBytes(anchor.uuid) == withUnsafeBytes(of: expectedUUID.uuid, { Array($0) }),
-              resource.isWritable && !resource.isRevoked else { throw POSIXError(.EACCES) }
+              resource.isWritable && !resource.isRevoked, items.isEmpty, !diagnosticWritable,
+              let handle else { throw POSIXError(.EACCES) }
+        var r = sfs_result()
+        try check(sfs_image_pin_configure(handle, UInt32(itemLimit), Self.diagnosticPinBytes, &r), r)
+        items.reserveCapacity(itemLimit)
         diagnosticWritable = true; diagnosticDurable = anchor.generation; writeRecords.reserveCapacity(4096)
     }
     func diagnosticSnapshot() -> (WriteCounters, [WriteRecord], DeliveryFailure?) {
@@ -208,13 +221,48 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             writeCounters.commitFences, writeCounters.commitSuccess, writeCounters.refused, writeCounters.syncs].contains(UInt64.max) {
             writeCounters.overflow = true
         }
-        return (writeCounters, writeRecords, deliveryFailure)
+        // Never export the live array's COW storage: a retained snapshot must
+        // not force observeWrite to allocate when appending after commit.
+        let copied = Array<WriteRecord>(unsafeUninitializedCapacity: writeRecords.count) { storage, initialized in
+            for record in writeRecords {
+                storage.baseAddress!.advanced(by: initialized).initialize(to: record)
+                initialized += 1
+            }
+        }
+        return (writeCounters, copied, deliveryFailure)
     }
 #if STALLION_ADAPTER_CHECK
+    func diagnosticTraceStorageForTesting() -> (address: UInt, capacity: Int, count: Int) {
+        submissionLock.lock(); defer { submissionLock.unlock() }
+        return writeRecords.withUnsafeBufferPointer { buffer in
+            let address = buffer.baseAddress.map { UInt(bitPattern: UnsafeRawPointer($0)) } ?? 0
+            return (address, writeRecords.capacity, writeRecords.count)
+        }
+    }
     var diagnosticBeforeCommit: (() -> Void)?
     var diagnosticAfterChunk: ((Int) -> Void)?
     var diagnosticAfterSizeCommit: (() -> Void)?
+    var diagnosticBeforePrepare: (() throws -> Void)?
     func diagnosticCloseForTesting(_ item: FSItem) { (item as? StallionItem)?.retainedModes = [] }
+    func diagnosticCloseModesForTesting(_ item: FSItem, modes: FSVolume.OpenModes) throws {
+        try closeModes(item, modes: modes)
+    }
+    func ownsForTesting(_ item: FSItem) -> Bool { (try? id(item)) != nil }
+    func diagnosticReadForTesting(_ item: FSItem, length: Int) throws -> Data {
+        guard length >= 0 && length <= 65536 else { throw POSIXError(.EINVAL) }
+        let h = try ready(mounted: true), inode = try id(item)
+        guard try metadata(inode).entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+        var data = Data(count: length), count = 0, r = sfs_result()
+        let status = try data.withUnsafeMutableBytes { bytes in
+            try readTarget(h, inode: inode, offset: 0, data: bytes.baseAddress, length: length, count: &count, receipt: &r)
+        }
+        try check(status, r); guard count >= 0 && count <= length else { throw POSIXError(.EIO) }
+        data.count = count; return data
+    }
+    func diagnosticMutationForTesting(_ body: (OpaquePointer, inout sfs_result) throws -> Void) throws {
+        var r = sfs_result()
+        let _: Bool = try mutate(body, prepare: { _, _ in true }, receipt: &r)
+    }
 #endif
 #endif
     private let callbacks = CallbackBudget()
@@ -333,22 +381,94 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         guard let handle, state == .active || state == .mounted, !mounted || state == .mounted else { throw POSIXError(.ENXIO) }
         return handle
     }
-    private func id(_ item: FSItem) throws -> UInt64 {
+    private func ownedItem(_ item: FSItem) throws -> StallionItem {
         guard let own = item as? StallionItem, items[own.inode] === own else { throw POSIXError(.EINVAL) }
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { guard !own.reclaimed else { throw POSIXError(.EINVAL) } }
+#endif
+        return own
+    }
+    private func id(_ item: FSItem) throws -> UInt64 {
+        let own = try ownedItem(item)
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { guard own.pin != nil else { throw POSIXError(.EINVAL) } }
+#endif
         return own.inode
     }
     private func canonical(_ inode: UInt64) throws -> StallionItem {
         if let item = items[inode] { return item }
         guard items.count < itemLimit else { throw POSIXError(.ENFILE) }
-        let item = StallionItem(inode); items[inode] = item; return item
+        let item = StallionItem(inode)
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable {
+            let h = try ready(); var pin = sfs_pin(), r = sfs_result()
+            try check(sfs_image_pin_acquire(h, inode, &pin, &r), r); item.pin = pin
+        }
+#endif
+        items[inode] = item; return item
     }
     private func metadata(_ inode: UInt64) throws -> sfs_metadata_entry {
         let h = try ready(); var m = sfs_metadata_entry(), r = sfs_result()
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable, let item = items[inode] {
+            let pin = try token(inode); var value = sfs_pin_stat()
+            try check(sfs_image_pin_stat(h, pin, &value, &r), r)
+            try validatePinMetadata(value, inode: item.inode); return value.metadata
+        }
+#endif
         try check(sfs_image_stat_metadata(h, 0, inode, &m, &r), r)
         guard m.entry.inode == inode && m.link_count > 0 else {
             let error = POSIXError(.EIO); latch(error); throw error
         }
         return m
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private func token(_ inode: UInt64) throws -> sfs_pin {
+        guard let item = items[inode], !item.reclaimed, let pin = item.pin else { throw POSIXError(.EINVAL) }
+        return pin
+    }
+    private func validatePinMetadata(_ value: sfs_pin_stat, inode: UInt64) throws {
+        let m = value.metadata
+        guard m.entry.inode == inode, (value.linked != 0) == (m.link_count > 0),
+              value.linked != 0 || (m.entry.parent == 0 && m.entry.name_length == 0) else {
+            let e = POSIXError(.EIO); latch(e); throw e
+        }
+        if value.linked == 0 && m.entry.kind == SFS_DIRECTORY { throw POSIXError(.ENOTSUP) }
+    }
+    private func transactionMetadata(_ h: OpaquePointer, inode: UInt64, receipt: inout sfs_result) throws -> sfs_metadata_entry {
+        var value = sfs_pin_stat()
+        try check(sfs_image_pin_stat_transaction(h, try token(inode), &value, &receipt), receipt)
+        guard receipt.transaction_active != 0 else { throw POSIXError(.EIO) }
+        try validatePinMetadata(value, inode: inode); return value.metadata
+    }
+    // Memory-only ownership cleanup, including after poison or revocation.
+    // Called inside tryReclaim's block, or for the activation-owned root at deactivate.
+    private func releaseItem(_ item: StallionItem) -> Error? {
+        guard items[item.inode] === item, !item.reclaimed else { return POSIXError(.EINVAL) }
+        let token = item.pin
+        item.reclaimed = true; item.pin = nil; item.retainedModes = []
+        items.removeValue(forKey: item.inode)
+        guard let pin = token, let handle else {
+            let e = POSIXError(.EINVAL); latch(e); rememberDelivery(e); return e
+        }
+        var r = sfs_result(); let status = sfs_image_pin_release(handle, pin, &r)
+        if status == SFS_OK && anchorMatches(r, anchor) { return nil }
+        let e = status == SFS_OK ? POSIXError(.ESTALE) as Error : sfsError(status, r)
+        latch(e); rememberDelivery(e, r); return e
+    }
+    private func closeModes(_ item: FSItem, modes: FSVolume.OpenModes) throws {
+        _ = try ownedItem(item)
+        guard modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
+        (item as! StallionItem).retainedModes = modes
+    }
+#endif
+    private func readTarget(_ h: OpaquePointer, inode: UInt64, offset: UInt64,
+                            data: UnsafeMutableRawPointer?, length: Int, count: inout Int,
+                            receipt: inout sfs_result) throws -> sfs_status {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { return sfs_image_pin_read(h, try token(inode), offset, data, length, &count, &receipt) }
+#endif
+        return sfs_image_read(h, 0, inode, offset, data, length, &count, &receipt)
     }
     private func checkedAlias(_ entry: sfs_entry, parent: UInt64) throws {
         let name = Data(rawBytes(entry.name).prefix(entry.name_length))
@@ -363,8 +483,12 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     private func attributes(_ inode: UInt64, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence) throws -> FSItem.Attributes {
         let mask = request.wantedAttributes.rawValue; try validateWanted(mask)
-        let m = try metadata(inode), a = FSItem.Attributes(); a.invalidateAllProperties()
-        parents.core = m.entry.parent
+        return try attributes(try metadata(inode), request, parents: &parents)
+    }
+    private func attributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence) throws -> FSItem.Attributes {
+        try validateWanted(request.wantedAttributes.rawValue)
+        let inode = m.entry.inode, a = FSItem.Attributes(); a.invalidateAllProperties()
+        parents.core = m.link_count == 0 ? nil : m.entry.parent
         let links = try checkedLinks(m.link_count)
         if request.isAttributeWanted(.type) { a.type = try type(m.entry.kind) }
         if request.isAttributeWanted(.mode) { a.mode = m.mode }
@@ -376,7 +500,10 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         // Referenced data cells only: excludes metadata and xattrs, and can be shared.
         if request.isAttributeWanted(.allocSize) { a.allocSize = m.referenced_data_bytes }
         if request.isAttributeWanted(.fileID) { a.fileID = try itemIdentifier(inode) }
-        if request.isAttributeWanted(.parentID) { a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent) }
+        if request.isAttributeWanted(.parentID) {
+            guard m.link_count > 0 else { throw POSIXError(.ENOTSUP) }
+            a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent)
+        }
         if request.isAttributeWanted(.accessTime) { a.accessTime = try checkedTime(m.access) }
         if request.isAttributeWanted(.modifyTime) { a.modifyTime = try checkedTime(m.modification) }
         if request.isAttributeWanted(.changeTime) { a.changeTime = try checkedTime(m.change) }
@@ -467,9 +594,23 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     func deactivate(options: FSDeactivateOptions, replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         self.submissionLock.lock()
-        var error: Error? = self.failure ?? (self.state == .mounted || self.pendingUnmountReplies != 0 ? POSIXError(.EBUSY) : nil)
+        let busy = self.state == .mounted || self.pendingUnmountReplies != 0
+        var error: Error? = self.failure ?? (busy ? POSIXError(.EBUSY) : nil)
 #if STALLION_WRITE_DIAGNOSTIC
         error = self.deliveryFailure?.error ?? error
+        if self.diagnosticWritable {
+            self.submissionLock.unlock()
+            guard self.state != .terminal else { replyHandler(error); return }
+            // FSKit has reclaimed every other item before deactivation. A root
+            // still retained for the activation lifetime is released here.
+            let root = self.items[1]
+            guard !busy && self.items.count == (root == nil ? 0 : 1) else {
+                self.record(4, error: POSIXError(.EBUSY)); replyHandler(error ?? POSIXError(.EBUSY)); return
+            }
+            if let root { let cleanup = self.releaseItem(root); error = error ?? cleanup }
+            self.state = .inactive
+            self.record(4, error: error); replyHandler(error); return
+        }
 #endif
         if error == nil && self.state != .terminal { self.state = .inactive }
         self.submissionLock.unlock()
@@ -517,6 +658,11 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
 #endif
             submissionLock.unlock(); return (false, POSIXError(.EBUSY))
         }
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable && (state != .inactive || !items.isEmpty) {
+            submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
+        }
+#endif
         admission = .terminal; submissionLock.unlock()
         state = .terminal; nonce.removeAll(); let owned = handle; handle = nil
         if let owned { var r = sfs_result(); let status = sfs_image_close(owned, &r); if status != SFS_OK { latch(sfsError(status, r)) } }
@@ -569,9 +715,17 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             replyHandler($0)
         }) {
         do {
-            let inode = try self.id(item)
-            let eligible = attempt { if inode != 1 && self.items[inode] === item { self.items.removeValue(forKey: inode) } }
-            self.record(12, inode, reclaim: eligible ? 1 : 0); replyHandler(nil)
+            let inode = try self.ownedItem(item).inode
+            var cleanupError: Error?
+            let eligible = attempt {
+#if STALLION_WRITE_DIAGNOSTIC
+                if self.diagnosticWritable {
+                    cleanupError = self.releaseItem(item as! StallionItem); return
+                }
+#endif
+                if inode != 1 && self.items[inode] === item { self.items.removeValue(forKey: inode) }
+            }
+            self.record(12, inode, error: cleanupError, reclaim: eligible ? 1 : 0); replyHandler(eligible ? cleanupError : nil)
         } catch { self.record(12, error: error); replyHandler(error) }
     } }
 #if STALLION_ADAPTER_CHECK
@@ -585,7 +739,13 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             let inode = try self.id(item); _ = try self.ready(mounted: true)
             let m = try self.metadata(inode); guard m.entry.kind == SFS_SYMLINK else { throw POSIXError(.EINVAL) }
             var bytes = [UInt8](repeating: 0, count: 4096), count = 0, r = sfs_result(); let h = try self.ready()
-            let status = sfs_image_readlink(h, 0, inode, &bytes, bytes.count, &count, &r)
+            let status: sfs_status
+#if STALLION_WRITE_DIAGNOSTIC
+            if self.diagnosticWritable { status = sfs_image_pin_readlink(h, try self.token(inode), &bytes, bytes.count, &count, &r) }
+            else { status = sfs_image_readlink(h, 0, inode, &bytes, bytes.count, &count, &r) }
+#else
+            status = sfs_image_readlink(h, 0, inode, &bytes, bytes.count, &count, &r)
+#endif
             if status == SFS_LIMIT { throw POSIXError(.EIO) }; try self.check(status, r)
             guard count > 0 && count <= bytes.count && !bytes.prefix(count).contains(0) else { throw POSIXError(.EIO) }
             self.record(13, inode); replyHandler(FSFileName(data: Data(bytes.prefix(count))), nil)
@@ -686,7 +846,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
 #if STALLION_WRITE_DIAGNOSTIC
             if self.diagnosticWritable {
                 guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-                if modes.contains(.write) { try self.writableMetadata(inode) }
+                if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, uid: context.effectiveUserID) }
                 if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID) }
                 (item as! StallionItem).retainedModes.formUnion(modes)
                 self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
@@ -711,15 +871,15 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             replyHandler($0)
         }) {
         do {
-            _ = try self.ready(); let inode = try self.id(item)
-            guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
+            let inode = try self.ownedItem(item).inode
 #if STALLION_WRITE_DIAGNOSTIC
             if self.diagnosticWritable {
-                guard modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
-                (item as! StallionItem).retainedModes = modes
+                try self.closeModes(item, modes: modes)
                 self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
             }
 #endif
+            _ = try self.ready()
+            guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
             self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(16, uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
@@ -748,7 +908,16 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         // owner-mode shortcut when the native security descriptor is present.
         let name = Data("com.apple.system.Security".utf8)
         var size: UInt64 = 0, r = sfs_result(); let h = try ready()
-        let status = name.withUnsafeBytes { sfs_image_xattr_size(h, 0, inode, $0.baseAddress, $0.count, &size, &r) }
+#if STALLION_WRITE_DIAGNOSTIC
+        let pin: sfs_pin?
+        if diagnosticWritable { pin = try token(inode) } else { pin = nil }
+#endif
+        let status = name.withUnsafeBytes { bytes -> sfs_status in
+#if STALLION_WRITE_DIAGNOSTIC
+            if let pin { return sfs_image_pin_xattr_size(h, pin, bytes.baseAddress, bytes.count, &size, &r) }
+#endif
+            return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
+        }
         if status == SFS_NOT_FOUND { return }
         try check(status, r); throw POSIXError(.ENOTSUP)
     }
@@ -763,7 +932,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             var r = sfs_result()
             let status = try buffer.withUnsafeMutableBytes { bytes -> sfs_status in
                 guard length <= bytes.count else { throw POSIXError(.EINVAL) }
-                return sfs_image_read(h, 0, inode, UInt64(offset), bytes.baseAddress, length, &count, &r)
+                return try self.readTarget(h, inode: inode, offset: UInt64(offset), data: bytes.baseAddress, length: length, count: &count, receipt: &r)
             }
             guard count >= 0 && count <= length else { count = 0; throw POSIXError(.EIO) }
             try self.check(status, r); self.record(18, inode); replyHandler(count, nil)
@@ -775,7 +944,16 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         do {
             let h = try self.ready(mounted: true), inode = try self.id(item); _ = try self.metadata(inode); try component(name.data, xattr: true)
             var size: UInt64 = 0, r = sfs_result()
-            let status = name.data.withUnsafeBytes { sfs_image_xattr_size(h, 0, inode, $0.baseAddress, $0.count, &size, &r) }
+#if STALLION_WRITE_DIAGNOSTIC
+            let sizePin: sfs_pin?
+            if self.diagnosticWritable { sizePin = try self.token(inode) } else { sizePin = nil }
+#endif
+            let status = name.data.withUnsafeBytes { bytes -> sfs_status in
+#if STALLION_WRITE_DIAGNOSTIC
+                if let sizePin { return sfs_image_pin_xattr_size(h, sizePin, bytes.baseAddress, bytes.count, &size, &r) }
+#endif
+                return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
+            }
             try self.check(status, r, missing: ENOATTR)
             let length = try checkedXattrLength(size)
             if length == 0 { self.record(19, inode); replyHandler(Data(), nil); return }
@@ -785,7 +963,16 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             guard let memory = malloc(length) else { throw POSIXError(.ENOMEM) }
             var transferred = false; defer { if !transferred { free(memory) } }
             var count = 0
-            let readStatus = name.data.withUnsafeBytes { sfs_image_read_xattr(h, 0, inode, $0.baseAddress, $0.count, 0, memory, length, &count, &r) }
+#if STALLION_WRITE_DIAGNOSTIC
+            let readPin: sfs_pin?
+            if self.diagnosticWritable { readPin = try self.token(inode) } else { readPin = nil }
+#endif
+            let readStatus = name.data.withUnsafeBytes { bytes -> sfs_status in
+#if STALLION_WRITE_DIAGNOSTIC
+                if let readPin { return sfs_image_pin_read_xattr(h, readPin, bytes.baseAddress, bytes.count, 0, memory, length, &count, &r) }
+#endif
+                return sfs_image_read_xattr(h, 0, inode, bytes.baseAddress, bytes.count, 0, memory, length, &count, &r)
+            }
             if readStatus == SFS_LIMIT { throw POSIXError(.ERANGE) }; try self.check(readStatus, r, missing: ENOATTR)
             guard count == length else { throw POSIXError(.EIO) }
             let value = Data(bytesNoCopy: memory, count: count, deallocator: .free); transferred = true
@@ -798,8 +985,16 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             var names: [FSFileName] = [], after = Data(), total = 0, r = sfs_result()
             while true {
                 var entry = sfs_xattr_entry(), found: Int32 = 0
+#if STALLION_WRITE_DIAGNOSTIC
+                let pin: sfs_pin?
+                if self.diagnosticWritable { pin = try self.token(inode) } else { pin = nil }
+#endif
                 let status = rawBytes(self.anchor.root_digest).withUnsafeBufferPointer { digest in after.withUnsafeBytes {
-                    sfs_image_next_xattr(h, 0, self.anchor.generation, digest.baseAddress, inode,
+#if STALLION_WRITE_DIAGNOSTIC
+                    if let pin { return sfs_image_pin_next_xattr(h, pin, self.anchor.generation, digest.baseAddress,
+                        after.isEmpty ? nil : $0.baseAddress, $0.count, &entry, &found, &r) }
+#endif
+                    return sfs_image_next_xattr(h, 0, self.anchor.generation, digest.baseAddress, inode,
                         after.isEmpty ? nil : $0.baseAddress, $0.count, &entry, &found, &r)
                 } }
                 try self.check(status, r); if found == 0 { break }
@@ -833,7 +1028,9 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, replyHandler: @escaping (Error?) -> Void) { refuse { replyHandler($0) } }
 #if STALLION_WRITE_DIAGNOSTIC
-    @discardableResult private func writableMetadata(_ inode: UInt64) throws -> sfs_metadata_entry {
+    // Contextless write callbacks have no caller identity. This is only the
+    // existing disposable-image admission policy, not client authorization.
+    @discardableResult private func fixtureWritableMetadata(_ inode: UInt64) throws -> sfs_metadata_entry {
         if let error = deliveryError() { throw error }
         let m = try metadata(inode)
         guard m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
@@ -859,8 +1056,9 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     // This wrapper owns the only transaction; no previously acknowledged work
     // is staged. The original receipt survives abort/verification failures.
-    private func mutate(_ body: (OpaquePointer, inout sfs_result) throws -> Void,
-                        receipt: inout sfs_result) throws {
+    private func mutate<T>(_ body: (OpaquePointer, inout sfs_result) throws -> Void,
+                           prepare: (OpaquePointer, inout sfs_result) throws -> T,
+                           receipt: inout sfs_result) throws -> T {
         let h = try ready(mounted: true), before = anchor
         var began = false, committed = false
         do {
@@ -869,8 +1067,13 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             try check(begin, receipt); began = true
             try body(h, &receipt)
 #if STALLION_ADAPTER_CHECK
+            try diagnosticBeforePrepare?()
+#endif
+            let prepared = try prepare(h, &receipt)
+#if STALLION_ADAPTER_CHECK
             diagnosticBeforeCommit?()
 #endif
+            guard resource.isWritable && !resource.isRevoked else { throw POSIXError(.EACCES) }
             let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
             guard status == SFS_OK else {
                 let e = sfsError(status, receipt)
@@ -878,7 +1081,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 throw e
             }
             committed = true
-            guard rawBytes(receipt.uuid) == rawBytes(before.uuid), receipt.device == before.device,
+            guard sameBytes(receipt.uuid, before.uuid), receipt.device == before.device,
                   receipt.inode == before.inode, before.generation != UInt64.max,
                   receipt.generation == before.generation + 1, receipt.transaction_active == 0,
                   receipt.committed_end > before.committed_end,
@@ -887,6 +1090,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             }
             anchor = receipt
             submissionLock.lock(); diagnosticDurable = receipt.generation; submissionLock.unlock()
+            return prepared
         } catch {
             let original = receipt
             if original.poisoned != 0 || [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED, SFS_UNSUPPORTED].contains(original.status) {
@@ -913,23 +1117,24 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             var receipt = sfs_result(), inode: UInt64 = 0
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
-                _ = try self.ready(mounted: true); inode = try self.id(item); try self.writableMetadata(inode)
+                _ = try self.ready(mounted: true); inode = try self.id(item); try self.fixtureWritableMetadata(inode)
+                let pin = try self.token(inode)
                 self.submissionLock.lock(); self.saturated(&self.writeCounters.bytes, by: UInt64(contents.count)); self.submissionLock.unlock()
                 if !contents.isEmpty {
-                    try self.mutate({ h, r in
+                    let _: Bool = try self.mutate({ h, r in
                         try contents.withUnsafeBytes { bytes in
                             var at = 0
                             while at < bytes.count {
                                 let amount = min(65536, bytes.count - at)
                                 self.submissionLock.lock(); self.saturated(&self.writeCounters.chunks); self.submissionLock.unlock()
-                                let status = sfs_image_write(h, inode, UInt64(offset) + UInt64(at), bytes.baseAddress!.advanced(by: at), amount, &r)
+                                let status = sfs_image_pin_write(h, pin, UInt64(offset) + UInt64(at), bytes.baseAddress!.advanced(by: at), amount, &r)
                                 try self.check(status, r); at += amount
 #if STALLION_ADAPTER_CHECK
                                 self.diagnosticAfterChunk?(at)
 #endif
                             }
                         }
-                    }, receipt: &receipt)
+                    }, prepare: { _, _ in true }, receipt: &receipt)
                 }
                 self.observeWrite(1, inode: inode, offset: UInt64(offset), length: UInt64(contents.count), started: start, count: contents.count, error: nil, result: receipt)
                 reply(contents.count, nil)
@@ -966,28 +1171,32 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
+                let request = FSItem.GetAttributesRequest()
+                request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
+                var parents = ParentEvidence()
+                let result: FSItem.Attributes
                 if hasSize && m.entry.kind == SFS_FILE {
                     guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
-                    try self.writableMetadata(inode)
+                    try self.fixtureWritableMetadata(inode)
                     if a.size != m.entry.size {
-                        try self.mutate({ h, r in try self.check(sfs_image_resize(h, inode, a.size, &r), r) }, receipt: &receipt)
-                    }
+                        let pin = try self.token(inode)
+                        result = try self.mutate({ h, r in
+                            try self.check(sfs_image_pin_resize(h, pin, a.size, &r), r)
+                        }, prepare: { h, r in
+                            let pending = try self.transactionMetadata(h, inode: inode, receipt: &r)
+                            return try self.attributes(pending, request, parents: &parents)
+                        }, receipt: &receipt)
+                    } else { result = try self.attributes(m, request, parents: &parents) }
                     a.consumedAttributes = [.size]
 #if STALLION_ADAPTER_CHECK
                     self.diagnosticAfterSizeCommit?()
 #endif
-                }
-                let request = FSItem.GetAttributesRequest()
-                request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
-                var parents = ParentEvidence()
-                let result = try self.attributes(inode, request, parents: &parents)
+                } else { result = try self.attributes(m, request, parents: &parents) }
                 self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: nil, result: receipt)
                 reply(result, nil)
             } catch {
                 receipt = self.lastCoreFailure ?? receipt
                 if hasSize { self.rememberDelivery(error, receipt) }
-                // If size was consumed, it already committed. Do not abort it.
-                if !a.consumedAttributes.isEmpty { self.latch(error) }
                 self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: error, result: receipt)
                 reply(nil, error)
             }
