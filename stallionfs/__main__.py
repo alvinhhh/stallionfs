@@ -76,6 +76,7 @@ def main(argv=None):
     enroll.add_argument("id")
     enroll.add_argument("--disable", action="store_true")
     managed_run = commands.add_parser("run", help="Run a command while holding the managed-use lease")
+    managed_run.add_argument("--auto-retire", action="store_true", help="Allow cooperative folder sessions to retire after seven observed idle days")
     managed_run.add_argument("id")
     managed_run.add_argument("command", nargs=argparse.REMAINDER)
     cleanup = commands.add_parser("cleanup", help="Preview or retire enrolled workspaces closed for seven days")
@@ -171,7 +172,7 @@ def main(argv=None):
             text = args.id
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
-            result = store.run(args.id, command)
+            result = store.run(args.id, command, auto_retire=args.auto_retire)
             text = json.dumps(result) if args.json else ""
         elif args.action == "cleanup":
             if args.enable or args.disable:

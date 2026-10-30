@@ -39,7 +39,7 @@ def identity(path):
 
 
 def finite_time(value):
-    return type(value) in (int, float) and math.isfinite(value) and value > 0
+    return (type(value) is int or (type(value) is float and math.isfinite(value))) and value > 0
 
 
 
@@ -57,15 +57,16 @@ class Lifecycle:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise core.StallionError(f'Workspace is in managed use: {workspace}') from exc
-            yield
+            yield fd
         finally:
             os.close(fd)
 
     @contextlib.contextmanager
-    def _workspace_lock(self, workspace):
+    def _workspace_lock(self, workspace, *, reconcile=True):
         # Acquisition order: managed-use lease, workspace lock, retention lock.
         with self._lease(workspace), core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
-            self._reconcile(workspace)
+            if reconcile:
+                self._reconcile(workspace)
             yield
 
     def _payload(self, path, meta):
@@ -270,37 +271,108 @@ class Lifecycle:
             replace_json(self._state(workspace), state)
             return state
 
-    def run(self, workspace, command):
+    def run(self, workspace, command, *, auto_retire=False):
         if not command:
             raise core.StallionError('Supply a command after --')
-        with self._lease(workspace):
-            with core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
-                self._reconcile(workspace)
-                path, meta = self.object('workspaces', workspace)
-                self._open(workspace, path, meta)
-                repo = self._mount(path, meta)['path']
-            result = subprocess.run(command, cwd=repo)
-            # Command completion does not prove its descendants or external writers stopped.
-            return {'workspace': workspace, 'returncode': result.returncode}
+        if auto_retire and not self.cleanup_config()['enabled']:
+            raise core.StallionError('Enable cleanup before using --auto-retire')
+        generation = None
+        try:
+            with self._lease(workspace) as lease_fd:
+                with core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
+                    if auto_retire:
+                        self._no_pending_rollback(workspace)
+                    else:
+                        self._reconcile(workspace)
+                    path, meta = self.object('workspaces', workspace)
+                    if auto_retire:
+                        if meta.get('backend', 'folder') != 'folder':
+                            raise core.StallionError('--auto-retire supports folder workspaces only')
+                        previous = core.read_json(self._state(workspace))
+                        if not self._valid_state(workspace, path, meta, previous, time.time()):
+                            raise core.StallionError('--auto-retire requires valid cleanup enrollment')
+                    state = self._open(workspace, path, meta)
+                    if auto_retire:
+                        state['auto_retire'] = {'generation': state['generation']}
+                        replace_json(self._state(workspace), state)
+                        generation = state['generation']
+                    repo = self._mount(path, meta)['path']
+                options = {}
+                if auto_retire:
+                    options = {'pass_fds': (lease_fd,), 'env': {
+                        **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
+                        'STALLIONFS_LEASE_GENERATION': generation}}
+                result = subprocess.run(command, cwd=repo, **options)
+        finally:
+            # Closing our descriptor must not unlock the shared lease held by descendants.
+            if generation is not None:
+                self._observe_idle(workspace, generation)
+        return {'workspace': workspace, 'returncode': result.returncode}
+
+    def _policy(self):
+        path = self.root / 'cleanup.json'
+        value = core.read_json(path) if path.exists() else {'enabled': False}
+        cursor = value.get('cursor')
+        if (type(value.get('enabled')) is not bool or
+                (cursor is not None and (not isinstance(cursor, str) or not core.re.fullmatch('[0-9a-f]{32}', cursor)))):
+            raise core.StallionError('Invalid cleanup setting')
+        return value
 
     def cleanup_config(self, *, enabled=None):
-        path = self.root / 'cleanup.json'
         with core.lock(self.root / '.lock', blocking=enabled is not None):
+            value = self._policy()
             if enabled is not None:
-                replace_json(path, {'enabled': bool(enabled)})
-            value = core.read_json(path) if path.exists() else {'enabled': False}
-            if type(value.get('enabled')) is not bool:
-                raise core.StallionError('Invalid cleanup setting')
+                value = {**value, 'enabled': bool(enabled)}
+                replace_json(self.root / 'cleanup.json', value)
             return value
 
-    def _eligible(self, workspace, now):
+    def _no_pending_rollback(self, workspace):
+        if os.path.lexists(self.root / 'journals' / f'{workspace}.json'):
+            raise core.StallionError('Pending rollback requires an explicit workspace operation')
+
+    def _valid_state(self, workspace, path, meta, state, now):
+        if (not finite_time(now) or state.get('id') != workspace or state.get('enrolled') is not True or
+                state.get('status') not in ('open', 'closed') or
+                not isinstance(state.get('generation'), str) or
+                not core.re.fullmatch('[0-9a-f]{32}', state['generation']) or
+                state.get('object') != identity(path) or state.get('payload') != identity(self._payload(path, meta))):
+            return False
+        if state['status'] == 'closed':
+            closed = state.get('closed_at')
+            return ('auto_retire' not in state and finite_time(closed) and closed <= now)
+        if 'closed_at' in state:
+            return False
+        if 'auto_retire' in state:
+            session = state['auto_retire']
+            if (meta.get('backend', 'folder') != 'folder' or not isinstance(session, dict) or
+                    session.get('generation') != state['generation']):
+                return False
+            if 'idle_since' in session and (not finite_time(session['idle_since']) or session['idle_since'] > now):
+                return False
+        return True
+
+    def _eligible(self, workspace, now, *, observe=False, generation=None):
         path, meta = self.object('workspaces', workspace)
         state = core.read_json(self._state(workspace))
-        closed = state.get('closed_at')
-        if (state.get('id') != workspace or state.get('status') != 'closed' or state.get('enrolled') is not True or
-                not core.re.fullmatch('[0-9a-f]{32}', str(state.get('generation', ''))) or
-                not finite_time(now) or not finite_time(closed) or closed > now or now - closed < STALE_SECONDS or
-                state.get('object') != identity(path) or state.get('payload') != identity(self._payload(path, meta))):
+        if not self._valid_state(workspace, path, meta, state, now):
+            return None
+        if generation is not None and state['generation'] != generation:
+            return None
+        if state['status'] == 'closed':
+            since = state['closed_at']
+        else:
+            session = state.get('auto_retire')
+            if session is None:
+                return None
+            since = session.get('idle_since')
+            if since is None:
+                if not observe:
+                    return None
+                self._no_mounts(path)
+                state['auto_retire'] = {**session, 'idle_since': now}
+                replace_json(self._state(workspace), state)
+                since = now
+        if now - since < STALE_SECONDS:
             return None
         self._no_mounts(path)
         if meta.get('backend') == 'image':
@@ -309,35 +381,64 @@ class Lifecycle:
                 return None
         return path, meta, state
 
+    def _observe_idle(self, workspace, generation):
+        try:
+            with core.lock(self.root / '.lock', shared=True, blocking=False):
+                if not self._policy()['enabled']:
+                    return
+                with self._workspace_lock(workspace, reconcile=False):
+                    self._no_pending_rollback(workspace)
+                    self._eligible(workspace, time.time(), observe=True, generation=generation)
+        except (core.StallionError, OSError, ValueError, TypeError):
+            pass  # A later apply can observe the exact still-enrolled session.
+
+    def _advance_cursor(self, observed, last):
+        with core.lock(self.root / '.lock', blocking=False):
+            current = self._policy()
+            if current['enabled'] and current.get('cursor') == observed:
+                replace_json(self.root / 'cleanup.json', {**current, 'cursor': last})
+
     def cleanup(self, *, apply=False, limit=None):
         result = {'retired' if apply else 'would_retire': [], 'skipped': []}
-        if not self.cleanup_config()['enabled']:
+        policy = self.cleanup_config()
+        if not policy['enabled']:
             result['enabled'] = False
             return result
-        now = time.time()
-        # Bounded directory iteration also bounds work in stores with many workspaces.
-        import itertools
-        for entry in itertools.islice((self.root / 'workspaces').iterdir(), limit):
-            workspace = entry.name
+        names = sorted(p.name for p in (self.root / 'workspaces').iterdir()
+                       if core.re.fullmatch('[0-9a-f]{32}', p.name))
+        cursor = policy.get('cursor')
+        if limit is not None:
+            if cursor is not None:
+                names = [name for name in names if name > cursor] + [name for name in names if name <= cursor]
+            names = names[:limit]
+        for workspace in names:
             try:
-                with self._workspace_lock(workspace):
-                    eligible = self._eligible(workspace, now)
-                    if eligible is None:
-                        continue
-                    path, meta, state = eligible
-                    if apply:
-                        with self._retention():
-                            protection = self.root / 'protected' / f'{workspace}.json'
-                            if os.path.lexists(protection):
-                                raise core.StallionError('Existing protection requires explicit restore or purge')
-                            core.write_json(protection, {'id': workspace, 'object': identity(path),
-                                                        'generation': state['generation'], 'retired_at': now})
-                            # Protection precedes rename, including when rename succeeds then raises.
-                            from ._scan import move
-                            move(path, self.root / 'trash' / workspace)
-                    result['retired' if apply else 'would_retire'].append(workspace)
+                with core.lock(self.root / '.lock', shared=True, blocking=False):
+                    if not self._policy()['enabled']:
+                        result['enabled'] = False
+                        return result
+                    with self._workspace_lock(workspace, reconcile=False):
+                        self._no_pending_rollback(workspace)
+                        now = time.time()
+                        eligible = self._eligible(workspace, now, observe=apply)
+                        if eligible is None:
+                            continue
+                        path, meta, state = eligible
+                        if apply:
+                            with self._retention():
+                                protection = self.root / 'protected' / f'{workspace}.json'
+                                if os.path.lexists(protection):
+                                    raise core.StallionError('Existing protection requires explicit restore or purge')
+                                core.write_json(protection, {'id': workspace, 'object': identity(path),
+                                                            'generation': state['generation'], 'retired_at': now})
+                                # Protection precedes rename, including when rename succeeds then raises.
+                                from ._scan import move
+                                move(path, self.root / 'trash' / workspace)
+                        result['retired' if apply else 'would_retire'].append(workspace)
             except (core.StallionError, OSError, ValueError, TypeError) as error:
                 result['skipped'].append({'id': workspace, 'reason': str(error)})
+        if apply and limit is not None and names:
+            self._advance_cursor(cursor, names[-1])
         return result
 
     def opportunistic_cleanup(self):
