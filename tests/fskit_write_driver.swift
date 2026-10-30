@@ -10,6 +10,20 @@ import Darwin
 func need(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() { fatalError(message) }
 }
+#if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
+func resultMaskTrace(_ text: String) {
+    let bytes = Array(("RESULT_MASK " + text + "\n").utf8)
+    bytes.withUnsafeBytes { buffer in
+        var offset = 0
+        while offset < buffer.count {
+            let written = Darwin.write(STDERR_FILENO, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+            if written < 0 && errno == EINTR { continue }
+            need(written > 0, "result mask trace write failed")
+            offset += written
+        }
+    }
+}
+#endif
 func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
 func wait<T>(_ operation: (@escaping (T) -> Void) -> Void) -> T {
     let done = DispatchSemaphore(value: 0); var result: T?
@@ -64,12 +78,14 @@ struct Fixture {
 final class Mounted {
     let volume: StallionVolume, root: FSItem, file: FSItem, alias: FSItem, link: FSItem
     let coreHandle: OpaquePointer
+    let resource: FSPathURLResource
     init(_ fixture: Fixture, writable: Bool = true, itemLimit: Int = ReadOnlyLimits.activeItems) throws {
         fault(0, 0); var h: OpaquePointer?, r = sfs_result()
         let opened = writable ? sfs_image_open(fixture.url.path, "image.sfs", &h, &r) : sfs_image_open_readonly(fixture.url.path, "image.sfs", &h, &r)
         need(opened == SFS_OK, "open adapter")
         coreHandle = h!
-        volume = StallionVolume(handle: h!, resource: FSPathURLResource(url: fixture.url, writable: writable), scope: false, anchor: r, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
+        resource = FSPathURLResource(url: fixture.url, writable: writable)
+        volume = StallionVolume(handle: h!, resource: resource, scope: false, anchor: r, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
         if writable { try volume.enableWriteDiagnostic(expectedUUID: fixture.identity) }
         let v = volume
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
@@ -83,10 +99,10 @@ final class Mounted {
         need(file === alias, "aliases share canonical item")
     }
     func write(_ data: Data, at offset: off_t = 0, alias: Bool = false) -> (Int, Error?) {
-        wait { done in volume.write(contents: data, to: alias ? self.alias : file, at: offset) { done(($0, $1)) } }
+        wait { done in volume.writeCountForTesting(contents: data, to: alias ? self.alias : file, at: offset) { done(($0, $1)) } }
     }
     func set(_ request: FSItem.SetAttributesRequest, item: FSItem? = nil) -> (FSItem.Attributes?, Error?) {
-        wait { done in volume.setAttributes(request, on: item ?? file) { done(($0, $1)) } }
+        wait { done in volume.setAttributesValueForTesting(request, on: item ?? file, caller: CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0, $1)) } }
     }
     func size(_ value: UInt64, item: FSItem? = nil) -> (FSItem.Attributes?, Error?) {
         let a = FSItem.SetAttributesRequest(); a.size = value; return set(a, item: item)
@@ -187,12 +203,14 @@ func attributes(_ parent: URL) throws -> [Int] {
             m.close()
         }
     }
-    let m = try Mounted(f), before = m.volume.anchor.generation
+    let m = try Mounted(f), before = m.volume.anchor
     for item in [m.root, m.link] {
         let a = FSItem.SetAttributesRequest(); a.size = UInt64.max
-        need(m.set(a, item: item).1 == nil && a.consumedAttributes.isEmpty, "nonregular size ignored")
+        let result = m.set(a, item: item)
+        need(result.0 != nil && result.1 == nil && a.consumedAttributes.isEmpty, "nonregular size ignored with prepared result")
+        need(anchorMatches(m.volume.anchor, before) && m.volume.diagnosticSnapshot().0.commits == 0, "ignored nonregular size leaves anchor and commit count unchanged")
     }
-    need(m.set(FSItem.SetAttributesRequest()).1 == nil && m.volume.anchor.generation == before, "empty checked no-op")
+    need(m.set(FSItem.SetAttributesRequest()).1 == nil && anchorMatches(m.volume.anchor, before), "empty checked no-op")
     m.close()
     let oversized = try Mounted(f)
     need(code(oversized.size(UInt64.max).1) == Int(EFBIG) && code(oversized.sync()) == Int(EFBIG), "size bound sticky")
@@ -289,7 +307,7 @@ func admission(_ parent: URL) throws {
     let replies = DispatchGroup()
     for _ in 0..<ReadOnlyLimits.callbacks { replies.enter(); v.getAttributes(a, of: m.file) { _, _ in replies.leave() } }
     var rejected = 0
-    v.write(contents: Data([1]), to: m.file, at: 0) { count, error in
+    v.writeCountForTesting(contents: Data([1]), to: m.file, at: 0) { count, error in
         need(count == 0 && code(error) == Int(EAGAIN), "prequeue failure")
         rejected += 1
         // Reentrant sync must see the error before the rejection callback.
@@ -317,7 +335,7 @@ func admission(_ parent: URL) throws {
     for offset in [off_t(-1), off_t.max] {
         completed.enter()
         DispatchQueue.global().async(execute: DispatchWorkItem {
-            racing.volume.write(contents: Data([1]), to: racing.file, at: offset) { count, error in
+            racing.volume.writeCountForTesting(contents: Data([1]), to: racing.file, at: offset) { count, error in
                 need(count == 0 && [Int(EINVAL), Int(EFBIG)].contains(code(error)), "concurrent prequeue failure"); completed.leave()
             }
         })
@@ -347,7 +365,7 @@ func lifetimeAndBinding(_ parent: URL) throws {
     v.enqueue { held.signal(); need(release.wait(timeout: .now() + 20) == .success, "lifecycle release") }
     need(held.wait(timeout: .now() + 20) == .success, "hold lifecycle owner")
     var written = false
-    v.write(contents: Data("durable!".utf8), to: m.file, at: 0) { count, error in
+    v.writeCountForTesting(contents: Data("durable!".utf8), to: m.file, at: 0) { count, error in
         need(count == 8 && error == nil, "accepted write completes before unmount")
         let busy = v.unload(); need(!busy.consumed && code(busy.error) == Int(EBUSY), "write reply keeps handle ownership")
         written = true
@@ -443,6 +461,15 @@ func detachedTokenRoutes(_ parent: URL) throws {
     need(value.1 == nil && value.0 == Data("value".utf8) && names.1 == nil && names.0?.map(\.data) == [Data("note".utf8)], "detached xattr token routes")
     let target: (FSFileName?, Error?) = wait { done in v.readSymbolicLink(m.link) { done(($0,$1)) } }
     need(target.1 == nil && target.0?.data == Data("file".utf8), "detached symlink token route")
+#if STALLION_CONTEXT_HANDLERS
+    if FSWriteFileResult.requestedAttributes.isAttributeWanted(.parentID) || FSSetAttributesResult.requestedAttributes.isAttributeWanted(.parentID) {
+        let before = v.anchor
+        let denied = FSWriteFileResult.requestedAttributes.isAttributeWanted(.parentID) ? m.write(Data("detached".utf8)).1 : m.size(11).1
+        need(code(denied) == Int(ENOTSUP) && anchorMatches(v.anchor, before), "required detached parent refuses before commit")
+        m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("original".utf8), "detached preparation refusal preserves bytes") }
+        m.close(); return
+    }
+#endif
     need(m.write(Data("detached".utf8), alias: true).1 == nil, "detached write through alias")
     let resized = m.size(11); need(resized.1 == nil && resized.0?.size == 11, "detached precommit size reply")
     m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("detached".utf8) + Data(repeating: 0, count: 3), "detached resize/read bytes") }
@@ -450,8 +477,14 @@ func detachedTokenRoutes(_ parent: URL) throws {
         let missing: (FSItem?, Error?) = wait { done in v.lookupItem(named: FSFileName(string: name), inDirectory: m.root) { done(($0,$2)) } }
         need(missing.0 == nil && code(missing.1) == Int(ENOENT), "no namespace resurrection")
     }
+#if STALLION_CONTEXT_HANDLERS
+    // Pure refusal body; actual contextual selectors require a kernel FSContext.
+    let refused: Error? = wait { v.refusedMutationForTesting(replyHandler: $0) }
+    let xattrRefused: Error? = wait { v.refusedMutationForTesting(replyHandler: $0) }
+#else
     let refused: Error? = wait { v.removeItem(m.file, named: FSFileName(string: "file"), fromDirectory: m.root, replyHandler: $0) }
     let xattrRefused: Error? = wait { v.setXattr(named: FSFileName(string: "note"), to: Data(), on: m.file, policy: .alwaysSet, replyHandler: $0) }
+#endif
     need(code(refused) == Int(EROFS) && code(xattrRefused) == Int(EROFS), "namespace and xattr setter stay refused in private mode")
     let no: Error? = wait { v.reclaimForTesting(m.file, eligible: false, replyHandler: $0) }; need(no == nil, "false reclaim replies nil")
     m.serial { need(v.ownsForTesting(m.file) && (m.file as! StallionItem).pin != nil, "false reclaim retains ownership") }
@@ -540,12 +573,437 @@ func reclaimErrorAndRoot(_ parent: URL) throws {
     retained.close()
 }
 
+#if STALLION_CONTEXT_HANDLERS
+// These values exercise policy only; FSContext.init is unavailable.
+func contextualPolicyValues() throws {
+    let owner = geteuid(), caller = CallerIdentity(uid: Int(owner), gid: Int(getegid()))
+    var m = sfs_metadata_entry(); m.uid = owner; m.gid = getegid(); m.mode = 0o600; m.entry.kind = SFS_FILE
+    try checkOwnerPolicy(m, owner: owner, caller: caller, access: [.readData, .writeData], writable: true, hasACL: false)
+    try checkOwnerPolicy(m, owner: owner, caller: CallerIdentity(uid: Int(owner), gid: Int(getegid()) + 1), access: .readData, writable: false, hasACL: false)
+    func denied(_ expected: Int32, _ body: () throws -> Void) {
+        do { try body(); need(false, "policy unexpectedly granted access") }
+        catch { need(code(error) == Int(expected), "policy denial code") }
+    }
+    for foreign in [CallerIdentity(uid: Int(owner) + 1, gid: caller.gid), CallerIdentity(uid: -1, gid: caller.gid), CallerIdentity(uid: caller.uid, gid: -1)] {
+        denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: foreign, access: .readAttributes, writable: true, hasACL: false) }
+    }
+    if owner != 0 { denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: CallerIdentity(uid: 0, gid: 0), access: .readData, writable: true, hasACL: false) } }
+    denied(ENOTSUP) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: .readData, writable: false, hasACL: true) }
+    denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: .writeData, writable: false, hasACL: false) }
+    m.mode = 0o6600
+    denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: .writeData, writable: true, hasACL: false) }
+    m.entry.kind = SFS_DIRECTORY; m.mode = 0o400
+    denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: .search, writable: false, hasACL: false) }
+    m.mode = 0o100
+    try checkOwnerPolicy(m, owner: owner, caller: caller, access: .search, writable: false, hasACL: false)
+    denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: [.readData, .search], writable: false, hasACL: false) }
+    m.mode = 0o500
+    try checkOwnerPolicy(m, owner: owner, caller: caller, access: [.readData, .search], writable: false, hasACL: false)
+}
+func unknownCallerAttribute() -> FSItem.Attribute {
+    for index in 0..<UInt.bitWidth {
+        let bit = UInt(1) << index
+        if bit & UInt(0x3ffff) == 0 { return FSItem.Attribute(rawValue: Int(bitPattern: bit)) }
+    }
+    fatalError("an undeclared caller attribute is required for this case")
+}
+func incompleteSnapshot(_ original: FSItem.Attributes) -> FSItem.Attributes {
+    let a = FSItem.Attributes(); a.invalidateAllProperties()
+    if original.isValid(.type) { a.type = original.type }
+    if original.isValid(.mode) { a.mode = original.mode }
+    if original.isValid(.linkCount) { a.linkCount = original.linkCount }
+    if original.isValid(.uid) { a.uid = original.uid }
+    if original.isValid(.gid) { a.gid = original.gid }
+    if original.isValid(.flags) { a.flags = original.flags }
+    if original.isValid(.allocSize) { a.allocSize = original.allocSize }
+    if original.isValid(.fileID) { a.fileID = original.fileID }
+    if original.isValid(.parentID) { a.parentID = original.parentID }
+    if original.isValid(.accessTime) { a.accessTime = original.accessTime }
+    if original.isValid(.modifyTime) { a.modifyTime = original.modifyTime }
+    if original.isValid(.changeTime) { a.changeTime = original.changeTime }
+    if original.isValid(.birthTime) { a.birthTime = original.birthTime }
+    // Preserve the result policy while deliberately omitting size.
+    a.supportsLimitedXAttrs = false
+    a.inhibitKernelOffloadedIO = true
+    return a
+}
+func completenessRefused(_ attributes: FSItem.Attributes, required: FSItem.Attribute) {
+    do { try StallionVolume.requireValidForTesting(attributes, required: required); need(false, "incomplete snapshot accepted") }
+    catch { need(code(error) == Int(ENOTSUP), "incomplete snapshot refusal") }
+}
+func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, required: FSItem.Attribute, exact: Bool = false) {
+    let fields: [FSItem.Attribute] = [.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize, .fileID, .parentID,
+        .accessTime, .modifyTime, .changeTime, .birthTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
+    try! StallionVolume.requireValidForTesting(a, required: required)
+    for field in fields {
+        if required.contains(field) { need(a.isValid(field), "required SDK attribute populated") }
+        if exact { need(a.isValid(field) == required.contains(field), "only explicit entry attributes populated") }
+    }
+    if a.isValid(.type) { need(a.type == (m.entry.kind == SFS_FILE ? .file : m.entry.kind == SFS_DIRECTORY ? .directory : .symlink), "type") }
+    if a.isValid(.mode) { need(a.mode == m.mode, "mode") }
+    if a.isValid(.linkCount) { need(UInt64(a.linkCount) == m.link_count, "link count") }
+    if a.isValid(.uid) { need(a.uid == m.uid, "uid") }
+    if a.isValid(.gid) { need(a.gid == m.gid, "gid") }
+    if a.isValid(.flags) { need(a.flags == m.flags, "flags") }
+    if a.isValid(.size) { need(a.size == m.entry.size, "size") }
+    if a.isValid(.allocSize) { need(a.allocSize == m.referenced_data_bytes, "allocation") }
+    if a.isValid(.fileID) { need(a.fileID == (try! itemIdentifier(m.entry.inode)), "file identifier") }
+    if a.isValid(.parentID) { need(m.link_count > 0 && a.parentID == (m.entry.inode == 1 ? .parentOfRoot : try! itemIdentifier(m.entry.parent)), "parent identifier") }
+    func time(_ actual: timespec, _ expected: sfs_timestamp) {
+        need(actual.tv_sec == expected.seconds && actual.tv_nsec == expected.nanoseconds, "timestamp")
+    }
+    if a.isValid(.accessTime) { time(a.accessTime, m.access) }
+    if a.isValid(.modifyTime) { time(a.modifyTime, m.modification) }
+    if a.isValid(.changeTime) { time(a.changeTime, m.change) }
+    if a.isValid(.birthTime) { time(a.birthTime, m.birth) }
+    if a.isValid(.supportsLimitedXAttrs) { need(!a.supportsLimitedXAttrs, "xattr capability") }
+    if a.isValid(.inhibitKernelOffloadedIO) { need(a.inhibitKernelOffloadedIO, "I/O routing attribute") }
+}
+func contextualResults(_ parent: URL) throws {
+    let f = try Fixture(parent, "handler-results"), m = try Mounted(f), v = m.volume
+    let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    let resultTypes: [FSVolumeHandlerResult.Type] = [FSLookupItemResult.self, FSGetAttributesResult.self,
+        FSReadSymlinkResult.self, FSReadFileResult.self, FSWriteFileResult.self, FSSetAttributesResult.self]
+    let resultMasks = resultTypes.map { ($0, $0.requestedAttributes.wantedAttributes) }
+#if STALLION_RESULT_MASK_TRACE
+    // Record all six actual snapshots before the first strict union check.
+    for (type, original) in resultMasks {
+        let raw = UInt(bitPattern: original.rawValue)
+        resultMaskTrace("\(type) original=0x\(String(raw, radix: 16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff), radix: 16)) explicit=0x140")
+    }
+#endif
+    for (type, original) in resultMasks {
+        let union = try StallionVolume.resultRequestForTesting(type, explicit: [.size, .fileID])
+        need(union.wantedAttributes == original.union([.size, .fileID]) && type.requestedAttributes.wantedAttributes == original, "subclass mask union leaves SDK object unchanged")
+        for index in 0..<UInt.bitWidth {
+            let bit = UInt(1) << index
+            if UInt(bitPattern: original.rawValue) & bit != 0 && bit & UInt(0x3fff) == 0 {
+                do { _ = try StallionVolume.resultRequestForTesting(type, explicit: FSItem.Attribute(rawValue: Int(bitPattern: bit))); need(false, "SDK-owned requirement accepted as caller field") }
+                catch { need(code(error) == Int(ENOTSUP), "caller and SDK authority remain separate") }
+            }
+        }
+    }
+    for unsupported in [unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
+        do { _ = try StallionVolume.resultRequestForTesting(FSWriteFileResult.self, explicit: unsupported); need(false, "unsupported mandatory field") }
+        catch { need(code(error) == Int(ENOTSUP), "unsupported result request refused") }
+    }
+    // Constructor-only access coverage; no fabricated FSContext or client claim.
+    need(FSCheckAccessResult(accessAllowed: true) != nil && FSCheckAccessResult(accessAllowed: false) != nil, "actual access constructors")
+    var retained: [(FSItem.Attributes, sfs_metadata_entry, FSItem.Attribute)] = []
+    var captured: [String: FSItem.Attributes] = [:], commitStarted = false
+    m.serial {
+        v.preparedAttributesForTesting = { name, attributes in need(!commitStarted, "attributes prepared before commit"); captured[name] = attributes }
+        v.diagnosticBeforeCommit = { commitStarted = true }
+        v.rejectResultForTesting = { _ in need(!commitStarted, "SDK result constructed before commit"); return false }
+    }
+    let activated: (FSActivateResult?, Error?) = wait { done in v.activateResultForTesting { done(($0,$1)) } }
+    need(activated.0 != nil && activated.1 == nil, "actual activation constructor")
+    for name in ["file", "alias"] {
+        let result: (FSLookupItemResult?, Error?) = wait { done in v.lookupResultForTesting(name, directory: m.root, caller: caller) { done(($0,$1)) } }
+        need(result.0 != nil && result.1 == nil, "actual lookup constructor")
+    }
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size, .fileID, .parentID, .mode, .uid, .gid, .linkCount, .flags, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime]
+    let attributes: (FSGetAttributesResult?, Error?) = wait { done in v.attributesResultForTesting(request, item: m.file, caller: caller) { done(($0,$1)) } }
+    need(attributes.0 != nil && attributes.1 == nil, "actual attribute constructor and explicit mask")
+    for rejected in [unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
+        let unsupported = FSItem.GetAttributesRequest(); unsupported.wantedAttributes = rejected
+        let denied: (FSGetAttributesResult?, Error?) = wait { done in v.attributesResultForTesting(unsupported, item: m.file, caller: caller) { done(($0,$1)) } }
+        need(denied.0 == nil && code(denied.1) == Int(ENOTSUP) && unsupported.wantedAttributes == rejected, "actual contextual caller-mask refusal is atomic")
+    }
+    m.serial {
+        let complete = captured["FSGetAttributesResult"]!, required = FSGetAttributesResult.requestedAttributes.wantedAttributes
+        try! StallionVolume.requireValidForTesting(complete, required: required)
+        let omitted = incompleteSnapshot(complete), invalidated = incompleteSnapshot(complete)
+        invalidated.invalidateAllProperties()
+        need(!omitted.isValid(.size) && FSGetAttributesResult(attributes: omitted) != nil && FSGetAttributesResult(attributes: invalidated) != nil,
+             "real incomplete constructors do not establish completeness on this runtime")
+        completenessRefused(omitted, required: required)
+        completenessRefused(invalidated, required: required)
+        need(!required.contains(.backupTime) && !complete.isValid(.backupTime), "absent synthetic additional requirement")
+        completenessRefused(complete, required: required.union(.backupTime))
+        // These synthetic masks cover the shared production guard, not an observed SDK requirement.
+        let callerOnly = FSItem.Attributes()
+        callerOnly.invalidateAllProperties()
+        callerOnly.fileID = complete.fileID
+        need(callerOnly.isValid(.fileID) && !callerOnly.isValid(.size), "synthetic SDK fields valid while caller-only size is missing")
+        do {
+            try StallionVolume.requireResultValidityForTesting(callerOnly, sdk: .fileID, caller: .size)
+            need(false, "production two-mask guard accepted missing caller-only size")
+        } catch { need(code(error) == Int(ENOTSUP), "caller-only completeness refusal") }
+        callerOnly.size = complete.size
+        need(callerOnly.isValid(.size), "caller-only size supplied from real metadata")
+        try! StallionVolume.requireResultValidityForTesting(callerOnly, sdk: .fileID, caller: .size)
+        need(FSGetAttributesResult.requestedAttributes.wantedAttributes == required, "synthetic requirement leaves SDK request unchanged")
+        try! StallionVolume.requireValidForTesting(complete, required: required)
+    }
+    let link: (FSReadSymlinkResult?, Error?) = wait { done in v.readlinkResultForTesting(m.link, caller: caller) { done(($0,$1)) } }
+    let xattr: (FSGetXattrResult?, Error?) = wait { done in v.xattrResultForTesting(m.file, caller: caller) { done(($0,$1)) } }
+    let names: (FSListXattrsResult?, Error?) = wait { done in v.xattrsResultForTesting(m.file, caller: caller) { done(($0,$1)) } }
+    need(link.0 != nil && link.1 == nil && xattr.0 != nil && xattr.1 == nil && names.0 != nil && names.1 == nil, "actual readlink/xattr constructors")
+    func enumeration(_ request: FSItem.GetAttributesRequest?, start: UInt64 = 0, verifier: UInt64 = 0,
+                     capacity: Int = 32) -> ([Data], [UInt64], UInt64, Error?) {
+        var names: [Data] = [], cookies: [UInt64] = []
+        let wanted = request?.wantedAttributes
+        let listed: (FSEnumerateDirectoryResult?, Error?) = wait { done in
+            v.enumerationResultForTesting(m.root, startingAt: FSDirectoryCookie(start), verifier: FSDirectoryVerifier(verifier),
+                attributes: request, caller: caller, pack: { name, _, itemID, next, attributes in
+                    guard names.count < capacity else { return false }
+                    if let wanted {
+                        need(attributes != nil, "explicit enumeration supplies attributes, even for an empty mask")
+                        var metadata = sfs_metadata_entry(), result = sfs_result()
+                        need(itemID.rawValue > 1, "entry identifier has a real core inode")
+                        need(sfs_image_stat_metadata(m.coreHandle, 0, itemID.rawValue - 1, &metadata, &result) == SFS_OK, "entry metadata source")
+                        checkPreparedAttributes(attributes!, metadata, required: wanted, exact: true)
+                        retained.append((attributes!, metadata, wanted))
+                    } else { need(attributes == nil, "nil enumeration preserves attribute-free entries") }
+                    names.append(name.data); cookies.append(next.rawValue); return true
+                }) { done(($0,$1)) }
+        }
+        need((listed.0 != nil) == (listed.1 == nil), "actual enumeration result or error")
+        let record: StallionVolume.Record = wait { done in v.enqueue { done(v.capturedRecords().last!) } }
+        need(record.operation == 14 && record.cookie == start && record.verifier == verifier &&
+             record.acceptedCookie == (cookies.last ?? 0), "contextual enumeration cookies")
+        need(request?.wantedAttributes == wanted, "enumeration leaves caller mask unchanged")
+        return (names, cookies, record.returnedVerifier, listed.1)
+    }
+    let nilEntries = enumeration(nil)
+    need(nilEntries.3 == nil && Array(nilEntries.0.prefix(2)) == [Data(".".utf8), Data("..".utf8)] &&
+         Array(nilEntries.1.prefix(2)) == [1, 2] && nilEntries.0.count == 5, "nil enumeration includes dot entries")
+    let page = enumeration(nil, capacity: 1)
+    let rest = enumeration(nil, start: page.1.last!, verifier: page.2)
+    need(page.3 == nil && rest.3 == nil && page.0 + rest.0 == nilEntries.0 && page.1 + rest.1 == nilEntries.1, "contextual pagination resumes without skipped entries")
+    let empty = FSItem.GetAttributesRequest(); empty.wantedAttributes = []
+    let emptyEntries = enumeration(empty)
+    let explicit = FSItem.GetAttributesRequest(); explicit.wantedAttributes = FSItem.Attribute(rawValue: 0x3fff)
+    let explicitEntries = enumeration(explicit)
+    need(emptyEntries.3 == nil && explicitEntries.3 == nil && emptyEntries.0 == Array(nilEntries.0.dropFirst(2)) &&
+         explicitEntries.0 == emptyEntries.0 && explicitEntries.1 == emptyEntries.1 && emptyEntries.1.allSatisfy { $0 > 16 }, "explicit empty and full masks omit dot entries")
+    let wrongVerifier = enumeration(explicit, start: nilEntries.1.last!, verifier: nilEntries.2)
+    need(wrongVerifier.3 != nil && wrongVerifier.0.isEmpty, "attribute mode cannot reuse nil-enumeration verifier")
+    for unsupported in [unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
+        let invalid = FSItem.GetAttributesRequest(); invalid.wantedAttributes = unsupported
+        let refused = enumeration(invalid)
+        need(code(refused.3) == Int(ENOTSUP) && refused.0.isEmpty, "unsupported explicit entry mask refused before packing")
+    }
+    m.serial {
+        _ = try! v.readResultConstructorForTesting(m.file)
+        for (name, item) in [("FSLookupItemResult", m.file), ("FSGetAttributesResult", m.file), ("FSReadSymlinkResult", m.link), ("FSReadFileResult", m.file)] {
+            var stat = sfs_pin_stat(), r = sfs_result()
+            need(sfs_image_pin_stat(m.coreHandle, (item as! StallionItem).pin!, &stat, &r) == SFS_OK, "constructor metadata source")
+            let type = resultTypes.first { String(describing: $0) == name }!
+            let explicit: FSItem.Attribute = name == "FSGetAttributesResult" ? request.wantedAttributes : []
+            let required = type.requestedAttributes.wantedAttributes.union(explicit)
+            checkPreparedAttributes(captured[name]!, stat.metadata, required: required)
+            retained.append((captured[name]!, stat.metadata, required))
+        }
+    }
+    need(m.write(Data("changed!".utf8)).1 == nil && commitStarted, "actual write result survives commit")
+    m.serial {
+        var stat = sfs_pin_stat(), r = sfs_result()
+        need(sfs_image_pin_stat(m.coreHandle, (m.file as! StallionItem).pin!, &stat, &r) == SFS_OK, "committed write metadata")
+        checkPreparedAttributes(captured["FSWriteFileResult"]!, stat.metadata, required: FSWriteFileResult.requestedAttributes.wantedAttributes)
+        retained.append((captured["FSWriteFileResult"]!, stat.metadata, FSWriteFileResult.requestedAttributes.wantedAttributes))
+        commitStarted = false
+    }
+    let resized = m.size(19)
+    need(resized.1 == nil && resized.0?.size == 19 && commitStarted, "actual size result survives commit")
+    m.serial {
+        var stat = sfs_pin_stat(), r = sfs_result()
+        need(sfs_image_pin_stat(m.coreHandle, (m.file as! StallionItem).pin!, &stat, &r) == SFS_OK, "committed size metadata")
+        checkPreparedAttributes(captured["FSSetAttributesResult"]!, stat.metadata, required: FSSetAttributesResult.requestedAttributes.wantedAttributes)
+        for (attributes, metadata, required) in retained {
+            checkPreparedAttributes(attributes, metadata, required: required)
+        }
+        v.preparedAttributesForTesting = nil; v.diagnosticBeforeCommit = nil; v.rejectResultForTesting = nil
+    }
+    let foreign = CallerIdentity(uid: caller.uid + 1, gid: caller.gid)
+    let deniedLookup: (FSLookupItemResult?, Error?) = wait { done in v.lookupResultForTesting("file", directory: m.root, caller: foreign) { done(($0,$1)) } }
+    let deniedRead: (FSGetAttributesResult?, Error?) = wait { done in v.attributesResultForTesting(request, item: m.file, caller: foreign) { done(($0,$1)) } }
+    let deniedList: (FSEnumerateDirectoryResult?, Error?) = wait { done in v.enumerationResultForTesting(m.root, caller: foreign, pack: { _,_,_,_,_ in need(false, "denied listing must not pack"); return true }) { done(($0,$1)) } }
+    need(code(deniedLookup.1) == Int(EACCES) && code(deniedRead.1) == Int(EACCES) && code(deniedList.1) == Int(EACCES), "shared contextual bodies deny foreign values")
+    m.close()
+}
+func queuedResizeAfterIncompleteSnapshot(_ parent: URL) throws {
+    let f = try Fixture(parent, "queued-incomplete"), m = try Mounted(f), v = m.volume, before = m.volume.anchor
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), replies = DispatchGroup()
+    let request = FSItem.SetAttributesRequest(); request.size = 29
+    var firstPrepared = false, laterPrepared = false, constructed = false, cleared = false
+    v.enqueue {
+        v.preparedAttributesForTesting = { name, attributes in
+            if name == "FSWriteFileResult" { firstPrepared = true; attributes.invalidateAllProperties() }
+        }
+        v.rejectResultForTesting = { _ in constructed = true; return false }
+        held.signal(); need(release.wait(timeout: .now() + 20) == .success, "release incomplete-snapshot queue")
+    }
+    need(held.wait(timeout: .now() + 20) == .success, "hold queue before completeness failure")
+    replies.enter()
+    v.writeCountForTesting(contents: Data("rejected".utf8), to: m.file, at: 0) { count, error in
+        need(count == 0 && code(error) == Int(ENOTSUP) && firstPrepared, "first queued write fails completeness")
+        v.preparedAttributesForTesting = { _, _ in laterPrepared = true }
+        cleared = true; replies.leave()
+    }
+    replies.enter()
+    v.setAttributesValueForTesting(request, on: m.file, caller: CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { attributes, error in
+        need(cleared && attributes == nil && code(error) == Int(ENOTSUP), "already-queued resize retains first completeness error")
+        replies.leave()
+    }
+    release.signal(); need(replies.wait(timeout: .now() + 20) == .success, "queued completeness callbacks finish")
+    need(!laterPrepared && !constructed && request.consumedAttributes.isEmpty && anchorMatches(v.anchor, before) &&
+         v.diagnosticSnapshot().0.commits == 0 && code(m.sync()) == Int(ENOTSUP), "cleared injection still blocks later preparation/commit")
+    m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("original".utf8), "queued completeness failure preserves bytes") }
+    m.close(); need(f.contents() == Data("original".utf8), "queued completeness failure preserves reopened bytes")
+}
+func rejectedHandlerResults(_ parent: URL) throws {
+    let payloadFixture = try Fixture(parent, "reject-no-attributes"), payload = try Mounted(payloadFixture)
+    let payloadCaller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    let payloadAnchor = payload.volume.anchor
+    let payloadCount: Int = wait { done in payload.volume.enqueue { done(payload.volume.activeItemCount()) } }
+    for operation in ["FSActivateResult", "FSGetXattrResult", "FSListXattrsResult", "FSEnumerateDirectoryResult"] {
+        var reached = false
+        payload.serial { payload.volume.rejectResultForTesting = { type in reached = reached || type == operation; return type == operation } }
+        let rejected: (Bool, Error?) = wait { done in
+            switch operation {
+            case "FSActivateResult": payload.volume.activateResultForTesting { done(($0 == nil, $1)) }
+            case "FSGetXattrResult": payload.volume.xattrResultForTesting(payload.file, caller: payloadCaller) { done(($0 == nil, $1)) }
+            case "FSListXattrsResult": payload.volume.xattrsResultForTesting(payload.file, caller: payloadCaller) { done(($0 == nil, $1)) }
+            default: payload.volume.enumerationResultForTesting(payload.root, caller: payloadCaller, pack: { _,_,_,_,_ in true }) { done(($0 == nil, $1)) }
+            }
+        }
+        need(reached && rejected.0 && code(rejected.1) == Int(EIO), "attribute-free actual result rejection")
+        payload.serial {
+            need(payload.volume.activeItemCount() == payloadCount && payload.volume.ownsForTesting(payload.root) &&
+                 anchorMatches(payload.volume.anchor, payloadAnchor) && payload.volume.diagnosticSnapshot().0.commits == 0,
+                 "attribute-free result failure preserves ownership and anchor")
+        }
+    }
+    payload.serial { payload.volume.rejectResultForTesting = nil }; payload.close()
+    need(payloadFixture.contents() == Data("original".utf8), "attribute-free result failure preserves reopened bytes")
+    let lookupFixture = try Fixture(parent, "reject-lookup", extra: true), lookup = try Mounted(lookupFixture, itemLimit: 4)
+    let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    let retainedCount: Int = wait { done in lookup.volume.enqueue { done(lookup.volume.activeItemCount()) } }
+    lookup.serial { lookup.volume.preparedAttributesForTesting = { _, attributes in attributes.invalidateAllProperties() } }
+    for name in ["extra", "alias"] {
+        let rejected: (FSLookupItemResult?, Error?) = wait { done in lookup.volume.lookupResultForTesting(name, directory: lookup.root, caller: caller) { done(($0,$1)) } }
+        need(rejected.0 == nil && code(rejected.1) == Int(ENOTSUP), "lookup completeness refusal")
+        lookup.serial { need(lookup.volume.activeItemCount() == retainedCount && lookup.volume.ownsForTesting(lookup.file), "completeness failure preserves canonical ownership") }
+    }
+    let rootRequest = FSItem.GetAttributesRequest(); rootRequest.wantedAttributes = [.size]
+    let rejectedRoot: (FSGetAttributesResult?, Error?) = wait { done in lookup.volume.attributesResultForTesting(rootRequest, item: lookup.root, caller: caller) { done(($0,$1)) } }
+    need(rejectedRoot.0 == nil && code(rejectedRoot.1) == Int(ENOTSUP), "root completeness refusal")
+    lookup.serial {
+        need(lookup.volume.activeItemCount() == retainedCount && lookup.volume.ownsForTesting(lookup.root), "root ownership survives incomplete snapshot")
+        lookup.volume.preparedAttributesForTesting = nil
+    }
+    lookup.serial { lookup.volume.rejectResultForTesting = { $0 == "FSLookupItemResult" } }
+    for name in ["extra", "alias"] {
+        let rejected: (FSLookupItemResult?, Error?) = wait { done in lookup.volume.lookupResultForTesting(name, directory: lookup.root, caller: caller) { done(($0,$1)) } }
+        need(rejected.0 == nil && code(rejected.1) == Int(EIO), "lookup constructor rejection")
+        lookup.serial { need(lookup.volume.activeItemCount() == retainedCount && lookup.volume.ownsForTesting(lookup.file), "failed lookup releases only newly acquired ownership") }
+    }
+    lookup.serial { lookup.volume.rejectResultForTesting = nil }
+    let retried: (FSLookupItemResult?, Error?) = wait { done in lookup.volume.lookupResultForTesting("extra", directory: lookup.root, caller: caller) { done(($0,$1)) } }
+    need(retried.0 != nil && retried.1 == nil, "failed lookup returned its finite pin slot")
+    let extra: (FSItem?, Error?) = wait { done in lookup.volume.lookupItem(named: FSFileName(string: "extra"), inDirectory: lookup.root) { done(($0,$2)) } }
+    let released: Error? = wait { lookup.volume.reclaimForTesting(extra.0!, eligible: true, replyHandler: $0) }
+    need(released == nil, "release recovered lookup ownership"); lookup.close()
+    for operation in ["write", "write-empty", "resize", "resize-same", "resize-root"] {
+        let f = try Fixture(parent, "incomplete-\(operation)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        let resultType = operation.hasPrefix("write") ? "FSWriteFileResult" : "FSSetAttributesResult"
+        var prepared = false, constructed = false, committed = false
+        m.serial {
+            v.preparedAttributesForTesting = { name, attributes in
+                if name == resultType { prepared = true; attributes.invalidateAllProperties() }
+            }
+            v.rejectResultForTesting = { name in if name == resultType { constructed = true }; return false }
+            v.diagnosticBeforeCommit = { committed = true }
+        }
+        let request = FSItem.SetAttributesRequest(); request.size = operation == "resize-same" ? 8 : 29
+        let error: Error?
+        if operation.hasPrefix("write") { error = m.write(operation == "write-empty" ? Data() : Data("rejected".utf8)).1 }
+        else { error = m.set(request, item: operation == "resize-root" ? m.root : m.file).1 }
+        need(prepared && !constructed && !committed && code(error) == Int(ENOTSUP) && anchorMatches(v.anchor, before), "completeness precedes result and commit")
+        need(request.consumedAttributes.isEmpty && v.diagnosticSnapshot().0.commits == 0 && code(m.sync()) == Int(ENOTSUP), "incomplete snapshot has no consumption or commit and keeps primary error")
+        m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("original".utf8), "completeness failure preserves acknowledged bytes") }
+        m.close(); need(f.contents() == Data("original".utf8), "completeness failure preserves reopened bytes")
+    }
+    for operation in ["FSWriteFileResult", "FSSetAttributesResult"] {
+        let f = try Fixture(parent, "reject-\(operation)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        var reached = false
+        m.serial { v.rejectResultForTesting = { type in reached = reached || type == operation; return type == operation } }
+        let request = FSItem.SetAttributesRequest(); request.size = 29
+        let error = operation == "FSWriteFileResult" ? m.write(Data("rejected".utf8)).1 : m.set(request).1
+        need(reached && code(error) == Int(EIO) && anchorMatches(v.anchor, before), "actual result preparation rejection aborts")
+        need(request.consumedAttributes.isEmpty && v.diagnosticSnapshot().0.commits == 0 && code(m.sync()) == Int(EIO), "no consumption or commit; primary preparation error retained")
+        m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("original".utf8), "result failure preserves committed bytes") }
+        m.close(); need(f.contents() == Data("original".utf8), "result failure preserves reopened bytes")
+    }
+    for operation in ["FSWriteFileResult", "FSSetAttributesResult"] {
+        let f = try Fixture(parent, "revoke-\(operation)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        m.serial { v.rejectResultForTesting = { type in if type == operation { m.resource.revoke() }; return false } }
+        let request = FSItem.SetAttributesRequest(); request.size = 31
+        let error = operation == "FSWriteFileResult" ? m.write(Data("revoked!".utf8)).1 : m.set(request).1
+        need(code(error) == Int(EACCES) && anchorMatches(v.anchor, before) && request.consumedAttributes.isEmpty && v.diagnosticSnapshot().0.commits == 0, "revocation after actual result construction refuses commit")
+        m.close(); need(f.contents() == Data("original".utf8), "revoked resource cleans up and preserves bytes")
+    }
+    let f = try Fixture(parent, "foreign-size"), m = try Mounted(f), before = m.volume.anchor
+    let request = FSItem.SetAttributesRequest(); request.size = 25
+    let denied: (FSItem.Attributes?, Error?) = wait { done in m.volume.setAttributesValueForTesting(request, on: m.file, caller: CallerIdentity(uid: Int(geteuid()) + 1, gid: Int(getegid()))) { done(($0,$1)) } }
+    need(code(denied.1) == Int(EACCES) && request.consumedAttributes.isEmpty && anchorMatches(m.volume.anchor, before), "actual size body denies foreign pure identity")
+    m.close(); need(f.contents() == Data("original".utf8), "foreign size leaves bytes unchanged")
+}
+#endif
+
+func queuedResizeAfterDeliveryFailure(_ parent: URL) throws {
+    // Both requests enter the queue before any delivery failure exists. Cover
+    // changed and unchanged size, since neither may consume size after failure.
+    for size in [UInt64(29), UInt64(8)] {
+        let f = try Fixture(parent, "queued-resize-\(size)"), m = try Mounted(f), v = m.volume
+        need(m.write(Data("accepted".utf8)).1 == nil, "queued-failure acknowledged baseline")
+        let before = v.anchor, counters = v.diagnosticSnapshot().0
+        let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let replies = DispatchGroup(), request = FSItem.SetAttributesRequest()
+        request.size = size
+        var cleared = false
+        v.enqueue {
+            v.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }
+            held.signal(); need(release.wait(timeout: .now() + 20) == .success, "release queued-failure owner")
+        }
+        need(held.wait(timeout: .now() + 20) == .success, "hold queue before admitting write and resize")
+        replies.enter()
+        v.writeCountForTesting(contents: Data("rejected".utf8), to: m.file, at: 0) { count, error in
+            need(count == 0 && code(error) == Int(ENOMEM), "first queued write fails during preparation")
+            v.diagnosticBeforePrepare = nil; cleared = true
+            replies.leave()
+        }
+        replies.enter()
+        v.setAttributesValueForTesting(request, on: m.file, caller: CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { attributes, error in
+            need(cleared && attributes == nil && code(error) == Int(ENOMEM), "queued resize preserves first failure after injection is removed")
+            need(request.consumedAttributes.isEmpty, "queued failed resize never consumes size")
+            replies.leave()
+        }
+        let admitted = v.diagnosticSnapshot().0
+        need(admitted.callbacks == counters.callbacks + 2 && admitted.refused == counters.refused,
+             "both callbacks admitted before first delivery failure")
+        release.signal()
+        need(replies.wait(timeout: .now() + 20) == .success, "queued failures complete")
+        need(anchorMatches(v.anchor, before) && v.diagnosticSnapshot().0.commits == counters.commits,
+             "queued failed resize adds no commit or anchor change")
+        need(code(m.sync()) == Int(ENOMEM) && v.diagnosticSnapshot().2?.code == Int(ENOMEM), "primary queued error remains sticky")
+        m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("accepted".utf8), "queued failure preserves acknowledged bytes") }
+        m.close(); need(f.contents() == Data("accepted".utf8), "reopened queued failure preserves acknowledged bytes")
+    }
+}
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+#if STALLION_CONTEXT_HANDLERS
+        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent)
+#endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
+        try queuedResizeAfterDeliveryFailure(parent)
         try retainedTraceSnapshot(parent); try preparedReplyFailure(parent); try detachedTokenRoutes(parent)
         try pinOwnershipLimits(parent); try reclaimErrorAndRoot(parent)
         for (index, spec) in [(UInt32(0o400), false, geteuid()), (UInt32(0o6600), false, geteuid()), (UInt32(0o600), true, geteuid()), (UInt32(0o600), false, geteuid() + 1)].enumerated() {

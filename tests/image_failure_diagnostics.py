@@ -18,7 +18,7 @@ import time
 
 ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64 * 1024
 BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
-EJECT_SECONDS, EJECT_CAPTURE_BYTES, EJECT_RETAINED_BYTES = 3, 16 * 1024, 2048
+EJECT_CAPTURE_BYTES, EJECT_RETAINED_BYTES = 16 * 1024, 2048
 DA_SUBSYSTEM = 'com.apple.DiskArbitration.diskarbitrationd'
 REPORT = "image-failures.jsonl"
 _metadata = {'operation_id', 'phase', 'timestamp_ns'}
@@ -412,8 +412,10 @@ class Diagnostics:
 
     def eject_log(self, observation):
         """Query once after the public detach operation has failed, never between attempts."""
-        deadline = time.monotonic() + EJECT_SECONDS
-        if not self.lock.acquire(timeout=EJECT_SECONDS):
+        deadline = observation.get('deadline')
+        if deadline is None:
+            return
+        if not self.lock.acquire(timeout=max(0, deadline - time.monotonic())):
             return
         raw_target = observation.get('target')
         event = dict(target=raw_target if isinstance(raw_target, str) and re.fullmatch(r'/dev/disk[0-9]+', raw_target) else None,
@@ -492,7 +494,7 @@ class Diagnostics:
             if saved_remaining is not None:
                 self.remaining = 0 if self.capture_disabled else saved_remaining - (allowance - self.remaining)
             try:
-                if event['reason'] is not None:
+                if event['reason'] is not None and time.monotonic() < deadline:
                     self._emit(deadline, 'eject_log', **event)
             finally:
                 self.operation_id, self.phase = 0, 'standalone'
@@ -501,11 +503,12 @@ class Diagnostics:
     def before(self, args, scope, observation=None):
         return self._observe(args, None, scope, phase='before', observation=observation)
 
-    def report(self, args, error, scope, operation_id=None):
+    def report(self, args, error, scope, operation_id=None, observation=None):
         # Intentional refusal tests must not consume unexpected-failure capacity.
         if scope and scope['expected']:
             return
-        return self._observe(args, error, scope, phase='after', operation_id=operation_id)
+        return self._observe(args, error, scope, phase='after', operation_id=operation_id,
+                             observation=observation)
 
     def _observe(self, args, error, scope, *, phase, operation_id=None, observation=None):
         before = phase == 'before'
@@ -530,6 +533,7 @@ class Diagnostics:
                 operation_id = self.operations
             if observation is not None:
                 observation['operation_id'] = operation_id
+                observation['deadline'] = deadline
             self.operation_id, self.phase = operation_id, phase
             if before:
                 saved_remaining = self.remaining
@@ -660,7 +664,8 @@ def install(images, directory):
                 observation['end_ns'], observation['end_mono'] = time.time_ns(), time.monotonic()
             try:
                 diagnostics.report(args, error, _scope.get(),
-                                   operation_id=observation['operation_id'] if observation else None)
+                                   operation_id=observation['operation_id'] if observation else None,
+                                   observation=observation)
             except Exception as unavailable:
                 try:
                     error.add_note('Image diagnostics unavailable: ' + type(unavailable).__name__)

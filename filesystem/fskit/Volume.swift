@@ -86,6 +86,25 @@ func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSV
     if m.entry.kind == SFS_DIRECTORY && m.mode & 0o100 != 0 { allowed.insert(.search) }
     guard access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
 }
+struct CallerIdentity {
+    let uid: Int, gid: Int
+    init(uid: Int, gid: Int) { self.uid = uid; self.gid = gid }
+    init(_ context: FSContext) { uid = context.effectiveUserID; gid = context.effectiveGroupID }
+}
+// Owner-only profile: a group or root identity never grants an exception.
+func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity,
+                      access: FSVolume.AccessMask, writable: Bool, hasACL: Bool) throws {
+    guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil else { throw POSIXError(.EACCES) }
+    var readAccess = access
+    let writes: FSVolume.AccessMask = [.writeData, .appendData]
+    if writable && !access.intersection(writes).isEmpty {
+        guard caller.uid == Int(owner), m.uid == owner, m.entry.kind == SFS_FILE,
+              m.mode & 0o200 != 0, m.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
+        readAccess.subtract(writes)
+    }
+    try checkOwnerMode(m, owner: owner, uid: caller.uid, access: readAccess)
+    guard !hasACL else { throw POSIXError(.ENOTSUP) }
+}
 func component(_ data: Data, xattr: Bool = false) throws {
     guard data.count <= 255 else { throw POSIXError(.ENAMETOOLONG) }
     guard !data.isEmpty && !data.contains(0) && (xattr || !data.contains(47)) else { throw POSIXError(.EINVAL) }
@@ -119,8 +138,13 @@ final class StallionItem: FSItem {
     init(_ inode: UInt64) { self.inode = inode; super.init() }
 }
 
-final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperations,
-    FSVolume.XattrOperations, FSVolume.OpenCloseHandler, FSVolume.AccessCheckHandler, @unchecked Sendable {
+// The two interfaces share Objective-C selectors and must never coexist.
+#if STALLION_CONTEXT_HANDLERS
+extension StallionVolume: FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.XattrHandler {}
+#else
+extension StallionVolume: FSVolume.Operations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations {}
+#endif
+final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.AccessCheckHandler, @unchecked Sendable {
     enum State: Int { case inactive, active, mounted, terminal }
     struct ParentEvidence { var core: UInt64?; var mapped: UInt64? }
     enum EnumerationStop: UInt64 { case eof = 1, refused = 2, error = 3 }
@@ -485,6 +509,39 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         let mask = request.wantedAttributes.rawValue; try validateWanted(mask)
         return try attributes(try metadata(inode), request, parents: &parents)
     }
+#if STALLION_CONTEXT_HANDLERS
+    private func attributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence) throws -> FSItem.Attributes {
+        try validateWanted(request.wantedAttributes.rawValue)
+        return try populateAttributes(m, request, parents: &parents)
+    }
+    private func populateAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence, includeResultPolicy: Bool = false) throws -> FSItem.Attributes {
+        let inode = m.entry.inode, a = FSItem.Attributes(); a.invalidateAllProperties()
+        parents.core = m.link_count == 0 ? nil : m.entry.parent
+        let links = try checkedLinks(m.link_count)
+        if request.isAttributeWanted(.type) { a.type = try type(m.entry.kind) }
+        if request.isAttributeWanted(.mode) { a.mode = m.mode }
+        if request.isAttributeWanted(.linkCount) { a.linkCount = links }
+        if request.isAttributeWanted(.uid) { a.uid = m.uid }
+        if request.isAttributeWanted(.gid) { a.gid = m.gid }
+        if request.isAttributeWanted(.flags) { a.flags = m.flags }
+        if request.isAttributeWanted(.size) { a.size = m.entry.size }
+        // Referenced data cells only: excludes metadata and xattrs, and can be shared.
+        if request.isAttributeWanted(.allocSize) { a.allocSize = m.referenced_data_bytes }
+        if request.isAttributeWanted(.fileID) { a.fileID = try itemIdentifier(inode) }
+        if request.isAttributeWanted(.parentID) {
+            guard m.link_count > 0 else { throw POSIXError(.ENOTSUP) }
+            a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent)
+        }
+        if request.isAttributeWanted(.accessTime) { a.accessTime = try checkedTime(m.access) }
+        if request.isAttributeWanted(.modifyTime) { a.modifyTime = try checkedTime(m.modification) }
+        if request.isAttributeWanted(.changeTime) { a.changeTime = try checkedTime(m.change) }
+        if request.isAttributeWanted(.birthTime) { a.birthTime = try checkedTime(m.birth) }
+        if includeResultPolicy || request.isAttributeWanted(.supportsLimitedXAttrs) { a.supportsLimitedXAttrs = false }
+        if includeResultPolicy || request.isAttributeWanted(.inhibitKernelOffloadedIO) { a.inhibitKernelOffloadedIO = true }
+        if request.isAttributeWanted(.parentID) { parents.mapped = a.parentID.rawValue }
+        return a
+    }
+#else
     private func attributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence) throws -> FSItem.Attributes {
         try validateWanted(request.wantedAttributes.rawValue)
         let inode = m.entry.inode, a = FSItem.Attributes(); a.invalidateAllProperties()
@@ -513,6 +570,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         if request.isAttributeWanted(.parentID) { parents.mapped = a.parentID.rawValue }
         return a
     }
+#endif
     var maximumLinkCount: Int { Int(UInt32.max) }
     var maximumNameLength: Int { 255 }
     var restrictsOwnershipChanges: Bool { true }
@@ -537,16 +595,38 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     var volumeStatistics: FSStatFSResult {
         let s = FSStatFSResult(fileSystemTypeName: "sfsro27"); s.blockSize = 4096; s.ioSize = 4096; return s
     }
+#if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
     func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activate(replyHandler: replyHandler) }
-    func activate(replyHandler: @escaping (FSItem?, Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler(nil, $0) }) {
-        let previous = self.state
-        do {
-            if let failure = self.failure { throw failure }
-            guard self.state != .terminal && self.handle != nil else { throw POSIXError(.ENXIO) }
-            if self.state == .inactive { self.state = .active }
-            _ = try self.metadata(1); let root = try self.canonical(1); self.record(1); replyHandler(root, nil)
-        } catch { if previous == .inactive { self.state = .inactive }; self.record(1, error: error); replyHandler(nil, error) }
-    } }
+    func activate(replyHandler: @escaping (FSItem?, Error?) -> Void) { activateBody(prepare: { $0 }, reply: replyHandler) }
+#endif
+    private func activateBody<T>(prepare: @escaping (StallionItem) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+        enqueue(maintenance: true, rejected: { reply(nil, $0) }) {
+            let previous = self.state
+            do {
+                if let failure = self.failure { throw failure }
+                guard self.state != .terminal && self.handle != nil else { throw POSIXError(.ENXIO) }
+                if self.state == .inactive { self.state = .active }
+                _ = try self.metadata(1)
+                let result = try self.canonicalResult(1, prepare: prepare)
+                self.record(1); reply(result, nil)
+            } catch { if previous == .inactive { self.state = .inactive }; self.record(1, error: error); reply(nil, error) }
+        }
+    }
+    private func canonicalResult<T>(_ inode: UInt64, prepare: (StallionItem) throws -> T) throws -> T {
+        let existed = items[inode] != nil, item = try canonical(inode)
+        do { return try prepare(item) }
+        catch {
+            if !existed {
+#if STALLION_WRITE_DIAGNOSTIC
+                if diagnosticWritable { _ = releaseItem(item) }
+                else { items.removeValue(forKey: inode) }
+#else
+                items.removeValue(forKey: inode)
+#endif
+            }
+            throw error
+        }
+    }
     func mount(options: FSTaskOptions, replyHandler: @escaping (Error?) -> Void) { mount(arguments: options.taskOptions, replyHandler: replyHandler) }
     func mount(arguments: [String], replyHandler: @escaping (Error?) -> Void) {
         guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(POSIXError(.E2BIG)); return }
@@ -669,21 +749,61 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         if scope { scope = false; resource.url.stopAccessingSecurityScopedResource() }
         items.removeAll(); record(6, error: failure); emit(); return (true, failure)
     }
-    func getAttributes(_ request: FSItem.GetAttributesRequest, of item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
-        var parents = ParentEvidence(), inode: UInt64 = 0
-        let mask = UInt64(bitPattern: Int64(request.wantedAttributes.rawValue))
-        do {
-            inode = try self.id(item); let a = try self.attributes(inode, request, parents: &parents)
-            self.record(10, inode, mask: mask, allocation: request.isAttributeWanted(.allocSize) ? a.allocSize : 0, parents: parents)
-            replyHandler(a, nil)
-        } catch { parents.mapped = nil; self.record(10, inode, mask: mask, error: error, parents: parents); replyHandler(nil, error) }
-    } }
+#if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
+    func getAttributes(_ request: FSItem.GetAttributesRequest, of item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) {
+        getAttributesBody({ request }, item: item, caller: nil, prepare: { $0 }, reply: replyHandler)
+    }
     func lookupItem(named name: FSFileName, inDirectory directory: FSItem, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
-        do { try component(name.data) } catch { replyHandler(nil, nil, error); return }
-        enqueue(retainedBytes: name.data.count, rejected: { replyHandler(nil, nil, $0) }) {
+        lookupBody(name, directory: directory, caller: nil, prepare: { item, name, _ in (item as FSItem, name) }) { result, error in
+            replyHandler(result?.0, result?.1, error)
+        }
+    }
+#endif
+#if STALLION_CONTEXT_HANDLERS
+    private func getAttributesBody<T>(_ makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+                                     requirements: ResultRequirements? = nil,
+                                     prepare: @escaping (FSItem.Attributes) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+        enqueue(rejected: { reply(nil, $0) }) {
+            var parents = ParentEvidence(), inode: UInt64 = 0
+            var mask: UInt64 = 0
+            do {
+                let request = try makeRequest(); mask = UInt64(bitPattern: Int64(request.wantedAttributes.rawValue))
+                inode = try self.id(item); let m = try self.metadata(inode)
+                if let caller { try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller) }
+                let a: FSItem.Attributes
+                if let requirements { a = try self.preparedResultAttributes(m, request, requirements, parents: &parents) }
+                else { a = try self.attributes(m, request, parents: &parents) }
+                let result = try prepare(a)
+                self.record(10, inode, mask: mask, allocation: request.isAttributeWanted(.allocSize) ? a.allocSize : 0, parents: parents)
+                reply(result, nil)
+            } catch { parents.mapped = nil; self.record(10, inode, mask: mask, error: error, parents: parents); reply(nil, error) }
+        }
+    }
+#else
+    private func getAttributesBody<T>(_ makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+                                     prepare: @escaping (FSItem.Attributes) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+        enqueue(rejected: { reply(nil, $0) }) {
+            var parents = ParentEvidence(), inode: UInt64 = 0
+            var mask: UInt64 = 0
+            do {
+                let request = try makeRequest(); mask = UInt64(bitPattern: Int64(request.wantedAttributes.rawValue))
+                inode = try self.id(item); let m = try self.metadata(inode)
+                if let caller { try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller) }
+                let a = try self.attributes(m, request, parents: &parents), result = try prepare(a)
+                self.record(10, inode, mask: mask, allocation: request.isAttributeWanted(.allocSize) ? a.allocSize : 0, parents: parents)
+                reply(result, nil)
+            } catch { parents.mapped = nil; self.record(10, inode, mask: mask, error: error, parents: parents); reply(nil, error) }
+        }
+    }
+#endif
+    private func lookupBody<T>(_ name: FSFileName, directory: FSItem, caller: CallerIdentity?,
+                               prepare: @escaping (StallionItem, FSFileName, sfs_metadata_entry) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+        do { try component(name.data) } catch { reply(nil, error); return }
+        enqueue(retainedBytes: name.data.count, rejected: { reply(nil, $0) }) {
         do {
             let parent = try self.id(directory), m = try self.metadata(parent)
             guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
+            if let caller { try self.ownerAccess(m, inode: parent, access: .search, caller: caller) }
             try component(name.data); let inode: UInt64; let returned: FSFileName
             if name.data == Data(".".utf8) { inode = parent; returned = name }
             else if name.data == Data("..".utf8) { inode = parent == 1 ? 1 : m.entry.parent; returned = name }
@@ -695,8 +815,10 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 try self.checkedAlias(e, parent: parent)
                 returned = FSFileName(data: Data(rawBytes(e.name).prefix(e.name_length)))
             }
-            _ = try self.metadata(inode); let item = try self.canonical(inode); self.record(11, inode); replyHandler(item, returned, nil)
-        } catch { self.record(11, error: error); replyHandler(nil, nil, error) }
+            let target = try (inode == parent ? m : self.metadata(inode))
+            let result = try self.canonicalResult(inode) { try prepare($0, returned, target) }
+            self.record(11, inode); reply(result, nil)
+        } catch { self.record(11, error: error); reply(nil, error) }
     } }
     func reclaimItem(_ item: FSItem, replyHandler: @escaping (Error?) -> Void) {
         reclaim(item, attempt: { item.tryReclaim($0) }, replyHandler: replyHandler)
@@ -734,10 +856,18 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         reclaim(item, attempt: { cleanup in if eligible { cleanup() }; return eligible }, replyHandler: replyHandler)
     }
 #endif
-    func readSymbolicLink(_ item: FSItem, replyHandler: @escaping (FSFileName?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
+#if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
+    func readSymbolicLink(_ item: FSItem, replyHandler: @escaping (FSFileName?, Error?) -> Void) {
+        readlinkBody(item, caller: nil, prepare: { name, _ in name }, reply: replyHandler)
+    }
+#endif
+    private func readlinkBody<T>(_ item: FSItem, caller: CallerIdentity?,
+                                 prepare: @escaping (FSFileName, sfs_metadata_entry) throws -> T, reply: @escaping (T?, Error?) -> Void) { enqueue(rejected: { reply(nil, $0) }) {
         do {
             let inode = try self.id(item); _ = try self.ready(mounted: true)
-            let m = try self.metadata(inode); guard m.entry.kind == SFS_SYMLINK else { throw POSIXError(.EINVAL) }
+            let m = try self.metadata(inode)
+            if let caller { try self.ownerAccess(m, inode: inode, access: .readData, caller: caller) }
+            guard m.entry.kind == SFS_SYMLINK else { throw POSIXError(.EINVAL) }
             var bytes = [UInt8](repeating: 0, count: 4096), count = 0, r = sfs_result(); let h = try self.ready()
             let status: sfs_status
 #if STALLION_WRITE_DIAGNOSTIC
@@ -748,8 +878,9 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
 #endif
             if status == SFS_LIMIT { throw POSIXError(.EIO) }; try self.check(status, r)
             guard count > 0 && count <= bytes.count && !bytes.prefix(count).contains(0) else { throw POSIXError(.EIO) }
-            self.record(13, inode); replyHandler(FSFileName(data: Data(bytes.prefix(count))), nil)
-        } catch { self.record(13, error: error); replyHandler(nil, error) }
+            let result = try prepare(FSFileName(data: Data(bytes.prefix(count))), m)
+            self.record(13, inode); reply(result, nil)
+        } catch { self.record(13, error: error); reply(nil, error) }
     } }
     private func directoryVerifier(_ parent: UInt64, attributes: Bool) throws -> UInt64 {
         guard nonce.count == 16 else { throw POSIXError(.ENXIO) }
@@ -767,6 +898,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         return ((value & 0x3fff_ffff_ffff_ffff) << 1) | 0x8000_0000_0000_0000 | (attributes ? 1 : 0)
     }
     typealias DirectoryPack = (FSFileName, FSItem.ItemType, FSItem.Identifier, FSDirectoryCookie, FSItem.Attributes?) -> Bool
+#if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
     func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie,
                             verifier: FSDirectoryVerifier, attributes request: FSItem.GetAttributesRequest?,
                             packer: FSDirectoryEntryPacker, replyHandler: @escaping (FSDirectoryVerifier, Error?) -> Void) {
@@ -774,21 +906,25 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             packer.packEntry(name: $0, itemType: $1, itemID: $2, nextCookie: $3, attributes: $4)
         }, replyHandler: replyHandler)
     }
+#endif
     // Both callers enter the same serialized body; the packing closure is synchronous.
     func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie,
                             verifier: FSDirectoryVerifier, attributes request: FSItem.GetAttributesRequest?,
-                            pack: @escaping DirectoryPack, replyHandler: @escaping (FSDirectoryVerifier, Error?) -> Void) { enqueue(rejected: { replyHandler(.initial, $0) }) {
+                            pack: @escaping DirectoryPack, caller: CallerIdentity? = nil, requestForPacking: @escaping (FSItem.GetAttributesRequest?) throws -> FSItem.GetAttributesRequest? = { $0 }, replyHandler: @escaping (FSDirectoryVerifier, Error?) -> Void) { enqueue(rejected: { replyHandler(.initial, $0) }) {
         var returned: UInt64 = 0, accepted: UInt64 = 0, parent: UInt64 = 0
-        let mask = UInt64(bitPattern: Int64(request?.wantedAttributes.rawValue ?? 0))
+        var mask: UInt64 = 0
         func finish(_ reason: EnumerationStop, _ error: Error? = nil) {
             self.record(14, parent, mask: mask, error: error, cookie: cookie.rawValue, verifier: verifier.rawValue,
                         returnedVerifier: returned, acceptedCookie: accepted, stop: reason.rawValue)
             replyHandler(FSDirectoryVerifier(returned), error)
         }
         do {
+            let request = try requestForPacking(request)
+            mask = UInt64(bitPattern: Int64(request?.wantedAttributes.rawValue ?? 0))
             try validateDirectoryLayout(FSDirectoryCookie.initial.rawValue, FSDirectoryVerifier.initial.rawValue)
             let h = try self.ready(mounted: true); parent = try self.id(directory)
             let m = try self.metadata(parent)
+            if let caller { try self.ownerAccess(m, inode: parent, access: [.readData, .search], caller: caller) }
             guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
             if let request { try validateWanted(request.wantedAttributes.rawValue) }
             returned = try self.directoryVerifier(parent, attributes: request != nil)
@@ -846,15 +982,15 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
 #if STALLION_WRITE_DIAGNOSTIC
             if self.diagnosticWritable {
                 guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-                if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, uid: context.effectiveUserID) }
-                if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID) }
+                if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, caller: CallerIdentity(context)) }
+                if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, caller: CallerIdentity(context)) }
                 (item as! StallionItem).retainedModes.formUnion(modes)
                 self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
             }
 #endif
             if modes.contains(.write) { throw POSIXError(.EROFS) }
             guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-            try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID)
+            try self.ownerAccess(m, inode: inode, access: .readData, caller: CallerIdentity(context))
             self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
     } }
@@ -878,8 +1014,6 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
             }
 #endif
-            _ = try self.ready()
-            guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
             self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(16, uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
@@ -888,24 +1022,22 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                      replyHandler: @escaping @Sendable (FSCheckAccessResult?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
         do {
             let inode = try self.id(item), m = try self.metadata(inode)
-            try self.ownerAccess(m, inode: inode, access: access, uid: context.effectiveUserID)
+            try self.ownerAccess(m, inode: inode, access: access, caller: CallerIdentity(context))
+#if STALLION_CONTEXT_HANDLERS
+            let result = try self.handlerResult(FSCheckAccessResult.self) { FSCheckAccessResult(accessAllowed: true) }
+#else
             guard let result = FSCheckAccessResult(accessAllowed: true) else { throw POSIXError(.EIO) }
+#endif
             self.record(17, inode, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(result, nil)
         } catch { self.record(17, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(nil, error) }
     } }
-    private func ownerAccess(_ m: sfs_metadata_entry, inode: UInt64, access: FSVolume.AccessMask, uid: Int) throws {
-        var readAccess = access
+    private func ownerAccess(_ m: sfs_metadata_entry, inode: UInt64, access: FSVolume.AccessMask, caller: CallerIdentity) throws {
+        var writable = false
 #if STALLION_WRITE_DIAGNOSTIC
-        let writeAccess: FSVolume.AccessMask = [.writeData, .appendData]
-        if diagnosticWritable && !access.intersection(writeAccess).isEmpty {
-            guard uid == Int(owner), m.uid == owner, m.entry.kind == SFS_FILE,
-                  m.mode & 0o200 != 0, m.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
-            readAccess.subtract(writeAccess)
-        }
+        writable = diagnosticWritable
 #endif
-        try checkOwnerMode(m, owner: owner, uid: uid, access: readAccess)
-        // Opaque ACL storage is not ACL evaluation. Refuse rather than grant an
-        // owner-mode shortcut when the native security descriptor is present.
+        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: false)
+        // Opaque security descriptors are not an implemented ACL evaluator.
         let name = Data("com.apple.system.Security".utf8)
         var size: UInt64 = 0, r = sfs_result(); let h = try ready()
 #if STALLION_WRITE_DIAGNOSTIC
@@ -919,12 +1051,20 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
         }
         if status == SFS_NOT_FOUND { return }
-        try check(status, r); throw POSIXError(.ENOTSUP)
+        try check(status, r)
+        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: true)
     }
+#if !STALLION_CONTEXT_HANDLERS
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
               replyHandler: @escaping (Int, Error?) -> Void) {
-        guard length >= 0 && offset >= 0 && length <= buffer.length else { replyHandler(0, POSIXError(.EINVAL)); return }
-        enqueue(retainedBytes: buffer.length, rejected: { replyHandler(0, $0) }) {
+        readBody(from: item, at: offset, length: length, into: buffer, prepare: { count, _ in count }, failedRead: replyHandler) { replyHandler($0 ?? 0, $1) }
+    }
+#endif
+    private func readBody<T>(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
+                             prepare: @escaping (Int, sfs_metadata_entry) throws -> T, failedRead: ((Int, Error?) -> Void)? = nil,
+                             reply: @escaping (T?, Error?) -> Void) {
+        guard length >= 0 && offset >= 0 && length <= buffer.length else { reply(nil, POSIXError(.EINVAL)); return }
+        enqueue(retainedBytes: buffer.length, rejected: { reply(nil, $0) }) {
         var count = 0
         do {
             let h = try self.ready(mounted: true), inode = try self.id(item), m = try self.metadata(inode)
@@ -935,14 +1075,28 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 return try self.readTarget(h, inode: inode, offset: UInt64(offset), data: bytes.baseAddress, length: length, count: &count, receipt: &r)
             }
             guard count >= 0 && count <= length else { count = 0; throw POSIXError(.EIO) }
-            try self.check(status, r); self.record(18, inode); replyHandler(count, nil)
-        } catch { self.record(18, error: error); replyHandler(count, error) }
+            try self.check(status, r); let result = try prepare(count, m)
+            self.record(18, inode); reply(result, nil)
+        } catch {
+            self.record(18, error: error)
+            if let failedRead { failedRead(count, error) } else { reply(nil, error) }
+        }
     } }
+#if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
     func getXattr(named name: FSFileName, of item: FSItem, replyHandler: @escaping (Data?, Error?) -> Void) {
-        do { try component(name.data, xattr: true) } catch { replyHandler(nil, error); return }
-        enqueue(retainedBytes: name.data.count, rejected: { replyHandler(nil, $0) }) {
+        getXattrBody(named: name, of: item, caller: nil, prepare: { $0 }, reply: replyHandler)
+    }
+    func listXattrs(of item: FSItem, replyHandler: @escaping ([FSFileName]?, Error?) -> Void) {
+        listXattrsBody(of: item, caller: nil, prepare: { $0 }, reply: replyHandler)
+    }
+#endif
+    private func getXattrBody<T>(named name: FSFileName, of item: FSItem, caller: CallerIdentity?,
+                                 prepare: @escaping (Data) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+        do { try component(name.data, xattr: true) } catch { reply(nil, error); return }
+        enqueue(retainedBytes: name.data.count, rejected: { reply(nil, $0) }) {
         do {
-            let h = try self.ready(mounted: true), inode = try self.id(item); _ = try self.metadata(inode); try component(name.data, xattr: true)
+            let h = try self.ready(mounted: true), inode = try self.id(item); let m = try self.metadata(inode)
+            if let caller { try self.ownerAccess(m, inode: inode, access: .readXattr, caller: caller) }; try component(name.data, xattr: true)
             var size: UInt64 = 0, r = sfs_result()
 #if STALLION_WRITE_DIAGNOSTIC
             let sizePin: sfs_pin?
@@ -956,7 +1110,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             }
             try self.check(status, r, missing: ENOATTR)
             let length = try checkedXattrLength(size)
-            if length == 0 { self.record(19, inode); replyHandler(Data(), nil); return }
+            if length == 0 { self.record(19, inode); reply(try prepare(Data()), nil); return }
 #if STALLION_ADAPTER_CHECK
             self.xattrAllocations += 1
 #endif
@@ -976,12 +1130,14 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             if readStatus == SFS_LIMIT { throw POSIXError(.ERANGE) }; try self.check(readStatus, r, missing: ENOATTR)
             guard count == length else { throw POSIXError(.EIO) }
             let value = Data(bytesNoCopy: memory, count: count, deallocator: .free); transferred = true
-            self.record(19, inode); replyHandler(value, nil)
-        } catch { self.record(19, error: error); replyHandler(nil, error) }
+            self.record(19, inode); reply(try prepare(value), nil)
+        } catch { self.record(19, error: error); reply(nil, error) }
     } }
-    func listXattrs(of item: FSItem, replyHandler: @escaping ([FSFileName]?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
+    private func listXattrsBody<T>(of item: FSItem, caller: CallerIdentity?,
+                                  prepare: @escaping ([FSFileName]) throws -> T, reply: @escaping (T?, Error?) -> Void) { enqueue(rejected: { reply(nil, $0) }) {
         do {
-            let h = try self.ready(mounted: true), inode = try self.id(item); _ = try self.metadata(inode)
+            let h = try self.ready(mounted: true), inode = try self.id(item); let m = try self.metadata(inode)
+            if let caller { try self.ownerAccess(m, inode: inode, access: .readXattr, caller: caller) }
             var names: [FSFileName] = [], after = Data(), total = 0, r = sfs_result()
             while true {
                 var entry = sfs_xattr_entry(), found: Int32 = 0
@@ -1004,14 +1160,18 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                 total = try checkedXattrListTotal(total, count: names.count, next: next.count)
                 names.append(FSFileName(data: next)); after = next
             }
-            self.record(20, inode); replyHandler(names, nil)
-        } catch { self.record(20, error: error); replyHandler(nil, error) }
+            self.record(20, inode); reply(try prepare(names), nil)
+        } catch { self.record(20, error: error); reply(nil, error) }
     } }
     // Refusal retains no caller payload and never waits for queue capacity.
     private func refuse(_ reply: (Error) -> Void) { reply(POSIXError(.EROFS)) }
+#if !STALLION_CONTEXT_HANDLERS
     func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { diagnosticSetAttributes(attributes, item: item, reply: replyHandler); return }
+        if diagnosticWritable {
+            let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
+            diagnosticSetAttributes(attributes, item: item, caller: nil, request: { request }, prepare: { $0 }, reply: replyHandler); return
+        }
 #endif
         refuse { replyHandler(nil, $0) }
     }
@@ -1022,11 +1182,281 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, replyHandler: @escaping (FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (Int, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { diagnosticWrite(contents, item: item, offset: offset, reply: replyHandler); return }
+        if diagnosticWritable { diagnosticWrite(contents, item: item, offset: offset, prepare: { count, _ in count }) { replyHandler($0 ?? 0, $1) }; return }
 #endif
         refuse { replyHandler(0, $0) }
     }
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, replyHandler: @escaping (Error?) -> Void) { refuse { replyHandler($0) } }
+#endif
+#if STALLION_CONTEXT_HANDLERS
+    private static func validateCallerWanted(_ wanted: FSItem.Attribute) throws {
+        try validateWanted(wanted.rawValue)
+        guard wanted.rawValue & ~0x3fff == 0 else { throw POSIXError(.ENOTSUP) }
+    }
+    private struct ResultRequirements {
+        let type: FSVolumeHandlerResult.Type
+        let caller: FSItem.Attribute
+        let sdk: FSItem.Attribute
+        init(_ type: FSVolumeHandlerResult.Type, explicit: FSItem.Attribute = []) {
+            self.type = type; caller = explicit
+            sdk = type.requestedAttributes.wantedAttributes
+        }
+        func request() throws -> FSItem.GetAttributesRequest {
+            try StallionVolume.validateCallerWanted(caller)
+            let request = FSItem.GetAttributesRequest()
+            request.wantedAttributes = sdk.union(caller)
+            return request
+        }
+    }
+    private static func requireResultValidity(_ attributes: FSItem.Attributes, sdk: FSItem.Attribute, caller: FSItem.Attribute) throws {
+        try requireValid(attributes, sdk)
+        try requireValid(attributes, caller)
+    }
+    private static func requireValid(_ attributes: FSItem.Attributes, _ required: FSItem.Attribute) throws {
+        let raw = UInt(bitPattern: required.rawValue)
+        for index in 0..<UInt.bitWidth {
+            let bit = UInt(1) << index
+            if raw & bit != 0 && !attributes.isValid(FSItem.Attribute(rawValue: Int(bitPattern: bit))) {
+                throw POSIXError(.ENOTSUP)
+            }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    var rejectResultForTesting: ((String) -> Bool)?
+    var preparedAttributesForTesting: ((String, FSItem.Attributes) -> Void)?
+    static func resultRequestForTesting(_ type: FSVolumeHandlerResult.Type, explicit: FSItem.Attribute = []) throws -> FSItem.GetAttributesRequest {
+        try ResultRequirements(type, explicit: explicit).request()
+    }
+    static func requireValidForTesting(_ attributes: FSItem.Attributes, required: FSItem.Attribute) throws {
+        try requireValid(attributes, required)
+    }
+    static func requireResultValidityForTesting(_ attributes: FSItem.Attributes, sdk: FSItem.Attribute, caller: FSItem.Attribute) throws {
+        try validateCallerWanted(caller)
+        try requireResultValidity(attributes, sdk: sdk, caller: caller)
+    }
+#endif
+    private func handlerResult<T: FSVolumeHandlerResult>(_ type: T.Type, _ construct: () -> T?) throws -> T {
+        let result = construct()
+#if STALLION_ADAPTER_CHECK
+        if rejectResultForTesting?(String(describing: type)) == true { throw POSIXError(.EIO) }
+#endif
+        guard let result else { throw POSIXError(.EIO) }
+        return result
+    }
+    private func preparedResultAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest,
+                                          _ requirements: ResultRequirements, parents: inout ParentEvidence) throws -> FSItem.Attributes {
+        try Self.validateCallerWanted(requirements.caller)
+        guard request.wantedAttributes == requirements.sdk.union(requirements.caller) else { throw POSIXError(.EIO) }
+        // SDK result snapshots may supply additional truthful policy attributes.
+        let attributes = try populateAttributes(m, request, parents: &parents, includeResultPolicy: true)
+#if STALLION_ADAPTER_CHECK
+        preparedAttributesForTesting?(String(describing: requirements.type), attributes)
+#endif
+        try Self.requireResultValidity(attributes, sdk: requirements.sdk, caller: requirements.caller)
+        return attributes
+    }
+    private func resultAttributes(_ m: sfs_metadata_entry, _ type: FSVolumeHandlerResult.Type,
+                                  explicit: FSItem.Attribute = []) throws -> FSItem.Attributes {
+        let requirements = ResultRequirements(type, explicit: explicit)
+        var parents = ParentEvidence()
+        return try preparedResultAttributes(m, requirements.request(), requirements, parents: &parents)
+    }
+    func activateVolume(options: FSTaskOptions, replyHandler: @escaping (FSActivateResult?, Error?) -> Void) {
+        activateHandler(replyHandler: replyHandler)
+    }
+    private func activateHandler(replyHandler: @escaping (FSActivateResult?, Error?) -> Void) {
+        activateBody(prepare: { root in
+            return try self.handlerResult(FSActivateResult.self) { FSActivateResult(rootItem: root) }
+        }, reply: replyHandler)
+    }
+    func deactivateVolume(options: FSDeactivateOptions, replyHandler: @escaping (Error?) -> Void) {
+        deactivate(options: options, replyHandler: replyHandler)
+    }
+    func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext,
+                    replyHandler: @escaping (FSLookupItemResult?, Error?) -> Void) {
+        lookupHandler(name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func lookupHandler(_ name: FSFileName, directory: FSItem, caller: CallerIdentity,
+                               reply: @escaping (FSLookupItemResult?, Error?) -> Void) {
+        lookupBody(name, directory: directory, caller: caller, prepare: { item, returned, m in
+            let attributes = try self.resultAttributes(m, FSLookupItemResult.self)
+            return try self.handlerResult(FSLookupItemResult.self) {
+                FSLookupItemResult(foundItem: item, itemName: returned, itemAttributes: attributes)
+            }
+        }, reply: reply)
+    }
+    func getAttributes(_ request: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext,
+                       replyHandler: @escaping (FSGetAttributesResult?, Error?) -> Void) {
+        getAttributesHandler(request, item: item, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func getAttributesHandler(_ request: FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity,
+                                      reply: @escaping (FSGetAttributesResult?, Error?) -> Void) {
+        let explicit = request.wantedAttributes
+        let requirements = ResultRequirements(FSGetAttributesResult.self, explicit: explicit)
+        getAttributesBody({ try requirements.request() }, item: item, caller: caller, requirements: requirements, prepare: { attributes in
+            return try self.handlerResult(FSGetAttributesResult.self) { FSGetAttributesResult(attributes: attributes) }
+        }, reply: reply)
+    }
+    func readSymbolicLink(_ item: FSItem, context: FSContext, replyHandler: @escaping (FSReadSymlinkResult?, Error?) -> Void) {
+        readlinkHandler(item, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func readlinkHandler(_ item: FSItem, caller: CallerIdentity, reply: @escaping (FSReadSymlinkResult?, Error?) -> Void) {
+        readlinkBody(item, caller: caller, prepare: { name, m in
+            let attributes = try self.resultAttributes(m, FSReadSymlinkResult.self)
+            return try self.handlerResult(FSReadSymlinkResult.self) { FSReadSymlinkResult(contents: name, symlinkAttributes: attributes) }
+        }, reply: reply)
+    }
+    func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie,
+                            verifier: FSDirectoryVerifier, attributes request: FSItem.GetAttributesRequest?,
+                            packer: FSDirectoryEntryPacker, context: FSContext,
+                            replyHandler: @escaping (FSEnumerateDirectoryResult?, Error?) -> Void) {
+        enumerateHandler(directory, startingAt: cookie, verifier: verifier, attributes: request, caller: CallerIdentity(context), pack: {
+            packer.packEntry(name: $0, itemType: $1, itemID: $2, nextCookie: $3, attributes: $4)
+        }, reply: replyHandler)
+    }
+    private func enumerateHandler(_ directory: FSItem, startingAt cookie: FSDirectoryCookie,
+                                  verifier: FSDirectoryVerifier, attributes request: FSItem.GetAttributesRequest?,
+                                  caller: CallerIdentity, pack: @escaping DirectoryPack,
+                                  reply: @escaping (FSEnumerateDirectoryResult?, Error?) -> Void) {
+        enumerateDirectory(directory, startingAt: cookie, verifier: verifier, attributes: request, pack: pack, caller: caller,
+            requestForPacking: { explicit in
+                guard let explicit else { return nil }
+                let copied = FSItem.GetAttributesRequest()
+                copied.wantedAttributes = explicit.wantedAttributes
+                try Self.validateCallerWanted(copied.wantedAttributes)
+                return copied
+            }) { verifier, error in
+            if let error { reply(nil, error); return }
+            do { reply(try self.handlerResult(FSEnumerateDirectoryResult.self) { FSEnumerateDirectoryResult(verifier: verifier.rawValue) }, nil) }
+            catch { reply(nil, error) }
+        }
+    }
+    func getXattr(named name: FSFileName, of item: FSItem, context: FSContext,
+                  replyHandler: @escaping (FSGetXattrResult?, Error?) -> Void) {
+        getXattrHandler(name, item: item, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func getXattrHandler(_ name: FSFileName, item: FSItem, caller: CallerIdentity, reply: @escaping (FSGetXattrResult?, Error?) -> Void) {
+        getXattrBody(named: name, of: item, caller: caller, prepare: { value in
+            return try self.handlerResult(FSGetXattrResult.self) { FSGetXattrResult(xattrValue: value) }
+        }, reply: reply)
+    }
+    func listXattrs(of item: FSItem, context: FSContext, replyHandler: @escaping (FSListXattrsResult?, Error?) -> Void) {
+        listXattrsHandler(item, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func listXattrsHandler(_ item: FSItem, caller: CallerIdentity, reply: @escaping (FSListXattrsResult?, Error?) -> Void) {
+        listXattrsBody(of: item, caller: caller, prepare: { names in
+            return try self.handlerResult(FSListXattrsResult.self) { FSListXattrsResult(xattrNames: names) }
+        }, reply: reply)
+    }
+    func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
+              replyHandler: @escaping (FSReadFileResult?, Error?) -> Void) {
+        readBody(from: item, at: offset, length: length, into: buffer, prepare: { count, m in
+            let attributes = try self.resultAttributes(m, FSReadFileResult.self)
+            return try self.handlerResult(FSReadFileResult.self) { FSReadFileResult(bytesRead: count, itemAttributes: attributes) }
+        }, reply: replyHandler)
+    }
+    // ReadWriteHandler supplies no FSContext. This preserves only disposable-image
+    // admission; delegated descriptors, mmap and installed caller routing are unqualified.
+    func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (FSWriteFileResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable {
+            let requirements = ResultRequirements(FSWriteFileResult.self)
+            var request: FSItem.GetAttributesRequest?
+            diagnosticWrite(contents, item: item, offset: offset, admit: {
+                request = try requirements.request()
+            }, prepare: { count, m in
+                guard let request else { throw POSIXError(.EIO) }
+                var parents = ParentEvidence()
+                let attributes = try self.preparedResultAttributes(m, request, requirements, parents: &parents)
+                return try self.handlerResult(FSWriteFileResult.self) { FSWriteFileResult(bytesWritten: count, itemAttributes: attributes, freeSpace: nil) }
+            }, reply: replyHandler); return
+        }
+#endif
+        refuse { replyHandler(nil, $0) }
+    }
+    func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext,
+                       replyHandler: @escaping (FSSetAttributesResult?, Error?) -> Void) {
+        setAttributesHandler(attributes, item: item, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func setAttributesHandler(_ attributes: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity,
+                                      reply: @escaping (FSSetAttributesResult?, Error?) -> Void) {
+        attributes.consumedAttributes = []
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable {
+            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.size, .allocSize, .modifyTime, .changeTime, .fileID])
+            diagnosticSetAttributes(attributes, item: item, caller: caller, requirements: requirements,
+                request: { try requirements.request() }, prepare: { a in
+                    return try self.handlerResult(FSSetAttributesResult.self) { FSSetAttributesResult(attributes: a, freeSpace: nil) }
+                }, reply: reply); return
+        }
+#endif
+        refuse { reply(nil, $0) }
+    }
+    func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler: @escaping (FSCreateItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, context: FSContext, replyHandler: @escaping (FSCreateSymlinkResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler: @escaping (FSCreateLinkResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler: @escaping (FSRenameItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+#endif
+#if STALLION_ADAPTER_CHECK
+    // Direct checks use pure caller values; these are not framework entry points
+    // and do not establish that the kernel supplied any particular FSContext.
+    func writeCountForTesting(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (Int, Error?) -> Void) {
+#if STALLION_CONTEXT_HANDLERS
+        write(contents: contents, to: item, at: offset) { replyHandler($0 == nil ? 0 : contents.count, $1) }
+#else
+        write(contents: contents, to: item, at: offset, replyHandler: replyHandler)
+#endif
+    }
+    func setAttributesValueForTesting(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, caller: CallerIdentity,
+                                      replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) {
+#if STALLION_CONTEXT_HANDLERS
+        var prepared: FSItem.Attributes?
+        let prior = preparedAttributesForTesting
+        preparedAttributesForTesting = { name, value in
+            prior?(name, value)
+            if name == "FSSetAttributesResult" { prepared = value }
+        }
+        setAttributesHandler(attributes, item: item, caller: caller) { result, error in
+            self.preparedAttributesForTesting = prior
+            replyHandler(result == nil ? nil : prepared, error)
+        }
+#else
+        setAttributes(attributes, on: item, replyHandler: replyHandler)
+#endif
+    }
+    func refusedMutationForTesting(replyHandler: (Error?) -> Void) { refuse { replyHandler($0) } }
+#if STALLION_CONTEXT_HANDLERS
+    func activateResultForTesting(replyHandler: @escaping (FSActivateResult?, Error?) -> Void) { activateHandler(replyHandler: replyHandler) }
+    func lookupResultForTesting(_ name: String, directory: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSLookupItemResult?, Error?) -> Void) {
+        lookupHandler(FSFileName(string: name), directory: directory, caller: caller, reply: replyHandler)
+    }
+    func attributesResultForTesting(_ request: FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSGetAttributesResult?, Error?) -> Void) {
+        getAttributesHandler(request, item: item, caller: caller, reply: replyHandler)
+    }
+    func readlinkResultForTesting(_ item: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSReadSymlinkResult?, Error?) -> Void) {
+        readlinkHandler(item, caller: caller, reply: replyHandler)
+    }
+    func xattrResultForTesting(_ item: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSGetXattrResult?, Error?) -> Void) {
+        getXattrHandler(FSFileName(string: "note"), item: item, caller: caller, reply: replyHandler)
+    }
+    func xattrsResultForTesting(_ item: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSListXattrsResult?, Error?) -> Void) {
+        listXattrsHandler(item, caller: caller, reply: replyHandler)
+    }
+    func enumerationResultForTesting(_ directory: FSItem, startingAt cookie: FSDirectoryCookie = .initial,
+                                     verifier: FSDirectoryVerifier = .initial, attributes: FSItem.GetAttributesRequest? = nil,
+                                     caller: CallerIdentity, pack: @escaping DirectoryPack,
+                                     replyHandler: @escaping (FSEnumerateDirectoryResult?, Error?) -> Void) {
+        enumerateHandler(directory, startingAt: cookie, verifier: verifier, attributes: attributes, caller: caller, pack: pack, reply: replyHandler)
+    }
+    // Constructor-only: no fabricated FSMutableFileDataBuffer or kernel read call.
+    func readResultConstructorForTesting(_ item: FSItem) throws -> FSReadFileResult {
+        let a = try resultAttributes(metadata(id(item)), FSReadFileResult.self)
+        return try handlerResult(FSReadFileResult.self) { FSReadFileResult(bytesRead: 0, itemAttributes: a) }
+    }
+#endif
+#endif
 #if STALLION_WRITE_DIAGNOSTIC
     // Contextless write callbacks have no caller identity. This is only the
     // existing disposable-image admission policy, not client authorization.
@@ -1034,7 +1464,7 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         if let error = deliveryError() { throw error }
         let m = try metadata(inode)
         guard m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-        try ownerAccess(m, inode: inode, access: .writeData, uid: Int(owner))
+        try ownerAccess(m, inode: inode, access: .writeData, caller: CallerIdentity(uid: Int(owner), gid: Int(getegid())))
         return m
     }
     private func observeWrite(_ operation: UInt64, inode: UInt64, offset: UInt64, length: UInt64,
@@ -1108,20 +1538,23 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             receipt = original; rememberDelivery(error, original); throw error
         }
     }
-    private func diagnosticWrite(_ contents: Data, item: FSItem, offset: off_t, reply: @escaping (Int, Error?) -> Void) {
+    private func diagnosticWrite<T>(_ contents: Data, item: FSItem, offset: off_t,
+                                    admit: @escaping () throws -> Void = {}, prepare: @escaping (Int, sfs_metadata_entry) throws -> T, reply: @escaping (T?, Error?) -> Void) {
         let start = DispatchTime.now().uptimeNanoseconds
         var validation: Error?
         if offset < 0 { validation = POSIXError(.EINVAL) }
         else if UInt64(offset) > maximumFileSize || UInt64(contents.count) > maximumFileSize - UInt64(offset) { validation = POSIXError(.EFBIG) }
-        enqueue(retainedBytes: contents.count, dataOperation: true, writeOperation: true, validationError: validation, rejected: { reply(0, $0) }) {
+        enqueue(retainedBytes: contents.count, dataOperation: true, writeOperation: true, validationError: validation, rejected: { reply(nil, $0) }) {
             var receipt = sfs_result(), inode: UInt64 = 0
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
-                _ = try self.ready(mounted: true); inode = try self.id(item); try self.fixtureWritableMetadata(inode)
+                _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.fixtureWritableMetadata(inode)
+                try admit()
                 let pin = try self.token(inode)
                 self.submissionLock.lock(); self.saturated(&self.writeCounters.bytes, by: UInt64(contents.count)); self.submissionLock.unlock()
+                let result: T
                 if !contents.isEmpty {
-                    let _: Bool = try self.mutate({ h, r in
+                    result = try self.mutate({ h, r in
                         try contents.withUnsafeBytes { bytes in
                             var at = 0
                             while at < bytes.count {
@@ -1134,15 +1567,21 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
 #endif
                             }
                         }
-                    }, prepare: { _, _ in true }, receipt: &receipt)
-                }
+                    }, prepare: { h, r in
+#if STALLION_CONTEXT_HANDLERS
+                        return try prepare(contents.count, self.transactionMetadata(h, inode: inode, receipt: &r))
+#else
+                        return try prepare(contents.count, m)
+#endif
+                    }, receipt: &receipt)
+                } else { result = try prepare(0, m) }
                 self.observeWrite(1, inode: inode, offset: UInt64(offset), length: UInt64(contents.count), started: start, count: contents.count, error: nil, result: receipt)
-                reply(contents.count, nil)
+                reply(result, nil)
             } catch {
                 receipt = self.lastCoreFailure ?? receipt
                 self.rememberDelivery(error, receipt)
                 self.observeWrite(1, inode: inode, offset: UInt64(offset), length: UInt64(contents.count), started: start, count: 0, error: error, result: receipt)
-                reply(0, error)
+                reply(nil, error)
             }
         }
     }
@@ -1161,8 +1600,11 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         // addedTime and backupTime have no representation and stay unconsumed.
         return nil
     }
-    private func diagnosticSetAttributes(_ a: FSItem.SetAttributesRequest, item: FSItem,
-                                         reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
+#if STALLION_CONTEXT_HANDLERS
+    private func diagnosticSetAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+                                            requirements: ResultRequirements? = nil,
+                                            request makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, prepare: @escaping (FSItem.Attributes) throws -> T,
+                                            reply: @escaping (T?, Error?) -> Void) {
         let start = DispatchTime.now().uptimeNanoseconds
         a.consumedAttributes = []
         let hasSize = a.isValid(.size), validation = Self.sizeRequestError(a)
@@ -1171,27 +1613,35 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
-                let request = FSItem.GetAttributesRequest()
-                request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
+                let regularSize = hasSize && m.entry.kind == SFS_FILE
+                if regularSize, let error = self.deliveryError() { throw error }
+                if let caller { try self.ownerAccess(m, inode: inode, access: regularSize ? .writeData : .readAttributes, caller: caller) }
+                let request = try makeRequest()
+                if let requirements { try Self.validateCallerWanted(requirements.caller) }
+                else { try validateWanted(request.wantedAttributes.rawValue) }
                 var parents = ParentEvidence()
-                let result: FSItem.Attributes
-                if hasSize && m.entry.kind == SFS_FILE {
+                func snapshot(_ metadata: sfs_metadata_entry) throws -> FSItem.Attributes {
+                    if let requirements { return try self.preparedResultAttributes(metadata, request, requirements, parents: &parents) }
+                    return try self.attributes(metadata, request, parents: &parents)
+                }
+                let result: T
+                if regularSize {
                     guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
-                    try self.fixtureWritableMetadata(inode)
+                    if caller == nil { try self.fixtureWritableMetadata(inode) }
                     if a.size != m.entry.size {
                         let pin = try self.token(inode)
                         result = try self.mutate({ h, r in
                             try self.check(sfs_image_pin_resize(h, pin, a.size, &r), r)
                         }, prepare: { h, r in
                             let pending = try self.transactionMetadata(h, inode: inode, receipt: &r)
-                            return try self.attributes(pending, request, parents: &parents)
+                            return try prepare(snapshot(pending))
                         }, receipt: &receipt)
-                    } else { result = try self.attributes(m, request, parents: &parents) }
+                    } else { result = try prepare(snapshot(m)) }
                     a.consumedAttributes = [.size]
 #if STALLION_ADAPTER_CHECK
                     self.diagnosticAfterSizeCommit?()
 #endif
-                } else { result = try self.attributes(m, request, parents: &parents) }
+                } else { result = try prepare(snapshot(m)) }
                 self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: nil, result: receipt)
                 reply(result, nil)
             } catch {
@@ -1202,5 +1652,51 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
             }
         }
     }
+#else
+    private func diagnosticSetAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+                                            request makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, prepare: @escaping (FSItem.Attributes) throws -> T,
+                                            reply: @escaping (T?, Error?) -> Void) {
+        let start = DispatchTime.now().uptimeNanoseconds
+        a.consumedAttributes = []
+        let hasSize = a.isValid(.size), validation = Self.sizeRequestError(a)
+        enqueue(dataOperation: hasSize, validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result(), inode: UInt64 = 0
+            if self.failure == nil { self.lastCoreFailure = nil }
+            do {
+                _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
+                let regularSize = hasSize && m.entry.kind == SFS_FILE
+                if regularSize, let error = self.deliveryError() { throw error }
+                if let caller { try self.ownerAccess(m, inode: inode, access: regularSize ? .writeData : .readAttributes, caller: caller) }
+                let request = try makeRequest(); try validateWanted(request.wantedAttributes.rawValue)
+                var parents = ParentEvidence()
+                let result: T
+                if regularSize {
+                    guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
+                    if caller == nil { try self.fixtureWritableMetadata(inode) }
+                    if a.size != m.entry.size {
+                        let pin = try self.token(inode)
+                        result = try self.mutate({ h, r in
+                            try self.check(sfs_image_pin_resize(h, pin, a.size, &r), r)
+                        }, prepare: { h, r in
+                            let pending = try self.transactionMetadata(h, inode: inode, receipt: &r)
+                            return try prepare(self.attributes(pending, request, parents: &parents))
+                        }, receipt: &receipt)
+                    } else { result = try prepare(self.attributes(m, request, parents: &parents)) }
+                    a.consumedAttributes = [.size]
+#if STALLION_ADAPTER_CHECK
+                    self.diagnosticAfterSizeCommit?()
+#endif
+                } else { result = try prepare(self.attributes(m, request, parents: &parents)) }
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: nil, result: receipt)
+                reply(result, nil)
+            } catch {
+                receipt = self.lastCoreFailure ?? receipt
+                if hasSize { self.rememberDelivery(error, receipt) }
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: error, result: receipt)
+                reply(nil, error)
+            }
+        }
+    }
+#endif
 #endif
 }
