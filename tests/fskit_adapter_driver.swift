@@ -522,9 +522,13 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(evidence.contains { $0.operation == 22 && $0.accepted == 0 && $0.coreParentValid == 1 && $0.mappedParentValid == 1 }, "refused attributes recorded as attempt")
         need(evidence.contains { $0.operation == 10 && $0.mask == 0 && $0.coreParentValid == 1 && $0.mappedParentValid == 0 }, "unrequested parent remains invalid")
         need(evidence.filter { $0.operation == 10 && $0.error != 0 }.allSatisfy { $0.mappedParentValid == 0 }, "failed getter has no returned parent")
-        let write: (Int, Error?) = wait { done in volume.write(contents: Data([1]), to: files["data"]!, at: 0) { done(($0, $1)) } }
+        let write: (Int, Error?) = wait { done in volume.writeCountForTesting(contents: Data([1]), to: files["data"]!, at: 0) { done(($0, $1)) } }
         need(write.0 == 0 && code(write.1) == Int(EROFS), "write refused")
+#if STALLION_CONTEXT_HANDLERS
+        let set: Error? = wait { done in volume.refusedMutationForTesting(replyHandler: done) }
+#else
         let set: Error? = wait { done in volume.setXattr(named: FSFileName(string: "x"), to: Data(), on: files["empty"]!, policy: .alwaysSet, replyHandler: done) }
+#endif
         need(code(set) == Int(EROFS), "set xattr refused")
         hooksReset()
         let _: Bool = wait { done in volume.unmount { done(true) } }
