@@ -39,21 +39,26 @@ struct Fixture {
     let url: URL
     let id: UInt64
     let identity: UUID
-    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid(), extra: Bool = false) throws {
+    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid(), extra: Bool = false, sourceFlags: UInt32 = 0, rootFlags: UInt32 = 0, rootMode: UInt32 = 0o700, rootACL: Bool = false, directory: Bool = false, capacity: UInt64 = 16 * 1024 * 1024) throws {
         fault(0, 0); url = parent.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         var h: OpaquePointer?, r = sfs_result(), m = sfs_metadata_initial(), inode: UInt64 = 0
-        m.mode = UInt32(S_IFDIR) | 0o700; m.uid = geteuid(); m.gid = getegid()
-        need(sfs_image_create_metadata_version(url.path, "image.sfs", 16 * 1024 * 1024, 6, &m, &h, &r) == SFS_OK, "create disposable")
+        m.mode = UInt32(S_IFDIR) | rootMode; m.uid = geteuid(); m.gid = getegid(); m.flags = rootFlags
+        need(sfs_image_create_metadata_version(url.path, "image.sfs", capacity, 6, &m, &h, &r) == SFS_OK, "create disposable")
         need(sfs_image_begin(h, &r) == SFS_OK, "begin producer")
-        m.mode = UInt32(S_IFREG) | mode; m.uid = owner
+        m.mode = UInt32(S_IFREG) | mode; m.uid = owner; m.flags = sourceFlags
         need(sfs_image_add_metadata(h, 1, "file", 4, SFS_FILE, &m, &inode, &r) == SFS_OK, "create regular")
         let fileID = inode; id = fileID
         need(sfs_image_link(h, inode, 1, "alias", 5, &r) == SFS_OK, "create alias")
         need(sfs_image_set_xattr(h, fileID, "note", 4, "value", 5, &r) == SFS_OK, "regular opaque xattr")
         if extra { need(sfs_image_add_metadata(h, 1, "extra", 5, SFS_FILE, &m, &inode, &r) == SFS_OK, "extra capacity operand") }
-        m.mode = UInt32(S_IFLNK) | 0o700; m.uid = geteuid()
+        m.mode = UInt32(S_IFLNK) | 0o700; m.uid = geteuid(); m.flags = 0
         need(sfs_image_symlink_metadata(h, 1, "link", 4, "file", 4, &m, &inode, &r) == SFS_OK, "create symlink")
+        if directory {
+            m.mode = UInt32(S_IFDIR) | 0o700
+            need(sfs_image_add_metadata(h, 1, "dir", 3, SFS_DIRECTORY, &m, &inode, &r) == SFS_OK, "namespace fixture directory")
+        }
+        if rootACL { need(sfs_image_set_xattr(h, 1, "com.apple.system.Security", 25, nil, 0, &r) == SFS_OK, "parent security descriptor") }
         if acl {
             let key = Data("com.apple.system.Security".utf8)
             need(key.withUnsafeBytes { sfs_image_set_xattr(h, fileID, $0.baseAddress, $0.count, nil, 0, &r) } == SFS_OK, "create security descriptor")
@@ -352,6 +357,14 @@ func lifetimeAndBinding(_ parent: URL) throws {
     let unbound = StallionFileSystem()
     let loaded: (FSVolume?, Error?) = wait { done in unbound.loadResource(resource: resource, force: false) { done(($0,$1)) } }
     need(loaded.1 == nil && (loaded.0 as! StallionVolume).requestedMountOptions.contains(.readOnly), "public default resource remains read-only")
+#if STALLION_CONTEXT_HANDLERS
+    let unboundVolume = loaded.0 as! StallionVolume
+    let refusedLink: (FSCreateLinkResult?, Error?) = wait { done in
+        unboundVolume.linkResultForTesting(StallionItem(2), name: FSFileName(string: "new-name"), directory: StallionItem(1),
+            caller: CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0,$1)) }
+    }
+    need(refusedLink.0 == nil && code(refusedLink.1) == Int(EROFS), "writable generic resource without UUID cannot link")
+#endif
     let unloaded: Error? = wait { unbound.unloadResource(resource: resource, replyHandler: $0) }; need(unloaded == nil, "unbound unload")
     let wrong = StallionFileSystem(); wrong.diagnosticUUID = UUID()
     let denied: (FSVolume?, Error?) = wait { done in wrong.loadResource(resource: resource, force: false) { done(($0,$1)) } }
@@ -994,12 +1007,294 @@ func queuedResizeAfterDeliveryFailure(_ parent: URL) throws {
     }
 }
 
+#if STALLION_CONTEXT_HANDLERS
+func namespaceLink(_ m: Mounted, _ item: FSItem? = nil, name: Data = Data("new-name".utf8),
+                   directory: FSItem? = nil, caller: CallerIdentity? = nil) -> (FSCreateLinkResult?, Error?) {
+    wait { done in m.volume.linkResultForTesting(item ?? m.file, name: FSFileName(data: name), directory: directory ?? m.root,
+        caller: caller ?? CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0,$1)) } }
+}
+func namespaceLookup(_ m: Mounted, _ name: String, directory: FSItem? = nil) -> FSItem {
+    let found: (FSItem?, Error?) = wait { done in m.volume.lookupItem(named: FSFileName(string: name), inDirectory: directory ?? m.root) { done(($0,$2)) } }
+    need(found.1 == nil && found.0 != nil, "namespace lookup"); return found.0!
+}
+func namespaceMetadata(_ m: Mounted, _ item: FSItem) -> sfs_metadata_entry {
+    var value = sfs_metadata_entry()
+    m.serial { var r = sfs_result(); need(sfs_image_stat_metadata(m.coreHandle, 0, (item as! StallionItem).inode, &value, &r) == SFS_OK, "namespace committed metadata") }
+    return value
+}
+func namespaceAbsent(_ m: Mounted, _ name: String = "new-name") {
+    m.serial {
+        var r = sfs_result(), e = sfs_entry(), info = sfs_image_information()
+        let bytes = Data(name.utf8)
+        need(bytes.withUnsafeBytes { sfs_image_lookup(m.coreHandle, 0, 1, $0.baseAddress, $0.count, &e, &r) } == SFS_NOT_FOUND, "no alias publication")
+        need(sfs_image_get_information(m.coreHandle, &info, &r) == SFS_OK && r.transaction_active == 0, "no pending transaction")
+        need(m.volume.ownsForTesting(m.file) && m.volume.ownsForTesting(m.root) && m.volume.activeItemCount() == 3,
+             "namespace keeps canonical ownership and item count")
+    }
+    let budget = m.volume.linkBudgetForTesting
+    need(budget.0 == 0 && budget.1 == 0, "namespace releases callback and name-byte charge")
+}
+func namespaceReopened(_ f: Fixture, _ name: String, parent: UInt64 = 1, inode: UInt64?) {
+    fault(0,0); var h: OpaquePointer?, r = sfs_result(), entry = sfs_entry()
+    need(sfs_image_open_readonly(f.url.path, "image.sfs", &h, &r) == SFS_OK, "namespace reopen")
+    let bytes = Data(name.utf8), status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &entry, &r) }
+    if let inode { need(status == SFS_OK && entry.inode == inode && Data(rawBytes(entry.name).prefix(entry.name_length)) == bytes, "reopened acknowledged alias") }
+    else { need(status == SFS_NOT_FOUND, "reopened refused alias absent") }
+    need(sfs_image_close(h, &r) == SFS_OK, "namespace reopen close")
+}
+func contextualLinks(_ parent: URL) throws {
+    let required = FSCreateLinkResult.requestedAttributes.wantedAttributes
+#if STALLION_RESULT_MASK_TRACE
+    let raw = UInt(bitPattern: required.rawValue)
+    resultMaskTrace("FSCreateLinkResult original=0x\(String(raw, radix: 16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff), radix: 16)) explicit=0x0")
+#endif
+    let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    // Same-parent and cross-parent links share existing items even at the item cap.
+    for cross in [false, true] {
+        let f = try Fixture(parent, "namespace-success-\(cross)", mode: 0o400, directory: cross)
+        let m = try Mounted(f, itemLimit: cross ? 4 : 3), v = m.volume
+        let destination = cross ? namespaceLookup(m, "dir") : m.root
+        let aliasName = cross ? String(repeating: "n", count: 255) : "Hard-Link-Ω"
+        if cross { need(code(namespaceLink(m,destination).1) == Int(ENOTSUP), "nonroot directory link refusal") }
+        var snapshots: [FSItem.Attributes] = [], commitStarted = false
+        m.serial {
+            v.preparedAttributesForTesting = { name, value in
+                if name == "FSCreateLinkResult" { need(!commitStarted, "both role snapshots precommit"); snapshots.append(value) }
+            }
+            v.rejectResultForTesting = { name in if name == "FSCreateLinkResult" { need(snapshots.count == 2 && !commitStarted, "real link constructor precommit") }; return false }
+            v.diagnosticBeforeCommit = { commitStarted = true }
+            try! v.linkAccessForTesting(destination, access: [.addFile, .search], caller: caller)
+            let refused: [FSVolume.AccessMask] = [.addSubdirectory, .delete, [.addFile, .delete]]
+            for access in refused {
+                do { try v.linkAccessForTesting(destination, access: access, caller: caller); need(false, "link policy granted unrelated mutation") }
+                catch { need(code(error) == Int(EACCES), "other access bits remain refused") }
+            }
+        }
+        let originalPin = (m.file as! StallionItem).pin!, retainedTrace = v.diagnosticSnapshot().1
+        let result = namespaceLink(m, name: Data(aliasName.utf8), directory: destination)
+        need(result.0 != nil && result.1 == nil && snapshots.count == 2 && commitStarted, "actual link result success")
+        let linkedMetadata = namespaceMetadata(m, m.file), parentMetadata = namespaceMetadata(m, destination)
+        checkPreparedAttributes(snapshots[0], linkedMetadata, required: required)
+        checkPreparedAttributes(snapshots[1], parentMetadata, required: required)
+        need(linkedMetadata.link_count == 3 && namespaceLookup(m, aliasName, directory: destination) === m.file,
+             "hardlink preserves canonical identity at capacity")
+        need(sameBytes(originalPin, (m.file as! StallionItem).pin!), "link preserves source token")
+        let originalSnapshots = snapshots
+        m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil }
+        need(namespaceLink(m, m.link, name: Data("symbolic-alias".utf8), directory: destination).1 == nil,
+             "symlink hardlink without target traversal")
+        need(namespaceLookup(m, "symbolic-alias", directory: destination) === m.link, "symlink canonical alias")
+        need(namespaceLink(m,name:Data("later-alias".utf8),directory:destination).1 == nil && namespaceMetadata(m,m.file).link_count == 4,
+             "later link changes real source metadata")
+        checkPreparedAttributes(originalSnapshots[0], linkedMetadata, required: required)
+        checkPreparedAttributes(originalSnapshots[1], parentMetadata, required: required)
+        need(retainedTrace.count <= v.diagnosticSnapshot().1.count, "retained trace remains independent")
+        let target: (FSFileName?, Error?) = wait { done in v.readSymbolicLink(m.link) { done(($0,$1)) } }
+        need(target.1 == nil && target.0?.data == Data("file".utf8), "hardlinked symlink contents")
+        let xattr: (Data?, Error?) = wait { done in v.getXattr(named: FSFileName(string: "note"), of: m.file) { done(($0,$1)) } }
+        need(xattr.1 == nil && xattr.0 == Data("value".utf8), "hardlink preserves opaque xattrs")
+        let parentID = (destination as! StallionItem).inode, symlinkID = (m.link as! StallionItem).inode
+        if cross { let e: Error? = wait { v.reclaimForTesting(destination, eligible: true, replyHandler: $0) }; need(e == nil, "release retained test directory") }
+        m.close(); namespaceReopened(f, aliasName, parent: parentID, inode: f.id)
+        namespaceReopened(f, "symbolic-alias", parent: parentID, inode: symlinkID)
+        namespaceReopened(f, "later-alias", parent: parentID, inode: f.id)
+        need(f.contents() == Data("original".utf8), "readonly-mode source data unchanged")
+    }
+    let invalid = try Fixture(parent, "namespace-preflight", extra: true), m = try Mounted(invalid), v = m.volume
+    var staged = false
+    m.serial { v.diagnosticBeforePrepare = { staged = true } }
+    let before = v.anchor
+    for (bytes, expected) in [(Data(), EINVAL), (Data([0]), EINVAL), (Data("a/b".utf8), EINVAL),
+                              (Data(".".utf8), EINVAL), (Data("..".utf8), EINVAL), (Data(repeating: 97, count: 256), ENAMETOOLONG),
+                              (Data("alias".utf8), EEXIST)] {
+        need(code(namespaceLink(m, name: bytes).1) == Int(expected), "precise component/duplicate refusal")
+    }
+    need(code(namespaceLink(m, m.root).1) == Int(ENOTSUP), "root hardlink refusal")
+    need(code(namespaceLink(m, directory: m.file).1) == Int(ENOTDIR), "non-directory destination refusal")
+    need(code(namespaceLink(m, StallionItem(invalid.id)).1) == Int(EINVAL), "foreign item identity refusal")
+    need(code(namespaceLink(m, directory: StallionItem(1)).1) == Int(EINVAL), "foreign directory identity refusal")
+    let stale = namespaceLookup(m, "extra")
+    let reclaimed: Error? = wait { v.reclaimForTesting(stale, eligible: true, replyHandler: $0) }; need(reclaimed == nil, "stale operand setup")
+    need(code(namespaceLink(m, stale).1) == Int(EINVAL), "reclaimed operand refusal")
+    for identity in [CallerIdentity(uid: caller.uid + 1, gid: caller.gid), CallerIdentity(uid: -1, gid: caller.gid), CallerIdentity(uid: caller.uid, gid: -1)] {
+        need(code(namespaceLink(m, caller: identity).1) == Int(EACCES), "foreign or unrepresentable caller refusal")
+    }
+    if geteuid() != 0 { need(code(namespaceLink(m, caller: CallerIdentity(uid: 0, gid: 0)).1) == Int(EACCES), "root is not owner bypass") }
+    for count in [UInt64(UInt32.max), UInt64.max] {
+        do { try checkLinkCount(count); need(false, "link limit accepted") } catch { need(code(error) == Int(EMLINK), "pure link limit") }
+    }
+    try checkLinkCount(UInt64(UInt32.max) - 1)
+    var pureParent = namespaceMetadata(m,m.root); pureParent.flags = UInt32.max
+    do { try checkLinkParentPolicy(pureParent,owner:geteuid(),caller:caller); need(false,"pure unknown flags granted") }
+    catch { need(code(error) == Int(ENOTSUP),"pure policy input flags refused; not an image format case") }
+    need(!staged && anchorMatches(v.anchor, before) && v.diagnosticSnapshot().0.commits == 0, "preflight before transaction")
+    namespaceAbsent(m); m.close()
+    // Representable creation flags and real ACL/mode metadata, not invented flags.
+    for index in 0..<9 {
+        let f = try Fixture(parent, "namespace-policy-\(index)", mode: index == 4 ? 0o6600 : 0o600, acl: index == 2,
+            owner: index == 8 ? geteuid() + 1 : geteuid(), sourceFlags: index == 0 ? 1 : 0, rootFlags: index == 1 ? 0x8000 : 0,
+            rootMode: index == 5 ? 0o500 : index == 6 ? 0o600 : index == 7 ? 0o1700 : 0o700, rootACL: index == 3)
+        let m = try Mounted(f), v = m.volume, before = v.anchor
+        var prepared = false
+        m.serial { v.diagnosticBeforePrepare = { prepared = true } }
+        let expected = index < 4 ? ENOTSUP : EACCES
+        need(code(namespaceLink(m).1) == Int(expected) && !prepared && anchorMatches(v.anchor, before), "real namespace policy refusal")
+        if [1,3,5,6,7].contains(index) {
+            m.serial {
+                do { try v.linkAccessForTesting(m.root, access: .addFile, caller: caller); need(false, "private addFile bypass") }
+                catch { need(code(error) == Int(expected), "same parent policy in access check") }
+            }
+        }
+        namespaceAbsent(m); m.close(); namespaceReopened(f, "new-name", inode: nil)
+    }
+    // The alias cannot resurrect a detached source retained by a live pin.
+    let detachedFixture = try Fixture(parent, "namespace-detached"), detached = try Mounted(detachedFixture)
+    detached.serial { try! detached.volume.diagnosticMutationForTesting { h,r in
+        need(sfs_image_unlink_expected(h, 1, "file", 4, detachedFixture.id, &r) == SFS_OK, "detach first name")
+        need(sfs_image_unlink_expected(h, 1, "alias", 5, detachedFixture.id, &r) == SFS_OK, "detach final name")
+    } }
+    let detachedAnchor = detached.volume.anchor
+    need(code(namespaceLink(detached).1) == Int(ENOENT) && anchorMatches(detached.volume.anchor, detachedAnchor), "detached source refused")
+    namespaceAbsent(detached); detached.close()
+    let roFixture = try Fixture(parent, "namespace-readonly"), ro = try Mounted(roFixture, writable: false)
+    need(code(namespaceLink(ro).1) == Int(EROFS), "no UUID/write authority refuses link"); ro.close()
+    let revokedFixture = try Fixture(parent,"namespace-revoked"), revoked = try Mounted(revokedFixture), revokedAnchor = revoked.volume.anchor
+    revoked.resource.revoke()
+    need(code(namespaceLink(revoked).1) == Int(EACCES) && anchorMatches(revoked.volume.anchor,revokedAnchor),"revoked link preflight refusal")
+    revoked.close(); namespaceReopened(revokedFixture,"new-name",inode:nil)
+    try namespaceResultFailures(parent, required: required)
+    try namespaceDeliveryGates(parent)
+}
+
+func namespaceResultFailures(_ parent: URL, required: FSItem.Attribute) throws {
+    // Each metadata role fails the production completeness check independently.
+    need(!required.isEmpty, "actual link result has completeness requirements")
+    for rejectedRole in 0..<2 {
+        let f = try Fixture(parent, "namespace-incomplete-\(rejectedRole)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        var role = 0, constructed = false
+        let sourcePin = (m.file as! StallionItem).pin!, parentPin = (m.root as! StallionItem).pin!
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSCreateLinkResult" {
+                if role == rejectedRole { a.invalidateAllProperties() }; role += 1
+            } }
+            v.rejectResultForTesting = { _ in constructed = true; return false }
+        }
+        let result = namespaceLink(m)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && !constructed && role == rejectedRole + 1,
+             "individual role completeness before constructor")
+        need(anchorMatches(v.anchor,before) && v.diagnosticSnapshot().0.commits == 0 &&
+             sameBytes(sourcePin,(m.file as! StallionItem).pin!) && sameBytes(parentPin,(m.root as! StallionItem).pin!), "incomplete link rollback and tokens")
+        namespaceAbsent(m); m.close(); namespaceReopened(f,"new-name",inode:nil)
+    }
+    for mode in 0..<4 {
+        let f = try Fixture(parent,"namespace-prepare-\(mode)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        var reached = false
+        m.serial {
+            if mode < 2 { v.rejectResultForTesting = { name in
+                if name == "FSCreateLinkResult" { reached = true; if mode == 1 { m.resource.revoke() }; return mode == 0 }; return false
+            } }
+            else if mode == 2 { v.diagnosticBeforeCommit = { sfs_image_clear_read_cache(m.coreHandle); fault(7,1) } }
+        }
+        if mode == 3 { fault(1,1) }
+        let result = namespaceLink(m)
+        let expected = mode == 0 ? EIO : mode == 1 ? EACCES : mode == 2 ? ENOMEM : ENOSPC
+        need(result.0 == nil && code(result.1) == Int(expected) && (mode >= 2 || reached) && anchorMatches(v.anchor,before), "prepared result/resource/allocation/append refusal")
+        if mode >= 2 { need(hits() > 0, "real core fault reached") }
+        fault(0,0)
+        if mode < 3 { namespaceAbsent(m) }
+        m.close(); namespaceReopened(f,"new-name",inode:nil)
+    }
+    // Real append-capacity exhaustion; at most 32 links in a 32-cell image.
+    let capacityFixture = try Fixture(parent,"namespace-capacity",capacity:128 * 1024), capacityMount = try Mounted(capacityFixture)
+    var acknowledged: [String] = [], exhausted = false
+    for index in 0..<32 {
+        let name = "capacity-\(index)", before = capacityMount.volume.anchor
+        let result = namespaceLink(capacityMount,name:Data(name.utf8))
+        if let error = result.1 {
+            let first = capacityMount.volume.diagnosticSnapshot().2!
+            need(result.0 == nil && code(error) == Int(ENOSPC) && first.result.status == SFS_LIMIT &&
+                 first.result.limit_reason == SFS_LIMIT_APPEND_CAPACITY && anchorMatches(capacityMount.volume.anchor,before),
+                 "real append capacity refusal retains last acknowledged anchor")
+            namespaceAbsent(capacityMount,name); exhausted = true; break
+        }
+        need(result.0 != nil,"capacity case acknowledged result"); acknowledged.append(name)
+    }
+    need(exhausted,"bounded image reaches append capacity")
+    capacityMount.close()
+    for name in acknowledged { namespaceReopened(capacityFixture,name,inode:capacityFixture.id) }
+    namespaceReopened(capacityFixture,"capacity-\(acknowledged.count)",inode:nil)
+    for fence in [Int32(1), Int32(2)] {
+        let f = try Fixture(parent,"namespace-fence-\(fence)"), m = try Mounted(f), v = m.volume, before = v.anchor
+        fault(4,fence); let result = namespaceLink(m)
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && hits() > 0, "namespace fence error")
+        let failure = v.diagnosticSnapshot().2!
+        need(failure.result.status == (fence == 1 ? SFS_IO : SFS_OUTCOME_UNKNOWN) &&
+             failure.result.phase == (fence == 1 ? SFS_PHASE_RECORD_BARRIER : SFS_PHASE_COMMIT_BARRIER) &&
+             failure.result.poisoned != 0 && anchorMatches(v.anchor,before), "primary fence disposition retained")
+        fault(0,0); need(code(namespaceLink(m).1) == Int(ENOSPC), "sticky fence error")
+        m.close()
+        if fence == 1 { namespaceReopened(f,"new-name",inode:nil) }
+        // Unknown publication is deliberately not described as a rolled-back alias.
+    }
+}
+
+func namespaceDeliveryGates(_ parent: URL) throws {
+    let f = try Fixture(parent,"namespace-queued"), m = try Mounted(f), v = m.volume, before = v.anchor
+    let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), replies = DispatchGroup()
+    var preflight = 0, cleared = false
+    v.enqueue {
+        v.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }
+        v.linkPreflightForTesting = { preflight += 1 }
+        held.signal(); need(release.wait(timeout:.now()+20) == .success,"release namespace queue")
+    }
+    need(held.wait(timeout:.now()+20) == .success,"hold namespace queue")
+    replies.enter(); v.writeCountForTesting(contents:Data([1]),to:m.file,at:0) { count,error in
+        need(count == 0 && code(error) == Int(ENOMEM),"preceding preparation error")
+        v.diagnosticBeforePrepare = nil; cleared = true; replies.leave()
+    }
+    let bytes = Data("queued-name".utf8), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    replies.enter(); v.linkResultForTesting(m.file,name:FSFileName(data:bytes),directory:m.root,caller:caller) { result,error in
+        need(cleared && result == nil && code(error) == Int(ENOMEM),"queued link returns first error after injection cleared"); replies.leave()
+    }
+    let charged = v.linkBudgetForTesting
+    need(charged.0 == 2 && charged.1 == 2 * ReadOnlyLimits.callbackOverhead + 1 + bytes.count,"both callbacks charged before first failure")
+    need(v.diagnosticSnapshot().0.callbacks == 1 && v.diagnosticSnapshot().0.resizes == 0,"namespace is not data/resize")
+    release.signal(); need(replies.wait(timeout:.now()+20) == .success,"queued namespace callbacks finish")
+    m.serial { need(preflight == 0,"queued error checked before namespace preflight") }
+    let admissionHeld = DispatchSemaphore(value:0), admissionRelease = DispatchSemaphore(value:0)
+    v.enqueue { admissionHeld.signal(); need(admissionRelease.wait(timeout:.now()+20) == .success,"release already-failed queue") }
+    need(admissionHeld.wait(timeout:.now()+20) == .success,"hold queue for admission refusal")
+    need(code(namespaceLink(m).1) == Int(ENOMEM),"already-latched error replies without entering held queue")
+    let afterRefusal = v.linkBudgetForTesting
+    need(afterRefusal.0 == 0 && afterRefusal.1 == 0,"admission returns any acquired name-byte ticket")
+    admissionRelease.signal()
+    m.serial { need(preflight == 0,"no namespace preflight after admission refusal") }
+    need(anchorMatches(v.anchor,before) && v.diagnosticSnapshot().0.commits == 0,"no later preflight or commit")
+    namespaceAbsent(m,"queued-name"); namespaceAbsent(m); m.close()
+    namespaceReopened(f,"queued-name",inode:nil); need(f.contents() == Data("original".utf8),"queued failure reopened bytes")
+    let fullFixture = try Fixture(parent,"namespace-saturation"), full = try Mounted(fullFixture)
+    let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), drained = DispatchGroup()
+    full.volume.enqueue { entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"release full namespace queue") }
+    need(entered.wait(timeout:.now()+20) == .success,"hold full namespace queue")
+    for _ in 0..<ReadOnlyLimits.callbacks {
+        drained.enter(); full.volume.enqueue(retainedBytes:0,rejected:{ _ in need(false,"fill namespace callback budget") }) { drained.leave() }
+    }
+    let chargedBefore = full.volume.linkBudgetForTesting
+    need(code(namespaceLink(full).1) == Int(EAGAIN),"namespace callback saturation refusal")
+    let chargedAfter = full.volume.linkBudgetForTesting
+    need(chargedBefore.0 == chargedAfter.0 && chargedBefore.1 == chargedAfter.1 && full.volume.diagnosticSnapshot().0.callbacks == 0,
+         "saturation adds no ticket or data counter")
+    resume.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain namespace budget")
+    namespaceAbsent(full); full.close(); namespaceReopened(fullFixture,"new-name",inode:nil)
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
-        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent)
+        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent)
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
@@ -1014,5 +1309,8 @@ func queuedResizeAfterDeliveryFailure(_ parent: URL) throws {
         print("PASS existing-file diagnostic real-core writes, attributes, failures and admission")
         print("UNQUALIFIED installed default-cache routing and syscall error propagation")
         print("SDK unconstructible capability request fields: \(unavailable.map(String.init).joined(separator: ","))")
+#if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
+        print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
+#endif
     }
 }

@@ -127,7 +127,10 @@ class FSKitInterfaces(unittest.TestCase):
                          'readlinkresultfortesting', 'xattrresultfortesting', 'xattrsresultfortesting',
                          'enumerationresultfortesting', 'readresultconstructorfortesting',
                          'preparedattributesfortesting', 'rejectresultfortesting',
-                         'resultrequestfortesting', 'requirevalidfortesting', 'requireresultvalidityfortesting', 'sqlite')
+                         'resultrequestfortesting', 'requirevalidfortesting', 'requireresultvalidityfortesting',
+                         'linkresultfortesting', 'linkaccessfortesting', 'linkbudgetfortesting',
+                         'linkpreflightfortesting', 'snapshotfortesting', 'createlinkhandler',
+                         'checklinkparentpolicy', 'checklinkcount', 'sqlite')
             for variant in ('legacy', 'context'):
                 directory = self.base / variant
                 directory.mkdir(mode=0o700)
