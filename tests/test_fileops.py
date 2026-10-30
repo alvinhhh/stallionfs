@@ -17,8 +17,12 @@ import sysconfig
 import tempfile
 import unittest
 
-from stallionfs import _scan
+from stallionfs import _scan, images
 from stallionfs.core import run
+if __package__:
+    from .image_failure_diagnostics import failure_scope
+else:
+    from image_failure_diagnostics import failure_scope
 
 
 def descriptors():
@@ -35,8 +39,13 @@ def descriptors():
 class FileOperations(unittest.TestCase):
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-fileops-')).resolve()
+        self.images = {}
 
     def tearDown(self):
+        for image, point in self.images.items():
+            with failure_scope(self.base, image, mountpoint=point, stage='cleanup'):
+                if images.mounted(image) is not None:
+                    raise RuntimeError(f'Attached image; retaining {self.base}')
         if any(Path(m['path']).is_relative_to(self.base) for m in _scan.mounts()):
             raise RuntimeError(f'Unexpected mounted volume; retaining {self.base}')
         for parent, directories, _ in os.walk(self.base, followlinks=False):
@@ -293,7 +302,6 @@ for jobs in (1, 4):
 
     @unittest.skipUnless(os.environ.get('STALLIONFS_TEST_IMAGES') == '1', 'Enable disposable APFS mount check')
     def test_actual_mounted_subtree_refused_and_cross_volume_clone_move_fail(self):
-        from stallionfs import images
         seed = self.fixture()
         (seed / 'outside').unlink()
         (seed / 'outside').symlink_to('directory-0/file-0')
@@ -301,34 +309,47 @@ for jobs in (1, 4):
         victim = self.base / 'victim'; victim.mkdir(mode=0o700)
         sentinel = victim / 'sentinel'; sentinel.write_bytes(b'kept')
         point = victim / 'mounted'
-        images.build(seed, image, 1)
+        self.images[image] = point
+        with failure_scope(self.base, image, stage='preparation'):
+            images.build(seed, image, 1)
         try:
-            repo = images.attach(image, point)
-            expected = dict(files=1, directories=1, symlinks=0, other=0, logical_bytes=4, skipped_mounts=1)
-            self.assertEqual(_scan.scan(victim), expected)
-            self.assertEqual(_scan.scan(victim, bulk=False), expected)
-            launcher = Path(sysconfig.get_path('scripts')) / 'stallionfs'
-            scanned = subprocess.run([str(launcher), '--json', 'scan', str(victim)],
-                                     capture_output=True, text=True, timeout=15)
-            self.assertEqual(scanned.returncode, 0, scanned.stderr)
-            self.assertEqual(json.loads(scanned.stdout), expected)
-            for path in (victim, point):
-                with self.assertRaises(OSError): _scan.delete(path, recursive=True)
-            self.assertEqual(sentinel.read_bytes(), b'kept')
-            with self.assertRaises(OSError) as raised:
-                _scan.clone(victim, self.base / 'contains-mount')
-            self.assertIn(raised.exception.errno, (errno.EXDEV, errno.EBUSY))
-            target = self.base / 'cross-volume-copy'
-            with self.assertRaises(OSError) as raised: _scan.clone(repo / 'directory-0/file-0', target)
-            self.assertEqual(raised.exception.errno, errno.EXDEV)
-            self.assertFalse(target.exists())
-            with self.assertRaises(OSError) as raised: _scan.move(repo / 'directory-0/file-0', target)
-            self.assertEqual(raised.exception.errno, errno.EXDEV)
-            self.assertEqual((repo / 'directory-0/file-0').read_bytes(), b'\0' * 73)
+            with failure_scope(self.base, image, mountpoint=point):
+                repo = images.attach(image, point)
+                expected = dict(files=1, directories=1, symlinks=0, other=0, logical_bytes=4, skipped_mounts=1)
+                self.assertEqual(_scan.scan(victim), expected)
+                self.assertEqual(_scan.scan(victim, bulk=False), expected)
+                launcher = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+                scanned = subprocess.run([str(launcher), '--json', 'scan', str(victim)],
+                                         capture_output=True, text=True, timeout=15)
+                self.assertEqual(scanned.returncode, 0, scanned.stderr)
+                self.assertEqual(json.loads(scanned.stdout), expected)
+                for path in (victim, point):
+                    with self.assertRaises(OSError): _scan.delete(path, recursive=True)
+                self.assertEqual(sentinel.read_bytes(), b'kept')
+                with self.assertRaises(OSError) as raised:
+                    _scan.clone(victim, self.base / 'contains-mount')
+                self.assertIn(raised.exception.errno, (errno.EXDEV, errno.EBUSY))
+                target = self.base / 'cross-volume-copy'
+                with self.assertRaises(OSError) as raised: _scan.clone(repo / 'directory-0/file-0', target)
+                self.assertEqual(raised.exception.errno, errno.EXDEV)
+                self.assertFalse(target.exists())
+                with self.assertRaises(OSError) as raised: _scan.move(repo / 'directory-0/file-0', target)
+                self.assertEqual(raised.exception.errno, errno.EXDEV)
+                self.assertEqual((repo / 'directory-0/file-0').read_bytes(), b'\0' * 73)
         finally:
-            state = images.mounted(image)
-            if state is not None: images.detach(image, state['mountpoint'] or point)
-            if images.mounted(image) is not None: raise RuntimeError(f'Retaining attached image {image}')
+            primary = sys.exc_info()[1]
+            try:
+                with failure_scope(self.base, image, mountpoint=point, stage='cleanup'):
+                    state = images.mounted(image)
+                    if state is not None: images.detach(image, state['mountpoint'] or point)
+                    if images.mounted(image) is not None: raise RuntimeError(f'Retaining attached image {image}')
+            except BaseException as cleanup:
+                if primary is None:
+                    raise
+                try:
+                    primary.add_note(f'Image cleanup failed; retaining {self.base}: {cleanup}')
+                except Exception:
+                    pass
 
 
 if __name__ == '__main__':

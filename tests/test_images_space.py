@@ -14,6 +14,10 @@ import tempfile
 import unittest
 
 from stallionfs import images
+if __package__:
+    from .image_failure_diagnostics import failure_scope
+else:
+    from image_failure_diagnostics import failure_scope
 
 
 def fullsync(path, value):
@@ -37,6 +41,7 @@ def digest(path):
 class ImageSpace(unittest.TestCase):
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-space-')).resolve()
+        self.image_points = {}
         # Registered before setup so a failed build never leaves an unexamined mount.
         self.addCleanup(self.clean)
         if shutil.disk_usage(self.base).free < 3 * 1024 ** 3:
@@ -50,19 +55,25 @@ class ImageSpace(unittest.TestCase):
                         str(self.source / 'sentinel')], check=True)
         (self.source / 'link').symlink_to('sentinel')
         self.seed = self.base / 'seed.sparseimage'
-        images.build(self.source, self.seed, 1)
+        with failure_scope(self.base, self.seed, stage='preparation'):
+            images.build(self.source, self.seed, 1)
 
     def clean(self):
         # A failed/unknown/busy detach aborts cleanup and retains every image.
         try:
             for image in self.base.glob('*.sparseimage'):
-                state = images.mounted(image)
-                if state:
-                    point = state['mountpoint'] or self.base / 'unmounted'
-                    images.detach(image, point)
+                expected_point = self.image_points.get(image)
+                with failure_scope(self.base, image, mountpoint=expected_point, stage='cleanup'):
+                    state = images.mounted(image)
+                    if state:
+                        observed_point = state['mountpoint']
+                        point = observed_point or expected_point or self.base / 'unmounted'
+                        with failure_scope(self.base, image, mountpoint=observed_point or expected_point, stage='cleanup'):
+                            images.detach(image, point)
             for image in self.base.glob('*.sparseimage'):
-                if images.mounted(image) is not None:
-                    raise RuntimeError(f'Image is still attached: {image}')
+                with failure_scope(self.base, image, mountpoint=self.image_points.get(image), stage='cleanup'):
+                    if images.mounted(image) is not None:
+                        raise RuntimeError(f'Image is still attached: {image}')
             # Also reject unexpected mounts under the owned test directory.
             for directory, children, _ in os.walk(self.base, followlinks=False):
                 for name in children:
@@ -86,55 +97,65 @@ class ImageSpace(unittest.TestCase):
 
     def test_volume_full_preserves_existing_data_and_other_images(self):
         first, sibling = self.base / 'full.sparseimage', self.base / 'sibling.sparseimage'
-        images.clone(self.seed, first)
-        images.clone(self.seed, sibling)
-        seed_digest, sibling_digest = digest(self.seed), digest(sibling)
         point = self.base / 'full'
-        repo = images.attach(first, point)
-        self.assert_original(repo)
-        # An explicitly durable user write precedes the out-of-space condition.
-        fullsync(repo / 'acknowledged', b'present before volume filled')
-        filler = repo / 'filler'
-        block = random.Random(42).randbytes(1024 * 1024)
-        written, saw_full = 0, False
-        ceiling = 1200 * 1024 * 1024
-        with filler.open('xb', buffering=0) as stream:
-            try:
-                while written < ceiling:
-                    count = stream.write(block[:min(len(block), ceiling - written)])
-                    self.assertGreater(count, 0, 'Write returned zero without an error')
-                    written += count
-                    if written % (16 * len(block)) == 0:
-                        os.fsync(stream.fileno())
-                os.fsync(stream.fileno())
-            except OSError as exc:
-                if exc.errno != errno.ENOSPC:
-                    raise
-                saw_full = True
-        self.assertTrue(saw_full, f'No ENOSPC before the bounded {ceiling}-byte ceiling')
-        self.assertGreater(written, 0)
-        self.assert_original(repo)
-        self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
-        filler.unlink()
-        fullsync(repo / 'recovered', b'write after freeing space')
-        images.detach(first, point)
-        repo = images.attach(first, point)
-        self.assert_original(repo)
-        self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
-        self.assertEqual((repo / 'recovered').read_bytes(), b'write after freeing space')
-        self.assertFalse((repo / 'filler').exists())
-        images.detach(first, point)
+        self.image_points.update({first: point, sibling: self.base / 'sibling', self.seed: self.base / 'seed'})
+        with failure_scope(self.base, first, stage='preparation'):
+            images.clone(self.seed, first)
+        with failure_scope(self.base, sibling, stage='preparation'):
+            images.clone(self.seed, sibling)
+        with failure_scope(self.base, self.seed):
+            seed_digest = digest(self.seed)
+        with failure_scope(self.base, sibling):
+            sibling_digest = digest(sibling)
+        with failure_scope(self.base, first, mountpoint=point):
+            repo = images.attach(first, point)
+            self.assert_original(repo)
+            # An explicitly durable user write precedes the out-of-space condition.
+            fullsync(repo / 'acknowledged', b'present before volume filled')
+            filler = repo / 'filler'
+            block = random.Random(42).randbytes(1024 * 1024)
+            written, saw_full = 0, False
+            ceiling = 1200 * 1024 * 1024
+            with filler.open('xb', buffering=0) as stream:
+                try:
+                    while written < ceiling:
+                        count = stream.write(block[:min(len(block), ceiling - written)])
+                        self.assertGreater(count, 0, 'Write returned zero without an error')
+                        written += count
+                        if written % (16 * len(block)) == 0:
+                            os.fsync(stream.fileno())
+                    os.fsync(stream.fileno())
+                except OSError as exc:
+                    if exc.errno != errno.ENOSPC:
+                        raise
+                    saw_full = True
+            self.assertTrue(saw_full, f'No ENOSPC before the bounded {ceiling}-byte ceiling')
+            self.assertGreater(written, 0)
+            self.assert_original(repo)
+            self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
+            filler.unlink()
+            fullsync(repo / 'recovered', b'write after freeing space')
+            images.detach(first, point)
+            repo = images.attach(first, point)
+            self.assert_original(repo)
+            self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
+            self.assertEqual((repo / 'recovered').read_bytes(), b'write after freeing space')
+            self.assertFalse((repo / 'filler').exists())
+            images.detach(first, point)
         # Compare closed bytes before mounting these untouched images for content checks.
-        self.assertEqual(digest(self.seed), seed_digest)
-        self.assertEqual(digest(sibling), sibling_digest)
+        with failure_scope(self.base, self.seed):
+            self.assertEqual(digest(self.seed), seed_digest)
+        with failure_scope(self.base, sibling):
+            self.assertEqual(digest(sibling), sibling_digest)
         self.assert_original(self.source)
         for image, name in ((sibling, 'sibling'), (self.seed, 'seed')):
             mounted = self.base / name
-            untouched = images.attach(image, mounted)
-            self.assert_original(untouched)
-            for extra in ('acknowledged', 'recovered', 'filler'):
-                self.assertFalse((untouched / extra).exists())
-            images.detach(image, mounted)
+            with failure_scope(self.base, image, mountpoint=mounted):
+                untouched = images.attach(image, mounted)
+                self.assert_original(untouched)
+                for extra in ('acknowledged', 'recovered', 'filler'):
+                    self.assertFalse((untouched / extra).exists())
+                images.detach(image, mounted)
         print(f'\nAPFS ENOSPC after {written} acknowledged bytes; remount and isolation passed', flush=True)
 
 
