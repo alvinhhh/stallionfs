@@ -15,9 +15,9 @@ import unittest
 
 from stallionfs import images
 if __package__:
-    from .image_failure_diagnostics import failure_scope
+    from .image_failure_diagnostics import failure_scope, observe_detach
 else:
-    from image_failure_diagnostics import failure_scope
+    from image_failure_diagnostics import failure_scope, observe_detach
 
 
 def fullsync(path, value):
@@ -135,7 +135,8 @@ class ImageSpace(unittest.TestCase):
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             filler.unlink()
             fullsync(repo / 'recovered', b'write after freeing space')
-            images.detach(first, point)
+            with observe_detach():
+                images.detach(first, point)
             repo = images.attach(first, point)
             self.assert_original(repo)
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
