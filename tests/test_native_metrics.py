@@ -162,27 +162,101 @@ class NativeCollector(unittest.TestCase):
         self.assertEqual(base64.b64decode(row['stderr_b64']), stderr)
 
     def test_timeout_terminates_original_group_and_keeps_uncertainty(self):
-        child = process(code=-signal.SIGKILL, effects=[
+        child = process(code=None)
+        responses = iter([
             subprocess.TimeoutExpired('command', 1, output=b'partial', stderr=b'pending'),
             subprocess.TimeoutExpired('command', 1, output=b'partial', stderr=b'pending'),
             (b'partial', b'pending')])
+        def communicate(**kwargs):
+            response = next(responses)
+            if isinstance(response, BaseException): raise response
+            child.returncode = -signal.SIGKILL
+            return response
+        child.communicate.side_effect = communicate
         with mock.patch.object(metrics.subprocess, 'Popen', return_value=child), \
-             mock.patch.object(metrics.os, 'killpg', side_effect=[None, None, ProcessLookupError()]) as kill:
+             mock.patch.object(metrics.os, 'killpg') as kill:
             row = metrics.collect(['/bin/sleep', '60'], timeout_s=0.1, termination_grace_s=0.1)
         self.assertTrue(row['timed_out'])
         self.assertTrue(row['completion_uncertain'])
         self.assertFalse(row['ok'])
-        self.assertEqual(kill.call_args_list, [mock.call(54321, signal.SIGTERM), mock.call(54321, signal.SIGKILL), mock.call(54321, 0)])
+        self.assertEqual(kill.call_args_list, [mock.call(54321, signal.SIGTERM), mock.call(54321, signal.SIGKILL)])
+        self.assertEqual(row['exit_code'], -signal.SIGKILL)
         self.assertEqual(base64.b64decode(row['stdout_b64']), b'partial')
 
-    def test_reaped_leader_does_not_leave_original_group_unterminated(self):
-        child = process(code=0, effects=[subprocess.TimeoutExpired('command', 1), (b'', REPORT), (b'', REPORT)])
-        with mock.patch.object(metrics.subprocess, 'Popen', return_value=child), \
-             mock.patch.object(metrics.os, 'killpg', side_effect=[None, None, None, ProcessLookupError()]) as kill:
-            row = metrics.collect(['/usr/bin/true'], timeout_s=0.1)
-        self.assertEqual(kill.call_args_list, [mock.call(54321, signal.SIGTERM), mock.call(54321, 0),
-                                               mock.call(54321, signal.SIGKILL), mock.call(54321, 0)])
-        self.assertTrue(row['completion_uncertain'])
+    def test_already_reaped_cleanup_preserves_first_failure_and_output_without_signals(self):
+        for code in (0, 7):
+            with self.subTest(returncode=code):
+                child = process(code=code, effects=[(b'complete\xff', b'error\xfe')])
+                denied = PermissionError(1, 'original probe denied')
+                prior = {'signal': 'SIGTERM', 'sent': False, 'error': 'earlier signal denied'}
+                receipt = {'termination': [prior]}
+
+                def foreign_group(pgid, number):
+                    self.assertEqual(pgid, child.pid)
+                    if not number: raise PermissionError(1, 'foreign group probe denied')
+                    return None  # A foreign group could accept a destructive signal.
+
+                with mock.patch.object(metrics.os, 'killpg', side_effect=foreign_group) as kill, \
+                        self.assertRaises(metrics.ChildCompletionUnknown) as caught:
+                    with metrics._retain_on_failure(receipt, lambda: child, None, 0.1):
+                        raise denied
+                self.assertIs(caught.exception.__cause__, denied)
+                self.assertIs(caught.exception.receipt, receipt)
+                self.assertEqual(receipt['error'], 'PermissionError: [Errno 1] original probe denied')
+                self.assertEqual(receipt['termination'][0], prior)
+                self.assertEqual(receipt['termination'][1],
+                                 {'signal': 'SIGTERM', 'sent': False, 'reason': 'leader already reaped'})
+                kill.assert_not_called()
+                child.communicate.assert_called_once_with(timeout=0.1)
+                self.assertEqual(base64.b64decode(receipt['stdout_b64']), b'complete\xff')
+                self.assertEqual(base64.b64decode(receipt['stderr_b64']), b'error\xfe')
+                self.assertEqual(receipt['exit_code'], code)
+                self.assertFalse(receipt['ok'])
+                self.assertTrue(receipt['completion_uncertain'])
+                self.assertEqual(receipt['group_ownership_after_cleanup'], 'unknown_after_reap')
+                self.assertIsNone(receipt['group_alive_after_cleanup'])
+
+    def test_cleanup_never_escalates_after_communicate_reaps_leader(self):
+        for profile in ('complete', 'term-eperm', 'reaped-timeout'):
+            with self.subTest(profile=profile):
+                child = process(code=None)
+                receipt = {'completion_uncertain': True, 'error': 'original deadline'}
+                output = (b'partial\xff', b'error\xfe')
+                calls = []
+
+                def communicate(**kwargs):
+                    calls.append(kwargs)
+                    child.returncode = 0
+                    if profile == 'reaped-timeout' and len(calls) == 1:
+                        raise subprocess.TimeoutExpired('command', 0.1, output=output[0], stderr=output[1])
+                    return output
+
+                def group(pgid, number):
+                    self.assertEqual(pgid, child.pid)
+                    if number == signal.SIGTERM:
+                        self.assertIsNone(child.returncode)
+                        if profile == 'term-eperm': raise PermissionError(1, 'synthetic TERM denied')
+                    elif not number:
+                        raise PermissionError(1, 'foreign group probe denied')
+                    return None  # A reused group would accept SIGKILL.
+
+                child.communicate.side_effect = communicate
+                with mock.patch.object(metrics.os, 'killpg', side_effect=group) as kill:
+                    self.assertEqual(metrics._stop_group(child, receipt, 0.1), output)
+                self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM)])
+                self.assertEqual(calls, [{'timeout': 0.1}] * (2 if profile == 'reaped-timeout' else 1))
+                self.assertEqual(receipt['error'], 'original deadline')
+                self.assertTrue(receipt['completion_uncertain'])
+                self.assertEqual(receipt['group_signal_skipped_reason'], 'leader_already_reaped')
+                self.assertEqual(receipt['group_ownership_after_cleanup'], 'unknown_after_reap')
+                self.assertIsNone(receipt['group_alive_after_cleanup'])
+                if profile == 'term-eperm':
+                    self.assertEqual(receipt['termination'][0]['error'], '[Errno 1] synthetic TERM denied')
+                if profile == 'reaped-timeout':
+                    self.assertEqual(receipt['termination'][-1],
+                                     {'signal': 'SIGKILL', 'sent': False, 'reason': 'leader already reaped'})
+                    self.assertEqual(base64.b64decode(receipt['partial_stdout_b64']), output[0])
+                    self.assertEqual(base64.b64decode(receipt['partial_stderr_b64']), output[1])
 
     def test_unreapable_child_is_bounded_and_partial_bytes_retained(self):
         timeout = subprocess.TimeoutExpired('command', 1, output=b'x', stderr=b'y')

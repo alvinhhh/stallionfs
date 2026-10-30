@@ -157,14 +157,22 @@ def _owned_command(argv, *, cwd, timeout, stem):
             record['phase'] = 'cleaning'
             record['drain_deadline'] = time.monotonic() + 2
             record['reap_deadline'] = record['drain_deadline'] + 2
-            record['kill_attempts'] += 1
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except BaseException as error:
-                record['cleanup_errors'].append(repr(error))
+            leader_reaped = proc.returncode is not None
+            if leader_reaped:
+                # Reaping releases the PID; its numeric group no longer proves ownership.
+                record['group_signal_skipped_reason'] = 'leader_already_reaped'
+                record['group_ownership_after_cleanup'] = 'unknown_after_reap'
+                record['group_alive_after_cleanup'] = None
                 record['cleanup_uncertain'] = True
+            else:
+                record['kill_attempts'] += 1
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    record['cleanup_errors'].append(repr(error))
+                    record['cleanup_uncertain'] = True
             while selector is not None and selector.get_map() and time.monotonic() < record['drain_deadline']:
                 try:
                     capture(cleaning=True)
@@ -182,16 +190,17 @@ def _owned_command(argv, *, cwd, timeout, stem):
                     record['cleanup_uncertain'] = True
             if cleanup_poll() is None:
                 record['cleanup_uncertain'] = True
-            try:
-                os.killpg(proc.pid, 0)
-            except ProcessLookupError:
-                record['group_alive_after_cleanup'] = False
-            except BaseException as error:
-                record['cleanup_errors'].append(repr(error))
-                record['cleanup_uncertain'] = True
-            else:
-                record['group_alive_after_cleanup'] = True
-                record['cleanup_uncertain'] = True
+            if not leader_reaped:
+                try:
+                    os.killpg(proc.pid, 0)
+                except ProcessLookupError:
+                    record['group_alive_after_cleanup'] = False
+                except BaseException as error:
+                    record['cleanup_errors'].append(repr(error))
+                    record['cleanup_uncertain'] = True
+                else:
+                    record['group_alive_after_cleanup'] = True
+                    record['cleanup_uncertain'] = True
         if proc is not None:
             record['returncode'] = cleanup_poll()
             for pipe in (proc.stdout, proc.stderr):
@@ -482,6 +491,83 @@ class ImageCore(unittest.TestCase):
 
 
 class ImageDiagnostics(unittest.TestCase):
+    def test_reaped_child_failure_never_signals_numeric_group(self):
+        for label, returncode in (('eperm', 0), ('live-group', 0), ('exit', 7)):
+            with self.subTest(command=label), tempfile.TemporaryDirectory(prefix='stallionfs-image-reaped-') as temporary:
+                state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+                stem = Path(temporary) / label
+                output, error_output = b'complete output\n', b'complete error\n'
+                denied = PermissionError(1, 'synthetic group probe denied')
+                fake = mock.Mock(pid=987654, returncode=None)
+                foreign_group_signals = []
+
+                def launch(argv, **kwargs):
+                    self.assertEqual(argv, ['owned', label])
+                    self.assertIs(kwargs['start_new_session'], True)
+                    for name, raw in (('stdout', output), ('stderr', error_output)):
+                        reader, writer = os.pipe()
+                        try:
+                            os.write(writer, raw)
+                        finally:
+                            os.close(writer)
+                        setattr(fake, name, os.fdopen(reader, 'rb', buffering=0))
+                    return fake
+
+                def poll():
+                    self.assertTrue(fake.stdout.closed and fake.stderr.closed)
+                    fake.returncode = returncode
+                    return returncode
+
+                def group(pgid, number):
+                    self.assertEqual(pgid, fake.pid)
+                    if number:
+                        # A reused, signalable group would accept this destructive call.
+                        foreign_group_signals.append(number)
+                        return
+                    if label == 'eperm':
+                        raise denied
+                    if label == 'exit':
+                        raise ProcessLookupError()
+
+                fake.poll.side_effect = poll
+                with mock.patch(__name__ + '._command_state', state), \
+                        mock.patch.object(subprocess, 'Popen', side_effect=launch) as popen, \
+                        mock.patch.object(os, 'killpg', side_effect=group) as killpg:
+                    if label == 'exit':
+                        result = _owned_command(['owned', label], cwd=temporary, timeout=10, stem=stem)
+                        self.assertEqual(result.returncode, returncode)
+                        self.assertEqual((result.stdout, result.stderr), (output.decode(), error_output.decode()))
+                    else:
+                        with self.assertRaises(PermissionError if label == 'eperm' else RuntimeError) as caught:
+                            _owned_command(['owned', label], cwd=temporary, timeout=10, stem=stem)
+                        if label == 'eperm':
+                            self.assertIs(caught.exception, denied)
+                        else:
+                            self.assertEqual(str(caught.exception), 'Image command left an owned process group alive')
+                    self.assertEqual(killpg.call_args_list, [mock.call(fake.pid, 0)])
+                    self.assertEqual(foreign_group_signals, [])
+                    fake.wait.assert_not_called()
+                    receipt = json.loads(Path(str(stem) + '.command.json').read_text())
+                    self.assertEqual(receipt['returncode'], returncode)
+                    self.assertEqual(receipt['kill_attempts'], 0)
+                    self.assertEqual(receipt['group_signal_skipped_reason'], 'leader_already_reaped')
+                    self.assertEqual(receipt['group_ownership_after_cleanup'], 'unknown_after_reap')
+                    self.assertIsNone(receipt['group_alive_after_cleanup'])
+                    self.assertTrue(receipt['cleanup_uncertain'])
+                    self.assertEqual(receipt['first_failure']['kind'], 'exit' if label == 'exit' else 'command_error')
+                    if label == 'eperm':
+                        self.assertEqual(receipt['primary_exception'], repr(denied))
+                        self.assertEqual(receipt['first_failure']['detail'], repr(denied))
+                    for name, raw in (('stdout', output), ('stderr', error_output)):
+                        self.assertEqual(Path(receipt[name + '_path']).read_bytes(), raw)
+                        self.assertEqual(receipt[name + '_retained_bytes'], len(raw))
+                    self.assertIsNone(state['active'])
+                    next_stem = Path(temporary) / 'refused-next'
+                    with self.assertRaises(RuntimeError):
+                        _owned_command(['never'], cwd=temporary, timeout=10, stem=next_stem)
+                    self.assertEqual(popen.call_count, 1)
+                    self.assertFalse(list(Path(temporary).glob('refused-next*')))
+
     def test_timeout_preserves_partial_output_and_reraises(self):
         # Local pipes carry exact bytes; Popen, clocks and group signals are all synthetic.
         profiles = [('compile-0', 'deadline'), ('compile-1', 'existing-timeout'),
@@ -664,7 +750,7 @@ class ImageDiagnostics(unittest.TestCase):
                         else:
                             self.assertEqual(receipt['pid'], fake.pid)
                             self.assertEqual(receipt['pgid'], fake.pid)
-                            self.assertEqual(receipt['kill_attempts'], 1)
+                            self.assertEqual(receipt['kill_attempts'], 0 if profile == 'exit' else 1)
                         if profile == 'cancel':
                             self.assertEqual(receipt['first_signal'], signal.SIGTERM)
                             self.assertEqual(receipt['signal_count'], 3)
