@@ -185,7 +185,12 @@ static void replacement_and_types(void) {
     sfs_diag_fault(6, 2); assert(sfs_image_rename_replace(h, 1, "src", 3, src, 1, "dst", 3, dst, &receipt) == SFS_TIME_UNAVAILABLE);
     assert(sfs_diag_hit() == 1 && !receipt.transaction_active); sfs_diag_fault(0, 0);
     OK(sfs_image_lookup(h, 0, 1, "dst", 3, &e, &receipt)); assert(e.inode == dst); bytes(h, dp, "target", 6);
-    OK(sfs_image_begin(h, &receipt)); OK(sfs_image_rename_replace(h, 1, "src", 3, src, 1, "dst", 3, dst, &receipt)); commit(h);
+    OK(sfs_image_begin(h, &receipt)); OK(sfs_image_rename_replace(h, 1, "src", 3, src, 1, "dst", 3, dst, &receipt));
+    sfs_pin_stat pending, committed; OK(sfs_image_pin_stat_transaction(h, dp, &pending, &receipt));
+    assert(!pending.linked && !pending.metadata.link_count && !pending.metadata.entry.parent && !pending.metadata.entry.name_length);
+    OK(sfs_image_pin_stat(h, dp, &committed, &receipt)); assert(committed.linked && committed.metadata.link_count == 1);
+    OK(sfs_image_pin_stat_transaction(h, sp, &pending, &receipt)); assert(pending.linked && pending.metadata.link_count == 2);
+    commit(h);
     bytes(h, dp, "target", 6); bytes(h, sp, "source", 6);
     OK(sfs_image_begin(h, &receipt)); OK(sfs_image_pin_write(h, dp, 0, "orphan", 6, &receipt)); commit(h);
     bytes(h, sp, "source", 6); bytes(h, dp, "orphan", 6);
@@ -252,6 +257,7 @@ static void reservations_and_limits(void) {
         assert(sfs_image_pin_acquire(h, 1, &zero, &receipt) == SFS_UNSUPPORTED);
         assert(sfs_image_pin_reserve(h, &zero, &receipt) == SFS_UNSUPPORTED);
         assert(sfs_image_pin_stat(h, zero, &st, &receipt) == SFS_UNSUPPORTED);
+        assert(sfs_image_pin_stat_transaction(h, zero, &st, &receipt) == SFS_UNSUPPORTED);
         assert(sfs_image_pin_write(h, zero, 0, "x", 1, &receipt) == SFS_UNSUPPORTED);
         assert(sfs_image_pin_bind(h, zero, 1, &receipt) == SFS_UNSUPPORTED);
         assert(sfs_image_pin_release(h, zero, &receipt) == SFS_UNSUPPORTED);
@@ -297,12 +303,16 @@ static void abort_capacity_and_faults(void) {
     }
     for (int fault = 1; fault <= 3; ++fault) {
         h = fresh(6, name, 4); pin = detached(h, "file", &id);
-        OK(sfs_image_begin(h, &receipt)); OK(sfs_image_pin_write(h, pin, 0, "new", 3, &receipt));
+        OK(sfs_image_begin(h, &receipt)); OK(sfs_image_pin_write(h, pin, 8192, "new", 3, &receipt));
+        sfs_pin_stat pending; OK(sfs_image_pin_stat_transaction(h, pin, &pending, &receipt));
+        assert(!pending.linked && pending.metadata.entry.size == 8195 && receipt.transaction_active && !receipt.fence_attempted);
         sfs_diag_fault(fault == 2 ? 0 : 4, fault == 3 ? 2 : 1); partial_slot = fault == 2;
         enum sfs_status e = sfs_image_commit(h, &receipt); assert(sfs_diag_hit() || partial_slot == 2); partial_slot = 0;
         assert(e == (fault == 1 ? SFS_IO : SFS_OUTCOME_UNKNOWN) && receipt.poisoned && !receipt.transaction_active);
         assert(receipt.fence_attempted == (fault == 3 ? 3u : 1u) && receipt.fence_succeeded == (fault == 1 ? 0u : 1u));
         sfs_diag_fault(0, 0); sfs_pin_stat st; assert(sfs_image_pin_stat(h, pin, &st, &receipt) == SFS_POISONED);
+        memset(&st, 0xa5, sizeof(st)); sfs_pin_stat unchanged; memcpy(&unchanged, &st, sizeof(st));
+        assert(sfs_image_pin_stat_transaction(h, pin, &st, &receipt) == SFS_POISONED && !memcmp(&st, &unchanged, sizeof(st)));
         assert(sfs_image_begin(h, &receipt) == SFS_POISONED); OK(sfs_image_pin_release(h, pin, &receipt));
         close_failure = 1; assert(sfs_image_close(h, &receipt) == SFS_IO); /* Handle consumed. */
     }
@@ -417,11 +427,157 @@ static void rollover_leaf_boundaries_and_target_switches(void) {
     complete_bytes(h, a, expected, WIDE_SIZE); complete_bytes(h, b, expected_b, sizeof(expected_b)); complete_bytes(h, c, expected_c, sizeof(expected_c));
     no_resurrection(h, aid, bid, cid); verify(h); free(expected); OK(sfs_image_close(h, &receipt));
 }
+static void same_time(sfs_timestamp a, sfs_timestamp b) {
+    assert(a.seconds == b.seconds && a.nanoseconds == b.nanoseconds);
+}
+static void same_stat(sfs_pin_stat a, sfs_pin_stat b) {
+    assert(a.linked == b.linked && a.metadata.link_count == b.metadata.link_count);
+    sfs_metadata_entry *x = &a.metadata, *y = &b.metadata;
+    assert(x->entry.inode == y->entry.inode && x->entry.parent == y->entry.parent &&
+        x->entry.kind == y->entry.kind && x->entry.size == y->entry.size &&
+        x->entry.name_length == y->entry.name_length && !memcmp(x->entry.name, y->entry.name, sizeof(x->entry.name)));
+    assert(x->mode == y->mode && x->uid == y->uid && x->gid == y->gid && x->flags == y->flags &&
+        x->referenced_data_bytes == y->referenced_data_bytes);
+    same_time(x->birth, y->birth); same_time(x->access, y->access);
+    same_time(x->modification, y->modification); same_time(x->change, y->change);
+}
+static void transaction_stat_error(sfs_image *h, sfs_pin pin, enum sfs_status expected) {
+    sfs_pin_stat value, before; memset(&value, 0xa5, sizeof(value)); memcpy(&before, &value, sizeof(value));
+    assert(sfs_image_pin_stat_transaction(h, pin, &value, &receipt) == expected);
+    assert(!memcmp(&value, &before, sizeof(value)));
+}
+static sfs_pin_stat transaction_stat(sfs_image *h, sfs_pin pin) {
+    uint64_t eof = h->eof, token = h->token; batch *pending = h->batch;
+    sfs_pin_stat value; OK(sfs_image_pin_stat_transaction(h, pin, &value, &receipt));
+    assert(h->batch == pending && h->eof == eof && h->token == token);
+    assert(receipt.transaction_active && !receipt.poisoned && receipt.generation == h->current.generation &&
+        !memcmp(receipt.root_digest, h->current.root.digest, sizeof(receipt.root_digest)) &&
+        receipt.committed_end == h->current.end && !receipt.fence_attempted && !receipt.fence_succeeded);
+    return value;
+}
+static void transaction_metadata_views(void) {
+    char name[48]; sfs_image *h = fresh(6, name, 12); sfs_inode id;
+    sfs_pin pin = named_pin(h, "live", &id), root, reserved;
+    OK(sfs_image_pin_acquire(h, 1, &root, &receipt)); OK(sfs_image_pin_reserve(h, &reserved, &receipt));
+    sfs_pin_stat old, root_old, value, prepared, parent_prepared;
+    OK(sfs_image_pin_stat(h, pin, &old, &receipt)); OK(sfs_image_pin_stat(h, root, &root_old, &receipt));
+    transaction_stat_error(h, pin, SFS_STATE);
+    OK(sfs_image_begin(h, &receipt)); transaction_stat_error(h, reserved, SFS_STATE);
+    sfs_inode created = add(h, 1, "new", SFS_FILE); OK(sfs_image_pin_bind(h, reserved, created, &receipt));
+    value = transaction_stat(h, reserved); assert(value.linked && value.metadata.entry.inode == created && !value.metadata.entry.size);
+    same_time(transaction_stat(h, root).metadata.modification, value.metadata.change);
+    OK(sfs_image_pin_write(h, reserved, 4096, "N", 1, &receipt));
+    value = transaction_stat(h, reserved); assert(value.metadata.entry.size == 4097 && value.metadata.referenced_data_bytes == 4096);
+    memset(&value, 0xa5, sizeof(value)); sfs_pin_stat untouched; memcpy(&untouched, &value, sizeof(value));
+    assert(sfs_image_pin_stat(h, reserved, &value, &receipt) == SFS_STATE && !memcmp(&value, &untouched, sizeof(value)));
+    OK(sfs_image_link(h, id, 1, "alias", 5, &receipt));
+    value = transaction_stat(h, pin); assert(value.linked && value.metadata.link_count == 2);
+    OK(sfs_image_pin_write(h, pin, 8192, "new", 3, &receipt)); assert(h->batch && h->batch->inode.e.inode == id);
+    prepared = transaction_stat(h, pin); assert(prepared.metadata.entry.size == 8195 && prepared.metadata.referenced_data_bytes == 8192);
+    OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, old);
+    OK(sfs_image_pin_stat(h, root, &value, &receipt)); same_stat(value, root_old);
+    parent_prepared = transaction_stat(h, root); sfs_pin_stat created_prepared = transaction_stat(h, reserved);
+    commit(h); OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, prepared);
+    OK(sfs_image_pin_stat(h, root, &value, &receipt)); same_stat(value, parent_prepared);
+    OK(sfs_image_pin_stat(h, reserved, &value, &receipt)); same_stat(value, created_prepared);
+    old = prepared;
+    /* Metadata-only staged target and matching detached batch both matter. */
+    OK(sfs_image_begin(h, &receipt)); OK(sfs_image_unlink_expected(h, 1, "live", 4, id, &receipt));
+    value = transaction_stat(h, pin); assert(value.linked && value.metadata.link_count == 1);
+    OK(sfs_image_unlink_expected(h, 1, "alias", 5, id, &receipt));
+    value = transaction_stat(h, pin); assert(!value.linked && !value.metadata.link_count && !value.metadata.entry.parent && !value.metadata.entry.name_length);
+    OK(sfs_image_pin_resize(h, pin, 4097, &receipt));
+    sfs_metadata_update update = { .fields = SFS_META_MODE, .mode = 0100600u };
+    OK(sfs_image_pin_set_metadata(h, pin, &update, &receipt));
+    OK(sfs_image_pin_set_xattr(h, pin, "x", 1, "v", 1, &receipt));
+    OK(sfs_image_pin_write(h, pin, 4096, "Q", 1, &receipt));
+    assert(h->batch && h->batch->detached);
+    prepared = transaction_stat(h, pin); assert(!prepared.linked && prepared.metadata.entry.size == 4097 &&
+        prepared.metadata.mode == 0100600u && prepared.metadata.referenced_data_bytes == 8192);
+    OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, old);
+    OK(sfs_image_abort(h, &receipt)); OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, old);
+    OK(sfs_image_begin(h, &receipt)); OK(sfs_image_unlink_expected(h, 1, "live", 4, id, &receipt));
+    OK(sfs_image_unlink_expected(h, 1, "alias", 5, id, &receipt));
+    OK(sfs_image_pin_resize(h, pin, 2, &receipt)); prepared = transaction_stat(h, pin);
+    commit(h); OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, prepared); bytes(h, pin, "ol", 2);
+    sfs_entry entry; assert(sfs_image_stat(h, 0, id, &entry, &receipt) == SFS_NOT_FOUND);
+    assert(sfs_image_lookup(h, 0, 1, "live", 4, &entry, &receipt) == SFS_NOT_FOUND);
+    assert(sfs_image_lookup(h, 0, 1, "alias", 5, &entry, &receipt) == SFS_NOT_FOUND);
+    /* Previously committed detached P is also distinct from a new Q. */
+    OK(sfs_image_begin(h, &receipt)); OK(sfs_image_pin_write(h, pin, 8192, "Z", 1, &receipt));
+    value = transaction_stat(h, pin); assert(!value.linked && value.metadata.entry.size == 8193);
+    OK(sfs_image_abort(h, &receipt)); OK(sfs_image_pin_stat(h, pin, &value, &receipt)); same_stat(value, prepared);
+    const unsigned kinds[] = { SFS_DIRECTORY, SFS_SYMLINK };
+    for (unsigned i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
+        unsigned kind = kinds[i];
+        const char *child = kind == SFS_DIRECTORY ? "directory" : "symlink"; sfs_pin next;
+        OK(sfs_image_pin_reserve(h, &next, &receipt)); OK(sfs_image_begin(h, &receipt));
+        sfs_inode child_id = add(h, 1, child, kind); OK(sfs_image_pin_bind(h, next, child_id, &receipt));
+        value = transaction_stat(h, next); assert(value.linked && value.metadata.entry.kind == kind);
+        commit(h); sfs_pin_stat published; OK(sfs_image_pin_stat(h, next, &published, &receipt)); same_stat(published, value);
+        OK(sfs_image_pin_release(h, next, &receipt));
+    }
+    sfs_pin aborted; OK(sfs_image_pin_reserve(h, &aborted, &receipt)); OK(sfs_image_begin(h, &receipt));
+    created = add(h, 1, "aborted", SFS_FILE); OK(sfs_image_pin_bind(h, aborted, created, &receipt));
+    OK(sfs_image_pin_write(h, aborted, 4096, "A", 1, &receipt));
+    value = transaction_stat(h, aborted); assert(value.metadata.entry.size == 4097);
+    OK(sfs_image_abort(h, &receipt)); OK(sfs_image_begin(h, &receipt)); transaction_stat_error(h, aborted, SFS_INVALID);
+    OK(sfs_image_abort(h, &receipt)); assert(sfs_image_lookup(h, 0, 1, "aborted", 7, &entry, &receipt) == SFS_NOT_FOUND);
+    verify(h); OK(sfs_image_close(h, &receipt));
+}
+static void transaction_metadata_failures(void) {
+    char name[48]; sfs_image *h = fresh(6, name, 4); sfs_inode id;
+    sfs_pin pin = named_pin(h, "live", &id), stale;
+    OK(sfs_image_pin_reserve(h, &stale, &receipt)); OK(sfs_image_pin_release(h, stale, &receipt));
+    OK(sfs_image_begin(h, &receipt)); transaction_stat_error(h, stale, SFS_INVALID);
+    sfs_pin bad = pin; bad.session[0] ^= 1; transaction_stat_error(h, bad, SFS_INVALID);
+    assert(sfs_image_pin_stat_transaction(h, pin, NULL, &receipt) == SFS_INVALID && receipt.transaction_active);
+    char other_name[48]; sfs_image *other = fresh(6, other_name, 2);
+    OK(sfs_image_begin(other, &receipt)); transaction_stat_error(other, pin, SFS_INVALID);
+    OK(sfs_image_abort(other, &receipt)); OK(sfs_image_close(other, &receipt));
+    for (int at = 1; at <= 2; ++at) {
+        sfs_image_clear_read_cache(h); sfs_diag_fault(7, at);
+        transaction_stat_error(h, pin, SFS_NOMEM); assert(sfs_diag_hit() && receipt.transaction_active && !receipt.poisoned && receipt.system_errno == ENOMEM);
+        sfs_diag_fault(0, 0); assert(transaction_stat(h, pin).metadata.entry.size == 3);
+    }
+    OK(sfs_image_pin_write(h, pin, 8192, "new", 3, &receipt));
+    /* The matching batch path neither allocates nor flushes. */
+    sfs_diag_fault(7, 1); assert(transaction_stat(h, pin).metadata.entry.size == 8195 && !sfs_diag_hit());
+    sfs_diag_fault(0, 0); OK(sfs_image_abort(h, &receipt)); bytes(h, pin, "old", 3);
+    OK(sfs_image_close(h, &receipt)); OK(sfs_image_open_readonly(parent, name, &h, &receipt));
+    OK(sfs_image_pin_configure(h, 2, 1048576, &receipt)); OK(sfs_image_pin_acquire(h, id, &pin, &receipt));
+    transaction_stat_error(h, pin, SFS_STATE); OK(sfs_image_close(h, &receipt));
+    /* A fatal metadata read discards pending namespace work and reservations. */
+    h = fresh(6, name, 4); pin = named_pin(h, "live", &id); sfs_pin created;
+    OK(sfs_image_pin_reserve(h, &created, &receipt)); OK(sfs_image_begin(h, &receipt));
+    sfs_inode new_id = add(h, 1, "pending", SFS_FILE); OK(sfs_image_pin_bind(h, created, new_id, &receipt));
+    OK(sfs_image_rename_replace(h, 1, "live", 4, id, 1, "renamed", 7, 0, &receipt));
+    sfs_image_clear_read_cache(h); sfs_diag_fault(8, 1); transaction_stat_error(h, pin, SFS_IO);
+    assert(sfs_diag_hit() && receipt.poisoned && !receipt.transaction_active);
+    sfs_diag_fault(0, 0); transaction_stat_error(h, pin, SFS_POISONED); OK(sfs_image_close(h, &receipt));
+    OK(sfs_image_open(parent, name, &h, &receipt)); sfs_entry e;
+    OK(sfs_image_lookup(h, 0, 1, "live", 4, &e, &receipt)); assert(e.inode == id);
+    assert(sfs_image_lookup(h, 0, 1, "pending", 7, &e, &receipt) == SFS_NOT_FOUND);
+    assert(sfs_image_lookup(h, 0, 1, "renamed", 7, &e, &receipt) == SFS_NOT_FOUND); verify(h); OK(sfs_image_close(h, &receipt));
+    for (unsigned fault = 0; fault < 2; ++fault) {
+        h = fresh(6, name, 2); pin = named_pin(h, "live", &id);
+        OK(sfs_image_begin(h, &receipt)); OK(sfs_image_pin_write(h, pin, 4096, "x", 1, &receipt));
+        assert(h->batch);
+        if (!fault) h->batch->arena->epoch++; /* Existing lineage validation. */
+        else h->batch->inode.attributes.extents = UINT64_MAX; /* Checked byte conversion. */
+        transaction_stat_error(h, pin, SFS_CORRUPT); assert(receipt.poisoned && !receipt.transaction_active);
+        OK(sfs_image_close(h, &receipt)); OK(sfs_image_open(parent, name, &h, &receipt));
+        sfs_metadata_entry committed; OK(sfs_image_stat_metadata(h, 0, id, &committed, &receipt)); assert(committed.entry.size == 3);
+        verify(h); OK(sfs_image_close(h, &receipt));
+    }
+}
 int main(int argc, char **argv) {
     assert(argc == 2 && argv[1][0] == '/'); parent = argv[1]; umask(077);
     assert(mkdir(parent, 0700) == 0);
     contents_aliases_snapshots(); replacement_and_types(); reservations_and_limits();
     abort_capacity_and_faults(); detached_integrity();
     rollover_leaf_boundaries_and_target_switches();
+    transaction_metadata_views();
+    transaction_metadata_failures();
     puts("PASS live-pins"); return 0;
 }
