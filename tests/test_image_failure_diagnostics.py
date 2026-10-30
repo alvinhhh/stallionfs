@@ -170,13 +170,14 @@ class DirectImageFixtureTests(unittest.TestCase):
             def digest(image):
                 self.assert_scope(fixture.base, image, None, 'body')
                 return 'unchanged'
-            seen = []
+            seen, observed_detaches = [], []
             def attach(image, point):
                 self.assert_scope(fixture.base, image, point, 'body')
                 seen.append(image.name)
                 return repo if image.name == 'full.sparseimage' else untouched
             def detach(image, point):
                 self.assert_scope(fixture.base, image, point, 'body')
+                observed_detaches.append(diagnostics._detach_observation.get() is not None)
             with patch.object(space.images, 'clone', side_effect=clone), \
                     patch.object(space, 'digest', side_effect=digest), \
                     patch.object(space.images, 'attach', side_effect=attach), \
@@ -186,6 +187,8 @@ class DirectImageFixtureTests(unittest.TestCase):
                     patch.object(Path, 'open', open_path), patch('builtins.print'):
                 fixture.test_volume_full_preserves_existing_data_and_other_images()
             self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
+            self.assertEqual(observed_detaches, [True, False, False, False])
+            self.assertIsNone(diagnostics._detach_observation.get())
             self.assertIsNone(diagnostics._scope.get())
 
     def test_space_cleanup_scopes_each_image_and_resets_after_failure(self):
@@ -376,10 +379,16 @@ class DiagnosticTests(unittest.TestCase):
     def events(self):
         return [json.loads(s) for s in (self.reporter.directory / diagnostics.REPORT).read_text().splitlines()]
 
+    def holder_output(self, *, device=None, inode=None):
+        info = self.image.stat()
+        device = info.st_dev if device is None else device
+        inode = info.st_ino if inode is None else inode
+        return f'p10\ncworker\nf3\ntREG\nD{device:#x}\ni{inode}\nn{self.image}\n'.encode()
+
     def mapping_capture(self, records=None, native=None):
         return [captured(plistlib.dumps({'images': records if records is not None else [self.record]})),
                 captured(json.dumps(native or []).encode()),
-                captured(b'p10\ncworker\nf3\ntREG\nn' + str(self.image).encode() + b'\n', b'partial visibility\n', 1)]
+                captured(self.holder_output(), b'partial visibility\n', 1)]
 
     def test_unmounted_attachment_exact_targets_and_exit1_output(self):
         with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture()) as capture:
@@ -393,6 +402,12 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(event['returncode'], 1)
         self.assertIn('p10', event['stdout'])
         self.assertIn('partial visibility', event['stderr'])
+        info = self.image.stat()
+        self.assertEqual((self.events()[1]['backing_device'], self.events()[1]['backing_inode']),
+                         (info.st_dev, info.st_ino))
+        self.assertEqual(event['backing_identity_status'], 'matched')
+        self.assertIn(f'D{info.st_dev:#x}', event['stdout'])
+        self.assertIn(f'i{info.st_ino}', event['stdout'])
         self.assertIsNone(self.events()[1]['mountpoint'])
         self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
@@ -503,7 +518,7 @@ class DiagnosticTests(unittest.TestCase):
             if str(path) == str(self.point):
                 return SimpleNamespace(st_dev=42)
             return native_stat(path, *args, **kwargs)
-        with patch.object(self.reporter, '_mapping', return_value=(str(self.image), ['/dev/disk999'], str(self.point), '/dev/disk999s1')), \
+        with patch.object(self.reporter, '_mapping', return_value=(str(self.image), ['/dev/disk999'], str(self.point), '/dev/disk999s1', (self.image.stat().st_dev, self.image.stat().st_ino))), \
                 patch.object(self.reporter, '_capture', side_effect=[captured(), captured(status=1)]) as capture, \
                 patch.object(diagnostics.os.path, 'ismount', return_value=True), patch.object(diagnostics.os, 'stat', side_effect=device_stat):
             self.reporter.report(self.args, OSError('busy'), self.scope())
@@ -518,15 +533,249 @@ class DiagnosticTests(unittest.TestCase):
                 images._command(*self.args)
             report.assert_not_called()
 
-    def test_shared_deadline_and_attempt_budget(self):
+    def test_expected_busy_preserves_unexpected_deadline_and_attempt_budget(self):
         with patch.object(self.reporter, '_capture', side_effect=[v for _ in range(4) for v in self.mapping_capture()]) as capture:
             for _ in range(6):
-                self.reporter.report(self.args, OSError('busy'), self.scope(expected=True))
+                self.reporter.report(self.args, OSError('intentional busy'), self.scope(expected=True))
+            self.assertEqual(self.reporter.attempts, 0)
+            self.assertEqual(self.reporter.remaining, diagnostics.CAPTURE_BYTES)
+            self.assertEqual((self.reporter.events, self.reporter.written), (0, 0))
+            self.assertFalse(self.reporter.directory.exists())
+            capture.assert_not_called()
+            for _ in range(6):
+                self.reporter.report(self.args, OSError('unexpected busy'), self.scope())
         self.assertEqual(self.reporter.attempts, 4)
         self.assertEqual(capture.call_count, 12)
         for index in range(0, 12, 3):
             self.assertEqual(len({c.args[1] for c in capture.call_args_list[index:index + 3]}), 1)
-        self.assertTrue(self.events()[0]['expected_busy'])
+        self.assertFalse(self.events()[0]['expected_busy'])
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_pre_detach_and_failure_records_share_operation_and_timestamps(self):
+        error = OSError('actual detach failure')
+        order = []
+        def original(*args):
+            order.append('detach')
+            raise error
+        images = SimpleNamespace(_command=original)
+        collector = diagnostics.install(images, self.reporter.directory)
+        self.addCleanup(collector.close)
+        self.reporter = collector
+        def capture(argv, deadline):
+            order.append('observe')
+            if argv[0] == '/usr/bin/hdiutil':
+                return captured(plistlib.dumps({'images': [self.record]}))
+            if argv[0] == diagnostics.sys.executable:
+                return captured(b'[]')
+            return captured(self.holder_output(), status=1)
+        with patch.object(collector, '_capture', side_effect=capture), \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+            for _ in range(2):
+                with self.assertRaises(OSError) as caught:
+                    images._command(*self.args)
+                self.assertIs(caught.exception, error)
+        events = self.events()
+        self.assertEqual(order[:4], ['observe', 'observe', 'observe', 'detach'])
+        self.assertEqual(collector.before_attempts, 1)
+        self.assertEqual(collector.attempts, 2)
+        self.assertEqual(len({e['operation_id'] for e in events}), 1)
+        self.assertEqual([e['phase'] for e in events[:4]], ['before'] * 4)
+        self.assertTrue(all(e['phase'] == 'after' for e in events[4:]))
+        self.assertEqual([e['timestamp_ns'] for e in events], sorted(e['timestamp_ns'] for e in events))
+        self.assertEqual(events[0]['kind'], 'observation')
+        self.assertEqual(sum(e['kind'] == 'failure' for e in events), 2)
+        self.assertTrue(diagnostics.artifact_available(collector.directory))
+        self.assertIsNone(diagnostics._detach_observation.get())
+
+    def replace_backing(self):
+        self.image.rename(self.base / 'previous-backing')
+        self.image.write_bytes(b'replacement, not a disk image')
+        self.image.chmod(0o600)
+
+    def test_same_path_replacement_is_distinct_across_operation_snapshots(self):
+        original = self.image.stat()
+        with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture()):
+            operation = self.reporter.before(self.args, self.scope())
+        self.replace_backing()
+        replacement = self.image.stat()
+        self.assertNotEqual(original.st_ino, replacement.st_ino)
+        with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture()):
+            self.reporter.report(self.args, OSError('actual detach failure'), self.scope(), operation)
+        mappings = [e for e in self.events() if e['kind'] == 'mapping']
+        self.assertEqual([e['backing_inode'] for e in mappings], [original.st_ino, replacement.st_ino])
+        self.assertEqual([e['backing_identity_matches_first'] for e in mappings], [True, False])
+        self.assertTrue(any('identity changed between' in e.get('reason', '') for e in self.events()))
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_backing_replacement_around_holder_query_is_not_a_match(self):
+        original = self.image.stat()
+        values = iter(self.mapping_capture())
+        def capture(argv, deadline):
+            value = next(values)
+            if argv[0] == '/usr/sbin/lsof':
+                self.replace_backing()
+            return value
+        with patch.object(self.reporter, '_capture', side_effect=capture):
+            self.reporter.report(self.args, OSError('actual detach failure'), self.scope())
+        event = self.events()[-1]
+        self.assertEqual(event['kind'], 'lsof')
+        self.assertEqual(event['backing_identity_status'], 'changed')
+        self.assertIn(f'i{original.st_ino}', event['stdout'])
+        self.assertEqual(event['backing_inode_after'], self.image.stat().st_ino)
+        self.assertNotEqual(event['backing_inode_after'], original.st_ino)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_backing_replacement_before_holder_query_omits_holder_query(self):
+        values = iter(self.mapping_capture())
+        def capture(argv, deadline):
+            value = next(values)
+            if argv[0] == diagnostics.sys.executable:
+                self.replace_backing()
+            return value
+        with patch.object(self.reporter, '_capture', side_effect=capture) as captured_calls:
+            self.reporter.report(self.args, OSError('actual detach failure'), self.scope())
+        self.assertEqual(captured_calls.call_count, 2)
+        self.assertIn('identity changed before holder', self.events()[-1]['reason'])
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_holder_identity_requires_valid_matching_device_and_inode(self):
+        info = self.image.stat()
+        outputs = [
+            (f'p10\nf3\nn{self.image}\n'.encode(), 'unavailable'),
+            (self.holder_output(inode=info.st_ino + 1), 'mismatch'),
+            (self.holder_output(device=info.st_dev + 1), 'mismatch'),
+            (self.holder_output().replace(f'D{info.st_dev:#x}'.encode(), b'Dnot-a-device'), 'unavailable'),
+        ]
+        for output, expected in outputs:
+            with self.subTest(expected=expected):
+                values = self.mapping_capture()
+                values[-1] = captured(output, status=1)
+                with patch.object(self.reporter, '_capture', side_effect=values):
+                    self.reporter.report(self.args, OSError('actual detach failure'), self.scope())
+                self.assertEqual(self.events()[-1]['backing_identity_status'], expected)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_artifact_rejects_invalid_backing_identity_fields(self):
+        with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture()):
+            self.reporter.report(self.args, OSError('actual detach failure'), self.scope())
+        path = self.reporter.directory / diagnostics.REPORT
+        original = path.read_text()
+        for field, invalid in (('backing_inode', 'unknown'), ('backing_device', -1),
+                               ('backing_identity_matches_first', 'yes')):
+            with self.subTest(field=field):
+                events = [json.loads(line) for line in original.splitlines()]
+                next(e for e in events if e['kind'] == 'mapping')[field] = invalid
+                path.write_text(''.join(json.dumps(event) + '\n' for event in events))
+                self.assertFalse(diagnostics.artifact_available(self.reporter.directory))
+        path.write_text(original)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_partial_before_event_and_actual_failure_keep_operation_association(self):
+        primary = OSError('actual detach failure')
+        images = SimpleNamespace(_command=Mock(side_effect=primary))
+        collector = diagnostics.install(images, self.reporter.directory)
+        self.addCleanup(collector.close)
+        self.reporter = collector
+        emit = collector._emit
+        def partial(deadline, kind, **values):
+            if collector.phase == 'before' and kind != 'observation':
+                raise TimeoutError('pre-observation deadline after first row')
+            return emit(deadline, kind, **values)
+        captures = self.mapping_capture()[:2] + self.mapping_capture()
+        with patch.object(collector, '_emit', side_effect=partial), \
+                patch.object(collector, '_capture', side_effect=captures), \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+            with self.assertRaises(OSError) as caught:
+                images._command(*self.args)
+        self.assertIs(caught.exception, primary)
+        events = self.events()
+        self.assertEqual(events[0]['kind'], 'observation')
+        self.assertEqual(events[1]['kind'], 'failure')
+        self.assertEqual({e['operation_id'] for e in events}, {events[0]['operation_id']})
+        self.assertEqual(collector.before_attempts, 1)
+        self.assertEqual(collector.attempts, 1)
+        self.assertLessEqual(collector.events, diagnostics.EVENTS)
+        self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+        self.assertTrue(diagnostics.artifact_available(collector.directory))
+        self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_pre_snapshot_cap_reserves_failure_bytes_and_observation_capacity(self):
+        def consume(argv, deadline):
+            self.assertEqual(self.reporter.remaining, diagnostics.BEFORE_CAPTURE_BYTES)
+            self.reporter.remaining = 0
+            value = captured(b'x' * diagnostics.BEFORE_CAPTURE_BYTES)
+            value['truncated'] = True
+            return value
+        # A full pre-snapshot capture can leave no useful mapping, but cannot take
+        # the output allowance reserved for the subsequent failure observation.
+        with patch.object(self.reporter, '_capture', side_effect=consume) as capture:
+            operation = self.reporter.before(self.args, self.scope())
+            self.reporter.before(self.args, self.scope())
+        capture.assert_called_once()
+        self.assertEqual(self.reporter.attempts, 0)
+        self.assertEqual(self.reporter.remaining, diagnostics.CAPTURE_BYTES - diagnostics.BEFORE_CAPTURE_BYTES)
+        self.assertLessEqual(self.reporter.events, diagnostics.BEFORE_EVENTS)
+        self.assertLessEqual(self.reporter.written, diagnostics.BEFORE_FILE_BYTES)
+        with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture()):
+            self.reporter.report(self.args, OSError('actual failure'), self.scope(), operation)
+        self.assertEqual(self.events()[-1]['phase'], 'after')
+        self.assertEqual({e['operation_id'] for e in self.events()}, {operation})
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_pre_snapshot_artifact_caps_leave_room_for_failure(self):
+        def oversized_observation(args, scope, deadline):
+            for _ in range(50):
+                self.reporter._emit(deadline, 'unavailable', reason='x' * 4000)
+            raise ValueError('pre-snapshot mapping unavailable')
+        with patch.object(self.reporter, '_mapping', side_effect=oversized_observation):
+            operation = self.reporter.before(self.args, self.scope())
+        self.assertLessEqual(self.reporter.events, diagnostics.BEFORE_EVENTS)
+        self.assertLessEqual(self.reporter.written, diagnostics.BEFORE_FILE_BYTES)
+        self.reporter.report(self.args, OSError('actual failure'), None, operation)
+        self.assertEqual(self.events()[-2]['kind'], 'failure')
+        self.assertEqual(self.events()[-2]['phase'], 'after')
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+        self.reporter.before_attempts = 0
+        self.reporter.events = diagnostics.EVENTS - diagnostics.BEFORE_EVENTS
+        with patch.object(self.reporter, '_mapping') as mapping:
+            self.reporter.before(self.args, self.scope())
+        mapping.assert_not_called()
+        self.reporter.events = 0
+        self.reporter.remaining = diagnostics.BEFORE_CAPTURE_BYTES
+        with patch.object(self.reporter, '_capture') as capture:
+            self.reporter.before(self.args, self.scope())
+        capture.assert_not_called()
+
+    def test_pre_observation_error_preserves_success_and_actual_detach_error(self):
+        for error in (None, OSError('actual detach failure')):
+            with self.subTest(error=error):
+                images = SimpleNamespace(_command=Mock(return_value=b'ok', side_effect=error))
+                collector = diagnostics.install(images, self.base / 'unused')
+                with patch.object(collector, 'before', side_effect=TimeoutError('observation deadline')), \
+                        patch.object(collector, 'report') as report, diagnostics.observe_detach():
+                    if error is None:
+                        self.assertEqual(images._command(*self.args), b'ok')
+                        report.assert_not_called()
+                    else:
+                        with self.assertRaises(OSError) as caught:
+                            images._command(*self.args)
+                        self.assertIs(caught.exception, error)
+                        report.assert_called_once()
+                self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_pre_snapshot_uncertain_child_cleanup_disables_later_capture(self):
+        def unsafe(argv, deadline):
+            self.reporter.capture_disabled = True
+            self.reporter.remaining = 0
+            value = captured()
+            value['cleanup_error'] = 'group termination: PermissionError'
+            return value
+        with patch.object(self.reporter, '_capture', side_effect=unsafe):
+            self.reporter.before(self.args, self.scope())
+        self.assertEqual(self.reporter.remaining, 0)
+        with self.assertRaises(TimeoutError):
+            self.reporter._capture(['must-not-spawn'], time.monotonic() + 12)
+        self.spawn.assert_not_called()
 
     def test_checked_partial_writes_caps_and_artifact_allowlist(self):
         real_write = os.write
@@ -585,7 +834,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertNotIn('disk111', text)
         self.assertIn('visible warning', text)
         self.assertIn('unscoped name omitted', text)
-        with patch.object(self.reporter, '_mapping', return_value=(str(self.image), ['/dev/disk999'], str(self.point), '/dev/disk999s1')), \
+        with patch.object(self.reporter, '_mapping', return_value=(str(self.image), ['/dev/disk999'], str(self.point), '/dev/disk999s1', (self.image.stat().st_dev, self.image.stat().st_ino))), \
                 patch.object(self.reporter, '_capture', return_value=captured(('n' + str(self.point) + '/file -> /other-user/private\n').encode(), status=1)), \
                 patch.object(diagnostics.os.path, 'ismount', return_value=False):
             self.reporter.report(self.args, OSError('busy'), self.scope())
@@ -615,6 +864,7 @@ class DiagnosticTests(unittest.TestCase):
         for failure in ('kill-eperm', 'wait-error', 'wait-timeout'):
             with self.subTest(failure=failure):
                 self.reporter.remaining = 1024
+                self.reporter.capture_disabled = False
                 out, err = Mock(), Mock()
                 out.fileno.return_value, err.fileno.return_value = 11, 12
                 process = Mock(pid=123456, stdout=out, stderr=err, returncode=1)

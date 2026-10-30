@@ -218,22 +218,34 @@ def _bytes(value):
 
 def _stop_group(process, receipt, grace_s):
     """Bound termination and collection. Never infer all descendants exited."""
-    receipt['termination'] = []
+    receipt.setdefault('termination', [])
+
+    def reaped_group_unknown():
+        receipt.update(completion_uncertain=True, group_signal_skipped_reason='leader_already_reaped',
+                       group_ownership_after_cleanup='unknown_after_reap', group_alive_after_cleanup=None)
+
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(process.pid, sig)
-            receipt['termination'].append({'signal': sig.name, 'sent': True})
-        except ProcessLookupError:
-            receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'group absent'})
-        except OSError as error:
-            receipt['termination'].append({'signal': sig.name, 'sent': False, 'error': str(error)})
+        if process.returncode is not None:
+            # Reaping releases the PID; its numeric group no longer proves ownership.
+            reaped_group_unknown()
+            receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'leader already reaped'})
+        else:
+            try:
+                os.killpg(process.pid, sig)
+                receipt['termination'].append({'signal': sig.name, 'sent': True})
+            except ProcessLookupError:
+                receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'group absent'})
+            except OSError as error:
+                receipt['termination'].append({'signal': sig.name, 'sent': False, 'error': str(error)})
         try:
             output = process.communicate(timeout=grace_s)
+            if process.returncode is not None:
+                reaped_group_unknown()
+                return output
             try: os.killpg(process.pid, 0)
             except ProcessLookupError: return output
             except OSError as error: receipt['group_probe_error'] = str(error)
             if sig == signal.SIGKILL: return output
-            # A reaped leader does not prove its original process group is gone.
         except subprocess.TimeoutExpired as error:
             receipt['partial_stdout_b64'] = base64.b64encode(_bytes(error.output)).decode('ascii')
             receipt['partial_stderr_b64'] = base64.b64encode(_bytes(error.stderr)).decode('ascii')

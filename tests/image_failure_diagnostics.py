@@ -1,4 +1,4 @@
-"""Bounded, failure-only observations for the installed-wheel image tests."""
+"""Bounded image-test observations around explicitly selected detach operations."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
@@ -15,14 +15,18 @@ import threading
 import time
 
 ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64 * 1024
+BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
 REPORT = "image-failures.jsonl"
+_metadata = {'operation_id', 'phase', 'timestamp_ns'}
 _fields = {
     'failure': {'operation', 'error', 'message', 'expected_busy', 'observation', 'stage', 'workspace', 'failed_device', 'expected_mountpoint'},
     'unavailable': {'reason'},
-    'mapping': {'image', 'devices', 'mountpoint', 'volume_device', 'expected_mountpoint', 'mountpoint_matches'},
-    'lsof': {'returncode', 'stdout', 'stderr', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error', 'display_truncated'},
+    'mapping': {'image', 'devices', 'mountpoint', 'volume_device', 'expected_mountpoint', 'mountpoint_matches', 'backing_device', 'backing_inode', 'backing_identity_matches_first'},
+    'lsof': {'returncode', 'stdout', 'stderr', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error', 'display_truncated', 'backing_identity_status', 'backing_device_after', 'backing_inode_after'},
 }
+_fields['observation'] = _fields['failure']
 _scope = ContextVar("image_failure_scope", default=None)
+_detach_observation = ContextVar("image_detach_observation", default=None)
 _device = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
 
 
@@ -35,6 +39,16 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
         yield
     finally:
         _scope.reset(token)
+
+
+@contextmanager
+def observe_detach():
+    """Observe only the first detach command in this explicit test operation."""
+    token = _detach_observation.set(dict(started=False, operation_id=None))
+    try:
+        yield
+    finally:
+        _detach_observation.reset(token)
 
 
 def _private(path, directory=False):
@@ -67,7 +81,20 @@ def artifact_available(directory):
             return False
         for line in lines:
             value = json.loads(line)
-            if not isinstance(value, dict) or value.get('kind') not in _fields or set(value) - {'kind'} != _fields[value['kind']]:
+            if not isinstance(value, dict) or value.get('kind') not in _fields or set(value) - {'kind'} != _fields[value['kind']] | _metadata:
+                return False
+            if (type(value['operation_id']) is not int or value['operation_id'] < 0 or
+                    value['phase'] not in ('before', 'after', 'standalone') or
+                    type(value['timestamp_ns']) is not int or value['timestamp_ns'] <= 0):
+                return False
+            for name in ('backing_device', 'backing_inode', 'backing_device_after', 'backing_inode_after'):
+                if name in value and (value[name] is None and value['kind'] == 'mapping' or
+                        value[name] is not None and (type(value[name]) is not int or value[name] < 0)):
+                    return False
+            if value['kind'] == 'mapping' and type(value['backing_identity_matches_first']) is not bool:
+                return False
+            if value['kind'] == 'lsof' and value['backing_identity_status'] not in (
+                    'matched', 'mismatch', 'changed', 'unavailable', 'not_queried'):
                 return False
             if len(line) > 8192:
                 return False
@@ -95,6 +122,11 @@ class Diagnostics:
         self.events = self.written = self.attempts = 0
         self.lock = threading.Lock()
         self.fd = None
+        self.capture_disabled = False
+        self.operations = self.before_attempts = 0
+        self.operation_id, self.phase = 0, 'standalone'
+        self.before_events = self.before_written = 0
+        self.backing_identities = {}
 
     def close(self):
         if self.fd is not None:
@@ -102,9 +134,14 @@ class Diagnostics:
             os.close(fd)
 
     def _emit(self, deadline, kind, **values):
-        data = (json.dumps(dict(kind=kind, **values), ensure_ascii=True) + "\n").encode()
+        metadata = dict(operation_id=self.operation_id, phase=self.phase, timestamp_ns=time.time_ns())
+        data = (json.dumps(dict(kind=kind, **metadata, **values), ensure_ascii=True) + "\n").encode()
         if len(data) > 8192:
-            data = b'{"kind":"unavailable","reason":"diagnostic event exceeds serialization cap"}\n'
+            data = (json.dumps(dict(kind='unavailable', **metadata,
+                reason='diagnostic event exceeds serialization cap')) + "\n").encode()
+        if self.phase == 'before' and (self.events - self.before_events >= BEFORE_EVENTS or
+                self.written - self.before_written + len(data) > BEFORE_FILE_BYTES):
+            return
         if self.events >= EVENTS or self.written + len(data) > FILE_BYTES:
             return
         if self.fd is None:
@@ -125,7 +162,7 @@ class Diagnostics:
 
     def _capture(self, argv, deadline):
         """One bounded pipe reader; the caller's deadline includes kill/reap."""
-        if self.remaining <= 0 or time.monotonic() >= deadline - 1:
+        if self.capture_disabled or self.remaining <= 0 or time.monotonic() >= deadline - 1:
             raise TimeoutError("diagnostic collection budget exhausted")
         selector = selectors.DefaultSelector()
         try:
@@ -190,6 +227,7 @@ class Diagnostics:
             finally:
                 # This also runs when cleanup itself raises or is interrupted.
                 if cleanup_error or not terminated or not reaped:
+                    self.capture_disabled = True
                     self.remaining = 0
                 selector.close()
                 proc.stdout.close()
@@ -231,7 +269,8 @@ class Diagnostics:
                 backing.resolve() != backing or not backing.is_relative_to(base) or
                 (image is not None and backing != image)):
             raise ValueError("attachment owner/path mismatch")
-        _private(backing)
+        backing_stat = _private(backing)
+        identity = (backing_stat.st_dev, backing_stat.st_ino)
         entities = record['system-entities']
         devices = [e.get('dev-entry') for e in entities]
         if (not 0 < len(devices) <= 32 or len(set(devices)) != len(devices) or
@@ -255,40 +294,99 @@ class Diagnostics:
         if point is None:
             if related:
                 raise ValueError("unmapped native mount")
-            return str(backing), devices, None, None
+            return str(backing), devices, None, None, identity
         if (len(related) != 1 or related[0].get('device') != volumes[0]['dev-entry'] or
                 related[0].get('path') != str(point) or related[0].get('filesystem') != 'apfs'):
             raise ValueError("native mount mismatch")
-        return str(backing), devices, str(point), volumes[0]['dev-entry']
+        return str(backing), devices, str(point), volumes[0]['dev-entry'], identity
 
-    def report(self, args, error, scope):
-        if self.attempts >= ATTEMPTS or self.events >= EVENTS or self.written >= FILE_BYTES:
+    @staticmethod
+    def _holder_identity(lines, image, identity):
+        # lsof's D is hexadecimal st_dev; i is the decimal inode number.
+        # A pathname without both fields cannot establish the held backing inode.
+        matches, record = [], {}
+        for line in [*lines, 'f']:
+            if line.startswith(('p', 'f')):
+                if record.get('n') == image:
+                    matches.append((record.get('D'), record.get('i')))
+                record = {}
+            elif re.fullmatch(r'D0x[0-9a-fA-F]{1,16}', line):
+                record['D'] = int(line[1:], 16)
+            elif re.fullmatch(r'i[0-9]{1,20}', line):
+                record['i'] = int(line[1:])
+            elif line.startswith('n'):
+                record['n'] = line[1:]
+        if not matches or any(None in value for value in matches):
+            return 'unavailable'
+        return 'matched' if all(value == identity for value in matches) else 'mismatch'
+
+    def before(self, args, scope, observation=None):
+        return self._observe(args, None, scope, phase='before', observation=observation)
+
+    def report(self, args, error, scope, operation_id=None):
+        # Intentional refusal tests must not consume unexpected-failure capacity.
+        if scope and scope['expected']:
             return
+        return self._observe(args, error, scope, phase='after', operation_id=operation_id)
+
+    def _observe(self, args, error, scope, *, phase, operation_id=None, observation=None):
+        before = phase == 'before'
+        if ((self.before_attempts >= 1 if before else self.attempts >= ATTEMPTS) or
+                self.events >= EVENTS or self.written >= FILE_BYTES):
+            return operation_id
         deadline = time.monotonic() + SECONDS
         if not self.lock.acquire(timeout=SECONDS):
-            return
+            return operation_id
+        saved_remaining = None
         try:
-            if self.attempts >= ATTEMPTS or self.events >= EVENTS or self.written >= FILE_BYTES:
-                return
-            self.attempts += 1
-            self._emit(deadline, 'failure', operation=args[1], error=type(error).__name__,
-                       message=_message(error), expected_busy=bool(scope and scope['expected']),
+            if ((self.before_attempts >= 1 if before else self.attempts >= ATTEMPTS) or
+                    self.events >= EVENTS or self.written >= FILE_BYTES):
+                return operation_id
+            # Reserve failure capacity before taking the pre-snapshot allowance.
+            if before and (self.remaining < 2 * BEFORE_CAPTURE_BYTES or
+                           self.events + BEFORE_EVENTS + 5 > EVENTS or
+                           self.written + BEFORE_FILE_BYTES + 8192 > FILE_BYTES):
+                return operation_id
+            if operation_id is None:
+                self.operations += 1
+                operation_id = self.operations
+            if observation is not None:
+                observation['operation_id'] = operation_id
+            self.operation_id, self.phase = operation_id, phase
+            if before:
+                saved_remaining = self.remaining
+                before_budget = min(saved_remaining, BEFORE_CAPTURE_BYTES)
+                self.before_attempts += 1
+                self.before_events, self.before_written = self.events, self.written
+                self.remaining = before_budget
+            else:
+                self.attempts += 1
+            self._emit(deadline, 'observation' if before else 'failure', operation=args[1],
+                       error=None if before else type(error).__name__,
+                       message=None if before else _message(error),
+                       expected_busy=bool(scope and scope['expected']),
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
                        failed_device=args[2] if args[1] == 'detach' and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
-                       observation='post-failure only; pre-operation mapping unknown')
+                       observation='immediately before detach command' if before else 'post-failure observation')
             if scope is None:
                 self._emit(deadline, 'unavailable', reason='no explicit owned fixture context')
-                return
+                return operation_id
             try:
-                image, devices, point, volume = self._mapping(args, scope, deadline)
+                image, devices, point, volume, identity = self._mapping(args, scope, deadline)
             except Exception as unavailable:
                 self._emit(deadline, 'unavailable', reason=_message(unavailable))
-                return
+                return operation_id
             expected_point = str(scope['mountpoint']) if scope['mountpoint'] else None
             matches = point is not None and point == expected_point
+            first_identity = self.backing_identities.setdefault(operation_id, identity)
+            same_backing = first_identity == identity
             self._emit(deadline, 'mapping', image=image, devices=devices, mountpoint=point, volume_device=volume,
-                       expected_mountpoint=expected_point, mountpoint_matches=matches)
+                       expected_mountpoint=expected_point, mountpoint_matches=matches,
+                       backing_device=identity[0], backing_inode=identity[1],
+                       backing_identity_matches_first=same_backing)
+            if not same_backing:
+                self._emit(deadline, 'unavailable', reason='backing identity changed between operation observations')
             if point != expected_point:
                 self._emit(deadline, 'unavailable', reason='expected/observed mountpoint mismatch; filesystem lsof omitted')
             # Exact backing/device queries remain useful when detached or remapped.
@@ -298,14 +396,23 @@ class Diagnostics:
             if point is not None:
                 queries.append((['+f'], [point]))
             for options, names in queries:
+                try:
+                    current = _private(Path(image))
+                except (OSError, ValueError):
+                    self._emit(deadline, 'unavailable', reason='backing identity unavailable before holder observation')
+                    break
+                if (current.st_dev, current.st_ino) != identity:
+                    self._emit(deadline, 'unavailable', reason='backing identity changed before holder observation')
+                    break
                 if options and (not os.path.ismount(point) or not stat.S_ISBLK(os.stat(volume).st_mode) or
                                 os.stat(point).st_dev != os.stat(volume).st_rdev):
                     self._emit(deadline, 'unavailable', reason='mount changed; filesystem lsof omitted')
                     break
-                value = self._capture(['/usr/sbin/lsof', '-nP', '-F', 'pcftn', *options, '--', *names], deadline)
+                value = self._capture(['/usr/sbin/lsof', '-nP', '-F', 'pcftDin', *options, '--', *names], deadline)
+                raw_lines = value.pop('stdout').decode(errors='replace').splitlines()
                 lines = []
                 display_truncated = False
-                for line in value.pop('stdout').decode(errors='replace').splitlines():
+                for line in raw_lines:
                     if line.startswith('n'):
                         name = line[1:]
                         allowed = name in [image, *devices, point] or (point is not None and name.startswith(point + '/') and '..' not in Path(name).parts)
@@ -313,17 +420,34 @@ class Diagnostics:
                         allowed = allowed and not any(c.isspace() for c in name)
                         display_truncated |= allowed and len(line) > 512
                         lines.append(line[:512] if allowed else 'n[unscoped name omitted]')
-                    elif re.fullmatch(r'(?:p[0-9]+|[cft][A-Za-z0-9 ._+-]{1,64})', line):
+                    elif re.fullmatch(r'(?:p[0-9]+|[cft][A-Za-z0-9 ._+-]{1,64}|D0x[0-9a-fA-F]{1,16}|i[0-9]{1,20})', line):
                         lines.append(line)
                 stderr = value.pop('stderr').decode(errors='replace')
                 stdout = '\n'.join(lines)
                 display_truncated |= len(stdout) > 2048 or len(stderr) > 2048
+                try:
+                    after = _private(Path(image))
+                    after_identity = (after.st_dev, after.st_ino)
+                except (OSError, ValueError):
+                    after_identity = (None, None)
+                identity_status = 'not_queried' if options else self._holder_identity(raw_lines, image, identity)
+                if after_identity == (None, None):
+                    identity_status = 'unavailable'
+                elif after_identity != identity:
+                    identity_status = 'changed'
+                elif display_truncated or value['timeout'] or value['truncated'] or not value['reaped'] or value.get('capture_error') or value.get('cleanup_error'):
+                    identity_status = 'unavailable'
                 self._emit(deadline, 'lsof', **value, stdout=stdout[:2048], stderr=_message(stderr),
-                           display_truncated=display_truncated)
+                           display_truncated=display_truncated, backing_identity_status=identity_status,
+                           backing_device_after=after_identity[0], backing_inode_after=after_identity[1])
                 if not value['reaped'] or value['timeout'] or value['truncated'] or value.get('capture_error') or value.get('cleanup_error'):
                     break
         finally:
+            if saved_remaining is not None:
+                self.remaining = 0 if self.capture_disabled else saved_remaining - (before_budget - self.remaining)
+            self.operation_id, self.phase = 0, 'standalone'
             self.lock.release()
+        return operation_id
 
 
 def install(images, directory):
@@ -333,11 +457,19 @@ def install(images, directory):
     def command(*args):
         if len(args) < 3 or args[0] != '/usr/bin/hdiutil' or args[1] not in ('create', 'detach'):
             return original(*args)
+        observation = _detach_observation.get() if args[1] == 'detach' else None
+        if observation is not None and not observation['started']:
+            observation['started'] = True
+            try:
+                diagnostics.before(args, _scope.get(), observation)
+            except Exception:
+                pass  # Observation failure cannot prevent the requested detach.
         try:
             return original(*args, '-verbose')
         except Exception as error:
             try:
-                diagnostics.report(args, error, _scope.get())
+                diagnostics.report(args, error, _scope.get(),
+                                   operation_id=observation['operation_id'] if observation else None)
             except Exception as unavailable:
                 try:
                     error.add_note('Image diagnostics unavailable: ' + type(unavailable).__name__)
