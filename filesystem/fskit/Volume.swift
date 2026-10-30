@@ -17,8 +17,11 @@ func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOEN
     case SFS_NOMEM: code = ENOMEM
     // Read callbacks translate their known buffer limits at the call site.
     // An unspecified core limit does not establish a file-size failure.
-    case SFS_LIMIT: code = EOVERFLOW
-    case SFS_IO: code = result.system_errno > 0 ? result.system_errno : EIO
+    case SFS_LIMIT:
+        code = result.limit_reason == SFS_LIMIT_APPEND_CAPACITY ? ENOSPC :
+            result.limit_reason == SFS_LIMIT_FILE_SIZE ? EFBIG : EOVERFLOW
+    case SFS_IO, SFS_OUTCOME_UNKNOWN, SFS_TIME_UNAVAILABLE:
+        code = result.system_errno > 0 ? result.system_errno : EIO
     default: code = EIO
     }
     return NSError(domain: NSPOSIXErrorDomain, code: Int(code))
@@ -102,6 +105,9 @@ func validateDirectoryLayout(_ cookie: UInt64, _ verifier: UInt64) throws {
 }
 final class StallionItem: FSItem {
     let inode: UInt64
+#if STALLION_WRITE_DIAGNOSTIC
+    var retainedModes: FSVolume.OpenModes = []
+#endif
     init(_ inode: UInt64) { self.inode = inode; super.init() }
 }
 
@@ -126,7 +132,91 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     private let resource: FSPathURLResource
     private var scope: Bool
     let owner: uid_t
-    let anchor: sfs_result
+    private(set) var anchor: sfs_result
+#if STALLION_WRITE_DIAGNOSTIC
+    // Only the private diagnostic build can enable writing; even it defaults RO.
+    private(set) var diagnosticWritable = false
+    struct DeliveryFailure {
+        let code: Int, sequence: UInt64, durableGeneration: UInt64
+        let result: sfs_result
+        var error: Error { NSError(domain: NSPOSIXErrorDomain, code: code) }
+    }
+    struct WriteRecord {
+        let sequence: UInt64, operation: UInt64, inode: UInt64, offset: UInt64, length: UInt64, mask: UInt64
+        let started: UInt64, finished: UInt64, generation: UInt64
+        let count: Int, code: Int, result: sfs_result
+    }
+    struct WriteCounters {
+        var callbacks: UInt64 = 0, bytes: UInt64 = 0, chunks: UInt64 = 0, commits: UInt64 = 0
+        var writes: UInt64 = 0, resizes: UInt64 = 0, deliveredBytes: UInt64 = 0
+        var recordFences: UInt64 = 0, recordSuccess: UInt64 = 0, commitFences: UInt64 = 0, commitSuccess: UInt64 = 0
+        var refused: UInt64 = 0, syncs: UInt64 = 0, overflow = false
+    }
+    private var deliveryFailure: DeliveryFailure?
+    private var lastCoreFailure: sfs_result?
+    private var diagnosticSequence: UInt64 = 0
+    private var diagnosticTraceSequence: UInt64 = 0
+    private var diagnosticDurable: UInt64 = 0
+    private var writeCounters = WriteCounters()
+    private var writeRecords: [WriteRecord] = []
+    private func controlRecordLocked(_ operation: UInt64, inode: UInt64 = 0, mask: UInt64, error: Error?, entry: Bool = false) {
+        guard writeRecords.count < 4096 else { writeCounters.overflow = true; return }
+        saturated(&diagnosticTraceSequence)
+        let now = DispatchTime.now().uptimeNanoseconds
+        writeRecords.append(WriteRecord(sequence: diagnosticTraceSequence, operation: (entry ? 2000 : 1000) + operation,
+            inode: inode, offset: 0, length: 0, mask: mask, started: now, finished: now,
+            generation: diagnosticDurable, count: 0, code: (error as NSError?)?.code ?? 0,
+            result: deliveryFailure?.result ?? sfs_result()))
+    }
+    private func controlEntry(_ operation: UInt64, item: FSItem, mask: UInt64 = 0) {
+        guard diagnosticWritable else { return }
+        submissionLock.lock()
+        controlRecordLocked(operation, inode: (item as? StallionItem)?.inode ?? 0, mask: mask, error: nil, entry: true)
+        submissionLock.unlock()
+    }
+    // All diagnostic counters/first-error state use submissionLock; the trace
+    // stores at most 4096 fixed records, with no paths, names or file bytes.
+    private func saturated(_ value: inout UInt64, by amount: UInt64 = 1) {
+        let (next, overflow) = value.addingReportingOverflow(amount)
+        value = overflow ? UInt64.max : next
+    }
+    private func deliveryError() -> Error? {
+        submissionLock.lock(); defer { submissionLock.unlock() }; return deliveryFailure?.error
+    }
+    private func rememberDeliveryLocked(_ error: Error, _ result: sfs_result = sfs_result()) {
+        if deliveryFailure == nil {
+            // A first-error observation has its own sequence, independent of
+            // how many later callbacks were already admitted while it ran.
+            saturated(&diagnosticSequence)
+            deliveryFailure = DeliveryFailure(code: (error as NSError).code, sequence: diagnosticSequence,
+                durableGeneration: diagnosticDurable, result: result)
+        }
+    }
+    private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result()) {
+        submissionLock.lock(); rememberDeliveryLocked(error, result); submissionLock.unlock()
+    }
+    func enableWriteDiagnostic(expectedUUID: UUID) throws {
+        guard state == .inactive, rawBytes(anchor.uuid) == withUnsafeBytes(of: expectedUUID.uuid, { Array($0) }),
+              resource.isWritable && !resource.isRevoked else { throw POSIXError(.EACCES) }
+        diagnosticWritable = true; diagnosticDurable = anchor.generation; writeRecords.reserveCapacity(4096)
+    }
+    func diagnosticSnapshot() -> (WriteCounters, [WriteRecord], DeliveryFailure?) {
+        submissionLock.lock(); defer { submissionLock.unlock() }
+        if [diagnosticSequence, diagnosticTraceSequence, writeCounters.callbacks, writeCounters.bytes,
+            writeCounters.writes, writeCounters.resizes, writeCounters.deliveredBytes,
+            writeCounters.chunks, writeCounters.commits, writeCounters.recordFences, writeCounters.recordSuccess,
+            writeCounters.commitFences, writeCounters.commitSuccess, writeCounters.refused, writeCounters.syncs].contains(UInt64.max) {
+            writeCounters.overflow = true
+        }
+        return (writeCounters, writeRecords, deliveryFailure)
+    }
+#if STALLION_ADAPTER_CHECK
+    var diagnosticBeforeCommit: (() -> Void)?
+    var diagnosticAfterChunk: ((Int) -> Void)?
+    var diagnosticAfterSizeCommit: (() -> Void)?
+    func diagnosticCloseForTesting(_ item: FSItem) { (item as? StallionItem)?.retainedModes = [] }
+#endif
+#endif
     private let callbacks = CallbackBudget()
     private let itemLimit: Int
 #if STALLION_ADAPTER_CHECK
@@ -151,13 +241,43 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         super.init(volumeID: .init(uuid: uuid), volumeName: FSFileName(string: "StallionFS"))
         records.reserveCapacity(4096); record(0)
     }
-    func enqueue(retainedBytes: Int = 0, maintenance: Bool = false, rejected: (Error) -> Void, _ block: @escaping () -> Void) {
+    func enqueue(retainedBytes: Int = 0, maintenance: Bool = false,
+                 dataOperation: Bool = false, writeOperation: Bool = false,
+                 syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil,
+                 rejected: (Error) -> Void, _ block: @escaping () -> Void) {
         submissionLock.lock()
-        let error: POSIXError?
-        if admission == .terminal { error = POSIXError(.ENXIO) }
+        var error: Error?
+        if let validationError { error = validationError }
+        else if admission == .terminal { error = POSIXError(.ENXIO) }
         else if !maintenance && admission != .open { error = POSIXError(admission == .draining ? .EAGAIN : .ENXIO) }
         else if !callbacks.acquire(retainedBytes) { error = POSIXError(.EAGAIN) }
         else { error = nil }
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable {
+            if syncOperation {
+                saturated(&writeCounters.syncs); controlRecordLocked(5, mask: syncFlags, error: nil, entry: true)
+            }
+            if dataOperation {
+                saturated(&diagnosticSequence); saturated(&writeCounters.callbacks)
+                if writeOperation {
+                    saturated(&writeCounters.writes); saturated(&writeCounters.deliveredBytes, by: UInt64(retainedBytes))
+                } else { saturated(&writeCounters.resizes) }
+            }
+            // A previous delivery failure blocks mutation without consuming a
+            // ticket. Undo a successful reservation before rejecting it.
+            if dataOperation, let first = deliveryFailure, error == nil {
+                callbacks.release(retainedBytes); error = first.error
+            }
+            if let rejectedError = error, dataOperation {
+                saturated(&writeCounters.refused); rememberDeliveryLocked(rejectedError)
+            }
+            if syncOperation, let first = deliveryFailure {
+                if error == nil { callbacks.release(retainedBytes) }
+                error = first.error
+            }
+            if syncOperation, let error { controlRecordLocked(5, mask: syncFlags, error: error) }
+        }
+#endif
         guard error == nil else { submissionLock.unlock(); rejected(error!); return }
         // Reservation and submission are atomic against the unmount cutoff.
         queue.async(execute: DispatchWorkItem { defer { self.callbacks.release(retainedBytes) }; block() })
@@ -170,6 +290,11 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
                         cookie: UInt64 = 0, verifier: UInt64 = 0, returnedVerifier: UInt64 = 0,
                         acceptedCookie: UInt64 = 0, stop: UInt64 = 0,
                         parents: ParentEvidence = ParentEvidence(), accepted: Int64 = -1, reclaim: Int64 = -1) {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable && [1, 2, 3, 4, 5, 6, 12, 15, 16].contains(op) {
+            submissionLock.lock(); controlRecordLocked(op, inode: inode, mask: mask, error: error); submissionLock.unlock()
+        }
+#endif
         guard !emitted else { return }
         sequence &+= 1
         guard records.count < 4096 else { overflow = true; return }
@@ -194,7 +319,10 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     private func check(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOENT) throws {
         guard status == SFS_OK else {
             let error = sfsError(status, result, missing: missing)
-            if [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED].contains(status) { latch(error) }
+#if STALLION_WRITE_DIAGNOSTIC
+            if diagnosticWritable { lastCoreFailure = result }
+#endif
+            if result.poisoned != 0 || [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED].contains(status) { latch(error) }
             throw error
         }
         guard anchorMatches(result, anchor) else { let error = POSIXError(.ESTALE); latch(error); throw error }
@@ -266,7 +394,12 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     var maximumXattrSize: Int { ReadOnlyLimits.xattrValue }
     var isOpenCloseInhibited: Bool { false }
     var isAccessCheckInhibited: Bool { false }
-    var requestedMountOptions: FSVolume.MountOptions { [.readOnly] }
+    var requestedMountOptions: FSVolume.MountOptions {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { return [] }
+#endif
+        return [.readOnly]
+    }
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let c = FSVolume.SupportedCapabilities(); c.caseFormat = .sensitive
         c.supportsHardLinks = true; c.supportsSymbolicLinks = true; c.supportsSparseFiles = true
@@ -313,6 +446,9 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     // Each reply runs after all earlier accepted work, including reentrant calls.
     func unmount(replyHandler: @escaping () -> Void) {
         submissionLock.lock()
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { controlRecordLocked(3, mask: 0, error: nil, entry: true) }
+#endif
         pendingUnmountReplies += 1
         if admission != .terminal { admission = .draining }
         queue.async(execute: DispatchWorkItem {
@@ -331,19 +467,54 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     }
     func deactivate(options: FSDeactivateOptions, replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         self.submissionLock.lock()
-        let error = self.failure ?? (self.state == .mounted || self.pendingUnmountReplies != 0 ? POSIXError(.EBUSY) : nil)
+        var error: Error? = self.failure ?? (self.state == .mounted || self.pendingUnmountReplies != 0 ? POSIXError(.EBUSY) : nil)
+#if STALLION_WRITE_DIAGNOSTIC
+        error = self.deliveryFailure?.error ?? error
+#endif
         if error == nil && self.state != .terminal { self.state = .inactive }
         self.submissionLock.unlock()
         self.record(4, error: error); replyHandler(error)
     } }
-    func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
+    func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable {
+            let invalid: Error? = [FSSyncFlags.wait, .dWait, .noWait].contains(flags) ? nil : POSIXError(.EINVAL)
+            enqueue(maintenance: true, syncOperation: true, syncFlags: UInt64(bitPattern: Int64(flags.rawValue)), validationError: invalid, rejected: { replyHandler($0) }) {
+                var error = self.deliveryError() ?? self.failure
+                if error == nil {
+                    do {
+                        let h = try self.ready(); var info = sfs_image_information(), r = sfs_result()
+                        try self.check(sfs_image_get_information(h, &info, &r), r)
+                        guard r.transaction_active == 0 else { throw POSIXError(.EIO) }
+                    } catch let caught { self.latch(caught); self.rememberDelivery(caught, self.lastCoreFailure ?? sfs_result()); error = caught }
+                }
+                // Recheck under the same lock used by prequeue rejection.
+                error = self.deliveryError() ?? error
+                self.record(5, mask: UInt64(bitPattern: Int64(flags.rawValue)), error: error); replyHandler(error)
+            }
+            return
+        }
+#endif
+        enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         self.record(5, error: self.failure); replyHandler(self.failure)
     } }
     // Queue-only. Busy is nonconsuming; a close error still consumes ownership.
     func unload() -> (consumed: Bool, error: Error?) {
         submissionLock.lock()
-        if state == .terminal { submissionLock.unlock(); return (true, failure) }
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { controlRecordLocked(6, mask: 0, error: nil, entry: true) }
+        if diagnosticWritable, let first = deliveryFailure { latch(first.error) }
+#endif
+        if state == .terminal {
+#if STALLION_WRITE_DIAGNOSTIC
+            if diagnosticWritable { controlRecordLocked(6, mask: 1, error: failure) }
+#endif
+            submissionLock.unlock(); return (true, failure)
+        }
         guard pendingUnmountReplies == 0 && callbacks.isEmpty else {
+#if STALLION_WRITE_DIAGNOSTIC
+            if diagnosticWritable { controlRecordLocked(6, mask: 0, error: POSIXError(.EBUSY)) }
+#endif
             submissionLock.unlock(); return (false, POSIXError(.EBUSY))
         }
         admission = .terminal; submissionLock.unlock()
@@ -385,7 +556,18 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         reclaim(item, attempt: { item.tryReclaim($0) }, replyHandler: replyHandler)
     }
     private func reclaim(_ item: FSItem, attempt: @escaping (@escaping () -> Void) -> Bool,
-                         replyHandler: @escaping (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
+                         replyHandler: @escaping (Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        controlEntry(12, item: item)
+#endif
+        enqueue(maintenance: true, rejected: {
+#if STALLION_WRITE_DIAGNOSTIC
+            if self.diagnosticWritable {
+                self.submissionLock.lock(); self.controlRecordLocked(12, mask: 0, error: $0); self.submissionLock.unlock()
+            }
+#endif
+            replyHandler($0)
+        }) {
         do {
             let inode = try self.id(item)
             let eligible = attempt { if inode != 1 && self.items[inode] === item { self.items.removeValue(forKey: inode) } }
@@ -501,16 +683,43 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         do {
             _ = try self.ready(mounted: true); let inode = try self.id(item), m = try self.metadata(inode)
             guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
+#if STALLION_WRITE_DIAGNOSTIC
+            if self.diagnosticWritable {
+                guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+                if modes.contains(.write) { try self.writableMetadata(inode) }
+                if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID) }
+                (item as! StallionItem).retainedModes.formUnion(modes)
+                self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
+            }
+#endif
             if modes.contains(.write) { throw POSIXError(.EROFS) }
             guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
             try self.ownerAccess(m, inode: inode, access: .readData, uid: context.effectiveUserID)
             self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
     } }
-    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue(maintenance: true, rejected: { replyHandler($0) }) {
+    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        controlEntry(16, item: item, mask: UInt64(modes.rawValue))
+#endif
+        enqueue(maintenance: true, rejected: {
+#if STALLION_WRITE_DIAGNOSTIC
+            if self.diagnosticWritable {
+                self.submissionLock.lock(); self.controlRecordLocked(16, mask: UInt64(modes.rawValue), error: $0); self.submissionLock.unlock()
+            }
+#endif
+            replyHandler($0)
+        }) {
         do {
             _ = try self.ready(); let inode = try self.id(item)
             guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
+#if STALLION_WRITE_DIAGNOSTIC
+            if self.diagnosticWritable {
+                guard modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
+                (item as! StallionItem).retainedModes = modes
+                self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
+            }
+#endif
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
             self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
         } catch { self.record(16, uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
@@ -525,7 +734,16 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
         } catch { self.record(17, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(nil, error) }
     } }
     private func ownerAccess(_ m: sfs_metadata_entry, inode: UInt64, access: FSVolume.AccessMask, uid: Int) throws {
-        try checkOwnerMode(m, owner: owner, uid: uid, access: access)
+        var readAccess = access
+#if STALLION_WRITE_DIAGNOSTIC
+        let writeAccess: FSVolume.AccessMask = [.writeData, .appendData]
+        if diagnosticWritable && !access.intersection(writeAccess).isEmpty {
+            guard uid == Int(owner), m.uid == owner, m.entry.kind == SFS_FILE,
+                  m.mode & 0o200 != 0, m.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
+            readAccess.subtract(writeAccess)
+        }
+#endif
+        try checkOwnerMode(m, owner: owner, uid: uid, access: readAccess)
         // Opaque ACL storage is not ACL evaluation. Refuse rather than grant an
         // owner-mode shortcut when the native security descriptor is present.
         let name = Data("com.apple.system.Security".utf8)
@@ -596,12 +814,184 @@ final class StallionVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpe
     } }
     // Refusal retains no caller payload and never waits for queue capacity.
     private func refuse(_ reply: (Error) -> Void) { reply(POSIXError(.EROFS)) }
-    func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { diagnosticSetAttributes(attributes, item: item, reply: replyHandler); return }
+#endif
+        refuse { replyHandler(nil, $0) }
+    }
     func createItem(named name: FSFileName, type: FSItem.ItemType, inDirectory directory: FSItem, attributes: FSItem.SetAttributesRequest, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, nil, $0) } }
     func createSymbolicLink(named name: FSFileName, inDirectory directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, nil, $0) } }
     func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem, replyHandler: @escaping (FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem, replyHandler: @escaping (Error?) -> Void) { refuse { replyHandler($0) } }
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, replyHandler: @escaping (FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
-    func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (Int, Error?) -> Void) { refuse { replyHandler(0, $0) } }
+    func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (Int, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable { diagnosticWrite(contents, item: item, offset: offset, reply: replyHandler); return }
+#endif
+        refuse { replyHandler(0, $0) }
+    }
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, replyHandler: @escaping (Error?) -> Void) { refuse { replyHandler($0) } }
+#if STALLION_WRITE_DIAGNOSTIC
+    @discardableResult private func writableMetadata(_ inode: UInt64) throws -> sfs_metadata_entry {
+        if let error = deliveryError() { throw error }
+        let m = try metadata(inode)
+        guard m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+        try ownerAccess(m, inode: inode, access: .writeData, uid: Int(owner))
+        return m
+    }
+    private func observeWrite(_ operation: UInt64, inode: UInt64, offset: UInt64, length: UInt64,
+                              started: UInt64, count: Int, error: Error?, result: sfs_result) {
+        submissionLock.lock(); defer { submissionLock.unlock() }
+        if writeRecords.count == 4096 { writeCounters.overflow = true; return }
+        saturated(&diagnosticTraceSequence)
+        writeRecords.append(WriteRecord(sequence: diagnosticTraceSequence, operation: operation, inode: inode,
+            offset: offset, length: length, mask: 0, started: started, finished: DispatchTime.now().uptimeNanoseconds,
+            generation: anchor.generation, count: count, code: (error as NSError?)?.code ?? 0, result: result))
+    }
+    private func accountCommit(_ r: sfs_result) {
+        submissionLock.lock(); defer { submissionLock.unlock() }
+        saturated(&writeCounters.commits)
+        if r.fence_attempted & 1 != 0 { saturated(&writeCounters.recordFences) }
+        if r.fence_succeeded & 1 != 0 { saturated(&writeCounters.recordSuccess) }
+        if r.fence_attempted & 2 != 0 { saturated(&writeCounters.commitFences) }
+        if r.fence_succeeded & 2 != 0 { saturated(&writeCounters.commitSuccess) }
+    }
+    // This wrapper owns the only transaction; no previously acknowledged work
+    // is staged. The original receipt survives abort/verification failures.
+    private func mutate(_ body: (OpaquePointer, inout sfs_result) throws -> Void,
+                        receipt: inout sfs_result) throws {
+        let h = try ready(mounted: true), before = anchor
+        var began = false, committed = false
+        do {
+            let begin = sfs_image_begin(h, &receipt)
+            if begin == SFS_STATE { let e = POSIXError(.EIO); latch(e); throw e }
+            try check(begin, receipt); began = true
+            try body(h, &receipt)
+#if STALLION_ADAPTER_CHECK
+            diagnosticBeforeCommit?()
+#endif
+            let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
+            guard status == SFS_OK else {
+                let e = sfsError(status, receipt)
+                if receipt.poisoned != 0 || status == SFS_UNSUPPORTED { latch(e) }
+                throw e
+            }
+            committed = true
+            guard rawBytes(receipt.uuid) == rawBytes(before.uuid), receipt.device == before.device,
+                  receipt.inode == before.inode, before.generation != UInt64.max,
+                  receipt.generation == before.generation + 1, receipt.transaction_active == 0,
+                  receipt.committed_end > before.committed_end,
+                  receipt.poisoned == 0, receipt.fence_attempted == 3, receipt.fence_succeeded == 3 else {
+                let e = POSIXError(.EIO); latch(e); throw e
+            }
+            anchor = receipt
+            submissionLock.lock(); diagnosticDurable = receipt.generation; submissionLock.unlock()
+        } catch {
+            let original = receipt
+            if original.poisoned != 0 || [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED, SFS_UNSUPPORTED].contains(original.status) {
+                latch(error)
+            } else if began && !committed && failure == nil {
+                var cleanup = sfs_result(), information = sfs_image_information()
+                let aborted = sfs_image_abort(h, &cleanup)
+                if (aborted != SFS_OK && aborted != SFS_STATE) || cleanup.transaction_active != 0 || cleanup.poisoned != 0 {
+                    latch(POSIXError(.EIO))
+                } else {
+                    let checked = sfs_image_get_information(h, &information, &cleanup)
+                    if checked != SFS_OK || cleanup.transaction_active != 0 || !anchorMatches(cleanup, before) { latch(POSIXError(.EIO)) }
+                }
+            }
+            receipt = original; rememberDelivery(error, original); throw error
+        }
+    }
+    private func diagnosticWrite(_ contents: Data, item: FSItem, offset: off_t, reply: @escaping (Int, Error?) -> Void) {
+        let start = DispatchTime.now().uptimeNanoseconds
+        var validation: Error?
+        if offset < 0 { validation = POSIXError(.EINVAL) }
+        else if UInt64(offset) > maximumFileSize || UInt64(contents.count) > maximumFileSize - UInt64(offset) { validation = POSIXError(.EFBIG) }
+        enqueue(retainedBytes: contents.count, dataOperation: true, writeOperation: true, validationError: validation, rejected: { reply(0, $0) }) {
+            var receipt = sfs_result(), inode: UInt64 = 0
+            if self.failure == nil { self.lastCoreFailure = nil }
+            do {
+                _ = try self.ready(mounted: true); inode = try self.id(item); try self.writableMetadata(inode)
+                self.submissionLock.lock(); self.saturated(&self.writeCounters.bytes, by: UInt64(contents.count)); self.submissionLock.unlock()
+                if !contents.isEmpty {
+                    try self.mutate({ h, r in
+                        try contents.withUnsafeBytes { bytes in
+                            var at = 0
+                            while at < bytes.count {
+                                let amount = min(65536, bytes.count - at)
+                                self.submissionLock.lock(); self.saturated(&self.writeCounters.chunks); self.submissionLock.unlock()
+                                let status = sfs_image_write(h, inode, UInt64(offset) + UInt64(at), bytes.baseAddress!.advanced(by: at), amount, &r)
+                                try self.check(status, r); at += amount
+#if STALLION_ADAPTER_CHECK
+                                self.diagnosticAfterChunk?(at)
+#endif
+                            }
+                        }
+                    }, receipt: &receipt)
+                }
+                self.observeWrite(1, inode: inode, offset: UInt64(offset), length: UInt64(contents.count), started: start, count: contents.count, error: nil, result: receipt)
+                reply(contents.count, nil)
+            } catch {
+                receipt = self.lastCoreFailure ?? receipt
+                self.rememberDelivery(error, receipt)
+                self.observeWrite(1, inode: inode, offset: UInt64(offset), length: UInt64(contents.count), started: start, count: 0, error: error, result: receipt)
+                reply(0, error)
+            }
+        }
+    }
+    // All 18 SDK27 fields are classified before mutation; no guessed mask.
+    static func sizeRequestError(_ a: FSItem.SetAttributesRequest) -> Error? {
+        let fields: [FSItem.Attribute] = [.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize,
+            .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
+            .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
+        return sizeRequestError(valid: fields.filter { a.isValid($0) })
+    }
+    static func sizeRequestError(valid: [FSItem.Attribute]) -> Error? {
+        let computed: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID, .changeTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
+        let disabled: [FSItem.Attribute] = [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
+        if computed.contains(where: { valid.contains($0) }) { return POSIXError(.EINVAL) }
+        if disabled.contains(where: { valid.contains($0) }) { return POSIXError(.ENOTSUP) }
+        // addedTime and backupTime have no representation and stay unconsumed.
+        return nil
+    }
+    private func diagnosticSetAttributes(_ a: FSItem.SetAttributesRequest, item: FSItem,
+                                         reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
+        let start = DispatchTime.now().uptimeNanoseconds
+        a.consumedAttributes = []
+        let hasSize = a.isValid(.size), validation = Self.sizeRequestError(a)
+        enqueue(dataOperation: hasSize, validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result(), inode: UInt64 = 0
+            if self.failure == nil { self.lastCoreFailure = nil }
+            do {
+                _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
+                if hasSize && m.entry.kind == SFS_FILE {
+                    guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
+                    try self.writableMetadata(inode)
+                    if a.size != m.entry.size {
+                        try self.mutate({ h, r in try self.check(sfs_image_resize(h, inode, a.size, &r), r) }, receipt: &receipt)
+                    }
+                    a.consumedAttributes = [.size]
+#if STALLION_ADAPTER_CHECK
+                    self.diagnosticAfterSizeCommit?()
+#endif
+                }
+                let request = FSItem.GetAttributesRequest()
+                request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
+                var parents = ParentEvidence()
+                let result = try self.attributes(inode, request, parents: &parents)
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: nil, result: receipt)
+                reply(result, nil)
+            } catch {
+                receipt = self.lastCoreFailure ?? receipt
+                if hasSize { self.rememberDelivery(error, receipt) }
+                // If size was consumed, it already committed. Do not abort it.
+                if !a.consumedAttributes.isEmpty { self.latch(error) }
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: error, result: receipt)
+                reply(nil, error)
+            }
+        }
+    }
+#endif
 }

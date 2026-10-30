@@ -54,6 +54,11 @@ struct sfs_image {
     uint64_t eof, epoch, token;
     anchor current, slots[2]; enum sfs_status slot_status[2]; int slot_error[2], slot_observed[2];
     state live, staged; enum sfs_phase phase; cache *cache; batch *batch;
+    enum sfs_limit_reason limit_reason;
+    unsigned fence_attempted, fence_succeeded;
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    uint64_t diagnostic_capacity;
+#endif
 };
 typedef struct { uint64_t block, stamp; uint8_t *bytes; int valid, dirty; } aux_entry;
 typedef struct {
@@ -139,10 +144,16 @@ void sfs_image_clear_read_cache(sfs_image *h) { if (h) cache_clear(h); }
 static enum sfs_status result(sfs_image *h, enum sfs_status status, enum sfs_phase phase, int error, sfs_result *r) {
     if (r) { memset(r, 0, sizeof(*r)); r->status = status; r->phase = phase; r->system_errno = error;
         if (h) { r->generation = h->current.generation; r->committed_end = h->current.end; r->physical_end = h->eof; r->device = (uint64_t)h->identity.st_dev; r->inode = (uint64_t)h->identity.st_ino; memcpy(r->uuid, h->current.uuid, 16); memcpy(r->root_digest, h->current.root.digest, 32); }
+        if (h) {
+            r->limit_reason = status == SFS_LIMIT ? h->limit_reason : SFS_LIMIT_UNSPECIFIED;
+            r->fence_attempted = h->fence_attempted; r->fence_succeeded = h->fence_succeeded;
+            r->transaction_active = h->transaction; r->poisoned = h->poisoned;
+        }
     } return status;
 }
 static enum sfs_status ready(sfs_image *h, int writing, int tx, sfs_result *r) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
     if (h->poisoned) return result(h, SFS_POISONED, h->phase, 0, r);
     if (!h->selected || (writing && h->policy != ORDINARY_WRITABLE) || (tx && !h->transaction)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r); return SFS_OK;
 }
@@ -731,7 +742,19 @@ static enum sfs_status tree_delete(tree *t, const key *k) {
 }
 static unsigned tree_dirty(tree *t, unsigned id) { overlay_page *p = owned_page(t, id); if (!p) return 0; unsigned n = !!p->dirty; if (page_level(p->bytes)) for (unsigned i = 0; i < page_count(p->bytes); ++i) if (p->children[i] != NO_CHILD) n += tree_dirty(t, p->children[i]); return n; }
 static uint64_t pending_cells(tree *t) { return t->root >= 0 ? tree_dirty(t, (unsigned)t->root) : 0; }
-static int reserve_cells(sfs_image *h, uint64_t cells) { uint64_t at; return aligned(h->eof < DATA_START ? DATA_START : h->eof, &at) && cells <= UINT64_MAX / CELL && at <= h->current.capacity && cells * CELL <= h->current.capacity - at; }
+static int reserve_cells(sfs_image *h, uint64_t cells) {
+    uint64_t at, capacity = h->current.capacity;
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    if (h->diagnostic_capacity && h->diagnostic_capacity < capacity) capacity = h->diagnostic_capacity;
+#endif
+    if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at) || cells > UINT64_MAX / CELL) {
+        h->limit_reason = SFS_LIMIT_STRUCTURE; return 0;
+    }
+    if (at > capacity || cells * CELL > capacity - at) {
+        h->limit_reason = SFS_LIMIT_APPEND_CAPACITY; return 0;
+    }
+    return 1;
+}
 static enum sfs_status append_prepared(sfs_image *h, unsigned type, const uint8_t b[CELL], reference *out, uint64_t *remaining, const reference *prepared) {
     if (!*remaining || !reserve_cells(h, 1)) return SFS_LIMIT;
     uint64_t at; if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at)) return SFS_LIMIT;
@@ -1045,6 +1068,7 @@ enum sfs_status sfs_image_select(sfs_image *h, unsigned slot, const sfs_verify_b
 }
 enum sfs_status sfs_image_close(sfs_image *h, sfs_result *out) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_CLOSE, 0, out);
+    h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
     int error = 0; if (close(h->fd)) error = errno; if (close(h->aux_parent) && !error) error = errno;
     enum sfs_status e = result(h, error ? SFS_IO : SFS_OK, SFS_PHASE_CLOSE, error, out); discard(h); cache_clear(h); free(h); return e;
 }
@@ -1207,6 +1231,9 @@ static enum sfs_status prepare_metadata(reader *r, unsigned inode_keys, unsigned
 }
 static enum sfs_status mutation_start(sfs_image *h, sfs_result *out) {
     enum sfs_status e = ready(h, 1, 1, out); if (e) return e;
+    /* Remaining LIMIT sites in these mutators are arithmetic/tree bounds;
+     * reserve_cells and explicit file bounds replace this reason at origin. */
+    h->limit_reason = SFS_LIMIT_STRUCTURE;
     if (h->batch && (h->batch->arena != h->batch->extent.arena || h->batch->arena->epoch != h->epoch || h->batch->arena->batch != h->batch->number || !same_ref(&h->batch->arena->lineage, &h->staged.ns.ref) || h->batch->extent.owner != h->batch->inode.e.inode || h->batch->extent.map != MAP_EXTENT)) return mutation_failure(h, SFS_CORRUPT, SFS_PHASE_VALIDATE, 0, 0, out);
     if (stable(h)) return mutation_failure(h, SFS_IO, SFS_PHASE_IDENTITY, errno, 0, out); return SFS_OK;
 }
@@ -1230,11 +1257,18 @@ static enum sfs_status write_metadata_trees(reader *r, tree *inodes, tree *names
 }
 enum sfs_status sfs_image_begin(sfs_image *h, sfs_result *out) {
     enum sfs_status e = ready(h, 1, 0, out); if (e) return e; if (h->transaction) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    h->limit_reason = SFS_LIMIT_STRUCTURE;
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
     if (h->current.generation == UINT64_MAX || h->epoch == UINT64_MAX || !reserve_cells(h, 1)) return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, out);
     h->staged = h->live; h->transaction = 1; h->epoch++; return result(h, SFS_OK, SFS_PHASE_NONE, 0, out);
 }
 enum sfs_status sfs_image_abort(sfs_image *h, sfs_result *out) { enum sfs_status e = ready(h, 1, 1, out); if (e) return e; discard(h); return result(h, SFS_OK, SFS_PHASE_NONE, 0, out); }
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+void sfs_image_diagnostic_counters(sfs_image *h, uint64_t epoch, uint64_t token) {
+    if (h && !h->transaction) { h->epoch = epoch; h->token = token; }
+}
+void sfs_image_diagnostic_capacity(sfs_image *h, uint64_t capacity) { if (h) h->diagnostic_capacity = capacity; }
+#endif
 /* Probe the exact metadata edit before a pending batch can consume append space. */
 static enum sfs_status probe_metadata(reader *r, unsigned operation, const node *before, const node *after) {
     if (!r->h->batch) return SFS_OK;
@@ -1667,7 +1701,7 @@ enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, con
     reader r = current_reader(h, 1); node n; unsigned transition_height = 0; uint64_t transition_bound = 0; int same = h->batch && h->batch->inode.e.inode == id, late = 0; arena *a = NULL; batch *candidate = NULL; uint8_t *merge = NULL; tree ext;
     if (same) n = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed; }
     if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; }
-    if (!add64(offset, length, &end) || end > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
+    if (!add64(offset, length, &end) || end > SFS_FILE_MAX) { h->limit_reason = SFS_LIMIT_FILE_SIZE; e = SFS_LIMIT; goto failed; }
     if (!length) return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out);
     sfs_timestamp operation_time = {0}; if (metadata_capable(h->current.minor)) { int error; e = clock_sample(&operation_time, &error); if (e) return result(h, e, SFS_PHASE_NONE, error, result_out); }
     uint64_t extent_count = n.attributes.extents;
@@ -1862,7 +1896,7 @@ enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_
     enum sfs_status e = mutation_start(h, result_out); if (e) return e;
     reader r = current_reader(h, 1); node n; int same = h->batch && h->batch->inode.e.inode == id, late = 0; arena *guard = NULL; prefix_builder *builder = NULL;
     if (same) n = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed; }
-    if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; } if (size > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
+    if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; } if (size > SFS_FILE_MAX) { h->limit_reason = SFS_LIMIT_FILE_SIZE; e = SFS_LIMIT; goto failed; }
     uint64_t old_size = n.e.size, retained = 0, total = 0, pages[MAX_HEIGHT] = {0}; unsigned levels = 0, boundary = 0; uint8_t boundary_bytes[CELL], boundary_row[MAX_ROW];
     sfs_timestamp operation_time = {0}; if (metadata_capable(h->current.minor) && size != old_size) { int error; e = clock_sample(&operation_time, &error); if (e) return result(h, e, SFS_PHASE_NONE, error, result_out); }
     if (size > old_size) {
@@ -1915,9 +1949,12 @@ enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     uint64_t remaining = 1; e = append_cell(h, ROOT, b, &next.root, &remaining); if (e) return mutation_failure(h, e, SFS_PHASE_RECORDS, e == SFS_IO ? errno : 0, 1, out); next.end = h->eof;
     /* Finalize every reachable byte and the slot before the first fence. */
     encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
+    h->fence_attempted |= 1;
     if (fullsync(h->fd)) goto failed;
+    h->fence_succeeded |= 1;
     phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0; published = 1; if (write_exact(h->fd, b, CELL, slot * ALIGNMENT)) goto failed;
-    phase = SFS_PHASE_COMMIT_BARRIER; if (fullsync(h->fd)) goto failed;
+    phase = SFS_PHASE_COMMIT_BARRIER; h->fence_attempted |= 2; if (fullsync(h->fd)) goto failed;
+    h->fence_succeeded |= 2;
     h->live = h->staged; memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; h->current = next; h->slots[slot] = next; h->slot_observed[slot] = 1; h->slot_status[slot] = SFS_OK;
     result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_ROOT_ONLY; return SFS_OK;
 failed: { int error = errno; discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out); }

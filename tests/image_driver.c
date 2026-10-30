@@ -281,7 +281,7 @@ int sfs_test_fcntl(int fd, int command, ...) {
         for (unsigned i = 0; i < 2; i++) { const unsigned char *ref = last + 64 + i * 56; if (ref[0]) { uint64_t offset = 0; for (int j = 7; j >= 0; j--) offset = (offset << 8) | ref[8+j]; assert(offset < (uint64_t)st.st_size - CELL); } }
     }
     if (competing) competitor();
-    if (is("full") && fulls == target) { hit++; errno = EIO; return -1; }
+    if ((is("full") || is("full_enospc")) && fulls == target) { hit++; errno = is("full_enospc") ? ENOSPC : EIO; return -1; }
     int result = fcntl(fd, command);
     if (!result && model) capture(fd);
     if (!result && cut) stop_at(fd, NULL, 0, 0);
@@ -1377,7 +1377,7 @@ static void limits(void) {
     open_image(&h); reset("", 0);
     enum sfs_status status = sfs_image_begin(h, &r);
     if (status == SFS_OK) status = sfs_image_commit(h, &r);
-    assert(status == SFS_LIMIT && writes == 0 && fulls == 0);
+    assert(status == SFS_LIMIT && r.limit_reason == SFS_LIMIT_STRUCTURE && writes == 0 && fulls == 0);
     admission_unchanged(h, before, n); close_image(h); free(before);
     cap_phase("generation-limit", "after");
 }
@@ -4376,6 +4376,59 @@ static void position_views(void) {
     image_unwritten(); close_image(h); unchanged("image", before, n); free(before); retain(3531);
 }
 
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+static void diagnostic_receipts(void) {
+    sfs_image *h; sfs_result r; sfs_inode id; sfs_metadata_initial initial = metadata_input(SFS_FILE);
+    hardlink_create(&h, TEST_CAPACITY); OK(sfs_image_begin(h, &r));
+    OK(sfs_image_add_metadata(h, 1, "file", 4, SFS_FILE, &initial, &id, &r));
+    OK(sfs_image_write(h, id, 0, "accepted", 8, &r)); OK(sfs_image_commit(h, &r));
+    assert(r.fence_attempted == 3 && r.fence_succeeded == 3 && !r.transaction_active && !r.poisoned);
+    uint64_t generation = r.generation;
+    sfs_image_diagnostic_counters(h, UINT64_MAX, 0);
+    assert(sfs_image_begin(h, &r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_STRUCTURE && !r.transaction_active);
+    sfs_image_diagnostic_counters(h, 0, UINT64_MAX);
+    OK(sfs_image_begin(h, &r));
+    assert(sfs_image_write(h, id, 0, "no", 2, &r) == SFS_NOMEM && r.limit_reason == SFS_LIMIT_UNSPECIFIED);
+    OK(sfs_image_abort(h, &r)); sfs_image_diagnostic_counters(h, 0, 0);
+    OK(sfs_image_begin(h, &r));
+    assert(sfs_image_write(h, id, SFS_FILE_MAX, "x", 1, &r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_FILE_SIZE && !r.transaction_active);
+    assert(sfs_image_abort(h, &r) == SFS_STATE && r.limit_reason == SFS_LIMIT_UNSPECIFIED);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, id, 0, "staged", 6, &r));
+    clock_failure = 1;
+    assert(sfs_image_write(h, id, CELL, "second", 6, &r) == SFS_TIME_UNAVAILABLE && r.transaction_active && !r.poisoned && r.system_errno == ENXIO);
+    clock_failure = 0; OK(sfs_image_abort(h, &r)); expect(h, 0, id, "accepted");
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, id, 0, "staged", 6, &r));
+    reset("", 0); fail_allocation = allocation_calls + 1;
+    assert(sfs_image_commit(h, &r) == SFS_NOMEM && !r.transaction_active && !r.poisoned && r.generation == generation);
+    fail_allocation = 0; assert(sfs_image_abort(h, &r) == SFS_STATE); expect(h, 0, id, "accepted");
+    sfs_image_information information; OK(sfs_image_get_information(h, &information, &r));
+    sfs_image_diagnostic_capacity(h, information.committed.physical_end);
+    assert(sfs_image_begin(h, &r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY && !r.transaction_active);
+    sfs_image_diagnostic_capacity(h, TEST_CAPACITY); OK(sfs_image_begin(h, &r));
+    OK(sfs_image_write(h, id, 0, "staged", 6, &r)); OK(sfs_image_get_information(h, &information, &r));
+    sfs_image_diagnostic_capacity(h, information.committed.physical_end);
+    assert(sfs_image_commit(h, &r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY && !r.transaction_active);
+    sfs_image_diagnostic_capacity(h, TEST_CAPACITY); expect(h, 0, id, "accepted");
+    close_image(h); retain(3600);
+    for (unsigned pass = 0; pass < 3; ++pass) {
+        hardlink_create(&h, TEST_CAPACITY); OK(sfs_image_begin(h, &r));
+        OK(sfs_image_add_metadata(h, 1, "file", 4, SFS_FILE, &initial, &id, &r)); OK(sfs_image_commit(h, &r));
+        generation = r.generation; OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, id, 0, "x", 1, &r));
+        reset(pass == 1 ? "slot_torn" : "full_enospc", pass == 2 ? 2 : 1);
+        enum sfs_status status = sfs_image_commit(h, &r);
+        assert(hit && status == (pass ? SFS_OUTCOME_UNKNOWN : SFS_IO) && r.system_errno == ENOSPC);
+        assert(r.poisoned && !r.transaction_active && r.generation == generation && r.limit_reason == SFS_LIMIT_UNSPECIFIED);
+        assert(r.fence_attempted == (pass == 2 ? 3u : 1u) && r.fence_succeeded == (pass ? 1u : 0u));
+        assert(r.phase == (pass == 0 ? SFS_PHASE_RECORD_BARRIER : pass == 2 ? SFS_PHASE_COMMIT_BARRIER : SFS_PHASE_SLOT1));
+        reset("", 0); close_image(h); retain(3601 + (int)pass);
+    }
+    fixture f = indexed_fixture(1, 1, 0); size_t size = f.n;
+    for (unsigned slot = 0; slot < 2; ++slot) { put64(f.p + slot * CELL + 144, size + CELL); slot_hash(f.p + slot * CELL); }
+    fixture_save(&f); open_image(&h); OK(sfs_image_begin(h, &r));
+    assert(sfs_image_resize(h, 2, 8192, &r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY);
+    assert(!r.transaction_active && !r.poisoned); close_image(h);
+}
+#endif
 static void metadata_information(void) {
     sfs_image *h = NULL; sfs_result r; sfs_image_information first, pending, current;
     sfs_metadata_initial initial = { .mode = S_IFDIR | 0700, .uid = geteuid(), .gid = getegid() };
@@ -4434,6 +4487,9 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
     else if(!strcmp(argv[1],"metadata-information")) metadata_information();
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    else if(!strcmp(argv[1],"diagnostic-receipts")) diagnostic_receipts();
+#endif
     else if(!strcmp(argv[1],"hardlink-versions")) hardlink_versions();
     else if(!strcmp(argv[1],"hardlink-shared")) { hardlink_shared(); position_views(); }
     else if(!strcmp(argv[1],"hardlink-transitions")) hardlink_transitions();
@@ -4454,7 +4510,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strcmp(argv[1],"cache")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
+    if(strcmp(argv[1],"cache")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }
