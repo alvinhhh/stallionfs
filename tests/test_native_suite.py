@@ -72,6 +72,8 @@ class NativeSuite(unittest.TestCase):
         self.scan_expected = {}
         self.metadata_calls = []
         self.coverage_calls = []
+        self.counter_boundaries = []
+        self.digest_reads = []
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -145,6 +147,16 @@ class NativeSuite(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, b'cp (GNU coreutils) 9.7\n', b'')
         if argv == ['/usr/bin/time', '--version']:
             return subprocess.CompletedProcess(argv, 0, b'time (GNU Time) 1.9\n', b'')
+        if argv == [suite.ZPOOL, 'get', '-Hp', '-o', 'property,value',
+                    'guid,feature@block_cloning,bcloneused,bclonesaved,bcloneratio', 'testpool']:
+            destination_present = bool(self.measured) and Path(self.measured[0][-1]).exists()
+            self.counter_boundaries.append((len(self.measured), destination_present))
+            if self.measured:
+                self.assertTrue(list(self.journal.iter_latest('rows'))[0]['validated'])
+            values = ('active', 4096, '2.00') if self.measured else ('enabled', 0, '1.00')
+            text = ('guid\t17\nfeature@block_cloning\t%s\nbcloneused\t%d\n'
+                    'bclonesaved\t%d\nbcloneratio\t%s\n') % (values[0], values[1], values[1], values[2])
+            return subprocess.CompletedProcess(argv, 0, text.encode(), b'')
         if argv[:1] == [str(self.binary)] and argv[1:] == ['--json', 'volumes']:
             return subprocess.CompletedProcess(argv, 0, b'{}', b'')
         if argv == [str(self.binary), '--version']:
@@ -182,7 +194,7 @@ class NativeSuite(unittest.TestCase):
                 'cpu_s': 0.2, 'rss_bytes': 16384, 'io_input_blocks': 0, 'io_output_blocks': 1,
                 'precision_floor': {'wall_s': 1e-9, 'user_s': 0.01, 'system_s': 0.01, 'cpu_s': 0.02}}
 
-    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, system='Darwin'):
+    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, digest=None, system='Darwin'):
         fixture_names = (fixture,) if fixture_names is None else fixture_names
         argv = ['native_suite.py', *([] if system == 'Linux' else ['--binary', str(self.binary)]), '--scratch', str(self.root),
                 '--output', str(self.output), '--fixtures', *fixture_names, '--copy-tools', *copy_tools,
@@ -190,6 +202,9 @@ class NativeSuite(unittest.TestCase):
         def warm_manifest(path):
             self.cache_calls.append(str(path))
             return {'hash': Path(path).read_bytes().hex()}
+        def pinned_digest(path):
+            self.digest_reads.append(str(path))
+            return 'digest:' + str(path)
         owner = self
         class CapturingJournal(JOURNAL):
             def __init__(self, output):
@@ -204,7 +219,7 @@ class NativeSuite(unittest.TestCase):
                 mock.patch.object(suite, 'restore_setup_symlink_times', return_value=[]),
                 mock.patch.object(suite.fileops, 'scratch_volume', return_value={'fstype': 'apfs'}),
                 mock.patch.object(suite.fileops, 'fingerprint_sources', return_value={'product': 'pinned'}),
-                mock.patch.object(suite.fileops, 'digest', side_effect=lambda path: 'digest:' + str(path)),
+                mock.patch.object(suite.fileops, 'digest', side_effect=digest or pinned_digest),
                 mock.patch.object(suite.fileops, 'fixtures', side_effect=self.fixtures),
                 mock.patch.object(suite.native_fixtures, 'scan_fixture', side_effect=self.scan_fixture),
                 mock.patch.object(suite.native_fixtures, 'enrich_metadata', side_effect=enrich or self.enrich_metadata),
@@ -229,7 +244,7 @@ class NativeSuite(unittest.TestCase):
                 read_text = Path.read_text
                 stack.enter_context(mock.patch.object(suite.fileops, 'linux_mounts', return_value=[]))
                 stack.enter_context(mock.patch.object(suite.fileops, 'linux_scratch_volume',
-                    return_value={'filesystem': 'zfs', 'zfs_executable': '/usr/sbin/zfs'}))
+                    return_value={'filesystem': 'zfs', 'zfs_executable': '/usr/sbin/zfs', 'dataset': 'testpool/bench'}))
                 stack.enter_context(mock.patch.object(suite.fileops, 'large_fixture', side_effect=tiny_large))
                 stack.enter_context(mock.patch.object(Path, 'read_text', autospec=True,
                     side_effect=lambda path, *args, **kwargs: 'MemTotal:       4194304 kB\n' if str(path) == '/proc/meminfo'
@@ -261,8 +276,175 @@ class NativeSuite(unittest.TestCase):
         self.assertEqual(report['environment']['host_storage'], 'unobserved by guest')
         self.assertFalse(any(str(self.binary) in argv for argv in self.commands))
 
+    def test_linux_required_reflink_has_separate_api_and_pool_evidence(self):
+        def no_darwin_sharing(*_args):
+            self.fail('Linux required-reflink must not query Darwin sharing attributes')
+        with mock.patch.object(suite.native_metrics, 'compare_paired', side_effect=AssertionError('No Linux pairs')):
+            report = self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                                    fixture='docs_5k_100mb', sharing=no_darwin_sharing)
+        self.assertTrue(report['passed'] and report['cleanup_passed'])
+        self.assertEqual(self.exit_code, 0)
+        self.assertEqual(len(report['rows']), 20)
+        self.assertEqual({row['method'] for row in report['rows']}, {'gnu-cp-reflink'})
+        self.assertTrue(all(argv[:4] == ['/bin/cp', '-a', '--reflink=always', '--'] for argv in self.measured))
+        self.assertTrue(all(row['validated'] and row['source_unchanged'] and 'pair_id' not in row
+                            and row['clone_evidence']['api_accepted'] is True
+                            and row['clone_evidence']['full_data_stream_sharing'] is None
+                            and 'data_stream_sharing' not in row for row in report['rows']))
+        self.assertTrue(all(not options.get('observe_sharing', False) for options in self.snapshot_options))
+        self.assertEqual(len(report['comparisons']), 2)
+        self.assertTrue(all(item['method'] == 'gnu-cp-reflink' and item['kind'] == 'descriptive'
+                            and item['complete'] and item['metrics']['wall_s']['n'] == 10
+                            for item in report['comparisons']))
+        self.assertNotIn('all_metrics_won', report)
+        self.assertEqual(self.counter_boundaries, [(0, False), (1, True)])
+        self.assertEqual(report['clone_pool_evidence']['corroboration']['status'], 'corroborated')
+        self.assertTrue(report['clone_pool_evidence']['corroboration']['same_pool_guid'])
+        self.assertIn(suite.ZPOOL, report['executables'])
+        self.assertEqual(self.digest_reads.count(suite.ZPOOL), 2)
+
+    def test_linux_reflink_stale_or_unavailable_counters_do_not_negate_api_acceptance(self):
+        for failure in ('stale', 'unavailable', 'malformed'):
+            self.output = self.root / f'clone-counter-{failure}.json'
+            self.measured.clear(); self.counter_boundaries.clear()
+            def command(argv, **kwargs):
+                result = self.command(argv, **kwargs)
+                if argv[0] == suite.ZPOOL and self.measured:
+                    if failure == 'stale':
+                        result.stdout = result.stdout.replace(b'4096', b'0')
+                    elif failure == 'unavailable':
+                        result.returncode, result.stderr = 1, b'counter unavailable\xff'
+                    else:
+                        result.stdout += b'guid\t17\n'
+                return result
+            with self.subTest(failure=failure):
+                report = self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                                        fixture='docs_5k_100mb', command=command)
+                self.assertTrue(report['passed'])
+                self.assertEqual(len(report['rows']), 20)
+                self.assertTrue(all(row['clone_evidence']['api_accepted'] is True for row in report['rows']))
+                self.assertEqual(report['clone_pool_evidence']['corroboration']['status'], 'inconclusive')
+                self.assertIsNone(report['clone_pool_evidence']['corroboration']['full_data_stream_sharing'])
+                self.assertEqual(self.counter_boundaries, [(0, False), (1, True)])
+                if failure == 'unavailable':
+                    self.assertEqual(base64.b64decode(report['clone_pool_evidence']['after']['stderr_b64']),
+                                     b'counter unavailable\xff')
+
+    def test_linux_reflink_pool_guid_change_retains_validated_destination(self):
+        for failure in ('none', 'after malformed', 'after missing', 'after disabled', 'before malformed', 'after error'):
+            self.output = self.root / f'clone-guid-{failure}.json'
+            self.measured.clear(); self.counter_boundaries.clear()
+            def command(argv, **kwargs):
+                result = self.command(argv, **kwargs)
+                if argv[0] == suite.ZPOOL:
+                    if self.measured:
+                        result.stdout = result.stdout.replace(b'guid\t17\n', b'guid\t18\n')
+                        if failure == 'after malformed':
+                            result.stdout = result.stdout.replace(b'bcloneused\t4096\n', b'bcloneused\t-\n')
+                        elif failure == 'after missing':
+                            result.stdout = result.stdout.replace(b'bcloneused\t4096\n', b'')
+                        elif failure == 'after disabled':
+                            result.stdout = result.stdout.replace(b'\tactive\n', b'\tdisabled\n')
+                        elif failure == 'after error':
+                            result.returncode, result.stderr = 1, b'optional counter unavailable'
+                    elif failure == 'before malformed':
+                        result.stdout = result.stdout.replace(b'bcloneused\t0\n', b'bcloneused\t-\n')
+                return result
+            with self.subTest(failure=failure), self.assertRaisesRegex(RuntimeError, 'pool GUID changed'):
+                self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                               fixture='docs_5k_100mb', command=command)
+            report = json.loads(self.output.read_text())
+            evidence = report['clone_pool_evidence']
+            self.assertEqual(len(self.measured), 1)
+            self.assertTrue(report['rows'][0]['validated'])
+            self.assertTrue(report['rows'][0]['clone_evidence']['api_accepted'])
+            self.assertEqual((evidence['before']['guid'], evidence['after']['guid']), ('17', '18'))
+            self.assertFalse(evidence['corroboration']['same_pool_guid'])
+            self.assertEqual(evidence['corroboration']['status'], 'inconclusive')
+            if failure.startswith('after'): self.assertFalse(evidence['after']['valid'])
+            elif failure == 'before malformed': self.assertFalse(evidence['before']['valid'])
+            self.assertTrue((Path(report['retained_fixture'])/'destination').exists())
+            self.assertFalse(report.get('cleanup_passed', False))
+
+    def test_linux_reflink_raw_failures_are_checkpointed_and_retained_without_fallback(self):
+        for failure in ('unsupported', 'resource parse', 'uncertain'):
+            self.output = self.root / f'clone-raw-{failure}.json'
+            self.measured.clear(); self.counter_boundaries.clear()
+            def collect(argv, **kwargs):
+                row = self.collect(argv, **kwargs)
+                row.update(ok=False, stderr_b64=base64.b64encode(b'reflink raw failure\xff').decode())
+                if failure == 'unsupported': row['exit_code'] = 1
+                elif failure == 'resource parse': row['parse_errors'] = ['rss_bytes']
+                else: row.update(exit_code=None, completion_uncertain=True, timed_out=True)
+                return row
+            with self.subTest(failure=failure), self.assertRaises(RuntimeError):
+                self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                               fixture='docs_5k_100mb', collector=collect)
+            report = json.loads(self.output.read_text())
+            self.assertEqual(len(self.measured), 1)
+            self.assertEqual(self.measured[0][2], '--reflink=always')
+            self.assertTrue((Path(report['retained_fixture'])/'destination').exists())
+            self.assertFalse(report['rows'][0]['validated'])
+            self.assertFalse(report.get('cleanup_passed', False))
+            self.assertIs(report['rows'][0]['clone_evidence']['api_accepted'],
+                          False if failure == 'unsupported' else True if failure == 'resource parse' else None)
+            self.assertEqual(base64.b64decode(report['rows'][0]['stderr_b64']), b'reflink raw failure\xff')
+            journal = JOURNAL.open_existing(self.output)
+            try: self.assertEqual(list(journal.iter_latest('rows')), report['rows'])
+            finally: journal.close()
+            self.assertEqual(self.counter_boundaries, [(0, False)])
+
+    def test_linux_reflink_semantic_failures_retain_source_and_destination(self):
+        verify = self.verify_clone
+        for failure in ('metadata', 'hardlink_groups', 'sparse_lost', 'sparse_unknown', 'source alias', 'source mutation'):
+            self.output = self.root / f'clone-semantic-{failure}.json'; self.measured.clear()
+            def reject(before, after):
+                result = verify(before, after)
+                if failure.startswith('sparse'):
+                    result['sparse_preserved'] = False if failure == 'sparse_lost' else None
+                elif failure in ('metadata', 'hardlink_groups'):
+                    result.update(strict_equal=False, candidate_losses=[{'field': failure}])
+                return result
+            def collect(argv, **kwargs):
+                row = self.collect(argv, **kwargs)
+                if failure == 'source alias':
+                    Path(argv[-1]).unlink(); os.link(argv[-2], argv[-1])
+                elif failure == 'source mutation': Path(argv[-2]).write_bytes(b'changed source')
+                return row
+            with self.subTest(failure=failure), mock.patch.object(self, 'verify_clone', side_effect=reject), \
+                    self.assertRaisesRegex(RuntimeError, 'validation failed'):
+                self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                               fixture='docs_5k_100mb', collector=collect)
+            report = json.loads(self.output.read_text())
+            self.assertEqual(len(self.measured), 1)
+            self.assertTrue(report['rows'][0]['clone_evidence']['api_accepted'])
+            self.assertFalse(report['rows'][0]['validated'])
+            self.assertTrue((Path(report['retained_fixture'])/'docs_5k_100mb').exists())
+            self.assertTrue((Path(report['retained_fixture'])/'destination').exists())
+            self.assertFalse(report.get('cleanup_passed', False))
+
+    def test_linux_reflink_zpool_hash_change_retains_fixture(self):
+        reads = []
+        def digest(path):
+            reads.append(str(path))
+            return 'changed' if str(path) == suite.ZPOOL and reads.count(suite.ZPOOL) == 2 else 'digest:' + str(path)
+        with self.assertRaisesRegex(RuntimeError, 'Executable changed'):
+            self.run_suite(system='Linux', operations=('clone',), copy_tools=('cp-clone',),
+                           fixture='docs_5k_100mb', digest=digest)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(len(self.measured), 20)
+        self.assertTrue((Path(report['retained_fixture'])/'docs_5k_100mb').exists())
+        self.assertFalse(report.get('cleanup_passed', False))
+
+    def test_pool_ratio_feature_or_one_byte_counter_alone_is_not_corroboration(self):
+        before = {'valid': True, 'guid': '17', 'feature': 'active', 'bcloneused': 10, 'bclonesaved': 10}
+        for used, saved in ((10, 10), (11, 10), (10, 11), (9, 12)):
+            after = before | {'bcloneused': used, 'bclonesaved': saved, 'bcloneratio': '999.00'}
+            self.assertEqual(suite.clone_pool_corroboration(before, after)['status'], 'inconclusive')
+
     def test_linux_unsupported_selections_fail_before_artifacts_or_commands(self):
         for options in ({'fixture': 'tiny_4kib'}, {'operations': ('scan',)}, {'operations': ('clone',)},
+                        {'operations': ('clone', 'copy'), 'copy_tools': ('cp-clone', 'cp')},
                         {'operations': ('move',)}, {'operations': ('delete',)}, {'cache': ('cold',)},
                         {'copy_tools': ('cp-clone',)}, {'extra': ('--jobs', '1')},
                         {'extra': ('--runs', '2')}, {'extra': ('--samples', '11')},
