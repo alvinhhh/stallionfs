@@ -80,18 +80,18 @@ source .venv/bin/activate
 
 ## Performance
 
-0.6.3 · macOS 27 arm64 · warm generated fixtures · October 24–29, 2026. Median elapsed times, including command startup, from ten timing pairs per comparison.
+macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median elapsed times include command startup; each row has ten timing pairs and ten separate resource pairs. Measured native code matches the current native sources; build provenance and exact commands are linked below.
 
 | Operation | Native reference | Native | stallionfs |
 | --- | --- | ---: | ---: |
-| [Copy a 4 KiB file](tests/perf/results/ordinary-copy-tiny-v0.6.3-arm64.json) | `cp -Rp` | 4.857 ms | 5.861 ms |
-| [Move a 4 KiB file](tests/perf/results/native-move-tiny-20261024-arm64.json.xz) | `mv -n` | 3.758 ms | 4.704 ms |
-| [Scan 20,000 files in one folder](tests/perf/results/native-scan-flat-20261024-arm64.json.xz) | `find` + batched `stat` | 14.146 s | 33.494 ms |
-| [Scan 20,000 files across nested folders](tests/perf/results/native-scan-nested-20261024-arm64.json.xz) | `find` + batched `stat` | 12.784 s | 17.051 ms |
-| [Scan 20,000 files along a 40-folder chain](tests/perf/results/native-scan-deep40-20261024-arm64.json.xz) | `find` + batched `stat` | 13.018 s | 32.026 ms |
-| [Clone a document tree, 5,002 files, `--jobs 1`](tests/perf/results/native-clone-docs-jobs1-20261029-arm64.json.xz) | `ditto --rsrc --extattr --acl` | 754.396 ms | 572.289 ms |
+| [Copy a 4 KiB file](tests/perf/results/ordinary-copy-tiny-20261030-arm64.json.xz) | `cp -Rp` | 7.157 ms | 9.539 ms |
+| [Move a 4 KiB file](tests/perf/results/native-move-tiny-direct-controls-20261030-arm64.json.xz) | `mv -n` | 3.731 ms | 4.361 ms |
+| [Scan a flat 20k-file fixture](tests/perf/results/native-scans-20k-20261030-arm64.json.xz) | Recorded find/stat | 11.416 s | 33.169 ms |
+| [Scan a nested 20k-file fixture](tests/perf/results/native-scans-20k-20261030-arm64.json.xz) | Recorded find/stat | 12.137 s | 17.766 ms |
+| [Scan a deep40 20k-file fixture](tests/perf/results/native-scans-20k-20261030-arm64.json.xz) | Recorded find/stat | 12.615 s | 34.431 ms |
+| [Clone 5,002 document files, explicit `--jobs 2`](tests/perf/results/native-clone-docs-jobs2-20261029-arm64.json.xz) | `ditto --rsrc --extattr --acl` | 763.839 ms | 356.793 ms |
 
-[CPU, memory and full results](tests/perf/README.md).
+[CPU, reported process RSS, default-four-worker clone results and full data](tests/perf/README.md). Scan results apply only to the recorded find/stat recipe.
 
 ## Contributing
 
