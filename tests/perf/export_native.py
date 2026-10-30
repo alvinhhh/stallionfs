@@ -380,6 +380,10 @@ def _redactor(aliases):
             counts[index] += count
         return data
     def visit(value, field=None, *, measured_row=False, report_root=False):
+        # Raw Git diagnostics and ownership details remain in private reports.
+        if field in ('git_commands', 'git_preparations') or (isinstance(value, dict)
+                and value.get('kind') == 'git-preparation'):
+            raise ValueError('Raw Git preparation receipts require separate export review; retain the private original')
         if field == 'data_stream_sharing':
             return redact_sharing(value, replace)
         if field is not None and field.endswith('gzip_b64'):
