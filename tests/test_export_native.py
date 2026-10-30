@@ -136,6 +136,24 @@ def dependency_report():
 
 
 class ExportNative(unittest.TestCase):
+    def test_raw_git_receipts_rejected_at_every_depth(self):
+        raw_values = ({'git_commands': []}, {'git_preparations': []},
+                      {'kind': 'git-preparation', 'stdout_b64': 'cHJpdmF0ZQ=='})
+        for value in raw_values:
+            for location in ('top', 'row', 'preparation'):
+                with self.subTest(value=value, location=location):
+                    data = report()
+                    if location == 'top':
+                        data['nested'] = [{'further': value}]
+                    elif location == 'row':
+                        data['rows'][0]['nested'] = [{'further': value}]
+                    else:
+                        data['preparation'] = [{'nested': [{'further': value}]}]
+                    before = copy.deepcopy(data)
+                    with self.assertRaisesRegex(ValueError, 'Raw Git preparation'):
+                        exporter.redact_report(data, [('/Users/example', 'ROOT')])
+                    self.assertEqual(data, before)
+
     def test_existing_scans_preserve_numeric_stdout_and_failure_evidence(self):
         for fixture in ('scan_flat_20k', 'scan_nested_20k', 'scan_deep40_20k'):
             for method in ('find-stat', 'stallionfs'):
@@ -547,6 +565,24 @@ class JournalExportNative(unittest.TestCase):
         finally:
             writer.close()
         return output, writer.manifest_path, writer.journal_path
+
+    def test_raw_git_rejection_publishes_no_plain_or_journal_output(self):
+        data = report()
+        data['preparation'] = [{'fixture': 'tiny_4kib', 'nested': {
+            'kind': 'git-preparation', 'git_commands': [{'stdout_b64': 'cHJpdmF0ZQ=='}]}}]
+        with tempfile.TemporaryDirectory() as folder:
+            plain = Path(folder) / 'plain.json'
+            plain.write_text(json.dumps(data))
+            original, manifest, journal = self.journal(folder, data)
+            retained = {path: path.read_bytes() for path in (plain, original, manifest, journal)}
+            for source in (plain, manifest):
+                target = Path(folder) / (source.name + '.export.json')
+                with self.subTest(source=source.name):
+                    with self.assertRaisesRegex(ValueError, 'Raw Git preparation'):
+                        exporter.export_report(source, target, [('/Users/example', 'ROOT')])
+                    self.assertFalse(target.exists())
+                    self.assertFalse(list(Path(folder).glob('.native-export-*')))
+            self.assertEqual({path: path.read_bytes() for path in retained}, retained)
 
     def test_optional_jobs_preserves_plain_and_journal_values_and_exclusive_outputs(self):
         for selection in ({}, {'jobs': None}, *({'jobs': jobs} for jobs in range(1, 5))):
