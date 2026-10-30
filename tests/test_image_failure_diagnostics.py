@@ -1,5 +1,6 @@
 """Mocks only: no disk-image commands, mounts, or diagnostic subprocesses."""
 import errno
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -19,11 +20,13 @@ if __package__:
     from . import test_image_store as lifecycle
     from . import test_fileops as fileops
     from . import test_images_space as space
+    from . import test_images as image_cases
 else:
     import image_failure_diagnostics as diagnostics
     import test_image_store as lifecycle
     import test_fileops as fileops
     import test_images_space as space
+    import test_images as image_cases
 
 
 def captured(stdout=b'', stderr=b'', status=0, **extra):
@@ -378,6 +381,280 @@ class DiagnosticTests(unittest.TestCase):
 
     def events(self):
         return [json.loads(s) for s in (self.reporter.directory / diagnostics.REPORT).read_text().splitlines()]
+
+    def eject_observation(self, **changes):
+        identity = self.image.stat()
+        self.reporter.eject_contexts[1] = dict(image=str(self.image), target=self.args[2],
+            identity=(identity.st_dev, identity.st_ino), deadline=time.monotonic() + 12)
+        return dict(operation_id=1, scope=self.scope(), target=self.args[2],
+                    start_ns=1700000000 * 10**9, end_ns=1700000002 * 10**9,
+                    start_mono=10, end_mono=12) | changes
+
+    def log_record(self, message, **changes):
+        value = dict(timestamp='2023-11-14 22:13:21.000000+0000', subsystem=diagnostics.DA_SUBSYSTEM,
+                     processImagePath='/usr/libexec/diskarbitrationd', eventMessage=message,
+                     unused_private_field='/Users/unrelated/private-file') | changes
+        return (json.dumps(value) + '\n').encode()
+
+    def test_eject_log_retains_only_exact_public_stage_and_status(self):
+        native = 'unable to eject /dev/disk999 (status code 0x00000010).'
+        approval = ('  dispatched response, id = 1234567890ABCDEF:0123456789ABCDEF, '
+                    'kind = DADiskEjectApprovalCallback, disk = /dev/disk999, dissented, status = 0xF8DA0002.')
+        raw = (self.log_record(native) + self.log_record(approval) +
+               self.log_record(native.replace('disk999', 'disk9990')) +
+               self.log_record(native.replace('disk999', 'disk999s1')) +
+               self.log_record(native, subsystem='unrelated') +
+               self.log_record(native, processImagePath='/usr/bin/unrelated') +
+               self.log_record(native, timestamp='2023-11-14 22:13:19.000000+0000') +
+               self.log_record('private reason: /Users/unrelated/private-file') + b'{"finished":true}\n')
+        observation = self.eject_observation()
+        now = time.monotonic()
+        def capture(argv, deadline):
+            self.assertEqual(self.reporter.remaining, diagnostics.EJECT_CAPTURE_BYTES)
+            self.assertLessEqual(deadline, now + diagnostics.EJECT_SECONDS + 0.1)
+            self.assertEqual(argv[:4], ['/usr/bin/log', 'show', '--style', 'ndjson'])
+            self.assertEqual(argv[argv.index('--start') + 1], '2023-11-14 22:13:20+0000')
+            self.assertEqual(argv[argv.index('--end') + 1], '2023-11-14 22:13:22+0000')
+            self.assertIn('--no-debug', argv)
+            self.assertIn('--no-info', argv)
+            self.assertIn('subsystem == "' + diagnostics.DA_SUBSYSTEM + '"', argv[-1])
+            self.assertIn('"/dev/disk999,"', argv[-1])
+            self.assertNotIn(str(self.image), argv[-1])
+            self.reporter.remaining -= len(raw)
+            return captured(raw)
+        initial = self.reporter.remaining
+        with patch.object(self.reporter, '_capture', side_effect=capture) as query:
+            self.reporter.eject_log(observation)
+            self.reporter.eject_log(observation)
+        query.assert_called_once()
+        event = self.events()[-1]
+        self.assertEqual(event['query_status'], 'matched')
+        self.assertIn('native_eject_failed /dev/disk999 0x00000010', event['records'])
+        self.assertIn('approval_dissent /dev/disk999 0xF8DA0002', event['records'])
+        self.assertEqual(len(event['records'].splitlines()), 2)
+        for secret in ('1234567890ABCDEF', 'unused_private_field', '/Users/', 'disk9990', 'disk999s1'):
+            self.assertNotIn(secret, (self.reporter.directory / diagnostics.REPORT).read_text())
+        self.assertEqual(self.reporter.remaining, initial - len(raw))
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_eject_log_empty_denied_malformed_redacted_and_partial_are_inconclusive(self):
+        native = self.log_record('unable to eject /dev/disk999 (status code 0x00000010).')
+        cases = [('empty', captured(b'{"finished":true}\n'), 'empty'),
+                 ('denied', captured(b'private reason', b'/private/unrelated', 1), 'unavailable'),
+                 ('malformed', captured(b'not json\n'), 'incomplete'),
+                 ('redacted', captured(self.log_record('unable to eject /dev/disk999 <private>')), 'incomplete'),
+                 ('timeout', captured(native) | dict(timeout=True), 'incomplete'),
+                 ('truncated', captured(native) | dict(truncated=True), 'incomplete'),
+                 ('cleanup', captured(native) | dict(cleanup_error='PermissionError'), 'incomplete'),
+                 ('spawn', OSError('private path /Users/unrelated'), 'unavailable')]
+        for label, response, expected in cases:
+            with self.subTest(label=label):
+                self.reporter.eject_log_attempted = False
+                observation = self.eject_observation()
+                with patch.object(self.reporter, '_capture', side_effect=response if isinstance(response, Exception) else None,
+                                  return_value=response):
+                    self.reporter.eject_log(observation)
+                event = self.events()[-1]
+                self.assertEqual(event['query_status'], expected)
+                self.assertNotIn('/Users/', json.dumps(event))
+                self.assertNotIn('/private/unrelated', json.dumps(event))
+        records, reason, limited = diagnostics._eject_records(native * 100, self.args[2],
+            1700000000 * 10**9, 1700000002 * 10**9)
+        self.assertTrue(limited)
+        self.assertIsNone(reason)
+        self.assertLessEqual(len(records.encode()), diagnostics.EJECT_RETAINED_BYTES)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_eject_log_requires_owned_mapping_time_window_and_remaining_budget(self):
+        for label in ('expected', 'mapping', 'identity', 'target', 'window', 'clock', 'disabled', 'bytes', 'events', 'deadline'):
+            with self.subTest(label=label):
+                self.reporter.eject_log_attempted = self.reporter.capture_disabled = False
+                self.reporter.remaining = diagnostics.CAPTURE_BYTES
+                self.reporter.events = self.reporter.written = 0
+                observation = self.eject_observation()
+                context = self.reporter.eject_contexts[1]
+                if label == 'expected': observation['scope']['expected'] = True
+                elif label == 'mapping': self.reporter.eject_contexts.clear()
+                elif label == 'identity': context['identity'] = (-1, -1)
+                elif label == 'target': observation['target'] = '/Users/private/" OR TRUE'
+                elif label == 'window': observation.update(end_ns=observation['start_ns'] + 31 * 10**9, end_mono=41)
+                elif label == 'clock': observation['end_ns'] += 2 * 10**9
+                elif label == 'disabled': self.reporter.capture_disabled = True
+                elif label == 'bytes': self.reporter.remaining = 0
+                elif label == 'events': self.reporter.events = diagnostics.EVENTS
+                elif label == 'deadline': context['deadline'] = time.monotonic() + 0.5
+                with patch.object(self.reporter, '_capture') as capture, patch.object(self.reporter, '_emit') as emit:
+                    self.reporter.eject_log(observation)
+                capture.assert_not_called()
+                self.assertEqual(emit.call_args.kwargs['query_status'], 'unavailable')
+                self.assertEqual(emit.call_args.kwargs['records'], '')
+                self.assertNotIn('/Users/private', str(emit.call_args))
+
+    def test_eject_log_uncertain_capture_cannot_restore_budget(self):
+        observation = self.eject_observation()
+        def capture(argv, deadline):
+            self.assertEqual(self.reporter.remaining, diagnostics.EJECT_CAPTURE_BYTES)
+            self.reporter.capture_disabled = True
+            self.reporter.remaining = 0
+            return captured() | dict(cleanup_error='PermissionError', reaped=False)
+        with patch.object(self.reporter, '_capture', side_effect=capture) as query:
+            self.reporter.eject_log(observation)
+            self.reporter.eject_log(observation)
+        query.assert_called_once()
+        self.assertEqual(self.reporter.remaining, 0)
+        self.assertEqual(self.events()[-1]['query_status'], 'incomplete')
+
+    def test_actual_intentional_refusal_scope_leaves_recovery_failure_unexpected(self):
+        fixture = image_cases.Images('test_clone_ownership_busy_detach_and_recovery')
+        fixture.base = self.base / 'busy-case'
+        fixture.base.mkdir(mode=0o700)
+        fixture.seed = fixture.base / 'seed.sparseimage'
+        fixture.seed.write_bytes(b'synthetic backing')
+        first = fixture.base / 'first.sparseimage'
+        first_mount = fixture.base / 'first'
+        native = [dict(path=str(first_mount), device='/dev/disk998', readonly=False, ignore_ownership=False)]
+        attached, scopes = {}, []
+        primary = image_cases.StallionError('unexpected recovery failure')
+        def clone(source, destination):
+            if source in attached:
+                raise image_cases.StallionError('attached source')
+            shutil.copyfile(source, destination)
+        def attach(image, point):
+            if image not in attached:
+                point.mkdir(mode=0o700)
+                repo = point / 'repo'
+                repo.mkdir()
+                (repo / 'file').write_bytes(b'original')
+                (repo / 'file').chmod(0o640)
+                (repo / 'link').symlink_to('file')
+                attached[image] = repo
+            return attached[image]
+        def mounted(image):
+            from stallionfs._scan import mounts
+            record = mounts()[0]
+            if record['readonly'] or record['ignore_ownership'] or record['device'] != '/dev/disk998':
+                raise image_cases.StallionError('changed mapping')
+            return dict(mountpoint=str(first_mount), device='/dev/disk999')
+        def detach(image, point):
+            if point != first_mount:
+                raise image_cases.StallionError('wrong mountpoint')
+            scope = diagnostics._scope.get()
+            scopes.append(scope)
+            error = image_cases.StallionError('intentional busy') if scope else primary
+            self.reporter.report(self.args, error, scope)
+            raise error
+        with patch.object(image_cases.images, 'clone', side_effect=clone), \
+                patch.object(image_cases.images, 'attach', side_effect=attach), \
+                patch.object(image_cases.images, 'mounted', side_effect=mounted), \
+                patch.object(image_cases.images, 'detach', side_effect=detach), \
+                patch.object(image_cases.subprocess, 'check_output', return_value=b'attribute'), \
+                patch('stallionfs._scan.mounts', return_value=native), self.assertRaises(type(primary)) as caught:
+            image_cases.Images.test_clone_ownership_busy_detach_and_recovery(fixture)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(scopes, [dict(base=fixture.base, image=first, workspace=None,
+            mountpoint=first_mount, stage='body', expected=True), None])
+        self.assertEqual(self.reporter.attempts, 1)
+        self.assertEqual(self.events()[0]['message'], 'unexpected recovery failure')
+        self.assertIsNone(diagnostics._scope.get())
+
+    def test_eject_query_follows_both_existing_attempts_and_keeps_original_exception(self):
+        first, final = space.images._error('first busy'), space.images._error('final busy')
+        first.returncode = final.returncode = errno.EBUSY
+        order = []
+        errors = iter([first, final])
+        def original(*args):
+            order.append('detach')
+            raise next(errors)
+        current = dict(device='/dev/disk999', mountpoint=str(self.point), volume_device='/dev/disk999s1')
+        remaining = dict(current, mountpoint=None, volume_device=None)
+        with patch.object(space.images, '_command', side_effect=original) as command, \
+                patch.object(space.images, 'mounted', side_effect=[current, remaining]), \
+                patch.object(space.images.os.path, 'ismount', return_value=False), \
+                patch('stallionfs._scan.mounts', return_value=[]):
+            collector = diagnostics.install(space.images, self.base / 'unused')
+            def before(args, scope, observation):
+                order.append('before')
+                observation['operation_id'] = 1
+            def query(observation):
+                self.assertEqual(command.call_count, 2)
+                self.assertEqual(observation['target'], '/dev/disk999')
+                self.assertLessEqual(observation['start_ns'], observation['end_ns'])
+                order.append('log')
+            with patch.object(collector, 'before', side_effect=before), \
+                    patch.object(collector, 'report', side_effect=lambda *a, **k: order.append('report')), \
+                    patch.object(collector, 'eject_log', side_effect=query), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                    self.assertRaises(type(final)) as caught:
+                with diagnostics.observe_detach():
+                    space.images.detach(self.image, self.point)
+        self.assertIs(caught.exception, final)
+        self.assertEqual(command.call_args_list, [call(*self.args, '-verbose')] * 2)
+        self.assertEqual(order, ['before', 'detach', 'report', 'detach', 'report', 'log'])
+        self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_eject_query_skips_success_expected_refusal_other_errors_and_cancellation(self):
+        busy, other = space.images._error('busy'), space.images._error('other')
+        busy.returncode, other.returncode = errno.EBUSY, 5
+        for result, expected in ((b'ok', False), (busy, True), (other, False),
+                                 (KeyboardInterrupt(), False), (SystemExit(2), False)):
+            with self.subTest(result=type(result).__name__, expected=expected):
+                images = SimpleNamespace(_command=Mock(side_effect=result if isinstance(result, BaseException) else None,
+                                                       return_value=result))
+                collector = diagnostics.install(images, self.base / 'unused')
+                with patch.object(collector, 'before'), patch.object(collector, 'report'), \
+                        patch.object(collector, 'eject_log') as query, \
+                        diagnostics.failure_scope(self.base, self.image, expected=expected):
+                    if isinstance(result, BaseException):
+                        with self.assertRaises(type(result)):
+                            with diagnostics.observe_detach():
+                                images._command(*self.args)
+                    else:
+                        with diagnostics.observe_detach():
+                            self.assertEqual(images._command(*self.args), b'ok')
+                query.assert_not_called()
+
+    def test_recovery_success_or_log_error_cannot_change_detach_result(self):
+        busy = space.images._error('busy')
+        busy.returncode = errno.EBUSY
+        for recovered in (True, False):
+            with self.subTest(recovered=recovered):
+                images = SimpleNamespace(_command=Mock(side_effect=[busy, b'ok' if recovered else busy]))
+                collector = diagnostics.install(images, self.base / 'unused')
+                with patch.object(collector, 'before'), patch.object(collector, 'report'), \
+                        patch.object(collector, 'eject_log', side_effect=OSError('log failed')) as query, \
+                        diagnostics.failure_scope(self.base, self.image):
+                    def operation():
+                        with diagnostics.observe_detach():
+                            try:
+                                images._command(*self.args)
+                            except type(busy):
+                                return images._command(*self.args)
+                    if recovered:
+                        self.assertEqual(operation(), b'ok')
+                        query.assert_not_called()
+                    else:
+                        with self.assertRaises(type(busy)) as caught:
+                            operation()
+                        self.assertIs(caught.exception, busy)
+                        query.assert_called_once()
+                        self.assertIn('Eject log unavailable: OSError', busy.__notes__)
+
+    def test_artifact_rejects_unscoped_eject_log_records(self):
+        observation = self.eject_observation()
+        with patch.object(self.reporter, '_capture', return_value=captured(
+                self.log_record('unable to eject /dev/disk999 (status code 0x00000010).'))):
+            self.reporter.eject_log(observation)
+        self.reporter.close()
+        path = self.reporter.directory / diagnostics.REPORT
+        original = path.read_text()
+        event = json.loads(original)
+        for change in ({'target': '/Users/unrelated'}, {'records': 'private /Users/unrelated\n'},
+                       {'window_start_ns': -1}, {'query_status': 'empty'}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps(event | change) + '\n')
+                self.assertFalse(diagnostics.artifact_available(self.reporter.directory))
+        path.write_text(original)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
     def holder_output(self, *, device=None, inode=None):
         info = self.image.stat()

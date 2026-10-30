@@ -420,6 +420,9 @@ class ImageCore(unittest.TestCase):
     def test_metadata_atomic_admission_clock_failures_and_bounded_getter(self):
         self.scenario('metadata-atomic')
 
+    def test_selected_information_constant_work_and_committed_receipt(self):
+        self.scenario('metadata-information')
+
     def test_symlink_explicit_versions_and_legacy_capability(self):
         self.scenario('symlink-versions')
 
