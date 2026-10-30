@@ -152,6 +152,15 @@ enum sfs_status sfs_image_pin_release(sfs_image *, sfs_pin, sfs_result *);
  * cleared: linked=0 explicitly marks those namespace fields unavailable.
  * Detached metadata is lost at close/crash; snapshots never include it. */
 enum sfs_status sfs_image_pin_stat(sfs_image *, sfs_pin, sfs_pin_stat *, sfs_result *);
+/* Metadata only from the active transaction on an ordinary writable handle.
+ * Includes pending writes and bound creates; unbound reservations fail STATE.
+ * Returns a value copy without a batch flush or data/xattr reads.
+ * Keep the result private until commit succeeds. With no further mutation,
+ * successful commit publishes these values; abort never publishes them. The receipt
+ * still names the committed anchor and is not durability evidence.
+ * Detached parent/name remain unavailable. Failure leaves output unchanged. */
+enum sfs_status sfs_image_pin_stat_transaction(sfs_image *, sfs_pin,
+    sfs_pin_stat *, sfs_result *);
 enum sfs_status sfs_image_pin_read(sfs_image *, sfs_pin, uint64_t,
     void *, size_t, size_t *, sfs_result *);
 enum sfs_status sfs_image_pin_readlink(sfs_image *, sfs_pin,

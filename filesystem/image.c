@@ -1323,22 +1323,34 @@ enum sfs_status sfs_image_stat_metadata(sfs_image *h, sfs_view view, sfs_inode i
     if (!e) { sfs_metadata_entry v = {0}; v.entry = n.e; v.birth = n.attributes.birth; v.access = n.attributes.access; v.modification = n.attributes.modification; v.change = n.attributes.change; v.mode = n.attributes.mode; v.uid = n.attributes.uid; v.gid = n.attributes.gid; v.flags = n.attributes.flags; v.referenced_data_bytes = n.attributes.extents * CELL; v.link_count = n.nlink; *out = v; }
     return touched_result(&r, e, result_out);
 }
+static enum sfs_status pin_stat_value(const node *n, sfs_pin_stat *out) {
+    if (n->attributes.extents > UINT64_MAX / CELL) return SFS_CORRUPT;
+    sfs_pin_stat v = {0}; sfs_metadata_entry *m = &v.metadata;
+    v.linked = !!n->nlink; m->entry = n->e;
+    if (!v.linked) { m->entry.parent = 0; m->entry.name_length = 0; memset(m->entry.name, 0, sizeof(m->entry.name)); }
+    m->birth = n->attributes.birth; m->access = n->attributes.access;
+    m->modification = n->attributes.modification; m->change = n->attributes.change;
+    m->mode = n->attributes.mode; m->uid = n->attributes.uid; m->gid = n->attributes.gid; m->flags = n->attributes.flags;
+    m->referenced_data_bytes = n->attributes.extents * CELL; m->link_count = n->nlink; *out = v;
+    return SFS_OK;
+}
 enum sfs_status sfs_image_pin_stat(sfs_image *h, sfs_pin token, sfs_pin_stat *out, sfs_result *result_out) {
     enum sfs_status e = pin_gate(h, 0, 0, result_out); if (e) return e;
     if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); node n; reference attrs; uint64_t next;
     e = pin_committed(&r, token, &n, &attrs, &next);
-    if (!e && n.attributes.extents > UINT64_MAX / CELL) e = SFS_CORRUPT;
-    if (!e) {
-        sfs_pin_stat v = {0}; sfs_metadata_entry *m = &v.metadata;
-        v.linked = !!n.nlink; m->entry = n.e;
-        if (!v.linked) { m->entry.parent = 0; m->entry.name_length = 0; memset(m->entry.name, 0, sizeof(m->entry.name)); }
-        m->birth = n.attributes.birth; m->access = n.attributes.access;
-        m->modification = n.attributes.modification; m->change = n.attributes.change;
-        m->mode = n.attributes.mode; m->uid = n.attributes.uid; m->gid = n.attributes.gid; m->flags = n.attributes.flags;
-        m->referenced_data_bytes = n.attributes.extents * CELL; m->link_count = n.nlink; *out = v;
-    }
+    if (!e) e = pin_stat_value(&n, out);
+    return touched_result(&r, e, result_out);
+}
+enum sfs_status sfs_image_pin_stat_transaction(sfs_image *h, sfs_pin token, sfs_pin_stat *out, sfs_result *result_out) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, token, &target, result_out); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    e = mutation_start(h, result_out); if (e) return e;
+    reader r = current_reader(h, 1); node n;
+    if (target_same(h->batch, target)) n = h->batch->inode;
+    else e = target_get(&r, target, &n);
+    if (!e) e = pin_stat_value(&n, out);
     return touched_result(&r, e, result_out);
 }
 enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, const void *name, size_t length, sfs_entry *out, sfs_result *result_out) {
