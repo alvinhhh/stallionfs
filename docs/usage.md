@@ -157,9 +157,25 @@ sfs cleanup --apply
 sfs cleanup --disable
 ```
 
-Cleanup is off by default. Both global enablement and workspace enrollment are required. `enroll --disable WORKSPACE_ID` removes enrollment. `run` holds an exclusive managed-use lease and records the workspace as open before starting the command. The command's exit, a dead process, or a released lease never means closed. Only explicit `close --quiescent` records closure. It also normally detaches and flushes image workspaces. Running commands does not contain their descendants or restrict filesystem access.
+Cleanup is off by default. Both global enablement and workspace enrollment are required. `enroll --disable WORKSPACE_ID` removes enrollment. `run` holds an exclusive managed-use lease and records the workspace as open before starting the command. For ordinary `run`, command exit, a dead process, or a released lease never means closed. Only explicit `close --quiescent` records closure. It also normally detaches and flushes image workspaces. Running commands does not contain their descendants or restrict filesystem access.
 
-Enabled cleanup retires eligible workspaces seven days after their recorded closure. It skips open, legacy, unknown, busy, mounted, corrupt, or identity-changed workspaces and invalid or future closure times. Explicit preview and apply inspect the full workspace collection. Managed CLI mutations also attempt a nonblocking pass over at most eight entries after completing the requested operation. Ordinary file operations never run cleanup. This is opportunistic maintenance; there is no scheduled service and no guarantee every old workspace is visited.
+Enabled cleanup retires eligible workspaces seven days after explicit closure or the first reliable idle observation of an opted-in cooperative session. It skips ordinary open, legacy, unknown, busy, mounted, corrupt, or identity-changed workspaces and invalid or future timestamps. Explicit preview and apply inspect the full workspace collection. Managed CLI mutations also attempt a nonblocking pass over at most eight workspace IDs after completing the requested operation. A saved lexical cursor advances over busy and ineligible IDs too, so later workspaces are visited on subsequent passes. Ordinary file operations never run cleanup. This is opportunistic maintenance; there is no scheduled service. Preview does not record idle observations, reconcile pending rollbacks, or advance the cursor. Apply also skips pending rollback journals until an explicit workspace operation resolves them.
+
+### Cooperative session retirement
+
+```sh
+sfs cleanup --enable
+sfs enroll WORKSPACE_ID
+sfs run --auto-retire WORKSPACE_ID -- COMMAND ARGUMENTS
+```
+
+`--auto-retire` must appear before the workspace ID. It supports folder workspaces only and requires enabled cleanup and valid enrollment before launch. Images continue to require explicit `close --quiescent`.
+
+Use this option only with cooperating commands. The command receives `STALLIONFS_LEASE_FD`, an inherited open descriptor holding the workspace lease, and `STALLIONFS_LEASE_GENERATION`, the session generation. Every process that may continue writing independently must keep that descriptor open and pass it to its own writers until they finish. For Python subprocesses, explicitly include it in `pass_fds`. A waiting ancestor holding the descriptor does not protect a child after that ancestor dies. Never call `flock(..., LOCK_UN)` on the shared descriptor; close it when finished. This option does not contain processes or detect unmanaged writers.
+
+The wrapper closes its own descriptor without unlocking descendants' copies. After the wrapper exits, a targeted check records `idle_since` only if the exact enrolled generation's lease is free and its identity still matches. A surviving holder keeps it busy. If the wrapper crashes, a later cleanup apply can make that first observation. The seven-day grace starts at this observation, not process death, creation, or command exit. Later checks preserve a valid idle timestamp. Preview never starts the grace period.
+
+An ordinary reopen, restore, or new session clears the old session's opt-in. Disabled cleanup, a changed generation, malformed state, future timestamps, or pending rollback keeps the workspace ineligible. This allows forgotten cooperative sessions to be retired while preserving the explicit-close rule for other workspaces.
 
 Retirement moves the whole workspace into protected trash. It does not permanently delete data or free the retained blocks. `gc --yes`, including `--older-than 0`, skips protected trash. Restore with `sfs restore WORKSPACE_ID`; restoration marks it open so it cannot immediately be retired again. An interrupted retirement before the move leaves the workspace in place with protection; explicitly reopening it with `run`, `mount`, or `enroll` cancels a verified source-only retirement intent.
 
