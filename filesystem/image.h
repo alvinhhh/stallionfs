@@ -34,6 +34,10 @@ enum sfs_status {
     SFS_NOT_FOUND, SFS_EXISTS, SFS_STATE, SFS_NOMEM, SFS_INCOMPLETE,
     SFS_TIME_UNAVAILABLE
 };
+enum sfs_limit_reason {
+    SFS_LIMIT_UNSPECIFIED, SFS_LIMIT_APPEND_CAPACITY,
+    SFS_LIMIT_FILE_SIZE, SFS_LIMIT_STRUCTURE
+};
 enum sfs_phase {
     SFS_PHASE_NONE, SFS_PHASE_PARENT, SFS_PHASE_CREATE, SFS_PHASE_LOCK,
     SFS_PHASE_VALIDATE, SFS_PHASE_READ, SFS_PHASE_ADMISSION,
@@ -68,6 +72,12 @@ typedef struct {
     uint8_t uuid[16], root_digest[32];
     enum sfs_coverage coverage;
     enum sfs_incomplete_reason incomplete_reason;
+    /* Per-invocation receipt. begin/write/resize/commit distinguish LIMIT causes.
+     * Internal arena capacity/token/allocation failures retain NOMEM.
+     * Fence bits 1/2 describe actual record/publication fence calls this call. */
+    enum sfs_limit_reason limit_reason;
+    unsigned fence_attempted, fence_succeeded;
+    int transaction_active, poisoned;
 } sfs_result;
 typedef struct {
     uint32_t major, minor;
@@ -238,6 +248,11 @@ enum sfs_status sfs_image_verify(sfs_image *, const sfs_verify_budget *, sfs_res
 
 enum sfs_status sfs_image_begin(sfs_image *, sfs_result *);
 enum sfs_status sfs_image_abort(sfs_image *, sfs_result *);
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+/* Private helper only: boundary injection, absent from ordinary objects. */
+void sfs_image_diagnostic_counters(sfs_image *, uint64_t epoch, uint64_t token);
+void sfs_image_diagnostic_capacity(sfs_image *, uint64_t capacity);
+#endif
 enum sfs_status sfs_image_add(sfs_image *, sfs_inode parent, const void *name,
                             size_t name_length, enum sfs_kind, sfs_inode *out,
                             sfs_result *);

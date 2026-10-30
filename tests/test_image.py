@@ -423,6 +423,14 @@ class ImageCore(unittest.TestCase):
     def test_selected_information_constant_work_and_committed_receipt(self):
         self.scenario('metadata-information')
 
+    def test_existing_file_diagnostic_receipts_and_transaction_failures(self):
+        try:
+            self.compile('diagnostic', '-DSFS_IMAGE_DIAGNOSTIC_TESTING=1')
+            self.scenario('diagnostic-receipts', 'diagnostic')
+        except BaseException:
+            type(self).failed = True
+            raise
+
     def test_symlink_explicit_versions_and_legacy_capability(self):
         self.scenario('symlink-versions')
 
