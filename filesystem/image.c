@@ -43,7 +43,8 @@ typedef struct { uint32_t view, length; uint8_t name[SFS_NAME_MAX]; reference ns
 typedef struct { uint64_t generation, end, capacity; uint8_t uuid[16]; reference root; uint32_t minor; } anchor;
 typedef struct { namespace ns; uint32_t count; snapshot snapshots[SFS_SNAPSHOT_MAX]; reference catalog; } state;
 typedef struct { reference ref; uint64_t stamp; uint8_t *bytes; } cache_entry;
-typedef struct { cache_entry entries[CACHE_COUNT]; uint64_t clock; unsigned count; } cache;
+/* Only count entries are searchable; the first allocated entries own buffers. */
+typedef struct { cache_entry entries[CACHE_COUNT]; uint64_t clock; unsigned count, allocated; } cache;
 typedef struct arena arena;
 typedef struct tree tree;
 typedef struct batch batch;
@@ -162,7 +163,9 @@ static void pins_promote(sfs_image *h);
 static void pins_free(sfs_image *h);
 static enum sfs_status mutation_start(sfs_image *, sfs_result *);
 static enum sfs_status mutation_failure(sfs_image *, enum sfs_status, enum sfs_phase, int, int, sfs_result *);
-static void cache_clear(sfs_image *h) { if (!h->cache) return; for (unsigned i = 0; i < h->cache->count; ++i) free(h->cache->entries[i].bytes); free(h->cache); h->cache = NULL; }
+static void cache_clear(sfs_image *h) { if (!h->cache) return; for (unsigned i = 0; i < h->cache->allocated; ++i) free(h->cache->entries[i].bytes); free(h->cache); h->cache = NULL; }
+/* Invalidate content so commit keeps its existing rereads and checks. */
+static void cache_invalidate(sfs_image *h) { if (h->cache) { h->cache->count = 0; h->cache->clock = 0; } }
 void sfs_image_clear_read_cache(sfs_image *h) { if (h) cache_clear(h); }
 static enum sfs_status result(sfs_image *h, enum sfs_status status, enum sfs_phase phase, int error, sfs_result *r) {
     if (r) { memset(r, 0, sizeof(*r)); r->status = status; r->phase = phase; r->system_errno = error;
@@ -358,7 +361,10 @@ static enum sfs_status metadata(reader *r, const reference *ref, unsigned type, 
     e = charge(r, SFS_INCOMPLETE_METADATA_HASH, CELL); if (e) return e;
     unsigned slot = c->count;
     if (slot == CACHE_COUNT) { slot = 0; for (unsigned i = 1; i < c->count; ++i) if (c->entries[i].stamp < c->entries[slot].stamp) slot = i; }
-    else { c->entries[slot].bytes = malloc(CELL); if (!c->entries[slot].bytes) return SFS_NOMEM; c->count++; }
+    else {
+        if (slot == c->allocated) { uint8_t *bytes = malloc(CELL); if (!bytes) return SFS_NOMEM; c->entries[slot].bytes = bytes; c->allocated++; }
+        c->count++;
+    }
     cache_entry *v = &c->entries[slot]; memset(&v->ref, 0, sizeof(v->ref));
     if (read_exact(r->h->fd, v->bytes, CELL, ref->offset)) return io_failure(r, SFS_PHASE_READ);
     uint8_t digest[32]; hash_cell(v->bytes, type, r->a.uuid, digest, r->a.minor);
@@ -2322,7 +2328,7 @@ enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     enum sfs_status e = mutation_start(h, out); if (e) return e;
     if (h->pins) for (uint32_t i = h->pins->changed; i != PIN_NONE; i = h->pins->slots[i].next)
         if (h->pins->slots[i].pending == PIN_RESERVED) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
-    reader r = current_reader(h, 0); state fresh; cache_clear(h); e = reconcile(&r, &fresh);
+    reader r = current_reader(h, 0); state fresh; cache_invalidate(h); e = reconcile(&r, &fresh);
     if (!e && h->staged.ns.next_inode < fresh.ns.next_inode) e = SFS_CORRUPT;
     if (e) return mutation_failure(h, e, r.phase, r.error, 1, out);
     r = current_reader(h, 1); uint64_t pending; e = batch_cost(&r, &pending); if (!e && !reserve_cells(h, pending + 1)) e = SFS_LIMIT;

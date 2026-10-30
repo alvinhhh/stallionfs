@@ -423,6 +423,9 @@ class ImageCore(unittest.TestCase):
     def test_memory_only_cache_release_refill_authority_and_transactions(self):
         self.scenario('cache')
 
+    def test_commit_cache_storage_reuse_invalidation_growth_and_integrity(self):
+        self.scenario('cache-commit')
+
     def test_ordinary_readonly_admission_policy_poison_and_budgets(self):
         self.scenario('readonly')
 

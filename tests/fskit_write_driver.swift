@@ -25,7 +25,7 @@ struct Fixture {
     let url: URL
     let id: UInt64
     let identity: UUID
-    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid()) throws {
+    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid(), extra: Bool = false) throws {
         fault(0, 0); url = parent.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         var h: OpaquePointer?, r = sfs_result(), m = sfs_metadata_initial(), inode: UInt64 = 0
@@ -36,6 +36,8 @@ struct Fixture {
         need(sfs_image_add_metadata(h, 1, "file", 4, SFS_FILE, &m, &inode, &r) == SFS_OK, "create regular")
         let fileID = inode; id = fileID
         need(sfs_image_link(h, inode, 1, "alias", 5, &r) == SFS_OK, "create alias")
+        need(sfs_image_set_xattr(h, fileID, "note", 4, "value", 5, &r) == SFS_OK, "regular opaque xattr")
+        if extra { need(sfs_image_add_metadata(h, 1, "extra", 5, SFS_FILE, &m, &inode, &r) == SFS_OK, "extra capacity operand") }
         m.mode = UInt32(S_IFLNK) | 0o700; m.uid = geteuid()
         need(sfs_image_symlink_metadata(h, 1, "link", 4, "file", 4, &m, &inode, &r) == SFS_OK, "create symlink")
         if acl {
@@ -61,11 +63,13 @@ struct Fixture {
 }
 final class Mounted {
     let volume: StallionVolume, root: FSItem, file: FSItem, alias: FSItem, link: FSItem
-    init(_ fixture: Fixture, writable: Bool = true) throws {
+    let coreHandle: OpaquePointer
+    init(_ fixture: Fixture, writable: Bool = true, itemLimit: Int = ReadOnlyLimits.activeItems) throws {
         fault(0, 0); var h: OpaquePointer?, r = sfs_result()
         let opened = writable ? sfs_image_open(fixture.url.path, "image.sfs", &h, &r) : sfs_image_open_readonly(fixture.url.path, "image.sfs", &h, &r)
         need(opened == SFS_OK, "open adapter")
-        volume = StallionVolume(handle: h!, resource: FSPathURLResource(url: fixture.url, writable: writable), scope: false, anchor: r, queue: DispatchQueue(label: "sfs.write.test"))
+        coreHandle = h!
+        volume = StallionVolume(handle: h!, resource: FSPathURLResource(url: fixture.url, writable: writable), scope: false, anchor: r, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
         if writable { try volume.enableWriteDiagnostic(expectedUUID: fixture.identity) }
         let v = volume
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
@@ -94,7 +98,15 @@ final class Mounted {
     func close() {
         fault(0, 0)
         let _: Bool = wait { done in volume.unmount { done(true) } }
-        let _: Bool = wait { done in volume.enqueue { _ = self.volume.unload(); done(true) } }
+        if volume.diagnosticWritable {
+            for item in [file, link] {
+                let owned: Bool = wait { done in volume.enqueue { done(self.volume.ownsForTesting(item)) } }
+                if owned { let error: Error? = wait { volume.reclaimForTesting(item, eligible: true, replyHandler: $0) }; need(error == nil, "controlled item cleanup") }
+            }
+            let _: Error? = wait { volume.deactivate(options: [], replyHandler: $0) }
+        }
+        let consumed: Bool = wait { done in volume.enqueue { done(self.volume.unload().consumed) } }
+        need(consumed, "quiescent unload consumes ownership")
     }
 }
 
@@ -210,6 +222,7 @@ func failures(_ parent: URL) throws {
         need(sticky.result.poisoned != 0 && sticky.durableGeneration == before, "old known receipt retained")
         fault(0,0)
         need(code(m.write(Data([1])).1) == test.2 && code(m.sync()) == test.2, "later operations retain first failure")
+        m.serial { try! m.volume.diagnosticCloseModesForTesting(m.file, modes: []) }
         m.close()
         if test.3 == SFS_IO { need(f.contents() == Data("original".utf8), "definitely unpublished image remains old") }
         else {
@@ -227,7 +240,11 @@ func failures(_ parent: URL) throws {
         need(m.write(Data("accepted".utf8)).1 == nil, "earlier callback accepted")
         let before = m.volume.anchor.generation
         m.serial {
-            if atCommit { m.volume.diagnosticBeforeCommit = { fault(7,1) } }
+            // Target the real cold reconciliation allocation, independent of
+            // whether a warm commit can reuse its metadata cache storage.
+            if atCommit { m.volume.diagnosticBeforeCommit = { [coreHandle = m.coreHandle] in
+                sfs_image_clear_read_cache(coreHandle); fault(7,1)
+            } }
             else { m.volume.diagnosticAfterChunk = { _ in fault(6,1) } }
         }
         let result = m.write(Data(repeating: 2, count: 150000))
@@ -241,8 +258,8 @@ func failures(_ parent: URL) throws {
     m.serial { m.volume.diagnosticAfterSizeCommit = { fault(8,1) } }
     let a = FSItem.SetAttributesRequest(); a.size = 70
     let before = m.volume.anchor.generation, result = m.set(a)
-    need(result.0 == nil && code(result.1) == Int(EIO) && a.consumedAttributes == [.size] && m.volume.anchor.generation == before + 1, "postcommit fetch failure remains committed")
-    m.close(); need(f.contents().count == 70, "postcommit failure does not undo resize")
+    need(result.0?.size == 70 && result.1 == nil && hits() == 0 && a.consumedAttributes == [.size] && m.volume.anchor.generation == before + 1, "prebuilt size reply needs no postcommit fetch")
+    m.close(); need(f.contents().count == 70, "prepared reply matches committed resize")
     let rolloverFixture = try Fixture(parent, "rollover"), rollover = try Mounted(rolloverFixture)
     need(rollover.write(Data("accepted".utf8)).1 == nil, "rollover prior callback")
     rollover.serial { rollover.volume.diagnosticAfterChunk = { bytes in if bytes == 1024 * 1024 { fault(1,1) } } }
@@ -351,12 +368,186 @@ func lifetimeAndBinding(_ parent: URL) throws {
     m.close(); need(f.contents() == Data("durable!".utf8), "lifetime retains durable callback")
 }
 
+func retainedTraceSnapshot(_ parent: URL) throws {
+    let f = try Fixture(parent, "trace-snapshot"), m = try Mounted(f), v = m.volume
+    func values(_ records: [StallionVolume.WriteRecord]) -> [[UInt64]] {
+        records.map { record in
+            let r = record.result
+            let fields: [UInt64] = [record.sequence, record.operation, record.inode, record.offset, record.length, record.mask,
+                record.started, record.finished, record.generation, UInt64(bitPattern: Int64(record.count)), UInt64(bitPattern: Int64(record.code)),
+                UInt64(r.status.rawValue), UInt64(r.phase.rawValue), UInt64(bitPattern: Int64(r.system_errno)),
+                r.generation, r.committed_end, r.physical_end, r.device, r.inode,
+                UInt64(r.coverage.rawValue), UInt64(r.incomplete_reason.rawValue), UInt64(r.limit_reason.rawValue),
+                UInt64(r.fence_attempted), UInt64(r.fence_succeeded), UInt64(bitPattern: Int64(r.transaction_active)), UInt64(bitPattern: Int64(r.poisoned))]
+            return fields + rawBytes(r.uuid).map(UInt64.init) + rawBytes(r.root_digest).map(UInt64.init)
+        }
+    }
+    let live = v.diagnosticTraceStorageForTesting(), saved = v.diagnosticSnapshot()
+    let savedValues = values(saved.1), savedCallbacks = saved.0.callbacks, savedCommits = saved.0.commits
+    let exportedAddress = saved.1.withUnsafeBufferPointer { UInt(bitPattern: UnsafeRawPointer($0.baseAddress!)) }
+    need(live.count > 0 && live.capacity >= 4096 && exportedAddress != live.address, "snapshot owns storage independent of reserved live trace")
+    withExtendedLifetime(saved) {
+        need(m.write(Data("snapshot".utf8)).1 == nil, "write while exported snapshot remains retained")
+        need(m.size(13).1 == nil, "resize while same snapshot remains retained")
+        let after = v.diagnosticTraceStorageForTesting(), current = v.diagnosticSnapshot()
+        need(after.address == live.address && after.capacity == live.capacity && after.count == live.count + 2, "postcommit appends keep original reserved trace buffer")
+        need(values(saved.1) == savedValues && saved.0.callbacks == savedCallbacks && saved.0.commits == savedCommits, "retained snapshot contents stay unchanged")
+        need(current.1.count == after.count && values(current.1).starts(with: savedValues), "new trace preserves complete old records")
+        need(current.1.suffix(2).map(\.operation) == [1, 2] && current.1.suffix(2).allSatisfy { $0.code == 0 }, "write and resize trace outcomes remain correct")
+        need(current.0.commits == savedCommits + 2 && current.0.callbacks == savedCallbacks + 2, "live counters reflect both commits")
+    }
+    m.close()
+    need(f.contents() == Data("snapshot".utf8) + Data(repeating: 0, count: 5), "retained trace does not change saved file contents")
+}
+
+func preparedReplyFailure(_ parent: URL) throws {
+    let f = try Fixture(parent, "prepare-failure"), m = try Mounted(f)
+    need(m.write(Data("accepted".utf8)).1 == nil, "preparation baseline accepted")
+    let before = m.volume.anchor.generation
+    // A throwing preparation seam models a fallible conversion/admission step;
+    // it is not evidence of a recoverable Swift allocator or SDK constructor OOM.
+    m.serial { m.volume.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) } }
+    let a = FSItem.SetAttributesRequest(); a.size = 128
+    let result = m.set(a)
+    need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty, "precommit preparation error consumes no fields")
+    need(m.volume.anchor.generation == before && code(m.sync()) == Int(ENOMEM), "preparation preserves committed anchor and first error")
+    m.serial {
+        var r = sfs_result(), info = sfs_image_information()
+        need(sfs_image_get_information(m.coreHandle, &info, &r) == SFS_OK && r.transaction_active == 0 && r.generation == before, "preparation abort completed")
+        try! m.volume.diagnosticCloseModesForTesting(m.file, modes: [])
+    }
+    m.close(); need(f.contents() == Data("accepted".utf8), "preparation never publishes resize")
+}
+
+func detachedTokenRoutes(_ parent: URL) throws {
+    let f = try Fixture(parent, "detached-routes"), m = try Mounted(f), v = m.volume
+    let originalToken = (m.file as! StallionItem).pin!
+    // Only this direct helper edits names through C; no adapter namespace
+    // callback is enabled and no installed unlink routing is claimed.
+    m.serial {
+        try! v.diagnosticMutationForTesting { h, r in
+            need(sfs_image_unlink_expected(h, 1, "file", 4, f.id, &r) == SFS_OK, "drop first alias")
+            need(sfs_image_unlink_expected(h, 1, "alias", 5, f.id, &r) == SFS_OK, "drop final alias")
+            need(sfs_image_unlink_expected(h, 1, "link", 4, (m.link as! StallionItem).inode, &r) == SFS_OK, "drop symlink name")
+        }
+        need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("original".utf8), "adapter shared read helper uses detached token")
+    }
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size, .linkCount, .fileID]
+    let st: (FSItem.Attributes?, Error?) = wait { done in v.getAttributes(request, of: m.alias) { done(($0,$1)) } }
+    need(st.1 == nil && st.0?.size == 8 && st.0?.linkCount == 0 && m.alias === m.file, "detached aliases retain canonical object and metadata")
+    let parentRequest = FSItem.GetAttributesRequest(); parentRequest.wantedAttributes = [.parentID]
+    let unavailable: (FSItem.Attributes?, Error?) = wait { done in v.getAttributes(parentRequest, of: m.file) { done(($0,$1)) } }
+    need(unavailable.0 == nil && code(unavailable.1) == Int(ENOTSUP), "detached parent is unavailable")
+    let value: (Data?, Error?) = wait { done in v.getXattr(named: FSFileName(string: "note"), of: m.file) { done(($0,$1)) } }
+    let names: ([FSFileName]?, Error?) = wait { done in v.listXattrs(of: m.alias) { done(($0,$1)) } }
+    need(value.1 == nil && value.0 == Data("value".utf8) && names.1 == nil && names.0?.map(\.data) == [Data("note".utf8)], "detached xattr token routes")
+    let target: (FSFileName?, Error?) = wait { done in v.readSymbolicLink(m.link) { done(($0,$1)) } }
+    need(target.1 == nil && target.0?.data == Data("file".utf8), "detached symlink token route")
+    need(m.write(Data("detached".utf8), alias: true).1 == nil, "detached write through alias")
+    let resized = m.size(11); need(resized.1 == nil && resized.0?.size == 11, "detached precommit size reply")
+    m.serial { need(try! v.diagnosticReadForTesting(m.file, length: 64) == Data("detached".utf8) + Data(repeating: 0, count: 3), "detached resize/read bytes") }
+    for name in ["file", "alias", "link"] {
+        let missing: (FSItem?, Error?) = wait { done in v.lookupItem(named: FSFileName(string: name), inDirectory: m.root) { done(($0,$2)) } }
+        need(missing.0 == nil && code(missing.1) == Int(ENOENT), "no namespace resurrection")
+    }
+    let refused: Error? = wait { v.removeItem(m.file, named: FSFileName(string: "file"), fromDirectory: m.root, replyHandler: $0) }
+    let xattrRefused: Error? = wait { v.setXattr(named: FSFileName(string: "note"), to: Data(), on: m.file, policy: .alwaysSet, replyHandler: $0) }
+    need(code(refused) == Int(EROFS) && code(xattrRefused) == Int(EROFS), "namespace and xattr setter stay refused in private mode")
+    let no: Error? = wait { v.reclaimForTesting(m.file, eligible: false, replyHandler: $0) }; need(no == nil, "false reclaim replies nil")
+    m.serial { need(v.ownsForTesting(m.file) && (m.file as! StallionItem).pin != nil, "false reclaim retains ownership") }
+    let yes: Error? = wait { v.reclaimForTesting(m.file, eligible: true, replyHandler: $0) }; need(yes == nil, "controlled successful detached reclaim")
+    m.serial {
+        var r = sfs_result(), st = sfs_pin_stat()
+        need(!v.ownsForTesting(m.file) && (m.file as! StallionItem).pin == nil && sfs_image_pin_stat(m.coreHandle, originalToken, &st, &r) == SFS_INVALID, "successful reclaim releases exactly one core token")
+    }
+    m.close()
+    var h: OpaquePointer?, r = sfs_result(), entry = sfs_entry()
+    need(sfs_image_open_readonly(f.url.path, "image.sfs", &h, &r) == SFS_OK, "detached reopen")
+    need(sfs_image_stat(h, 0, f.id, &entry, &r) == SFS_NOT_FOUND, "detached inode remains outside committed namespace")
+    need(sfs_image_close(h, &r) == SFS_OK, "detached reopen close")
+}
+
+func pinOwnershipLimits(_ parent: URL) throws {
+    let f = try Fixture(parent, "pin-capacity", extra: true), m = try Mounted(f, itemLimit: 3), v = m.volume
+    let full: (FSItem?, Error?) = wait { done in v.lookupItem(named: FSFileName(string: "extra"), inDirectory: m.root) { done(($0,$2)) } }
+    need(full.0 == nil && code(full.1) == Int(ENFILE), "finite canonical and core pin capacity")
+    let alias: (FSItem?, Error?) = wait { done in v.lookupItem(named: FSFileName(string: "alias"), inDirectory: m.root) { done(($0,$2)) } }
+    need(alias.1 == nil && alias.0 === m.file, "full capacity still reuses canonical alias")
+    let before = (m.file as! StallionItem).pin!
+    let retained: Error? = wait { v.reclaimForTesting(m.file, eligible: false, replyHandler: $0) }; need(retained == nil, "lookup/reclaim false boundary")
+    let released: Error? = wait { v.reclaimForTesting(m.file, eligible: true, replyHandler: $0) }; need(released == nil, "capacity release")
+    let again: (FSItem?, Error?) = wait { done in v.lookupItem(named: FSFileName(string: "file"), inDirectory: m.root) { done(($0,$2)) } }
+    need(again.1 == nil && again.0 !== m.file, "lookup after reclaim has new canonical owner")
+    let next = (again.0 as! StallionItem).pin!
+    need(next.slot == before.slot && next.incarnation > before.incarnation, "new ownership cannot reuse old token")
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size]
+    let stale: (FSItem.Attributes?, Error?) = wait { done in v.getAttributes(request, of: m.file) { done(($0,$1)) } }
+    need(stale.0 == nil && code(stale.1) == Int(EINVAL), "stale FSItem cannot resolve new owner")
+    let done: Error? = wait { v.reclaimForTesting(again.0!, eligible: true, replyHandler: $0) }; need(done == nil, "new owner cleanup")
+    let _: Bool = wait { signal in v.unmount { signal(true) } }
+    let busy: Error? = wait { v.deactivate(options: [], replyHandler: $0) }; need(code(busy) == Int(EBUSY), "deactivate retains root while nonroot survives")
+    let busyUnload: Bool = wait { done in v.enqueue { done(v.unload().consumed) } }; need(!busyUnload, "busy unload retains handle and pins")
+    m.close()
+    let allocation = try Fixture(parent, "pin-allocation")
+    var h: OpaquePointer?, r = sfs_result()
+    need(sfs_image_open(allocation.url.path, "image.sfs", &h, &r) == SFS_OK, "allocation fixture open")
+    let volume = StallionVolume(handle: h!, resource: FSPathURLResource(url: allocation.url, writable: true), scope: false, anchor: r, queue: DispatchQueue(label: "sfs.pin.allocation"))
+    fault(7, 1)
+    do { try volume.enableWriteDiagnostic(expectedUUID: allocation.identity); fatalError("pin allocation should fail before exposure") }
+    catch { need(code(error) == Int(ENOMEM) && hits() == 1 && !volume.diagnosticWritable, "pin configuration NOMEM stays unexposed") }
+    fault(0, 0)
+    let consumed: Bool = wait { done in volume.enqueue { done(volume.unload().consumed) } }; need(consumed, "failed configuration handle consumed")
+}
+
+func reclaimErrorAndRoot(_ parent: URL) throws {
+    let f = try Fixture(parent, "reclaim-error"), m = try Mounted(f), v = m.volume
+    // Corrupt only the adapter's private test token; no SDK state is fabricated.
+    m.serial { (m.file as! StallionItem).pin = sfs_pin() }
+    let error: Error? = wait { v.reclaimForTesting(m.file, eligible: true, replyHandler: $0) }
+    need(code(error) == Int(EINVAL), "release failure is retained as terminal evidence")
+    m.serial {
+        need(!v.ownsForTesting(m.file), "failed release never reinserts reclaimed item")
+        try! v.diagnosticCloseModesForTesting(m.link, modes: [])
+    }
+    need(code(m.sync()) == Int(EINVAL), "release error sticks")
+    m.close()
+    let rootFixture = try Fixture(parent, "root-lifetime"), rootMount = try Mounted(rootFixture), rootVolume = rootMount.volume
+    let token = (rootMount.root as! StallionItem).pin!
+    let rejected: Error? = wait { rootVolume.reclaimForTesting(rootMount.root, eligible: false, replyHandler: $0) }; need(rejected == nil, "false root reclaim")
+    rootMount.serial { need(rootVolume.ownsForTesting(rootMount.root), "false root reclaim keeps activation token") }
+    let accepted: Error? = wait { rootVolume.reclaimForTesting(rootMount.root, eligible: true, replyHandler: $0) }; need(accepted == nil, "successful root reclaim consumes activation owner")
+    let activated: (FSItem?, Error?) = wait { done in rootVolume.activate { done(($0,$1)) } }
+    need(activated.1 == nil && activated.0 !== rootMount.root, "reactivation reacquires root")
+    rootMount.serial {
+        var r = sfs_result(), st = sfs_pin_stat()
+        need(sfs_image_pin_stat(rootMount.coreHandle, token, &st, &r) == SFS_INVALID, "old root token stays invalid")
+    }
+    rootMount.close()
+    let retainedFixture = try Fixture(parent, "activation-root"), retained = try Mounted(retainedFixture), rv = retained.volume
+    let retainedToken = (retained.root as! StallionItem).pin!
+    let _: Bool = wait { done in rv.unmount { done(true) } }
+    for item in [retained.file, retained.link] {
+        let error: Error? = wait { rv.reclaimForTesting(item, eligible: true, replyHandler: $0) }; need(error == nil, "nonroot reclaim before deactivate")
+    }
+    let deactivated: Error? = wait { rv.deactivate(options: [], replyHandler: $0) }; need(deactivated == nil, "deactivate releases activation-owned root")
+    retained.serial {
+        var r = sfs_result(), st = sfs_pin_stat()
+        need(!rv.ownsForTesting(retained.root) && sfs_image_pin_stat(retained.coreHandle, retainedToken, &st, &r) == SFS_INVALID, "activation root released without data access")
+    }
+    let next: (FSItem?, Error?) = wait { done in rv.activate { done(($0,$1)) } }
+    need(next.1 == nil && next.0 !== retained.root, "next activation owns fresh root")
+    let mounted: Error? = wait { rv.mount(arguments: [], replyHandler: $0) }; need(mounted == nil, "reactivated volume mounts")
+    retained.close()
+}
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
+        try retainedTraceSnapshot(parent); try preparedReplyFailure(parent); try detachedTokenRoutes(parent)
+        try pinOwnershipLimits(parent); try reclaimErrorAndRoot(parent)
         for (index, spec) in [(UInt32(0o400), false, geteuid()), (UInt32(0o6600), false, geteuid()), (UInt32(0o600), true, geteuid()), (UInt32(0o600), false, geteuid() + 1)].enumerated() {
             let f = try Fixture(parent, "access-\(index)", mode: spec.0, acl: spec.1, owner: spec.2), m = try Mounted(f)
             need(code(m.write(Data([1])).1) == Int(spec.1 ? ENOTSUP : EACCES), "owner-mode/setid/ACL write refusal")

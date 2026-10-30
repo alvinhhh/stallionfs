@@ -68,7 +68,7 @@ static uint64_t aux_write_calls, image_truncates;
 static int image_open_fd=-1, image_open_flags;
 static uint64_t raw_hash_input, metadata_hash_input, raw_hashes, copies;
 static uint64_t overlay_clone_bytes, overlay_clone_calls, observed_clone_size;
-static uint64_t allocated, peak_allocated, allocation_calls;
+static uint64_t allocated, peak_allocated, allocation_calls, free_calls;
 static uint64_t fail_allocation, fail_after_append;
 static unsigned arena_allocations, fail_arena_allocation;
 static unsigned aux_created, aux_removed;
@@ -99,6 +99,7 @@ void *sfs_test_calloc(size_t n, size_t size) {
     void *p = sfs_test_malloc(n * size); if (p) memset(p, 0, n * size); return p;
 }
 void sfs_test_free(void *p) {
+    if (p) free_calls++;
     if (clearing_cache && p) cache_frees++;
     if (p) { allocation_header *h = (allocation_header *)p - 1; assert(allocated >= h->value.bytes); allocated -= h->value.bytes;
         if (h->value.previous) h->value.previous->value.next = h->value.next; else allocations = h->value.next;
@@ -4101,6 +4102,131 @@ static void cache_binding(const sfs_result *a, const sfs_result *b) {
     assert(a->generation == b->generation && a->committed_end == b->committed_end && a->physical_end == b->physical_end);
     assert(a->device == b->device && a->inode == b->inode && !memcmp(a->uuid, b->uuid, 16) && !memcmp(a->root_digest, b->root_digest, 32));
 }
+/* These fixtures have no overlay/auxiliary allocations: only handle + cache. */
+static unsigned cache_owned_allocations(void) {
+    unsigned count = 0;
+    for (allocation_header *p = allocations; p; p = p->value.next) count++;
+    assert(count); return count - 1;
+}
+static void cache_commit_reuse(void) {
+    fixture f = indexed_fixture(432, 1, 1); fixture_save(&f);
+    reset("", 0); sfs_image *h; sfs_result r, before; open_image(&h);
+    sfs_entry entry; uint64_t handle = cache_handle_bytes(h);
+    for (unsigned i = 0; i < 432; ++i) OK(sfs_image_stat(h, 0, i + 2, &entry, &r));
+    uint64_t pool = allocated; unsigned owned = cache_owned_allocations();
+    assert(owned > 40 && pool <= handle + 4u * 1024u * 1024u);
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        sfs_cookie cookie = {0}; int found;
+        OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &before)); assert(found);
+        size_t n; unsigned char *image = bytes("image", &n), *slot = selected_slot(image);
+        unsigned char *ns = namespace_at(image, slot, n);
+        watch_payload(0, slot + 48);
+        watch_at[1] = (uint64_t)(inode_row(image, ns, 2, n) - image) / CELL * CELL;
+        watch_size[1] = CELL; watch_count = 2; watch_clear();
+        OK(sfs_image_begin(h, &r)); reset("", 0);
+        uint64_t calls = allocation_calls, frees = free_calls;
+        OK(sfs_image_commit(h, &r));
+        assert(allocation_calls == calls && free_calls == frees && allocated == pool);
+        assert(r.generation == before.generation + 1 && r.fence_attempted == 3 && r.fence_succeeded == 3);
+        assert(fulls == 2 && slots == 1 && image_read_bytes > 2 * CELL && metadata_hash_input > 2 * CELL);
+        assert(watch_reads[0] && !watch_reads[1] && !r.poisoned && !r.transaction_active);
+        assert(r.committed_end == before.committed_end + CELL && !memcmp(r.root_digest, before.root_digest, 32));
+        reset("", 0);
+        resume_failure(h, 0, &before, 1, entry.inode, SFS_STATE);
+        /* The former deep hit was invalidated, even though its buffer survives. */
+        reset("", 0); OK(sfs_image_stat(h, 0, 2, &entry, &r));
+        assert(watch_reads[1] == 1 && image_read_bytes && metadata_hash_input);
+        reset("", 0); OK(sfs_image_stat(h, 0, 2, &entry, &r));
+        assert(!image_read_bytes && !metadata_hash_input);
+        expect(h, 0, 2, "shared"); expect(h, 1, 2, "shared");
+        assert(allocated == pool && cache_owned_allocations() == owned);
+        watch_count = 0; free(image);
+    }
+    /* count has fallen well below allocated; clear must free the whole pool. */
+    uint64_t calls = allocation_calls; cache_release(h);
+    assert(cache_frees == owned && allocated == handle && allocation_calls == calls);
+    cache_release(h); assert(!cache_frees && allocation_calls == calls);
+    close_image(h); assert(!allocated); retain(3700);
+}
+static enum sfs_status cache_extent_probe(sfs_image *h, unsigned leaf, sfs_result *r) {
+    unsigned char byte = 0; size_t got = 0;
+    enum sfs_status e = sfs_image_read(h, 0, 2, (uint64_t)leaf * 48 * CELL, &byte, 1, &got, r);
+    if (!e) assert(got == 1 && byte == 's'); else assert(!got);
+    return e;
+}
+static void cache_commit_growth(void) {
+    /* 1,050 leaves: bounded physical fixture, one shared raw cell per mapping. */
+    fixture f = indexed_fixture(2, 48 * 1050, 0); fixture_save(&f);
+    reset("", 0); sfs_image *h; sfs_result r; open_image(&h);
+    uint64_t handle = cache_handle_bytes(h);
+    for (unsigned i = 0; i < 16; ++i) OK(cache_extent_probe(h, i, &r));
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_commit(h, &r));
+    uint64_t pool = allocated; unsigned owned = cache_owned_allocations();
+    /* Reused slots must work; the first growth allocation fails before ownership
+       or active count advances, and a retry can fill that very slot. */
+    fail_allocation = allocation_calls + 1; unsigned failed = 1050;
+    for (unsigned i = 0; i < 1050; ++i) {
+        enum sfs_status e = cache_extent_probe(h, i, &r);
+        if (e) { assert(e == SFS_NOMEM && hit && !r.poisoned && r.system_errno == ENOMEM); failed = i; break; }
+    }
+    assert(failed > 0 && failed < 1050 && allocated == pool && cache_owned_allocations() == owned);
+    fail_allocation = 0;
+    for (unsigned i = failed; i < 1050; ++i) OK(cache_extent_probe(h, i, &r));
+    assert(cache_owned_allocations() == 1001 && allocated <= handle + 4u * 1024u * 1024u);
+    pool = allocated; uint64_t calls = allocation_calls;
+    reset("", 0); OK(cache_extent_probe(h, 0, &r)); assert(metadata_hash_input && allocation_calls == calls && allocated == pool);
+    reset("", 0); OK(cache_extent_probe(h, 0, &r)); assert(!metadata_hash_input && allocation_calls == calls);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_commit(h, &r));
+    assert(allocated == pool && allocation_calls == calls);
+    cache_release(h); assert(cache_frees == 1001 && allocated == handle && allocation_calls == calls);
+    /* Header succeeds, first buffer allocation fails before activation. */
+    fail_allocation = allocation_calls + 2;
+    assert(cache_extent_probe(h, 0, &r) == SFS_NOMEM && !r.poisoned);
+    assert(cache_owned_allocations() == 1); calls = allocation_calls;
+    cache_release(h); assert(cache_frees == 1 && allocated == handle && allocation_calls == calls);
+    cache_release(h); assert(!cache_frees); fail_allocation = 0;
+    close_image(h); assert(!allocated); retain(3701);
+}
+static void cache_commit_integrity(void) {
+    /* Same-size root, namespace, and index-root corruption must not be masked
+       by the warm cache. Targeted I/O failures exercise the same rereads. */
+    for (unsigned io = 0; io < 2; ++io) for (unsigned level = 0; level < 3; ++level) {
+        fixture f = indexed_fixture(432, 1, 1); size_t n = f.n;
+        unsigned char *image = malloc(n); assert(image); memcpy(image, f.p, n);
+        unsigned char *slot = selected_slot(image), *ns = namespace_at(image, slot, n);
+        uint64_t offset = level == 0 ? get64(slot + 56) : level == 1 ? (uint64_t)(ns - image) : get64(ns + 72);
+        fixture_save(&f); reset("", 0); sfs_image *h; sfs_result r; sfs_entry entry; open_image(&h);
+        for (unsigned i = 0; i < 432; ++i) OK(sfs_image_stat(h, 0, i + 2, &entry, &r));
+        uint64_t generation = r.generation, handle = cache_handle_bytes(h); unsigned owned = cache_owned_allocations();
+        OK(sfs_image_begin(h, &r));
+        if (io) { read_at[0] = offset; reset("candidate_reads", 1); }
+        else { image[offset + 200] ^= 1; replace_image(image, n); reset("", 0); }
+        assert(sfs_image_commit(h, &r) == (io ? SFS_IO : SFS_CORRUPT));
+        assert(r.phase == SFS_PHASE_READ && r.system_errno == (io ? EIO : 0));
+        assert(r.generation == generation && r.poisoned && !r.transaction_active);
+        assert(!slots && !records && !fulls && !r.fence_attempted && !r.fence_succeeded);
+        if (io) assert(hit);
+        uint64_t calls = allocation_calls; cache_release(h);
+        assert(cache_frees == owned && allocated == handle && allocation_calls == calls);
+        cache_release(h); assert(!cache_frees); reset("", 0); close_image(h); assert(!allocated);
+        free(image); retain(3710 + (int)(io * 3 + level));
+    }
+    /* Reconciliation does not walk this leaf. Its stale precommit contents must
+       nevertheless be inaccessible when the page is first touched afterward. */
+    fixture f = indexed_fixture(432, 1, 0); size_t n = f.n;
+    unsigned char *image = malloc(n); assert(image); memcpy(image, f.p, n);
+    unsigned char *ns = namespace_at(image, selected_slot(image), n);
+    uint64_t leaf = (uint64_t)(inode_row(image, ns, 2, n) - image) / CELL * CELL;
+    fixture_save(&f); reset("", 0); sfs_image *h; sfs_result r; sfs_entry entry; open_image(&h);
+    OK(sfs_image_stat(h, 0, 2, &entry, &r)); OK(sfs_image_begin(h, &r));
+    image[leaf + 200] ^= 1; replace_image(image, n);
+    watch_at[0] = leaf; watch_size[0] = CELL; watch_count = 1; watch_clear(); reset("", 0);
+    OK(sfs_image_commit(h, &r)); assert(!watch_reads[0] && r.fence_succeeded == 3);
+    assert(sfs_image_stat(h, 0, 2, &entry, &r) == SFS_CORRUPT && r.poisoned && r.phase == SFS_PHASE_READ);
+    assert(watch_reads[0] == 1); watch_count = 0;
+    cache_release(h); close_image(h); assert(!allocated); free(image); retain(3716);
+}
+static void cache_commit(void) { cache_commit_reuse(); cache_commit_growth(); cache_commit_integrity(); }
 static void cache_purge(void) {
     reset("", 0); cache_release(NULL); assert(!cache_frees && !allocated);
     fixture f = indexed_fixture(32, 1, 2); fixture_save(&f);
@@ -4398,7 +4524,9 @@ static void diagnostic_receipts(void) {
     assert(sfs_image_write(h, id, CELL, "second", 6, &r) == SFS_TIME_UNAVAILABLE && r.transaction_active && !r.poisoned && r.system_errno == ENXIO);
     clock_failure = 0; OK(sfs_image_abort(h, &r)); expect(h, 0, id, "accepted");
     OK(sfs_image_begin(h, &r)); OK(sfs_image_write(h, id, 0, "staged", 6, &r));
-    reset("", 0); fail_allocation = allocation_calls + 1;
+    /* Fail the real cold reconciliation header allocation, not an allocation
+       ordinal which disappears when commit reuses its existing cache pool. */
+    cache_release(h); reset("", 0); fail_allocation = allocation_calls + 1;
     assert(sfs_image_commit(h, &r) == SFS_NOMEM && !r.transaction_active && !r.poisoned && r.generation == generation);
     fail_allocation = 0; assert(sfs_image_abort(h, &r) == SFS_STATE); expect(h, 0, id, "accepted");
     sfs_image_information information; OK(sfs_image_get_information(h, &information, &r));
@@ -4509,6 +4637,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-failures")) symlink_failures();
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
     else if(!strcmp(argv[1],"cache")) cache_purge();
+    else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
     if(strcmp(argv[1],"cache")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
