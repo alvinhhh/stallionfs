@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -16,14 +17,206 @@ from unittest.mock import Mock, call, patch
 if __package__:
     from . import image_failure_diagnostics as diagnostics
     from . import test_image_store as lifecycle
+    from . import test_fileops as fileops
+    from . import test_images_space as space
 else:
     import image_failure_diagnostics as diagnostics
     import test_image_store as lifecycle
+    import test_fileops as fileops
+    import test_images_space as space
 
 
 def captured(stdout=b'', stderr=b'', status=0, **extra):
     return dict(stdout=stdout, stderr=stderr, returncode=status, timeout=False,
                 truncated=False, reaped=True, capture_error=None, cleanup_error=None, **extra)
+
+
+class DirectImageFixtureTests(unittest.TestCase):
+    def file_fixture(self):
+        fixture = fileops.FileOperations()
+        fixture.setUp()
+        self.addCleanup(shutil.rmtree, fixture.base, ignore_errors=True)
+        return fixture
+
+    def assert_scope(self, base, image, point, stage):
+        self.assertEqual(diagnostics._scope.get(), dict(base=base, image=image, workspace=None,
+                         mountpoint=point, stage=stage, expected=False))
+
+    def run_file_body(self, fixture):
+        method = fileops.FileOperations.test_actual_mounted_subtree_refused_and_cross_volume_clone_move_fail
+        getattr(method, '__wrapped__', method)(fixture)
+
+    def test_failed_build_registers_image_before_return_and_retains_attached_base(self):
+        fixture = self.file_fixture()
+        image, point = fixture.base / 'test.sparseimage', fixture.base / 'victim/mounted'
+        primary = OSError('build failed before returning')
+        def build(source, destination, capacity):
+            self.assertEqual(fixture.images, {image: point})
+            self.assert_scope(fixture.base, image, None, 'preparation')
+            destination.write_bytes(b'backing image')
+            raise primary
+        with patch.object(fileops.images, 'build', side_effect=build), \
+                patch.object(fileops.images, 'attach') as attach, \
+                patch.object(fileops.images, 'detach') as detach:
+            with self.assertRaises(OSError) as caught:
+                self.run_file_body(fixture)
+            self.assertIs(caught.exception, primary)
+            attach.assert_not_called()
+            detach.assert_not_called()
+        self.assertIsNone(diagnostics._scope.get())
+        self.check_file_cleanup_retains(fixture, dict(mountpoint=None, device='/dev/disk999'))
+        self.assertTrue(image.exists())
+
+    def check_file_cleanup_retains(self, fixture, state):
+        image = fixture.base / 'test.sparseimage'
+        fixture.images[image] = fixture.base / 'victim/mounted'
+        def inspect(actual):
+            self.assertEqual(actual, image)
+            self.assert_scope(fixture.base, image, fixture.images[image], 'cleanup')
+            if isinstance(state, BaseException):
+                raise state
+            return state
+        with patch.object(fileops.images, 'mounted', side_effect=inspect), \
+                patch.object(fileops._scan, 'mounts') as mounts, \
+                patch.object(fileops.os, 'walk') as walk, \
+                patch.object(fileops.os, 'chmod') as chmod, \
+                patch.object(fileops.shutil, 'rmtree') as remove:
+            with self.assertRaises((RuntimeError, OSError)):
+                fixture.tearDown()
+            for operation in (mounts, walk, chmod, remove):
+                operation.assert_not_called()
+        self.assertTrue(fixture.base.exists())
+        self.assertIsNone(diagnostics._scope.get())
+
+    def test_attachment_inspection_error_retains_base_before_traversal(self):
+        self.check_file_cleanup_retains(self.file_fixture(), OSError('inspection failed'))
+
+    def test_confirmed_detached_image_still_requires_native_mount_check(self):
+        for mounted in (False, True):
+            with self.subTest(mounted=mounted):
+                fixture = self.file_fixture()
+                image = fixture.base / 'test.sparseimage'
+                fixture.images[image] = fixture.base / 'victim/mounted'
+                native = [dict(path=str(fixture.base / 'unexpected'))] if mounted else []
+                with patch.object(fileops.images, 'mounted', return_value=None), \
+                        patch.object(fileops._scan, 'mounts', return_value=native), \
+                        patch.object(fileops.os, 'walk', return_value=[]) as walk, \
+                        patch.object(fileops.shutil, 'rmtree') as remove:
+                    if mounted:
+                        with self.assertRaises(RuntimeError): fixture.tearDown()
+                        walk.assert_not_called()
+                        remove.assert_not_called()
+                    else:
+                        fixture.tearDown()
+                        remove.assert_called_once_with(fixture.base)
+                self.assertIsNone(diagnostics._scope.get())
+
+    def test_body_and_cleanup_scopes_preserve_original_exception(self):
+        fixture = self.file_fixture()
+        image, point = fixture.base / 'test.sparseimage', fixture.base / 'victim/mounted'
+        primary = AssertionError('body failure')
+        def attach(actual, mounted):
+            self.assert_scope(fixture.base, image, point, 'body')
+            raise primary
+        def inspect(actual):
+            self.assert_scope(fixture.base, image, point, 'cleanup')
+            raise OSError('cleanup failed')
+        with patch.object(fileops.images, 'build'), \
+                patch.object(fileops.images, 'attach', side_effect=attach), \
+                patch.object(fileops.images, 'mounted', side_effect=inspect):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_file_body(fixture)
+        self.assertIs(caught.exception, primary)
+        self.assertIn('cleanup failed', '\n'.join(primary.__notes__))
+        self.assertIsNone(diagnostics._scope.get())
+
+    def test_space_failed_setup_has_preparation_scope_and_registered_cleanup(self):
+        fixture = space.ImageSpace()
+        primary = OSError('build failed')
+        def build(source, image, capacity):
+            self.addCleanup(shutil.rmtree, fixture.base, ignore_errors=True)
+            self.assertTrue(fixture._cleanups)
+            self.assert_scope(fixture.base, image, None, 'preparation')
+            raise primary
+        with patch.object(space.shutil, 'disk_usage', return_value=SimpleNamespace(free=4 * 1024 ** 3)), \
+                patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                patch.object(space.subprocess, 'run'), \
+                patch.object(space.images, 'build', side_effect=build):
+            with self.assertRaises(OSError) as caught: fixture.setUp()
+        self.assertIs(caught.exception, primary)
+        self.assertIsNone(diagnostics._scope.get())
+
+    def test_space_body_scopes_full_sibling_and_seed_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = space.ImageSpace()
+            fixture.base = Path(temporary).resolve()
+            fixture.source = fixture.base / 'source'
+            fixture.seed = fixture.base / 'seed.sparseimage'
+            fixture.image_points = {}
+            repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
+            repo.mkdir(); untouched.mkdir()
+            filler = repo / 'filler'
+            filler.touch()
+            stream = Mock()
+            stream.write.side_effect = [1, OSError(errno.ENOSPC, 'mock disk full')]
+            opened = Mock()
+            opened.__enter__ = Mock(return_value=stream)
+            opened.__exit__ = Mock(return_value=False)
+            original_open = Path.open
+            def open_path(path, *args, **kwargs):
+                return opened if path == filler else original_open(path, *args, **kwargs)
+            def clone(seed, image):
+                self.assert_scope(fixture.base, image, None, 'preparation')
+            def digest(image):
+                self.assert_scope(fixture.base, image, None, 'body')
+                return 'unchanged'
+            seen = []
+            def attach(image, point):
+                self.assert_scope(fixture.base, image, point, 'body')
+                seen.append(image.name)
+                return repo if image.name == 'full.sparseimage' else untouched
+            def detach(image, point):
+                self.assert_scope(fixture.base, image, point, 'body')
+            with patch.object(space.images, 'clone', side_effect=clone), \
+                    patch.object(space, 'digest', side_effect=digest), \
+                    patch.object(space.images, 'attach', side_effect=attach), \
+                    patch.object(space.images, 'detach', side_effect=detach), \
+                    patch.object(fixture, 'assert_original'), \
+                    patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                    patch.object(Path, 'open', open_path), patch('builtins.print'):
+                fixture.test_volume_full_preserves_existing_data_and_other_images()
+            self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
+            self.assertIsNone(diagnostics._scope.get())
+
+    def test_space_cleanup_scopes_each_image_and_resets_after_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = space.ImageSpace()
+            fixture.base = Path(temporary).resolve()
+            fixture.image_points = {}
+            for name in ('seed', 'sibling'):
+                image = fixture.base / f'{name}.sparseimage'
+                image.touch()
+                fixture.image_points[image] = fixture.base / name
+            seen = []
+            def inspect(image):
+                self.assert_scope(fixture.base, image, fixture.image_points[image], 'cleanup')
+                seen.append(image)
+                return dict(mountpoint=None) if seen.count(image) == 1 else None
+            def detach(image, point):
+                self.assert_scope(fixture.base, image, point, 'cleanup')
+            with patch.object(space.images, 'mounted', side_effect=inspect), \
+                    patch.object(space.images, 'detach', side_effect=detach) as detached, \
+                    patch.object(space.os, 'walk', return_value=[]), \
+                    patch.object(space.shutil, 'rmtree') as remove:
+                fixture.clean()
+                self.assertEqual(detached.call_count, 2)
+                remove.assert_called_once_with(fixture.base)
+                remove.reset_mock()
+                with patch.object(space.images, 'mounted', side_effect=OSError('inspection failed')):
+                    with self.assertRaisesRegex(RuntimeError, 'Test files retained'):
+                        fixture.clean()
+                remove.assert_not_called()
+            self.assertIsNone(diagnostics._scope.get())
 
 
 class CleanupTests(unittest.TestCase):
