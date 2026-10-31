@@ -322,11 +322,11 @@ class ImageCore(unittest.TestCase):
         else:
             shutil.rmtree(cls.base)
 
-    def scenario(self, name, executable='normal'):
+    def scenario(self, name, executable='normal', *, argument=None, timeout=90):
         receipt = self.base / f'{executable}-{name}.json'
         try:
-            result = _owned_command([str(self.executables[executable]), name], cwd=self.base,
-                                    timeout=90, stem=self.base / f'command-{executable}-{name}')
+            result = _owned_command([str(self.executables[executable]), name if argument is None else str(argument)], cwd=self.base,
+                                    timeout=timeout, stem=self.base / f'command-{executable}-{name}')
             _exclusive(receipt, json.dumps({'scenario': name, 'returncode': result.returncode,
                                           'stdout': result.stdout, 'stderr': result.stderr}, indent=2))
             self.assertEqual(result.returncode, 0, f'{name}: {result.stderr}\n{result.stdout}\nRetained: {self.base}')
@@ -363,6 +363,24 @@ class ImageCore(unittest.TestCase):
 
     def test_create_reopen_atomic_snapshot_ranges_and_iteration(self):
         self.scenario('basic')
+
+    def test_live_inode_pins_detached_batches_replacement_and_faults(self):
+        """Included by normal test_image unittest discovery; owns a fresh fixture."""
+        try:
+            executable = self.base / 'live-pins'
+            command = [*self.common, str(self.source / 'tests/image_live_pins.c'),
+                       str(self.source / 'tests/fskit_write_hooks.c'), '-o', str(executable)]
+            result = _owned_command(command, cwd=None, timeout=60,
+                                    stem=self.base / 'command-live-pins-compile')
+            _exclusive(self.base / 'live-pins-compile.txt', result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 0,
+                             f'Live pin compilation failed; retained {self.base}\n{result.stderr}')
+            self.executables['live-pins'] = executable
+            self.scenario('live-pins', 'live-pins', argument=self.base / 'live-pins-fixture', timeout=180)
+        except BaseException as error:
+            type(self).failed = True
+            _latch_command('live-pins', repr(error))
+            raise
 
     def test_creation_locks_fences_identity_and_retained_failures(self):
         self.scenario('creation')
@@ -405,6 +423,9 @@ class ImageCore(unittest.TestCase):
     def test_memory_only_cache_release_refill_authority_and_transactions(self):
         self.scenario('cache')
 
+    def test_commit_cache_storage_reuse_invalidation_growth_and_integrity(self):
+        self.scenario('cache-commit')
+
     def test_ordinary_readonly_admission_policy_poison_and_budgets(self):
         self.scenario('readonly')
 
@@ -422,6 +443,14 @@ class ImageCore(unittest.TestCase):
 
     def test_selected_information_constant_work_and_committed_receipt(self):
         self.scenario('metadata-information')
+
+    def test_existing_file_diagnostic_receipts_and_transaction_failures(self):
+        try:
+            self.compile('diagnostic', '-DSFS_IMAGE_DIAGNOSTIC_TESTING=1')
+            self.scenario('diagnostic-receipts', 'diagnostic')
+        except BaseException:
+            type(self).failed = True
+            raise
 
     def test_symlink_explicit_versions_and_legacy_capability(self):
         self.scenario('symlink-versions')

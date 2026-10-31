@@ -34,6 +34,10 @@ enum sfs_status {
     SFS_NOT_FOUND, SFS_EXISTS, SFS_STATE, SFS_NOMEM, SFS_INCOMPLETE,
     SFS_TIME_UNAVAILABLE
 };
+enum sfs_limit_reason {
+    SFS_LIMIT_UNSPECIFIED, SFS_LIMIT_APPEND_CAPACITY,
+    SFS_LIMIT_FILE_SIZE, SFS_LIMIT_STRUCTURE, SFS_LIMIT_PIN_RESOURCES
+};
 enum sfs_phase {
     SFS_PHASE_NONE, SFS_PHASE_PARENT, SFS_PHASE_CREATE, SFS_PHASE_LOCK,
     SFS_PHASE_VALIDATE, SFS_PHASE_READ, SFS_PHASE_ADMISSION,
@@ -68,6 +72,12 @@ typedef struct {
     uint8_t uuid[16], root_digest[32];
     enum sfs_coverage coverage;
     enum sfs_incomplete_reason incomplete_reason;
+    /* Per-invocation receipt. begin/write/resize/commit distinguish LIMIT causes.
+     * Internal arena capacity/token/allocation failures retain NOMEM.
+     * Fence bits 1/2 describe actual record/publication fence calls this call. */
+    enum sfs_limit_reason limit_reason;
+    unsigned fence_attempted, fence_succeeded;
+    int transaction_active, poisoned;
 } sfs_result;
 typedef struct {
     uint32_t major, minor;
@@ -118,6 +128,67 @@ typedef struct {
     uint32_t mode, uid, gid, flags;
     uint64_t referenced_data_bytes, link_count;
 } sfs_metadata_entry;
+typedef struct { uint64_t size; size_t name_length; uint8_t name[SFS_NAME_MAX]; } sfs_xattr_entry;
+
+/* Format0.6 only; callers serialize every operation and close. Tokens are
+ * mount-lifetime ownership, not disk references or per-descriptor opens.
+ * Configure once on an ordinary handle, quiescent, before acquisition. The complete slot/index/P/Q
+ * allocation is charged against max_bytes; no data/xattr values are retained.
+ * Token resolution is constant work. Inode lookup uses a bounded hash table.
+ * Acquire only committed inodes, one owner per inode (duplicates: EXISTS).
+ * Reserve quiescent before create; bind inside its transaction before commit.
+ * Abort invalidates reservations; do not expose them before commit succeeds.
+ * Release is memory-only and BUSY during a transaction, allowed after poison.
+ * Every API rejects earlier formats before allocation or mutation. */
+typedef struct { uint64_t instance, incarnation; uint32_t slot, reserved; uint8_t session[16]; } sfs_pin;
+typedef struct { sfs_metadata_entry metadata; int linked; } sfs_pin_stat;
+enum sfs_status sfs_image_pin_configure(sfs_image *, uint32_t max_pins,
+    uint64_t max_bytes, sfs_result *);
+enum sfs_status sfs_image_pin_acquire(sfs_image *, sfs_inode, sfs_pin *, sfs_result *);
+enum sfs_status sfs_image_pin_reserve(sfs_image *, sfs_pin *, sfs_result *);
+enum sfs_status sfs_image_pin_bind(sfs_image *, sfs_pin, sfs_inode, sfs_result *);
+enum sfs_status sfs_image_pin_release(sfs_image *, sfs_pin, sfs_result *);
+/* Committed view even during a transaction. Detached entry parent/name are
+ * cleared: linked=0 explicitly marks those namespace fields unavailable.
+ * Detached metadata is lost at close/crash; snapshots never include it. */
+enum sfs_status sfs_image_pin_stat(sfs_image *, sfs_pin, sfs_pin_stat *, sfs_result *);
+/* Metadata only from the active transaction on an ordinary writable handle.
+ * Includes pending writes and bound creates; unbound reservations fail STATE.
+ * Returns a value copy without a batch flush or data/xattr reads.
+ * Keep the result private until commit succeeds. With no further mutation,
+ * successful commit publishes these values; abort never publishes them. The receipt
+ * still names the committed anchor and is not durability evidence.
+ * Detached parent/name remain unavailable. Failure leaves output unchanged. */
+enum sfs_status sfs_image_pin_stat_transaction(sfs_image *, sfs_pin,
+    sfs_pin_stat *, sfs_result *);
+enum sfs_status sfs_image_pin_read(sfs_image *, sfs_pin, uint64_t,
+    void *, size_t, size_t *, sfs_result *);
+enum sfs_status sfs_image_pin_readlink(sfs_image *, sfs_pin,
+    void *, size_t, size_t *, sfs_result *);
+enum sfs_status sfs_image_pin_xattr_size(sfs_image *, sfs_pin,
+    const void *, size_t, uint64_t *, sfs_result *);
+enum sfs_status sfs_image_pin_read_xattr(sfs_image *, sfs_pin,
+    const void *, size_t, uint64_t, void *, size_t, size_t *, sfs_result *);
+enum sfs_status sfs_image_pin_next_xattr(sfs_image *, sfs_pin,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    const void *, size_t, sfs_xattr_entry *, int *, sfs_result *);
+enum sfs_status sfs_image_pin_write(sfs_image *, sfs_pin, uint64_t,
+    const void *, size_t, sfs_result *);
+enum sfs_status sfs_image_pin_resize(sfs_image *, sfs_pin, uint64_t, sfs_result *);
+enum sfs_status sfs_image_pin_set_metadata(sfs_image *, sfs_pin,
+    const sfs_metadata_update *, sfs_result *);
+enum sfs_status sfs_image_pin_set_xattr(sfs_image *, sfs_pin,
+    const void *, size_t, const void *, size_t, sfs_result *);
+enum sfs_status sfs_image_pin_remove_xattr(sfs_image *, sfs_pin,
+    const void *, size_t, sfs_result *);
+/* Exact transaction-current identities; expected destination0 means absent.
+ * Replacement is atomic in the existing transaction. Failure after its first
+ * edit aborts the entire transaction, including all pending pin changes. */
+enum sfs_status sfs_image_unlink_expected(sfs_image *, sfs_inode parent,
+    const void *, size_t, sfs_inode expected, sfs_result *);
+enum sfs_status sfs_image_rename_replace(sfs_image *, sfs_inode old_parent,
+    const void *, size_t, sfs_inode expected_source, sfs_inode new_parent,
+    const void *, size_t, sfs_inode expected_destination, sfs_result *);
 
 /* Explicitly creates format0.3; legacy create continues producing0.2.
  * Initial mode includes the matching regular/directory type and07777 bits.
@@ -174,7 +245,6 @@ enum sfs_status sfs_image_stat_metadata(sfs_image *, sfs_view, sfs_inode,
  * prefix through read_count after valid arguments; values have no terminator.
  * Enumeration binds the successful open/select generation and commit digest.
  * NULL after_name with zero length starts; otherwise seek strictly after it. */
-typedef struct { uint64_t size; size_t name_length; uint8_t name[SFS_NAME_MAX]; } sfs_xattr_entry;
 enum sfs_status sfs_image_set_xattr(sfs_image *, sfs_inode,
     const void *name, size_t name_length, const void *value, size_t length, sfs_result *);
 enum sfs_status sfs_image_remove_xattr(sfs_image *, sfs_inode,
@@ -238,6 +308,11 @@ enum sfs_status sfs_image_verify(sfs_image *, const sfs_verify_budget *, sfs_res
 
 enum sfs_status sfs_image_begin(sfs_image *, sfs_result *);
 enum sfs_status sfs_image_abort(sfs_image *, sfs_result *);
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+/* Private helper only: boundary injection, absent from ordinary objects. */
+void sfs_image_diagnostic_counters(sfs_image *, uint64_t epoch, uint64_t token);
+void sfs_image_diagnostic_capacity(sfs_image *, uint64_t capacity);
+#endif
 enum sfs_status sfs_image_add(sfs_image *, sfs_inode parent, const void *name,
                             size_t name_length, enum sfs_kind, sfs_inode *out,
                             sfs_result *);

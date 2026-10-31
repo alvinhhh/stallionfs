@@ -15,6 +15,11 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
     private var unloadedURL: URL?
     private var disposition: Error?
     private let callbacks = CallbackBudget()
+#if STALLION_WRITE_DIAGNOSTIC
+    // Explicit, single-image binding supplied by the disposable-image harness.
+    // The default extension initializer supplies no binding and stays read-only.
+    var diagnosticUUID: UUID?
+#endif
     private func enqueue(rejected: (Error) -> Void, _ block: @escaping () -> Void) {
         guard callbacks.acquire(4096) else { rejected(POSIXError(.EAGAIN)); return }
         queue.async(execute: DispatchWorkItem { defer { self.callbacks.release(4096) }; block() })
@@ -23,18 +28,32 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         guard let path = resource as? FSPathURLResource else { return true }
         return path.url.absoluteString.utf8.count <= 4096
     }
-    private func open(_ path: FSPathURLResource) throws -> (OpaquePointer, sfs_result, Bool) {
+    private func open(_ path: FSPathURLResource, writing: Bool = false) throws -> (OpaquePointer, sfs_result, Bool) {
         guard !path.isRevoked && path.url.isFileURL else { throw POSIXError(.EACCES) }
         let scoped = path.url.startAccessingSecurityScopedResource()
         var handle: OpaquePointer?, r = sfs_result()
         do {
-            let status = sfs_image_open_readonly(path.url.path, "image.sfs", &handle, &r)
+            let status: sfs_status
+#if STALLION_WRITE_DIAGNOSTIC
+            if writing {
+                guard diagnosticUUID != nil && path.isWritable else { throw POSIXError(.EACCES) }
+                status = sfs_image_open(path.url.path, "image.sfs", &handle, &r)
+            } else { status = sfs_image_open_readonly(path.url.path, "image.sfs", &handle, &r) }
+#else
+            status = sfs_image_open_readonly(path.url.path, "image.sfs", &handle, &r)
+#endif
             guard status == SFS_OK, let opened = handle else { throw sfsError(status, r) }
             var information = sfs_image_information()
             let infoStatus = sfs_image_get_information(opened, &information, &r)
             guard infoStatus == SFS_OK else { throw sfsError(infoStatus, r) }
             guard information.major == 0 && information.minor == 6 && information.root_inode == 1 else { throw POSIXError(.ENOTSUP) }
             let anchor = information.committed; var root = sfs_metadata_entry()
+#if STALLION_WRITE_DIAGNOSTIC
+            if writing {
+                guard let expected = diagnosticUUID,
+                    rawBytes(anchor.uuid) == withUnsafeBytes(of: expected.uuid, { Array($0) }) else { throw POSIXError(.EACCES) }
+            }
+#endif
             let stat = sfs_image_stat_metadata(opened, 0, 1, &root, &r)
             guard stat == SFS_OK else { throw sfsError(stat, r) }
             guard !path.isRevoked && anchorMatches(r, anchor) && root.entry.inode == 1 && root.entry.kind == SFS_DIRECTORY && root.link_count == 1 else { throw POSIXError(.EIO) }
@@ -77,8 +96,18 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         guard self.resource == nil && self.unloadedURL == nil, let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
         guard !force else { replyHandler(nil, POSIXError(.ENOTSUP)); return }
         do {
-            let (handle, anchor, scoped) = try self.open(path)
+            var writing = false
+#if STALLION_WRITE_DIAGNOSTIC
+            writing = self.diagnosticUUID != nil
+#endif
+            let (handle, anchor, scoped) = try self.open(path, writing: writing)
             let loaded = StallionVolume(handle: handle, resource: path, scope: scoped, anchor: anchor, queue: self.queue)
+#if STALLION_WRITE_DIAGNOSTIC
+            if let expected = self.diagnosticUUID {
+                do { try loaded.enableWriteDiagnostic(expectedUUID: expected) }
+                catch { _ = loaded.unload(); throw error }
+            }
+#endif
             self.resource = path; self.volume = loaded; self.containerStatus = .ready; replyHandler(loaded, nil)
         } catch { replyHandler(nil, error) }
     } }

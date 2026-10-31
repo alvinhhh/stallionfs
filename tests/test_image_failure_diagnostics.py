@@ -386,7 +386,8 @@ class DiagnosticTests(unittest.TestCase):
         identity = self.image.stat()
         self.reporter.eject_contexts[1] = dict(image=str(self.image), target=self.args[2],
             identity=(identity.st_dev, identity.st_ino), deadline=time.monotonic() + 12)
-        return dict(operation_id=1, scope=self.scope(), target=self.args[2],
+        return dict(operation_id=1, deadline=self.reporter.eject_contexts[1]['deadline'],
+                    scope=self.scope(), target=self.args[2],
                     start_ns=1700000000 * 10**9, end_ns=1700000002 * 10**9,
                     start_mono=10, end_mono=12) | changes
 
@@ -408,10 +409,9 @@ class DiagnosticTests(unittest.TestCase):
                self.log_record(native, timestamp='2023-11-14 22:13:19.000000+0000') +
                self.log_record('private reason: /Users/unrelated/private-file') + b'{"finished":true}\n')
         observation = self.eject_observation()
-        now = time.monotonic()
         def capture(argv, deadline):
             self.assertEqual(self.reporter.remaining, diagnostics.EJECT_CAPTURE_BYTES)
-            self.assertLessEqual(deadline, now + diagnostics.EJECT_SECONDS + 0.1)
+            self.assertEqual(deadline, self.reporter.eject_contexts[1]['deadline'])
             self.assertEqual(argv[:4], ['/usr/bin/log', 'show', '--style', 'ndjson'])
             self.assertEqual(argv[argv.index('--start') + 1], '2023-11-14 22:13:20+0000')
             self.assertEqual(argv[argv.index('--end') + 1], '2023-11-14 22:13:22+0000')
@@ -466,7 +466,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
     def test_eject_log_requires_owned_mapping_time_window_and_remaining_budget(self):
-        for label in ('expected', 'mapping', 'identity', 'target', 'window', 'clock', 'disabled', 'bytes', 'events', 'deadline'):
+        for label in ('expected', 'mapping', 'identity', 'target', 'window', 'clock', 'disabled', 'bytes', 'events', 'deadline', 'no_deadline'):
             with self.subTest(label=label):
                 self.reporter.eject_log_attempted = self.reporter.capture_disabled = False
                 self.reporter.remaining = diagnostics.CAPTURE_BYTES
@@ -483,12 +483,125 @@ class DiagnosticTests(unittest.TestCase):
                 elif label == 'bytes': self.reporter.remaining = 0
                 elif label == 'events': self.reporter.events = diagnostics.EVENTS
                 elif label == 'deadline': context['deadline'] = time.monotonic() + 0.5
+                elif label == 'no_deadline': observation.pop('deadline')
                 with patch.object(self.reporter, '_capture') as capture, patch.object(self.reporter, '_emit') as emit:
                     self.reporter.eject_log(observation)
                 capture.assert_not_called()
+                if label == 'no_deadline':
+                    emit.assert_not_called()  # No existing observation budget to spend.
+                    continue
                 self.assertEqual(emit.call_args.kwargs['query_status'], 'unavailable')
                 self.assertEqual(emit.call_args.kwargs['records'], '')
                 self.assertNotIn('/Users/private', str(emit.call_args))
+
+    def test_eject_log_uses_only_budget_remaining_after_earlier_captures(self):
+        now = [100.0]
+        raw = self.log_record('unable to eject /dev/disk999 (status code 0x00000010).')
+        with patch.object(diagnostics.time, 'monotonic', side_effect=lambda: now[0]):
+            observation = self.eject_observation()
+            observation.pop('deadline')
+            self.reporter.eject_contexts.clear()
+            identity = self.image.stat()
+            # Prior observation work used time and output, but did not renew its deadline.
+            earlier_output = self.holder_output()
+            def earlier_capture(argv, deadline):
+                self.assertEqual(argv[0], '/usr/sbin/lsof')
+                now[0] += 6.5
+                self.reporter.remaining -= len(earlier_output)
+                return captured(earlier_output, status=1)
+            with patch.object(self.reporter, '_mapping', return_value=(str(self.image),
+                    [self.args[2]], None, None, (identity.st_dev, identity.st_ino))), \
+                    patch.object(self.reporter, '_capture', side_effect=earlier_capture):
+                self.reporter.report(self.args, OSError('busy'), self.scope(), 1, observation)
+            self.assertEqual(observation['deadline'], 112.0)
+            initial = self.reporter.remaining
+            def capture(argv, deadline):
+                self.assertEqual(deadline, 112.0)
+                self.assertEqual(deadline - now[0], 5.5)
+                self.assertEqual(self.reporter.remaining, diagnostics.EJECT_CAPTURE_BYTES)
+                self.assertEqual(argv[:2], ['/usr/bin/log', 'show'])
+                self.reporter.remaining -= len(raw)
+                now[0] = deadline - 0.8  # Collection and reap stay inside the original deadline.
+                return captured(raw, status=-9) | dict(timeout=True)
+            with patch.object(self.reporter, '_capture', side_effect=capture) as query, \
+                    patch.object(self.reporter, 'lock', wraps=self.reporter.lock) as lock:
+                self.reporter.eject_log(observation)
+                self.reporter.eject_log(observation)
+        query.assert_called_once()
+        self.assertEqual(lock.acquire.call_args_list[0], call(timeout=5.5))
+        self.assertEqual(self.reporter.remaining, initial - len(raw))
+        event = self.events()[-1]
+        self.assertEqual(event['query_status'], 'unavailable')
+        self.assertEqual(event['reason'], 'log_query_failed')
+        self.assertEqual(event['returncode'], -9)
+        self.assertTrue(event['timeout'])
+        self.assertTrue(event['reaped'])
+        self.assertEqual(event['records'], '')
+        self.assertLessEqual(self.reporter.written, diagnostics.FILE_BYTES)
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_eject_log_rechecks_context_after_lock_without_extending_deadline(self):
+        for changed in ('removed', 'later_deadline', 'expired_deadline'):
+            with self.subTest(changed=changed):
+                self.reporter.eject_log_attempted = False
+                with patch.object(diagnostics.time, 'monotonic', return_value=100.0):
+                    observation = self.eject_observation()
+                def acquire(*, timeout):
+                    self.assertEqual(timeout, 5.5)
+                    context = self.reporter.eject_contexts.pop(1)
+                    if changed != 'removed':
+                        self.reporter.eject_contexts[1] = dict(context,
+                            deadline=130.0 if changed == 'later_deadline' else 105.0)
+                    return True
+                lock = Mock()
+                lock.acquire.side_effect = acquire
+                with patch.object(diagnostics.time, 'monotonic', return_value=106.5), \
+                        patch.object(self.reporter, 'lock', lock), \
+                        patch.object(self.reporter, '_capture', return_value=captured(b'{"finished":true}\n')) as query, \
+                        patch.object(self.reporter, '_emit') as emit:
+                    self.reporter.eject_log(observation)
+                lock.release.assert_called_once()
+                if changed == 'later_deadline':
+                    query.assert_called_once()
+                    self.assertEqual(query.call_args.args[1], 112.0)
+                    self.assertEqual(emit.call_args.kwargs['query_status'], 'empty')
+                else:
+                    query.assert_not_called()
+                    if changed == 'removed':
+                        self.assertEqual(emit.call_args.kwargs['reason'], 'no_verified_attachment_mapping')
+                        self.assertEqual(emit.call_args.kwargs['query_status'], 'unavailable')
+                    else:
+                        emit.assert_not_called()
+
+    def test_eject_log_expired_existing_budget_cannot_wait_capture_or_write(self):
+        observation = self.eject_observation()
+        deadline = self.reporter.eject_contexts[1]['deadline']
+        initial = self.reporter.remaining
+        with patch.object(diagnostics.time, 'monotonic', return_value=deadline + 1), \
+                patch.object(self.reporter, '_capture') as query, \
+                patch.object(self.reporter, '_emit') as emit, \
+                patch.object(self.reporter, 'lock', wraps=self.reporter.lock) as lock:
+            self.reporter.eject_log(observation)
+            self.reporter.eject_log(observation)
+        self.assertEqual(lock.acquire.call_args_list, [call(timeout=0)] * 2)
+        query.assert_not_called()
+        emit.assert_not_called()
+        self.assertTrue(self.reporter.eject_log_attempted)
+        self.assertEqual(self.reporter.remaining, initial)
+        self.assertFalse(self.reporter.directory.exists())
+
+    def test_eject_log_keeps_one_second_cleanup_reserve_in_existing_budget(self):
+        observation = self.eject_observation()
+        deadline = self.reporter.eject_contexts[1]['deadline']
+        with patch.object(diagnostics.time, 'monotonic', return_value=deadline - 0.5), \
+                patch.object(self.reporter, '_capture') as query:
+            self.reporter.eject_log(observation)
+        query.assert_not_called()
+        event = self.events()[-1]
+        self.assertEqual(event['query_status'], 'unavailable')
+        self.assertEqual(event['reason'], 'diagnostic_budget_exhausted')
+        self.assertEqual(event['records'], '')
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
     def test_eject_log_uncertain_capture_cannot_restore_budget(self):
         observation = self.eject_observation()

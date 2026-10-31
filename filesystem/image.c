@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #define CELL 4096u
 #define ALIGNMENT UINT64_C(4096)
@@ -42,10 +43,27 @@ typedef struct { uint32_t view, length; uint8_t name[SFS_NAME_MAX]; reference ns
 typedef struct { uint64_t generation, end, capacity; uint8_t uuid[16]; reference root; uint32_t minor; } anchor;
 typedef struct { namespace ns; uint32_t count; snapshot snapshots[SFS_SNAPSHOT_MAX]; reference catalog; } state;
 typedef struct { reference ref; uint64_t stamp; uint8_t *bytes; } cache_entry;
-typedef struct { cache_entry entries[CACHE_COUNT]; uint64_t clock; unsigned count; } cache;
+/* Only count entries are searchable; the first allocated entries own buffers. */
+typedef struct { cache_entry entries[CACHE_COUNT]; uint64_t clock; unsigned count, allocated; } cache;
 typedef struct arena arena;
 typedef struct tree tree;
 typedef struct batch batch;
+typedef struct pin_slot pin_slot;
+typedef struct pin_table pin_table;
+typedef struct { sfs_inode id; pin_slot *detached; } mutation_target;
+typedef struct { node inode; reference xattrs; uint64_t next_inode, end, generation; } pin_descriptor;
+enum { PIN_FREE, PIN_RESERVED, PIN_LINKED, PIN_DETACHED };
+struct pin_slot {
+    uint64_t incarnation; sfs_inode id;
+    uint32_t state, pending, dirty, next, previous, free_next;
+    pin_descriptor committed, staged;
+};
+struct pin_table {
+    uint64_t instance, bytes;
+    uint8_t session[16];
+    uint32_t count, hash_count, free_head, changed;
+    pin_slot *slots; uint32_t *hash;
+};
 enum image_policy { ORDINARY_WRITABLE, ORDINARY_READONLY, RECOVERY };
 struct sfs_image {
     int fd, aux_parent, selected, poisoned, transaction;
@@ -54,6 +72,12 @@ struct sfs_image {
     uint64_t eof, epoch, token;
     anchor current, slots[2]; enum sfs_status slot_status[2]; int slot_error[2], slot_observed[2];
     state live, staged; enum sfs_phase phase; cache *cache; batch *batch;
+    enum sfs_limit_reason limit_reason;
+    unsigned fence_attempted, fence_succeeded;
+    pin_table *pins;
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    uint64_t diagnostic_capacity;
+#endif
 };
 typedef struct { uint64_t block, stamp; uint8_t *bytes; int valid, dirty; } aux_entry;
 typedef struct {
@@ -134,15 +158,28 @@ static attributes initial_attributes(const sfs_metadata_initial *a, sfs_timestam
     if (a->restore & SFS_RESTORE_BIRTH) v.birth = a->birth; if (a->restore & SFS_RESTORE_ACCESS) v.access = a->access; if (a->restore & SFS_RESTORE_MODIFICATION) v.modification = a->modification; return v;
 }
 static void discard(sfs_image *h);
-static void cache_clear(sfs_image *h) { if (!h->cache) return; for (unsigned i = 0; i < h->cache->count; ++i) free(h->cache->entries[i].bytes); free(h->cache); h->cache = NULL; }
+static void pins_discard(sfs_image *h);
+static void pins_promote(sfs_image *h);
+static void pins_free(sfs_image *h);
+static enum sfs_status mutation_start(sfs_image *, sfs_result *);
+static enum sfs_status mutation_failure(sfs_image *, enum sfs_status, enum sfs_phase, int, int, sfs_result *);
+static void cache_clear(sfs_image *h) { if (!h->cache) return; for (unsigned i = 0; i < h->cache->allocated; ++i) free(h->cache->entries[i].bytes); free(h->cache); h->cache = NULL; }
+/* Invalidate content so commit keeps its existing rereads and checks. */
+static void cache_invalidate(sfs_image *h) { if (h->cache) { h->cache->count = 0; h->cache->clock = 0; } }
 void sfs_image_clear_read_cache(sfs_image *h) { if (h) cache_clear(h); }
 static enum sfs_status result(sfs_image *h, enum sfs_status status, enum sfs_phase phase, int error, sfs_result *r) {
     if (r) { memset(r, 0, sizeof(*r)); r->status = status; r->phase = phase; r->system_errno = error;
         if (h) { r->generation = h->current.generation; r->committed_end = h->current.end; r->physical_end = h->eof; r->device = (uint64_t)h->identity.st_dev; r->inode = (uint64_t)h->identity.st_ino; memcpy(r->uuid, h->current.uuid, 16); memcpy(r->root_digest, h->current.root.digest, 32); }
+        if (h) {
+            r->limit_reason = status == SFS_LIMIT ? h->limit_reason : SFS_LIMIT_UNSPECIFIED;
+            r->fence_attempted = h->fence_attempted; r->fence_succeeded = h->fence_succeeded;
+            r->transaction_active = h->transaction; r->poisoned = h->poisoned;
+        }
     } return status;
 }
 static enum sfs_status ready(sfs_image *h, int writing, int tx, sfs_result *r) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
     if (h->poisoned) return result(h, SFS_POISONED, h->phase, 0, r);
     if (!h->selected || (writing && h->policy != ORDINARY_WRITABLE) || (tx && !h->transaction)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r); return SFS_OK;
 }
@@ -324,7 +361,10 @@ static enum sfs_status metadata(reader *r, const reference *ref, unsigned type, 
     e = charge(r, SFS_INCOMPLETE_METADATA_HASH, CELL); if (e) return e;
     unsigned slot = c->count;
     if (slot == CACHE_COUNT) { slot = 0; for (unsigned i = 1; i < c->count; ++i) if (c->entries[i].stamp < c->entries[slot].stamp) slot = i; }
-    else { c->entries[slot].bytes = malloc(CELL); if (!c->entries[slot].bytes) return SFS_NOMEM; c->count++; }
+    else {
+        if (slot == c->allocated) { uint8_t *bytes = malloc(CELL); if (!bytes) return SFS_NOMEM; c->entries[slot].bytes = bytes; c->allocated++; }
+        c->count++;
+    }
     cache_entry *v = &c->entries[slot]; memset(&v->ref, 0, sizeof(v->ref));
     if (read_exact(r->h->fd, v->bytes, CELL, ref->offset)) return io_failure(r, SFS_PHASE_READ);
     uint8_t digest[32]; hash_cell(v->bytes, type, r->a.uuid, digest, r->a.minor);
@@ -568,12 +608,12 @@ static enum sfs_status extent_growth(reader *r, reference root, uint64_t old_siz
 typedef struct { uint8_t bytes[CELL]; reference source; uint64_t owner, token; unsigned map; uint16_t children[48]; int dirty; } overlay_page;
 struct arena { overlay_page *pages[ARENA_COUNT]; unsigned used; uint64_t epoch, batch; reference lineage; };
 struct tree { arena *arena; reader *reader; reference source; int root; unsigned map; uint64_t owner, next_inode, eof; };
-struct batch { arena *arena; tree extent; node inode; uint64_t low, high, number; };
-_Static_assert(sizeof(batch) == 640, "bounded primary batch");
+struct batch { arena *arena; tree extent; node inode; uint64_t low, high, number; pin_slot *detached; uint64_t incarnation; };
+_Static_assert(sizeof(batch) == 656, "bounded primary batch");
 _Static_assert(sizeof(arena) + ARENA_COUNT * sizeof(overlay_page) + 17 * CELL <= ARENA_BYTES, "bounded overlay including merge cells");
 static void arena_free(arena *a) { if (!a) return; for (unsigned i = 0; i < a->used; ++i) free(a->pages[i]); free(a); }
 static arena *arena_new(sfs_image *h, uint64_t batch_number) { arena *a = calloc(1, sizeof(*a)); if (a) { a->epoch = h->epoch; a->batch = batch_number; a->lineage = h->staged.ns.ref; } return a; }
-static void discard(sfs_image *h) { if (h->batch) { arena_free(h->batch->arena); free(h->batch); h->batch = NULL; } memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; }
+static void discard(sfs_image *h) { if (h->batch) { arena_free(h->batch->arena); free(h->batch); h->batch = NULL; } pins_discard(h); memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; }
 static void envelope(uint8_t b[CELL], unsigned type, const uint8_t uuid[16], unsigned minor) { memset(b, 0, CELL); memcpy(b, record_magic(minor), 8); put32(b + 8, type); put64(b + 16, CELL - 64); memcpy(b + 24, uuid, 16); }
 static int arena_add(tree *t, unsigned level) {
     arena *a = t->arena; unsigned i = 0; while (i < a->used && a->pages[i]) i++; if (i == ARENA_COUNT || t->reader->h->token == UINT64_MAX) return -1;
@@ -731,7 +771,19 @@ static enum sfs_status tree_delete(tree *t, const key *k) {
 }
 static unsigned tree_dirty(tree *t, unsigned id) { overlay_page *p = owned_page(t, id); if (!p) return 0; unsigned n = !!p->dirty; if (page_level(p->bytes)) for (unsigned i = 0; i < page_count(p->bytes); ++i) if (p->children[i] != NO_CHILD) n += tree_dirty(t, p->children[i]); return n; }
 static uint64_t pending_cells(tree *t) { return t->root >= 0 ? tree_dirty(t, (unsigned)t->root) : 0; }
-static int reserve_cells(sfs_image *h, uint64_t cells) { uint64_t at; return aligned(h->eof < DATA_START ? DATA_START : h->eof, &at) && cells <= UINT64_MAX / CELL && at <= h->current.capacity && cells * CELL <= h->current.capacity - at; }
+static int reserve_cells(sfs_image *h, uint64_t cells) {
+    uint64_t at, capacity = h->current.capacity;
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    if (h->diagnostic_capacity && h->diagnostic_capacity < capacity) capacity = h->diagnostic_capacity;
+#endif
+    if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at) || cells > UINT64_MAX / CELL) {
+        h->limit_reason = SFS_LIMIT_STRUCTURE; return 0;
+    }
+    if (at > capacity || cells * CELL > capacity - at) {
+        h->limit_reason = SFS_LIMIT_APPEND_CAPACITY; return 0;
+    }
+    return 1;
+}
 static enum sfs_status append_prepared(sfs_image *h, unsigned type, const uint8_t b[CELL], reference *out, uint64_t *remaining, const reference *prepared) {
     if (!*remaining || !reserve_cells(h, 1)) return SFS_LIMIT;
     uint64_t at; if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at)) return SFS_LIMIT;
@@ -758,6 +810,123 @@ static arena *arena_clone(arena *old) {
     for (unsigned i = 0; i < old->used; ++i) if (old->pages[i]) { a->pages[i] = malloc(sizeof(overlay_page)); if (!a->pages[i]) { arena_free(a); return NULL; } memcpy(a->pages[i], old->pages[i], sizeof(overlay_page)); } return a;
 }
 static reader current_reader(sfs_image *h, int staged) { reader r; memset(&r, 0, sizeof(r)); r.h = h; r.a = h->current; r.phase = SFS_PHASE_READ; if (staged) { r.a.end = h->eof; r.a.generation++; } return r; }
+/* All lifetime storage is reserved up front. No pointer into the read cache is
+ * retained. The hash owns inode uniqueness; tokens index slots directly. */
+#define PIN_NONE UINT32_MAX
+static atomic_uint_fast64_t pin_instances = ATOMIC_VAR_INIT(1);
+static uint32_t pin_hash(const pin_table *t, uint64_t id) {
+    id ^= id >> 30; id *= UINT64_C(0xbf58476d1ce4e5b9); id ^= id >> 27;
+    id *= UINT64_C(0x94d049bb133111eb); id ^= id >> 31; return (uint32_t)id & (t->hash_count - 1);
+}
+static pin_slot *pin_find(sfs_image *h, sfs_inode id) {
+    pin_table *t = h->pins; if (!t || !id) return NULL;
+    uint32_t at = pin_hash(t, id);
+    for (uint32_t n = 0; n < t->hash_count; ++n, at = (at + 1) & (t->hash_count - 1)) {
+        uint32_t v = t->hash[at]; if (!v) return NULL;
+        if (t->slots[v - 1].id == id) return &t->slots[v - 1];
+    } return NULL;
+}
+static void pin_hash_insert(pin_table *t, pin_slot *p) {
+    uint32_t at = pin_hash(t, p->id);
+    while (t->hash[at]) at = (at + 1) & (t->hash_count - 1);
+    t->hash[at] = (uint32_t)(p - t->slots) + 1;
+}
+static void pin_hash_remove(pin_table *t, pin_slot *p) {
+    if (!p->id) return; uint32_t at = pin_hash(t, p->id);
+    for (uint32_t n = 0; n < t->hash_count; ++n, at = (at + 1) & (t->hash_count - 1)) {
+        if (!t->hash[at]) return;
+        if (t->hash[at] == (uint32_t)(p - t->slots) + 1) {
+            /* Backshift this cluster, without tombstones or a table rebuild. */
+            uint32_t hole = at, scan = (at + 1) & (t->hash_count - 1), mask = t->hash_count - 1;
+            while (t->hash[scan]) {
+                uint32_t home = pin_hash(t, t->slots[t->hash[scan] - 1].id);
+                if (((scan - home) & mask) >= ((scan - hole) & mask)) { t->hash[hole] = t->hash[scan]; hole = scan; }
+                scan = (scan + 1) & mask;
+            }
+            t->hash[hole] = 0; return;
+        }
+    }
+}
+static void pin_touch(sfs_image *h, pin_slot *p) {
+    if (p->dirty) return; pin_table *t = h->pins;
+    p->pending = p->state; p->staged = p->committed; p->dirty = 1;
+    p->previous = PIN_NONE; p->next = t->changed;
+    if (t->changed != PIN_NONE) t->slots[t->changed].previous = (uint32_t)(p - t->slots);
+    t->changed = (uint32_t)(p - t->slots);
+}
+static void pin_unchain(pin_table *t, pin_slot *p) {
+    if (!p->dirty) return;
+    if (p->previous == PIN_NONE) t->changed = p->next; else t->slots[p->previous].next = p->next;
+    if (p->next != PIN_NONE) t->slots[p->next].previous = p->previous;
+    p->dirty = 0; p->next = p->previous = PIN_NONE;
+}
+static void pin_retire(pin_table *t, pin_slot *p) {
+    pin_unchain(t, p); pin_hash_remove(t, p); p->id = 0; p->state = p->pending = PIN_FREE;
+    memset(&p->committed, 0, sizeof(p->committed)); memset(&p->staged, 0, sizeof(p->staged));
+    /* Never wrap a slot incarnation. An exhausted slot stays unavailable. */
+    if (p->incarnation != UINT64_MAX) { p->free_next = t->free_head; t->free_head = (uint32_t)(p - t->slots); }
+}
+static void pins_discard(sfs_image *h) {
+    pin_table *t = h->pins; if (!t) return;
+    while (t->changed != PIN_NONE) {
+        pin_slot *p = &t->slots[t->changed];
+        if (p->state == PIN_RESERVED) pin_retire(t, p);
+        else { pin_unchain(t, p); p->pending = PIN_FREE; memset(&p->staged, 0, sizeof(p->staged)); }
+    }
+}
+static void pins_promote(sfs_image *h) {
+    pin_table *t = h->pins; if (!t) return;
+    while (t->changed != PIN_NONE) {
+        pin_slot *p = &t->slots[t->changed]; p->state = p->pending;
+        p->committed = p->staged; pin_unchain(t, p); p->pending = PIN_FREE;
+        memset(&p->staged, 0, sizeof(p->staged));
+    }
+}
+static void pins_free(sfs_image *h) { if (h->pins) { free(h->pins->hash); free(h->pins->slots); free(h->pins); h->pins = NULL; } }
+static enum sfs_status pin_resolve(sfs_image *h, sfs_pin token, pin_slot **out) {
+    pin_table *t = h->pins;
+    if (!t || token.reserved || token.instance != t->instance || memcmp(token.session, t->session, sizeof(t->session)) || token.slot >= t->count) return SFS_INVALID;
+    pin_slot *p = &t->slots[token.slot];
+    if (p->state == PIN_FREE || p->incarnation != token.incarnation || !token.incarnation) return SFS_INVALID;
+    *out = p; return SFS_OK;
+}
+static enum sfs_status pin_gate(sfs_image *h, int writing, int tx, sfs_result *out) {
+    if (h && h->selected && h->current.minor != 6) {
+        h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
+        return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, out);
+    }
+    return ready(h, writing, tx, out);
+}
+static unsigned pin_pending_state(const pin_slot *p) { return p->dirty ? p->pending : p->state; }
+static pin_descriptor *pin_pending_descriptor(pin_slot *p) { return p->dirty ? &p->staged : &p->committed; }
+static int pin_descriptor_valid(sfs_image *h, const pin_slot *p, const pin_descriptor *d, int staged) {
+    return p->id > 1 && d->inode.e.inode == p->id && !d->inode.nlink && !d->inode.reverse.type &&
+        d->next_inode > p->id && d->end >= DATA_START && d->end <= (staged ? h->eof : h->current.end) &&
+        d->generation && d->generation <= h->current.generation + (unsigned)staged;
+}
+static enum sfs_status pin_mutation_target(sfs_image *h, sfs_pin token, mutation_target *out, sfs_result *r) {
+    enum sfs_status e = pin_gate(h, 1, 1, r); if (e) return e; pin_slot *p;
+    e = pin_resolve(h, token, &p); if (e) return result(h, e, SFS_PHASE_NONE, 0, r);
+    unsigned state = pin_pending_state(p);
+    if (state != PIN_LINKED && state != PIN_DETACHED) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r);
+    *out = (mutation_target){ p->id, state == PIN_DETACHED ? p : NULL }; return SFS_OK;
+}
+static int target_same(const batch *b, mutation_target target) { return b && b->inode.e.inode == target.id && b->detached == target.detached; }
+static enum sfs_status target_get(reader *r, mutation_target target, node *out) {
+    if (target.detached) {
+        pin_descriptor *d = pin_pending_descriptor(target.detached);
+        if (target.detached->id != target.id || pin_pending_state(target.detached) != PIN_DETACHED || !pin_descriptor_valid(r->h, target.detached, d, 1)) return SFS_CORRUPT;
+        *out = d->inode; return SFS_OK;
+    }
+    enum sfs_status e = node_get(r, &r->h->staged.ns, target.id, 1, out);
+    if (e != SFS_NOT_FOUND) return e;
+    pin_slot *p = pin_find(r->h, target.id);
+    return p && pin_pending_state(p) == PIN_LINKED ? SFS_CORRUPT : e;
+}
+static void target_store(reader *r, pin_slot *p, const node *n) {
+    pin_touch(r->h, p); p->pending = PIN_DETACHED; p->staged.inode = *n;
+    p->staged.end = r->h->eof; p->staged.generation = r->a.generation;
+}
 static tree make_tree(arena *a, reader *r, reference source, unsigned map, uint64_t owner, uint64_t next, uint64_t eof) { return (tree){ .arena = a, .reader = r, .source = source, .root = -1, .map = map, .owner = owner, .next_inode = next, .eof = eof }; }
 static enum sfs_status mutation_failure(sfs_image *h, enum sfs_status e, enum sfs_phase phase, int error, int late, sfs_result *result_out) {
     if (e == SFS_LIMIT || late || e == SFS_IO || e == SFS_CORRUPT || e == SFS_UNSUPPORTED || e == SFS_RECOVERY_REQUIRED) discard(h);
@@ -1045,8 +1214,9 @@ enum sfs_status sfs_image_select(sfs_image *h, unsigned slot, const sfs_verify_b
 }
 enum sfs_status sfs_image_close(sfs_image *h, sfs_result *out) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_CLOSE, 0, out);
+    h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
     int error = 0; if (close(h->fd)) error = errno; if (close(h->aux_parent) && !error) error = errno;
-    enum sfs_status e = result(h, error ? SFS_IO : SFS_OK, SFS_PHASE_CLOSE, error, out); discard(h); cache_clear(h); free(h); return e;
+    enum sfs_status e = result(h, error ? SFS_IO : SFS_OK, SFS_PHASE_CLOSE, error, out); discard(h); pins_free(h); cache_clear(h); free(h); return e;
 }
 enum sfs_status sfs_image_verify(sfs_image *h, const sfs_verify_budget *budget, sfs_result *out) {
     enum sfs_status e = ready(h, 0, 0, out); if (e) return e; if (!valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
@@ -1063,6 +1233,81 @@ static enum sfs_status selected_namespace(reader *r, sfs_view view, namespace *o
     return SFS_NOT_FOUND;
 }
 static enum sfs_status touched_result(reader *r, enum sfs_status e, sfs_result *out) { read_result(r->h, e, r->phase, e == SFS_IO ? r->error : e == SFS_NOMEM ? ENOMEM : 0, out); if (!e && out) out->coverage = SFS_COVERAGE_TOUCHED; return e; }
+enum sfs_status sfs_image_pin_configure(sfs_image *h, uint32_t count, uint64_t max_bytes, sfs_result *out) {
+    enum sfs_status e = pin_gate(h, 0, 0, out); if (e) return e;
+    if (!count || !max_bytes || count > UINT32_MAX / 4) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    if (h->transaction || h->pins || h->policy == RECOVERY) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    uint32_t hash_count = 2; while (hash_count < count * 2u) hash_count *= 2;
+    uint64_t bytes = sizeof(pin_table) + (uint64_t)count * sizeof(pin_slot) + (uint64_t)hash_count * sizeof(uint32_t);
+    if (bytes > max_bytes || bytes > SIZE_MAX) { h->limit_reason = SFS_LIMIT_PIN_RESOURCES; return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, out); }
+    uint_fast64_t instance = atomic_load_explicit(&pin_instances, memory_order_relaxed);
+    do { if (instance == UINT64_MAX) { h->limit_reason = SFS_LIMIT_PIN_RESOURCES; return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, out); } }
+    while (!atomic_compare_exchange_weak_explicit(&pin_instances, &instance, instance + 1, memory_order_relaxed, memory_order_relaxed));
+    pin_table *t = calloc(1, sizeof(*t)); if (!t) return result(h, SFS_NOMEM, SFS_PHASE_NONE, ENOMEM, out);
+    t->slots = calloc(count, sizeof(*t->slots)); t->hash = calloc(hash_count, sizeof(*t->hash));
+    if (!t->slots || !t->hash) { free(t->slots); free(t->hash); free(t); return result(h, SFS_NOMEM, SFS_PHASE_NONE, ENOMEM, out); }
+    t->instance = instance; t->bytes = bytes; t->count = count; t->hash_count = hash_count; t->changed = PIN_NONE;
+    arc4random_buf(t->session, sizeof(t->session));
+    for (uint32_t i = 0; i < count; ++i) { t->slots[i].free_next = i + 1 < count ? i + 1 : PIN_NONE; t->slots[i].next = t->slots[i].previous = PIN_NONE; }
+    h->pins = t; return result(h, SFS_OK, SFS_PHASE_NONE, 0, out);
+}
+static enum sfs_status pin_allocate(sfs_image *h, unsigned state, sfs_inode id, sfs_pin *out, sfs_result *r) {
+    pin_table *t = h->pins;
+    if (!t) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r);
+    if (t->free_head == PIN_NONE) { h->limit_reason = SFS_LIMIT_PIN_RESOURCES; return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, r); }
+    uint32_t index = t->free_head; pin_slot *p = &t->slots[index]; t->free_head = p->free_next;
+    p->incarnation++; p->state = state; p->id = id;
+    if (id) pin_hash_insert(t, p);
+    if (state == PIN_RESERVED) pin_touch(h, p);
+    sfs_pin token = { .instance = t->instance, .incarnation = p->incarnation, .slot = index };
+    memcpy(token.session, t->session, sizeof(token.session)); *out = token;
+    return result(h, SFS_OK, SFS_PHASE_NONE, 0, r);
+}
+enum sfs_status sfs_image_pin_acquire(sfs_image *h, sfs_inode id, sfs_pin *out, sfs_result *r) {
+    enum sfs_status e = pin_gate(h, 0, 0, r); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    if (h->transaction) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, r);
+    if (!h->pins) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, r);
+    if (pin_find(h, id)) return result(h, SFS_EXISTS, SFS_PHASE_NONE, 0, r);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, r);
+    reader rd = current_reader(h, 0); node n; e = node_get(&rd, &h->live.ns, id, 1, &n);
+    if (e) return touched_result(&rd, e, r); return pin_allocate(h, PIN_LINKED, id, out, r);
+}
+enum sfs_status sfs_image_pin_reserve(sfs_image *h, sfs_pin *out, sfs_result *r) {
+    enum sfs_status e = pin_gate(h, 1, 0, r); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    if (h->transaction) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, r);
+    return pin_allocate(h, PIN_RESERVED, 0, out, r);
+}
+enum sfs_status sfs_image_pin_bind(sfs_image *h, sfs_pin token, sfs_inode id, sfs_result *out) {
+    enum sfs_status e = pin_gate(h, 1, 1, out); if (e) return e; pin_slot *p;
+    e = pin_resolve(h, token, &p); if (e) return result(h, e, SFS_PHASE_NONE, 0, out);
+    if (p->state != PIN_RESERVED || p->pending != PIN_RESERVED || p->id || id < h->live.ns.next_inode) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    if (pin_find(h, id)) return result(h, SFS_EXISTS, SFS_PHASE_NONE, 0, out);
+    e = mutation_start(h, out); if (e) return e;
+    reader r = current_reader(h, 1); node n; e = node_get(&r, &h->staged.ns, id, 1, &n);
+    if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+    p->id = id; p->pending = PIN_LINKED; pin_hash_insert(h->pins, p); return result(h, SFS_OK, SFS_PHASE_NONE, 0, out);
+}
+enum sfs_status sfs_image_pin_release(sfs_image *h, sfs_pin token, sfs_result *out) {
+    if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
+    if (h->current.minor != 6) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, out);
+    if (h->transaction) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, out);
+    pin_slot *p; enum sfs_status e = pin_resolve(h, token, &p);
+    if (!e) pin_retire(h->pins, p); return result(h, e, SFS_PHASE_NONE, 0, out);
+}
+static enum sfs_status pin_committed(reader *r, sfs_pin token, node *n, reference *xattrs, uint64_t *next) {
+    pin_slot *p; enum sfs_status e = pin_resolve(r->h, token, &p); if (e) return e;
+    if (p->state == PIN_LINKED) {
+        e = node_get(r, &r->h->live.ns, p->id, 1, n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
+        *xattrs = r->h->live.ns.xattrs; *next = r->h->live.ns.next_inode; return e;
+    }
+    if (p->state != PIN_DETACHED) return SFS_STATE;
+    if (!pin_descriptor_valid(r->h, p, &p->committed, 0)) return SFS_CORRUPT;
+    *n = p->committed.inode; *xattrs = p->committed.xattrs; *next = p->committed.next_inode;
+    r->a.end = p->committed.end; r->a.generation = p->committed.generation; return SFS_OK;
+}
 enum sfs_status sfs_image_snapshot_view(sfs_image *h, const void *name, size_t length, sfs_view *out, sfs_result *r) {
     enum sfs_status e = ready(h, 0, 0, r); if (e) return e; if (!out || !valid_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, r);
@@ -1084,6 +1329,36 @@ enum sfs_status sfs_image_stat_metadata(sfs_image *h, sfs_view view, sfs_inode i
     if (!e) { sfs_metadata_entry v = {0}; v.entry = n.e; v.birth = n.attributes.birth; v.access = n.attributes.access; v.modification = n.attributes.modification; v.change = n.attributes.change; v.mode = n.attributes.mode; v.uid = n.attributes.uid; v.gid = n.attributes.gid; v.flags = n.attributes.flags; v.referenced_data_bytes = n.attributes.extents * CELL; v.link_count = n.nlink; *out = v; }
     return touched_result(&r, e, result_out);
 }
+static enum sfs_status pin_stat_value(const node *n, sfs_pin_stat *out) {
+    if (n->attributes.extents > UINT64_MAX / CELL) return SFS_CORRUPT;
+    sfs_pin_stat v = {0}; sfs_metadata_entry *m = &v.metadata;
+    v.linked = !!n->nlink; m->entry = n->e;
+    if (!v.linked) { m->entry.parent = 0; m->entry.name_length = 0; memset(m->entry.name, 0, sizeof(m->entry.name)); }
+    m->birth = n->attributes.birth; m->access = n->attributes.access;
+    m->modification = n->attributes.modification; m->change = n->attributes.change;
+    m->mode = n->attributes.mode; m->uid = n->attributes.uid; m->gid = n->attributes.gid; m->flags = n->attributes.flags;
+    m->referenced_data_bytes = n->attributes.extents * CELL; m->link_count = n->nlink; *out = v;
+    return SFS_OK;
+}
+enum sfs_status sfs_image_pin_stat(sfs_image *h, sfs_pin token, sfs_pin_stat *out, sfs_result *result_out) {
+    enum sfs_status e = pin_gate(h, 0, 0, result_out); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    reader r = current_reader(h, 0); node n; reference attrs; uint64_t next;
+    e = pin_committed(&r, token, &n, &attrs, &next);
+    if (!e) e = pin_stat_value(&n, out);
+    return touched_result(&r, e, result_out);
+}
+enum sfs_status sfs_image_pin_stat_transaction(sfs_image *h, sfs_pin token, sfs_pin_stat *out, sfs_result *result_out) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, token, &target, result_out); if (e) return e;
+    if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    e = mutation_start(h, result_out); if (e) return e;
+    reader r = current_reader(h, 1); node n;
+    if (target_same(h->batch, target)) n = h->batch->inode;
+    else e = target_get(&r, target, &n);
+    if (!e) e = pin_stat_value(&n, out);
+    return touched_result(&r, e, result_out);
+}
 enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, const void *name, size_t length, sfs_entry *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!out || !valid_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
@@ -1093,11 +1368,14 @@ enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, 
     if (!e) { e = node_get(&r, &ns, get64(row + 267), 1, &n); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT; if (!e) { e = r.a.minor == 6 ? name_member(&r, &ns, &n, &k) : (n.e.parent != parent || n.e.name_length != length || memcmp(n.e.name, name, length)) ? SFS_CORRUPT : SFS_OK; if (!e) { n.e.parent = parent; n.e.name_length = length; memset(n.e.name, 0, sizeof(n.e.name)); memcpy(n.e.name, name, length); } } }
     if (!e) *out = n.e; return touched_result(&r, e, result_out);
 }
-enum sfs_status sfs_image_read(sfs_image *h, sfs_view view, sfs_inode id, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
-    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!read_count || (capacity && !data)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *read_count = 0;
+static enum sfs_status read_target(sfs_image *h, sfs_view view, sfs_inode id, const sfs_pin *pin, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out); if (e) return e; if (!read_count || (capacity && !data)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *read_count = 0;
     uint64_t end; if (!add64(offset, capacity, &end)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
-    reader r = current_reader(h, 0); namespace ns; node n; e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n); if (!e && n.e.kind != SFS_FILE) e = SFS_INVALID;
+    reader r = current_reader(h, 0); namespace ns; node n;
+    if (pin) { reference attrs; uint64_t next; e = pin_committed(&r, *pin, &n, &attrs, &next); }
+    else { e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n); }
+    if (!e && n.e.kind != SFS_FILE) e = SFS_INVALID;
     while (!e && *read_count < capacity && offset + *read_count < n.e.size) {
         uint64_t position = offset + *read_count; size_t amount = CELL - position % CELL; if (amount > capacity - *read_count) amount = capacity - *read_count; if (amount > n.e.size - position) amount = (size_t)(n.e.size - position);
         uint8_t row[MAX_ROW], bytes[CELL] = {0}; int found; key k = number_key(position / CELL);
@@ -1108,13 +1386,16 @@ enum sfs_status sfs_image_read(sfs_image *h, sfs_view view, sfs_inode id, uint64
     return touched_result(&r, e, result_out);
 }
 
-enum sfs_status sfs_image_readlink(sfs_image *h, sfs_view view, sfs_inode id, void *target, size_t capacity, size_t *read_count, sfs_result *result_out) {
-    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+enum sfs_status sfs_image_read(sfs_image *h, sfs_view v, sfs_inode id, uint64_t offset, void *data, size_t size, size_t *count, sfs_result *r) { return read_target(h, v, id, NULL, offset, data, size, count, r); }
+enum sfs_status sfs_image_pin_read(sfs_image *h, sfs_pin pin, uint64_t offset, void *data, size_t size, size_t *count, sfs_result *r) { return read_target(h, 0, 0, &pin, offset, data, size, count, r); }
+static enum sfs_status readlink_target(sfs_image *h, sfs_view view, sfs_inode id, const sfs_pin *pin, void *target, size_t capacity, size_t *read_count, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out); if (e) return e;
     if (!read_count || (capacity && !target)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *read_count = 0;
     if (!symlink_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
     reader r = current_reader(h, 0); namespace ns; node n;
-    e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n);
+    if (pin) { reference attrs; uint64_t next; e = pin_committed(&r, *pin, &n, &attrs, &next); }
+    else { e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n); }
     if (!e && n.e.kind != SFS_SYMLINK) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (!e && capacity < n.e.size) return result(h, SFS_LIMIT, SFS_PHASE_NONE, 0, result_out);
     uint8_t *bytes = NULL;
@@ -1123,28 +1404,40 @@ enum sfs_status sfs_image_readlink(sfs_image *h, sfs_view view, sfs_inode id, vo
     if (!e) { memcpy(target, bytes, (size_t)n.e.size); *read_count = (size_t)n.e.size; }
     free(bytes); return touched_result(&r, e, result_out);
 }
+enum sfs_status sfs_image_readlink(sfs_image *h, sfs_view v, sfs_inode id, void *data, size_t size, size_t *count, sfs_result *r) { return readlink_target(h, v, id, NULL, data, size, count, r); }
+enum sfs_status sfs_image_pin_readlink(sfs_image *h, sfs_pin pin, void *data, size_t size, size_t *count, sfs_result *r) { return readlink_target(h, 0, 0, &pin, data, size, count, r); }
 
 static enum sfs_status xattr_get(reader *r, const namespace *ns, sfs_inode id, const void *name, size_t length, uint8_t row[MAX_ROW]) {
     node owner; enum sfs_status e = node_get(r, ns, id, 1, &owner); if (e) return e;
     key k = name_key(id, name, length); int found;
     e = index_get(r, ns->xattrs, MAP_XATTR, ns->next_inode, UINT64_MAX, &k, row, &found); return e ? e : found ? SFS_OK : SFS_NOT_FOUND;
 }
-enum sfs_status sfs_image_xattr_size(sfs_image *h, sfs_view view, sfs_inode id, const void *name, size_t length, uint64_t *out, sfs_result *result_out) {
-    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+static enum sfs_status xattr_read_target(reader *r, sfs_view view, sfs_inode id, const sfs_pin *pin, const void *name, size_t length, uint8_t row[MAX_ROW]) {
+    namespace ns; enum sfs_status e;
+    if (!pin) { e = selected_namespace(r, view, &ns); return e ? e : xattr_get(r, &ns, id, name, length, row); }
+    node n; reference attrs; uint64_t next; e = pin_committed(r, *pin, &n, &attrs, &next); if (e) return e;
+    key k = name_key(n.e.inode, name, length); int found;
+    e = index_get(r, attrs, MAP_XATTR, next, UINT64_MAX, &k, row, &found);
+    return e ? e : found ? SFS_OK : SFS_NOT_FOUND;
+}
+static enum sfs_status xattr_size_target(sfs_image *h, sfs_view view, sfs_inode id, const sfs_pin *pin, const void *name, size_t length, uint64_t *out, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out); if (e) return e;
     if (!out || !valid_xattr_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
-    reader r = current_reader(h, 0); namespace ns; uint8_t row[MAX_ROW];
-    e = selected_namespace(&r, view, &ns); if (!e) e = xattr_get(&r, &ns, id, name, length, row);
+    reader r = current_reader(h, 0); uint8_t row[MAX_ROW];
+    e = xattr_read_target(&r, view, id, pin, name, length, row);
     if (!e) *out = get64(row + 272); return touched_result(&r, e, result_out);
 }
-enum sfs_status sfs_image_read_xattr(sfs_image *h, sfs_view view, sfs_inode id, const void *name, size_t length, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
-    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; uint64_t end;
+enum sfs_status sfs_image_xattr_size(sfs_image *h, sfs_view v, sfs_inode id, const void *n, size_t len, uint64_t *out, sfs_result *r) { return xattr_size_target(h, v, id, NULL, n, len, out, r); }
+enum sfs_status sfs_image_pin_xattr_size(sfs_image *h, sfs_pin pin, const void *n, size_t len, uint64_t *out, sfs_result *r) { return xattr_size_target(h, 0, 0, &pin, n, len, out, r); }
+static enum sfs_status read_xattr_target(sfs_image *h, sfs_view view, sfs_inode id, const sfs_pin *pin, const void *name, size_t length, uint64_t offset, void *data, size_t capacity, size_t *read_count, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out); if (e) return e; uint64_t end;
     if (!read_count || (capacity && !data) || !valid_xattr_name(name, length) || !add64(offset, capacity, &end)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out); *read_count = 0;
     if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
-    reader r = current_reader(h, 0); namespace ns; uint8_t row[MAX_ROW]; reference extent;
-    e = selected_namespace(&r, view, &ns); if (!e) e = xattr_get(&r, &ns, id, name, length, row); if (e) return touched_result(&r, e, result_out);
+    reader r = current_reader(h, 0); uint8_t row[MAX_ROW]; reference extent;
+    e = xattr_read_target(&r, view, id, pin, name, length, row); if (e) return touched_result(&r, e, result_out);
     uint64_t size = get64(row + 272); if (!decode_ref(row + 280, &extent)) return touched_result(&r, SFS_CORRUPT, result_out);
     if (end > size) end = size;
     while (offset < end) {
@@ -1158,14 +1451,18 @@ enum sfs_status sfs_image_read_xattr(sfs_image *h, sfs_view view, sfs_inode id, 
     }
     return touched_result(&r, e, result_out);
 }
-enum sfs_status sfs_image_next_xattr(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode owner, const void *after_name, size_t after_length, sfs_xattr_entry *out, int *found, sfs_result *result_out) {
-    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+enum sfs_status sfs_image_read_xattr(sfs_image *h, sfs_view v, sfs_inode id, const void *n, size_t len, uint64_t offset, void *data, size_t size, size_t *count, sfs_result *r) { return read_xattr_target(h, v, id, NULL, n, len, offset, data, size, count, r); }
+enum sfs_status sfs_image_pin_read_xattr(sfs_image *h, sfs_pin pin, const void *n, size_t len, uint64_t offset, void *data, size_t size, size_t *count, sfs_result *r) { return read_xattr_target(h, 0, 0, &pin, n, len, offset, data, size, count, r); }
+static enum sfs_status next_xattr_target(sfs_image *h, sfs_view view, uint64_t expected_generation, const uint8_t expected_root_digest[32], sfs_inode owner, const sfs_pin *pin, const void *after_name, size_t after_length, sfs_xattr_entry *out, int *found, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out); if (e) return e;
     if (!out || !found || !expected_root_digest || !expected_generation || (after_name || after_length ? !valid_xattr_name(after_name, after_length) : 0)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     if (expected_generation != h->current.generation || memcmp(expected_root_digest, h->current.root.digest, 32)) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
-    reader r = current_reader(h, 0); namespace ns; node n; cursor c; uint8_t row[MAX_ROW]; int present = 0; key k = name_key(owner, after_name, after_length);
-    e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, owner, 1, &n);
+    reader r = current_reader(h, 0); namespace ns = {0}; node n; cursor c; uint8_t row[MAX_ROW]; int present = 0;
+    if (pin) { e = pin_committed(&r, *pin, &n, &ns.xattrs, &ns.next_inode); if (!e) owner = n.e.inode; }
+    else { e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, owner, 1, &n); }
+    key k = name_key(owner, after_name, after_length);
     if (!e) e = cursor_start(&c, &r, ns.xattrs, MAP_XATTR, ns.next_inode, UINT64_MAX, &k);
     if (!e) e = cursor_next(&c, row, &present);
     if (!e && present && after_length) { key actual = row_key(row, MAP_XATTR, 0); if (!keycmp(&actual, &k)) e = cursor_next(&c, row, &present); }
@@ -1173,16 +1470,28 @@ enum sfs_status sfs_image_next_xattr(sfs_image *h, sfs_view view, uint64_t expec
     return touched_result(&r, e, result_out);
 }
 
+enum sfs_status sfs_image_next_xattr(sfs_image *h, sfs_view v, uint64_t generation, const uint8_t digest[32], sfs_inode id, const void *n, size_t len, sfs_xattr_entry *out, int *found, sfs_result *r) { return next_xattr_target(h, v, generation, digest, id, NULL, n, len, out, found, r); }
+enum sfs_status sfs_image_pin_next_xattr(sfs_image *h, sfs_pin pin, uint64_t generation, const uint8_t digest[32], const void *n, size_t len, sfs_xattr_entry *out, int *found, sfs_result *r) { return next_xattr_target(h, 0, generation, digest, 0, &pin, n, len, out, found, r); }
 static enum sfs_status index_height(reader *r, reference ref, unsigned map, uint64_t next, uint64_t eof, unsigned *height) {
     *height = 0; if (!ref.type) return SFS_OK; const uint8_t *b; enum sfs_status e = root_page(r, &ref, map, next, eof, &b); if (!e) *height = page_level(b) + 1; return e;
 }
 static enum sfs_status batch_cost(reader *r, uint64_t *cost) {
-    *cost = 0; if (!r->h->batch) return SFS_OK; unsigned hi; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, r->h->staged.ns.name_count, &hi); if (e) return e;
+    *cost = 0; if (!r->h->batch) return SFS_OK;
+    if (r->h->batch->detached) { *cost = pending_cells(&r->h->batch->extent); return SFS_OK; }
+    unsigned hi; enum sfs_status e = index_height(r, r->h->staged.ns.inodes, MAP_INODE, r->h->staged.ns.next_inode, r->h->staged.ns.name_count, &hi); if (e) return e;
     *cost = pending_cells(&r->h->batch->extent) + hi + 1; return SFS_OK;
 }
 static enum sfs_status flush_batch(reader *r, int *wrote) {
     sfs_image *h = r->h; if (!h->batch) return SFS_OK; batch *b = h->batch;
     uint64_t liability; enum sfs_status e = batch_cost(r, &liability); if (e) return e; if (!reserve_cells(h, liability + 1)) return SFS_LIMIT;
+    if (b->detached) {
+        if (b->detached->incarnation != b->incarnation || pin_pending_state(b->detached) != PIN_DETACHED || b->detached->id != b->inode.e.inode) return SFS_CORRUPT;
+        uint64_t remaining = liability; reference extent; b->extent.reader = r;
+        if (remaining) *wrote = 1; r->phase = SFS_PHASE_RECORDS;
+        e = seal_tree(&b->extent, &extent, &remaining); if (e) { if (e == SFS_IO) r->error = errno; return e; }
+        if (remaining) return SFS_CORRUPT; b->inode.extent = extent; target_store(r, b->detached, &b->inode);
+        arena_free(b->arena); free(b); h->batch = NULL; r->a.end = h->eof; r->phase = SFS_PHASE_READ; return SFS_OK;
+    }
     arena *a = arena_new(h, b->number); if (!a) return SFS_NOMEM;
     tree inodes = make_tree(a, r, h->staged.ns.inodes, MAP_INODE, 0, h->staged.ns.next_inode, h->staged.ns.name_count); uint8_t row[MAX_ROW]; encode_node(row, &b->inode, r->a.minor);
     e = tree_put(&inodes, row); if (e) { arena_free(a); return e; }
@@ -1207,7 +1516,11 @@ static enum sfs_status prepare_metadata(reader *r, unsigned inode_keys, unsigned
 }
 static enum sfs_status mutation_start(sfs_image *h, sfs_result *out) {
     enum sfs_status e = ready(h, 1, 1, out); if (e) return e;
+    /* Remaining LIMIT sites in these mutators are arithmetic/tree bounds;
+     * reserve_cells and explicit file bounds replace this reason at origin. */
+    h->limit_reason = SFS_LIMIT_STRUCTURE;
     if (h->batch && (h->batch->arena != h->batch->extent.arena || h->batch->arena->epoch != h->epoch || h->batch->arena->batch != h->batch->number || !same_ref(&h->batch->arena->lineage, &h->staged.ns.ref) || h->batch->extent.owner != h->batch->inode.e.inode || h->batch->extent.map != MAP_EXTENT)) return mutation_failure(h, SFS_CORRUPT, SFS_PHASE_VALIDATE, 0, 0, out);
+    if (h->batch && h->batch->detached && (h->batch->detached->incarnation != h->batch->incarnation || pin_pending_state(h->batch->detached) != PIN_DETACHED || h->batch->detached->id != h->batch->inode.e.inode)) return mutation_failure(h, SFS_CORRUPT, SFS_PHASE_VALIDATE, 0, 0, out);
     if (stable(h)) return mutation_failure(h, SFS_IO, SFS_PHASE_IDENTITY, errno, 0, out); return SFS_OK;
 }
 static enum sfs_status input_name(sfs_image *h, const void *name, size_t length, sfs_result *out) {
@@ -1230,11 +1543,18 @@ static enum sfs_status write_metadata_trees(reader *r, tree *inodes, tree *names
 }
 enum sfs_status sfs_image_begin(sfs_image *h, sfs_result *out) {
     enum sfs_status e = ready(h, 1, 0, out); if (e) return e; if (h->transaction) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    h->limit_reason = SFS_LIMIT_STRUCTURE;
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
     if (h->current.generation == UINT64_MAX || h->epoch == UINT64_MAX || !reserve_cells(h, 1)) return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, out);
     h->staged = h->live; h->transaction = 1; h->epoch++; return result(h, SFS_OK, SFS_PHASE_NONE, 0, out);
 }
 enum sfs_status sfs_image_abort(sfs_image *h, sfs_result *out) { enum sfs_status e = ready(h, 1, 1, out); if (e) return e; discard(h); return result(h, SFS_OK, SFS_PHASE_NONE, 0, out); }
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+void sfs_image_diagnostic_counters(sfs_image *h, uint64_t epoch, uint64_t token) {
+    if (h && !h->transaction) { h->epoch = epoch; h->token = token; }
+}
+void sfs_image_diagnostic_capacity(sfs_image *h, uint64_t capacity) { if (h) h->diagnostic_capacity = capacity; }
+#endif
 /* Probe the exact metadata edit before a pending batch can consume append space. */
 static enum sfs_status probe_metadata(reader *r, unsigned operation, const node *before, const node *after) {
     if (!r->h->batch) return SFS_OK;
@@ -1463,7 +1783,18 @@ static enum sfs_status name_mutation(sfs_image *h, unsigned operation, sfs_inode
     if (after->nlink) {
         if (after->nlink > 1) { e = reverse_first(&r, &edit->ns, after, row); if (e) goto failed; entry_name(after, row); if (after->nlink == 2) { e = reverse_pair(&r, &edit->ns, after, NULL, NULL); if (e) goto failed; } }
         key representative = name_key(after->e.parent, after->e.name, after->e.name_length); e = name_member(&r, &edit->ns, after, &representative); if (e) goto failed;
-    } else if (attrs) { e = remove_owner_xattrs(&r, &edit->ns, existing, attrs, ab, &late); if (e) goto failed; }
+    } else {
+        pin_slot *pin = pin_find(h, existing);
+        if (pin) {
+            if (pin_pending_state(pin) != PIN_LINKED) { e = SFS_CORRUPT; goto failed; }
+            pin_touch(h, pin); pin->pending = PIN_DETACHED;
+            pin->staged = (pin_descriptor){ .inode = *after, .xattrs = edit->ns.xattrs,
+                .next_inode = edit->base_next, .end = h->eof, .generation = r.a.generation };
+            /* The name removal has sealed; any subsequent failure discards Q. */
+            late = 1;
+        }
+        if (attrs) { e = remove_owner_xattrs(&r, &edit->ns, existing, attrs, ab, &late); if (e) goto failed; }
+    }
     /* Parents precede final owner deletion; each replacement has its own arena. */
     for (unsigned phase = 0; phase < edit->count; ++phase) {
         unsigned i = phase + 1 == edit->count ? 0 : phase + 1;
@@ -1487,6 +1818,52 @@ failed:
 enum sfs_status sfs_image_link(sfs_image *h, sfs_inode existing, sfs_inode parent, const void *name, size_t length, sfs_result *out) { return name_mutation(h, NAME_LINK, existing, 0, NULL, 0, parent, name, length, out); }
 enum sfs_status sfs_image_unlink(sfs_image *h, sfs_inode parent, const void *name, size_t length, sfs_result *out) { return name_mutation(h, NAME_UNLINK, 0, parent, name, length, 0, NULL, 0, out); }
 enum sfs_status sfs_image_rename_entry(sfs_image *h, sfs_inode old_parent, const void *old_name, size_t old_length, sfs_inode new_parent, const void *new_name, size_t new_length, sfs_result *out) { return name_mutation(h, NAME_RENAME, 0, old_parent, old_name, old_length, new_parent, new_name, new_length, out); }
+static enum sfs_status staged_name(reader *r, sfs_inode parent, const void *name, size_t length, node *out) {
+    namespace *ns = &r->h->staged.ns; enum sfs_status e = directory_check(r, ns, parent); if (e) return e;
+    key k = name_key(parent, name, length); uint8_t row[MAX_ROW]; int found;
+    e = index_get(r, ns->names, MAP_NAME, ns->next_inode, UINT64_MAX, &k, row, &found); if (e) return e;
+    if (!found) return SFS_NOT_FOUND;
+    e = node_get(r, ns, get64(row + 267), 1, out); if (e == SFS_NOT_FOUND) e = SFS_CORRUPT;
+    return e ? e : name_member(r, ns, out, &k);
+}
+enum sfs_status sfs_image_unlink_expected(sfs_image *h, sfs_inode parent, const void *name, size_t length, sfs_inode expected, sfs_result *out) {
+    enum sfs_status e = pin_gate(h, 1, 1, out); if (e) return e;
+    if (!expected || !valid_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    e = mutation_start(h, out); if (e) return e; reader r = current_reader(h, 1); node n;
+    e = staged_name(&r, parent, name, length, &n);
+    if (!e && n.e.inode != expected) e = SFS_STATE;
+    if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+    return name_mutation(h, NAME_UNLINK, 0, parent, name, length, 0, NULL, 0, out);
+}
+enum sfs_status sfs_image_rename_replace(sfs_image *h, sfs_inode old_parent, const void *old_name, size_t old_length, sfs_inode expected_source, sfs_inode new_parent, const void *new_name, size_t new_length, sfs_inode expected_destination, sfs_result *out) {
+    enum sfs_status e = pin_gate(h, 1, 1, out); if (e) return e;
+    if (!expected_source || !valid_name(old_name, old_length) || !valid_name(new_name, new_length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    e = mutation_start(h, out); if (e) return e; reader r = current_reader(h, 1); node source, destination;
+    e = staged_name(&r, old_parent, old_name, old_length, &source);
+    if (!e && source.e.inode != expected_source) e = SFS_STATE;
+    if (!e) e = directory_check(&r, &h->staged.ns, new_parent);
+    if (!e) e = parent_chain(&r, &h->staged.ns, new_parent, source.e.kind == SFS_DIRECTORY ? source.e.inode : 0);
+    if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+    e = staged_name(&r, new_parent, new_name, new_length, &destination);
+    if (e == SFS_NOT_FOUND) { if (expected_destination) e = SFS_STATE; else e = SFS_OK; }
+    else if (!e && destination.e.inode != expected_destination) e = SFS_STATE;
+    if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+    if (expected_destination && expected_source == expected_destination) { result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK; }
+    if (expected_destination) {
+        if ((source.e.kind == SFS_DIRECTORY) != (destination.e.kind == SFS_DIRECTORY) || destination.e.inode == 1) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+        if (destination.e.kind == SFS_DIRECTORY) {
+            cursor c; uint8_t row[MAX_ROW]; int found; key k = name_key(destination.e.inode, NULL, 0);
+            e = cursor_start(&c, &r, h->staged.ns.names, MAP_NAME, h->staged.ns.next_inode, UINT64_MAX, &k);
+            if (!e) e = cursor_next(&c, row, &found);
+            if (!e && found && get64(row) == destination.e.inode) e = SFS_STATE;
+            if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+        }
+        e = name_mutation(h, NAME_UNLINK, 0, new_parent, new_name, new_length, 0, NULL, 0, out); if (e) return e;
+    }
+    sfs_result receipt; e = name_mutation(h, NAME_RENAME, 0, old_parent, old_name, old_length, new_parent, new_name, new_length, &receipt);
+    if (e && expected_destination) discard(h);
+    result(h, e, receipt.phase, receipt.system_errno, out); if (!e && out) out->coverage = SFS_COVERAGE_TOUCHED; return e;
+}
 
 static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_inode id, sfs_inode parent, const void *name, size_t length, enum sfs_kind kind, const sfs_metadata_initial *initial, int supplied, const sfs_metadata_update *update, const void *target, size_t target_length, sfs_inode *out, sfs_result *result_out) {
     enum sfs_status e = mutation_start(h, result_out); if (e) return e;
@@ -1499,7 +1876,7 @@ static enum sfs_status metadata_mutation(sfs_image *h, unsigned operation, sfs_i
     if (link ? !symlink_capable(h->current.minor) : !metadata_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     reader r = current_reader(h, 1); metadata_edit edit = {0}; edit.ns = h->staged.ns; edit.base_root = edit.ns.attributes; edit.base_count = edit.ns.count; edit.base_next = edit.ns.next_inode; edit.base_names = edit.ns.name_count; edit.count = 1;
     arena *a = NULL; uint8_t *link_bytes = NULL; reference link_raw = {0}; int late = 0; uint64_t xattr_count = 0, xattr_bound = 0, remove_total = 0, remove_start = 0; node *old = &edit.before[0], *next = &edit.after[0];
-    if (operation != EDIT_ADD) { if (h->batch && h->batch->inode.e.inode == id) *old = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, old); if (e) goto failed; } *next = *old; }
+    if (operation != EDIT_ADD) { if (h->batch && !h->batch->detached && h->batch->inode.e.inode == id) *old = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, old); if (e) goto failed; } *next = *old; }
     if (operation == EDIT_ADD || operation == EDIT_RENAME) { e = directory_check(&r, &h->staged.ns, parent); if (!e) e = parent_chain(&r, &h->staged.ns, parent, operation == EDIT_RENAME ? id : 0); if (!e) e = name_absent(&r, &h->staged.ns, parent, name, length, operation == EDIT_RENAME ? id : 0); if (e) goto failed; }
     if (operation == EDIT_REMOVE && old->e.kind == SFS_DIRECTORY) { key prefix = name_key(id, NULL, 0); cursor c; e = cursor_start(&c, &r, edit.ns.names, MAP_NAME, edit.ns.next_inode, UINT64_MAX, &prefix); uint8_t row[MAX_ROW]; int found; if (!e) { e = cursor_next(&c, row, &found); if (!e && found && get64(row) == id) e = SFS_STATE; } if (e) goto failed; }
     if (operation == EDIT_RENAME && old->e.parent == parent && old->e.name_length == length && !memcmp(old->e.name, name, length)) return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out);
@@ -1660,14 +2037,15 @@ static enum sfs_status tree_growth(tree *t, uint64_t old_size) {
     if (last == boundary) { uint8_t row[MAX_ROW]; int found; key k = number_key(boundary); e = tree_get(t, &k, row, &found); if (e) return e; if (!found || get16(row + 64) > old_size % CELL) return SFS_CORRUPT; }
     return SFS_OK;
 }
-enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, const void *data, size_t length, sfs_result *result_out) {
+static enum sfs_status write_target(sfs_image *h, mutation_target target, uint64_t offset, const void *data, size_t length, sfs_result *result_out) {
+    sfs_inode id = target.id;
     enum sfs_status e = mutation_start(h, result_out); if (e) return e;
     if ((length && !data) || length > 65536) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     uint64_t end;
-    reader r = current_reader(h, 1); node n; unsigned transition_height = 0; uint64_t transition_bound = 0; int same = h->batch && h->batch->inode.e.inode == id, late = 0; arena *a = NULL; batch *candidate = NULL; uint8_t *merge = NULL; tree ext;
-    if (same) n = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed; }
+    reader r = current_reader(h, 1); node n; unsigned transition_height = 0; uint64_t transition_bound = 0; int same = target_same(h->batch, target), late = 0; arena *a = NULL; batch *candidate = NULL; uint8_t *merge = NULL; tree ext;
+    if (same) n = h->batch->inode; else { e = target_get(&r, target, &n); if (e) goto failed; }
     if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; }
-    if (!add64(offset, length, &end) || end > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
+    if (!add64(offset, length, &end) || end > SFS_FILE_MAX) { h->limit_reason = SFS_LIMIT_FILE_SIZE; e = SFS_LIMIT; goto failed; }
     if (!length) return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out);
     sfs_timestamp operation_time = {0}; if (metadata_capable(h->current.minor)) { int error; e = clock_sample(&operation_time, &error); if (e) return result(h, e, SFS_PHASE_NONE, error, result_out); }
     uint64_t extent_count = n.attributes.extents;
@@ -1686,7 +2064,7 @@ enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, con
         memcpy(merge + i * CELL + (size_t)(begin - base), (const uint8_t *)data + (size_t)(begin - offset), (size_t)(finish - begin));
     }
     if (metadata_capable(h->current.minor) && extent_count > new_size / CELL + !!(new_size % CELL)) { e = SFS_CORRUPT; goto failed; }
-    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
+    unsigned hi = 0; if (!target.detached) e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
     if (rollover) {
         unsigned he; if (same) { e = tree_root(&ext); if (e) goto failed; he = page_level(owned_page(&ext, (unsigned)ext.root)->bytes) + 1; }
         else { e = index_height(&r, n.extent, MAP_EXTENT, UINT64_MAX, n.e.size, &he); if (e) goto failed; }
@@ -1702,7 +2080,7 @@ enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, con
         }
         transition_height = page_level(owned_page(&ext, (unsigned)ext.root)->bytes) + 1;
         arena_free(a); a = NULL; e = flush_batch(&r, &late); if (e) goto failed;
-        e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed; same = 0; next_low = low; next_high = high;
+        e = target_get(&r, target, &n); if (e) goto failed; same = 0; next_low = low; next_high = high;
     }
     if (!a) { a = arena_new(h, h->token + 1); if (!a) { e = SFS_NOMEM; goto failed; } ext = make_tree(a, &r, n.extent, MAP_EXTENT, id, UINT64_MAX, n.e.size); }
     candidate = calloc(1, sizeof(*candidate)); if (!candidate) { e = SFS_NOMEM; goto failed; }
@@ -1719,10 +2097,15 @@ enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, con
     for (unsigned i = 0; i < count; ++i) { reference appended; e = append_prepared(h, RAW, merge + i * CELL, &appended, &remaining, &refs[i]); if (e) { if (e == SFS_IO) r.error = errno; goto failed; } }
     if (metadata_capable(h->current.minor)) { n.attributes.extents = extent_count; n.attributes.modification = n.attributes.change = operation_time; }
     n.e.size = new_size; candidate->arena = a; candidate->extent = ext; candidate->extent.reader = NULL; candidate->inode = n; candidate->low = next_low; candidate->high = next_high; candidate->number = a->batch;
+    candidate->detached = target.detached; candidate->incarnation = target.detached ? target.detached->incarnation : 0;
     if (h->batch) { arena_free(h->batch->arena); free(h->batch); } h->batch = candidate; free(merge);
     result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 failed:
     arena_free(a); free(candidate); free(merge); return mutation_failure(h, e, r.phase, r.error, late, result_out);
+}
+enum sfs_status sfs_image_write(sfs_image *h, sfs_inode id, uint64_t offset, const void *data, size_t length, sfs_result *r) { return write_target(h, (mutation_target){id, NULL}, offset, data, length, r); }
+enum sfs_status sfs_image_pin_write(sfs_image *h, sfs_pin pin, uint64_t offset, const void *data, size_t length, sfs_result *r) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, pin, &target, r); return e ? e : write_target(h, target, offset, data, length, r);
 }
 
 typedef struct { int shadow; reference ref; uint64_t before; context context; unsigned index; } extent_frame;
@@ -1769,22 +2152,26 @@ static void encode_xattr(uint8_t row[MAX_ROW], sfs_inode owner, const void *name
     memset(row, 0, MAX_ROW); put64(row, owner); put32(row + 8, (uint32_t)name_length); memcpy(row + 12, name, name_length);
     put64(row + 272, size); encode_ref(row + 280, &extent); put64(row + 336, dense_count(size));
 }
-static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *name, size_t name_length, const void *value, size_t length, int remove, sfs_result *result_out) {
+static enum sfs_status xattr_mutation(sfs_image *h, mutation_target target, const void *name, size_t name_length, const void *value, size_t length, int remove, sfs_result *result_out) {
+    sfs_inode id = target.id;
     enum sfs_status e = ready(h, 1, 1, result_out); if (e) return e;
     if (!valid_xattr_name(name, name_length) || (!remove && length && !value)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (!xattr_capable(h->current.minor)) return result(h, SFS_UNSUPPORTED, SFS_PHASE_NONE, 0, result_out);
     e = mutation_start(h, result_out); if (e) return e;
     reader r = current_reader(h, 1); namespace ns = h->staged.ns; node before, owner;
+    pin_descriptor *descriptor = target.detached ? pin_pending_descriptor(target.detached) : NULL;
+    reference attr_source = descriptor ? descriptor->xattrs : ns.xattrs;
+    uint64_t attr_next = descriptor ? descriptor->next_inode : ns.next_inode;
     arena *a = NULL; prefix_builder *builder = NULL; int late = 0, found; uint8_t row[MAX_ROW];
     key k = name_key(id, name, name_length);
-    if (h->batch && h->batch->inode.e.inode == id) before = h->batch->inode;
-    else { e = node_get(&r, &ns, id, 1, &before); if (e) goto failed; }
-    e = index_get(&r, ns.xattrs, MAP_XATTR, ns.next_inode, UINT64_MAX, &k, row, &found); if (e) goto failed;
+    if (target_same(h->batch, target)) before = h->batch->inode;
+    else { e = target_get(&r, target, &before); if (e) goto failed; }
+    e = index_get(&r, attr_source, MAP_XATTR, attr_next, UINT64_MAX, &k, row, &found); if (e) goto failed;
     if (remove && !found) { e = SFS_NOT_FOUND; goto failed; }
     if (length > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
     unsigned hi, ha, levels; uint64_t pages[MAX_HEIGHT] = {0}, page_total, count = remove ? 0 : dense_count(length), old_cost;
-    e = index_height(&r, ns.inodes, MAP_INODE, ns.next_inode, ns.name_count, &hi);
-    if (!e) e = index_height(&r, ns.xattrs, MAP_XATTR, ns.next_inode, UINT64_MAX, &ha);
+    hi = 0; if (!target.detached) e = index_height(&r, ns.inodes, MAP_INODE, ns.next_inode, ns.name_count, &hi);
+    if (!e) e = index_height(&r, attr_source, MAP_XATTR, attr_next, UINT64_MAX, &ha);
     if (!e) e = prefix_shape(count, pages, &levels, &page_total);
     if (!e) e = batch_cost(&r, &old_cost); if (e) goto failed;
     uint64_t attr_bound = remove ? 3u * ha + 3u : found ? ha : 3u * (ha < MAX_HEIGHT ? ha + 1 : ha) + 3u;
@@ -1796,20 +2183,20 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
         for (unsigned i = 1; i < levels; ++i) builder->input[i] = pages[i - 1];
     }
     a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
-    tree attrs = make_tree(a, &r, ns.xattrs, MAP_XATTR, 0, ns.next_inode, UINT64_MAX);
+    tree attrs = make_tree(a, &r, attr_source, MAP_XATTR, 0, attr_next, UINT64_MAX);
     /* A structural probe only: this placeholder is never sealed or read. */
     reference extent = count ? (reference){ .type = INDEX, .length = CELL } : (reference){0};
     if (remove) e = tree_delete(&attrs, &k);
     else { encode_xattr(row, id, name, name_length, length, extent); e = tree_put(&attrs, row); }
     if (!e && pending_cells(&attrs) > attr_bound) e = SFS_CORRUPT;
     tree inodes = make_tree(a, &r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count);
-    if (!e && id != 1) { encode_node(row, &before, h->current.minor); e = tree_put(&inodes, row); if (!e && pending_cells(&inodes) > inode_bound) e = SFS_CORRUPT; }
+    if (!e && id != 1 && !target.detached) { encode_node(row, &before, h->current.minor); e = tree_put(&inodes, row); if (!e && pending_cells(&inodes) > inode_bound) e = SFS_CORRUPT; }
     arena_free(a); a = NULL; if (e) goto failed;
     sfs_timestamp t; int clock_error; e = clock_sample(&t, &clock_error);
     if (e) { free(builder); return result(h, e, SFS_PHASE_NONE, clock_error, result_out); }
     e = flush_batch(&r, &late); if (e) goto failed;
     if ((old_cost && (h->eof < start || (h->eof - start) / CELL > old_cost)) || h->staged.ns.count != ns.count || h->staged.ns.name_count != ns.name_count || h->staged.ns.next_inode != ns.next_inode || !same_attributes(&h->staged.ns.attributes, &ns.attributes) || !same_ref(&h->staged.ns.xattrs, &ns.xattrs)) { e = SFS_CORRUPT; goto failed; }
-    e = node_get(&r, &h->staged.ns, id, 1, &owner); if (e) goto failed;
+    e = target_get(&r, target, &owner); if (e) goto failed;
     if (!same_logical_node(&owner, &before)) { e = SFS_CORRUPT; goto failed; }
     ns = h->staged.ns; owner.attributes.change = t; extent = (reference){0};
     if (count) {
@@ -1827,13 +2214,21 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
     }
     free(builder); builder = NULL; r.a.end = h->eof; r.phase = SFS_PHASE_READ;
     a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
-    attrs = make_tree(a, &r, ns.xattrs, MAP_XATTR, 0, ns.next_inode, UINT64_MAX);
+    attrs = make_tree(a, &r, attr_source, MAP_XATTR, 0, attr_next, UINT64_MAX);
     if (remove) e = tree_delete(&attrs, &k);
     else { encode_xattr(row, id, name, name_length, length, extent); e = tree_put(&attrs, row); }
     uint64_t remaining = pending_cells(&attrs); if (!e && remaining > attr_bound) e = SFS_CORRUPT;
-    if (!e) { if (remaining) late = 1; r.phase = SFS_PHASE_RECORDS; e = seal_tree(&attrs, &ns.xattrs, &remaining); if (e == SFS_IO) r.error = errno; }
+    reference changed_attrs;
+    if (!e) { if (remaining) late = 1; r.phase = SFS_PHASE_RECORDS; e = seal_tree(&attrs, &changed_attrs, &remaining); if (e == SFS_IO) r.error = errno; }
     arena_free(a); a = NULL; if (e) goto failed; if (remaining) { e = SFS_CORRUPT; goto failed; }
     r.a.end = h->eof; r.phase = SFS_PHASE_READ;
+    if (target.detached) {
+        if (h->eof < start || (h->eof - start) / CELL >= total) { e = SFS_CORRUPT; goto failed; }
+        target_store(&r, target.detached, &owner); target.detached->staged.xattrs = changed_attrs;
+        target.detached->staged.next_inode = attr_next;
+        result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+    }
+    ns.xattrs = changed_attrs;
     if (id == 1) ns.attributes = owner.attributes;
     else {
         a = arena_new(h, 0); if (!a) { e = SFS_NOMEM; goto failed; }
@@ -1848,21 +2243,29 @@ static enum sfs_status xattr_mutation(sfs_image *h, sfs_inode id, const void *na
 failed:
     free(builder); arena_free(a); return mutation_failure(h, e, r.phase, r.error, late, result_out);
 }
-enum sfs_status sfs_image_set_xattr(sfs_image *h, sfs_inode id, const void *name, size_t name_length, const void *value, size_t length, sfs_result *result_out) { return xattr_mutation(h, id, name, name_length, value, length, 0, result_out); }
-enum sfs_status sfs_image_remove_xattr(sfs_image *h, sfs_inode id, const void *name, size_t name_length, sfs_result *result_out) { return xattr_mutation(h, id, name, name_length, NULL, 0, 1, result_out); }
+enum sfs_status sfs_image_set_xattr(sfs_image *h, sfs_inode id, const void *name, size_t name_length, const void *value, size_t length, sfs_result *result_out) { return xattr_mutation(h, (mutation_target){id, NULL}, name, name_length, value, length, 0, result_out); }
+enum sfs_status sfs_image_remove_xattr(sfs_image *h, sfs_inode id, const void *name, size_t name_length, sfs_result *result_out) { return xattr_mutation(h, (mutation_target){id, NULL}, name, name_length, NULL, 0, 1, result_out); }
+enum sfs_status sfs_image_pin_set_xattr(sfs_image *h, sfs_pin pin, const void *name, size_t length, const void *value, size_t size, sfs_result *r) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, pin, &target, r); return e ? e : xattr_mutation(h, target, name, length, value, size, 0, r);
+}
+enum sfs_status sfs_image_pin_remove_xattr(sfs_image *h, sfs_pin pin, const void *name, size_t length, sfs_result *r) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, pin, &target, r); return e ? e : xattr_mutation(h, target, name, length, NULL, 0, 1, r);
+}
 
-static enum sfs_status replace_inode(reader *r, node *n, int *late) {
+static enum sfs_status replace_inode(reader *r, mutation_target target, node *n, int *late) {
+    if (target.detached) { if (!reserve_cells(r->h, 1)) return SFS_LIMIT; target_store(r, target.detached, n); return SFS_OK; }
     arena *a = arena_new(r->h, 0); if (!a) return SFS_NOMEM; namespace ns = r->h->staged.ns;
     tree inodes = make_tree(a, r, ns.inodes, MAP_INODE, 0, ns.next_inode, ns.name_count); uint8_t row[MAX_ROW]; encode_node(row, n, r->a.minor); enum sfs_status e = tree_put(&inodes, row); uint64_t remaining = pending_cells(&inodes) + 1;
     if (!e && !reserve_cells(r->h, remaining + 1)) e = SFS_LIMIT;
     if (!e) { *late = 1; r->phase = SFS_PHASE_RECORDS; e = seal_tree(&inodes, &ns.inodes, &remaining); if (!e) e = write_namespace(r->h, &ns, &remaining); if (e == SFS_IO) r->error = errno; }
     arena_free(a); if (!e && remaining) e = SFS_CORRUPT; if (!e) r->h->staged.ns = ns; return e;
 }
-enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_result *result_out) {
+static enum sfs_status resize_target(sfs_image *h, mutation_target target, uint64_t size, sfs_result *result_out) {
+    sfs_inode id = target.id;
     enum sfs_status e = mutation_start(h, result_out); if (e) return e;
-    reader r = current_reader(h, 1); node n; int same = h->batch && h->batch->inode.e.inode == id, late = 0; arena *guard = NULL; prefix_builder *builder = NULL;
-    if (same) n = h->batch->inode; else { e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed; }
-    if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; } if (size > SFS_FILE_MAX) { e = SFS_LIMIT; goto failed; }
+    reader r = current_reader(h, 1); node n; int same = target_same(h->batch, target), late = 0; arena *guard = NULL; prefix_builder *builder = NULL;
+    if (same) n = h->batch->inode; else { e = target_get(&r, target, &n); if (e) goto failed; }
+    if (id == 1) { e = SFS_NOT_FOUND; goto failed; } if (n.e.kind != SFS_FILE) { e = SFS_INVALID; goto failed; } if (size > SFS_FILE_MAX) { h->limit_reason = SFS_LIMIT_FILE_SIZE; e = SFS_LIMIT; goto failed; }
     uint64_t old_size = n.e.size, retained = 0, total = 0, pages[MAX_HEIGHT] = {0}; unsigned levels = 0, boundary = 0; uint8_t boundary_bytes[CELL], boundary_row[MAX_ROW];
     sfs_timestamp operation_time = {0}; if (metadata_capable(h->current.minor) && size != old_size) { int error; e = clock_sample(&operation_time, &error); if (e) return result(h, e, SFS_PHASE_NONE, error, result_out); }
     if (size > old_size) {
@@ -1878,11 +2281,11 @@ enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_
         if (retained) { builder = calloc(1, sizeof(*builder)); if (!builder) { e = SFS_NOMEM; goto failed; } builder->h = h; builder->generation = r.a.generation; builder->levels = levels; memcpy(builder->pages, pages, sizeof(pages)); builder->input[0] = retained; for (unsigned i = 1; i < levels; ++i) builder->input[i] = pages[i - 1]; }
     }
     if (metadata_capable(h->current.minor) && size < old_size && retained > n.attributes.extents) { e = SFS_CORRUPT; goto failed; }
-    unsigned hi; e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
+    unsigned hi = 0; if (!target.detached) e = index_height(&r, h->staged.ns.inodes, MAP_INODE, h->staged.ns.next_inode, h->staged.ns.name_count, &hi); if (e) goto failed;
     uint64_t old; e = batch_cost(&r, &old); if (e) goto failed;
     uint64_t required = old + (size == old_size ? 1 : total + boundary + hi + 2); if (!reserve_cells(h, required)) { e = SFS_LIMIT; goto failed; }
     e = flush_batch(&r, &late); if (e) goto failed; if (size == old_size) { free(builder); return result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); }
-    e = node_get(&r, &h->staged.ns, id, 1, &n); if (e) goto failed;
+    e = target_get(&r, target, &n); if (e) goto failed;
     if (size < old_size) {
         reference new_boundary = {0}; uint64_t remaining = total + boundary; r.phase = SFS_PHASE_RECORDS;
         if (boundary) { late = 1; e = append_cell(h, RAW, boundary_bytes, &new_boundary, &remaining); if (e) { if (e == SFS_IO) r.error = errno; goto failed; } }
@@ -1899,13 +2302,33 @@ enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_
         if (remaining) { e = SFS_CORRUPT; goto failed; }
     }
     if (metadata_capable(h->current.minor)) { if (size < old_size) n.attributes.extents = retained; n.attributes.modification = n.attributes.change = operation_time; }
-    n.e.size = size; e = replace_inode(&r, &n, &late); if (e) goto failed; free(builder); result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+    n.e.size = size; e = replace_inode(&r, target, &n, &late); if (e) goto failed; free(builder); result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 failed: arena_free(guard); free(builder); return mutation_failure(h, e, r.phase, r.error, late, result_out);
+}
+enum sfs_status sfs_image_resize(sfs_image *h, sfs_inode id, uint64_t size, sfs_result *r) { return resize_target(h, (mutation_target){id, NULL}, size, r); }
+enum sfs_status sfs_image_pin_resize(sfs_image *h, sfs_pin pin, uint64_t size, sfs_result *r) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, pin, &target, r); return e ? e : resize_target(h, target, size, r);
+}
+enum sfs_status sfs_image_pin_set_metadata(sfs_image *h, sfs_pin pin, const sfs_metadata_update *update, sfs_result *out) {
+    mutation_target target; enum sfs_status e = pin_mutation_target(h, pin, &target, out); if (e) return e;
+    if (!target.detached) return sfs_image_set_metadata(h, target.id, update, out);
+    e = mutation_start(h, out); if (e) return e; reader r = current_reader(h, 1); node n; int late = 0;
+    e = target_get(&r, target, &n); if (!e) e = update_valid(update, n.e.kind);
+    if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
+    if (!update->fields) return result(h, SFS_OK, SFS_PHASE_NONE, 0, out);
+    sfs_timestamp t; int error; e = clock_sample(&t, &error); if (e) return result(h, e, SFS_PHASE_NONE, error, out);
+    uint64_t pending; e = batch_cost(&r, &pending); if (!e && !reserve_cells(h, pending + 1)) e = SFS_LIMIT;
+    if (!e) e = flush_batch(&r, &late); if (!e) e = target_get(&r, target, &n);
+    if (!e) { update_attributes(&n.attributes, update, t); e = replace_inode(&r, target, &n, &late); }
+    if (e) return mutation_failure(h, e, r.phase, r.error, late, out);
+    result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
 }
 
 enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     enum sfs_status e = mutation_start(h, out); if (e) return e;
-    reader r = current_reader(h, 0); state fresh; cache_clear(h); e = reconcile(&r, &fresh);
+    if (h->pins) for (uint32_t i = h->pins->changed; i != PIN_NONE; i = h->pins->slots[i].next)
+        if (h->pins->slots[i].pending == PIN_RESERVED) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    reader r = current_reader(h, 0); state fresh; cache_invalidate(h); e = reconcile(&r, &fresh);
     if (!e && h->staged.ns.next_inode < fresh.ns.next_inode) e = SFS_CORRUPT;
     if (e) return mutation_failure(h, e, r.phase, r.error, 1, out);
     r = current_reader(h, 1); uint64_t pending; e = batch_cost(&r, &pending); if (!e && !reserve_cells(h, pending + 1)) e = SFS_LIMIT;
@@ -1915,9 +2338,13 @@ enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     uint64_t remaining = 1; e = append_cell(h, ROOT, b, &next.root, &remaining); if (e) return mutation_failure(h, e, SFS_PHASE_RECORDS, e == SFS_IO ? errno : 0, 1, out); next.end = h->eof;
     /* Finalize every reachable byte and the slot before the first fence. */
     encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
+    h->fence_attempted |= 1;
     if (fullsync(h->fd)) goto failed;
+    h->fence_succeeded |= 1;
     phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0; published = 1; if (write_exact(h->fd, b, CELL, slot * ALIGNMENT)) goto failed;
-    phase = SFS_PHASE_COMMIT_BARRIER; if (fullsync(h->fd)) goto failed;
+    phase = SFS_PHASE_COMMIT_BARRIER; h->fence_attempted |= 2; if (fullsync(h->fd)) goto failed;
+    h->fence_succeeded |= 2;
+    pins_promote(h);
     h->live = h->staged; memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; h->current = next; h->slots[slot] = next; h->slot_observed[slot] = 1; h->slot_status[slot] = SFS_OK;
     result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_ROOT_ONLY; return SFS_OK;
 failed: { int error = errno; discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out); }
