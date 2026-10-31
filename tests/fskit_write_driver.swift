@@ -1289,12 +1289,382 @@ func namespaceDeliveryGates(_ parent: URL) throws {
 }
 #endif
 
+#if STALLION_CONTEXT_HANDLERS
+func creationAttributes(_ mode: UInt32 = 0o600) -> FSItem.SetAttributesRequest {
+    let request = FSItem.SetAttributesRequest(); request.mode = mode; request.uid = geteuid(); request.gid = getegid(); return request
+}
+// Fresh real metadata fixtures, independent of the existing-file helper's operands.
+final class CreationMount {
+    let url: URL, volume: StallionVolume, resource: FSPathURLResource, coreHandle: OpaquePointer
+    let root: FSItem
+    var directory: FSItem?, returned: [FSItem] = []
+    init(_ parent: URL, _ name: String, capacity: UInt64 = 1024 * 1024, directory: Bool = false,
+         rootMode: UInt32 = 0o700, rootFlags: UInt32 = 0, rootOwner: uid_t = geteuid(), acl: Bool = false,
+         writable: Bool = true, enable: Bool = true, limit: Int = 4) throws {
+        fault(0,0); url = parent.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        var h: OpaquePointer?, r = sfs_result(), initial = sfs_metadata_initial(), inode: UInt64 = 0
+        initial.mode = UInt32(S_IFDIR) | rootMode; initial.uid = rootOwner; initial.gid = getegid(); initial.flags = rootFlags
+        need(sfs_image_create_metadata_version(url.path,"image.sfs",capacity,6,&initial,&h,&r) == SFS_OK,"creation fixture")
+        if directory || acl {
+            need(sfs_image_begin(h,&r) == SFS_OK,"creation fixture begin")
+            if directory {
+                initial.mode = UInt32(S_IFDIR) | 0o700; initial.uid = geteuid(); initial.flags = 0
+                need(sfs_image_add_metadata(h,1,"dir",3,SFS_DIRECTORY,&initial,&inode,&r) == SFS_OK,"existing creation parent")
+            }
+            if acl { need(sfs_image_set_xattr(h,1,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"creation parent ACL") }
+            need(sfs_image_commit(h,&r) == SFS_OK,"creation fixture commit")
+        }
+        let identity = uuid(r)
+        need(sfs_image_close(h,&r) == SFS_OK,"creation producer close")
+        let status = writable ? sfs_image_open(url.path,"image.sfs",&h,&r) : sfs_image_open_readonly(url.path,"image.sfs",&h,&r)
+        need(status == SFS_OK,"creation fixture open"); coreHandle = h!
+        resource = FSPathURLResource(url:url,writable:writable)
+        volume = StallionVolume(handle:h!,resource:resource,scope:false,anchor:r,queue:DispatchQueue(label:"sfs.create.test"),itemLimit:limit)
+        let v = volume
+        if writable && enable { try v.enableWriteDiagnostic(expectedUUID:identity) }
+        let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }
+        need(activation.1 == nil && activation.0 != nil,"create activation"); root = activation.0!
+        let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) }; need(mounted == nil,"create mount")
+        if directory { self.directory = lookup("dir"); returned.append(self.directory!) }
+    }
+    func serial(_ body: @escaping () -> Void) { let _: Bool = wait { done in volume.enqueue { body(); done(true) } } }
+    func lookup(_ name: String, parent: FSItem? = nil) -> FSItem {
+        let found: (FSItem?,Error?) = wait { done in volume.lookupItem(named:FSFileName(string:name),inDirectory:parent ?? root) { done(($0,$2)) } }
+        need(found.1 == nil && found.0 != nil,"created lookup error=\(code(found.1))"); return found.0!
+    }
+    func create(_ name: String = "new", request: FSItem.SetAttributesRequest? = nil, parent: FSItem? = nil,
+                type: FSItem.ItemType = .file, caller: CallerIdentity? = nil) -> (FSCreateItemResult?,Error?,StallionItem?) {
+        let a = request ?? creationAttributes(); var item: StallionItem?
+        var prior: ((String,StallionItem?) throws -> Void)?
+        serial {
+            prior = self.volume.createStageForTesting
+            self.volume.createStageForTesting = { stage,value in
+                if stage == "inserted" { item = value }
+                try prior?(stage,value)
+            }
+        }
+        let result: (FSCreateItemResult?,Error?) = wait { done in volume.createResultForTesting(FSFileName(string:name),type:type,
+            directory:parent ?? root,attributes:a,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        serial { self.volume.createStageForTesting = prior }
+        if result.0 != nil, let item { returned.append(item) }
+        return (result.0,result.1,result.0 == nil ? nil : item)
+    }
+    func metadata(_ item: FSItem) -> sfs_metadata_entry {
+        var m = sfs_metadata_entry()
+        serial { var r = sfs_result(); need(sfs_image_stat_metadata(self.coreHandle,0,(item as! StallionItem).inode,&m,&r) == SFS_OK,"created metadata") }
+        return m
+    }
+    func absent(_ name: String = "new") {
+        serial { var entry = sfs_entry(), r = sfs_result(); let bytes = Data(name.utf8)
+            need(bytes.withUnsafeBytes { sfs_image_lookup(self.coreHandle,0,1,$0.baseAddress,$0.count,&entry,&r) } == SFS_NOT_FOUND,"unpublished create absent")
+        }
+    }
+    func state(_ count: Int, cap: Int = 4) {
+        serial {
+            let state = self.volume.createStateForTesting
+            need(!state.pending && !state.quarantine && state.ticket == 0 && self.volume.activeItemCount() == count,"published/clean pending and map accounting")
+            // Count the remaining real slots without trusting an adapter counter.
+            var reservations: [sfs_pin] = [], r = sfs_result()
+            for _ in 0..<(cap - count) { var pin = sfs_pin(); need(sfs_image_pin_reserve(self.coreHandle,&pin,&r) == SFS_OK,"expected free pin slot"); reservations.append(pin) }
+            var extra = sfs_pin()
+            need(sfs_image_pin_reserve(self.coreHandle,&extra,&r) == SFS_LIMIT && r.limit_reason == SFS_LIMIT_PIN_RESOURCES,"exact live pin count")
+            for pin in reservations { need(sfs_image_pin_release(self.coreHandle,pin,&r) == SFS_OK,"release accounting probe reservation") }
+        }
+        let charge = volume.linkBudgetForTesting; need(charge.0 == 0 && charge.1 == 0,"create callback charge released")
+    }
+    func reclaim(_ item: FSItem) -> Error? { wait { volume.reclaimForTesting(item,eligible:true,replyHandler:$0) } }
+    func close() {
+        fault(0,0)
+        let _: Bool = wait { done in volume.unmount { done(true) } }
+        if volume.diagnosticWritable {
+            for item in returned {
+                var owned = false; serial { owned = self.volume.ownsForTesting(item) }
+                if owned { _ = reclaim(item) } // A terminal transaction can make memory release BUSY.
+            }
+            let _: Error? = wait { volume.deactivate(options:[],replyHandler:$0) }
+        }
+        serial { need(self.volume.unload().consumed,"creation consume-close"); need(!self.volume.createStateForTesting.pending,"close clears quarantine") }
+    }
+    func reopened(_ name: String = "new", parent: UInt64 = 1, inode: UInt64?, bytes expectedBytes: Data? = nil) {
+        fault(0,0); var h: OpaquePointer?, r = sfs_result(), entry = sfs_entry()
+        need(sfs_image_open_readonly(url.path,"image.sfs",&h,&r) == SFS_OK,"creation reopen")
+        let bytes = Data(name.utf8), status = bytes.withUnsafeBytes { sfs_image_lookup(h,0,parent,$0.baseAddress,$0.count,&entry,&r) }
+        if let inode { need(status == SFS_OK && entry.inode == inode,"durable created identity") }
+        else { need(status == SFS_NOT_FOUND,"reopened nonpublication") }
+        if let expectedBytes, let inode {
+            var bytes = Data(count:expectedBytes.count), count = 0
+            need(bytes.withUnsafeMutableBytes { sfs_image_read(h,0,inode,0,$0.baseAddress,$0.count,&count,&r) } == SFS_OK && count == expectedBytes.count && bytes == expectedBytes,"reopened created data")
+        }
+        need(sfs_image_close(h,&r) == SFS_OK,"creation reopened close")
+    }
+}
+func contextualCreates(_ parent: URL) throws {
+    let required = FSCreateItemResult.requestedAttributes.wantedAttributes
+#if STALLION_RESULT_MASK_TRACE
+    let raw = UInt(bitPattern:required.rawValue)
+    resultMaskTrace("FSCreateItemResult original=0x\(String(raw,radix:16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff),radix:16)) explicit=0x0")
+#endif
+    let m = try CreationMount(parent,"create-reuse",directory:true), v = m.volume
+    m.state(2)
+    var snapshots: [FSItem.Attributes] = [], committed = false, constructors = 0
+    m.serial {
+        v.createStageForTesting = { stage,item in if stage == "inserted" {
+            need(item != nil && v.createVisibilityForTesting(item!),"pending item hidden from both canonical return paths")
+        } }
+        v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { need(!committed,"create snapshot precommit"); snapshots.append(a) } }
+        v.rejectResultForTesting = { name in if name == "FSCreateItemResult" { need(snapshots.count == 2 && !committed,"real create constructor precommit"); constructors += 1 }; return false }
+        v.diagnosticBeforeCommit = { committed = true }
+    }
+    let a = creationAttributes(); a.size = 0; a.flags = 0
+    let first = m.create("first",request:a)
+    need(first.0 != nil && first.1 == nil && first.2 != nil,"actual create result error=\(code(first.1)) item=\(first.2 != nil) roles=\(snapshots.count) constructors=\(constructors) commitAttempted=\(v.createOutcomeForTesting.commitAttempted) committed=\(v.createOutcomeForTesting.commitSucceeded)")
+    need(a.consumedAttributes == [.mode,.uid,.gid,.size,.flags] && constructors == 1,"exact successful creation consumption")
+    let firstItem = first.2!, firstPin = firstItem.pin!, firstMetadata = m.metadata(firstItem), firstParent = m.metadata(m.root), retained = snapshots
+    checkPreparedAttributes(retained[0],firstMetadata,required:required); checkPreparedAttributes(retained[1],firstParent,required:required)
+    need(firstMetadata.mode == UInt32(S_IFREG) | 0o600 && firstMetadata.entry.size == 0 && firstMetadata.link_count == 1 && firstMetadata.uid == geteuid() && firstMetadata.gid == getegid() && firstMetadata.flags == 0,"truthful empty child")
+    m.state(3)
+    m.serial { v.diagnosticBeforeCommit = nil; v.rejectResultForTesting = nil; v.preparedAttributesForTesting = nil }
+    let linked: (FSCreateLinkResult?,Error?) = wait { done in v.linkResultForTesting(firstItem,name:FSFileName(string:"first-alias"),directory:m.root,
+        caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(linked.0 != nil && linked.1 == nil && m.lookup("first-alias") === firstItem,"first alias remains canonical")
+    let written: (Int,Error?) = wait { done in v.writeCountForTesting(contents:Data("created".utf8),to:firstItem,at:0) { done(($0,$1)) } }
+    need(written.0 == 7 && written.1 == nil,"new item uses existing write path")
+    let resize = FSItem.SetAttributesRequest(); resize.size = 9
+    let resized: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(resize,on:firstItem,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(resized.0 != nil && resized.1 == nil && resize.consumedAttributes == [.size],"new item uses existing resize path")
+    snapshots = []
+    m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { snapshots.append(a) } } }
+    let b = creationAttributes(UInt32(S_IFREG) | 0o640), second = m.create("second",request:b,parent:m.directory)
+    need(second.0 != nil && second.1 == nil && second.2 != nil && b.consumedAttributes == [.mode,.uid,.gid],"second same-mount create error=\(code(second.1))")
+    let secondItem = second.2!, secondID = secondItem.inode, secondPin = secondItem.pin!, parentID = (m.directory as! StallionItem).inode
+    need(secondItem !== firstItem && secondID != firstItem.inode && m.metadata(secondItem).mode == UInt32(S_IFREG) | 0o640,"distinct real created identity and normalized full mode")
+    checkPreparedAttributes(snapshots[0],m.metadata(secondItem),required:required); checkPreparedAttributes(snapshots[1],m.metadata(m.directory!),required:required)
+    m.state(4)
+    let fullAnchor = v.anchor, full = m.create("full")
+    need(full.0 == nil && code(full.1) == Int(ENFILE) && anchorMatches(fullAnchor,v.anchor),"create item capacity preflight")
+    m.state(4); need(m.reclaim(secondItem) == nil,"reclaim second created item"); m.state(3)
+    snapshots = []
+    let third = m.create("third",parent:m.directory)
+    need(third.0 != nil && third.1 == nil && third.2 != nil,"third same-mount create error=\(code(third.1))")
+    let thirdItem = third.2!
+    need(thirdItem !== firstItem && thirdItem !== secondItem && thirdItem.inode != firstItem.inode && thirdItem.inode != secondID && thirdItem.pin!.slot == secondPin.slot && thirdItem.pin!.incarnation > secondPin.incarnation,"reclaim reuses only the slot with a fresh token and distinct inode/object")
+    checkPreparedAttributes(snapshots[0],m.metadata(thirdItem),required:required); checkPreparedAttributes(snapshots[1],m.metadata(m.directory!),required:required)
+    m.state(4)
+    need(m.lookup("first") === firstItem && m.lookup("first-alias") === firstItem && sameBytes(firstPin,firstItem.pin!),"first aliases survive consecutive creates/reclaim")
+    m.serial { need((try! v.diagnosticReadForTesting(firstItem,length:9)) == Data("created".utf8) + Data([0,0]),"first bytes survive creation state reuse") }
+    checkPreparedAttributes(retained[0],firstMetadata,required:required); checkPreparedAttributes(retained[1],firstParent,required:required)
+    withExtendedLifetime(first.0) {}
+    m.close(); m.reopened("first",inode:firstItem.inode,bytes:Data("created".utf8) + Data([0,0])); m.reopened("first-alias",inode:firstItem.inode)
+    m.reopened("second",parent:parentID,inode:secondID); m.reopened("third",parent:parentID,inode:thirdItem.inode)
+    try creationRefusals(parent)
+    try creationFailures(parent,required:required)
+    try creationDelivery(parent)
+}
+func creationRefusals(_ parent: URL) throws {
+    let m = try CreationMount(parent,"create-refusals"), v = m.volume, before = v.anchor
+    let unsupported: [(FSItem.Attribute,(FSItem.SetAttributesRequest)->Void)] = [
+        (.type,{$0.type = .file}),(.linkCount,{$0.linkCount = 1}),(.allocSize,{$0.allocSize = 0}),
+        (.fileID,{$0.fileID = FSItem.Identifier(rawValue:3)!}),(.parentID,{$0.parentID = FSItem.Identifier(rawValue:2)!}),
+        (.accessTime,{$0.accessTime = timespec(tv_sec:1,tv_nsec:0)}),(.modifyTime,{$0.modifyTime = timespec(tv_sec:1,tv_nsec:0)}),
+        (.changeTime,{$0.changeTime = timespec(tv_sec:1,tv_nsec:0)}),(.birthTime,{$0.birthTime = timespec(tv_sec:1,tv_nsec:0)}),
+        (.backupTime,{$0.backupTime = timespec(tv_sec:1,tv_nsec:0)}),(.addedTime,{$0.addedTime = timespec(tv_sec:1,tv_nsec:0)})]
+    for (field,set) in unsupported {
+        let a = creationAttributes(); set(a); need(a.isValid(field),"construct explicit unsupported creation field")
+        let result = m.create(request:a)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"atomic unsupported creation request")
+    }
+    for missing in 0..<3 {
+        let a = FSItem.SetAttributesRequest(); if missing != 0 { a.mode = 0o600 }; if missing != 1 { a.uid = geteuid() }; if missing != 2 { a.gid = getegid() }
+        need(code(m.create(request:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"missing required creation field")
+    }
+    for (mode,expected) in [(UInt32(0o4600),ENOTSUP),(UInt32(S_IFDIR) | 0o700,EINVAL),(UInt32(1)<<31,ENOTSUP)] {
+        need(code(m.create(request:creationAttributes(mode)).1) == Int(expected),"unsupported/conflicting creation mode")
+    }
+    for field in [FSItem.Attribute.flags,.size,.uid,.gid] {
+        let a = creationAttributes()
+        if field == .flags { a.flags = 1 }; if field == .size { a.size = 1 }; if field == .uid { a.uid = geteuid() + 1 }; if field == .gid { a.gid = getegid() + 1 }
+        need(code(m.create(request:a).1) == Int(field == .uid || field == .gid ? EACCES : ENOTSUP) && a.consumedAttributes.isEmpty,"unsupported value without mutation")
+    }
+    for type in [FSItem.ItemType.directory,.symlink] { need(code(m.create(type:type).1) == Int(ENOTSUP),"other creation types refused") }
+    for name in ["", ".", "..", "bad/name", String(repeating:"n",count:256)] {
+        need(code(m.create(name).1) == Int(name.utf8.count > 255 ? ENAMETOOLONG : EINVAL),"invalid create component")
+    }
+    for caller in [CallerIdentity(uid:-1,gid:Int(getegid())),CallerIdentity(uid:Int(geteuid()),gid:-1),CallerIdentity(uid:Int(geteuid()) + 1,gid:Int(getegid()))] {
+        need(code(m.create(caller:caller).1) == Int(EACCES),"actual caller value admission")
+    }
+    need(anchorMatches(v.anchor,before),"all attribute refusals precede mutation"); m.state(1); m.absent()
+    let created = m.create("exists"), acknowledged = v.anchor
+    need(created.0 != nil && created.1 == nil,"valid create after preflight refusals")
+    need(code(m.create("exists").1) == Int(EEXIST) && anchorMatches(acknowledged,v.anchor),"EEXIST before reservation/begin")
+    need(code(m.create(parent:created.2!).1) == Int(ENOTDIR),"non-directory parent")
+    need(code(m.create(parent:StallionItem(1)).1) == Int(EINVAL),"foreign canonical parent")
+    need(m.reclaim(created.2!) == nil && code(m.create(parent:created.2!).1) == Int(EINVAL),"reclaimed parent identity refused")
+    m.state(1); m.close(); m.reopened(inode:nil); m.reopened("exists",inode:created.2!.inode)
+    for spec in 0..<7 {
+        let policy = try CreationMount(parent,"create-policy-\(spec)",rootMode:spec == 0 ? 0o500 : spec == 1 ? 0o1700 : 0o700,
+            rootFlags:spec == 2 ? 1 : 0,rootOwner:spec == 3 ? geteuid() + 1 : geteuid(),acl:spec == 4,
+            writable:spec != 5,enable:spec != 6)
+        let error = policy.create().1
+        need(code(error) == Int(spec == 2 || spec == 4 ? ENOTSUP : spec >= 5 ? EROFS : EACCES),"parent policy/write gate")
+        policy.close(); policy.reopened(inode:nil)
+    }
+    let revoked = try CreationMount(parent,"create-revoked"), revokedAnchor = revoked.volume.anchor
+    revoked.resource.revoke()
+    need(code(revoked.create().1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"revocation before create reservation")
+    revoked.close(); revoked.reopened(inode:nil)
+    let readonly = try CreationMount(parent,"create-read-mode")
+    let result = readonly.create(request:creationAttributes(0o400))
+    need(result.0 != nil && result.1 == nil && result.2 != nil,"initial read-only mode is honored")
+    let written: (Int,Error?) = wait { done in readonly.volume.writeCountForTesting(contents:Data([1]),to:result.2!,at:0) { done(($0,$1)) } }
+    need(written.0 == 0 && code(written.1) == Int(EACCES),"new file owner write permission enforced"); readonly.close(); readonly.reopened(inode:result.2!.inode)
+}
+func creationFailures(_ parent: URL, required: FSItem.Attribute) throws {
+    for stage in ["reserved","before-add","added","allocated","bound","inserted"] {
+        let m = try CreationMount(parent,"create-stage-\(stage)"), v = m.volume, before = v.anchor
+        weak var unreturned: StallionItem?
+        m.serial { v.createStageForTesting = { point,item in if point == stage { unreturned = item; throw POSIXError(.ENOMEM) } } }
+        let a = creationAttributes(), result = m.create(request:a)
+        need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"creation stage rollback \(stage)")
+        let outcome = v.createOutcomeForTesting
+        need(outcome.releaseAttempted == (stage == "reserved") && outcome.discarded == (stage != "reserved") && !outcome.commitSucceeded,"stage-specific pin cleanup")
+        m.serial { need(unreturned == nil,"unreturned failed item not retained") }
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+    }
+    need(!required.isEmpty,"actual creation result requirements")
+    for role in 0..<2 {
+        let m = try CreationMount(parent,"create-incomplete-\(role)"), v = m.volume; var seen = 0, constructed = false
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { if seen == role { a.invalidateAllProperties() }; seen += 1 } }
+            v.rejectResultForTesting = { _ in constructed = true; return false }
+        }
+        let result = m.create()
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role + 1 && !constructed,"each role completeness before actual constructor")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+    }
+    for scenario in 0..<7 {
+        let m = try CreationMount(parent,"create-failure-\(scenario)"), v = m.volume, before = v.anchor; var constructor = false
+        m.serial {
+            if scenario == 0 { v.rejectResultForTesting = { name in if name == "FSCreateItemResult" { constructor = true; return true }; return false } }
+            if scenario == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if scenario == 2 { v.diagnosticBeforeCommit = { sfs_image_clear_read_cache(m.coreHandle); fault(7,1) } }
+            if scenario == 6 { v.createCommitReceiptForTesting = { $0.fence_succeeded = 0 } }
+        }
+        if scenario == 3 { fault(1,1) }; if scenario == 4 || scenario == 5 { fault(4,Int32(scenario - 3)) }
+        let a = creationAttributes(), result = m.create(request:a), outcome = v.createOutcomeForTesting
+        let expected = scenario == 1 ? EACCES : scenario == 2 ? ENOMEM : (3...5).contains(scenario) ? ENOSPC : EIO
+        need(result.0 == nil && code(result.1) == Int(expected) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"create failure scenario \(scenario) actual=\(code(result.1))")
+        if scenario == 0 { need(constructor,"real failable constructor exercised before rejection") }
+        if (2...5).contains(scenario) { need(hits() > 0,"actual core fault reached") }
+        if scenario == 6 {
+            need(outcome.commitSucceeded && outcome.commit.status == SFS_OK && outcome.commit.fence_succeeded == 3 && !outcome.abortAttempted && outcome.releaseAttempted && outcome.release.status == SFS_OK && v.diagnosticSnapshot().0.commitSuccess == 1,"promoted pin release and actual fence accounting after rejected successful receipt")
+        } else { need(outcome.discarded && !outcome.releaseAttempted && !outcome.commitSucceeded,"discarded reservation never released again") }
+        if scenario == 4 { need(outcome.original.status == SFS_IO && outcome.original.fence_attempted == 1,"first fence known failure receipt") }
+        if scenario == 5 { need(outcome.original.status == SFS_OUTCOME_UNKNOWN && outcome.original.fence_attempted == 3,"unknown publication receipt preserved") }
+        fault(0,0)
+        if scenario < 3 { m.state(1); m.absent() }
+        let token = v.createTokenForTesting!
+        if scenario == 6 { m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"promoted never-returned token was already released") } }
+        m.close()
+        if scenario == 6 { m.reopened(inode:2) }
+        else if scenario != 5 { m.reopened(inode:nil) } // Unknown publication is never called absence.
+    }
+    for capacity in [UInt64(16384),UInt64(20480)] {
+        let m = try CreationMount(parent,"create-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        m.serial { var info = sfs_image_information(), r = sfs_result()
+            need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 16384 && info.append_headroom == capacity - 16384,"real root-only capacity setup")
+        }
+        let result = m.create(), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT,"actual append limit")
+        need(outcome.beginAttempted && outcome.beginSucceeded == (capacity == 20480) && outcome.discarded == (capacity == 20480) && outcome.releaseAttempted == (capacity == 16384),"begin LIMIT retains versus mutation LIMIT discards")
+        m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil)
+    }
+    let fatal = try CreationMount(parent,"create-begin-discard"), path = fatal.url.appendingPathComponent("image.sfs").path
+    fatal.serial { fatal.volume.createStageForTesting = { stage,_ in if stage == "reserved" { need(chmod(path,0o400) == 0,"owned fixture identity failure setup") } } }
+    let failed = fatal.create(), outcome = fatal.volume.createOutcomeForTesting
+    need(chmod(path,0o600) == 0,"restore owned fixture mode")
+    need(failed.0 == nil && code(failed.1) == Int(EINVAL) && outcome.beginAttempted && !outcome.beginSucceeded && outcome.discarded && !outcome.releaseAttempted,"begin read failure discards live reservation")
+    fatal.close(); fatal.reopened(inode:nil)
+    let exhausted = try CreationMount(parent,"create-pin-exhaustion"), e = exhausted.volume
+    var heldPins: [sfs_pin] = []
+    exhausted.serial { var r = sfs_result(); for _ in 0..<3 { var pin = sfs_pin(); need(sfs_image_pin_reserve(exhausted.coreHandle,&pin,&r) == SFS_OK,"occupy actual core slots"); heldPins.append(pin) } }
+    need(code(exhausted.create().1) == Int(ENFILE) && !e.createOutcomeForTesting.beginAttempted && !e.createOutcomeForTesting.releaseAttempted,"core pin failure with free adapter capacity")
+    exhausted.serial { var r = sfs_result(); for pin in heldPins { need(sfs_image_pin_release(exhausted.coreHandle,pin,&r) == SFS_OK,"release separately owned reservations") } }
+    exhausted.state(1); exhausted.close(); exhausted.reopened(inode:nil)
+    let quarantine = try CreationMount(parent,"create-release-quarantine"), q = quarantine.volume
+    var releases = 0
+    quarantine.serial {
+        q.createStageForTesting = { stage,_ in if stage == "reserved" { throw POSIXError(.ENOMEM) } }
+        q.createReleaseForTesting = { _,_,r in releases += 1; r.status = SFS_BUSY; return SFS_BUSY }
+    }
+    need(code(quarantine.create().1) == Int(ENOMEM),"primary error survives synthetic release BUSY")
+    quarantine.serial { let state = q.createStateForTesting; need(state.pending && state.quarantine && state.ticket == 1 && q.activeItemCount() == 1 && releases == 1,"bounded token-only release quarantine") }
+    need(code(quarantine.create("later").1) == Int(ENOMEM) && releases == 1,"no automatic retry after quarantine")
+    quarantine.close(); quarantine.reopened(inode:nil)
+}
+func creationDelivery(_ parent: URL) throws {
+    let saturated = try CreationMount(parent,"create-saturation"), enteredFull = DispatchSemaphore(value:0), resumeFull = DispatchSemaphore(value:0), drained = DispatchGroup()
+    saturated.volume.enqueue { enteredFull.signal(); need(resumeFull.wait(timeout:.now()+20) == .success,"resume saturated creation queue") }
+    need(enteredFull.wait(timeout:.now()+20) == .success,"hold saturated creation queue")
+    for _ in 0..<ReadOnlyLimits.callbacks { drained.enter(); saturated.volume.enqueue(rejected:{ _ in need(false,"fill creation budget") }) { drained.leave() } }
+    let refused: (FSCreateItemResult?,Error?) = wait { done in saturated.volume.createResultForTesting(FSFileName(string:"new"),directory:saturated.root,attributes:creationAttributes(),caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(refused.0 == nil && code(refused.1) == Int(EAGAIN) && saturated.volume.linkBudgetForTesting.0 == ReadOnlyLimits.callbacks,"saturated create admission adds no ticket")
+    resumeFull.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain saturation")
+    saturated.state(1); saturated.close(); saturated.reopened(inode:nil)
+    for quarantine in [false,true] {
+        let m = try CreationMount(parent,"create-queued-\(quarantine)",directory:quarantine), v = m.volume, before = v.anchor
+        let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+        var preflights = 0, cleared = false
+        weak var unreturned: StallionItem?
+        v.enqueue {
+            v.createStageForTesting = { stage,item in if stage == "preflight" { preflights += 1 }; if stage == "inserted" { unreturned = item; throw POSIXError(.ENOMEM) } }
+            if quarantine { v.createAbortForTesting = { _,r in r.status = SFS_IO; r.transaction_active = 1; r.system_errno = EIO; return SFS_IO } }
+            entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume create queue")
+        }
+        need(entered.wait(timeout:.now()+20) == .success,"hold create queue")
+        let first = creationAttributes(), next = creationAttributes(), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+        replies.enter(); v.createResultForTesting(FSFileName(string:"first"),directory:m.root,attributes:first,caller:caller) { result,error in
+            need(result == nil && code(error) == Int(ENOMEM),"first create primary failure")
+            v.createStageForTesting = nil; v.createAbortForTesting = nil; cleared = true; replies.leave()
+        }
+        replies.enter(); v.createResultForTesting(FSFileName(string:"next"),directory:m.root,attributes:next,caller:caller) { result,error in
+            need(cleared && result == nil && code(error) == Int(ENOMEM),"queued create preserves earlier error after injection cleared"); replies.leave()
+        }
+        let charged = v.linkBudgetForTesting
+        need(charged.0 == 2 && charged.1 == 2 * ReadOnlyLimits.callbackOverhead + 9,"both create callbacks admitted before failure")
+        resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"drain create replies")
+        m.serial {
+            let state = v.createStateForTesting
+            need(preflights == 1 && first.consumedAttributes.isEmpty && next.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"queued guard before second reservation/begin")
+            need(state.pending == quarantine && state.quarantine == quarantine && state.ticket == (quarantine ? 1 : 0) && v.activeItemCount() == (quarantine ? 2 : 1) && unreturned == nil,"no unpublished object retention or double ticket")
+            if quarantine { need(v.createOutcomeForTesting.cleanup.status == SFS_IO && !v.createOutcomeForTesting.discarded,"synthetic unresolved abort evidence retained") }
+        }
+        let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
+        v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release failed create queue") }
+        need(held.wait(timeout:.now()+20) == .success,"hold already failed queue")
+        let refused: (FSCreateItemResult?,Error?) = wait { done in v.createResultForTesting(FSFileName(string:"again"),directory:m.root,attributes:creationAttributes(),caller:caller) { done(($0,$1)) } }
+        need(refused.0 == nil && code(refused.1) == Int(ENOMEM) && v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"admission returns charge without entering held queue")
+        release.signal(); m.serial {}
+        if !quarantine { m.state(1); m.absent("first"); m.absent("next") }
+        else {
+            need(v.diagnosticSnapshot().2?.code == Int(ENOMEM),"secondary abort error does not replace primary delivery failure")
+            let _: Bool = wait { done in v.unmount { done(true) } }
+            let _: Error? = wait { v.deactivate(options:[],replyHandler:$0) }
+            m.serial { need(!v.unload().consumed && v.activeItemCount() == 2,"quarantine cannot close beneath returned parent") }
+            need(code(m.reclaim(m.directory!)) == Int(EBUSY),"actual transaction blocks SDK-reclaimed parent pin release")
+            m.serial { need(!v.ownsForTesting(m.directory!) && v.activeItemCount() == 1,"BUSY release never resurrects reclaimed item") }
+        }
+        m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil)
+    }
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
-        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent)
+        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent)
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
@@ -1311,6 +1681,7 @@ func namespaceDeliveryGates(_ parent: URL) throws {
         print("SDK unconstructible capability request fields: \(unavailable.map(String.init).joined(separator: ","))")
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
+        print("PASS contextual empty-file creation, publication reuse, two-role results and outcome-specific cleanup")
 #endif
     }
 }

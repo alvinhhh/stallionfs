@@ -17,8 +17,11 @@ macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource
 | [Deep40 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.614668 / 0.034431 s | 12.410770 / 0.031100 s | 3,997,696 / 1,769,472 B | Wall/CPU/RSS lower |
 | [Document clone, explicit `--jobs 2`, ditto](results/native-clone-docs-jobs2-20261029-arm64.json.xz) | 0.763839 / 0.356793 s | 0.741951 / 0.661337 s | 1,818,624 / 1,916,928 B | Wall/CPU lower; RSS higher |
 | [Document clone, default 4 workers (`--jobs 4`), ditto](results/native-clone-docs-default4-20261029-arm64.json.xz) | 0.738710 / 0.219446 s | 0.709180 / 0.778186 s | 1,818,624 / 1,998,848 B | Wall lower; CPU/RSS higher |
+| [Generated repository delete, `rm -rf`](results/native-delete-repository-20261030-arm64.json.xz) | 2.491947 / 1.612499 s | 2.314500 / 4.890427 s | 1,179,648 / 1,949,696 B | Wall lower; CPU/RSS higher |
+| [Generated build-cache delete, `rm -rf`](results/native-delete-cache-20261030-arm64.json.xz) | 10.526252 / 6.966327 s | 9.562070 / 19.777616 s | 1,245,184 / 1,966,080 B | Wall lower; CPU/RSS higher |
+| [Generated dataset delete, `rm -rf`](results/native-delete-dataset-20261030-arm64.json.xz) | 0.114774 / 0.085604 s | 0.103147 / 0.221650 s | 1,097,728 / 1,916,928 B | Wall lower; CPU/RSS higher |
 
-RSS means `/usr/bin/time -lp reported maximum RSS`: a reported process peak, not whole-system or aggregate descendant memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
+RSS means `/usr/bin/time -lp reported maximum RSS`: the maximum individual child-process peak, excluding whole-system, aggregate descendant, kernel and server memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
 
 The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`). Its five native C/header hashes match current source. This is native-content equivalence, not a new build of the newer main or managed Python lifecycle. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
 
@@ -29,9 +32,11 @@ Recorded native command templates use the exact flags below; the data files reta
 ```sh
 /bin/cp -Rp SOURCE DESTINATION
 /bin/mv -n SOURCE DESTINATION
+/bin/rm -rf TARGET
 /usr/bin/ditto --rsrc --extattr --acl SOURCE DESTINATION
 stallionfs copy SOURCE DESTINATION
 stallionfs move SOURCE DESTINATION
+stallionfs delete --recursive TARGET
 stallionfs clone --jobs 2 SOURCE DESTINATION
 stallionfs clone --jobs 4 SOURCE DESTINATION
 /usr/bin/find -P -x ROOT -mindepth 1 -exec /usr/bin/stat -f '%Op%t%Dz%t%Dd' -- '{}' +
@@ -39,6 +44,14 @@ stallionfs --json scan ROOT
 ```
 
 Scan comparisons apply only to that find/stat numeric-output recipe, not native scanners generally. Both sides count six stable-tree fields; content-read throughput is not measured. The enriched scan fixtures contain 20,003 regular-file names and 12,196,597 logical bytes, plus three symlinks and one special entry. Directory counts including root are 2 flat, 202 nested and 42 deep40. Copy and move each use one enriched 4,096-byte file. The document tree contains 5,002 regular files, 105 directories including root and 116,777,216 logical bytes. Generated ACL/xattr, hardlink, sparse, source-stability and command-specific correctness observations remain in the data.
+
+Each delete report contains 40 measured rows, ten timing pairs and ten resource pairs, with no retries or exclusions. All use the default four workers.
+
+The repository input begins with 50,000 generated source files and 2,000,000,000 logical bytes. Git adds 13 regular-file names and 9,527,940 logical bytes; metadata enrichment adds two names and 16,777,216 logical bytes. The measured tree contains 50,015 regular-file names, 115 directories including root and 2,026,305,156 logical bytes. Recorded allocation is 2,048,000,000 B for the original source, 9,560,064 B for Git and 4,202,496 B for enrichment, totaling 2,061,762,560 B. Allocation is `st_blocks * 512`, not exclusive physical storage. Counts and logical lengths include hardlink aliases. Six untimed Git preparation commands and 40 independent operand preparations precede the relevant measurements.
+
+The build-cache input begins with 200,000 generated files and 10,000,000,000 logical bytes. Metadata enrichment produces the measured 200,002 regular-file names, 204 directories including root and 10,016,777,216 logical bytes, including hardlink aliases. Each of the 40 operands was independently prepared and validated outside command timing. All three source trees include ACL/xattr, resource-fork, hardlink and sparse metadata coverage; source preservation and target absence passed for every delete sample.
+
+The dataset input begins with 2,000 generated files and 50,000,000,000 logical bytes. Metadata enrichment produces 2,002 regular-file names, 23 directories including root and 50,016,777,216 logical bytes, including hardlink aliases. All 40 operands were prepared and validated outside command timing. Whole-tree allocation and generation time were not recorded.
 
 The clone configurations are the same workload. Two workers are explicit; the four-worker row records `--jobs 4`, matching the default setting. Both preserve the observed RSS increase. No worker default was changed. Older raw result files remain available.
 

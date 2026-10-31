@@ -315,6 +315,34 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var state = State.inactive
     private var failure: Error?
     private var items: [UInt64: StallionItem] = [:]
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+    private enum CreateOwnership { case reserved, transaction, discarded, promoted }
+    struct CreateOutcome {
+        var beginAttempted = false, beginSucceeded = false, commitAttempted = false, commitSucceeded = false
+        var abortAttempted = false, releaseAttempted = false, discarded = false
+        var original = sfs_result(), begin = sfs_result(), commit = sfs_result()
+        var cleanup = sfs_result(), verification = sfs_result(), release = sfs_result()
+        var verificationAttempted = false
+    }
+    private struct PendingCreate {
+        var pin: sfs_pin?, inode: UInt64 = 0
+        var ticket = true, quarantined = false
+        var ownership = CreateOwnership.reserved
+        var outcome = CreateOutcome()
+    }
+    private var pendingCreate: PendingCreate?
+#if STALLION_ADAPTER_CHECK
+    var createStageForTesting: ((String, StallionItem?) throws -> Void)?
+    var createAbortForTesting: ((OpaquePointer, inout sfs_result) -> sfs_status)?
+    var createReleaseForTesting: ((OpaquePointer, sfs_pin, inout sfs_result) -> sfs_status)?
+    var createCommitReceiptForTesting: ((inout sfs_result) -> Void)?
+    private(set) var createOutcomeForTesting = CreateOutcome()
+    private(set) var createTokenForTesting: sfs_pin?
+    var createStateForTesting: (pending: Bool, quarantine: Bool, ticket: Int) {
+        (pendingCreate != nil, pendingCreate?.quarantined == true, pendingCreate?.ticket == true ? 1 : 0)
+    }
+#endif
+#endif
     private var nonce: [UInt8] = []
     private var records: [Record] = []
     private var sequence: UInt64 = 0
@@ -433,6 +461,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if STALLION_WRITE_DIAGNOSTIC
         if diagnosticWritable { guard !own.reclaimed else { throw POSIXError(.EINVAL) } }
 #endif
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        guard pendingCreate?.inode != own.inode else { throw POSIXError(.EINVAL) }
+#endif
         return own
     }
     private func id(_ item: FSItem) throws -> UInt64 {
@@ -443,8 +474,15 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return own.inode
     }
     private func canonical(_ inode: UInt64) throws -> StallionItem {
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        guard pendingCreate?.inode != inode else { throw POSIXError(.EINVAL) }
+        let pendingTickets = pendingCreate?.ticket == true ? 1 : 0
+        if let item = items[inode] { return item }
+        guard items.count + pendingTickets < itemLimit else { throw POSIXError(.ENFILE) }
+#else
         if let item = items[inode] { return item }
         guard items.count < itemLimit else { throw POSIXError(.ENFILE) }
+#endif
         let item = StallionItem(inode)
 #if STALLION_WRITE_DIAGNOSTIC
         if diagnosticWritable {
@@ -766,9 +804,17 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
         }
 #endif
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        if let pendingCreate, !pendingCreate.quarantined {
+            submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
+        }
+#endif
         admission = .terminal; submissionLock.unlock()
         state = .terminal; nonce.removeAll(); let owned = handle; handle = nil
         if let owned { var r = sfs_result(); let status = sfs_image_close(owned, &r); if status != SFS_OK { latch(sfsError(status, r)) } }
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        pendingCreate = nil // Close consumes the table, including unresolved reservations.
+#endif
         if scope { scope = false; resource.url.stopAccessingSecurityScopedResource() }
         items.removeAll(); record(6, error: failure); emit(); return (true, failure)
     }
@@ -1423,7 +1469,178 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
         refuse { reply(nil, $0) }
     }
-    func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler: @escaping (FSCreateItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler: @escaping (FSCreateItemResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        createItemHandler(name, type: type, directory: directory, attributes: attributes, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private struct CreateAttributes {
+        let initial: sfs_metadata_initial
+        let consumed: FSItem.Attribute
+        init(_ attributes: FSItem.SetAttributesRequest, type: FSItem.ItemType, caller: CallerIdentity, owner: uid_t) throws {
+            guard type == .file else { throw POSIXError(.ENOTSUP) }
+            let unsupported: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID,
+                .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
+                .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
+            guard !unsupported.contains(where: { attributes.isValid($0) }),
+                  attributes.isValid(.mode), attributes.isValid(.uid), attributes.isValid(.gid) else { throw POSIXError(.ENOTSUP) }
+            guard let uid = uid_t(exactly: caller.uid), let gid = gid_t(exactly: caller.gid),
+                  uid == owner, attributes.uid == uid, attributes.gid == gid else { throw POSIXError(.EACCES) }
+            let mode = attributes.mode, kind = mode & UInt32(S_IFMT)
+            guard kind == 0 || kind == UInt32(S_IFREG) else { throw POSIXError(.EINVAL) }
+            guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
+            var used: FSItem.Attribute = [.mode, .uid, .gid]
+            if attributes.isValid(.flags) { guard attributes.flags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
+            if attributes.isValid(.size) { guard attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
+            var value = sfs_metadata_initial()
+            value.mode = UInt32(S_IFREG) | (mode & 0o777); value.uid = uid; value.gid = gid
+            initial = value; consumed = used
+        }
+    }
+    private func finishFailedCreate(_ item: StallionItem?, error: Error) {
+        guard var pending = pendingCreate else { return }
+        // Only this never-returned item can be removed. A quarantined record
+        // owns token/accounting facts, not a retained Swift item.
+        if !pending.ticket {
+            guard let item, items[pending.inode] === item else {
+                pending.quarantined = true; pendingCreate = pending; latch(POSIXError(.EIO)); return
+            }
+            items.removeValue(forKey: pending.inode); pending.ticket = true
+        }
+        item?.pin = nil; item?.reclaimed = true; item?.retainedModes = []
+        if let pin = pending.pin {
+            switch pending.ownership {
+            case .discarded: break // Abort/automatic discard already retired it.
+            case .reserved, .promoted:
+                if let handle {
+                    var receipt = sfs_result()
+                    pending.outcome.releaseAttempted = true
+                    let status: sfs_status
+#if STALLION_ADAPTER_CHECK
+                    if let injected = createReleaseForTesting { status = injected(handle, pin, &receipt) }
+                    else { status = sfs_image_pin_release(handle, pin, &receipt) }
+#else
+                    status = sfs_image_pin_release(handle, pin, &receipt)
+#endif
+                    pending.outcome.release = receipt
+                    // A promoted pin survives C success even when Swift rejected
+                    // the receipt. Memory-only release must not compare old anchor.
+                    if status != SFS_OK { pending.quarantined = true; latch(sfsError(status, receipt)) }
+                } else { pending.quarantined = true; latch(POSIXError(.EIO)) }
+            case .transaction:
+                pending.quarantined = true; latch(POSIXError(.EIO))
+            }
+        }
+#if STALLION_ADAPTER_CHECK
+        createOutcomeForTesting = pending.outcome
+#endif
+        pendingCreate = pending.quarantined ? pending : nil
+        rememberDelivery(error, pending.outcome.original)
+    }
+    private func createItemHandler(_ name: FSFileName, type: FSItem.ItemType, directory: FSItem,
+                                   attributes: FSItem.SetAttributesRequest, caller: CallerIdentity,
+                                   reply: @escaping (FSCreateItemResult?, Error?) -> Void) {
+        attributes.consumedAttributes = []
+        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        let bytes = name.data
+        let values: CreateAttributes
+        do {
+            try component(bytes)
+            guard bytes != Data(".".utf8), bytes != Data("..".utf8) else { throw POSIXError(.EINVAL) }
+            values = try CreateAttributes(attributes, type: type, caller: caller, owner: owner)
+        } catch { reply(nil, error); return }
+        enqueue(retainedBytes: bytes.count, namespaceOperation: true, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result(), created: StallionItem?
+            var ownsPending = false
+            do {
+                if let error = self.deliveryError() { throw error }
+#if STALLION_ADAPTER_CHECK
+                try self.createStageForTesting?("preflight", nil)
+#endif
+                let h = try self.ready(mounted: true)
+                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                let parent = try self.id(directory), parentMetadata = try self.metadata(parent)
+                try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: [.addFile, .search], caller: caller)
+                var found = sfs_entry()
+                let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
+                if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
+                guard anchorMatches(receipt, self.anchor) else { let e = POSIXError(.ESTALE); self.latch(e); throw e }
+                let requirements = ResultRequirements(FSCreateItemResult.self), request = try requirements.request()
+                guard self.pendingCreate == nil, self.items.count < self.itemLimit else { throw POSIXError(.ENFILE) }
+                self.pendingCreate = PendingCreate(); ownsPending = true
+                var pin = sfs_pin()
+                let reserved = sfs_image_pin_reserve(h, &pin, &receipt)
+                if reserved == SFS_OK { self.pendingCreate?.pin = pin }
+                self.pendingCreate?.outcome.original = receipt
+                try self.check(reserved, receipt)
+#if STALLION_ADAPTER_CHECK
+                self.createTokenForTesting = pin
+                try self.createStageForTesting?("reserved", nil)
+#endif
+                let result = try self.mutate({ h, r in
+#if STALLION_ADAPTER_CHECK
+                    try self.createStageForTesting?("before-add", nil)
+#endif
+                    var initial = values.initial, inode: UInt64 = 0
+                    let status = bytes.withUnsafeBytes { sfs_image_add_metadata(h, parent, $0.baseAddress, $0.count, SFS_FILE, &initial, &inode, &r) }
+                    try self.check(status, r)
+                    self.pendingCreate?.inode = inode
+#if STALLION_ADAPTER_CHECK
+                    try self.createStageForTesting?("added", nil)
+#endif
+                    _ = try itemIdentifier(inode)
+                    let item = StallionItem(inode); item.pin = pin; created = item
+#if STALLION_ADAPTER_CHECK
+                    try self.createStageForTesting?("allocated", item)
+#endif
+                    try self.check(sfs_image_pin_bind(h, pin, inode, &r), r)
+#if STALLION_ADAPTER_CHECK
+                    try self.createStageForTesting?("bound", item)
+#endif
+                    guard self.items[inode] == nil else { throw POSIXError(.EIO) }
+                    self.items[inode] = item; self.pendingCreate?.ticket = false
+#if STALLION_ADAPTER_CHECK
+                    try self.createStageForTesting?("inserted", item)
+#endif
+                }, prepare: { h, r in
+                    guard let item = created else { throw POSIXError(.EIO) }
+                    let child = try self.transactionMetadata(h, inode: item.inode, receipt: &r)
+                    let directoryMetadata = try self.transactionMetadata(h, inode: parent, receipt: &r)
+                    var childEvidence = ParentEvidence(), parentEvidence = ParentEvidence()
+                    let childAttributes = try self.preparedResultAttributes(child, request, requirements, parents: &childEvidence)
+                    let parentAttributes = try self.preparedResultAttributes(directoryMetadata, request, requirements, parents: &parentEvidence)
+                    return try self.handlerResult(FSCreateItemResult.self) {
+                        FSCreateItemResult(newItem: item, newItemName: name, newItemAttributes: childAttributes,
+                                           directoryAttributes: parentAttributes, freeSpace: nil)
+                    }
+                }, receipt: &receipt)
+#if STALLION_ADAPTER_CHECK
+                self.createOutcomeForTesting = self.pendingCreate!.outcome
+#endif
+                self.pendingCreate = nil
+                attributes.consumedAttributes = values.consumed
+                reply(result, nil)
+            } catch {
+                if ownsPending { self.finishFailedCreate(created, error: error) }
+                reply(nil, error)
+            }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    func createVisibilityForTesting(_ item: StallionItem) -> Bool {
+        (try? ownedItem(item)) == nil && (try? canonical(item.inode)) == nil
+    }
+    func createResultForTesting(_ name: FSFileName, type: FSItem.ItemType = .file, directory: FSItem,
+                                attributes: FSItem.SetAttributesRequest, caller: CallerIdentity,
+                                reply: @escaping (FSCreateItemResult?, Error?) -> Void) {
+        createItemHandler(name, type: type, directory: directory, attributes: attributes, caller: caller, reply: reply)
+    }
+#endif
+#endif
     func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, context: FSContext, replyHandler: @escaping (FSCreateSymlinkResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler: @escaping (FSCreateLinkResult?, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
@@ -1593,7 +1810,20 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         let h = try ready(mounted: true), before = anchor
         var began = false, committed = false
         do {
+#if STALLION_CONTEXT_HANDLERS
+            pendingCreate?.outcome.beginAttempted = true
+#endif
             let begin = sfs_image_begin(h, &receipt)
+#if STALLION_CONTEXT_HANDLERS
+            pendingCreate?.outcome.begin = receipt
+            if begin == SFS_OK {
+                pendingCreate?.outcome.beginSucceeded = true
+                pendingCreate?.ownership = .transaction
+            } else if receipt.poisoned != 0 && receipt.transaction_active == 0 &&
+                        [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_UNSUPPORTED].contains(begin) {
+                pendingCreate?.ownership = .discarded; pendingCreate?.outcome.discarded = true
+            }
+#endif
             if begin == SFS_STATE { let e = POSIXError(.EIO); latch(e); throw e }
             try check(begin, receipt); began = true
             try body(h, &receipt)
@@ -1605,7 +1835,20 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             diagnosticBeforeCommit?()
 #endif
             guard resource.isWritable && !resource.isRevoked else { throw POSIXError(.EACCES) }
+#if STALLION_CONTEXT_HANDLERS
+            pendingCreate?.outcome.commitAttempted = true
+            let status = sfs_image_commit(h, &receipt)
+            pendingCreate?.outcome.commit = receipt
+            if status == SFS_OK {
+                pendingCreate?.ownership = .promoted; pendingCreate?.outcome.commitSucceeded = true
+            }
+            accountCommit(receipt)
+#if STALLION_ADAPTER_CHECK
+            if pendingCreate != nil, status == SFS_OK { createCommitReceiptForTesting?(&receipt) }
+#endif
+#else
             let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
+#endif
             guard status == SFS_OK else {
                 let e = sfsError(status, receipt)
                 if receipt.poisoned != 0 || status == SFS_UNSUPPORTED { latch(e) }
@@ -1619,20 +1862,48 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                   receipt.poisoned == 0, receipt.fence_attempted == 3, receipt.fence_succeeded == 3 else {
                 let e = POSIXError(.EIO); latch(e); throw e
             }
+#if STALLION_CONTEXT_HANDLERS
+            pendingCreate?.outcome.original = receipt
+#endif
             anchor = receipt
             submissionLock.lock(); diagnosticDurable = receipt.generation; submissionLock.unlock()
             return prepared
         } catch {
             let original = receipt
+#if STALLION_CONTEXT_HANDLERS
+            pendingCreate?.outcome.original = original
+            if pendingCreate?.outcome.beginSucceeded == true && pendingCreate?.outcome.commitSucceeded == false && original.transaction_active == 0 {
+                pendingCreate?.ownership = .discarded; pendingCreate?.outcome.discarded = true
+            }
+#endif
             if original.poisoned != 0 || [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED, SFS_UNSUPPORTED].contains(original.status) {
                 latch(error)
             } else if began && !committed && failure == nil {
                 var cleanup = sfs_result(), information = sfs_image_information()
+#if STALLION_CONTEXT_HANDLERS
+                let aborted: sfs_status
+                pendingCreate?.outcome.abortAttempted = true
+#if STALLION_ADAPTER_CHECK
+                if pendingCreate != nil, let injected = createAbortForTesting { aborted = injected(h, &cleanup) }
+                else { aborted = sfs_image_abort(h, &cleanup) }
+#else
+                aborted = sfs_image_abort(h, &cleanup)
+#endif
+                pendingCreate?.outcome.cleanup = cleanup
+                if (aborted == SFS_OK || aborted == SFS_STATE) && cleanup.transaction_active == 0 {
+                    pendingCreate?.ownership = .discarded; pendingCreate?.outcome.discarded = true
+                }
+#else
                 let aborted = sfs_image_abort(h, &cleanup)
+#endif
                 if (aborted != SFS_OK && aborted != SFS_STATE) || cleanup.transaction_active != 0 || cleanup.poisoned != 0 {
                     latch(POSIXError(.EIO))
                 } else {
                     let checked = sfs_image_get_information(h, &information, &cleanup)
+#if STALLION_CONTEXT_HANDLERS
+                    pendingCreate?.outcome.verificationAttempted = true
+                    pendingCreate?.outcome.verification = cleanup
+#endif
                     if checked != SFS_OK || cleanup.transaction_active != 0 || !anchorMatches(cleanup, before) { latch(POSIXError(.EIO)) }
                 }
             }

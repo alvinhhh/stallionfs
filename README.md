@@ -90,8 +90,11 @@ macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median
 | [Scan a nested 20k-file fixture](tests/perf/results/native-scans-20k-20261030-arm64.json.xz) | Recorded find/stat | 12.137 s | 17.766 ms |
 | [Scan a deep40 20k-file fixture](tests/perf/results/native-scans-20k-20261030-arm64.json.xz) | Recorded find/stat | 12.615 s | 34.431 ms |
 | [Clone 5,002 document files, explicit `--jobs 2`](tests/perf/results/native-clone-docs-jobs2-20261029-arm64.json.xz) | `ditto --rsrc --extattr --acl` | 763.839 ms | 356.793 ms |
+| [Delete a generated repository tree](tests/perf/results/native-delete-repository-20261030-arm64.json.xz) | `rm -rf` | 2.491947 s | 1.612499 s |
+| [Delete a generated build-cache tree](tests/perf/results/native-delete-cache-20261030-arm64.json.xz) | `rm -rf` | 10.526252 s | 6.966327 s |
+| [Delete a generated 50 GB dataset tree](tests/perf/results/native-delete-dataset-20261030-arm64.json.xz) | `rm -rf` | 0.114774 s | 0.085604 s |
 
-[CPU, reported process RSS, default-four-worker clone results and full data](tests/perf/README.md). Scan results apply only to the recorded find/stat recipe.
+[Detailed results](tests/perf/README.md). Scan results apply only to the recorded find/stat recipe.
 
 ## Contributing
 

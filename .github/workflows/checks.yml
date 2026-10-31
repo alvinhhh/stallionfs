@@ -18,6 +18,7 @@ jobs:
           - {os: macos-26, python: '3.13', images: '1'}
           - {os: macos-26, python: '3.14', images: '1'}
           - {os: macos-26-intel, python: '3.13', images: '1'}
+          - {os: xcode-27, python: '3.13', images: '1'}
     env:
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
@@ -31,16 +32,53 @@ jobs:
       - name: Test installed wheel with image failure diagnostics
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
+          STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
           import faulthandler
           import os
           from pathlib import Path
+          import platform
+          import re
+          import subprocess
           import sys
           import unittest
           import stallionfs
           from stallionfs import images, _scan
+
+          require_contextual = os.environ.get('STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT') == '1'
+          contextual_test = 'test_fskit.FSKitInterfaces.test_contextual_and_legacy_callbacks_and_production_builds'
+
+          def require_contextual_environment():
+              host = (sys.platform, platform.mac_ver()[0], platform.machine())
+              print('Contextual FSKit host:', host, flush=True)
+              def version(label, argv):
+                  child = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+                  print(f'{label}: {child.stdout.strip()!r}; stderr: {child.stderr.strip()!r}', flush=True)
+                  child.check_returncode()
+                  return child.stdout.strip()
+              build = version('macOS build', ['/usr/bin/sw_vers', '-buildVersion'])
+              xcode = version('Selected Xcode', ['/usr/bin/xcodebuild', '-version'])
+              sdk = version('Selected macOS SDK', ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-version'])
+              if (host[0] != 'darwin' or not re.fullmatch(r'\d+(?:\.\d+)*', host[1])
+                      or int(host[1].split('.')[0]) < 27 or host[2] != 'arm64'
+                      or not re.fullmatch(r'\d+[A-Z]\d+[a-z]?', build)
+                      or not re.fullmatch(r'Xcode 27\.1\nBuild version [A-Za-z0-9]+', xcode)
+                      or sdk != '27.0'):
+                  raise RuntimeError('Contextual FSKit requires macOS 27+ ARM64 with selected Xcode 27.1 and SDK 27.0')
+
+          class ContextualResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.contextual_successes = 0
+              def addSuccess(self, test):
+                  super().addSuccess(test)
+                  if test.id() == contextual_test:
+                      self.contextual_successes += 1
+
+          if require_contextual:
+              require_contextual_environment()
 
           checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
           assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
@@ -51,7 +89,7 @@ jobs:
           faulthandler.dump_traceback_later(300)
           suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
           try:
-              result = unittest.TextTestRunner(verbosity=2).run(suite)
+              result = unittest.TextTestRunner(verbosity=2, resultclass=ContextualResult).run(suite)
           finally:
               try:
                   diagnostics.close()
@@ -70,7 +108,10 @@ jobs:
           ]
           if required_skips:
               print('Required filesystem tests were skipped.', file=sys.stderr)
-          sys.exit(not result.wasSuccessful() or bool(required_skips))
+          missing_contextual = require_contextual and result.contextual_successes != 1
+          if missing_contextual:
+              print(f'Required {contextual_test} successes: expected 1, observed {result.contextual_successes}', file=sys.stderr)
+          sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
           PY
       - name: Validate bounded image diagnostic artifact
         if: failure()

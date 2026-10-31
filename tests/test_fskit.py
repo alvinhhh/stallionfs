@@ -130,7 +130,13 @@ class FSKitInterfaces(unittest.TestCase):
                          'resultrequestfortesting', 'requirevalidfortesting', 'requireresultvalidityfortesting',
                          'linkresultfortesting', 'linkaccessfortesting', 'linkbudgetfortesting',
                          'linkpreflightfortesting', 'snapshotfortesting', 'createlinkhandler',
-                         'checklinkparentpolicy', 'checklinkcount', 'sqlite')
+                         'checklinkparentpolicy', 'checklinkcount',
+                         'createownership', 'createoutcome', 'pendingcreate',
+                         'createattributes', 'finishfailedcreate', 'createitemhandler',
+                         'createstagefortesting', 'createabortfortesting', 'createreleasefortesting',
+                         'createcommitreceiptfortesting', 'createoutcomefortesting', 'createtokenfortesting',
+                         'createstatefortesting', 'createvisibilityfortesting', 'createresultfortesting',
+                         'sqlite')
             for variant in ('legacy', 'context'):
                 directory = self.base / variant
                 directory.mkdir(mode=0o700)
