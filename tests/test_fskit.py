@@ -136,6 +136,8 @@ class FSKitInterfaces(unittest.TestCase):
                          'createstagefortesting', 'createabortfortesting', 'createreleasefortesting',
                          'createcommitreceiptfortesting', 'createoutcomefortesting', 'createtokenfortesting',
                          'createstatefortesting', 'createvisibilityfortesting', 'createresultfortesting',
+                         'removeitemhandler', 'removemutationfortesting', 'removepreflightfortesting',
+                         'removecommitreceiptfortesting', 'removeresultfortesting',
                          'sqlite')
             for variant in ('legacy', 'context'):
                 directory = self.base / variant

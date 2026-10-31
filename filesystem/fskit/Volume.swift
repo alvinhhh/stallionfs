@@ -1478,10 +1478,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
 #if STALLION_WRITE_DIAGNOSTIC
     private struct CreateAttributes {
+        let kind: sfs_kind
         let initial: sfs_metadata_initial
         let consumed: FSItem.Attribute
         init(_ attributes: FSItem.SetAttributesRequest, type: FSItem.ItemType, caller: CallerIdentity, owner: uid_t) throws {
-            guard type == .file else { throw POSIXError(.ENOTSUP) }
+            let modeKind: UInt32
+            switch type {
+            case .file: kind = SFS_FILE; modeKind = UInt32(S_IFREG)
+            case .directory: kind = SFS_DIRECTORY; modeKind = UInt32(S_IFDIR)
+            default: throw POSIXError(.ENOTSUP)
+            }
             let unsupported: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID,
                 .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
                 .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
@@ -1490,13 +1496,13 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard let uid = uid_t(exactly: caller.uid), let gid = gid_t(exactly: caller.gid),
                   uid == owner, attributes.uid == uid, attributes.gid == gid else { throw POSIXError(.EACCES) }
             let mode = attributes.mode, kind = mode & UInt32(S_IFMT)
-            guard kind == 0 || kind == UInt32(S_IFREG) else { throw POSIXError(.EINVAL) }
+            guard kind == 0 || kind == modeKind else { throw POSIXError(.EINVAL) }
             guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
             var used: FSItem.Attribute = [.mode, .uid, .gid]
             if attributes.isValid(.flags) { guard attributes.flags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
             if attributes.isValid(.size) { guard attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
             var value = sfs_metadata_initial()
-            value.mode = UInt32(S_IFREG) | (mode & 0o777); value.uid = uid; value.gid = gid
+            value.mode = modeKind | (mode & 0o777); value.uid = uid; value.gid = gid
             initial = value; consumed = used
         }
     }
@@ -1564,7 +1570,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 guard self.resource.isWritable else { throw POSIXError(.EACCES) }
                 let parent = try self.id(directory), parentMetadata = try self.metadata(parent)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
-                try self.ownerAccess(parentMetadata, inode: parent, access: [.addFile, .search], caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: values.kind == SFS_DIRECTORY ? .search : [.addFile, .search], caller: caller)
                 var found = sfs_entry()
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
@@ -1586,7 +1592,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     try self.createStageForTesting?("before-add", nil)
 #endif
                     var initial = values.initial, inode: UInt64 = 0
-                    let status = bytes.withUnsafeBytes { sfs_image_add_metadata(h, parent, $0.baseAddress, $0.count, SFS_FILE, &initial, &inode, &r) }
+                    let status = bytes.withUnsafeBytes { sfs_image_add_metadata(h, parent, $0.baseAddress, $0.count, values.kind, &initial, &inode, &r) }
                     try self.check(status, r)
                     self.pendingCreate?.inode = inode
 #if STALLION_ADAPTER_CHECK
@@ -1713,7 +1719,80 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     var linkBudgetForTesting: (Int, Int) { callbacks.snapshotForTesting }
 #endif
 #endif
-    func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        removeItemHandler(item, name: name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private func removeItemHandler(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
+                                   reply: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        let bytes = name.data
+        var validation: Error?
+        do {
+            try component(bytes)
+            guard bytes != Data(".".utf8), bytes != Data("..".utf8) else { throw POSIXError(.EINVAL) }
+        } catch { validation = error }
+        enqueue(retainedBytes: bytes.count, namespaceOperation: true, validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result()
+            do {
+                if let error = self.deliveryError() { throw error }
+                let h = try self.ready(mounted: true)
+                guard self.pendingCreate == nil else { throw POSIXError(.EBUSY) }
+#if STALLION_ADAPTER_CHECK
+                self.removePreflightForTesting?()
+#endif
+                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                let source = try self.id(item), parent = try self.id(directory)
+                let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
+                guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
+                guard sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
+                try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
+                try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: .search, caller: caller)
+                var found = sfs_entry()
+                let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
+                try self.check(status, receipt)
+                guard found.inode == source else { throw POSIXError(.ESTALE) }
+                let requirements = ResultRequirements(FSRemoveItemResult.self), request = try requirements.request()
+                // Detached pins have no parent identity. Do not invent one for a result.
+                guard sourceMetadata.link_count != 1 || !requirements.sdk.contains(.parentID) else { throw POSIXError(.ENOTSUP) }
+#if STALLION_ADAPTER_CHECK
+                self.removeMutationForTesting = true
+                defer { self.removeMutationForTesting = false }
+#endif
+                let result = try self.mutate({ h, r in
+                    let status = bytes.withUnsafeBytes { sfs_image_unlink_expected(h, parent, $0.baseAddress, $0.count, source, &r) }
+                    try self.check(status, r)
+                }, prepare: { h, r in
+                    let sourceMetadata = try self.transactionMetadata(h, inode: source, receipt: &r)
+                    let parentMetadata = try self.transactionMetadata(h, inode: parent, receipt: &r)
+                    var sourceEvidence = ParentEvidence(), parentEvidence = ParentEvidence()
+                    let removed = try self.preparedResultAttributes(sourceMetadata, request, requirements, parents: &sourceEvidence)
+                    let parentAttributes = try self.preparedResultAttributes(parentMetadata, request, requirements, parents: &parentEvidence)
+                    return try self.handlerResult(FSRemoveItemResult.self) {
+                        FSRemoveItemResult(itemAttributes: removed, directoryAttributes: parentAttributes, freeSpace: nil)
+                    }
+                }, receipt: &receipt)
+                reply(result, nil)
+            } catch { reply(nil, error) }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    private var removeMutationForTesting = false
+    var removePreflightForTesting: (() -> Void)?
+    var removeCommitReceiptForTesting: ((sfs_result, inout sfs_result) -> Void)?
+    func removeResultForTesting(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
+                                reply: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+        removeItemHandler(item, name: name, directory: directory, caller: caller, reply: reply)
+    }
+#endif
+#endif
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler: @escaping (FSRenameItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
 #endif
@@ -1845,6 +1924,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             accountCommit(receipt)
 #if STALLION_ADAPTER_CHECK
             if pendingCreate != nil, status == SFS_OK { createCommitReceiptForTesting?(&receipt) }
+            if removeMutationForTesting, status == SFS_OK {
+                let committedReceipt = receipt
+                removeCommitReceiptForTesting?(committedReceipt, &receipt)
+            }
 #endif
 #else
             let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
