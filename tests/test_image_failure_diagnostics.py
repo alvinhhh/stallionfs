@@ -34,6 +34,402 @@ def captured(stdout=b'', stderr=b'', status=0, **extra):
                 truncated=False, reaped=True, capture_error=None, cleanup_error=None, **extra)
 
 
+class CreateStatusObservationTests(unittest.TestCase):
+    """Fake children only: never launch, wait for, signal or inspect a real child."""
+    def setUp(self):
+        self.waitid = self.enterContext(patch.object(diagnostics.os, 'waitid', create=True,
+            side_effect=AssertionError('unexpected native waitid')))
+        for name, value in (('P_PID', 1), ('WEXITED', 4), ('WNOHANG', 1),
+                            ('WNOWAIT', 32), ('CLD_EXITED', 1), ('CLD_KILLED', 2), ('CLD_DUMPED', 3)):
+            self.enterContext(patch.object(diagnostics.os, name, value, create=True))
+        self.writer = self.enterContext(patch.object(diagnostics.os, 'write', side_effect=lambda fd, data: len(data)))
+        self.thread = self.enterContext(patch.object(diagnostics.threading, 'Thread'))
+        self.thread.return_value.is_alive.return_value = False
+        self.enterContext(patch.object(diagnostics.subprocess, 'Popen', side_effect=AssertionError('unexpected child')))
+
+    def observer(self):
+        value = diagnostics.CreateObservation(('selected',))
+        value.child = SimpleNamespace(pid=123, returncode=None,
+            stdout=SimpleNamespace(closed=False), stderr=SimpleNamespace(closed=True))
+        return value
+
+    def exit_status(self, code=1, status=0):
+        return SimpleNamespace(si_pid=123, si_code=code, si_status=status)
+
+    def test_nonreaping_status_and_local_close_only(self):
+        for result, state in ((None, 'no_exit_observed'), (self.exit_status(), 'exited_status_observed')):
+            with self.subTest(state=state):
+                value = self.observer()
+                self.waitid.side_effect = None
+                self.waitid.return_value = result
+                record = value._sample()
+                self.assertEqual(record['state'], state)
+                self.assertFalse(record['stdout_closed'])
+                self.assertTrue(record['stderr_closed'])
+                self.assertEqual((record['eof'], record['byte_counts']), ('unobserved', 'unobserved'))
+                self.waitid.assert_called_with(1, 123, 4 | 1 | 32)
+                self.assertIsNone(value.child.returncode)
+                self.assertFalse(value.in_flight)
+        for code, category in ((1, 'exit'), (2, 'signal'), (3, 'signal_core')):
+            self.waitid.return_value = self.exit_status(code, 9)
+            record = self.observer()._sample()
+            self.assertEqual((record['category'], record['status']), (category, 9))
+
+    def test_errors_identity_and_completion_are_unknown(self):
+        for error in (ChildProcessError(), OSError('unavailable')):
+            self.waitid.side_effect = error
+            self.assertEqual(self.observer()._sample()['state'], 'unknown')
+        self.waitid.side_effect = None
+        for status in (SimpleNamespace(si_pid=999, si_code=1, si_status=0), self.exit_status(99)):
+            self.waitid.return_value = status
+            self.assertEqual(self.observer()._sample()['state'], 'unknown')
+        value = self.observer()
+        def completion(*args):
+            value.child.returncode = 0
+            return self.exit_status()
+        self.waitid.side_effect = completion
+        self.assertEqual(value._sample()['reason'], 'completion_or_disarm_race')
+
+    def test_stop_or_foreign_entry_during_property_prevents_query(self):
+        for foreign in (False, True):
+            value = self.observer()
+            class ClosingProperty:
+                @property
+                def closed(self):
+                    if foreign:
+                        value.constructor_entry(object(), (['foreign'],), {})
+                    else:
+                        value.stop_queries()
+                    return False
+            value.child.stdout = ClosingProperty()
+            self.assertEqual(value._sample()['reason'], 'stopped_or_disarmed')
+        self.waitid.assert_not_called()
+
+    def test_final_gate_checks_after_properties_and_before_query(self):
+        value = self.observer()
+        class Gate:
+            def __enter__(self):
+                value.disarmed.set()
+            def __exit__(self, *args):
+                return False
+        value.gate = Gate()
+        self.assertEqual(value._sample()['reason'], 'stopped_or_disarmed')
+        self.waitid.assert_not_called()
+
+    def test_inflight_stop_discards_result(self):
+        value = self.observer()
+        def query(*args):
+            self.assertTrue(value.in_flight)
+            value.stop_queries()
+            return self.exit_status()
+        self.waitid.side_effect = query
+        self.assertEqual(value._sample()['reason'], 'completion_or_disarm_race')
+        self.assertTrue(value.query_uncertain)
+        self.assertFalse(value.in_flight)
+        self.waitid.reset_mock()
+        value._sample()
+        self.waitid.assert_not_called()
+
+    def test_foreign_entry_alone_latches_inflight_uncertainty(self):
+        value = self.observer()
+        def query(*args):
+            self.assertTrue(value.in_flight)
+            value.constructor_entry(object(), (['foreign'],), {})
+            self.assertTrue(value.query_uncertain)
+            return self.exit_status()
+        self.waitid.side_effect = query
+        self.assertEqual(value._sample()['reason'], 'completion_or_disarm_race')
+        self.assertTrue(value.disarmed.is_set())
+        self.assertTrue(value.query_stopped.is_set())
+        self.assertTrue(value.query_uncertain)
+        self.assertFalse(value.in_flight)
+        self.waitid.reset_mock()
+        value._sample()
+        self.waitid.assert_not_called()
+
+    def test_stop_while_query_releases_gate_latches_uncertainty(self):
+        value = self.observer()
+        real_gate = value.gate
+        entries = []
+        class Gate:
+            def __enter__(self):
+                entries.append(True)
+                real_gate.acquire()
+                if len(entries) == 2:
+                    # Stop was published while its nonblocking gate acquisition
+                    # could not see in_flight. The worker must retain that race.
+                    value.query_stopped.set()
+            def __exit__(self, *args):
+                real_gate.release()
+        value.gate = Gate()
+        self.waitid.side_effect = None
+        self.waitid.return_value = self.exit_status()
+        self.assertEqual(value._sample()['reason'], 'completion_or_disarm_race')
+        self.assertTrue(value.query_uncertain)
+
+    def test_stop_during_returncode_after_query_discards_result(self):
+        for foreign in (False, True):
+            value = self.observer()
+            reads = []
+            class Child:
+                pid = 123
+                stdout = stderr = SimpleNamespace(closed=False)
+                @property
+                def returncode(self):
+                    reads.append(True)
+                    if len(reads) == 2:
+                        if foreign:
+                            value.constructor_entry(object(), (['foreign'],), {})
+                        else:
+                            value.stop_queries()
+                    return None
+            value.child = Child()
+            self.waitid.side_effect = None
+            self.waitid.return_value = self.exit_status()
+            self.assertEqual(value._sample()['reason'], 'completion_or_disarm_race')
+            self.assertFalse(value.in_flight)
+            self.waitid.reset_mock()
+            value._sample()
+            self.waitid.assert_not_called()
+
+    def test_missing_api_property_error_and_reaped_child_do_not_query(self):
+        value = self.observer()
+        with patch.object(diagnostics, 'hasattr', side_effect=lambda obj, name: name != 'WNOWAIT', create=True):
+            self.assertEqual(value._sample()['reason'], 'api_unavailable')
+        value.child.stdout = None
+        self.assertEqual(value._sample()['state'], 'unknown')
+        value.child.returncode = 0
+        value._sample()
+        self.waitid.assert_not_called()
+
+    def test_constructor_selection_requires_owner_exact_args_and_one_instance(self):
+        for argv, owner in ((['other'], None), (['selected'], 'other_thread')):
+            value = diagnostics.CreateObservation(('selected',))
+            with patch.object(diagnostics.threading, 'get_ident',
+                              return_value=value.owner if owner is None else value.owner + 1):
+                value.constructor_entry(object(), (argv,), {})
+            self.assertIsNone(value.child)
+            self.assertTrue(value.disarmed.is_set())
+        value = diagnostics.CreateObservation(('selected',))
+        first, duplicate = object(), object()
+        value.constructor_entry(first, (), {'args': ['selected']})
+        self.assertIs(value.child, first)
+        self.assertFalse(value.disarmed.is_set())
+        value.constructor_entry(duplicate, (['selected'],), {})
+        self.assertIs(value.child, first)
+        self.assertTrue(value.disarmed.is_set())
+
+    def test_writer_caps_partial_write_and_error_without_textio(self):
+        value = self.observer()
+        for phase in ('start', '60', '120', 'finish', 'extra'):
+            value._emit(phase, state='unknown')
+        self.assertEqual(self.writer.call_count, 4)
+        payloads = [entry.args[1] for entry in self.writer.call_args_list]
+        self.assertTrue(all(entry.args[0] == 2 for entry in self.writer.call_args_list))
+        self.assertLessEqual(sum(map(len, payloads)), 4096)
+        self.assertTrue(all(len(data) <= 1024 for data in payloads))
+        self.assertNotIn(b'123', b''.join(payloads))
+        for failure in ('partial', 'error'):
+            value = self.observer()
+            self.writer.reset_mock()
+            self.writer.side_effect = OSError('blocked sink') if failure == 'error' else lambda *args: 1
+            value._emit('start')
+            value._emit('finish')
+            self.writer.assert_called_once()
+            self.assertTrue(value.write_unavailable)
+        value = self.observer()
+        self.writer.reset_mock()
+        value._emit('start', invalid='x' * 1024)
+        self.writer.assert_not_called()
+
+    def test_worker_schedule_and_early_completion_use_no_real_waits(self):
+        value = self.observer()
+        value.start = 0
+        value.ready = Mock()
+        value.done = Mock()
+        value.done.is_set.side_effect = [False, False, False]
+        value.done.wait.side_effect = [False, False, True]
+        with patch.object(value, '_sample', return_value={'state': 'unknown'}) as sample, \
+                patch.object(diagnostics.time, 'monotonic', return_value=0):
+            value._run()
+        self.assertEqual(sample.call_count, 2)
+        self.assertEqual(value.done.wait.call_args_list, [call(60), call(120), call()])
+        self.assertEqual([json.loads(c.args[1])['phase'] for c in self.writer.call_args_list],
+                         ['start', '60', '120', 'finish'])
+        self.writer.reset_mock()
+        value = self.observer()
+        value.done.set()
+        value.ready.set()
+        value._run()
+        self.assertEqual([json.loads(c.args[1])['phase'] for c in self.writer.call_args_list], ['start', 'finish'])
+        self.waitid.assert_not_called()
+
+    def test_thread_start_and_bounded_join_preserve_uncertainty(self):
+        value = self.observer()
+        self.thread.return_value.start.side_effect = RuntimeError('thread unavailable')
+        value.launch()
+        self.assertTrue(value.shutdown_uncertain)
+        value.close()
+        self.thread.return_value.start.side_effect = None
+        value = self.observer()
+        value.launch()
+        self.writer.assert_not_called()  # start/finish never write on operation thread
+        self.thread.return_value.is_alive.return_value = True
+        value.close()
+        self.thread.return_value.join.assert_called_with(0.05)
+        self.assertTrue(value.shutdown_uncertain)
+        self.assertTrue(value.query_stopped.is_set())
+        self.assertTrue(value.done.is_set())
+
+    def test_late_worker_after_pending_write_cannot_query(self):
+        value = self.observer()
+        value.start = 0
+        value.ready.set()
+        value.launch()
+        def write(fd, data):
+            if json.loads(data)['phase'] == 'start':
+                # Model close completing while this worker's write is pending.
+                self.thread.return_value.is_alive.return_value = True
+                value.close()
+            return len(data)
+        self.writer.side_effect = write
+        value._run()
+        self.waitid.assert_not_called()
+        self.assertTrue(value.shutdown_uncertain)
+        self.assertEqual([json.loads(c.args[1])['phase'] for c in self.writer.call_args_list], ['start', 'finish'])
+        self.thread.return_value.join.assert_called_once_with(0.05)
+
+    def test_selected_constructor_binding_foreign_entry_and_restoration(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        parent = base / 'store' / 'staging' / 'build-test'
+        parent.mkdir(parents=True, mode=0o700)
+        args = ('/usr/bin/hdiutil', 'create', parent / 'workspace.sparseimage')
+        constructions, communications, observations = [], [], []
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                observations.append(diagnostics._active_create)
+                if argv == ['foreign']:
+                    self_test.assertTrue(diagnostics._active_create.disarmed.is_set())
+                self.pid, self.returncode = 123, None
+                self.stdout = self.stderr = SimpleNamespace(closed=False)
+                constructions.append((argv, kwargs))
+            def communicate(self, *args, **kwargs):
+                communications.append((args, kwargs))
+                self.returncode = 0
+                return b'out', b'err'
+        self_test = self
+        def original(*actual):
+            child = subprocess.Popen([str(v) for v in actual], marker=7)
+            subprocess.Popen(['foreign'])  # never communicates; must disarm at entry
+            return child.communicate(input=None, timeout=None)
+        with patch.object(subprocess, 'Popen', FakePopen):
+            with diagnostics.observe_seed_create(base):
+                self.assertEqual(diagnostics._observed_create(original, args), (b'out', b'err'))
+            self.assertIs(subprocess.Popen, FakePopen)
+        self.assertEqual(communications, [((), {'input': None, 'timeout': None})])
+        self.assertEqual(constructions[0], ([str(v) for v in (*args, '-verbose')], {'marker': 7}))
+        self.assertIs(observations[0], observations[1])
+        self.assertTrue(observations[0].disarmed.is_set())
+        self.assertEqual(observations[0].outcome, 'returned')
+        self.assertIsNone(diagnostics._active_create)
+        self.assertIsNone(diagnostics._create_scope.get())
+        self.writer.assert_not_called()
+        self.waitid.assert_not_called()
+
+    def test_setup_start_and_close_errors_preserve_single_operation(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        parent = base / 'store' / 'staging' / 'build-test'
+        parent.mkdir(parents=True, mode=0o700)
+        args = ('/usr/bin/hdiutil', 'create', parent / 'workspace.sparseimage')
+        class FakePopen:
+            pass
+        for method in ('setup', 'launch', 'close'):
+            for primary in (None, OSError('native failure'), KeyboardInterrupt()):
+                original = Mock(return_value=b'unchanged', side_effect=primary)
+                target, attribute = ((diagnostics, 'CreateObservation') if method == 'setup'
+                                     else (diagnostics.CreateObservation, method))
+                with patch.object(subprocess, 'Popen', FakePopen), \
+                        patch.object(target, attribute, side_effect=RuntimeError('observer failure')), \
+                        diagnostics.observe_seed_create(base):
+                    if primary is None:
+                        self.assertEqual(diagnostics._observed_create(original, args), b'unchanged')
+                    else:
+                        with self.assertRaises(type(primary)) as caught:
+                            diagnostics._observed_create(original, args)
+                        self.assertIs(caught.exception, primary)
+                    self.assertIs(subprocess.Popen, FakePopen)
+                original.assert_called_once_with(*args, '-verbose')
+                self.assertIsNone(diagnostics._active_create)
+                self.assertTrue(diagnostics._create_patch_lock.acquire(blocking=False))
+                diagnostics._create_patch_lock.release()
+        self.writer.assert_not_called()
+        self.waitid.assert_not_called()
+
+    def test_selected_communicate_exception_and_scope_use_are_preserved(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        parent = base / 'store' / 'staging' / 'build-test'
+        parent.mkdir(parents=True, mode=0o700)
+        args = ('/usr/bin/hdiutil', 'create', parent / 'workspace.sparseimage')
+        for primary in (OSError('communicate failed'), KeyboardInterrupt(), SystemExit(9)):
+            communications, observations = [], []
+            class FakePopen:
+                def __init__(self, argv):
+                    self.pid, self.returncode = 123, None
+                    self.stdout = self.stderr = SimpleNamespace(closed=False)
+                def communicate(self, *actual, **kwargs):
+                    communications.append((actual, kwargs))
+                    raise primary
+            def original(*actual):
+                observations.append(diagnostics._active_create)
+                return subprocess.Popen([str(v) for v in actual]).communicate(b'input', timeout=7)
+            with patch.object(subprocess, 'Popen', FakePopen), diagnostics.observe_seed_create(base):
+                with self.assertRaises(type(primary)) as caught:
+                    diagnostics._observed_create(original, args)
+                self.assertIs(caught.exception, primary)
+                self.assertIs(subprocess.Popen, FakePopen)
+                # A second command in the same scope must bypass observation.
+                later = Mock(return_value=b'later')
+                self.assertEqual(diagnostics._observed_create(later, args), b'later')
+                later.assert_called_once_with(*args, '-verbose')
+            self.assertEqual(communications, [((b'input',), {'timeout': 7})])
+            self.assertEqual(len(observations), 1)
+            self.assertTrue(observations[0].query_stopped.is_set())
+            self.assertTrue(observations[0].done.is_set())
+            self.assertEqual(observations[0].outcome, 'raised')
+        self.waitid.assert_not_called()
+
+    def test_primary_exception_nested_scope_and_lock_restoration(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        parent = base / 'store' / 'staging' / 'build-test'
+        parent.mkdir(parents=True, mode=0o700)
+        args = ('/usr/bin/hdiutil', 'create', parent / 'workspace.sparseimage')
+        class FakePopen:
+            pass
+        for primary in (OSError('launch failed'), KeyboardInterrupt(), SystemExit(3)):
+            original = Mock(side_effect=primary)
+            with patch.object(subprocess, 'Popen', FakePopen), diagnostics.observe_seed_create(base):
+                with self.assertRaises(type(primary)) as caught:
+                    diagnostics._observed_create(original, args)
+                self.assertIs(caught.exception, primary)
+                self.assertIs(subprocess.Popen, FakePopen)
+            original.assert_called_once_with(*args, '-verbose')
+            self.assertIsNone(diagnostics._active_create)
+            self.assertTrue(diagnostics._create_patch_lock.acquire(blocking=False))
+            diagnostics._create_patch_lock.release()
+        with diagnostics.observe_seed_create(base):
+            outer = diagnostics._create_scope.get()
+            with diagnostics.observe_seed_create(base):
+                self.assertIs(diagnostics._create_scope.get(), outer)
+                self.assertTrue(outer['disabled'])
+            original = Mock(return_value=b'normal')
+            self.assertEqual(diagnostics._observed_create(original, args), b'normal')
+        self.waitid.assert_not_called()
+
+
 class DirectImageFixtureTests(unittest.TestCase):
     def file_fixture(self):
         fixture = fileops.FileOperations()
