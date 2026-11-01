@@ -55,6 +55,8 @@ The dataset input begins with 2,000 generated files and 50,000,000,000 logical b
 
 The clone configurations are the same workload. Two workers are explicit; the four-worker row records `--jobs 4`, matching the default setting. Both preserve the observed RSS increase. No worker default was changed. Older raw result files remain available.
 
+The clone rows compare StallionFS with the recorded `ditto` command; they do not establish a mandatory-clone performance win. macOS `cp -cRp` requests cloning but permits fallback to `copyfile`; it is not equivalent to a clone command that must fail when cloning is unavailable. Keep command policy separate from observed sharing.
+
 ### Linux/OpenZFS descriptive references
 
 Separate warm document-tree cells, ten direct and ten GNU Time resource samples each; these are unpaired native references, with no StallionFS comparison.
@@ -147,13 +149,13 @@ Apple references are plain `cp -cRp`, `mv -n` and `rm -f`; JSON comparisons are 
 /tmp/stallionfs-perf-env/bin/python tests/perf/fileops.py --memory --binary /tmp/stallionfs-perf-env/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/fileops.json
 ```
 
-Requires 2 GiB free. Clone, delete and move each cover a 4 KiB file, a 64 MiB file, 2,000 flat files and 10,000 nested files. References are `cp -cRp`, `rm -rf` and `mv -n`. Both copies use copy-on-write; moves use an absent exact destination. Overwrite and cross-volume behavior are outside this comparison.
+Requires 2 GiB free. Clone, delete and move each cover a 4 KiB file, a 64 MiB file, 2,000 flat files and 10,000 nested files. References are `cp -cRp`, `rm -rf` and `mv -n`. The `cp -cRp` reference permits fallback to `copyfile`; these checks do not establish that it shared data. Moves use an absent exact destination. Overwrite and cross-volume behavior are outside this comparison.
 
 Limit a run with `--fixtures flat_2000 nested_10000 --operations clone`. Unselected fixtures are never generated; JSON records selected cases and setup, validation and cleanup durations separately from command timing.
 
 Fresh-process timings use 31 measured pairs for 4 KiB, seven otherwise, plus one warmup, with shuffled order. CPU uses `cpu_children_s`; `cpu_self_s` and aggregate `cpu_s` remain diagnostics. `--memory` adds three separate pairs using `time -lp`: child peak RSS and physical footprint, excluding the runner. Wrapped times are separate; memory counters do not measure unique filesystem-cache or APFS storage use.
 
-Validation checks content, modes, symlinks, independent clone inodes, preserved move inodes and completed deletion. Deletion operates on a copy-on-write copy of the retained fixture. Verification reads precede timing; fixtures may exceed RAM. No durability flush is requested. `--timeout` adjusts the 600-second operation/setup-copy limit.
+Validation checks content, modes, symlinks, independent clone inodes, preserved move inodes and completed deletion. Deletion operates on a separate `cp -cRp` copy of the retained fixture. Verification reads precede timing; fixtures may exceed RAM. No durability flush is requested. `--timeout` adjusts the 600-second operation/setup-copy limit.
 
 ## Large file trees
 
@@ -289,8 +291,11 @@ Both npm version inspection and installation use the disposable project prefix a
 
 On macOS, the native suite observes regular-file data-stream clone attributes through the
 already-open validation descriptors. Destination attributes are compared with
-the post-copy source. StallionFS and `cp -cRp` require positive sharing evidence
-for every data-bearing regular-file stream; ordinary `cp`, `ditto` and `rsync`
+the post-copy source. The harness requires positive sharing evidence from StallionFS and `cp -cRp`
+for every data-bearing regular-file stream. This is a validation requirement,
+not a no-fallback command contract: macOS `cp -cRp` may use `copyfile`. Positive
+sharing applies to the measured streams and does not make its command policy
+equivalent to mandatory cloning. Ordinary `cp`, `ditto` and `rsync`
 record sharing separately from copy correctness. Unsupported attributes and
 zero identifiers remain unknown. Empty and observed holes-only streams are not
 positive evidence; a tree with no qualifying streams remains unknown.

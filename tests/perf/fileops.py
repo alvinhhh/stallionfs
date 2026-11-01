@@ -47,6 +47,18 @@ def digest(path):
 
 
 def command(arguments, *, check=True, timeout=120, environment=None):
+    if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
+        from stallionfs._benchmark_budget import command as bounded_command, ChildCompletionUnknown as BudgetUnknown
+        try:
+            result = bounded_command(arguments, timeout=timeout, environment=environment, umask=0o077)
+        except BudgetUnknown as error:
+            failure = ChildCompletionUnknown('Command completion uncertain; retain its fixture')
+            failure.receipt = error.receipt
+            raise failure from error
+        if check and result.returncode:
+            raise RuntimeError(f'Command failed ({result.returncode}): {arguments[0]}: '
+                               + result.stderr.decode(errors='replace').strip())
+        return result
     try:
         result = subprocess.run([str(arg) for arg in arguments], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -389,6 +401,22 @@ def remove_fixture(path):
 
 
 def fingerprint_sources():
+    manifest_path = Path(__file__).with_name('manifest.json')
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        require(manifest.get('schema') == 1 and manifest.get('kind') == 'build-source provenance',
+                'Invalid installed benchmark manifest')
+        root = Path(__file__).parent
+        actual = {name: digest(root / name) for name in manifest['resources']}
+        require(actual == manifest['resources'], 'Installed benchmark resource changed')
+        import stallionfs
+        package = Path(stallionfs.__file__).resolve().parent
+        result = {'build-source/' + name: value for name, value in manifest['build_source_sha256'].items()}
+        result.update({'installed-runner/' + name: value for name, value in actual.items()})
+        result.update({'installed-package/' + file.name: digest(file) for file in package.iterdir()
+                       if file.is_file() and file.suffix in ('.py', '.so')})
+        result['installed-runner/manifest.json'] = digest(manifest_path)
+        return result
     paths = [REPO / "pyproject.toml", REPO / "setup.py", Path(__file__)]
     paths.extend(path for path in (REPO / "stallionfs").iterdir()
                  if path.is_file() and path.suffix in {".c", ".h", ".py"})
@@ -617,7 +645,7 @@ def main():
             "Setup, full content/mode/link verification and cleanup are outside timed commands and identical between methods.",
             "Per-row setup_s excludes setup_validation_s; validation_s excludes cleanup_s. Fixture setup/validation totals cover generation and source checks. These overheads exclude reporting and final cleanup and never enter command timings or CPU.",
             "Selection lists the exact fixture/operation coverage. Filters run before generation; a complete selected run does not imply full-suite coverage. Verification preconditions caches; this is not a cold-cache comparison.",
-            "Clone baseline uses cp -cRp to request native cloning and preserve metadata; no weaker byte-copy baseline is substituted.",
+            "Clone baseline uses cp -cRp to request native cloning and preserve metadata, but macOS permits fallback to copyfile. Content/mode/inode checks do not prove sharing; this is not a mandatory-clone comparison.",
             "Every move uses an absent exact destination on the same filesystem. Existing-destination exit-status differences are not timed.",
             "Deletion timing ends only after process exit, and absence is checked immediately; no rename-to-trash or deferred deletion.",
             "These commands do not promise fsync durability; this benchmark makes no durable-write or power-loss claim.",

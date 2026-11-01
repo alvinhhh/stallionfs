@@ -270,11 +270,20 @@ class CampaignTests(unittest.TestCase):
         cold_tools = {'/usr/bin/sudo', '/usr/sbin/purge'}
         for cache in (['warm'], ['warm', 'cold']):
             args.cache = cache
+            # This fixture models checkout tools, not an installed resource manifest.
+            files = {args.binary, args.binary.with_name('stallionfs-python'),
+                     self.root / 'bin/python', args.node, args.npm,
+                     args.npm.parent.parent / 'package.json', Path('/usr/bin/git'),
+                     *(Path(name) for name in ('/bin/cp', '/bin/mv', '/bin/rm',
+                       '/usr/bin/ditto', '/usr/bin/rsync', '/usr/bin/find',
+                       '/usr/bin/stat', '/usr/bin/time', '/bin/chmod'))}
+            if 'cold' in cache:
+                files.update(map(Path, cold_tools))
             with self.subTest(cache=cache), \
                     mock.patch.dict(sys.modules, {'stallionfs': mock.Mock(__file__=str(package / '__init__.py'))}), \
                     mock.patch.object(sys, 'executable', str(self.root / 'bin/python')), \
                     mock.patch.object(sys, 'prefix', str(self.root)), \
-                    mock.patch.object(Path, 'is_file', return_value=True), \
+                    mock.patch.object(Path, 'is_file', autospec=True, side_effect=lambda path: path in files), \
                     mock.patch.object(campaign.os, 'access', return_value=True), \
                     mock.patch.object(campaign.shutil, 'which', return_value='/usr/bin/git'), \
                     mock.patch.object(campaign.f, 'fingerprint_sources', return_value={}), \

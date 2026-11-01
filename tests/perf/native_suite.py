@@ -598,6 +598,8 @@ def main():
                                     row['validated'] = preserved(row['correctness']) and row['source_unchanged']
                                     if operation == 'clone' and not linux and row['exit_code'] == 0:
                                         row['data_stream_sharing'] = native_correctness.clone_sharing(source_after, after)
+                                        # This requires observed sharing, not a no-fallback command contract.
+                                        # macOS cp -c may use copyfile; keep command policy separate.
                                         required = method in ('stallionfs', 'cp-clone')
                                         row['data_stream_sharing']['required'] = required
                                         if required:

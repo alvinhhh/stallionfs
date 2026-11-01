@@ -57,6 +57,24 @@ def comparisons(rows, phase):
             for method, values in methods.items() if method != 'posix'}
 
 
+def runtime_provenance():
+    """Hash installed resources without requiring repository C source files."""
+    native_binary = Path(_scan.__file__).resolve()
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        import stallionfs
+        package = Path(stallionfs.__file__).resolve().parent
+        f.require(native_binary.parent == package, 'Use the extension from this installed package')
+        return f.fingerprint_sources(), native_binary, 'Installed package; memory children verify the same binary hash'
+    package = Path(__file__).resolve().parents[2] / 'stallionfs'
+    f.require(native_binary.parent != package.resolve(),
+              'Use an installed runtime outside the source checkout')
+    sources = [package / name for name in ('__init__.py', '_scan.c', '_walk.c', '_tree.h')]
+    sources += [Path(__file__), Path(f.__file__), Path(native_fixtures.__file__),
+                Path(native_metrics.__file__), Path(native_correctness.__file__)]
+    return ({path.name: f.digest(path) for path in sources}, native_binary,
+            'Installed runtime outside source checkout; memory children verify the same binary hash')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scratch', type=Path, required=True)
@@ -68,14 +86,7 @@ def main():
     if not 1 <= args.files <= 1000000 or not 10 <= args.samples <= 100:
         parser.error('Use 1–1,000,000 files and 10–100 samples')
     rng = random.Random(20261006)
-    package = Path(__file__).resolve().parents[2] / 'stallionfs'
-    sources = [package / name for name in ('__init__.py', '_scan.c', '_walk.c', '_tree.h')]
-    sources += [Path(__file__), Path(f.__file__), Path(native_fixtures.__file__),
-                Path(native_metrics.__file__), Path(native_correctness.__file__)]
-    hashes = {path.name: f.digest(path) for path in sources}
-    native_binary = Path(_scan.__file__)
-    f.require(native_binary.resolve().parent != package.resolve(),
-              'Use an installed runtime outside the source checkout')
+    hashes, native_binary, native_origin = runtime_provenance()
     scratch = args.scratch.resolve(strict=True)
     f.require(scratch.is_dir(), '--scratch must be an existing directory')
     volume = f.scratch_volume(_scan.mounts(), scratch)
@@ -89,7 +100,7 @@ def main():
               'implementation_sha256': hashes,
               'native_binary_sha256': f.digest(native_binary),
               'native_module': native_binary.name,
-              'native_origin': 'Installed runtime outside source checkout; memory children verify the same binary hash',
+              'native_origin': native_origin,
               'python_binary_sha256': f.digest(Path(sys.executable)),
               'python': platform.python_version(), 'samples': args.samples, 'warmup_rounds': 2,
               'timing': 'Python API wall and process CPU time; native implementations; warm OS cache; no process startup',
@@ -197,7 +208,7 @@ def main():
                                  for key in ('rss_bytes', 'footprint_bytes')} for method in METHODS}
                     details['memory_comparisons'] = comparisons(details['memory_rows'], 'resources')
                 print(layout, json.dumps(medians), flush=True)
-            f.require({path.name: f.digest(path) for path in sources} == hashes and
+            f.require(runtime_provenance()[0] == hashes and
                       f.digest(native_binary) == result['native_binary_sha256'] and
                       f.digest(Path(sys.executable)) == result['python_binary_sha256'] and
                       (not args.memory or f.digest(Path('/usr/bin/time')) == result['time_sha256']),

@@ -93,6 +93,8 @@ def main(argv=None):
     purge.add_argument("id")
     purge.add_argument("--yes", action="store_true")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
+    from . import benchmark
+    benchmark.parser(commands)
     raw = list(sys.argv[1:] if argv is None else argv)
     setup = []
     command_index = 0
@@ -111,6 +113,8 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'benchmark':
+        return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
     try:
         store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)

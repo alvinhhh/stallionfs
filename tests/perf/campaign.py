@@ -37,10 +37,16 @@ def fingerprints(args):
     package = Path(stallionfs.__file__).resolve().parent
     python = Path(sys.executable).absolute()
     for path in (args.binary, python, python.resolve(), package):
-        f.require(not path.is_relative_to(f.REPO), 'Use an installed runtime outside the checkout')
-    f.require(package.is_relative_to(Path(sys.prefix).resolve()) and
-              args.binary.parent == python.parent.resolve(),
-              'Use the Python and CLI from the same installed environment')
+        f.require(Path(f.__file__).with_name('manifest.json').is_file() or not path.is_relative_to(f.REPO),
+                  'Use an installed runtime outside the checkout')
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        f.require(str(package) == os.environ.get('STALLIONFS_BENCHMARK_PACKAGE')
+                  and str(args.binary) == os.environ.get('STALLIONFS_BENCHMARK_BINARY'),
+                  'Use this installed package and its native executable')
+    else:
+        f.require(package.is_relative_to(Path(sys.prefix).resolve()) and
+                  args.binary.parent == python.parent.resolve(),
+                  'Use the Python and CLI from the same installed environment')
     helper = args.binary.with_name('stallionfs-python')
     npm_manifest = args.npm.parent.parent / 'package.json'
     git = shutil.which('git', path=environment(args.node)['PATH'])
@@ -169,7 +175,7 @@ def collect(args):
                     remaining = [cache for cache in argv[start:end] if cache != 'cold']
                     argv = [*argv[:start], *remaining, *argv[end:]] if remaining else None
                 row = {'cycle': cycle, 'stage': name, 'argv': argv, 'output': str(output),
-                       'log': str(log), 'status': 'pending', 'started_utc': datetime.now(timezone.utc).isoformat()}
+                       'log': str(log), 'cache': args.cache if name.startswith('native-') else ['warm'], 'status': 'pending', 'started_utc': datetime.now(timezone.utc).isoformat()}
                 if omitted:
                     row.update(planned_argv=planned, omitted_cold_cache=omitted)
                 report['stages'].append(row)
@@ -182,9 +188,14 @@ def collect(args):
                     with log.open('xb') as stream:
                         row['status'] = 'running'
                         save()
-                        completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stream,
-                                                   stderr=subprocess.STDOUT, cwd=args.output_dir,
-                                                   env=environment(args.node), check=False)
+                        if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
+                            from stallionfs._benchmark_budget import command
+                            completed = command(argv, timeout=None, cwd=args.output_dir,
+                                                environment=environment(args.node), umask=0o077, output=stream)
+                        else:
+                            completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stream,
+                                                       stderr=subprocess.STDOUT, cwd=args.output_dir,
+                                                       env=environment(args.node), check=False)
                     row.update(exit_code=completed.returncode, ended_utc=datetime.now(timezone.utc).isoformat())
                     row['outcome'], row['evidence'] = outcome(name, output)
                     row['fingerprints_unchanged'] = fingerprints(args) == pins
