@@ -225,6 +225,25 @@ def clone_policy(variant, platform_name=None):
     return 'unknown'
 
 
+COPY_COMPARISON_POLICY = {
+    'scope': 'logical_copy_commands',
+    'storage_mechanism': 'uncontrolled',
+    'materialized_copy_comparison': False,
+}
+
+
+def copy_comparison_policy(variant, platform_name=None):
+    platform_name = sys.platform if platform_name is None else platform_name
+    policy = dict(COPY_COMPARISON_POLICY)
+    policy['reason'] = 'Logical-copy validation does not establish storage-mechanism equivalence.'
+    if variant == 'native_ditto':
+        policy['reference_qualification'] = 'clone_capable'
+        policy['reason'] = 'ditto may enter clone-related paths; materialized-copy equivalence is not controlled.'
+    elif variant == 'native_cp' and platform_name == 'linux':
+        policy['clone_request'] = 'disabled_by_reflink_never'
+    return policy
+
+
 def summarize(samples, expected_repetitions=None):
     if expected_repetitions is not None and (type(expected_repetitions) is not int or expected_repetitions < 1):
         raise ValueError('Expected repetitions must be a positive integer')
@@ -234,6 +253,16 @@ def summarize(samples, expected_repetitions=None):
         for variant in sorted({s['variant'] for s in samples if s['case'] == case}):
             attempts = [s for s in samples if s['case'] == case and s['variant'] == variant]
             policy = {}
+            if case == 'copy':
+                recorded = attempts[0].get('copy_comparison_policy')
+                if (isinstance(recorded, dict)
+                        and all(recorded.get(k) == v for k, v in COPY_COMPARISON_POLICY.items())
+                        and all(s.get('copy_comparison_policy') == recorded for s in attempts)):
+                    copy_policy = dict(recorded)
+                else:
+                    copy_policy = dict(COPY_COMPARISON_POLICY, scope='unrecorded_or_inconsistent',
+                                       reason='Copy-comparison policy was not consistently recorded for all attempts.')
+                policy['copy_comparison_policy'] = copy_policy
             if case == 'clone':
                 recorded = {s.get('clone_policy', 'unknown') for s in attempts}
                 value = next(iter(recorded)) if len(recorded) == 1 else 'unknown'
@@ -360,12 +389,16 @@ def main():
               'A zero native RSS counter is retained raw but unavailable for memory summaries or wins.',
               'Supervision covers the owned process group; these known commands do not detach into new sessions.',
               'No durability flush, power-loss test, ACL/xattr/owner/time comparison or physical-space inference.',
+              'Ordinary-copy comparisons measure logical-copy commands with storage mechanisms uncontrolled; they are not materialized-copy comparisons.',
               'SFS clone and Linux GNU cp --reflink=always request mandatory CoW; macOS cp -c can fall back to copyfile.',
               'Clone policy is recorded per variant/sample; fallback-capable, missing or inconsistent policies cannot enter mandatory-clone comparisons.',
               'Correct contents and write isolation do not establish physical extent sharing; sharing attributes are not inspected.',
               'Each case has one warmup followed by deterministically shuffled variants each measured repetition.']}
     report['parameters']['sfs'] = args.sfs
     report['parameters']['worker_counts'] = worker_counts
+    report['copy_comparison_policies'] = {variant: copy_comparison_policy(variant) for variant in
+        ['native_cp', *(['native_ditto'] if 'ditto' in tools else []),
+         *('sfs_jobs' + str(n) for n in worker_counts if args.sfs)]}
     report['clone_policies'] = {variant: clone_policy(variant) for variant in
                                ['native_cp', *('sfs_jobs' + str(n) for n in worker_counts if args.sfs)]}
     for key in ('root', 'output'):
@@ -462,6 +495,8 @@ def main():
                 for variant in variants:
                     sample = {'case': case, 'variant': variant, 'repetition': repetition,
                               'warmup': repetition == -1, 'status': 'pending'}
+                    if case == 'copy':
+                        sample['copy_comparison_policy'] = dict(report['copy_comparison_policies'][variant])
                     if case == 'clone':
                         sample['clone_policy'] = report['clone_policies'][variant]
                     report['samples'].append(sample)

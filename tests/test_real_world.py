@@ -308,6 +308,76 @@ class RealWorldValidity(unittest.TestCase):
         self.assertFalse(summary['comparisons']['sfs_jobs1']['peak_rss_bytes']['available'])
         self.assertIn('baseline_over_variant_median', summary['comparisons']['sfs_jobs1']['wall_s'])
 
+    def test_copy_comparison_policy_preserves_logical_scope_and_numeric_results(self):
+        policy = {'scope': 'logical_copy_commands', 'storage_mechanism': 'uncontrolled',
+                  'materialized_copy_comparison': False}
+        policies = {
+            'native_ditto': dict(policy, reference_qualification='clone_capable',
+                reason='ditto may enter clone-related paths; materialized-copy equivalence is not controlled.'),
+            'sfs_jobs1': dict(policy,
+                reason='Logical-copy validation does not establish storage-mechanism equivalence.'),
+        }
+        self.assertEqual(BENCHMARK.copy_comparison_policy('native_ditto', 'darwin'), policies['native_ditto'])
+        self.assertEqual(BENCHMARK.copy_comparison_policy('native_cp', 'linux'),
+                         dict(policies['sfs_jobs1'], clone_request='disabled_by_reflink_never'))
+        self.assertEqual(BENCHMARK.clone_policy('native_cp', 'linux'), 'mandatory')
+        values = {'native_ditto': [(9, 9, 999), (4, 2, 100), (6, 4, 120)],
+                  'sfs_jobs1': [(9, 9, 999), (2, 3, 200), (3, 5, 240)]}
+        samples = [{'case': 'copy', 'variant': variant, 'repetition': index - 1,
+                    'warmup': index == 0, 'status': 'passed', 'wall_s': wall,
+                    'cpu_s': cpu, 'peak_rss_bytes': rss}
+                   for variant, rows in values.items() for index, (wall, cpu, rss) in enumerate(rows)]
+        with mock.patch.object(BENCHMARK.sys, 'platform', 'darwin'):
+            unlabelled = BENCHMARK.summarize(samples, expected_repetitions=2)['copy']
+            labelled = [dict(s, copy_comparison_policy=dict(policies[s['variant']])) for s in samples]
+            labelled += [dict(s, variant='native_cp', status='failed',
+                              copy_comparison_policy=dict(policies['sfs_jobs1'])) for s in labelled[:3]]
+            summary = BENCHMARK.summarize(labelled, expected_repetitions=2)['copy']
+        self.assertEqual(summary['baseline'], 'native_ditto')
+        self.assertEqual(summary['comparisons'], unlabelled['comparisons'])
+        expected = {'native_ditto': {'wall_s': (5, 6, 1), 'cpu_s': (3, 4, 1),
+                                      'peak_rss_bytes': (110, 120, 10)},
+                    'sfs_jobs1': {'wall_s': (2.5, 3, .5), 'cpu_s': (4, 5, 1),
+                                  'peak_rss_bytes': (220, 240, 20)}}
+        for variant, metrics in expected.items():
+            self.assertEqual(summary['variants'][variant]['copy_comparison_policy'], policies[variant])
+            self.assertEqual(summary['variants'][variant]['n'], 2)
+            for metric, (median, p95, deviation) in metrics.items():
+                self.assertEqual(summary['variants'][variant][metric],
+                                 {'median': median, 'p95': p95, 'population_stdev': deviation})
+        for metric, ratio, wins, losses in [('wall_s', 2, 2, 0), ('cpu_s', .75, 0, 2),
+                                          ('peak_rss_bytes', .5, 0, 2)]:
+            self.assertEqual(summary['comparisons']['sfs_jobs1'][metric],
+                             {'baseline_over_variant_median': ratio, 'wins': wins,
+                              'losses': losses, 'ties': 0, 'paired_n': 2})
+        self.assertEqual(summary['excluded_variants']['native_cp'],
+                         {'copy_comparison_policy': policies['sfs_jobs1'], 'statuses': {'failed': 3}})
+        self.assertNotIn('native_cp', summary['variants'])
+        self.assertNotIn('copy_comparison_policy', samples[0])
+
+    def test_copy_comparison_policy_does_not_infer_missing_or_inconsistent_labels(self):
+        policy = {'scope': 'logical_copy_commands', 'storage_mechanism': 'uncontrolled',
+                  'materialized_copy_comparison': False}
+        samples = [{'case': 'copy', 'variant': variant, 'repetition': repetition,
+                    'warmup': repetition == -1, 'status': 'passed', 'wall_s': 2,
+                    'cpu_s': 1, 'peak_rss_bytes': 100,
+                    'copy_comparison_policy': BENCHMARK.copy_comparison_policy(variant, 'darwin')}
+                   for variant in ('native_ditto', 'sfs_jobs1') for repetition in (-1, 0)]
+        for missing in (True, False):
+            rows = [dict(s) for s in samples]
+            if missing:
+                rows[0].pop('copy_comparison_policy')
+            else:
+                rows[0]['copy_comparison_policy'] = dict(policy, storage_mechanism='materialized')
+            with self.subTest(missing=missing), mock.patch.object(BENCHMARK.sys, 'platform', 'darwin'):
+                summary = BENCHMARK.summarize(rows, expected_repetitions=1)['copy']
+                observed = summary['variants']['native_ditto']['copy_comparison_policy']
+                self.assertEqual(observed, dict(policy, scope='unrecorded_or_inconsistent',
+                    reason='Copy-comparison policy was not consistently recorded for all attempts.'))
+                self.assertEqual(summary['variants']['sfs_jobs1']['copy_comparison_policy'],
+                    dict(policy, reason='Logical-copy validation does not establish storage-mechanism equivalence.'))
+                self.assertEqual(summary['comparisons']['sfs_jobs1']['wall_s']['baseline_over_variant_median'], 1)
+
     def test_fallback_or_unknown_clone_policy_cannot_become_a_mandatory_clone_win(self):
         def row(variant, repetition, policy):
             sample = {'case': 'clone', 'variant': variant, 'repetition': repetition,
