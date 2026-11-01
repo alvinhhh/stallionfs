@@ -244,6 +244,68 @@ def copy_comparison_policy(variant, platform_name=None):
     return policy
 
 
+def selected_plan(worker_counts, sfs, operations=None, copy_references=None,
+                  copy_strategies=None, platform_name=None):
+    """Resolve selectors without launching commands or touching the fixture."""
+    platform_name = sys.platform if platform_name is None else platform_name
+
+    def select(value, choices, default, option):
+        values = list(default) if value is None else value.split(',')
+        if not values or len(set(values)) != len(values) or any(v not in choices for v in values):
+            raise ValueError(option + ' requires distinct values from ' + ','.join(choices))
+        return values
+
+    cases = select(operations, ('scan', 'copy', 'clone', 'delete'),
+                   ('scan', 'copy', 'clone', 'delete'), '--operations')
+    references = ('cp', 'ditto') if platform_name == 'darwin' else ('cp',)
+    references = select(copy_references, references, references, '--copy-references')
+    strategies = (None,) if copy_strategies is None else select(
+        copy_strategies, ('materialized', 'auto'), (), '--copy-strategies')
+    if 'copy' not in cases and (copy_references is not None or copy_strategies is not None):
+        raise ValueError('Copy selectors require copy in --operations')
+    if copy_strategies is not None and not sfs:
+        raise ValueError('--copy-strategies requires --sfs')
+    plan = {}
+    for case in cases:
+        native = ['native_' + r for r in references] if case == 'copy' else [
+            {'scan': 'native_posix', 'clone': 'native_cp', 'delete': 'native_rm'}[case]]
+        variants = {variant: {} for variant in native}
+        if sfs:
+            for jobs in worker_counts:
+                for strategy in strategies if case == 'copy' else (None,):
+                    variant = 'sfs_jobs' + str(jobs) + ('_' + strategy if strategy else '')
+                    variants[variant] = {'jobs': jobs, **({'strategy': strategy} if strategy else {})}
+        if not variants:
+            raise ValueError('Every selected operation requires at least one variant')
+        plan[case] = variants
+    return plan
+
+
+def workload_command(case, variant, metadata, tools, dataset, target, helper, platform_name=None):
+    """Keep default commands unchanged; explicit strategies apply only to SFS copy."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    if 'jobs' in metadata:
+        path = dataset if case == 'scan' else target
+        argv = [tools['sfs'], '--json', case, path, '--jobs', str(metadata['jobs'])]
+        if case in ('copy', 'clone'):
+            argv.insert(3, dataset)
+        if case == 'delete':
+            argv.append('--recursive')
+        if 'strategy' in metadata:
+            argv.append('--strategy=' + metadata['strategy'])
+        return argv
+    if case == 'scan':
+        return [helper, dataset]
+    if case == 'delete':
+        return [tools['rm'], '-rf', target]
+    if variant == 'native_ditto':
+        return [tools['ditto'], '--rsrc', '--extattr', '--acl', dataset, target]
+    flags = ['-cRp'] if case == 'clone' else ['-Rp']
+    if platform_name == 'linux':
+        flags = ['-a', '--reflink=' + ('always' if case == 'clone' else 'never')]
+    return [tools['cp'], *flags, dataset, target]
+
+
 def summarize(samples, expected_repetitions=None):
     if expected_repetitions is not None and (type(expected_repetitions) is not int or expected_repetitions < 1):
         raise ValueError('Expected repetitions must be a positive integer')
@@ -339,6 +401,10 @@ def main():
     parser.add_argument('--repetitions', type=int, default=10)
     parser.add_argument('--files', type=int, default=10000)
     parser.add_argument('--directories', type=int, default=100, help='Use 1 for a flat file layout')
+    parser.add_argument('--operations', help='Comma-separated operations; default scan,copy,clone,delete')
+    parser.add_argument('--copy-references', help='Comma-separated copy references; default cp,ditto on macOS, cp on Linux')
+    parser.add_argument('--copy-strategies', help='Explicit SFS copy strategies: materialized,auto; omitted keeps existing command')
+    parser.add_argument('--expected-fixture-sha256', help='Require this canonical fixture manifest SHA256 before workloads')
     jobs = parser.add_mutually_exclusive_group()
     jobs.add_argument('--jobs', type=int, choices=range(1, 5), help='Single sfs worker count')
     jobs.add_argument('--sfs-jobs', help='Comma-separated sfs worker counts; default 1,2,4')
@@ -349,20 +415,31 @@ def main():
         parser.error('Require repetitions >= 1 and 2 <= files <= 100000')
     if not 1 <= args.directories <= 10000:
         parser.error('Require 1 <= directories <= 10000')
+    if args.expected_fixture_sha256 is not None:
+        args.expected_fixture_sha256 = args.expected_fixture_sha256.lower()
+        if (len(args.expected_fixture_sha256) != 64
+                or any(c not in '0123456789abcdef' for c in args.expected_fixture_sha256)):
+            parser.error('--expected-fixture-sha256 requires a 64-digit hexadecimal SHA256')
     try:
         worker_counts = [int(x) for x in args.sfs_jobs.split(',')] if args.sfs_jobs else ([args.jobs] if args.jobs else [1, 2, 4])
         if not worker_counts or len(set(worker_counts)) != len(worker_counts) or any(x not in range(1, 5) for x in worker_counts):
             raise ValueError()
     except ValueError:
         parser.error('--sfs-jobs requires distinct counts in 1,2,3,4')
+    try:
+        plan = selected_plan(worker_counts, args.sfs, args.operations, args.copy_references, args.copy_strategies)
+    except ValueError as exc:
+        parser.error(str(exc))
     root, output = args.root.resolve(strict=True), args.output.absolute()
     if not root.is_dir() or not output.parent.is_dir():
         parser.error('Root and output parent must be existing directories')
     csv_path = output.with_suffix('.csv')
     if csv_path == output or output.exists() or csv_path.exists():
         parser.error('JSON and CSV output paths must be distinct and new')
-    tools = {name: shutil.which(name) for name in ('cp', 'rm', 'cc')}
-    if sys.platform == 'darwin':
+    variants = {variant for case in plan.values() for variant in case}
+    tools = {name: shutil.which(name) for name in ('cp', 'rm', 'cc')
+             if name == 'cc' or 'native_' + name in variants}
+    if 'native_ditto' in variants:
         tools['ditto'] = shutil.which('ditto')
     if args.sfs:
         tools['sfs'] = shutil.which(args.sfs)
@@ -396,11 +473,13 @@ def main():
               'Each case has one warmup followed by deterministically shuffled variants each measured repetition.']}
     report['parameters']['sfs'] = args.sfs
     report['parameters']['worker_counts'] = worker_counts
-    report['copy_comparison_policies'] = {variant: copy_comparison_policy(variant) for variant in
-        ['native_cp', *(['native_ditto'] if 'ditto' in tools else []),
-         *('sfs_jobs' + str(n) for n in worker_counts if args.sfs)]}
-    report['clone_policies'] = {variant: clone_policy(variant) for variant in
-                               ['native_cp', *('sfs_jobs' + str(n) for n in worker_counts if args.sfs)]}
+    report['selected_plan'] = plan
+    variant_count = sum(len(variants) for variants in plan.values())
+    report['expected_samples'] = {'warmup': variant_count, 'measured': variant_count * args.repetitions,
+                                  'total': variant_count * (args.repetitions + 1)}
+    report['copy_comparison_policies'] = {variant: copy_comparison_policy(variant)
+                                          for variant in plan.get('copy', {})}
+    report['clone_policies'] = {variant: clone_policy(variant) for variant in plan.get('clone', {})}
     for key in ('root', 'output'):
         report['parameters'][key] = str(report['parameters'][key])
 
@@ -409,6 +488,8 @@ def main():
         output.write_text(json.dumps(report, indent=2) + '\n')
         fields = ('case', 'variant', 'clone_policy', 'repetition', 'warmup', 'status', 'wall_s', 'launcher_wall_s', 'measurement_method', 'cpu_s',
                   'peak_rss_bytes', 'returncode', 'validation', 'error')
+        if args.copy_strategies is not None:
+            fields = (*fields[:2], 'strategy', *fields[2:])
         with open(csv_path, 'w', newline='') as stream:
             writer = csv.DictWriter(stream, fields, extrasaction='ignore')
             writer.writeheader(); writer.writerows(report['samples'])
@@ -434,7 +515,7 @@ def main():
 
     def retain_failure_evidence(sample):
         if (not report.get('retain_scratch') and args.stop_on_sfs_failure
-                and sample['variant'].startswith('sfs_jobs') and sample['status'] == 'failed'):
+                and 'jobs' in plan[sample['case']][sample['variant']] and sample['status'] == 'failed'):
             report.update(retain_scratch=True, retention_reason='sfs_sample_failure',
                           stopped_on_sfs_failure=len(report['samples']) - 1)
 
@@ -457,16 +538,18 @@ def main():
                 raise RuntimeError('Setup process group completion is uncertain')
         source = Path(__file__).with_name('real_world_scan.c')
         measurement_source = Path(__file__).with_name('real_world_measure.c')
-        report['sources'] = {str(p): sha(p) for p in (Path(__file__), source, measurement_source)}
+        helper_sources = [(source, scratch / 'scan-posix')] if 'scan' in plan else []
+        helper_sources.append((measurement_source, scratch / 'measure-command'))
+        report['sources'] = {str(p): sha(p) for p in (Path(__file__), *(code for code, _ in helper_sources))}
         helper, measurement = scratch / 'scan-posix', scratch / 'measure-command'
-        for code, binary in ((source, helper), (measurement_source, measurement)):
+        for code, binary in helper_sources:
             compiled = execute([tools['cc'], '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', code, '-o', binary], scratch)
             report['setup'].append(compiled)
             if not compiled['process_group_quiescent']:
                 report['retain_scratch'] = True
             if compiled['returncode'] or compiled['timed_out'] or compiled['output_truncated'] or report.get('retain_scratch'):
                 raise RuntimeError('Native helper compilation failed: ' + code.name)
-        report['helpers'] = {str(p): sha(p) for p in (helper, measurement)}
+        report['helpers'] = {str(p): sha(p) for _, p in helper_sources}
         dataset = scratch / 'source'; dataset.mkdir(mode=0o700)
         for i in range(args.directories):
             (dataset / f'd{i:03d}').mkdir(mode=0o750)
@@ -480,21 +563,25 @@ def main():
         expected = manifest(dataset)
         report['fixture'] = {'files': args.files, 'file_bytes': 4096, 'directories': args.directories,
                              'manifest_sha256': hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()}
+        if args.expected_fixture_sha256 is not None:
+            report['fixture_guard'] = {'expected_sha256': args.expected_fixture_sha256,
+                                      'observed_sha256': report['fixture']['manifest_sha256']}
+            report['fixture_guard']['passed'] = args.expected_fixture_sha256 == report['fixture']['manifest_sha256']
+            if not report['fixture_guard']['passed']:
+                report.update(retain_scratch=True, retention_reason='fixture_manifest_mismatch')
+                raise RuntimeError('Fixture manifest SHA256 differs from --expected-fixture-sha256')
         counts = {'files': args.files + 1, 'directories': args.directories, 'symlinks': 2, 'other': 0,
                   'logical_bytes': (args.files + 1) * 4096, 'skipped_mounts': 0}
         sentinel = scratch / 'sentinel'; sentinel.write_bytes(b'untouched\x00sentinel')
         sentinel_hash = sha(sentinel)
         rng, unavailable = random.Random(20261101), set()
-        for case in ('scan', 'copy', 'clone', 'delete'):
+        for case, selected_variants in plan.items():
             for repetition in range(-1, args.repetitions):
-                variants = [{'scan': 'native_posix', 'copy': 'native_cp',
-                             'clone': 'native_cp', 'delete': 'native_rm'}[case]]
-                if case == 'copy' and sys.platform == 'darwin': variants.append('native_ditto')
-                if args.sfs: variants.extend('sfs_jobs' + str(n) for n in worker_counts)
+                variants = list(selected_variants)
                 rng.shuffle(variants)
                 for variant in variants:
                     sample = {'case': case, 'variant': variant, 'repetition': repetition,
-                              'warmup': repetition == -1, 'status': 'pending'}
+                              'warmup': repetition == -1, 'status': 'pending', **selected_variants[variant]}
                     if case == 'copy':
                         sample['copy_comparison_policy'] = dict(report['copy_comparison_policies'][variant])
                     if case == 'clone':
@@ -513,25 +600,9 @@ def main():
                             raise RuntimeError('Unexpected existing target')
                         if case == 'delete':
                             shutil.copytree(dataset, target, symlinks=True)
-                        path = dataset if case == 'scan' else target
-                        if variant.startswith('sfs_jobs'):
-                            sample['jobs'] = int(variant.removeprefix('sfs_jobs'))
-                            argv = [tools['sfs'], '--json', case, path, '--jobs', str(sample['jobs'])]
-                            if case in ('copy', 'clone'):
-                                argv.insert(3, dataset)
-                            if case == 'delete':
-                                argv.append('--recursive')
-                        elif case == 'scan':
-                            argv = [helper, dataset]
-                        elif case == 'delete':
-                            argv = [tools['rm'], '-rf', target]
-                        elif variant == 'native_ditto':
-                            argv = [tools['ditto'], '--rsrc', '--extattr', '--acl', dataset, target]
-                        else:
-                            flags = ['-cRp'] if case == 'clone' else ['-Rp']
-                            if sys.platform == 'linux':
-                                flags = ['-a', '--reflink=' + ('always' if case == 'clone' else 'never')]
-                            argv = [tools['cp'], *flags, dataset, target]
+                        argv = workload_command(case, variant, selected_variants[variant], tools,
+                                                dataset, target, helper)
+                        sample['argv'] = [str(x) for x in argv]
                         sample.update(execute(argv, scratch, measurement_helper=measurement))
                         if not sample['process_group_quiescent']:
                             report['retain_scratch'] = True
@@ -619,6 +690,8 @@ def main():
         try:
             if report.get('retention_reason') == 'sfs_sample_failure':
                 report['cleanup'] = 'retained_failure_evidence'
+            elif report.get('retention_reason') == 'fixture_manifest_mismatch':
+                report['cleanup'] = 'retained_fixture_mismatch'
             elif report.get('retain_scratch'):
                 raise RuntimeError('Scratch retained because process completion is uncertain')
             else:
