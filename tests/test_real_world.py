@@ -489,6 +489,348 @@ class RealWorldValidity(unittest.TestCase):
                 os.kill(pid, 0)
 
 
+class SfsFailureRetention(unittest.TestCase):
+    """Main-level control flow with simulated commands and validation results."""
+
+    @contextlib.contextmanager
+    def scenario(self, failure_kind, *, stop=True, measured=False, exception_type=OSError,
+                 uncertain=False, secondary_cleanup_failure=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root, output = Path(directory), Path(directory) / 'result.json'
+            expected = {'entries': {}, 'hardlinks': [['d000/f000000', 'hardlink-alias']]}
+            different = {'entries': {}, 'hardlinks': []}
+            receipt = {'returncode': 0, 'timed_out': False, 'output_truncated': False,
+                       'process_group_quiescent': True, 'stdout': '', 'stderr': '',
+                       'wall_s': .2, 'launcher_wall_s': .3, 'cpu_s': .1,
+                       'peak_rss_bytes': 1024, 'measurement_method': 'mocked_receipt'}
+            supervision = {'signals': [], 'post_reap_group_probe': {'outcome': 'present'}}
+            state = {'scratch': None, 'current': None, 'failed': False, 'after_failure': [],
+                     'executions': [], 'attempts': {}}
+            original_rmtree = shutil.rmtree
+
+            def fail(message):
+                state['failed'] = True
+                error = exception_type(message)
+                if uncertain:
+                    error.process_group_uncertain = True
+                    error.process_supervision = supervision
+                raise error
+
+            def fixture_event(operation, path):
+                if (state['failed'] and state['scratch'] is not None
+                        and Path(path).is_relative_to(state['scratch'])):
+                    state['after_failure'].append((operation, str(path)))
+
+            def guarded(original):
+                def check(path, *args, **kwargs):
+                    fixture_event(original.__name__, path)
+                    if (original.__name__ == 'write_text' and Path(path) == output and should_fail()
+                            and failure_kind == 'report_exception' and not state['failed']):
+                        fail('injected report write interruption')
+                    return original(path, *args, **kwargs)
+                return check
+
+            def remove(path, *args, **kwargs):
+                fixture_event('rmtree', path)
+                if Path(path).name == 'target' and should_fail() and failure_kind == 'cleanup':
+                    fail('injected target cleanup failure')
+                if Path(path).name == 'target' and should_fail() and secondary_cleanup_failure:
+                    raise OSError('injected target cleanup failure')
+                if Path(path) == state['scratch'] and failure_kind == 'final_cleanup':
+                    fail('injected scratch cleanup failure')
+                return original_rmtree(path, *args, **kwargs)
+
+            def make_target(source, target, **kwargs):
+                target.mkdir()
+                (target / 'd000').mkdir()
+                (target / 'd000/f000000').write_bytes(b'simulated destination')
+                (target / 'partial-marker').write_bytes(b'retain this target')
+
+            def should_fail():
+                current = state['current']
+                wanted_variant = 'native_cp' if failure_kind == 'cp_contract' else 'sfs_jobs1'
+                return (current and current['case'] == 'copy'
+                        and current['variant'] == wanted_variant
+                        and current['attempt'] == (1 if measured else 0))
+
+            def manifest(path):
+                fixture_event('manifest', path)
+                if should_fail() and Path(path).name == 'source' and failure_kind == 'source_exception':
+                    fail('injected source inspection failure')
+                if should_fail() and Path(path).name == 'target' and failure_kind == 'target_exception':
+                    fail('injected target inspection failure')
+                if should_fail() and ((Path(path).name == 'target' and failure_kind in ('integrity', 'cp_contract'))
+                                      or (Path(path).name == 'source' and failure_kind == 'source_check')):
+                    state['failed'] = True
+                    return different
+                return expected
+
+            def sha(path):
+                fixture_event('sha', path)
+                if should_fail() and Path(path).name == 'sentinel' and failure_kind == 'sentinel_exception':
+                    fail('injected sentinel inspection failure')
+                if should_fail() and Path(path).name == 'sentinel' and failure_kind == 'sentinel_check':
+                    state['failed'] = True
+                    return 'changed-sentinel-sha256'
+                return 'simulated-sha256'
+
+            def execute(argv, scratch, **kwargs):
+                state['scratch'] = Path(scratch)
+                if not kwargs.get('measurement_helper'):
+                    if '-o' in argv:
+                        Path(argv[-1]).write_bytes(b'simulated helper; never executed')
+                    return dict(receipt)
+                command = Path(argv[0]).name
+                if command == 'sfs':
+                    case, variant = argv[2], 'sfs_jobs1'
+                elif command == 'scan-posix':
+                    case, variant = 'scan', 'native_posix'
+                elif command == 'rm':
+                    case, variant = 'delete', 'native_rm'
+                else:
+                    case = 'clone' if '-cRp' in argv or '--reflink=always' in argv else 'copy'
+                    variant = 'native_ditto' if command == 'ditto' else 'native_cp'
+                key = case, variant
+                attempt = state['attempts'].get(key, 0)
+                state['attempts'][key] = attempt + 1
+                state['current'] = {'case': case, 'variant': variant, 'attempt': attempt}
+                state['executions'].append(dict(state['current']))
+                target = Path(scratch) / 'target'
+                if case in ('copy', 'clone'):
+                    make_target(None, target)
+                elif case == 'delete':
+                    original_rmtree(target)
+                result = dict(receipt)
+                if case == 'scan':
+                    result['stdout'] = json.dumps({'files': 3, 'directories': 1, 'symlinks': 2,
+                                                  'other': 0, 'logical_bytes': 12288, 'skipped_mounts': 0})
+                if should_fail() and failure_kind == 'command_exception':
+                    fail('injected command interruption')
+                if should_fail() and failure_kind in ('command', 'uncertain_return',
+                                                     'uncertain_exception', 'uncertain_interrupt'):
+                    state['failed'] = True
+                    if failure_kind == 'command':
+                        result.update(returncode=1, stderr='injected command failure')
+                    elif failure_kind == 'uncertain_return':
+                        result['process_group_quiescent'] = False
+                    else:
+                        error_type = KeyboardInterrupt if failure_kind == 'uncertain_interrupt' else RuntimeError
+                        error = error_type('injected uncertain completion')
+                        error.process_group_uncertain = True
+                        error.process_supervision = supervision
+                        raise error
+                return result
+
+            argv = ['real_world.py', '--root', str(root), '--output', str(output), '--sfs', 'sfs',
+                    '--jobs', '1', '--files', '2', '--directories', '1', '--repetitions', '1']
+            if stop:
+                argv.append('--stop-on-sfs-failure')
+            with contextlib.ExitStack() as stack:
+                for name in ('stat', 'lstat', 'exists', 'is_symlink', 'unlink', 'open', 'read_bytes', 'write_text'):
+                    stack.enter_context(mock.patch.object(Path, name, new=guarded(getattr(Path, name))))
+                stack.enter_context(mock.patch.object(sys, 'argv', argv))
+                stack.enter_context(mock.patch.object(BENCHMARK, 'execute', side_effect=execute))
+                stack.enter_context(mock.patch.object(BENCHMARK, 'manifest', side_effect=manifest))
+                stack.enter_context(mock.patch.object(BENCHMARK, 'sha', side_effect=sha))
+                stack.enter_context(mock.patch.object(BENCHMARK.shutil, 'which',
+                    side_effect=lambda name: None if name == 'df' else '/simulated/bin/' + name))
+                stack.enter_context(mock.patch.object(BENCHMARK.shutil, 'rmtree', side_effect=remove))
+                stack.enter_context(mock.patch.object(BENCHMARK.shutil, 'copytree', side_effect=make_target))
+                stack.enter_context(mock.patch.object(BENCHMARK.random.Random, 'shuffle', return_value=None))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                self.assertEqual(BENCHMARK.main(), 1)
+            report = json.loads(output.read_text())
+            yield report, state, receipt, supervision
+
+    def check_retained_failure(self, failure_kind, *, measured=False, exception_type=OSError):
+        with self.scenario(failure_kind, measured=measured, exception_type=exception_type) as data:
+            report, state, receipt, _ = data
+            self.assertTrue(state['failed'])
+            self.assertEqual(state['after_failure'], [], 'fixture inspected or deleted after failure detection')
+            self.assertFalse(report['passed'])
+            self.assertTrue(report['retain_scratch'])
+            self.assertTrue(report['parameters']['stop_on_sfs_failure'])
+            self.assertEqual(report['retention_reason'], 'sfs_sample_failure')
+            self.assertEqual(report['cleanup'], 'retained_failure_evidence')
+            self.assertEqual(report['stopped_on_sfs_failure'], len(report['samples']) - 1)
+            self.assertEqual(len(state['executions']), len(report['samples']))
+            failed = report['samples'][-1]
+            self.assertEqual((failed['case'], failed['variant'], failed['repetition']),
+                             ('copy', 'sfs_jobs1', 0 if measured else -1))
+            self.assertEqual(failed['warmup'], not measured)
+            self.assertEqual(failed['status'], 'failed')
+            self.assertTrue(failed['error'])
+            for metric in ('wall_s', 'launcher_wall_s', 'cpu_s', 'peak_rss_bytes', 'measurement_method'):
+                if failure_kind == 'command_exception':
+                    self.assertNotIn(metric, failed)
+                else:
+                    self.assertEqual(failed[metric], receipt[metric])
+            if exception_type in (KeyboardInterrupt, SystemExit):
+                self.assertIn(exception_type.__name__, failed['error'])
+                self.assertTrue(any(error.startswith(exception_type.__name__ + ':')
+                                    for error in report['errors']))
+            self.assertTrue(any(failed['error'] in error for error in report['errors']))
+            self.assertEqual((state['scratch'] / 'target/partial-marker').read_bytes(), b'retain this target')
+            self.assertTrue((state['scratch'] / 'source/d000/f000000').is_file())
+            self.assertTrue((state['scratch'] / 'sentinel').is_file())
+            self.assertNotIn('sfs_jobs1', report['summary']['copy']['variants'])
+            if failure_kind == 'integrity':
+                self.assertEqual(failed['manifest_difference']['expected_hardlinks'],
+                                 [['d000/f000000', 'hardlink-alias']])
+                self.assertEqual(failed['manifest_difference']['actual_hardlinks'], [])
+
+    def test_command_failure_retains_warmup_and_measured_sample_before_inspection(self):
+        for measured in (False, True):
+            with self.subTest(measured=measured):
+                self.check_retained_failure('command', measured=measured)
+
+    def test_integrity_failure_retains_target_before_source_inspection(self):
+        self.check_retained_failure('integrity')
+
+    def test_source_check_failure_retains_target_before_cleanup(self):
+        for failure_kind in ('source_check', 'source_exception', 'sentinel_check'):
+            with self.subTest(failure=failure_kind):
+                self.check_retained_failure(failure_kind)
+
+    def test_cleanup_failure_retains_remaining_target_without_further_inspection(self):
+        self.check_retained_failure('cleanup')
+
+    def test_interruptions_retain_failure_evidence_and_original_exception(self):
+        for failure_kind in ('command_exception', 'target_exception', 'source_exception',
+                             'sentinel_exception', 'cleanup'):
+            for exception_type in (KeyboardInterrupt, SystemExit):
+                for measured in (False, True):
+                    with self.subTest(failure=failure_kind, exception=exception_type.__name__, measured=measured):
+                        self.check_retained_failure(failure_kind, measured=measured, exception_type=exception_type)
+
+    def test_default_interruptions_mark_sample_failed_and_stop_collection(self):
+        for failure_kind in ('command_exception', 'target_exception', 'source_exception',
+                             'sentinel_exception', 'cleanup'):
+            with self.subTest(failure=failure_kind), \
+                    self.scenario(failure_kind, stop=False, exception_type=KeyboardInterrupt) as data:
+                report, state, _, _ = data
+                self.assertEqual(report['samples'][-1]['status'], 'failed')
+                self.assertIn('KeyboardInterrupt', report['samples'][-1]['error'])
+                self.assertEqual(len(state['executions']), len(report['samples']))
+                self.assertNotIn('retention_reason', report)
+                self.assertNotIn('stopped_on_sfs_failure', report)
+                self.assertEqual(report['cleanup'], 'passed')
+                self.assertFalse(state['scratch'].exists())
+
+    def test_later_cleanup_failure_does_not_replace_original_sample_error(self):
+        with self.scenario('command', stop=False, secondary_cleanup_failure=True) as data:
+            report, state, _, _ = data
+            failed = report['samples'][-1]
+            self.assertEqual(failed['error'], 'RuntimeError: Command failed: injected command failure')
+            self.assertEqual(failed['secondary_errors'], ['Target cleanup failed: OSError: injected target cleanup failure'])
+            self.assertTrue(any(failed['error'] in error for error in report['errors']))
+            self.assertTrue(any(failed['secondary_errors'][0] in error for error in report['errors']))
+            self.assertEqual(report['cleanup'], 'passed')
+            self.assertFalse(state['scratch'].exists())
+
+    def test_final_cleanup_interruption_still_saves_report(self):
+        with self.scenario('final_cleanup', exception_type=KeyboardInterrupt) as data:
+            report, state, _, _ = data
+            self.assertEqual(state['after_failure'], [])
+            self.assertFalse(report['passed'])
+            self.assertTrue(report['retain_scratch'])
+            self.assertNotIn('retention_reason', report)
+            self.assertNotIn('stopped_on_sfs_failure', report)
+            self.assertEqual(report['cleanup'], 'failed: KeyboardInterrupt: injected scratch cleanup failure')
+            self.assertTrue(state['scratch'].exists())
+
+    def test_interruption_while_saving_sample_retains_remaining_scratch(self):
+        with self.scenario('report_exception', exception_type=KeyboardInterrupt) as data:
+            report, state, receipt, _ = data
+            self.assertEqual(state['after_failure'], [])
+            self.assertFalse(report['passed'])
+            self.assertEqual(report['retention_reason'], 'sfs_sample_failure')
+            self.assertEqual(report['cleanup'], 'retained_failure_evidence')
+            self.assertEqual(report['stopped_on_sfs_failure'], len(report['samples']) - 1)
+            failed = report['samples'][-1]
+            self.assertEqual(failed['status'], 'failed')
+            self.assertIn('KeyboardInterrupt', failed['error'])
+            self.assertEqual(failed['wall_s'], receipt['wall_s'])
+            self.assertEqual(len(state['executions']), len(report['samples']))
+            self.assertTrue((state['scratch'] / 'source').is_dir())
+
+    def test_default_does_not_stop_or_retain_after_sfs_failure(self):
+        with self.scenario('command', stop=False) as (report, state, _, _):
+            self.assertFalse(report['parameters']['stop_on_sfs_failure'])
+            self.assertNotIn('retention_reason', report)
+            self.assertNotIn('stopped_on_sfs_failure', report)
+            self.assertFalse(report.get('retain_scratch', False))
+            self.assertEqual(report['cleanup'], 'passed')
+            self.assertFalse(state['scratch'].exists())
+            self.assertTrue(any(s['case'] == 'delete' and s['variant'] == 'sfs_jobs1'
+                                and s['status'] == 'passed' for s in report['samples']))
+            self.assertTrue(any(s['case'] == 'copy' and s['variant'] == 'sfs_jobs1'
+                                and not s['warmup'] and s['status'] == 'passed' for s in report['samples']))
+
+    def test_native_cp_hardlink_contract_failure_continues_with_flag_enabled(self):
+        with self.scenario('cp_contract') as (report, state, _, _):
+            failed = [s for s in report['samples'] if s['status'] == 'failed']
+            self.assertEqual(len(failed), 1)
+            self.assertEqual((failed[0]['case'], failed[0]['variant']), ('copy', 'native_cp'))
+            self.assertEqual(failed[0]['manifest_difference']['actual_hardlinks'], [])
+            self.assertNotIn('retention_reason', report)
+            self.assertNotIn('stopped_on_sfs_failure', report)
+            self.assertFalse(report.get('retain_scratch', False))
+            self.assertEqual(report['cleanup'], 'passed')
+            self.assertFalse(state['scratch'].exists())
+            self.assertTrue(any(s['case'] == 'delete' and s['status'] == 'passed' for s in report['samples']))
+            copy_summary = report['summary']['copy']
+            self.assertNotIn('native_cp', copy_summary['variants'])
+            self.assertEqual(copy_summary['excluded_variants']['native_cp']['statuses'],
+                             {'failed': 1, 'passed': 1})
+            self.assertIn('sfs_jobs1', copy_summary['variants'])
+            if sys.platform == 'darwin':
+                self.assertIn('native_ditto', copy_summary['variants'])
+                self.assertEqual(copy_summary['baseline'], 'native_ditto')
+            else:
+                self.assertNotIn('sfs_jobs1', copy_summary['comparisons'])
+
+    def test_uncertain_completion_keeps_its_separate_retention_path(self):
+        for failure_kind in ('uncertain_return', 'uncertain_exception', 'uncertain_interrupt'):
+            for stop in (False, True):
+                with self.subTest(failure=failure_kind, stop=stop), \
+                        self.scenario(failure_kind, stop=stop) as (report, state, receipt, supervision):
+                    self.assertEqual(state['after_failure'], [])
+                    self.assertTrue(report['retain_scratch'])
+                    self.assertNotIn('retention_reason', report)
+                    self.assertNotIn('stopped_on_sfs_failure', report)
+                    self.assertIn('process completion is uncertain', report['cleanup'])
+                    self.assertEqual(len(state['executions']), len(report['samples']))
+                    self.assertEqual(report['samples'][-1]['status'], 'failed')
+                    self.assertTrue((state['scratch'] / 'target/partial-marker').is_file())
+                    if failure_kind == 'uncertain_return':
+                        self.assertFalse(report['samples'][-1]['process_group_quiescent'])
+                        self.assertEqual(report['samples'][-1]['wall_s'], receipt['wall_s'])
+                    else:
+                        self.assertEqual(report['samples'][-1]['supervision'], supervision)
+                        self.assertEqual(report['supervision_failure'], supervision)
+
+    def test_validation_and_cleanup_uncertainty_precedes_sfs_failure_retention(self):
+        for failure_kind in ('source_exception', 'sentinel_exception', 'cleanup'):
+            for exception_type in (RuntimeError, KeyboardInterrupt):
+                for stop in (False, True):
+                    with self.subTest(failure=failure_kind, exception=exception_type.__name__, stop=stop), \
+                            self.scenario(failure_kind, stop=stop, exception_type=exception_type, uncertain=True) as data:
+                        report, state, receipt, supervision = data
+                        self.assertEqual(state['after_failure'], [])
+                        self.assertTrue(report['retain_scratch'])
+                        self.assertNotIn('retention_reason', report)
+                        self.assertNotIn('stopped_on_sfs_failure', report)
+                        self.assertIn('process completion is uncertain', report['cleanup'])
+                        self.assertEqual(report['supervision_failure'], supervision)
+                        failed = report['samples'][-1]
+                        self.assertEqual(failed['status'], 'failed')
+                        self.assertEqual(failed['supervision'], supervision)
+                        self.assertEqual(failed['wall_s'], receipt['wall_s'])
+                        self.assertEqual(len(state['executions']), len(report['samples']))
+                        self.assertTrue((state['scratch'] / 'target/partial-marker').is_file())
+
+
 class UncertainCompletionConsumers(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
