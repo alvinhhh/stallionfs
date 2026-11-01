@@ -2241,29 +2241,39 @@ func directoryQueuedFailure(_ parent: URL) throws {
 final class RenameFixture {
     let mount: CreationMount, from: StallionItem, to: StallionItem, item: StallionItem
     let child: StallionItem?
-    init(_ parent: URL, _ name: String, directory: Bool = false) throws {
+    let target: Data?
+    init(_ parent: URL, _ name: String, directory: Bool = false, target: Data? = nil) throws {
         let m = try CreationMount(parent,name,limit:6); mount = m
+        self.target = target
         m.serial {
             try! m.volume.diagnosticMutationForTesting { h,r in
                 var initial = sfs_metadata_initial(), a: UInt64 = 0, b: UInt64 = 0, inode: UInt64 = 0
                 initial.mode = UInt32(S_IFDIR) | 0o700; initial.uid = geteuid(); initial.gid = getegid()
                 need(sfs_image_add_metadata(h,1,"A",1,SFS_DIRECTORY,&initial,&a,&r) == SFS_OK,"rename source parent fixture")
                 need(sfs_image_add_metadata(h,1,"B",1,SFS_DIRECTORY,&initial,&b,&r) == SFS_OK,"rename destination parent fixture")
-                initial.mode = directory ? UInt32(S_IFDIR) | 0o700 : UInt32(S_IFREG) | 0o600
-                need(sfs_image_add_metadata(h,a,"old",3,directory ? SFS_DIRECTORY : SFS_FILE,&initial,&inode,&r) == SFS_OK,"rename source fixture")
-                if directory {
-                    initial.mode = UInt32(S_IFREG) | 0o600
-                    let directoryID = inode
-                    need(sfs_image_add_metadata(h,directoryID,"child",5,SFS_FILE,&initial,&inode,&r) == SFS_OK,"nonempty moved directory fixture")
+                if target == nil {
+                    initial.mode = directory ? UInt32(S_IFDIR) | 0o700 : UInt32(S_IFREG) | 0o600
+                    need(sfs_image_add_metadata(h,a,"old",3,directory ? SFS_DIRECTORY : SFS_FILE,&initial,&inode,&r) == SFS_OK,"rename source fixture")
+                    if directory {
+                        initial.mode = UInt32(S_IFREG) | 0o600
+                        let directoryID = inode
+                        need(sfs_image_add_metadata(h,directoryID,"child",5,SFS_FILE,&initial,&inode,&r) == SFS_OK,"nonempty moved directory fixture")
+                    }
+                    need(sfs_image_write(h,inode,0,"original",8,&r) == SFS_OK,"rename retained data fixture")
                 }
-                need(sfs_image_write(h,inode,0,"original",8,&r) == SFS_OK,"rename retained data fixture")
             }
         }
         let a = m.lookup("A") as! StallionItem, b = m.lookup("B") as! StallionItem
-        let source = m.lookup("old",parent:a) as! StallionItem
+        let source: StallionItem
+        if let target {
+            let created = createSymlink(m,FSFileName(data:target),name:"old",parent:a)
+            need(created.0 != nil && created.1 == nil && created.2 != nil,"contextually created rename symlink")
+            source = created.2!
+        } else { source = m.lookup("old",parent:a) as! StallionItem }
         let nested = directory ? m.lookup("child",parent:source) as? StallionItem : nil
         from = a; to = b; item = source; child = nested
-        m.returned.append(contentsOf:[a,b,source]); if let nested { m.returned.append(nested) }
+        m.returned.append(contentsOf:[a,b]); if target == nil { m.returned.append(source) }
+        if let nested { m.returned.append(nested) }
     }
     func rename(_ old: String = "old", _ new: String = "new", source: FSItem? = nil,
                 from oldParent: FSItem? = nil, to newParent: FSItem? = nil, over: FSItem? = nil,
@@ -2284,6 +2294,11 @@ final class RenameFixture {
     func unchanged(_ before: sfs_result) {
         need(anchorMatches(before,mount.volume.anchor),"rename refusal/rollback preserves anchor")
         names("old",nil); mount.state(child == nil ? 4 : 5,cap:6)
+        if let target { mount.serial { symlinkBytes(self.mount.coreHandle,self.item.inode,target) } }
+    }
+    func reopened(_ name: String = "old", parent: UInt64? = nil) {
+        if let target { symlinkReopened(mount,name,parent:parent ?? from.inode,inode:item.inode,target:target) }
+        else { mount.reopened(name,parent:parent ?? from.inode,inode:item.inode,bytes:child == nil ? Data("original".utf8) : nil) }
     }
 }
 func contextualRenames(_ parent: URL) throws {
@@ -2292,12 +2307,15 @@ func contextualRenames(_ parent: URL) throws {
     let raw = UInt(bitPattern:required.rawValue)
     resultMaskTrace("FSRenameItemResult original=0x\(String(raw,radix:16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff),radix:16)) explicit=0x0")
 #endif
-    for directory in [false,true] {
-        let f = try RenameFixture(parent,"rename-success-\(directory)",directory:directory), m = f.mount, v = m.volume
+    let cases: [(Bool,Data?)] = [(false,nil),(true,nil),(false,Data("../target".utf8)),
+                                (false,Data("/missing/absolute".utf8)),(false,Data([0xff,47,0x80]))]
+    for (index,entry) in cases.enumerated() {
+        let (directory,target) = entry
+        let f = try RenameFixture(parent,"rename-success-\(index)",directory:directory,target:target), m = f.mount, v = m.volume
         let operands = [f.item,f.from,f.to], tokens = operands.map { $0.pin! }
         var snapshots: [FSItem.Attributes] = [], beforeCommit = true, constructors = 0
         m.serial {
-            f.item.retainedModes = directory ? [] : [.read,.write]
+            f.item.retainedModes = directory || target != nil ? [] : [.read,.write]
             v.createStageForTesting = { _,_ in need(false,"rename entered creation") }
             v.createCommitReceiptForTesting = { _ in need(false,"rename entered creation receipt") }
             v.removeCommitReceiptForTesting = { _,_ in need(false,"rename entered removal receipt") }
@@ -2312,6 +2330,11 @@ func contextualRenames(_ parent: URL) throws {
             need(snapshots[0] !== snapshots[1] && snapshots[0] !== snapshots[2] && snapshots[1] !== snapshots[2],"three independent role snapshots even for same parent")
             for (a,item) in zip(snapshots,[f.item,oldParent,newParent]) { checkPreparedAttributes(a,m.metadata(item),required:required) }
             need(m.lookup(new,parent:newParent) === f.item,"rename preserves canonical object")
+            if let target {
+                let metadata = m.metadata(f.item)
+                need(metadata.entry.kind == SFS_SYMLINK && metadata.entry.size == UInt64(target.count) && metadata.link_count == 1 && metadata.entry.parent == (newParent as! StallionItem).inode,"rename preserves symlink metadata and new parent")
+                symlinkReadback(m,f.item,target)
+            }
             m.serial { var entry = sfs_entry(), r = sfs_result(); let bytes = Data(old.utf8)
                 need(bytes.withUnsafeBytes { sfs_image_lookup(m.coreHandle,0,(oldParent as! StallionItem).inode,$0.baseAddress,$0.count,&entry,&r) } == SFS_NOT_FOUND,"old renamed name absent")
             }
@@ -2324,15 +2347,15 @@ func contextualRenames(_ parent: URL) throws {
         _ = move("root-move","final",m.root,f.from)
         for (a,metadata) in zip(retained,retainedMetadata) { checkPreparedAttributes(a,metadata,required:required) }
         for (item,token) in zip(operands,tokens) { need(sameBytes(item.pin!,token),"rename never replaces returned pins") }
-        need(f.item.retainedModes == (directory ? [] : [.read,.write]),"rename preserves retained open modes")
+        need(f.item.retainedModes == (directory || target != nil ? [] : [.read,.write]),"rename preserves retained open modes")
         let dataItem = f.child ?? f.item
-        m.serial { need(try! v.diagnosticReadForTesting(dataItem,length:16) == Data("original".utf8),"moved data survives")
+        m.serial { if target == nil { need(try! v.diagnosticReadForTesting(dataItem,length:16) == Data("original".utf8),"moved data survives") }
             directoryNames(m.coreHandle,f.from.inode,["final"]); directoryNames(m.coreHandle,f.to.inode,[])
             if directory { directoryNames(m.coreHandle,f.item.inode,["child"]) }
         }
         if let child = f.child { need(m.lookup("child",parent:f.item) === child && m.metadata(child).entry.parent == f.item.inode,"descendant canonical parent survives move"); directoryMetadata(m.metadata(f.item),parent:f.from.inode,mode:0o700) }
         withExtendedLifetime(first) {}
-        m.close(); m.reopened("old",parent:f.from.inode,inode:nil); m.reopened("final",parent:f.from.inode,inode:f.item.inode,bytes:directory ? nil : Data("original".utf8))
+        m.close(); m.reopened("old",parent:f.from.inode,inode:nil); f.reopened("final")
         if let child = f.child { m.reopened("child",parent:f.item.inode,inode:child.inode,bytes:Data("original".utf8)) }
         var h: OpaquePointer?, r = sfs_result(), value = sfs_metadata_entry()
         need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,f.item.inode,&value,&r) == SFS_OK && value.entry.parent == f.from.inode && value.link_count == 1,"reopened moved metadata")
@@ -2342,7 +2365,8 @@ func contextualRenames(_ parent: URL) throws {
     try renameRefusals(parent); try renamePolicies(parent); try renameFailures(parent,required:required); try renameQueued(parent)
 }
 func renameRefusals(_ parent: URL) throws {
-    let f = try RenameFixture(parent,"rename-refusals"), m = f.mount, v = m.volume, before = v.anchor
+    for symlink in [false,true] {
+    let f = try RenameFixture(parent,"rename-refusals-\(symlink)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume, before = v.anchor
     var prepared = false
     m.serial { v.diagnosticBeforePrepare = { prepared = true } }
     need(code(f.rename(over:f.item).1) == Int(ENOTSUP),"rename overwrite parameter refused")
@@ -2372,13 +2396,37 @@ func renameRefusals(_ parent: URL) throws {
         let replacement = role == 0 ? m.lookup("old",parent:m.lookup("A")) : m.lookup(role == 1 ? "A" : "B")
         m.returned.append(replacement)
     }
-    m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    m.close(); f.reopened()
+    }
     let aliases = try Fixture(parent,"rename-types"), a = try Mounted(aliases,itemLimit:3)
+    a.serial {
+        try! a.volume.diagnosticMutationForTesting { h,r in
+            need(sfs_image_link(h,(a.link as! StallionItem).inode,1,"link-alias",10,&r) == SFS_OK,"true second symlink name fixture")
+        }
+        var r = sfs_result()
+        var metadata = sfs_metadata_entry()
+        need(sfs_image_stat_metadata(a.coreHandle,0,(a.link as! StallionItem).inode,&metadata,&r) == SFS_OK && metadata.link_count == 2,"observe committed multiply linked symlink before rename")
+    }
+    let beforeAliases = a.volume.anchor
     for item in [a.file,a.link] {
         let result: (FSRenameItemResult?,Error?) = wait { done in a.volume.renameResultForTesting(item,sourceDirectory:a.root,sourceName:FSFileName(string:item === a.file ? "file" : "link"),destinationName:FSFileName(string:"new"),destinationDirectory:a.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
-        need(result.0 == nil && code(result.1) == Int(ENOTSUP),"multiply named file and symlink rename refused")
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && anchorMatches(beforeAliases,a.volume.anchor),"multiply named source rename refused")
+    }
+    a.serial { var entry = sfs_entry(), metadata = sfs_metadata_entry(), r = sfs_result()
+        for name in ["link","link-alias"] { let bytes = Data(name.utf8)
+            need(bytes.withUnsafeBytes { sfs_image_lookup(a.coreHandle,0,1,$0.baseAddress,$0.count,&entry,&r) } == SFS_OK && entry.inode == (a.link as! StallionItem).inode,"both refused symlink names retain identity")
+        }
+        need(sfs_image_lookup(a.coreHandle,0,1,"new",3,&entry,&r) == SFS_NOT_FOUND,"multiply linked rename does not publish destination")
+        need(sfs_image_stat_metadata(a.coreHandle,0,(a.link as! StallionItem).inode,&metadata,&r) == SFS_OK && metadata.link_count == 2,"refused symlink keeps both links")
+        symlinkBytes(a.coreHandle,(a.link as! StallionItem).inode,Data("file".utf8))
     }
     a.close(); namespaceReopened(aliases,"file",inode:aliases.id)
+    for name in ["link","link-alias"] { namespaceReopened(aliases,name,inode:(a.link as! StallionItem).inode) }
+    var reopened: OpaquePointer?, receipt = sfs_result(), linkedMetadata = sfs_metadata_entry()
+    need(sfs_image_open_readonly(aliases.url.path,"image.sfs",&reopened,&receipt) == SFS_OK &&
+         sfs_image_stat_metadata(reopened,0,(a.link as! StallionItem).inode,&linkedMetadata,&receipt) == SFS_OK && linkedMetadata.link_count == 2,"reopened refused symlink retains both links")
+    symlinkBytes(reopened!,(a.link as! StallionItem).inode,Data("file".utf8))
+    need(sfs_image_close(reopened,&receipt) == SFS_OK,"close hardlinked symlink readback")
     for descendant in [false,true] {
         let cycle = try RenameFixture(parent,"rename-cycle-\(descendant)",directory:true), c = cycle.mount, anchor = c.volume.anchor
         // Core checks run after begin; they must make no namespace edits. The adapter still remembers the delivery error.
@@ -2394,8 +2442,9 @@ func renameRefusals(_ parent: URL) throws {
 }
 func renamePolicies(_ parent: URL) throws {
     // Source and each distinct parent are independently denied; no shared-parent shortcut.
+    for symlink in [false,true] {
     for role in 0..<3 { for policy in 0..<(role == 0 ? 4 : 6) {
-        let f = try RenameFixture(parent,"rename-policy-\(role)-\(policy)"), m = f.mount, v = m.volume
+        let f = try RenameFixture(parent,"rename-policy-\(symlink)-\(role)-\(policy)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume
         let operand = role == 0 ? f.item : role == 1 ? f.from : f.to
         m.serial { try! v.diagnosticMutationForTesting { h,r in
             if policy == 3 { need(sfs_image_set_xattr(h,operand.inode,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"rename ACL policy setup") }
@@ -2403,14 +2452,15 @@ func renamePolicies(_ parent: URL) throws {
                 var change = sfs_metadata_update()
                 if policy == 0 { change.fields = UInt32(SFS_META_UID.rawValue); change.uid = geteuid()+1 }
                 else if policy == 1 { change.fields = UInt32(SFS_META_FLAGS.rawValue); change.flags = 1 }
-                else { change.fields = UInt32(SFS_META_MODE.rawValue); change.mode = role == 0 ? UInt32(S_IFREG) | 0o6600 : UInt32(S_IFDIR) | (policy == 2 ? 0o1700 : policy == 4 ? 0o500 : 0o600) }
+                else { change.fields = UInt32(SFS_META_MODE.rawValue); change.mode = role == 0 ? UInt32(symlink ? S_IFLNK : S_IFREG) | 0o6600 : UInt32(S_IFDIR) | (policy == 2 ? 0o1700 : policy == 4 ? 0o500 : 0o600) }
                 need(sfs_image_set_metadata(h,operand.inode,&change,&r) == SFS_OK,"rename metadata policy setup")
             }
         } }
         let before = v.anchor, result = f.rename()
         need(result.0 == nil && code(result.1) == Int(policy == 1 || policy == 3 ? ENOTSUP : EACCES),"rename isolated role policy \(role)/\(policy)")
-        f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+        f.unchanged(before); m.close(); f.reopened()
     } }
+    }
     for spec in 0..<3 {
         let f = try RenameFixture(parent,"rename-gate-\(spec)"), m = f.mount
         if spec == 2 { let before = m.volume.anchor; m.resource.revoke(); need(code(f.rename().1) == Int(EACCES) && anchorMatches(before,m.volume.anchor),"revoked rename gate"); m.close() }
@@ -2431,18 +2481,22 @@ func renamePolicies(_ parent: URL) throws {
 }
 func renameFailures(_ parent: URL, required: FSItem.Attribute) throws {
     need(!required.isEmpty,"actual rename requirements must be observed")
+    for symlink in [false,true] {
     for role in 0..<3 {
-        let f = try RenameFixture(parent,"rename-incomplete-\(role)"), m = f.mount, v = m.volume, before = v.anchor
+        let f = try RenameFixture(parent,"rename-incomplete-\(symlink)-\(role)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume, before = v.anchor
+        let token = f.item.pin!
         var index = 0, constructed = false
         m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { if index == role { a.invalidateAllProperties() }; index += 1 } }
             v.rejectResultForTesting = { _ in constructed = true; return false }
         }
         let result = f.rename()
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && index == role+1 && !constructed,"rename role \(role) fails completeness before constructor")
-        f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8)); m.reopened("new",parent:f.to.inode,inode:nil)
+        f.unchanged(before)
+        m.serial { need(v.ownsForTesting(f.item) && sameBytes(token,f.item.pin!),"incomplete rename result preserves returned pin") }
+        m.close(); f.reopened(); m.reopened("new",parent:f.to.inode,inode:nil)
     }
     for scenario in 0..<4 {
-        let f = try RenameFixture(parent,"rename-failure-\(scenario)"), m = f.mount, v = m.volume, before = v.anchor
+        let f = try RenameFixture(parent,"rename-failure-\(symlink)-\(scenario)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume, before = v.anchor
         let token = f.item.pin!; var constructed = false
         m.serial {
             v.createCommitReceiptForTesting = { _ in need(false,"rename failure creation receipt") }; v.removeCommitReceiptForTesting = { _,_ in need(false,"rename failure removal receipt") }
@@ -2457,8 +2511,9 @@ func renameFailures(_ parent: URL, required: FSItem.Attribute) throws {
         m.serial { need(v.ownsForTesting(f.item) && sameBytes(token,f.item.pin!) && !v.createStateForTesting.pending && !v.createStateForTesting.quarantine,"rename failures never clean up returned pins") }
         if scenario < 2 { f.unchanged(before) }
         m.close()
-        if scenario != 3 { m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8)); m.reopened("new",parent:f.to.inode,inode:nil) }
+        if scenario != 3 { f.reopened(); m.reopened("new",parent:f.to.inode,inode:nil) }
         // OUTCOME_UNKNOWN is retained without asserting either durable namespace.
+    }
     }
     // Root-only plus one empty file commits eight cells: 4 initial + inode/name/namespace/commit.
     // At heights hi=hn=1, rename reserves delete6 + insert9 + inode1 + namespace/commit2 =18 cells.
@@ -2474,8 +2529,10 @@ func renameFailures(_ parent: URL, required: FSItem.Attribute) throws {
     }
 }
 func renameQueued(_ parent: URL) throws {
+    for symlink in [false,true] {
     for occupied in [false,true] {
-        let f = try RenameFixture(parent,"rename-stale-\(occupied)"), m = f.mount, v = m.volume
+        let f = try RenameFixture(parent,"rename-stale-\(symlink)-\(occupied)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume
+        let token = f.item.pin!
         let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), finished = DispatchGroup()
         var replacement: UInt64 = 0, substituted = false, after = v.anchor
         v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"resume stale rename queue") }
@@ -2493,24 +2550,33 @@ func renameQueued(_ parent: URL) throws {
             need(substituted && result == nil && code(error) == Int(occupied ? EEXIST : ESTALE) && anchorMatches(after,v.anchor),"queued exact source/absent target rechecked"); finished.leave()
         }
         release.signal(); need(finished.wait(timeout:.now()+20) == .success,"stale rename reply")
+        m.serial { need(v.ownsForTesting(f.item) && sameBytes(token,f.item.pin!),"queued refusal preserves canonical source pin"); if let target = f.target { symlinkBytes(m.coreHandle,f.item.inode,target) } }
         m.state(4,cap:6); m.close()
         m.reopened(occupied ? "new" : "old",parent:occupied ? f.to.inode : f.from.inode,inode:replacement)
-        m.reopened(occupied ? "old" : "retained",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+        f.reopened(occupied ? "old" : "retained")
     }
-    let f = try RenameFixture(parent,"rename-queued-failure"), m = f.mount, v = m.volume, before = v.anchor
+    let f = try RenameFixture(parent,"rename-queued-failure-\(symlink)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume, before = v.anchor
     let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), finished = DispatchGroup()
     var cleared = false, preflights = 0
     v.enqueue { v.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }; v.renamePreflightForTesting = { preflights += 1 }; held.signal(); need(release.wait(timeout:.now()+20) == .success,"resume queued rename") }
     need(held.wait(timeout:.now()+20) == .success,"hold queued rename")
-    finished.enter(); v.writeCountForTesting(contents:Data([1]),to:f.item,at:0) { count,error in
-        need(count == 0 && code(error) == Int(ENOMEM),"preceding write error retained"); v.diagnosticBeforePrepare = nil; cleared = true; finished.leave()
+    finished.enter()
+    if symlink {
+        v.renameResultForTesting(f.item,sourceDirectory:f.from,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"first"),destinationDirectory:f.to,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+            need(result == nil && code(error) == Int(ENOMEM),"preceding symlink rename error retained"); v.diagnosticBeforePrepare = nil; cleared = true; finished.leave()
+        }
+    } else {
+        v.writeCountForTesting(contents:Data([1]),to:f.item,at:0) { count,error in
+            need(count == 0 && code(error) == Int(ENOMEM),"preceding write error retained"); v.diagnosticBeforePrepare = nil; cleared = true; finished.leave()
+        }
     }
     finished.enter(); v.renameResultForTesting(f.item,sourceDirectory:f.from,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"new"),destinationDirectory:f.to,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
         need(cleared && result == nil && code(error) == Int(ENOMEM),"queued rename blocked after injection cleared"); finished.leave()
     }
-    need(v.linkBudgetForTesting.0 == 2 && v.linkBudgetForTesting.1 == 2 * ReadOnlyLimits.callbackOverhead + 7,"both rename names plus earlier write charged")
+    need(v.linkBudgetForTesting.0 == 2 && v.linkBudgetForTesting.1 == 2 * ReadOnlyLimits.callbackOverhead + (symlink ? 14 : 7),"both callback payloads charged")
     release.signal(); need(finished.wait(timeout:.now()+20) == .success,"queued rename replies")
-    m.serial { need(preflights == 0,"queued delivery guard before rename preflight") }; f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    m.serial { need(preflights == (symlink ? 1 : 0),"queued delivery guard before later rename preflight") }; f.unchanged(before); m.close(); f.reopened()
+    }
     let arithmetic = CallbackBudget()
     need(!arithmetic.acquire(Int.max) && arithmetic.isEmpty,"overflow-sized retained payload cannot enter budget")
     let b = try RenameFixture(parent,"rename-budget"), bm = b.mount, bv = bm.volume
