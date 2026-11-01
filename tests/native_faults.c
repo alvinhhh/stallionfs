@@ -30,6 +30,82 @@ static int preflight_saved_errno;
 static int acl_fault_call;
 static atomic_int acl_size_calls, acl_export_calls;
 static atomic_int entered, release_worker, cancelled, active, swaps, starts, created, joined;
+enum xattr_fault { XATTR_EQUAL, XATTR_CORRUPT, XATTR_READ_ERROR, XATTR_READ_NO_ERRNO,
+                   XATTR_SHORT_READ, XATTR_ALLOC_ERROR, XATTR_QUERY_ERROR, XATTR_QUERY_SHRINK };
+static const struct xattr_case {
+    const char *name;
+    size_t size;
+    enum xattr_fault action;
+    int read_call, error;
+} xattr_cases[] = {
+    {"bytes-8", 8, XATTR_CORRUPT, 0, ENOTSUP},
+    {"bytes-256", 256, XATTR_CORRUPT, 0, ENOTSUP},
+    {"bytes-257", 257, XATTR_CORRUPT, 0, ENOTSUP},
+    {"bytes-4097", 4097, XATTR_CORRUPT, 0, ENOTSUP},
+    {"empty", 0, XATTR_EQUAL, 0, 0},
+    {"equal-256", 256, XATTR_EQUAL, 0, 0},
+    {"equal-257", 257, XATTR_EQUAL, 0, 0},
+    {"source-error", 257, XATTR_READ_ERROR, 2, EACCES},
+    {"destination-error", 257, XATTR_READ_ERROR, 3, EDQUOT},
+    {"read-no-errno", 8, XATTR_READ_NO_ERRNO, 1, EIO},
+    {"source-short", 257, XATTR_SHORT_READ, 2, ESTALE},
+    {"destination-short", 257, XATTR_SHORT_READ, 3, ESTALE},
+    {"destination-growth", 257, XATTR_READ_ERROR, 3, ERANGE},
+    {"allocation-error", 257, XATTR_ALLOC_ERROR, 0, ENOMEM},
+    {"query-error", 257, XATTR_QUERY_ERROR, 0, EACCES},
+    {"query-shrink", 257, XATTR_QUERY_SHRINK, 0, ESTALE},
+};
+static const struct xattr_case *xattr_case;
+static int xattr_ready, xattr_reads, xattr_queries, xattr_allocations, xattr_frees, xattr_allocation_errors;
+static int xattr_starts, xattr_finishes, xattr_mutations;
+static void *xattr_allocation;
+static copyfile_callback_t xattr_callback;
+static const unsigned char xattr_pattern[] = {0x00, 0xff, 0x80, 0x41};
+void *stallion_test_malloc(size_t size) {
+    int value_buffer = xattr_case && xattr_ready && xattr_case->size > 256 && size == xattr_case->size * 2;
+    if (value_buffer && xattr_case->action == XATTR_ALLOC_ERROR) {
+        xattr_allocation_errors++; errno = ENOMEM; return NULL;
+    }
+    void *result = malloc(size);
+    if (value_buffer && result) {
+        assert(!xattr_allocation); xattr_allocation = result; xattr_allocations++;
+    }
+    return result;
+}
+void stallion_test_free(void *pointer) {
+    if (pointer && pointer == xattr_allocation) {
+        xattr_allocation = NULL; xattr_frees++;
+    }
+    free(pointer);
+}
+ssize_t stallion_test_fgetxattr(int fd, const char *name, void *value, size_t size,
+                               uint32_t position, int options) {
+    if (xattr_case && xattr_ready && !strcmp(name, "user.stallion-test") && !value) {
+        xattr_queries++;
+        if (xattr_case->action == XATTR_QUERY_ERROR) { errno = xattr_case->error; return -1; }
+        if (xattr_case->action == XATTR_QUERY_SHRINK) return 256;
+    }
+    if (xattr_case && xattr_ready && value && !strcmp(name, "user.stallion-test")) {
+        xattr_reads++;
+        if (xattr_reads == xattr_case->read_call) {
+            if (xattr_case->action == XATTR_READ_ERROR) { errno = xattr_case->error; return -1; }
+            if (xattr_case->action == XATTR_READ_NO_ERRNO) { errno = 0; return -1; }
+            if (xattr_case->action == XATTR_SHORT_READ) {
+                ssize_t result = fgetxattr(fd, name, value, size, position, options);
+                assert(result > 0); errno = EBUSY; return result - 1;
+            }
+        }
+    }
+    return fgetxattr(fd, name, value, size, position, options);
+}
+static int xattr_status(int what, int stage, copyfile_state_t state,
+                         const char *input, const char *output, void *context) {
+    if (what == COPYFILE_COPY_XATTR) {
+        if (stage == COPYFILE_START) xattr_starts++;
+        if (stage == COPYFILE_FINISH) xattr_finishes++;
+    }
+    return xattr_callback(what, stage, state, input, output, context);
+}
 ssize_t stallion_test_acl_size(acl_t acl) {
     if (atomic_fetch_add(&acl_size_calls, 1) + 1 == acl_fault_call) {
         if (!strcmp(fault, "acl-size-error")) { errno = EACCES; return -1; }
@@ -143,7 +219,25 @@ int stallion_test_fcopyfile(int from, int to, copyfile_state_t state, copyfile_f
     if (!strcmp(fault, "silent-acl")) flags &= ~COPYFILE_ACL;
     if (!strcmp(fault, "silent-xattr")) flags &= ~COPYFILE_XATTR;
     if (!strcmp(fault, "dense-copy")) flags &= ~COPYFILE_DATA_SPARSE;
+    if (xattr_case) {
+        assert(copyfile_state_get(state, COPYFILE_STATE_STATUS_CB, &xattr_callback) == 0 && xattr_callback);
+        assert(copyfile_state_set(state, COPYFILE_STATE_STATUS_CB, (void *)xattr_status) == 0);
+    }
     int result = fcopyfile(from, to, state, flags);
+    if (xattr_case) {
+        assert(copyfile_state_set(state, COPYFILE_STATE_STATUS_CB, (void *)xattr_callback) == 0);
+        if (!result) {
+            if (xattr_case->action == XATTR_CORRUPT) {
+                unsigned char value[4097];
+                assert(xattr_case->size > 0 && xattr_case->size <= sizeof(value));
+                assert(fgetxattr(to, "user.stallion-test", value, xattr_case->size, 0, 0) == (ssize_t)xattr_case->size);
+                value[xattr_case->size - 1] ^= 0x5a;
+                assert(fsetxattr(to, "user.stallion-test", value, xattr_case->size, 0, 0) == 0);
+                xattr_mutations++;
+            }
+            xattr_ready = 1;
+        }
+    }
     if (!result && (!strcmp(fault, "acl-permission") || !strcmp(fault, "acl-order") ||
                     !strcmp(fault, "acl-tag") || !strcmp(fault, "acl-uuid") ||
                     !strcmp(fault, "acl-entry-flags") || !strcmp(fault, "acl-flags"))) {
@@ -472,8 +566,88 @@ static void dense_preflight_case(const char *base, const char *kind) {
     }
     printf("PASS dense preflight %s: flags, offsets, error/guards and descriptors checked\n", kind);
 }
+static void xattr_value_cases(const char *base, int characterize) {
+    for (size_t index = 0; index < sizeof(xattr_cases) / sizeof(*xattr_cases); index++) {
+        xattr_case = &xattr_cases[index];
+        if (characterize && xattr_case->action != XATTR_CORRUPT) continue;
+        char root[PATH_MAX], input[PATH_MAX], output[PATH_MAX], error_path[PATH_MAX];
+        assert(snprintf(root, sizeof(root), "%s/xattr-%s", base, xattr_case->name) < (int)sizeof(root));
+        assert(mkdir(root, 0700) == 0); file(root, "input");
+        snprintf(input, sizeof(input), "%s/input", root);
+        snprintf(output, sizeof(output), "%s/output", root);
+        unsigned char expected[4097], source_value[4097], destination_value[4097];
+        assert(xattr_case->size <= sizeof(expected));
+        for (size_t i = 0; i < xattr_case->size; i++) expected[i] = xattr_pattern[i % sizeof(xattr_pattern)];
+        int input_fd = open(input, O_RDONLY | O_NOFOLLOW | O_CLOEXEC); assert(input_fd >= 0);
+        assert(fsetxattr(input_fd, "user.stallion-test", expected, xattr_case->size, 0, 0) == 0);
+        struct stat original, after, copied;
+        assert(fstat(input_fd, &original) == 0 && stat(root, &destination_parent) == 0);
+        fault = "xattr-values"; caller = pthread_self();
+        atomic_store(&copy_calls, 0); atomic_store(&starts, 0); atomic_store(&cancelled, 0);
+        xattr_ready = xattr_reads = xattr_queries = xattr_allocations = xattr_frees = xattr_allocation_errors = 0;
+        xattr_starts = xattr_finishes = xattr_mutations = 0; xattr_allocation = NULL;
+        int before = descriptors();
+        int result = stallion_copy(input, output, 4, cancel, NULL, error_path, sizeof(error_path));
+        int error = errno;
+        assert(descriptors() == before && copy_calls == 1 && xattr_ready);
+        assert(xattr_starts > 0 && xattr_starts == xattr_finishes);
+        int output_fd = open(output, O_RDONLY | O_NOFOLLOW | O_CLOEXEC); assert(output_fd >= 0);
+        assert(fstat(input_fd, &after) == 0 && fstat(output_fd, &copied) == 0);
+        assert(original.st_dev == after.st_dev && original.st_ino == after.st_ino && original.st_mode == after.st_mode &&
+               original.st_uid == after.st_uid && original.st_gid == after.st_gid && original.st_nlink == after.st_nlink &&
+               original.st_size == after.st_size && original.st_flags == after.st_flags && original.st_gen == after.st_gen &&
+               original.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec && original.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+               original.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec && original.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec &&
+               original.st_birthtimespec.tv_sec == after.st_birthtimespec.tv_sec && original.st_birthtimespec.tv_nsec == after.st_birthtimespec.tv_nsec);
+        assert(original.st_dev != copied.st_dev || original.st_ino != copied.st_ino);
+        assert(fgetxattr(input_fd, "user.stallion-test", NULL, 0, 0, 0) == (ssize_t)xattr_case->size);
+        assert(fgetxattr(output_fd, "user.stallion-test", NULL, 0, 0, 0) == (ssize_t)xattr_case->size);
+        assert(fgetxattr(input_fd, "user.stallion-test", source_value, xattr_case->size, 0, 0) == (ssize_t)xattr_case->size);
+        assert(fgetxattr(output_fd, "user.stallion-test", destination_value, xattr_case->size, 0, 0) == (ssize_t)xattr_case->size);
+        for (size_t i = 0; i < xattr_case->size; i++) {
+            assert(source_value[i] == expected[i]);
+            unsigned char wanted = expected[i];
+            if (xattr_case->action == XATTR_CORRUPT && i == xattr_case->size - 1) wanted ^= 0x5a;
+            assert(destination_value[i] == wanted);
+        }
+        char data[8];
+        assert(pread(input_fd, data, sizeof(data), 0) == sizeof(data) && !memcmp(data, "sentinel", sizeof(data)));
+        assert(pread(output_fd, data, sizeof(data), 0) == sizeof(data) && !memcmp(data, "sentinel", sizeof(data)));
+        assert(close(input_fd) == 0 && close(output_fd) == 0);
+        assert(!xattr_allocation && xattr_allocations == xattr_frees);
+        int expected_error = characterize ? 0 : xattr_case->error;
+        fprintf(stderr, "%s xattr %s: result=%d errno=%d mutation=%d callbacks=%d/%d reads=%d queries=%d allocations=%d frees=%d source_unchanged=1\n",
+                characterize ? "CHARACTERIZE" : "VERIFY", xattr_case->name, result, error, xattr_mutations,
+                xattr_starts, xattr_finishes, xattr_reads, xattr_queries, xattr_allocations, xattr_frees);
+        assert(result == (expected_error ? -1 : 0) && error == expected_error);
+        assert(xattr_mutations == (xattr_case->action == XATTR_CORRUPT));
+        if (characterize) assert(xattr_reads == 0 && xattr_queries == 2 && xattr_allocations == 0);
+        else {
+            assert(xattr_queries == (xattr_case->size > 256));
+            if (xattr_case->action == XATTR_ALLOC_ERROR) {
+                assert(xattr_allocation_errors == 1 && xattr_reads == 1 && xattr_allocations == 0);
+            } else if (xattr_case->action == XATTR_QUERY_ERROR || xattr_case->action == XATTR_QUERY_SHRINK) {
+                assert(xattr_reads == 1 && xattr_allocations == 0);
+            } else {
+                int reads = xattr_case->read_call ? xattr_case->read_call : (xattr_case->size > 256 ? 3 : 2);
+                assert(xattr_reads == reads);
+                assert(xattr_allocations == (xattr_case->size > 256));
+            }
+        }
+    }
+    xattr_case = NULL;
+}
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
+    if (argc == 3) {
+        if (__builtin_available(macOS 13.0, *)) {
+            assert(!strcmp(argv[2], "--xattr-values") || !strcmp(argv[2], "--xattr-characterize"));
+            xattr_value_cases(argv[1], !strcmp(argv[2], "--xattr-characterize"));
+            return 0;
+        }
+        fprintf(stderr, "xattr copy faults require macOS 13 or later\n");
+        return 77;
+    }
     int operations = 2;
     if (__builtin_available(macOS 13.0, *)) operations = 3;
     for (int deleting = 0; deleting < operations; deleting++) {
@@ -516,6 +690,7 @@ int main(int argc, char **argv) {
                                          "empty", "symlink", "early-hole", "sparse-unscreened", "sparse-screened", "source-mutation"};
         for (size_t i = 0; i < sizeof(preflight_cases) / sizeof(*preflight_cases); i++)
             dense_preflight_case(argv[1], preflight_cases[i]);
+        xattr_value_cases(argv[1], 0);
     }
     return 0;
 }
