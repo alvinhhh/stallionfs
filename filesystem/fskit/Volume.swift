@@ -111,6 +111,20 @@ func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdent
     guard !hasACL else { throw POSIXError(.ENOTSUP) }
 }
 #if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
+    guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
+          caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
+    guard m.entry.kind == SFS_FILE, m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.mode & 0o200 != 0, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
+}
+func writableXattrName(_ bytes: Data) throws {
+    try component(bytes, xattr: true)
+    // These names require security, ACL or compression semantics not supplied
+    // by opaque storage. Other Apple and vendor names remain ordinary values.
+    let unsupported = ["com.apple.acl.text", "com.apple.decmpfs", "com.apple.macl", "com.apple.provenance"]
+    guard !bytes.starts(with: "com.apple.system.".utf8),
+          !unsupported.contains(where: { bytes.elementsEqual($0.utf8) }) else { throw POSIXError(.ENOTSUP) }
+}
 func checkLinkParentPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
@@ -1106,6 +1120,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         writable = diagnosticWritable
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        if diagnosticWritable && access.contains(.writeXattr) {
+            try checkXattrOwnerPolicy(m, owner: owner, caller: caller)
+            try ownerAccess(m, inode: inode, access: access.subtracting(.writeXattr), caller: caller)
+            return
+        }
         if diagnosticWritable && m.entry.kind == SFS_DIRECTORY && access.contains(.addFile) {
             try checkLinkParentPolicy(m, owner: owner, caller: caller)
             // The reduced request still passes the existing owner and ACL checks.
@@ -1929,7 +1948,77 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
 #endif
 #endif
-    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        setXattrHandler(name, value: value, item: item, policy: policy, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private func setXattrHandler(_ name: FSFileName, value: Data?, item: FSItem, policy: FSVolume.SetXattrPolicy,
+                                 caller: CallerIdentity, reply: @escaping (FSSetXattrResult?, Error?) -> Void) {
+        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        // FSFileName has already applied its constructor's NUL termination.
+        // Keep exactly the delivered bytes; xattr names are not path components.
+        let bytes = name.data, length = value?.count ?? 0
+        let charge = bytes.count.addingReportingOverflow(length)
+        var validation: Error?
+        do {
+            try writableXattrName(bytes)
+            _ = try checkedXattrLength(UInt64(length))
+            guard !charge.overflow else { throw POSIXError(.E2BIG) }
+            switch policy {
+            case .alwaysSet, .mustCreate, .mustReplace:
+                guard value != nil else { throw POSIXError(.EINVAL) }
+            case .delete: break
+            @unknown default: throw POSIXError(.EINVAL)
+            }
+        } catch { validation = error }
+        enqueue(retainedBytes: charge.overflow ? Int.max : charge.partialValue, namespaceOperation: true,
+                validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result()
+            do {
+                if let error = self.deliveryError() { throw error }
+                let h = try self.ready(mounted: true)
+                guard self.pendingCreate == nil else { throw POSIXError(.EBUSY) }
+                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                let inode = try self.id(item), m = try self.metadata(inode), pin = try self.token(inode)
+                try self.ownerAccess(m, inode: inode, access: .writeXattr, caller: caller)
+                var information = sfs_image_information()
+                try self.check(sfs_image_get_information(h, &information, &receipt), receipt)
+                guard receipt.transaction_active == 0 else { throw POSIXError(.EBUSY) }
+                var size: UInt64 = 0
+                let status = bytes.withUnsafeBytes { sfs_image_pin_xattr_size(h, pin, $0.baseAddress, $0.count, &size, &receipt) }
+                if status != SFS_NOT_FOUND { try self.check(status, receipt) }
+                // A missing attribute still has a committed identity receipt.
+                guard anchorMatches(receipt, self.anchor) else { let error = POSIXError(.ESTALE); self.latch(error); throw error }
+                guard receipt.transaction_active == 0, receipt.poisoned == 0 else { throw POSIXError(.EIO) }
+                let exists = status == SFS_OK
+                if policy == .mustCreate && exists { throw POSIXError(.EEXIST) }
+                if (policy == .mustReplace || policy == .delete) && !exists { throw POSIXError(.ENOATTR) }
+                let result = try self.mutate({ h, r in
+                    let changed = bytes.withUnsafeBytes { name -> sfs_status in
+                        if policy == .delete { return sfs_image_pin_remove_xattr(h, pin, name.baseAddress, name.count, &r) }
+                        return value!.withUnsafeBytes { data in
+                            sfs_image_pin_set_xattr(h, pin, name.baseAddress, name.count, data.baseAddress, data.count, &r)
+                        }
+                    }
+                    try self.check(changed, r, missing: ENOATTR)
+                }, prepare: { _, _ in
+                    try self.handlerResult(FSSetXattrResult.self) { FSSetXattrResult(freeSpace: nil) }
+                }, receipt: &receipt)
+                reply(result, nil)
+            } catch { reply(nil, error) }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    func setXattrResultForTesting(_ name: FSFileName, value: Data?, item: FSItem, policy: FSVolume.SetXattrPolicy,
+                                  caller: CallerIdentity, reply: @escaping (FSSetXattrResult?, Error?) -> Void) {
+        setXattrHandler(name, value: value, item: item, policy: policy, caller: caller, reply: reply)
+    }
+#endif
+#endif
 #endif
 #if STALLION_ADAPTER_CHECK
     // Direct checks use pure caller values; these are not framework entry points
