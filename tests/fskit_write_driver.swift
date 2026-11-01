@@ -2236,12 +2236,560 @@ func directoryQueuedFailure(_ parent: URL) throws {
 }
 #endif
 
+#if STALLION_CONTEXT_HANDLERS
+// Owned real-core setup; rename itself always uses the contextual adapter path.
+final class RenameFixture {
+    let mount: CreationMount, from: StallionItem, to: StallionItem, item: StallionItem
+    let child: StallionItem?
+    init(_ parent: URL, _ name: String, directory: Bool = false) throws {
+        let m = try CreationMount(parent,name,limit:6); mount = m
+        m.serial {
+            try! m.volume.diagnosticMutationForTesting { h,r in
+                var initial = sfs_metadata_initial(), a: UInt64 = 0, b: UInt64 = 0, inode: UInt64 = 0
+                initial.mode = UInt32(S_IFDIR) | 0o700; initial.uid = geteuid(); initial.gid = getegid()
+                need(sfs_image_add_metadata(h,1,"A",1,SFS_DIRECTORY,&initial,&a,&r) == SFS_OK,"rename source parent fixture")
+                need(sfs_image_add_metadata(h,1,"B",1,SFS_DIRECTORY,&initial,&b,&r) == SFS_OK,"rename destination parent fixture")
+                initial.mode = directory ? UInt32(S_IFDIR) | 0o700 : UInt32(S_IFREG) | 0o600
+                need(sfs_image_add_metadata(h,a,"old",3,directory ? SFS_DIRECTORY : SFS_FILE,&initial,&inode,&r) == SFS_OK,"rename source fixture")
+                if directory {
+                    initial.mode = UInt32(S_IFREG) | 0o600
+                    let directoryID = inode
+                    need(sfs_image_add_metadata(h,directoryID,"child",5,SFS_FILE,&initial,&inode,&r) == SFS_OK,"nonempty moved directory fixture")
+                }
+                need(sfs_image_write(h,inode,0,"original",8,&r) == SFS_OK,"rename retained data fixture")
+            }
+        }
+        let a = m.lookup("A") as! StallionItem, b = m.lookup("B") as! StallionItem
+        let source = m.lookup("old",parent:a) as! StallionItem
+        let nested = directory ? m.lookup("child",parent:source) as? StallionItem : nil
+        from = a; to = b; item = source; child = nested
+        m.returned.append(contentsOf:[a,b,source]); if let nested { m.returned.append(nested) }
+    }
+    func rename(_ old: String = "old", _ new: String = "new", source: FSItem? = nil,
+                from oldParent: FSItem? = nil, to newParent: FSItem? = nil, over: FSItem? = nil,
+                caller: CallerIdentity? = nil) -> (FSRenameItemResult?,Error?) {
+        wait { done in mount.volume.renameResultForTesting(source ?? item,sourceDirectory:oldParent ?? from,sourceName:FSFileName(string:old),
+            destinationName:FSFileName(string:new),destinationDirectory:newParent ?? to,overItem:over,
+            caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    }
+    func names(_ old: String?, _ new: String?, newParent: UInt64? = nil) {
+        mount.serial {
+            var e = sfs_entry(), r = sfs_result()
+            for (parent,name,present) in [(self.from.inode,"old",old != nil),(newParent ?? self.to.inode,new ?? "new",new != nil)] {
+                let bytes = Data(name.utf8), status = bytes.withUnsafeBytes { sfs_image_lookup(self.mount.coreHandle,0,parent,$0.baseAddress,$0.count,&e,&r) }
+                need(present ? status == SFS_OK && e.inode == self.item.inode : status == SFS_NOT_FOUND,"rename exact committed names")
+            }
+        }
+    }
+    func unchanged(_ before: sfs_result) {
+        need(anchorMatches(before,mount.volume.anchor),"rename refusal/rollback preserves anchor")
+        names("old",nil); mount.state(child == nil ? 4 : 5,cap:6)
+    }
+}
+func contextualRenames(_ parent: URL) throws {
+    let required = FSRenameItemResult.requestedAttributes.wantedAttributes
+#if STALLION_RESULT_MASK_TRACE
+    let raw = UInt(bitPattern:required.rawValue)
+    resultMaskTrace("FSRenameItemResult original=0x\(String(raw,radix:16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff),radix:16)) explicit=0x0")
+#endif
+    for directory in [false,true] {
+        let f = try RenameFixture(parent,"rename-success-\(directory)",directory:directory), m = f.mount, v = m.volume
+        let operands = [f.item,f.from,f.to], tokens = operands.map { $0.pin! }
+        var snapshots: [FSItem.Attributes] = [], beforeCommit = true, constructors = 0
+        m.serial {
+            f.item.retainedModes = directory ? [] : [.read,.write]
+            v.createStageForTesting = { _,_ in need(false,"rename entered creation") }
+            v.createCommitReceiptForTesting = { _ in need(false,"rename entered creation receipt") }
+            v.removeCommitReceiptForTesting = { _,_ in need(false,"rename entered removal receipt") }
+            v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { need(beforeCommit,"rename snapshots precommit"); snapshots.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSRenameItemResult" { need(beforeCommit && snapshots.count == 3,"actual rename constructor has three prepared roles"); constructors += 1 }; return false }
+            v.diagnosticBeforeCommit = { beforeCommit = false }
+        }
+        func move(_ old: String,_ new: String,_ oldParent: FSItem,_ newParent: FSItem) -> FSRenameItemResult {
+            let prior = constructors; m.serial { snapshots = []; beforeCommit = true }
+            let result = f.rename(old,new,from:oldParent,to:newParent)
+            need(result.1 == nil && result.0 != nil && constructors == prior+1 && snapshots.count == 3 && !beforeCommit,"actual rename result error=\(code(result.1)) roles=\(snapshots.count) constructors=\(constructors)")
+            need(snapshots[0] !== snapshots[1] && snapshots[0] !== snapshots[2] && snapshots[1] !== snapshots[2],"three independent role snapshots even for same parent")
+            for (a,item) in zip(snapshots,[f.item,oldParent,newParent]) { checkPreparedAttributes(a,m.metadata(item),required:required) }
+            need(m.lookup(new,parent:newParent) === f.item,"rename preserves canonical object")
+            m.serial { var entry = sfs_entry(), r = sfs_result(); let bytes = Data(old.utf8)
+                need(bytes.withUnsafeBytes { sfs_image_lookup(m.coreHandle,0,(oldParent as! StallionItem).inode,$0.baseAddress,$0.count,&entry,&r) } == SFS_NOT_FOUND,"old renamed name absent")
+            }
+            m.state(directory ? 5 : 4,cap:6); return result.0!
+        }
+        let first = move("old","same",f.from,f.from), retained = snapshots
+        let retainedMetadata = [m.metadata(f.item),m.metadata(f.from),m.metadata(f.from)]
+        _ = move("same","cross",f.from,f.to)
+        _ = move("cross","root-move",f.to,m.root)
+        _ = move("root-move","final",m.root,f.from)
+        for (a,metadata) in zip(retained,retainedMetadata) { checkPreparedAttributes(a,metadata,required:required) }
+        for (item,token) in zip(operands,tokens) { need(sameBytes(item.pin!,token),"rename never replaces returned pins") }
+        need(f.item.retainedModes == (directory ? [] : [.read,.write]),"rename preserves retained open modes")
+        let dataItem = f.child ?? f.item
+        m.serial { need(try! v.diagnosticReadForTesting(dataItem,length:16) == Data("original".utf8),"moved data survives")
+            directoryNames(m.coreHandle,f.from.inode,["final"]); directoryNames(m.coreHandle,f.to.inode,[])
+            if directory { directoryNames(m.coreHandle,f.item.inode,["child"]) }
+        }
+        if let child = f.child { need(m.lookup("child",parent:f.item) === child && m.metadata(child).entry.parent == f.item.inode,"descendant canonical parent survives move"); directoryMetadata(m.metadata(f.item),parent:f.from.inode,mode:0o700) }
+        withExtendedLifetime(first) {}
+        m.close(); m.reopened("old",parent:f.from.inode,inode:nil); m.reopened("final",parent:f.from.inode,inode:f.item.inode,bytes:directory ? nil : Data("original".utf8))
+        if let child = f.child { m.reopened("child",parent:f.item.inode,inode:child.inode,bytes:Data("original".utf8)) }
+        var h: OpaquePointer?, r = sfs_result(), value = sfs_metadata_entry()
+        need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,f.item.inode,&value,&r) == SFS_OK && value.entry.parent == f.from.inode && value.link_count == 1,"reopened moved metadata")
+        if directory { directoryMetadata(value,parent:f.from.inode,mode:0o700) }
+        need(sfs_image_close(h,&r) == SFS_OK,"rename metadata reopen close")
+    }
+    try renameRefusals(parent); try renamePolicies(parent); try renameFailures(parent,required:required); try renameQueued(parent)
+}
+func renameRefusals(_ parent: URL) throws {
+    let f = try RenameFixture(parent,"rename-refusals"), m = f.mount, v = m.volume, before = v.anchor
+    var prepared = false
+    m.serial { v.diagnosticBeforePrepare = { prepared = true } }
+    need(code(f.rename(over:f.item).1) == Int(ENOTSUP),"rename overwrite parameter refused")
+    need(code(f.rename("old","old",to:f.from).1) == Int(EEXIST),"same path refused")
+    need(code(f.rename(source:f.to).1) == Int(ESTALE),"wrong actual source identity refused")
+    need(code(f.rename("missing").1) == Int(ENOENT),"missing old name refused")
+    need(code(f.rename(source:m.root).1) == Int(ENOTSUP),"root rename refused")
+    need(code(f.rename(from:f.item).1) == Int(ENOTDIR) && code(f.rename(to:f.item).1) == Int(ENOTDIR),"both rename parents must be directories")
+    for role in 0..<3 {
+        let foreign = StallionItem(role == 0 ? f.item.inode : role == 1 ? f.from.inode : f.to.inode)
+        need(code(f.rename(source:role == 0 ? foreign : nil,from:role == 1 ? foreign : nil,to:role == 2 ? foreign : nil).1) == Int(EINVAL),"foreign rename operand \(role)")
+    }
+    for name in ["", ".", "..", "bad/name", String(repeating:"n",count:256)] {
+        let expected = name.utf8.count > 255 ? ENAMETOOLONG : EINVAL
+        need(code(f.rename(name).1) == Int(expected) && code(f.rename("old",name).1) == Int(expected),"both rename components validated")
+    }
+    for caller in [CallerIdentity(uid:-1,gid:0),CallerIdentity(uid:Int(geteuid()),gid:-1),CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid()))] {
+        need(code(f.rename(caller:caller).1) == Int(EACCES),"rename contextual identity")
+    }
+    need(!prepared,"preflight errors never reach prepare"); f.unchanged(before)
+    m.serial { v.diagnosticBeforePrepare = nil }
+    for role in 0..<3 {
+        let old: StallionItem = role == 0 ? f.item : role == 1 ? f.from : f.to
+        need(m.reclaim(old) == nil,"reclaim rename operand")
+        need(code(f.rename(source:role == 0 ? old : m.lookup("old",parent:m.lookup("A")),from:role == 1 ? old : m.lookup("A"),to:role == 2 ? old : m.lookup("B")).1) == Int(EINVAL),"reclaimed rename operand \(role)")
+        // Restore canonical map ownership only through a real lookup; retain every newly returned object for cleanup.
+        let replacement = role == 0 ? m.lookup("old",parent:m.lookup("A")) : m.lookup(role == 1 ? "A" : "B")
+        m.returned.append(replacement)
+    }
+    m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    let aliases = try Fixture(parent,"rename-types"), a = try Mounted(aliases,itemLimit:3)
+    for item in [a.file,a.link] {
+        let result: (FSRenameItemResult?,Error?) = wait { done in a.volume.renameResultForTesting(item,sourceDirectory:a.root,sourceName:FSFileName(string:item === a.file ? "file" : "link"),destinationName:FSFileName(string:"new"),destinationDirectory:a.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP),"multiply named file and symlink rename refused")
+    }
+    a.close(); namespaceReopened(aliases,"file",inode:aliases.id)
+    for descendant in [false,true] {
+        let cycle = try RenameFixture(parent,"rename-cycle-\(descendant)",directory:true), c = cycle.mount, anchor = c.volume.anchor
+        // Core checks run after begin; they must make no namespace edits. The adapter still remembers the delivery error.
+        let result = descendant ? cycle.rename("A","descendant",source:cycle.from,from:c.root,to:cycle.item) : cycle.rename("old","self",to:cycle.item)
+        need(result.0 == nil && code(result.1) == Int(EINVAL),"self/descendant cycle rejected by core")
+        let first = c.volume.diagnosticSnapshot().2!
+        need(first.result.status == SFS_INVALID && first.result.transaction_active != 0,"cycle refusal is inside transaction before cleanup")
+        cycle.unchanged(anchor)
+        c.serial { directoryNames(c.coreHandle,cycle.item.inode,["child"]) }
+        need(code(cycle.rename().1) == Int(EINVAL) && anchorMatches(anchor,c.volume.anchor),"sticky cycle delivery error blocks later rename despite nonterminal core rollback")
+        c.close(); c.reopened("old",parent:cycle.from.inode,inode:cycle.item.inode); c.reopened("new",parent:cycle.to.inode,inode:nil)
+    }
+}
+func renamePolicies(_ parent: URL) throws {
+    // Source and each distinct parent are independently denied; no shared-parent shortcut.
+    for role in 0..<3 { for policy in 0..<(role == 0 ? 4 : 6) {
+        let f = try RenameFixture(parent,"rename-policy-\(role)-\(policy)"), m = f.mount, v = m.volume
+        let operand = role == 0 ? f.item : role == 1 ? f.from : f.to
+        m.serial { try! v.diagnosticMutationForTesting { h,r in
+            if policy == 3 { need(sfs_image_set_xattr(h,operand.inode,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"rename ACL policy setup") }
+            else {
+                var change = sfs_metadata_update()
+                if policy == 0 { change.fields = UInt32(SFS_META_UID.rawValue); change.uid = geteuid()+1 }
+                else if policy == 1 { change.fields = UInt32(SFS_META_FLAGS.rawValue); change.flags = 1 }
+                else { change.fields = UInt32(SFS_META_MODE.rawValue); change.mode = role == 0 ? UInt32(S_IFREG) | 0o6600 : UInt32(S_IFDIR) | (policy == 2 ? 0o1700 : policy == 4 ? 0o500 : 0o600) }
+                need(sfs_image_set_metadata(h,operand.inode,&change,&r) == SFS_OK,"rename metadata policy setup")
+            }
+        } }
+        let before = v.anchor, result = f.rename()
+        need(result.0 == nil && code(result.1) == Int(policy == 1 || policy == 3 ? ENOTSUP : EACCES),"rename isolated role policy \(role)/\(policy)")
+        f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    } }
+    for spec in 0..<3 {
+        let f = try RenameFixture(parent,"rename-gate-\(spec)"), m = f.mount
+        if spec == 2 { let before = m.volume.anchor; m.resource.revoke(); need(code(f.rename().1) == Int(EACCES) && anchorMatches(before,m.volume.anchor),"revoked rename gate"); m.close() }
+        else {
+            m.close(); var h: OpaquePointer?, r = sfs_result()
+            let status = spec == 0 ? sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) : sfs_image_open(m.url.path,"image.sfs",&h,&r)
+            need(status == SFS_OK,"rename unbound gate open")
+            let resource = FSPathURLResource(url:m.url,writable:spec != 0), v = StallionVolume(handle:h!,resource:resource,scope:false,anchor:r,queue:DispatchQueue(label:"sfs.rename.gate"))
+            let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }; need(activation.1 == nil,"rename gate activate")
+            let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) }; need(mounted == nil,"rename gate mount")
+            let result: (FSRenameItemResult?,Error?) = wait { done in v.renameResultForTesting(activation.0!,sourceDirectory:activation.0!,sourceName:FSFileName(string:"A"),destinationName:FSFileName(string:"new"),destinationDirectory:activation.0!,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+            need(result.0 == nil && code(result.1) == Int(EROFS) && anchorMatches(r,v.anchor),"RO or missing exact UUID refuses before operands")
+            let _: Bool = wait { done in v.unmount { done(true) } }
+            let consumed: Bool = wait { done in v.enqueue { done(v.unload().consumed) } }; need(consumed,"unbound rename gate close")
+        }
+        m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    }
+}
+func renameFailures(_ parent: URL, required: FSItem.Attribute) throws {
+    need(!required.isEmpty,"actual rename requirements must be observed")
+    for role in 0..<3 {
+        let f = try RenameFixture(parent,"rename-incomplete-\(role)"), m = f.mount, v = m.volume, before = v.anchor
+        var index = 0, constructed = false
+        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { if index == role { a.invalidateAllProperties() }; index += 1 } }
+            v.rejectResultForTesting = { _ in constructed = true; return false }
+        }
+        let result = f.rename()
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && index == role+1 && !constructed,"rename role \(role) fails completeness before constructor")
+        f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8)); m.reopened("new",parent:f.to.inode,inode:nil)
+    }
+    for scenario in 0..<4 {
+        let f = try RenameFixture(parent,"rename-failure-\(scenario)"), m = f.mount, v = m.volume, before = v.anchor
+        let token = f.item.pin!; var constructed = false
+        m.serial {
+            v.createCommitReceiptForTesting = { _ in need(false,"rename failure creation receipt") }; v.removeCommitReceiptForTesting = { _,_ in need(false,"rename failure removal receipt") }
+            v.rejectResultForTesting = { name in if name == "FSRenameItemResult" { constructed = true; return scenario == 0 }; return false }
+            if scenario == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if scenario >= 2 { v.diagnosticBeforeCommit = { fault(4,Int32(scenario-1)) } }
+        }
+        let result = f.rename()
+        need(result.0 == nil && code(result.1) == Int(scenario == 0 ? EIO : scenario == 1 ? EACCES : ENOSPC) && constructed && anchorMatches(before,v.anchor),"rename failure \(scenario) error=\(code(result.1)) actual constructor reached")
+        if scenario >= 2 { need(hits() > 0 && v.diagnosticSnapshot().2?.result.status == (scenario == 2 ? SFS_IO : SFS_OUTCOME_UNKNOWN),"actual rename fence failure versus uncertain outcome") }
+        fault(0,0)
+        m.serial { need(v.ownsForTesting(f.item) && sameBytes(token,f.item.pin!) && !v.createStateForTesting.pending && !v.createStateForTesting.quarantine,"rename failures never clean up returned pins") }
+        if scenario < 2 { f.unchanged(before) }
+        m.close()
+        if scenario != 3 { m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8)); m.reopened("new",parent:f.to.inode,inode:nil) }
+        // OUTCOME_UNKNOWN is retained without asserting either durable namespace.
+    }
+    // Root-only plus one empty file commits eight cells: 4 initial + inode/name/namespace/commit.
+    // At heights hi=hn=1, rename reserves delete6 + insert9 + inode1 + namespace/commit2 =18 cells.
+    for capacity in [UInt64(32768),UInt64(36864)] {
+        let m = try CreationMount(parent,"rename-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        let created = m.create("old"); need(created.0 != nil && created.1 == nil && created.2 != nil,"capacity rename source creation")
+        let item = created.2!, before = v.anchor
+        m.serial { var info = sfs_image_information(), r = sfs_result(); need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 32768 && info.append_headroom == capacity-32768,"rename actual fixture geometry zero/one free cell") }
+        let result: (FSRenameItemResult?,Error?) = wait { done in v.renameResultForTesting(item,sourceDirectory:m.root,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"new"),destinationDirectory:m.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        let receipt = v.diagnosticSnapshot().2!.result
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && receipt.status == SFS_LIMIT && receipt.limit_reason == SFS_LIMIT_APPEND_CAPACITY && receipt.phase == SFS_PHASE_ADMISSION && receipt.transaction_active == 0 && anchorMatches(before,v.anchor),"real begin/rename reservation capacity failure")
+        m.state(2,cap:2); m.close(); m.reopened("old",inode:item.inode); m.reopened("new",inode:nil)
+    }
+}
+func renameQueued(_ parent: URL) throws {
+    for occupied in [false,true] {
+        let f = try RenameFixture(parent,"rename-stale-\(occupied)"), m = f.mount, v = m.volume
+        let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), finished = DispatchGroup()
+        var replacement: UInt64 = 0, substituted = false, after = v.anchor
+        v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"resume stale rename queue") }
+        need(held.wait(timeout:.now()+20) == .success,"hold stale rename queue")
+        v.enqueue {
+            try! v.diagnosticMutationForTesting { h,r in
+                if !occupied { need(sfs_image_rename_replace(h,f.from.inode,"old",3,f.item.inode,f.from.inode,"retained",8,0,&r) == SFS_OK,"move retained original away from stale name") }
+                var initial = sfs_metadata_initial(); initial.mode = UInt32(S_IFREG) | 0o600; initial.uid = geteuid(); initial.gid = getegid()
+                let name = occupied ? "new" : "old"
+                need(sfs_image_add_metadata(h,occupied ? f.to.inode : f.from.inode,name,3,SFS_FILE,&initial,&replacement,&r) == SFS_OK,"commit real stale name replacement")
+            }
+            after = v.anchor; substituted = true
+        }
+        finished.enter(); v.renameResultForTesting(f.item,sourceDirectory:f.from,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"new"),destinationDirectory:f.to,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+            need(substituted && result == nil && code(error) == Int(occupied ? EEXIST : ESTALE) && anchorMatches(after,v.anchor),"queued exact source/absent target rechecked"); finished.leave()
+        }
+        release.signal(); need(finished.wait(timeout:.now()+20) == .success,"stale rename reply")
+        m.state(4,cap:6); m.close()
+        m.reopened(occupied ? "new" : "old",parent:occupied ? f.to.inode : f.from.inode,inode:replacement)
+        m.reopened(occupied ? "old" : "retained",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    }
+    let f = try RenameFixture(parent,"rename-queued-failure"), m = f.mount, v = m.volume, before = v.anchor
+    let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), finished = DispatchGroup()
+    var cleared = false, preflights = 0
+    v.enqueue { v.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }; v.renamePreflightForTesting = { preflights += 1 }; held.signal(); need(release.wait(timeout:.now()+20) == .success,"resume queued rename") }
+    need(held.wait(timeout:.now()+20) == .success,"hold queued rename")
+    finished.enter(); v.writeCountForTesting(contents:Data([1]),to:f.item,at:0) { count,error in
+        need(count == 0 && code(error) == Int(ENOMEM),"preceding write error retained"); v.diagnosticBeforePrepare = nil; cleared = true; finished.leave()
+    }
+    finished.enter(); v.renameResultForTesting(f.item,sourceDirectory:f.from,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"new"),destinationDirectory:f.to,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+        need(cleared && result == nil && code(error) == Int(ENOMEM),"queued rename blocked after injection cleared"); finished.leave()
+    }
+    need(v.linkBudgetForTesting.0 == 2 && v.linkBudgetForTesting.1 == 2 * ReadOnlyLimits.callbackOverhead + 7,"both rename names plus earlier write charged")
+    release.signal(); need(finished.wait(timeout:.now()+20) == .success,"queued rename replies")
+    m.serial { need(preflights == 0,"queued delivery guard before rename preflight") }; f.unchanged(before); m.close(); m.reopened("old",parent:f.from.inode,inode:f.item.inode,bytes:Data("original".utf8))
+    let arithmetic = CallbackBudget()
+    need(!arithmetic.acquire(Int.max) && arithmetic.isEmpty,"overflow-sized retained payload cannot enter budget")
+    let b = try RenameFixture(parent,"rename-budget"), bm = b.mount, bv = bm.volume
+    let stopped = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+    let old = String(repeating:"s",count:255), new = String(repeating:"d",count:255)
+    bv.enqueue { stopped.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume saturated rename queue") }
+    need(stopped.wait(timeout:.now()+20) == .success,"hold saturated rename queue")
+    // The adapter-only hold is uncharged; 256 queued renames fill the callback slots.
+    for _ in 0..<ReadOnlyLimits.callbacks {
+        replies.enter(); bv.renameResultForTesting(b.item,sourceDirectory:b.from,sourceName:FSFileName(string:old),destinationName:FSFileName(string:new),destinationDirectory:b.to,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+            need(result == nil && code(error) == Int(ENOENT),"bounded maximum-component rename returns missing source"); replies.leave()
+        }
+    }
+    need(bv.linkBudgetForTesting.0 == ReadOnlyLimits.callbacks && bv.linkBudgetForTesting.1 == ReadOnlyLimits.callbacks * ReadOnlyLimits.callbackOverhead + ReadOnlyLimits.callbacks*510,"both maximum names charged at slot boundary")
+    need(code(b.rename(old,new).1) == Int(EAGAIN),"saturated rename rejected synchronously")
+    resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"bounded saturated rename drain")
+    bm.state(4,cap:6); b.names("old",nil); bm.close()
+}
+#endif
+
+#if STALLION_CONTEXT_HANDLERS
+func createSymlink(_ m: CreationMount, _ target: FSFileName, name: String = "new", parent: FSItem? = nil,
+                   attributes: FSItem.SetAttributesRequest? = nil, caller: CallerIdentity? = nil) -> (FSCreateSymlinkResult?,Error?,StallionItem?) {
+    var item: StallionItem?, prior: ((String,StallionItem?) throws -> Void)?
+    m.serial { prior = m.volume.createStageForTesting; m.volume.createStageForTesting = { stage,value in
+        if stage == "inserted" { item = value }; try prior?(stage,value)
+    } }
+    let result: (FSCreateSymlinkResult?,Error?) = wait { done in m.volume.symlinkResultForTesting(FSFileName(string:name),directory:parent ?? m.root,
+        attributes:attributes ?? creationAttributes(0o700),linkContents:target,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    m.serial { m.volume.createStageForTesting = prior }
+    if result.0 != nil, let item { m.returned.append(item) }
+    return (result.0,result.1,result.0 == nil ? nil : item)
+}
+func symlinkBytes(_ h: OpaquePointer, _ inode: UInt64, _ expected: Data) {
+    var r = sfs_result(), bytes = Data(count:4096), count = 0
+    need(bytes.withUnsafeMutableBytes { sfs_image_readlink(h,0,inode,$0.baseAddress,$0.count,&count,&r) } == SFS_OK && count == expected.count && bytes.prefix(count) == expected,"raw exact stored target without terminator")
+}
+func symlinkReopened(_ m: CreationMount, _ name: String = "new", parent: UInt64 = 1, inode: UInt64, target: Data) {
+    m.reopened(name,parent:parent,inode:inode)
+    var h: OpaquePointer?, r = sfs_result(), metadata = sfs_metadata_entry()
+    need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,inode,&metadata,&r) == SFS_OK,"symlink reopen metadata")
+    need(metadata.entry.kind == SFS_SYMLINK && metadata.entry.size == UInt64(target.count) && metadata.referenced_data_bytes == 4096 && metadata.link_count == 1 && metadata.entry.parent == parent,"truthful target size/allocation/links/parent")
+    symlinkBytes(h!,inode,target); need(sfs_image_close(h,&r) == SFS_OK,"symlink reopen close")
+}
+func symlinkReadback(_ m: CreationMount, _ item: StallionItem, _ target: Data) {
+    let result: (FSReadSymlinkResult?,Error?) = wait { done in m.volume.readlinkResultForTesting(item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(result.0 != nil && result.1 == nil,"actual contextual readlink constructor error=\(code(result.1))")
+    // Result classes expose no target getter. This is the same readlinkBody's legacy return, correlated with raw storage.
+    let legacy: (FSFileName?,Error?) = wait { done in m.volume.readSymbolicLink(item) { done(($0,$1)) } }
+    need(legacy.1 == nil && legacy.0?.data == target,"shared readlink body exact delivered bytes")
+    m.serial { symlinkBytes(m.coreHandle,item.inode,target) }
+}
+func contextualSymlinkCreation(_ parent: URL) throws {
+    let required = FSCreateSymlinkResult.requestedAttributes.wantedAttributes
+#if STALLION_RESULT_MASK_TRACE
+    let raw = UInt(bitPattern:required.rawValue)
+    resultMaskTrace("FSCreateSymlinkResult original=0x\(String(raw,radix:16)) outside_caller_readable=0x\(String(raw & ~UInt(0x3fff),radix:16)) explicit=0x0")
+#endif
+    let targets = [Data("missing".utf8),Data("/missing/absolute".utf8),Data("../a/./b".utf8),Data("目标/é".utf8),Data([0xff,0xfe,47,0x80]),Data([120]),Data(repeating:120,count:4096)]
+    for (index,expected) in targets.enumerated() {
+        let target = FSFileName(data:expected); need(target.data == expected,"observe non-NUL FSFileName input bytes")
+        let m = try CreationMount(parent,"symlink-target-\(index)"), v = m.volume, attributes = creationAttributes(index % 2 == 0 ? 0o700 : UInt32(S_IFLNK) | 0o750)
+        attributes.flags = 0
+        var snapshots: [FSItem.Attributes] = [], beforeCommit = true, constructors = 0
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSCreateSymlinkResult" { need(beforeCommit,"symlink snapshots precommit"); snapshots.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSCreateSymlinkResult" { need(beforeCommit && snapshots.count == 2,"concrete symlink constructor has two complete roles"); constructors += 1 }; return false }
+            v.diagnosticBeforeCommit = { beforeCommit = false }
+            v.removeCommitReceiptForTesting = { _,_ in need(false,"symlink creation entered removal receipt hook") }
+        }
+        let first = createSymlink(m,target,attributes:attributes)
+        need(first.0 != nil && first.1 == nil && first.2 != nil && constructors == 1 && snapshots.count == 2 && !beforeCommit,"actual symlink result error=\(code(first.1)) roles=\(snapshots.count) constructors=\(constructors)")
+        let item = first.2!, childMetadata = m.metadata(item), parentMetadata = m.metadata(m.root)
+        need(snapshots[0] !== snapshots[1] && childMetadata.entry.kind == SFS_SYMLINK && childMetadata.entry.size == UInt64(expected.count) && childMetadata.referenced_data_bytes == 4096 && childMetadata.mode == UInt32(S_IFLNK) | (attributes.mode & 0o777) && childMetadata.uid == geteuid() && childMetadata.gid == getegid() && childMetadata.flags == 0 && childMetadata.link_count == 1,"actual symlink metadata")
+        need(attributes.consumedAttributes == [.mode,.uid,.gid,.flags],"only explicitly supported symlink fields consumed")
+        checkPreparedAttributes(snapshots[0],childMetadata,required:required); checkPreparedAttributes(snapshots[1],parentMetadata,required:required)
+        need(m.lookup("new") === item,"new symlink canonical identity"); symlinkReadback(m,item,expected); m.state(2)
+        let ignored = FSItem.SetAttributesRequest(); ignored.size = UInt64.max
+        let resized: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(ignored,on:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(resized.1 == nil && ignored.consumedAttributes.isEmpty,"existing symlink resize-ignore behavior preserved")
+        checkPreparedAttributes(snapshots[0],childMetadata,required:required); withExtendedLifetime(first.0) {}
+        m.close(); symlinkReopened(m,inode:item.inode,target:expected)
+    }
+    // The public constructor discards the suffix BEFORE the callback; do not label this a callback NUL rejection.
+    let truncated = FSFileName(data:Data([97,0,98])); need(truncated.data == Data([97]),"observe documented NUL truncation to delivered prefix")
+    let t = try CreationMount(parent,"symlink-truncated"), result = createSymlink(t,truncated)
+    need(result.0 != nil && result.1 == nil && result.2 != nil,"create only delivered prefix"); symlinkReadback(t,result.2!,truncated.data)
+    t.close(); symlinkReopened(t,inode:result.2!.inode,target:Data([97]))
+    try symlinkReuse(parent,required:required); try symlinkRefusals(parent); try symlinkFailures(parent); try symlinkQueued(parent)
+}
+func symlinkReuse(_ parent: URL, required: FSItem.Attribute) throws {
+    let m = try CreationMount(parent,"symlink-reuse",directory:true,limit:5), v = m.volume, target = FSFileName(string:"../missing")
+    var snapshots: [FSItem.Attributes] = []
+    m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSCreateSymlinkResult" { snapshots.append(a) } } }
+    let first = createSymlink(m,target,name:"first")
+    need(first.0 != nil && first.1 == nil && first.2 != nil && snapshots.count == 2,"first reusable symlink result error=\(code(first.1))")
+    let item = first.2!
+    let retained = snapshots, original = [m.metadata(item),m.metadata(m.root)], token = item.pin!
+    m.state(3,cap:5)
+    let file = m.create("file",parent:m.directory!); need(file.0 != nil && file.1 == nil && file.2 != nil,"ordinary file interleaved with symlink"); m.state(4,cap:5)
+    let second = createSymlink(m,target,name:"second",parent:m.directory!,attributes:creationAttributes(UInt32(S_IFLNK) | 0o700))
+    need(second.0 != nil && second.1 == nil && second.2 != nil && second.2! !== item,"nonroot full-mode symlink"); m.state(5,cap:5)
+    let before = v.anchor, full = createSymlink(m,target,name:"full")
+    need(full.0 == nil && code(full.1) == Int(ENFILE) && anchorMatches(before,v.anchor),"symlink cap before reservation")
+    let freed = file.2!.pin!; need(m.reclaim(file.2!) == nil,"reclaim interleaved file slot"); m.state(4,cap:5)
+    let directory = m.create("nested",request:creationAttributes(0o700),parent:m.directory!,type:.directory)
+    need(directory.0 != nil && directory.1 == nil && directory.2!.pin!.slot == freed.slot && directory.2!.pin!.incarnation > freed.incarnation,"directory reuses slot after symlink state"); m.state(5,cap:5)
+    let secondToken = second.2!.pin!; need(m.reclaim(second.2!) == nil,"reclaim second symlink slot"); m.state(4,cap:5)
+    let third = createSymlink(m,target,name:"third",parent:directory.2!)
+    need(third.0 != nil && third.1 == nil && third.2 != nil && third.2!.inode != item.inode && third.2!.inode != second.2!.inode && third.2!.pin!.slot == secondToken.slot && third.2!.pin!.incarnation > secondToken.incarnation,"symlink reuses only slot with fresh real identity")
+    need(m.lookup("first") === item && sameBytes(token,item.pin!),"first canonical identity survives interleaving")
+    symlinkReadback(m,item,target.data); symlinkReadback(m,third.2!,target.data); m.state(5,cap:5)
+    for (a,metadata) in zip(retained,original) { checkPreparedAttributes(a,metadata,required:required) }
+    withExtendedLifetime(first.0) {}
+    m.close(); symlinkReopened(m,"first",inode:item.inode,target:target.data); symlinkReopened(m,"second",parent:(m.directory as! StallionItem).inode,inode:second.2!.inode,target:target.data)
+    symlinkReopened(m,"third",parent:directory.2!.inode,inode:third.2!.inode,target:target.data)
+}
+func symlinkRefusals(_ parent: URL) throws {
+    let m = try CreationMount(parent,"symlink-refusals"), v = m.volume, target = FSFileName(string:"target"), before = v.anchor
+    var reserved = false
+    m.serial { v.createStageForTesting = { stage,_ in if stage == "reserved" { reserved = true } } }
+    let empty = FSFileName(data:Data([0,120])); need(empty.data.isEmpty,"leading NUL delivers empty target")
+    for (contents,expected) in [(FSFileName(data:Data()),EINVAL),(empty,EINVAL),(FSFileName(data:Data(repeating:120,count:4097)),ENAMETOOLONG)] {
+        let a = creationAttributes(0o700); need(code(createSymlink(m,contents,attributes:a).1) == Int(expected) && a.consumedAttributes.isEmpty,"invalid delivered target before reserve")
+    }
+    for size in [UInt64(0),UInt64(6),UInt64.max] { let a = creationAttributes(0o700); a.size = size; need(code(createSymlink(m,target,attributes:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"every supplied symlink size refused") }
+    for missing in 0..<3 {
+        let a = FSItem.SetAttributesRequest(); if missing != 0 { a.mode = 0o700 }; if missing != 1 { a.uid = geteuid() }; if missing != 2 { a.gid = getegid() }
+        need(code(createSymlink(m,target,attributes:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"explicit required symlink fields")
+    }
+    for mode in [UInt32(S_IFREG)|0o700,UInt32(S_IFDIR)|0o700] { need(code(createSymlink(m,target,attributes:creationAttributes(mode)).1) == Int(EINVAL),"conflicting symlink mode kind") }
+    for mode in [UInt32(0o1700),UInt32(0o2700),UInt32(0o4700),UInt32(1)<<31] { need(code(createSymlink(m,target,attributes:creationAttributes(mode)).1) == Int(ENOTSUP),"special/unknown symlink mode") }
+    for field in 0..<5 {
+        let a = creationAttributes(0o700)
+        if field == 0 { a.uid = geteuid()+1 }; if field == 1 { a.gid = getegid()+1 }; if field == 2 { a.flags = 1 }; if field == 3 { a.type = .symlink }; if field == 4 { a.birthTime = timespec(tv_sec:1,tv_nsec:0) }
+        need(code(createSymlink(m,target,attributes:a).1) == Int(field < 2 ? EACCES : ENOTSUP) && a.consumedAttributes.isEmpty,"symlink explicit unsupported/mismatched attributes")
+    }
+    for caller in [CallerIdentity(uid:-1,gid:0),CallerIdentity(uid:Int(geteuid()),gid:-1),CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid()))] { need(code(createSymlink(m,target,caller:caller).1) == Int(EACCES),"symlink actual caller validation") }
+    for name in ["", ".", "..", "bad/name", String(repeating:"n",count:256)] { need(code(createSymlink(m,target,name:name).1) == Int(name.utf8.count > 255 ? ENAMETOOLONG : EINVAL),"link name remains component") }
+    need(code(createSymlink(m,target,parent:StallionItem(1)).1) == Int(EINVAL),"foreign symlink parent")
+    need(code(m.create(type:.symlink).1) == Int(ENOTSUP),"ordinary createItem still has no target")
+    need(!reserved && anchorMatches(before,v.anchor),"all symlink preflight errors before reserve"); m.state(1); m.absent()
+    m.serial { v.createStageForTesting = nil }
+    let first = createSymlink(m,target); need(first.0 != nil && first.1 == nil && first.2 != nil,"valid symlink after refusal sequence")
+    let committed = v.anchor
+    need(code(createSymlink(m,target).1) == Int(EEXIST) && code(createSymlink(m,target,parent:first.2!).1) == Int(ENOTDIR) && anchorMatches(committed,v.anchor),"occupied/non-directory symlink parent refusal")
+    need(m.reclaim(first.2!) == nil && code(createSymlink(m,target,parent:first.2!).1) == Int(EINVAL),"reclaimed symlink parent refused")
+    m.close(); symlinkReopened(m,inode:first.2!.inode,target:target.data)
+    for spec in 0..<8 {
+        let p = try CreationMount(parent,"symlink-policy-\(spec)",rootMode:spec == 0 ? 0o500 : spec == 1 ? 0o600 : spec == 2 ? 0o1700 : 0o700,
+            rootFlags:spec == 3 ? 1 : 0,rootOwner:spec == 4 ? geteuid()+1 : geteuid(),acl:spec == 5,writable:spec != 6,enable:spec != 7)
+        need(code(createSymlink(p,target).1) == Int(spec == 3 || spec == 5 ? ENOTSUP : spec >= 6 ? EROFS : EACCES),"symlink isolated parent/write policy")
+        p.close(); p.reopened(inode:nil)
+    }
+    let restrictive = try CreationMount(parent,"symlink-restrictive"), link = createSymlink(restrictive,target,attributes:creationAttributes(0o200))
+    need(link.0 != nil && link.1 == nil && link.2 != nil,"explicit restrictive symlink mode retained")
+    let read: (FSReadSymlinkResult?,Error?) = wait { done in restrictive.volume.readlinkResultForTesting(link.2!,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(read.0 == nil && code(read.1) == Int(EACCES),"creation does not grant contextual readlink")
+    restrictive.serial { symlinkBytes(restrictive.coreHandle,link.2!.inode,target.data) }
+    restrictive.close(); symlinkReopened(restrictive,inode:link.2!.inode,target:target.data)
+}
+func symlinkFailures(_ parent: URL) throws {
+    let target = FSFileName(string:"../target")
+    for role in 0..<2 {
+        let m = try CreationMount(parent,"symlink-incomplete-\(role)"), v = m.volume, before = v.anchor
+        var seen = 0, constructed = false
+        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSCreateSymlinkResult" { if seen == role { a.invalidateAllProperties() }; seen += 1 } }; v.rejectResultForTesting = { _ in constructed = true; return false } }
+        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role+1 && !constructed && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"symlink role invalid before concrete constructor")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+    }
+    for stage in ["added","bound"] {
+        let m = try CreationMount(parent,"symlink-stage-\(stage)"), v = m.volume
+        weak var unreturned: StallionItem?
+        m.serial { v.createStageForTesting = { observed,item in if observed == stage { unreturned = item; throw POSIXError(.ENOMEM) } } }
+        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && outcome.discarded && !outcome.releaseAttempted && unreturned == nil,"symlink stage cleanup without double release or object retention")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+    }
+    for scenario in 0..<5 {
+        let m = try CreationMount(parent,"symlink-failure-\(scenario)"), v = m.volume, before = v.anchor
+        var constructed = false
+        m.serial {
+            v.removeCommitReceiptForTesting = { _,_ in need(false,"symlink entered removal receipt") }
+            if scenario == 0 { v.rejectResultForTesting = { name in if name == "FSCreateSymlinkResult" { constructed = true; return true }; return false } }
+            if scenario == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if scenario == 4 { v.createCommitReceiptForTesting = { $0.fence_succeeded = 0 } }
+        }
+        if scenario == 2 || scenario == 3 { fault(4,Int32(scenario-1)) }
+        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(scenario == 1 ? EACCES : scenario == 2 || scenario == 3 ? ENOSPC : EIO) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"symlink failure \(scenario) error=\(code(result.1))")
+        if scenario == 0 { need(constructed,"real concrete constructor precedes injected symlink failure") }
+        if scenario == 2 || scenario == 3 { need(hits() > 0 && outcome.original.status == (scenario == 2 ? SFS_IO : SFS_OUTCOME_UNKNOWN),"actual symlink first/second fence disposition") }
+        fault(0,0)
+        if scenario == 4 {
+            need(outcome.commitSucceeded && outcome.commit.status == SFS_OK && outcome.commit.fence_succeeded == 3 && !outcome.abortAttempted && outcome.releaseAttempted && outcome.release.status == SFS_OK,"promoted symlink pin released without abort after actual C success")
+            let token = v.createTokenForTesting!
+            m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID && !v.createStateForTesting.pending && v.activeItemCount() == 1,"unreturned promoted symlink token consumed") }
+        } else { need(outcome.discarded && !outcome.releaseAttempted,"discarded symlink reservation not released twice") }
+        m.close()
+        if scenario == 4 { symlinkReopened(m,inode:2,target:target.data) }
+        else if scenario != 3 { m.reopened(inode:nil) }
+    }
+    for capacity in [UInt64(16384),UInt64(20480),UInt64(40960)] {
+        let m = try CreationMount(parent,"symlink-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        m.serial { var info = sfs_image_information(), r = sfs_result(); need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 16384 && info.append_headroom == capacity-16384,"actual symlink root-only capacity geometry") }
+        let contents = FSFileName(data:Data(repeating:120,count:4096)); need(contents.data.count == 4096,"actual max target delivered")
+        let a = creationAttributes(0o700), result = createSymlink(m,contents,attributes:a), outcome = v.createOutcomeForTesting
+        if capacity == 40960 {
+            need(result.0 != nil && result.1 == nil && result.2 != nil && v.anchor.committed_end == 40960,"six symlink cells fit exact capacity")
+            m.state(2,cap:2); m.close(); symlinkReopened(m,inode:result.2!.inode,target:contents.data)
+        } else {
+            need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT && outcome.original.limit_reason == SFS_LIMIT_APPEND_CAPACITY && a.consumedAttributes.isEmpty,"actual symlink append capacity failure")
+            need(outcome.beginSucceeded == (capacity == 20480) && outcome.discarded == (capacity == 20480) && outcome.releaseAttempted == (capacity == 16384),"symlink begin reservation versus mutation discard")
+            m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil)
+        }
+    }
+    let q = try CreationMount(parent,"symlink-release-quarantine"), v = q.volume
+    q.serial { v.createStageForTesting = { stage,_ in if stage == "reserved" { throw POSIXError(.ENOMEM) } }; v.createReleaseForTesting = { _,_,r in r.status = SFS_IO; r.system_errno = EIO; return SFS_IO } }
+    let failure = createSymlink(q,target)
+    q.serial { need(failure.0 == nil && code(failure.1) == Int(ENOMEM) && v.createStateForTesting.pending && v.createStateForTesting.quarantine && v.createStateForTesting.ticket == 1 && v.activeItemCount() == 1 && v.createOutcomeForTesting.release.status == SFS_IO,"primary symlink failure plus unresolved release quarantine") }
+    q.close(); q.reopened(inode:nil)
+}
+func symlinkQueued(_ parent: URL) throws {
+    for quarantine in [false,true] {
+        let m = try CreationMount(parent,"symlink-queued-\(quarantine)",directory:quarantine), v = m.volume, before = v.anchor
+        let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+        var preflights = 0, cleared = false
+        weak var unreturned: StallionItem?
+        v.enqueue {
+            v.createStageForTesting = { stage,item in if stage == "preflight" { preflights += 1 }; if stage == "inserted" { unreturned = item; throw POSIXError(.ENOMEM) } }
+            if quarantine { v.createAbortForTesting = { _,r in r.status = SFS_IO; r.transaction_active = 1; r.system_errno = EIO; return SFS_IO } }
+            held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume symlink queue")
+        }
+        need(held.wait(timeout:.now()+20) == .success,"hold symlink queue")
+        let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), first = creationAttributes(0o700), next = creationAttributes(0o700), target = FSFileName(string:"../target")
+        replies.enter(); v.symlinkResultForTesting(FSFileName(string:"first"),directory:m.root,attributes:first,linkContents:target,caller:caller) { result,error in
+            need(result == nil && code(error) == Int(ENOMEM),"first symlink failure"); v.createStageForTesting = nil; v.createAbortForTesting = nil; cleared = true; replies.leave()
+        }
+        replies.enter(); v.symlinkResultForTesting(FSFileName(string:"next"),directory:m.root,attributes:next,linkContents:target,caller:caller) { result,error in
+            need(cleared && result == nil && code(error) == Int(ENOMEM),"queued symlink preserves first error after injection cleared"); replies.leave()
+        }
+        need(v.linkBudgetForTesting.0 == 2 && v.linkBudgetForTesting.1 == 2*ReadOnlyLimits.callbackOverhead + 9 + 2*target.data.count,"both names and targets charged")
+        resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"symlink queue drained")
+        m.serial { let state = v.createStateForTesting
+            need(preflights == 1 && first.consumedAttributes.isEmpty && next.consumedAttributes.isEmpty && anchorMatches(before,v.anchor) && state.pending == quarantine && state.quarantine == quarantine && state.ticket == (quarantine ? 1 : 0) && unreturned == nil,"symlink queued guard and token-only cleanup")
+            if quarantine { need(v.createOutcomeForTesting.cleanup.status == SFS_IO && !v.createOutcomeForTesting.discarded,"unresolved symlink abort receipt") }
+        }
+        need(v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"symlink queue releases all charges")
+        m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil)
+    }
+    let m = try CreationMount(parent,"symlink-budget"), v = m.volume
+    let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+    let name = FSFileName(string:String(repeating:"n",count:255)), target = FSFileName(data:Data(repeating:120,count:4096)), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    need(name.data.count == 255 && target.data.count == 4096,"maximum delivered name/target")
+    v.enqueue { held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume saturated symlink queue") }
+    need(held.wait(timeout:.now()+20) == .success,"hold saturated symlink queue")
+    var successes = 0, duplicates = 0
+    for _ in 0..<ReadOnlyLimits.callbacks {
+        replies.enter(); v.symlinkResultForTesting(name,directory:m.root,attributes:creationAttributes(0o700),linkContents:target,caller:caller) { result,error in
+            need((result != nil && error == nil) || (result == nil && code(error) == Int(EEXIST)),"first max symlink succeeds and later duplicate names refuse"); if result != nil { successes += 1 } else { duplicates += 1 }; replies.leave()
+        }
+    }
+    need(v.linkBudgetForTesting.0 == 256 && v.linkBudgetForTesting.1 == 2_162_432,"exact max name+target callback bound")
+    let refused: (FSCreateSymlinkResult?,Error?) = wait { done in v.symlinkResultForTesting(name,directory:m.root,attributes:creationAttributes(0o700),linkContents:target,caller:caller) { done(($0,$1)) } }
+    need(refused.0 == nil && code(refused.1) == Int(EAGAIN),"saturated symlink admission refuses without charge")
+    resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"bounded symlink admission drain")
+    need(successes == 1 && duplicates == 255,"exact saturated symlink outcomes")
+    let item = m.lookup(String(repeating:"n",count:255)) as! StallionItem; m.returned.append(item)
+    m.state(2); symlinkReadback(m,item,target.data); m.close(); symlinkReopened(m,String(repeating:"n",count:255),inode:item.inode,target:target.data)
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
-        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent)
+        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent)
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
@@ -2261,6 +2809,8 @@ func directoryQueuedFailure(_ parent: URL) throws {
         print("PASS contextual empty-file creation, publication reuse, two-role results and outcome-specific cleanup")
         print("PASS contextual exact-ID removal, two-role results, returned ownership and failure gates")
         print("PASS contextual empty directories, nesting, publication reuse and kind-specific failures")
+        print("PASS contextual non-overwriting rename, three-role results, exact identities and rollback")
+        print("PASS contextual symbolic-link creation, exact target bytes and shared publication cleanup")
 #endif
     }
 }
