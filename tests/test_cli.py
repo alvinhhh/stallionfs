@@ -55,7 +55,7 @@ class NativeImageCLI(unittest.TestCase):
         hooks = cls.artifacts / 'diagnostic-hooks.o'
         cls.owned('diagnostic-hooks', [*flags, '-c', tests / 'native_image_bridge_hooks.c', '-o', hooks])
         cls.diagnostic = cls.artifacts / ('_image' + sysconfig.get_config_var('EXT_SUFFIX'))
-        cls.owned('diagnostic-link', [clang, '-bundle', '-undefined', 'dynamic_lookup', bridge, normal, hooks, '-o', cls.diagnostic])
+        cls.owned('diagnostic-link', [clang, '-isysroot', sdk, '-bundle', '-undefined', 'dynamic_lookup', bridge, normal, hooks, '-o', cls.diagnostic])
         cls.failed = False
 
     @classmethod
