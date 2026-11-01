@@ -252,6 +252,77 @@ class OwnedProcessSupervision(unittest.TestCase):
                              'skipped_child_ownership_unverified')
 
 
+class RealWorldSelectors(unittest.TestCase):
+    """Plan and command checks do not launch a benchmark or build a fixture."""
+
+    def test_default_plan_preserves_order_ids_and_commands(self):
+        tools = {name: '/bin/' + name for name in ('sfs', 'cp', 'rm', 'ditto')}
+        for platform_name in ('darwin', 'linux'):
+            with self.subTest(platform=platform_name):
+                plan = BENCHMARK.selected_plan([1, 2, 4], True, platform_name=platform_name)
+                self.assertEqual(list(plan), ['scan', 'copy', 'clone', 'delete'])
+                for case, native in [('scan', 'native_posix'), ('copy', 'native_cp'),
+                                     ('clone', 'native_cp'), ('delete', 'native_rm')]:
+                    references = [native] + (['native_ditto'] if case == 'copy' and platform_name == 'darwin' else [])
+                    self.assertEqual(list(plan[case]), references + ['sfs_jobs1', 'sfs_jobs2', 'sfs_jobs4'])
+                    for jobs in (1, 2, 4):
+                        metadata = plan[case]['sfs_jobs' + str(jobs)]
+                        self.assertEqual(metadata, {'jobs': jobs})
+                        paths = ['source'] if case == 'scan' else ['source', 'target'] if case in ('copy', 'clone') else ['target']
+                        command = ['/bin/sfs', '--json', case, *paths, '--jobs', str(jobs)]
+                        if case == 'delete':
+                            command.append('--recursive')
+                        self.assertEqual(BENCHMARK.workload_command(case, 'sfs_jobs' + str(jobs),
+                            metadata, tools, 'source', 'target', 'scan-helper', platform_name), command)
+                self.assertEqual(BENCHMARK.workload_command('scan', 'native_posix', {}, tools,
+                    'source', 'target', 'scan-helper', platform_name), ['scan-helper', 'source'])
+                self.assertEqual(BENCHMARK.workload_command('delete', 'native_rm', {}, tools,
+                    'source', 'target', 'scan-helper', platform_name), ['/bin/rm', '-rf', 'target'])
+                for case in ('copy', 'clone'):
+                    flags = (['-Rp'] if case == 'copy' else ['-cRp']) if platform_name == 'darwin' else [
+                        '-a', '--reflink=' + ('never' if case == 'copy' else 'always')]
+                    self.assertEqual(BENCHMARK.workload_command(case, 'native_cp', {}, tools,
+                        'source', 'target', 'scan-helper', platform_name), ['/bin/cp', *flags, 'source', 'target'])
+        self.assertEqual(BENCHMARK.selected_plan([1], False, operations='copy', platform_name='linux'),
+                         {'copy': {'native_cp': {}}})
+
+    def test_copy_screen_has_exact_variants_and_explicit_commands(self):
+        plan = BENCHMARK.selected_plan([1], True, 'copy', 'ditto', 'materialized,auto', 'darwin')
+        self.assertEqual(plan, {'copy': {'native_ditto': {}, 'sfs_jobs1_materialized': {
+            'jobs': 1, 'strategy': 'materialized'}, 'sfs_jobs1_auto': {'jobs': 1, 'strategy': 'auto'}}})
+        tools = {'sfs': '/bin/sfs', 'ditto': '/usr/bin/ditto'}
+        for variant, metadata in plan['copy'].items():
+            expected = (['/usr/bin/ditto', '--rsrc', '--extattr', '--acl', 'source', 'target']
+                        if variant == 'native_ditto' else ['/bin/sfs', '--json', 'copy', 'source',
+                        'target', '--jobs', '1', '--strategy=' + metadata['strategy']])
+            self.assertEqual(BENCHMARK.workload_command('copy', variant, metadata, tools,
+                'source', 'target', None, 'darwin'), expected)
+        mixed = BENCHMARK.selected_plan([1, 4], True, 'copy,clone', 'ditto', 'materialized,auto', 'darwin')
+        self.assertEqual(mixed['clone'], {'native_cp': {}, 'sfs_jobs1': {'jobs': 1}, 'sfs_jobs4': {'jobs': 4}})
+        self.assertEqual(len(mixed['copy']), 5)
+
+    def test_invalid_selectors_fail_before_output_or_scratch_access(self):
+        invalid = [('--operations', ''), ('--operations', 'copy,copy'), ('--operations', 'unknown'),
+                   ('--copy-references', ''), ('--copy-references', 'ditto,ditto'),
+                   ('--copy-references', 'unknown'), ('--copy-strategies', ''),
+                   ('--copy-strategies', 'auto,auto'), ('--copy-strategies', 'clone'),
+                   ('--operations', 'scan', '--copy-references', 'ditto'),
+                   ('--expected-fixture-sha256', ''), ('--expected-fixture-sha256', 'f' * 63),
+                   ('--expected-fixture-sha256', 'g' * 64)]
+        for options in invalid:
+            argv = ['real_world.py', '--root', '/unused', '--output', '/unused/report.json', '--sfs', 'sfs', *options]
+            with self.subTest(options=options), mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(sys, 'platform', 'darwin'), \
+                    mock.patch.object(Path, 'resolve') as resolved, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                BENCHMARK.main()
+            resolved.assert_not_called()
+        for kwargs in ({'copy_references': 'ditto', 'platform_name': 'linux'},
+                       {'copy_strategies': 'auto', 'sfs': False}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                BENCHMARK.selected_plan([1], **({'sfs': True} | kwargs))
+
+
 class RealWorldValidity(unittest.TestCase):
     def test_manifest_detects_same_length_content_corruption(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -564,7 +635,8 @@ class SfsFailureRetention(unittest.TestCase):
 
     @contextlib.contextmanager
     def scenario(self, failure_kind, *, stop=True, measured=False, exception_type=OSError,
-                 uncertain=False, secondary_cleanup_failure=False):
+                 uncertain=False, secondary_cleanup_failure=False, extra_args=(), failed_variant=None,
+                 shuffle=False):
         with tempfile.TemporaryDirectory() as directory:
             root, output = Path(directory), Path(directory) / 'result.json'
             expected = {'entries': {}, 'hardlinks': [['d000/f000000', 'hardlink-alias']]}
@@ -577,6 +649,11 @@ class SfsFailureRetention(unittest.TestCase):
             state = {'scratch': None, 'current': None, 'failed': False, 'after_failure': [],
                      'executions': [], 'attempts': {}}
             original_rmtree = shutil.rmtree
+            original_shuffle = BENCHMARK.random.Random.shuffle
+
+            def shuffle_variants(rng, variants):
+                if shuffle:
+                    original_shuffle(rng, variants)
 
             def fail(message):
                 state['failed'] = True
@@ -618,7 +695,7 @@ class SfsFailureRetention(unittest.TestCase):
 
             def should_fail():
                 current = state['current']
-                wanted_variant = 'native_cp' if failure_kind == 'cp_contract' else 'sfs_jobs1'
+                wanted_variant = failed_variant or ('native_cp' if failure_kind == 'cp_contract' else 'sfs_jobs1')
                 return (current and current['case'] == 'copy'
                         and current['variant'] == wanted_variant
                         and current['attempt'] == (1 if measured else 0))
@@ -653,6 +730,10 @@ class SfsFailureRetention(unittest.TestCase):
                 command = Path(argv[0]).name
                 if command == 'sfs':
                     case, variant = argv[2], 'sfs_jobs1'
+                    strategy = next((arg.removeprefix('--strategy=') for arg in argv
+                                     if isinstance(arg, str) and arg.startswith('--strategy=')), None)
+                    if strategy:
+                        variant += '_' + strategy
                 elif command == 'scan-posix':
                     case, variant = 'scan', 'native_posix'
                 elif command == 'rm':
@@ -692,7 +773,7 @@ class SfsFailureRetention(unittest.TestCase):
                 return result
 
             argv = ['real_world.py', '--root', str(root), '--output', str(output), '--sfs', 'sfs',
-                    '--jobs', '1', '--files', '2', '--directories', '1', '--repetitions', '1']
+                    '--jobs', '1', '--files', '2', '--directories', '1', '--repetitions', '1', *extra_args]
             if stop:
                 argv.append('--stop-on-sfs-failure')
             with contextlib.ExitStack() as stack:
@@ -706,11 +787,106 @@ class SfsFailureRetention(unittest.TestCase):
                     side_effect=lambda name: None if name == 'df' else '/simulated/bin/' + name))
                 stack.enter_context(mock.patch.object(BENCHMARK.shutil, 'rmtree', side_effect=remove))
                 stack.enter_context(mock.patch.object(BENCHMARK.shutil, 'copytree', side_effect=make_target))
-                stack.enter_context(mock.patch.object(BENCHMARK.random.Random, 'shuffle', return_value=None))
+                stack.enter_context(mock.patch.object(BENCHMARK.random.Random, 'shuffle',
+                                                     autospec=True, side_effect=shuffle_variants))
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 self.assertEqual(BENCHMARK.main(), 1)
             report = json.loads(output.read_text())
             yield report, state, receipt, supervision
+
+    def test_explicit_copy_screen_records_33_rows_resources_and_failed_variant_eligibility(self):
+        options = ('--operations', 'copy', '--copy-references', 'ditto',
+                   '--copy-strategies', 'materialized,auto', '--repetitions', '10')
+        previous_order = None
+        for strategy in ('materialized', 'auto'):
+            failed_variant = 'sfs_jobs1_' + strategy
+            other_variant = 'sfs_jobs1_' + ('auto' if strategy == 'materialized' else 'materialized')
+            with self.subTest(strategy=strategy), mock.patch.object(sys, 'platform', 'darwin'), \
+                    self.scenario('command', stop=False, measured=True, extra_args=options,
+                                  failed_variant=failed_variant, shuffle=True) as data:
+                report, state, receipt, _ = data
+                self.assertEqual(report['expected_samples'], {'warmup': 3, 'measured': 30, 'total': 33})
+                self.assertEqual(len(report['samples']), 33)
+                self.assertEqual(sum(s['warmup'] for s in report['samples']), 3)
+                self.assertEqual(set(report['selected_plan']), {'copy'})
+                self.assertEqual(set(report['selected_plan']['copy']),
+                                 {'native_ditto', failed_variant, other_variant})
+                order = [s['variant'] for s in report['samples']]
+                groups = []
+                for repetition in range(-1, 10):
+                    group = [s for s in report['samples'] if s['repetition'] == repetition]
+                    self.assertEqual(len(group), 3)
+                    self.assertEqual({s['variant'] for s in group}, set(report['selected_plan']['copy']))
+                    self.assertTrue(all(s['warmup'] == (repetition == -1) for s in group))
+                    groups.append(tuple(s['variant'] for s in group))
+                self.assertGreater(len(set(groups)), 1)
+                if previous_order is not None:
+                    self.assertEqual(order, previous_order)
+                previous_order = order
+                self.assertEqual(set(report['tools']), {'cc', 'ditto', 'sfs'})
+                self.assertEqual([Path(p).name for p in report['helpers']], ['measure-command'])
+                self.assertIn('strategy', Path(report['parameters']['output']).with_suffix('.csv').read_text().splitlines()[0].split(','))
+                for sample in report['samples']:
+                    self.assertEqual(sample['case'], 'copy')
+                    self.assertEqual(sample['measurement_method'], receipt['measurement_method'])
+                    for metric in ('wall_s', 'cpu_s', 'peak_rss_bytes', 'launcher_wall_s'):
+                        self.assertEqual(sample[metric], receipt[metric])
+                    if sample['variant'] == 'native_ditto':
+                        self.assertNotIn('strategy', sample)
+                        self.assertEqual(sample['argv'][1:4], ['--rsrc', '--extattr', '--acl'])
+                    else:
+                        self.assertEqual(sample['jobs'], 1)
+                        self.assertEqual(sample['argv'][-1], '--strategy=' + sample['strategy'])
+                summary = report['summary']['copy']
+                self.assertNotIn(failed_variant, summary['variants'])
+                self.assertNotIn(failed_variant, summary['comparisons'])
+                self.assertEqual(summary['excluded_variants'][failed_variant]['statuses'],
+                                 {'failed': 1, 'passed': 10})
+                self.assertEqual(summary['variants'][other_variant]['n'], 10)
+                self.assertEqual(summary['comparisons'][other_variant]['wall_s']['paired_n'], 10)
+                self.assertEqual(summary['comparisons'][other_variant]['wall_s']['ties'], 10)
+
+    def test_stop_on_failure_retains_both_explicit_strategies_without_further_inspection(self):
+        options = ('--operations', 'copy', '--copy-references', 'ditto',
+                   '--copy-strategies', 'materialized,auto')
+        for strategy in ('materialized', 'auto'):
+            failed_variant = 'sfs_jobs1_' + strategy
+            with self.subTest(strategy=strategy), mock.patch.object(sys, 'platform', 'darwin'), \
+                    self.scenario('command', extra_args=options, failed_variant=failed_variant) as data:
+                report, state, _, _ = data
+                self.assertEqual(state['after_failure'], [])
+                self.assertEqual(report['retention_reason'], 'sfs_sample_failure')
+                self.assertEqual(report['cleanup'], 'retained_failure_evidence')
+                self.assertEqual(report['samples'][-1]['variant'], failed_variant)
+                self.assertEqual(report['samples'][-1]['strategy'], strategy)
+                self.assertEqual((state['scratch'] / 'target/partial-marker').read_bytes(), b'retain this target')
+
+    def test_fixture_guard_mismatch_retains_fixture_before_any_workload(self):
+        with self.scenario('fixture_guard', extra_args=('--expected-fixture-sha256', '0' * 64)) as data:
+            report, state, _, _ = data
+            self.assertFalse(report['passed'])
+            self.assertEqual(report['samples'], [])
+            self.assertEqual(state['executions'], [])
+            self.assertTrue(report['retain_scratch'])
+            self.assertEqual(report['retention_reason'], 'fixture_manifest_mismatch')
+            self.assertEqual(report['cleanup'], 'retained_fixture_mismatch')
+            self.assertEqual(report['fixture_guard'], {'passed': False, 'expected_sha256': '0' * 64,
+                'observed_sha256': report['fixture']['manifest_sha256']})
+            self.assertNotIn('supervision_failure', report)
+            self.assertTrue((state['scratch'] / 'source/d000/f000000').is_file())
+            self.assertFalse((state['scratch'] / 'target').exists())
+            self.assertEqual(Path(report['parameters']['output']).with_suffix('.csv').read_text().splitlines()[0],
+                'case,variant,clone_policy,repetition,warmup,status,wall_s,launcher_wall_s,measurement_method,cpu_s,peak_rss_bytes,returncode,validation,error')
+
+    def test_matching_fixture_guard_admits_workloads_and_normalizes_hex(self):
+        expected = {'entries': {}, 'hardlinks': [['d000/f000000', 'hardlink-alias']]}
+        digest = BENCHMARK.hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
+        with self.scenario('command', extra_args=('--expected-fixture-sha256', digest.upper())) as data:
+            report, state, _, _ = data
+            self.assertTrue(report['fixture_guard']['passed'])
+            self.assertEqual(report['fixture_guard']['expected_sha256'], digest)
+            self.assertTrue(state['executions'])
+            self.assertEqual(report['retention_reason'], 'sfs_sample_failure')
 
     def check_retained_failure(self, failure_kind, *, measured=False, exception_type=OSError):
         with self.scenario(failure_kind, measured=measured, exception_type=exception_type) as data:

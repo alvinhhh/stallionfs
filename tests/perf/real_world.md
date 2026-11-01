@@ -14,6 +14,22 @@ Omit `--sfs` on Linux. A C compiler named `cc` is required. The matching `real_w
 
 Each case has one warmup and ten measured repetitions by default. Candidate order is shuffled deterministically within each repetition. The fixture contains 4 KiB files, relative symlinks and a hardlink alias. Scanning uses the same six counters as `sfs scan`; the native reference is a compiled POSIX directory walker, not one subprocess per file.
 
+Optional selectors restrict future collection: `--operations` accepts distinct comma-separated `scan,copy,clone,delete`; `--copy-references` accepts `cp,ditto` on macOS and `cp` on Linux. Omitted selectors keep all existing operations and platform references. `--copy-strategies materialized,auto` requires `--sfs` and explicitly adds `--strategy=materialized` or `--strategy=auto` to SFS copy commands. It creates distinct IDs such as `sfs_jobs1_materialized` and `sfs_jobs1_auto`; omitting it retains `sfs_jobs1` and its existing argv. Copy selectors require `copy` among the selected operations. Empty, duplicate, invalid and unsupported selector values are rejected before output or scratch creation.
+
+The following macOS copy screen selects the existing 10,000-file, 4 KiB, 100-directory fixture and three variants: SFS materialized with one worker, SFS auto with one worker, and exactly `ditto --rsrc --extattr --acl`. It schedules one warmup and ten measured repetitions per variant, for 33 rows (3 warmup, 30 measured), with the existing deterministic within-repetition shuffle. Scan, clone, delete and native `cp` workloads are omitted. This command describes a future collection; preparation of selectors is not a benchmark result.
+
+```sh
+python3 tests/perf/real_world.py --root /path/to/scratch \
+  --output /path/to/new-copy-results.json --sfs /path/to/sfs \
+  --operations copy --copy-references ditto --copy-strategies materialized,auto \
+  --jobs 1 --repetitions 10 --files 10000 --directories 100 \
+  --stop-on-sfs-failure
+```
+
+Reports record `selected_plan`, exact scheduled `expected_samples` counts and each attempted command's argv; explicit SFS variants also record `strategy` in JSON and CSV. A stopped run can have fewer rows than scheduled. The selectors use the existing native command supervisor, resource units, postconditions, failure retention and summary arithmetic. Strategy labels record requests and do not establish materialized storage equivalence with `ditto`.
+
+Optional `--expected-fixture-sha256` accepts a 64-digit hexadecimal canonical manifest digest. The runner compares it with the existing generated fixture manifest before any workload command. A mismatch fails the run with no samples, retains the generated fixture, and records both digests in `fixture_guard`, `retention_reason=fixture_manifest_mismatch` and `cleanup=retained_fixture_mismatch`. This retention reason is distinct from process-completion uncertainty. Omitting the option leaves fixture admission unchanged. The default CSV header is unchanged; a `strategy` column is added only with an explicit copy-strategy selector.
+
 Copy and clone validation checks every file hash, mode, symlink target, directory mode and hardlink group. Source/destination regular inodes must differ. One measured clone is edited to check source isolation. Every operation rechecks the original fixture and an independent sentinel outside timing. ACLs, xattrs, ownership, timestamps, physical extent sharing and power-loss survival are not established by this runner.
 
 The references are macOS `cp -Rp`, `cp -cRp`, `ditto --rsrc --extattr --acl`, and `rm -rf`; Linux uses GNU `cp -a --reflink=never`, mandatory `--reflink=always`, and `rm -rf`. An unsupported mandatory clone remains unsupported. An incorrect copy remains failed, even if its command exits successfully. Any failed sample excludes that entire candidate from successful statistics. Raw failures are retained, the overall run returns failure, and unaffected candidates continue. Incompatible candidates remain non-wins when considering the complete comparison set. `ditto` is reported separately and does not retroactively replace a failed `cp` result.
