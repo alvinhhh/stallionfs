@@ -80,6 +80,197 @@ struct Fixture {
         need(sfs_image_close(h, &r) == SFS_OK, "reopen close"); return bytes
     }
 }
+func accessPolicyChecks(_ parent: URL) throws {
+    let f = try Fixture(parent,"access-policy"), resource = FSPathURLResource(url: f.url,writable: true)
+    let image = f.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
+    func load(_ fs: StallionFileSystem, _ args: [String] = []) -> (FSVolume?,Error?) {
+        wait { done in fs.loadResource(resource:resource,arguments:args) { done(($0,$1)) } }
+    }
+    func close(_ fs: StallionFileSystem, _ volume: StallionVolume, _ root: FSItem? = nil, _ file: FSItem? = nil, expectedError: Int = 0) {
+        let _: Bool = wait { done in volume.unmount { done(true) } }
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+        if let file {
+            let error: Error? = wait { volume.reclaimForTesting(file,eligible:true,replyHandler:$0) }
+            need(error == nil,"admission operand reclaimed")
+        }
+#endif
+        let error: Error? = wait { volume.deactivate(options:[],replyHandler:$0) }
+        need(code(error) == expectedError,"admission deactivation preserves delivery outcome")
+        let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) }
+        need(code(unloaded) == expectedError,"admission unload consumes handle and preserves outcome")
+    }
+    // SDK FSTaskOptions.init is unavailable. Exercise its exact shared decoder;
+    // installed task delivery is a separate qualification requirement.
+    for mode in 0..<3 {
+        let fs = mode == 0 ? StallionFileSystem() : StallionFileSystem(accessPolicy:.contextualWrites)
+#if STALLION_WRITE_DIAGNOSTIC
+        if mode == 2 { fs.diagnosticUUID = f.identity }
+#endif
+        let reply = load(fs,["--rdonly"])
+        need(reply.1 == nil && reply.0 != nil,"explicit readonly dominates every opt-in")
+        let volume = reply.0 as! StallionVolume
+        let coreRO: Bool = wait { done in volume.enqueue { done(volume.coreReadOnlyForTesting()) } }
+        need(coreRO && volume.requestedMountOptions.contains(.readOnly),"readonly core policy and mount request")
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        do { try volume.enableAdmittedWrites(); fatalError("readonly load promoted") }
+        catch { need(code(error)==Int(EACCES),"immutable admission rejects promotion") }
+#endif
+        let activated: (FSItem?,Error?) = wait { done in volume.activate { done(($0,$1)) } }
+        need(activated.1 == nil,"readonly activation")
+        let mounted: Error? = wait { volume.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"readonly mount")
+        let write: Error? = wait { done in
+#if STALLION_CONTEXT_HANDLERS
+            volume.write(contents:Data([1]),to:activated.0!,at:0) { done($1) }
+#else
+            volume.write(contents:Data([1]),to:activated.0!,at:0) { done($1) }
+#endif
+        }
+        need(code(write)==Int(EROFS),"readonly data callback refused")
+        close(fs,volume)
+        let after = try Data(contentsOf:image)
+        need(after==before,"readonly load unchanged through unload")
+    }
+    let force = load(StallionFileSystem(accessPolicy:.contextualWrites),["--rdonly","-f"])
+    need(force.0 == nil && code(force.1)==Int(ENOTSUP),"force remains refused before any open")
+    let revoked = FSPathURLResource(url:f.url,writable:true);revoked.revoke()
+    let revokedReply: (FSVolume?,Error?)=wait { done in StallionFileSystem(accessPolicy:.contextualWrites).loadResource(resource:revoked,arguments:["--rdonly"]) { done(($0,$1)) } }
+    need(revokedReply.0 == nil && code(revokedReply.1)==Int(EACCES),"revoked resource refuses even explicit readonly")
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+    let roResource=FSPathURLResource(url:f.url,writable:false), roFS=StallionFileSystem(accessPolicy:.contextualWrites)
+    let roReply: (FSVolume?,Error?)=wait { done in roFS.loadResource(resource:roResource,arguments:[]) { done(($0,$1)) } }
+    need(roReply.1 == nil && (roReply.0 as! StallionVolume).requestedMountOptions.contains(.readOnly),"nonwritable production resource falls back to readonly")
+    let roUnload: Error?=wait { roFS.unloadResource(resource:roResource,replyHandler:$0) };need(roUnload == nil,"nonwritable resource unload")
+#endif
+    let fs = StallionFileSystem(accessPolicy:.contextualWrites), reply = load(fs)
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+    need(reply.1 == nil && reply.0 != nil,"explicit contextual mutation admission")
+    let v = reply.0 as! StallionVolume
+    need(v.volumeID.uuid==f.identity && !v.requestedMountOptions.contains(.readOnly),"stored volume identity and admitted mode")
+    let coreRO: Bool = wait { done in v.enqueue { done(v.coreReadOnlyForTesting()) } }
+    need(!coreRO,"mutation admission uses actual writable core")
+    var competing: OpaquePointer?, receipt = sfs_result()
+    need(sfs_image_open(f.url.path,"image.sfs",&competing,&receipt)==SFS_BUSY && competing == nil,"same-inode exclusive ownership retained")
+    let active: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } };need(active.1 == nil,"mutation activation")
+    let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"mutation mount")
+    let found: (FSItem?,FSFileName?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$1,$2)) } }
+    need(found.2 == nil,"mutation file lookup")
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    let newAttributes=FSItem.SetAttributesRequest();newAttributes.mode=UInt32(S_IFREG)|0o600;newAttributes.uid=geteuid();newAttributes.gid=getegid()
+    let created: (FSCreateItemResult?,Error?)=wait { done in v.createResultForTesting(FSFileName(string:"created-no-grant"),directory:active.0!,attributes:newAttributes,caller:caller) { done(($0,$1)) } }
+    need(created.0 != nil && created.1 == nil,"contextual creation succeeds")
+    let createdLookup: (FSItem?,FSFileName?,Error?)=wait { done in v.lookupItem(named:FSFileName(string:"created-no-grant"),inDirectory:active.0!) { done(($0,$1,$2)) } }
+    let createdModes: FSVolume.OpenModes=wait { done in v.enqueue { done(try! v.retainedModesForTesting(createdLookup.0!)) } }
+    need(createdModes.isEmpty,"create and lookup do not mint write authority")
+    let createdRelease: Error?=wait { v.reclaimForTesting(createdLookup.0!,eligible:true,replyHandler:$0) };need(createdRelease == nil,"unopened create pin reclaimed")
+    let createdAgain: (FSItem?,FSFileName?,Error?)=wait { done in v.lookupItem(named:FSFileName(string:"created-no-grant"),inDirectory:active.0!) { done(($0,$1,$2)) } }
+    need(createdAgain.0 !== createdLookup.0,"reclaimed canonical item is replaced")
+    let staleOpen: Error?=wait { v.openForTesting(createdLookup.0!,modes:.write,caller:caller,reply:$0) }
+    let recreatedModes: FSVolume.OpenModes=wait { done in v.enqueue { done(try! v.retainedModesForTesting(createdAgain.0!)) } }
+    need(code(staleOpen)==Int(EINVAL) && recreatedModes.isEmpty,"stale item cannot grant authority to replacement")
+    let createdAgainRelease: Error?=wait { v.reclaimForTesting(createdAgain.0!,eligible:true,replyHandler:$0) };need(createdAgainRelease == nil,"replacement create pin reclaimed")
+    let changed: (FSSetXattrResult?,Error?) = wait { done in v.setXattrResultForTesting(FSFileName(string:"vendor.admission"),value:Data([0,255]),item:found.0!,policy:.mustCreate,caller:caller) { done(($0,$1)) } }
+    need(changed.0 != nil && changed.1 == nil && v.anchor.generation>2,"contextual xattr mutation commits")
+    let item = found.0!, foreign = CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())+1)
+    func modes() -> FSVolume.OpenModes {
+        wait { done in v.enqueue { done(try! v.retainedModesForTesting(item)) } }
+    }
+    need(modes().isEmpty,"lookup never grants open modes")
+    let checked: (FSCheckAccessResult?,Error?)=wait { done in v.accessForTesting(item,access:.writeData,caller:caller) { done(($0,$1)) } }
+    need(checked.0 != nil && checked.1 == nil && modes().isEmpty,"successful access check never grants open modes")
+    let deniedOpen: Error?=wait { v.openForTesting(item,modes:[.read,.write],caller:foreign,reply:$0) }
+    need(code(deniedOpen)==Int(EACCES) && modes().isEmpty,"foreign mixed open fails without partial grant")
+    let opened: Error?=wait { v.openForTesting(item,modes:[.read,.write],caller:caller,reply:$0) }
+    need(opened == nil && modes()==[.read,.write],"authorized open grants all modes only on success")
+    let foreignExisting: Error?=wait { v.openForTesting(item,modes:[.read,.write],caller:foreign,reply:$0) }
+    need(code(foreignExisting)==Int(EACCES) && modes()==[.read,.write],"failed foreign acquisition preserves existing writer grant")
+    let written: (FSWriteFileResult?,Error?)=wait { done in v.write(contents:Data("changed!".utf8),to:item,at:0) { done(($0,$1)) } }
+    need(written.0 != nil && written.1 == nil,"retained write admission uses shared real-core commit")
+    let reduced: Error?=wait { v.closeForTesting(item,modes:.write,caller:foreign,reply:$0) }
+    need(reduced == nil && modes() == .write,"different closing caller may reduce retained modes")
+    let increased: Error?=wait { v.closeForTesting(item,modes:[.read,.write],caller:foreign,reply:$0) }
+    need(code(increased)==Int(EINVAL) && modes() == .write,"close cannot add a mode")
+    let readBack: Data=wait { done in v.enqueue { done(try! v.diagnosticReadForTesting(item,length:8)) } }
+    need(readBack==Data("changed!".utf8),"existing contextless read remains usable for write-only retained mode")
+    let readOpen: Error?=wait { v.openForTesting(item,modes:.read,caller:caller,reply:$0) }
+    need(readOpen == nil && modes()==[.read,.write],"later authorized open unions modes")
+    let readOnlyClose: Error?=wait { v.closeForTesting(item,modes:.read,caller:foreign,reply:$0) }
+    need(readOnlyClose == nil && modes() == .read,"last write grant removed before later data")
+    let durable = v.anchor
+    let refused: (FSWriteFileResult?,Error?) = wait { done in v.write(contents:Data([1]),to:item,at:0) { done(($0,$1)) } }
+    need(refused.0 == nil && code(refused.1)==Int(EACCES) && anchorMatches(v.anchor,durable),"write without retained write fails before mutation")
+    let finalClose: Error?=wait { v.closeForTesting(item,modes:[],caller:foreign,reply:$0) }
+    need(finalClose == nil && modes().isEmpty,"final close clears retained authority despite delivery failure")
+#if STALLION_WRITE_DIAGNOSTIC
+    need(v.diagnosticSnapshot().1.isEmpty,"production policy does not allocate diagnostic trace")
+#endif
+    let trace: [StallionVolume.Record]=wait { done in v.enqueue { done(v.capturedRecords()) } }
+    need(trace.isEmpty,"nonfixture policy leaves optional trace empty")
+    close(fs,v,active.0,found.0,expectedError:Int(EACCES))
+    let reopened = StallionFileSystem(accessPolicy:.contextualWrites)
+    let probe: (FSProbeResult?,Error?) = wait { done in reopened.probeResource(resource:resource) { done(($0,$1)) } }
+    need(probe.1 == nil && probe.0?.containerID?.uuid==f.identity,"persistent container identity after commit")
+    let again = load(reopened,["--rdonly"]);need(again.1 == nil,"read-only reopen after mutation")
+    let rv = again.0 as! StallionVolume
+    need(rv.volumeID.uuid==f.identity && anchorMatches(rv.anchor,durable),"reopened committed identity and generation")
+    close(reopened,rv)
+    let deniedFixture=try Fixture(parent,"access-policy-denied",mode:0o400)
+    let deniedFS=StallionFileSystem(accessPolicy:.contextualWrites), deniedResource=FSPathURLResource(url:deniedFixture.url,writable:true)
+    let deniedLoad: (FSVolume?,Error?)=wait { done in deniedFS.loadResource(resource:deniedResource,arguments:[]) { done(($0,$1)) } }
+    need(deniedLoad.1 == nil,"readonly inode in writable volume admitted")
+    let deniedVolume=deniedLoad.0 as! StallionVolume
+    let deniedRoot: (FSItem?,Error?)=wait { done in deniedVolume.activate { done(($0,$1)) } }
+    let deniedMount: Error?=wait { deniedVolume.mount(arguments:[],replyHandler:$0) };need(deniedMount == nil,"denied-open model mount")
+    let deniedFile: (FSItem?,FSFileName?,Error?)=wait { done in deniedVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:deniedRoot.0!) { done(($0,$1,$2)) } }
+    let readGranted: Error?=wait { deniedVolume.openForTesting(deniedFile.0!,modes:.read,caller:caller,reply:$0) };need(readGranted == nil,"read acquisition authorized")
+    let mixed: Error?=wait { deniedVolume.openForTesting(deniedFile.0!,modes:[.read,.write],caller:caller,reply:$0) }
+    let stillRead: FSVolume.OpenModes=wait { done in deniedVolume.enqueue { done(try! deniedVolume.retainedModesForTesting(deniedFile.0!)) } }
+    need(code(mixed)==Int(EACCES) && stillRead == .read,"mixed-mode authorization failure retains exact old grant")
+    let deniedClose: Error?=wait { deniedVolume.closeForTesting(deniedFile.0!,modes:[],caller:foreign,reply:$0) };need(deniedClose == nil,"read grant cleared")
+    let _: Bool=wait { done in deniedVolume.unmount { done(true) } }
+    let released: Error?=wait { deniedVolume.reclaimForTesting(deniedFile.0!,eligible:true,replyHandler:$0) };need(released == nil,"denied-open item reclaimed")
+    let deactivated: Error?=wait { deniedVolume.deactivate(options:[],replyHandler:$0) };need(deactivated == nil,"denied-open model deactivated")
+    let deniedUnload: Error?=wait { deniedFS.unloadResource(resource:deniedResource,replyHandler:$0) };need(deniedUnload == nil,"denied-open model consumed")
+    need(deniedFixture.contents()==Data("original".utf8),"denied opens preserve file bytes")
+    let partial=try Fixture(parent,"access-policy-partial",mode:0o200)
+    let partialFS=StallionFileSystem(accessPolicy:.contextualWrites), partialResource=FSPathURLResource(url:partial.url,writable:true)
+    let partialLoad: (FSVolume?,Error?)=wait { done in partialFS.loadResource(resource:partialResource,arguments:[]) { done(($0,$1)) } };need(partialLoad.1 == nil,"partly authorized fixture load")
+    let partialVolume=partialLoad.0 as! StallionVolume
+    let partialRoot: (FSItem?,Error?)=wait { done in partialVolume.activate { done(($0,$1)) } }
+    let partialMount: Error?=wait { partialVolume.mount(arguments:[],replyHandler:$0) };need(partialMount == nil,"partly authorized model mount")
+    let partialFile: (FSItem?,FSFileName?,Error?)=wait { done in partialVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:partialRoot.0!) { done(($0,$1,$2)) } }
+    let writeCheck: (FSCheckAccessResult?,Error?)=wait { done in partialVolume.accessForTesting(partialFile.0!,access:.writeData,caller:caller) { done(($0,$1)) } }
+    need(writeCheck.0 != nil && writeCheck.1 == nil,"write part independently authorized")
+    let partialOpen: Error?=wait { partialVolume.openForTesting(partialFile.0!,modes:[.read,.write],caller:caller,reply:$0) }
+    let partialModes: FSVolume.OpenModes=wait { done in partialVolume.enqueue { done(try! partialVolume.retainedModesForTesting(partialFile.0!)) } }
+    need(code(partialOpen)==Int(EACCES) && partialModes.isEmpty,"failed read check after successful write check never publishes partial grant")
+    let _: Bool=wait { done in partialVolume.unmount { done(true) } }
+    let partialRelease: Error?=wait { partialVolume.reclaimForTesting(partialFile.0!,eligible:true,replyHandler:$0) };need(partialRelease == nil,"partly authorized item reclaimed")
+    let partialDeactivate: Error?=wait { partialVolume.deactivate(options:[],replyHandler:$0) };need(partialDeactivate == nil,"partly authorized model deactivated")
+    let partialClose: Error?=wait { partialFS.unloadResource(resource:partialResource,replyHandler:$0) };need(partialClose == nil,"partly authorized model consumed")
+    need(partial.contents()==Data("original".utf8),"partly authorized open preserves bytes")
+    let other = try Fixture(parent,"access-policy-other")
+    need(other.identity != f.identity,"independent image has its own stored identity")
+    let otherFS=StallionFileSystem(accessPolicy:.contextualWrites), otherResource=FSPathURLResource(url:other.url,writable:true)
+    let otherReply: (FSVolume?,Error?)=wait { done in otherFS.loadResource(resource:otherResource,arguments:[]) { done(($0,$1)) } }
+    need(otherReply.1 == nil && (otherReply.0 as! StallionVolume).volumeID.uuid==other.identity,"second image needs no fixture-specific rebuild")
+    let otherVolume=otherReply.0 as! StallionVolume
+    let otherRoot: (FSItem?,Error?)=wait { done in otherVolume.activate { done(($0,$1)) } }
+    let otherMount: Error?=wait { otherVolume.mount(arguments:[],replyHandler:$0) };need(otherMount == nil,"second image model mount")
+    let otherFile: (FSItem?,FSFileName?,Error?)=wait { done in otherVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:otherRoot.0!) { done(($0,$1,$2)) } }
+    let otherBefore=otherVolume.anchor
+    let neverOpened: (FSWriteFileResult?,Error?)=wait { done in otherVolume.write(contents:Data([1]),to:otherFile.0!,at:0) { done(($0,$1)) } }
+    need(neverOpened.0 == nil && code(neverOpened.1)==Int(EACCES) && anchorMatches(otherVolume.anchor,otherBefore),"lookup alone cannot authorize data write")
+    let _: Bool=wait { done in otherVolume.unmount { done(true) } }
+    let otherRelease: Error?=wait { otherVolume.reclaimForTesting(otherFile.0!,eligible:true,replyHandler:$0) };need(otherRelease == nil,"unopened item reclaimed after refusal")
+    let otherDeactivate: Error?=wait { otherVolume.deactivate(options:[],replyHandler:$0) };need(code(otherDeactivate)==Int(EACCES),"never-opened failure retained through deactivate")
+    let otherClose: Error?=wait { otherFS.unloadResource(resource:otherResource,replyHandler:$0) };need(code(otherClose)==Int(EACCES),"second image consuming close preserves first delivery failure")
+    need(other.contents()==Data("original".utf8),"never-opened data write leaves bytes unchanged")
+#else
+    need(reply.0 == nil && code(reply.1)==Int(ENOTSUP),"missing contextual mutation build cannot enable production policy")
+#endif
+}
+
+#if STALLION_WRITE_DIAGNOSTIC
 final class Mounted {
     let volume: StallionVolume, root: FSItem, file: FSItem, alias: FSItem, link: FSItem
     let coreHandle: OpaquePointer
@@ -90,7 +281,7 @@ final class Mounted {
         need(opened == SFS_OK, "open adapter")
         coreHandle = h!
         resource = FSPathURLResource(url: fixture.url, writable: writable)
-        volume = StallionVolume(handle: h!, resource: resource, scope: false, anchor: r, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
+        volume = StallionVolume(admission: .forTesting(handle: h!, anchor: r, writable: writable), resource: resource, scope: false, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
         if writable { try volume.enableWriteDiagnostic(expectedUUID: fixture.identity) }
         let v = volume
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
@@ -537,7 +728,7 @@ func pinOwnershipLimits(_ parent: URL) throws {
     let allocation = try Fixture(parent, "pin-allocation")
     var h: OpaquePointer?, r = sfs_result()
     need(sfs_image_open(allocation.url.path, "image.sfs", &h, &r) == SFS_OK, "allocation fixture open")
-    let volume = StallionVolume(handle: h!, resource: FSPathURLResource(url: allocation.url, writable: true), scope: false, anchor: r, queue: DispatchQueue(label: "sfs.pin.allocation"))
+    let volume = StallionVolume(admission: .forTesting(handle: h!, anchor: r, writable: true), resource: FSPathURLResource(url: allocation.url, writable: true), scope: false, queue: DispatchQueue(label: "sfs.pin.allocation"))
     fault(7, 1)
     do { try volume.enableWriteDiagnostic(expectedUUID: allocation.identity); fatalError("pin allocation should fail before exposure") }
     catch { need(code(error) == Int(ENOMEM) && hits() == 1 && !volume.diagnosticWritable, "pin configuration NOMEM stays unexposed") }
@@ -1320,7 +1511,7 @@ final class CreationMount {
         let status = writable ? sfs_image_open(url.path,"image.sfs",&h,&r) : sfs_image_open_readonly(url.path,"image.sfs",&h,&r)
         need(status == SFS_OK,"creation fixture open"); coreHandle = h!
         resource = FSPathURLResource(url:url,writable:writable)
-        volume = StallionVolume(handle:h!,resource:resource,scope:false,anchor:r,queue:DispatchQueue(label:"sfs.create.test"),itemLimit:limit)
+        volume = StallionVolume(admission:.forTesting(handle:h!,anchor:r,writable:writable),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.create.test"),itemLimit:limit)
         let v = volume
         if writable && enable { try v.enableWriteDiagnostic(expectedUUID:identity) }
         let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }
@@ -2468,7 +2659,7 @@ func renamePolicies(_ parent: URL) throws {
             m.close(); var h: OpaquePointer?, r = sfs_result()
             let status = spec == 0 ? sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) : sfs_image_open(m.url.path,"image.sfs",&h,&r)
             need(status == SFS_OK,"rename unbound gate open")
-            let resource = FSPathURLResource(url:m.url,writable:spec != 0), v = StallionVolume(handle:h!,resource:resource,scope:false,anchor:r,queue:DispatchQueue(label:"sfs.rename.gate"))
+            let resource = FSPathURLResource(url:m.url,writable:spec != 0), v = StallionVolume(admission:.forTesting(handle:h!,anchor:r),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.rename.gate"))
             let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }; need(activation.1 == nil,"rename gate activate")
             let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) }; need(mounted == nil,"rename gate mount")
             let result: (FSRenameItemResult?,Error?) = wait { done in v.renameResultForTesting(activation.0!,sourceDirectory:activation.0!,sourceName:FSFileName(string:"A"),destinationName:FSFileName(string:"new"),destinationDirectory:activation.0!,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
@@ -3106,8 +3297,15 @@ func contextualXattrQueue(_ parent: URL) throws {
 }
 #endif
 
+#endif
 @main struct Driver {
     static func main() throws {
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--access-policy" {
+            try accessPolicyChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
+            print("PASS immutable read-only selection, contextual open grants and retained-write delivery")
+            return
+        }
+#if STALLION_WRITE_DIAGNOSTIC
 #if STALLION_CONTEXT_HANDLERS
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-unhooked" {
             try contextualXattrValues(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
@@ -3128,7 +3326,7 @@ func contextualXattrQueue(_ parent: URL) throws {
         try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
-        try failures(parent); try admission(parent); try lifetimeAndBinding(parent)
+        try failures(parent); try admission(parent); try lifetimeAndBinding(parent); try accessPolicyChecks(parent)
         try queuedResizeAfterDeliveryFailure(parent)
         try retainedTraceSnapshot(parent); try preparedReplyFailure(parent); try detachedTokenRoutes(parent)
         try pinOwnershipLimits(parent); try reclaimErrorAndRoot(parent)
@@ -3147,6 +3345,9 @@ func contextualXattrQueue(_ parent: URL) throws {
         print("PASS contextual empty directories, nesting, publication reuse and kind-specific failures")
         print("PASS contextual non-overwriting rename, three-role results, exact identities and rollback")
         print("PASS contextual symbolic-link creation, exact target bytes and shared publication cleanup")
+#endif
+#else
+        fatalError("only --access-policy is available without private diagnostics")
 #endif
     }
 }

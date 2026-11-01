@@ -65,7 +65,7 @@ final class CallbackBudget: @unchecked Sendable {
         count -= 1; bytes -= payload + ReadOnlyLimits.callbackOverhead
         precondition(count >= 0 && bytes >= 0)
     }
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC && STALLION_ADAPTER_CHECK
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES) && STALLION_ADAPTER_CHECK
     var snapshotForTesting: (Int, Int) {
         lock.lock(); defer { lock.unlock() }; return (count, bytes)
     }
@@ -110,7 +110,7 @@ func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdent
     try checkOwnerMode(m, owner: owner, uid: caller.uid, access: readAccess)
     guard !hasACL else { throw POSIXError(.ENOTSUP) }
 }
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
 func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
@@ -162,7 +162,7 @@ func validateDirectoryLayout(_ cookie: UInt64, _ verifier: UInt64) throws {
 }
 final class StallionItem: FSItem {
     let inode: UInt64
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var retainedModes: FSVolume.OpenModes = []
     var pin: sfs_pin?
     var reclaimed = false
@@ -197,10 +197,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var scope: Bool
     let owner: uid_t
     private(set) var anchor: sfs_result
-#if STALLION_WRITE_DIAGNOSTIC
-    // Only the private diagnostic build can enable writing; even it defaults RO.
-    private static let diagnosticPinBytes: UInt64 = 8 * 1024 * 1024
-    private(set) var diagnosticWritable = false
+    private let selectedAccess: ImageAdmission.Access
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+    // Required write state is shared; optional tracing never authorizes access.
+    private var tracingEnabled: Bool { selectedAccess == .fixtureWritable }
+    private static let writablePinBytes: UInt64 = 8 * 1024 * 1024
+    private(set) var writesEnabled = false
     struct DeliveryFailure {
         let code: Int, sequence: UInt64, durableGeneration: UInt64
         let result: sfs_result
@@ -225,6 +227,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var writeCounters = WriteCounters()
     private var writeRecords: [WriteRecord] = []
     private func controlRecordLocked(_ operation: UInt64, inode: UInt64 = 0, mask: UInt64, error: Error?, entry: Bool = false) {
+        guard tracingEnabled else { return }
         guard writeRecords.count < 4096 else { writeCounters.overflow = true; return }
         saturated(&diagnosticTraceSequence)
         let now = DispatchTime.now().uptimeNanoseconds
@@ -234,7 +237,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             result: deliveryFailure?.result ?? sfs_result()))
     }
     private func controlEntry(_ operation: UInt64, item: FSItem, mask: UInt64 = 0) {
-        guard diagnosticWritable else { return }
+        guard writesEnabled else { return }
         submissionLock.lock()
         controlRecordLocked(operation, inode: (item as? StallionItem)?.inode ?? 0, mask: mask, error: nil, entry: true)
         submissionLock.unlock()
@@ -260,14 +263,27 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result()) {
         submissionLock.lock(); rememberDeliveryLocked(error, result); submissionLock.unlock()
     }
-    func enableWriteDiagnostic(expectedUUID: UUID) throws {
-        guard state == .inactive, rawBytes(anchor.uuid) == withUnsafeBytes(of: expectedUUID.uuid, { Array($0) }),
-              resource.isWritable && !resource.isRevoked, items.isEmpty, !diagnosticWritable,
+    func enableAdmittedWrites() throws {
+        guard selectedAccess != .readOnly, state == .inactive,
+              resource.isWritable && !resource.isRevoked, items.isEmpty, !writesEnabled,
               let handle else { throw POSIXError(.EACCES) }
+#if !(STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        guard selectedAccess == .fixtureWritable else { throw POSIXError(.ENOTSUP) }
+#endif
+        // selectedAccess comes from the successful core open, never from pin
+        // configuration, which is also legal for ordinary read-only handles.
         var r = sfs_result()
-        try check(sfs_image_pin_configure(handle, UInt32(itemLimit), Self.diagnosticPinBytes, &r), r)
+        try check(sfs_image_pin_configure(handle, UInt32(itemLimit), Self.writablePinBytes, &r), r)
         items.reserveCapacity(itemLimit)
-        diagnosticWritable = true; diagnosticDurable = anchor.generation; writeRecords.reserveCapacity(4096)
+        writesEnabled = true; diagnosticDurable = anchor.generation
+        if tracingEnabled { writeRecords.reserveCapacity(4096) }
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    var diagnosticWritable: Bool { writesEnabled }
+    func enableWriteDiagnostic(expectedUUID: UUID) throws {
+        guard selectedAccess == .fixtureWritable,
+              rawBytes(anchor.uuid) == withUnsafeBytes(of: expectedUUID.uuid, { Array($0) }) else { throw POSIXError(.EACCES) }
+        try enableAdmittedWrites()
     }
     func diagnosticSnapshot() -> (WriteCounters, [WriteRecord], DeliveryFailure?) {
         submissionLock.lock(); defer { submissionLock.unlock() }
@@ -287,6 +303,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
         return (writeCounters, copied, deliveryFailure)
     }
+#endif
 #if STALLION_ADAPTER_CHECK
     func diagnosticTraceStorageForTesting() -> (address: UInt, capacity: Int, count: Int) {
         submissionLock.lock(); defer { submissionLock.unlock() }
@@ -329,7 +346,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var state = State.inactive
     private var failure: Error?
     private var items: [UInt64: StallionItem] = [:]
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
     private enum CreateOwnership { case reserved, transaction, discarded, promoted }
     struct CreateOutcome {
         var beginAttempted = false, beginSucceeded = false, commitAttempted = false, commitSucceeded = false
@@ -362,17 +379,44 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var sequence: UInt64 = 0
     private var overflow = false
     private var emitted = false
-    init(handle: OpaquePointer, resource: FSPathURLResource, scope: Bool, anchor: sfs_result, queue: DispatchQueue,
+    init(admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
          itemLimit: Int = ReadOnlyLimits.activeItems) {
         precondition(itemLimit > 0 && itemLimit <= ReadOnlyLimits.activeItems)
         self.itemLimit = itemLimit
-        self.handle = handle; self.resource = resource; self.scope = scope; self.anchor = anchor
+        self.handle = admission.handle; self.resource = resource; self.scope = scope; self.anchor = admission.anchor
+        selectedAccess = admission.access
         self.queue = queue; owner = geteuid()
-        let bytes = rawBytes(anchor.uuid)
+        let bytes = rawBytes(admission.anchor.uuid)
         let uuid = UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]))
         super.init(volumeID: .init(uuid: uuid), volumeName: FSFileName(string: "StallionFS"))
-        records.reserveCapacity(4096); record(0)
+        if selectedAccess != .contextualWrites { records.reserveCapacity(4096) }
+        record(0)
     }
+#if STALLION_ADAPTER_CHECK
+    // Status from the real core policy, not a mount-options approximation.
+    func coreReadOnlyForTesting() -> Bool {
+        guard let handle else { return false }
+        var result = sfs_result()
+        let status = sfs_image_begin(handle, &result)
+        if status == SFS_OK {
+            var cleanup = sfs_result()
+            precondition(sfs_image_abort(handle, &cleanup) == SFS_OK && cleanup.transaction_active == 0)
+        }
+        return status == SFS_STATE && result.transaction_active == 0 && result.poisoned == 0
+    }
+    func openForTesting(_ item: FSItem, modes: FSVolume.OpenModes, caller: CallerIdentity, reply: @escaping (Error?) -> Void) {
+        openHandler(item, modes: modes, caller: caller, reply: reply)
+    }
+    func closeForTesting(_ item: FSItem, modes: FSVolume.OpenModes, caller: CallerIdentity, reply: @escaping (Error?) -> Void) {
+        closeHandler(item, modes: modes, caller: caller, reply: reply)
+    }
+    func accessForTesting(_ item: FSItem, access: FSVolume.AccessMask, caller: CallerIdentity, reply: @escaping (FSCheckAccessResult?, Error?) -> Void) {
+        accessHandler(item, requestedAccess: access, caller: caller, reply: reply)
+    }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+    func retainedModesForTesting(_ item: FSItem) throws -> FSVolume.OpenModes { try ownedItem(item).retainedModes }
+#endif
+#endif
     func enqueue(retainedBytes: Int = 0, maintenance: Bool = false,
                  dataOperation: Bool = false, writeOperation: Bool = false, namespaceOperation: Bool = false,
                  syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil,
@@ -384,12 +428,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         else if !maintenance && admission != .open { error = POSIXError(admission == .draining ? .EAGAIN : .ENXIO) }
         else if !callbacks.acquire(retainedBytes) { error = POSIXError(.EAGAIN) }
         else { error = nil }
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
-            if syncOperation {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled {
+            if syncOperation && tracingEnabled {
                 saturated(&writeCounters.syncs); controlRecordLocked(5, mask: syncFlags, error: nil, entry: true)
             }
-            if dataOperation {
+            if dataOperation && tracingEnabled {
                 saturated(&diagnosticSequence); saturated(&writeCounters.callbacks)
                 if writeOperation {
                     saturated(&writeCounters.writes); saturated(&writeCounters.deliveredBytes, by: UInt64(retainedBytes))
@@ -406,7 +450,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 callbacks.release(retainedBytes); error = first.error
             }
             if let rejectedError = error, dataOperation {
-                saturated(&writeCounters.refused); rememberDeliveryLocked(rejectedError)
+                if tracingEnabled { saturated(&writeCounters.refused) }
+                rememberDeliveryLocked(rejectedError)
             }
             if syncOperation, let first = deliveryFailure {
                 if error == nil { callbacks.release(retainedBytes) }
@@ -427,8 +472,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                         cookie: UInt64 = 0, verifier: UInt64 = 0, returnedVerifier: UInt64 = 0,
                         acceptedCookie: UInt64 = 0, stop: UInt64 = 0,
                         parents: ParentEvidence = ParentEvidence(), accepted: Int64 = -1, reclaim: Int64 = -1) {
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable && [1, 2, 3, 4, 5, 6, 12, 15, 16].contains(op) {
+        guard selectedAccess != .contextualWrites else { return }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled && [1, 2, 3, 4, 5, 6, 12, 15, 16].contains(op) {
             submissionLock.lock(); controlRecordLocked(op, inode: inode, mask: mask, error: error); submissionLock.unlock()
         }
 #endif
@@ -443,6 +489,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                               accepted: accepted, reclaim: reclaim))
     }
     private func emit() {
+        guard selectedAccess != .contextualWrites else { return }
         guard !emitted else { return }; emitted = true
         let logger = Logger(subsystem: "com.alvinhhh.stallionfs.private27.module", category: "experiment")
         for r in records {
@@ -456,8 +503,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func check(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOENT) throws {
         guard status == SFS_OK else {
             let error = sfsError(status, result, missing: missing)
-#if STALLION_WRITE_DIAGNOSTIC
-            if diagnosticWritable { lastCoreFailure = result }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if writesEnabled { lastCoreFailure = result }
 #endif
             if result.poisoned != 0 || [SFS_IO, SFS_CORRUPT, SFS_RECOVERY_REQUIRED, SFS_OUTCOME_UNKNOWN, SFS_POISONED].contains(status) { latch(error) }
             throw error
@@ -472,23 +519,23 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     private func ownedItem(_ item: FSItem) throws -> StallionItem {
         guard let own = item as? StallionItem, items[own.inode] === own else { throw POSIXError(.EINVAL) }
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { guard !own.reclaimed else { throw POSIXError(.EINVAL) } }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { guard !own.reclaimed else { throw POSIXError(.EINVAL) } }
 #endif
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         guard pendingCreate?.inode != own.inode else { throw POSIXError(.EINVAL) }
 #endif
         return own
     }
     private func id(_ item: FSItem) throws -> UInt64 {
         let own = try ownedItem(item)
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { guard own.pin != nil else { throw POSIXError(.EINVAL) } }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { guard own.pin != nil else { throw POSIXError(.EINVAL) } }
 #endif
         return own.inode
     }
     private func canonical(_ inode: UInt64) throws -> StallionItem {
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         guard pendingCreate?.inode != inode else { throw POSIXError(.EINVAL) }
         let pendingTickets = pendingCreate?.ticket == true ? 1 : 0
         if let item = items[inode] { return item }
@@ -498,8 +545,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         guard items.count < itemLimit else { throw POSIXError(.ENFILE) }
 #endif
         let item = StallionItem(inode)
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled {
             let h = try ready(); var pin = sfs_pin(), r = sfs_result()
             try check(sfs_image_pin_acquire(h, inode, &pin, &r), r); item.pin = pin
         }
@@ -508,8 +555,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     private func metadata(_ inode: UInt64) throws -> sfs_metadata_entry {
         let h = try ready(); var m = sfs_metadata_entry(), r = sfs_result()
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable, let item = items[inode] {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled, let item = items[inode] {
             let pin = try token(inode); var value = sfs_pin_stat()
             try check(sfs_image_pin_stat(h, pin, &value, &r), r)
             try validatePinMetadata(value, inode: item.inode); return value.metadata
@@ -521,7 +568,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
         return m
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private func token(_ inode: UInt64) throws -> sfs_pin {
         guard let item = items[inode], !item.reclaimed, let pin = item.pin else { throw POSIXError(.EINVAL) }
         return pin
@@ -556,16 +603,17 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         latch(e); rememberDelivery(e, r); return e
     }
     private func closeModes(_ item: FSItem, modes: FSVolume.OpenModes) throws {
-        _ = try ownedItem(item)
-        guard modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
-        (item as! StallionItem).retainedModes = modes
+        let own = try ownedItem(item)
+        guard own.pin != nil, modes.subtracting([.read, .write]).isEmpty,
+              modes.subtracting(own.retainedModes).isEmpty else { throw POSIXError(.EINVAL) }
+        own.retainedModes = modes
     }
 #endif
     private func readTarget(_ h: OpaquePointer, inode: UInt64, offset: UInt64,
                             data: UnsafeMutableRawPointer?, length: Int, count: inout Int,
                             receipt: inout sfs_result) throws -> sfs_status {
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { return sfs_image_pin_read(h, try token(inode), offset, data, length, &count, &receipt) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { return sfs_image_pin_read(h, try token(inode), offset, data, length, &count, &receipt) }
 #endif
         return sfs_image_read(h, 0, inode, offset, data, length, &count, &receipt)
     }
@@ -655,8 +703,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     var isOpenCloseInhibited: Bool { false }
     var isAccessCheckInhibited: Bool { false }
     var requestedMountOptions: FSVolume.MountOptions {
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { return [] }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { return [] }
 #endif
         return [.readOnly]
     }
@@ -692,8 +740,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         do { return try prepare(item) }
         catch {
             if !existed {
-#if STALLION_WRITE_DIAGNOSTIC
-                if diagnosticWritable { _ = releaseItem(item) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+                if writesEnabled { _ = releaseItem(item) }
                 else { items.removeValue(forKey: inode) }
 #else
                 items.removeValue(forKey: inode)
@@ -728,8 +776,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     // Each reply runs after all earlier accepted work, including reentrant calls.
     func unmount(replyHandler: @escaping () -> Void) {
         submissionLock.lock()
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { controlRecordLocked(3, mask: 0, error: nil, entry: true) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { controlRecordLocked(3, mask: 0, error: nil, entry: true) }
 #endif
         pendingUnmountReplies += 1
         if admission != .terminal { admission = .draining }
@@ -751,9 +799,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         self.submissionLock.lock()
         let busy = self.state == .mounted || self.pendingUnmountReplies != 0
         var error: Error? = self.failure ?? (busy ? POSIXError(.EBUSY) : nil)
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         error = self.deliveryFailure?.error ?? error
-        if self.diagnosticWritable {
+        if self.writesEnabled {
             self.submissionLock.unlock()
             guard self.state != .terminal else { replyHandler(error); return }
             // FSKit has reclaimed every other item before deactivation. A root
@@ -772,8 +820,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         self.record(4, error: error); replyHandler(error)
     } }
     func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled {
             let invalid: Error? = [FSSyncFlags.wait, .dWait, .noWait].contains(flags) ? nil : POSIXError(.EINVAL)
             enqueue(maintenance: true, syncOperation: true, syncFlags: UInt64(bitPattern: Int64(flags.rawValue)), validationError: invalid, rejected: { replyHandler($0) }) {
                 var error = self.deliveryError() ?? self.failure
@@ -797,28 +845,28 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     // Queue-only. Busy is nonconsuming; a close error still consumes ownership.
     func unload() -> (consumed: Bool, error: Error?) {
         submissionLock.lock()
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { controlRecordLocked(6, mask: 0, error: nil, entry: true) }
-        if diagnosticWritable, let first = deliveryFailure { latch(first.error) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { controlRecordLocked(6, mask: 0, error: nil, entry: true) }
+        if writesEnabled, let first = deliveryFailure { latch(first.error) }
 #endif
         if state == .terminal {
-#if STALLION_WRITE_DIAGNOSTIC
-            if diagnosticWritable { controlRecordLocked(6, mask: 1, error: failure) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if writesEnabled { controlRecordLocked(6, mask: 1, error: failure) }
 #endif
             submissionLock.unlock(); return (true, failure)
         }
         guard pendingUnmountReplies == 0 && callbacks.isEmpty else {
-#if STALLION_WRITE_DIAGNOSTIC
-            if diagnosticWritable { controlRecordLocked(6, mask: 0, error: POSIXError(.EBUSY)) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if writesEnabled { controlRecordLocked(6, mask: 0, error: POSIXError(.EBUSY)) }
 #endif
             submissionLock.unlock(); return (false, POSIXError(.EBUSY))
         }
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable && (state != .inactive || !items.isEmpty) {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled && (state != .inactive || !items.isEmpty) {
             submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
         }
 #endif
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         if let pendingCreate, !pendingCreate.quarantined {
             submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
         }
@@ -826,7 +874,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         admission = .terminal; submissionLock.unlock()
         state = .terminal; nonce.removeAll(); let owned = handle; handle = nil
         if let owned { var r = sfs_result(); let status = sfs_image_close(owned, &r); if status != SFS_OK { latch(sfsError(status, r)) } }
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         pendingCreate = nil // Close consumes the table, including unresolved reservations.
 #endif
         if scope { scope = false; resource.url.stopAccessingSecurityScopedResource() }
@@ -908,12 +956,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     private func reclaim(_ item: FSItem, attempt: @escaping (@escaping () -> Void) -> Bool,
                          replyHandler: @escaping (Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         controlEntry(12, item: item)
 #endif
         enqueue(maintenance: true, rejected: {
-#if STALLION_WRITE_DIAGNOSTIC
-            if self.diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if self.writesEnabled {
                 self.submissionLock.lock(); self.controlRecordLocked(12, mask: 0, error: $0); self.submissionLock.unlock()
             }
 #endif
@@ -923,8 +971,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             let inode = try self.ownedItem(item).inode
             var cleanupError: Error?
             let eligible = attempt {
-#if STALLION_WRITE_DIAGNOSTIC
-                if self.diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+                if self.writesEnabled {
                     cleanupError = self.releaseItem(item as! StallionItem); return
                 }
 #endif
@@ -953,8 +1001,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard m.entry.kind == SFS_SYMLINK else { throw POSIXError(.EINVAL) }
             var bytes = [UInt8](repeating: 0, count: 4096), count = 0, r = sfs_result(); let h = try self.ready()
             let status: sfs_status
-#if STALLION_WRITE_DIAGNOSTIC
-            if self.diagnosticWritable { status = sfs_image_pin_readlink(h, try self.token(inode), &bytes, bytes.count, &count, &r) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if self.writesEnabled { status = sfs_image_pin_readlink(h, try self.token(inode), &bytes, bytes.count, &count, &r) }
             else { status = sfs_image_readlink(h, 0, inode, &bytes, bytes.count, &count, &r) }
 #else
             status = sfs_image_readlink(h, 0, inode, &bytes, bytes.count, &count, &r)
@@ -1058,74 +1106,84 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     func capturedRecords() -> [Record] { records }
     func activeItemCount() -> Int { items.count }
 #endif
-    func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) { enqueue(rejected: { replyHandler($0) }) {
+    func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) {
+        openHandler(item, modes: modes, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func openHandler(_ item: FSItem, modes: FSVolume.OpenModes, caller: CallerIdentity, reply: @escaping (Error?) -> Void) { enqueue(rejected: { reply($0) }) {
         do {
             _ = try self.ready(mounted: true); let inode = try self.id(item), m = try self.metadata(inode)
-            guard context.effectiveUserID == Int(self.owner) else { throw POSIXError(.EACCES) }
-#if STALLION_WRITE_DIAGNOSTIC
-            if self.diagnosticWritable {
+            guard caller.uid == Int(self.owner) else { throw POSIXError(.EACCES) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if self.writesEnabled {
                 guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-                if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, caller: CallerIdentity(context)) }
-                if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, caller: CallerIdentity(context)) }
+                if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, caller: caller) }
+                if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, caller: caller) }
                 (item as! StallionItem).retainedModes.formUnion(modes)
-                self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
+                self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil); return
             }
 #endif
             if modes.contains(.write) { throw POSIXError(.EROFS) }
             guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
-            try self.ownerAccess(m, inode: inode, access: .readData, caller: CallerIdentity(context))
-            self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
-        } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
+            try self.ownerAccess(m, inode: inode, access: .readData, caller: caller)
+            self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
+        } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(caller.uid), error: error); reply(error) }
     } }
     func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler: @escaping @Sendable (Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+        closeHandler(item, modes: modes, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func closeHandler(_ item: FSItem, modes: FSVolume.OpenModes, caller: CallerIdentity, reply: @escaping (Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         controlEntry(16, item: item, mask: UInt64(modes.rawValue))
 #endif
         enqueue(maintenance: true, rejected: {
-#if STALLION_WRITE_DIAGNOSTIC
-            if self.diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if self.writesEnabled {
                 self.submissionLock.lock(); self.controlRecordLocked(16, mask: UInt64(modes.rawValue), error: $0); self.submissionLock.unlock()
             }
 #endif
-            replyHandler($0)
+            reply($0)
         }) {
         do {
             let inode = try self.ownedItem(item).inode
-#if STALLION_WRITE_DIAGNOSTIC
-            if self.diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if self.writesEnabled {
                 try self.closeModes(item, modes: modes)
-                self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil); return
+                self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil); return
             }
 #endif
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
-            self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(nil)
-        } catch { self.record(16, uid: Int64(context.effectiveUserID), error: error); replyHandler(error) }
+            self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
+        } catch { self.record(16, uid: Int64(caller.uid), error: error); reply(error) }
     } }
     func checkAccess(to item: FSItem, requestedAccess access: FSVolume.AccessMask, context: FSContext,
-                     replyHandler: @escaping @Sendable (FSCheckAccessResult?, Error?) -> Void) { enqueue(rejected: { replyHandler(nil, $0) }) {
+                     replyHandler: @escaping @Sendable (FSCheckAccessResult?, Error?) -> Void) {
+        accessHandler(item, requestedAccess: access, caller: CallerIdentity(context), reply: replyHandler)
+    }
+    private func accessHandler(_ item: FSItem, requestedAccess access: FSVolume.AccessMask, caller: CallerIdentity,
+                               reply: @escaping (FSCheckAccessResult?, Error?) -> Void) { enqueue(rejected: { reply(nil, $0) }) {
         do {
             let inode = try self.id(item), m = try self.metadata(inode)
-            try self.ownerAccess(m, inode: inode, access: access, caller: CallerIdentity(context))
+            try self.ownerAccess(m, inode: inode, access: access, caller: caller)
 #if STALLION_CONTEXT_HANDLERS
             let result = try self.handlerResult(FSCheckAccessResult.self) { FSCheckAccessResult(accessAllowed: true) }
 #else
             guard let result = FSCheckAccessResult(accessAllowed: true) else { throw POSIXError(.EIO) }
 #endif
-            self.record(17, inode, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID)); replyHandler(result, nil)
-        } catch { self.record(17, mask: UInt64(access.rawValue), uid: Int64(context.effectiveUserID), error: error); replyHandler(nil, error) }
+            self.record(17, inode, mask: UInt64(access.rawValue), uid: Int64(caller.uid)); reply(result, nil)
+        } catch { self.record(17, mask: UInt64(access.rawValue), uid: Int64(caller.uid), error: error); reply(nil, error) }
     } }
     private func ownerAccess(_ m: sfs_metadata_entry, inode: UInt64, access: FSVolume.AccessMask, caller: CallerIdentity) throws {
         var writable = false
-#if STALLION_WRITE_DIAGNOSTIC
-        writable = diagnosticWritable
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        writable = writesEnabled
 #endif
-#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable && access.contains(.writeXattr) {
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
+        if writesEnabled && access.contains(.writeXattr) {
             try checkXattrOwnerPolicy(m, owner: owner, caller: caller)
             try ownerAccess(m, inode: inode, access: access.subtracting(.writeXattr), caller: caller)
             return
         }
-        if diagnosticWritable && m.entry.kind == SFS_DIRECTORY && access.contains(.addFile) {
+        if writesEnabled && m.entry.kind == SFS_DIRECTORY && access.contains(.addFile) {
             try checkLinkParentPolicy(m, owner: owner, caller: caller)
             // The reduced request still passes the existing owner and ACL checks.
             try ownerAccess(m, inode: inode, access: access.subtracting(.addFile), caller: caller)
@@ -1136,12 +1194,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         // Opaque security descriptors are not an implemented ACL evaluator.
         let name = Data("com.apple.system.Security".utf8)
         var size: UInt64 = 0, r = sfs_result(); let h = try ready()
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         let pin: sfs_pin?
-        if diagnosticWritable { pin = try token(inode) } else { pin = nil }
+        if writesEnabled { pin = try token(inode) } else { pin = nil }
 #endif
         let status = name.withUnsafeBytes { bytes -> sfs_status in
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             if let pin { return sfs_image_pin_xattr_size(h, pin, bytes.baseAddress, bytes.count, &size, &r) }
 #endif
             return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
@@ -1194,12 +1252,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             let h = try self.ready(mounted: true), inode = try self.id(item); let m = try self.metadata(inode)
             if let caller { try self.ownerAccess(m, inode: inode, access: .readXattr, caller: caller) }; try component(name.data, xattr: true)
             var size: UInt64 = 0, r = sfs_result()
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             let sizePin: sfs_pin?
-            if self.diagnosticWritable { sizePin = try self.token(inode) } else { sizePin = nil }
+            if self.writesEnabled { sizePin = try self.token(inode) } else { sizePin = nil }
 #endif
             let status = name.data.withUnsafeBytes { bytes -> sfs_status in
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
                 if let sizePin { return sfs_image_pin_xattr_size(h, sizePin, bytes.baseAddress, bytes.count, &size, &r) }
 #endif
                 return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
@@ -1213,12 +1271,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard let memory = malloc(length) else { throw POSIXError(.ENOMEM) }
             var transferred = false; defer { if !transferred { free(memory) } }
             var count = 0
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             let readPin: sfs_pin?
-            if self.diagnosticWritable { readPin = try self.token(inode) } else { readPin = nil }
+            if self.writesEnabled { readPin = try self.token(inode) } else { readPin = nil }
 #endif
             let readStatus = name.data.withUnsafeBytes { bytes -> sfs_status in
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
                 if let readPin { return sfs_image_pin_read_xattr(h, readPin, bytes.baseAddress, bytes.count, 0, memory, length, &count, &r) }
 #endif
                 return sfs_image_read_xattr(h, 0, inode, bytes.baseAddress, bytes.count, 0, memory, length, &count, &r)
@@ -1237,12 +1295,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             var names: [FSFileName] = [], after = Data(), total = 0, r = sfs_result()
             while true {
                 var entry = sfs_xattr_entry(), found: Int32 = 0
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
                 let pin: sfs_pin?
-                if self.diagnosticWritable { pin = try self.token(inode) } else { pin = nil }
+                if self.writesEnabled { pin = try self.token(inode) } else { pin = nil }
 #endif
                 let status = rawBytes(self.anchor.root_digest).withUnsafeBufferPointer { digest in after.withUnsafeBytes {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
                     if let pin { return sfs_image_pin_next_xattr(h, pin, self.anchor.generation, digest.baseAddress,
                         after.isEmpty ? nil : $0.baseAddress, $0.count, &entry, &found, &r) }
 #endif
@@ -1264,9 +1322,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if !STALLION_CONTEXT_HANDLERS
     func setAttributes(_ attributes: FSItem.SetAttributesRequest, on item: FSItem, replyHandler: @escaping (FSItem.Attributes?, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
+        if writesEnabled && selectedAccess == .fixtureWritable {
             let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size, .allocSize, .modifyTime, .changeTime, .fileID]
-            diagnosticSetAttributes(attributes, item: item, caller: nil, request: { request }, prepare: { $0 }, reply: replyHandler); return
+            setWritableAttributes(attributes, item: item, caller: nil, request: { request }, prepare: { $0 }, reply: replyHandler); return
         }
 #endif
         refuse { replyHandler(nil, $0) }
@@ -1278,7 +1336,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, replyHandler: @escaping (FSFileName?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
     func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (Int, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable { diagnosticWrite(contents, item: item, offset: offset, prepare: { count, _ in count }) { replyHandler($0 ?? 0, $1) }; return }
+        if writesEnabled && selectedAccess == .fixtureWritable { performWrite(contents, item: item, offset: offset, prepare: { count, _ in count }) { replyHandler($0 ?? 0, $1) }; return }
 #endif
         refuse { replyHandler(0, $0) }
     }
@@ -1451,14 +1509,15 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             return try self.handlerResult(FSReadFileResult.self) { FSReadFileResult(bytesRead: count, itemAttributes: attributes) }
         }, reply: replyHandler)
     }
-    // ReadWriteHandler supplies no FSContext. This preserves only disposable-image
-    // admission; delegated descriptors, mmap and installed caller routing are unqualified.
+    // The item-level grant comes only from successful contextual open. FSKit's
+    // descriptor rejection, cached writeback and mapping-close ordering still
+    // require mounted qualification; no caller identity is synthesized here.
     func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler: @escaping (FSWriteFileResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled {
             let requirements = ResultRequirements(FSWriteFileResult.self)
             var request: FSItem.GetAttributesRequest?
-            diagnosticWrite(contents, item: item, offset: offset, admit: {
+            performWrite(contents, item: item, offset: offset, admit: {
                 request = try requirements.request()
             }, prepare: { count, m in
                 guard let request else { throw POSIXError(.EIO) }
@@ -1477,10 +1536,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func setAttributesHandler(_ attributes: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity,
                                       reply: @escaping (FSSetAttributesResult?, Error?) -> Void) {
         attributes.consumedAttributes = []
-#if STALLION_WRITE_DIAGNOSTIC
-        if diagnosticWritable {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled {
             let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.size, .allocSize, .modifyTime, .changeTime, .fileID])
-            diagnosticSetAttributes(attributes, item: item, caller: caller, requirements: requirements,
+            setWritableAttributes(attributes, item: item, caller: caller, requirements: requirements,
                 request: { try requirements.request() }, prepare: { a in
                     return try self.handlerResult(FSSetAttributesResult.self) { FSSetAttributesResult(attributes: a, freeSpace: nil) }
                 }, reply: reply); return
@@ -1489,13 +1548,13 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         refuse { reply(nil, $0) }
     }
     func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler: @escaping (FSCreateItemResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         createItemHandler(name, type: type, directory: directory, attributes: attributes, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private enum CreateInput {
         case item(FSItem.ItemType)
         case symbolicLink(Data)
@@ -1596,7 +1655,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                                    construct: @escaping (StallionItem, FSFileName, FSItem.Attributes, FSItem.Attributes) -> Result?,
                                    reply: @escaping (Result?, Error?) -> Void) {
         attributes.consumedAttributes = []
-        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        guard writesEnabled else { refuse { reply(nil, $0) }; return }
         let bytes = name.data, target = input.target
         let charge = bytes.count.addingReportingOverflow(target?.count ?? 0)
         let values: CreateAttributes
@@ -1708,23 +1767,23 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
 #endif
     func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, context: FSContext, replyHandler: @escaping (FSCreateSymlinkResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         createSymlinkHandler(name, directory: directory, attributes: attributes, linkContents: linkContents, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
     func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler: @escaping (FSCreateLinkResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         createLinkHandler(item, name: name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private func createLinkHandler(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
                                    reply: @escaping (FSCreateLinkResult?, Error?) -> Void) {
-        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        guard writesEnabled else { refuse { reply(nil, $0) }; return }
         let bytes = name.data
         var validation: Error?
         do {
@@ -1786,16 +1845,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
 #endif
     func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         removeItemHandler(item, name: name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private func removeItemHandler(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
                                    reply: @escaping (FSRemoveItemResult?, Error?) -> Void) {
-        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        guard writesEnabled else { refuse { reply(nil, $0) }; return }
         let bytes = name.data
         var validation: Error?
         do {
@@ -1860,18 +1919,18 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
 #endif
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler: @escaping (FSRenameItemResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         renameItemHandler(item, sourceDirectory: sourceDirectory, sourceName: sourceName, destinationName: destinationName,
                           destinationDirectory: destinationDirectory, overItem: overItem, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private func renameItemHandler(_ item: FSItem, sourceDirectory: FSItem, sourceName: FSFileName,
                                    destinationName: FSFileName, destinationDirectory: FSItem, overItem: FSItem?,
                                    caller: CallerIdentity, reply: @escaping (FSRenameItemResult?, Error?) -> Void) {
-        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        guard writesEnabled else { refuse { reply(nil, $0) }; return }
         let oldBytes = sourceName.data, newBytes = destinationName.data
         let charge = oldBytes.count.addingReportingOverflow(newBytes.count)
         var validation: Error?
@@ -1949,16 +2008,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
 #endif
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) {
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         setXattrHandler(name, value: value, item: item, policy: policy, caller: CallerIdentity(context), reply: replyHandler)
 #else
         refuse { replyHandler(nil, $0) }
 #endif
     }
-#if STALLION_WRITE_DIAGNOSTIC
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     private func setXattrHandler(_ name: FSFileName, value: Data?, item: FSItem, policy: FSVolume.SetXattrPolicy,
                                  caller: CallerIdentity, reply: @escaping (FSSetXattrResult?, Error?) -> Void) {
-        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        guard writesEnabled else { refuse { reply(nil, $0) }; return }
         // FSFileName has already applied its constructor's NUL termination.
         // Keep exactly the delivered bytes; xattr names are not path components.
         let bytes = name.data, length = value?.count ?? 0
@@ -2078,18 +2137,22 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
 #endif
 #endif
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
 #if STALLION_WRITE_DIAGNOSTIC
     // Contextless write callbacks have no caller identity. This is only the
     // existing disposable-image admission policy, not client authorization.
     @discardableResult private func fixtureWritableMetadata(_ inode: UInt64) throws -> sfs_metadata_entry {
+        guard selectedAccess == .fixtureWritable else { throw POSIXError(.EROFS) }
         if let error = deliveryError() { throw error }
         let m = try metadata(inode)
         guard m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
         try ownerAccess(m, inode: inode, access: .writeData, caller: CallerIdentity(uid: Int(owner), gid: Int(getegid())))
         return m
     }
+#endif
     private func observeWrite(_ operation: UInt64, inode: UInt64, offset: UInt64, length: UInt64,
                               started: UInt64, count: Int, error: Error?, result: sfs_result) {
+        guard tracingEnabled else { return }
         submissionLock.lock(); defer { submissionLock.unlock() }
         if writeRecords.count == 4096 { writeCounters.overflow = true; return }
         saturated(&diagnosticTraceSequence)
@@ -2098,6 +2161,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             generation: anchor.generation, count: count, code: (error as NSError?)?.code ?? 0, result: result))
     }
     private func accountCommit(_ r: sfs_result) {
+        guard tracingEnabled else { return }
         submissionLock.lock(); defer { submissionLock.unlock() }
         saturated(&writeCounters.commits)
         if r.fence_attempted & 1 != 0 { saturated(&writeCounters.recordFences) }
@@ -2217,7 +2281,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             receipt = original; rememberDelivery(error, original); throw error
         }
     }
-    private func diagnosticWrite<T>(_ contents: Data, item: FSItem, offset: off_t,
+    private func performWrite<T>(_ contents: Data, item: FSItem, offset: off_t,
                                     admit: @escaping () throws -> Void = {}, prepare: @escaping (Int, sfs_metadata_entry) throws -> T, reply: @escaping (T?, Error?) -> Void) {
         let start = DispatchTime.now().uptimeNanoseconds
         var validation: Error?
@@ -2227,10 +2291,26 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             var receipt = sfs_result(), inode: UInt64 = 0
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
-                _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.fixtureWritableMetadata(inode)
+                _ = try self.ready(mounted: true); inode = try self.id(item)
+                let m: sfs_metadata_entry
+                if self.selectedAccess == .contextualWrites {
+                    if let error = self.deliveryError() { throw error }
+                    let own = try self.ownedItem(item)
+                    guard own.retainedModes.contains(.write) else { throw POSIXError(.EACCES) }
+                    m = try self.metadata(inode)
+                    guard m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+                } else {
+#if STALLION_WRITE_DIAGNOSTIC
+                    m = try self.fixtureWritableMetadata(inode)
+#else
+                    throw POSIXError(.EROFS)
+#endif
+                }
                 try admit()
                 let pin = try self.token(inode)
-                self.submissionLock.lock(); self.saturated(&self.writeCounters.bytes, by: UInt64(contents.count)); self.submissionLock.unlock()
+                if self.tracingEnabled {
+                    self.submissionLock.lock(); self.saturated(&self.writeCounters.bytes, by: UInt64(contents.count)); self.submissionLock.unlock()
+                }
                 let result: T
                 if !contents.isEmpty {
                     result = try self.mutate({ h, r in
@@ -2238,7 +2318,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                             var at = 0
                             while at < bytes.count {
                                 let amount = min(65536, bytes.count - at)
-                                self.submissionLock.lock(); self.saturated(&self.writeCounters.chunks); self.submissionLock.unlock()
+                                if self.tracingEnabled {
+                                    self.submissionLock.lock(); self.saturated(&self.writeCounters.chunks); self.submissionLock.unlock()
+                                }
                                 let status = sfs_image_pin_write(h, pin, UInt64(offset) + UInt64(at), bytes.baseAddress!.advanced(by: at), amount, &r)
                                 try self.check(status, r); at += amount
 #if STALLION_ADAPTER_CHECK
@@ -2280,7 +2362,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return nil
     }
 #if STALLION_CONTEXT_HANDLERS
-    private func diagnosticSetAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+    private func setWritableAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity,
                                             requirements: ResultRequirements? = nil,
                                             request makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, prepare: @escaping (FSItem.Attributes) throws -> T,
                                             reply: @escaping (T?, Error?) -> Void) {
@@ -2294,7 +2376,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
                 let regularSize = hasSize && m.entry.kind == SFS_FILE
                 if regularSize, let error = self.deliveryError() { throw error }
-                if let caller { try self.ownerAccess(m, inode: inode, access: regularSize ? .writeData : .readAttributes, caller: caller) }
+                try self.ownerAccess(m, inode: inode, access: regularSize ? .writeData : .readAttributes, caller: caller)
                 let request = try makeRequest()
                 if let requirements { try Self.validateCallerWanted(requirements.caller) }
                 else { try validateWanted(request.wantedAttributes.rawValue) }
@@ -2306,7 +2388,6 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let result: T
                 if regularSize {
                     guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
-                    if caller == nil { try self.fixtureWritableMetadata(inode) }
                     if a.size != m.entry.size {
                         let pin = try self.token(inode)
                         result = try self.mutate({ h, r in
@@ -2332,7 +2413,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
     }
 #else
-    private func diagnosticSetAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity?,
+    private func setWritableAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity?,
                                             request makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, prepare: @escaping (FSItem.Attributes) throws -> T,
                                             reply: @escaping (T?, Error?) -> Void) {
         let start = DispatchTime.now().uptimeNanoseconds
