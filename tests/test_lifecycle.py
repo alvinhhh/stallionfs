@@ -15,6 +15,222 @@ from stallionfs import core, lifecycle, _scan
 from stallionfs.core import Store, StallionError, git, read_json, write_json
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'requires native private-directory admission')
+class NativeReferenceTests(unittest.TestCase):
+    """Managed metadata/lease boundaries; real image behavior is tested through installed sfs."""
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix='stallionfs-native-reference-')).resolve()
+        self.store = Store(self.base / 'store')
+        self.parent = self.base / 'native'
+        self.parent.mkdir(mode=0o700)
+        self.image = self.parent / 'image.sfs'
+        with os.fdopen(os.open(self.image, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
+            stream.write(b'owned external fixture')
+        self.calls = []
+        self.real_native_operation = core.native_operation
+        self.bridge = patch.object(core, 'native_operation', side_effect=self.operation)
+        self.bridge.start()
+        self.addCleanup(self.bridge.stop)
+        self.addCleanup(core.remove_tree, self.base)
+        self.registration = self.store.register_native_image(self.image, name='Native image')
+        self.workspace = self.registration['id']
+
+    def operation(self, target, action, *names):
+        self.calls.append((target.copy(), action, names))
+        if action == 'inspect':
+            info = self.image.stat()
+            return {'identity': {'file': [info.st_dev, info.st_ino], 'uuid': '12' * 16}}
+        with self.assertRaises(BlockingIOError):
+            with core.lock(self.store.root / 'locks' / f'use-{self.workspace}', blocking=False):
+                self.fail('native operation did not hold its managed lease')
+        if action == 'snapshots':
+            return {'snapshots': [{'id': 'before', 'name': 'before', 'view': 1, 'backend': 'native-image'}]}
+        return {'ok': True, 'committed': True, 'operation': action, 'receipt': {'generation': 2}}
+
+    def test_registration_is_external_reference_and_native_commands_share_lease(self):
+        metadata = read_json(self.store.root / 'workspaces' / self.workspace / 'meta.json')
+        self.assertNotIn('commit', metadata)
+        self.assertEqual(metadata['ownership'], 'external-reference')
+        self.assertEqual(metadata['native_image']['directory'], str(self.parent))
+        self.assertEqual(self.store.list()[0]['path'], str(self.image))
+        self.assertEqual(self.store.snapshot(self.workspace, name='before')['id'], 'before')
+        self.assertEqual(self.store.snapshots(self.workspace)[0]['id'], 'before')
+        restored = self.store.rollback(self.workspace, 'before')
+        self.assertTrue(restored['recovery'].startswith('recovery-'))
+        self.assertEqual(self.calls[-1][1:], ('restore', ('before', restored['recovery'])))
+        self.assertEqual(list((self.store.root / 'snapshots').iterdir()), [])
+        self.assertEqual(list((self.store.root / 'recovery').iterdir()), [])
+        self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+
+    def test_active_lease_and_native_cleanup_authority_are_refused(self):
+        with self.store._lease(self.workspace):
+            with self.assertRaises(StallionError):
+                self.store.snapshot(self.workspace, name='blocked')
+        for operation in (lambda: self.store.enroll(self.workspace),
+                          lambda: self.store.close(self.workspace, quiescent=True),
+                          lambda: self.store.move(self.workspace),
+                          lambda: self.store.mount(self.workspace),
+                          lambda: self.store.unmount(self.workspace)):
+            with self.assertRaises(StallionError):
+                operation()
+        self.store.cleanup_config(enabled=True)
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+        self.assertFalse((self.store.root / 'trash' / self.workspace).exists())
+
+    def test_names_and_unexpected_exchange_journal_fail_without_core_operation(self):
+        for name in ('', '.', '..', 'a/b', 'a\0b', 'a' * 256, None):
+            with self.assertRaises(StallionError):
+                self.store.rollback(self.workspace, name)
+        before = len(self.calls)
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        write_json(journal, {'unexpected': True})
+        original = journal.read_bytes()
+        with self.assertRaisesRegex(StallionError, 'Unexpected exchange journal'):
+            self.store.snapshot(self.workspace, name='before')
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertEqual(len(self.calls), before)
+
+    def test_intermediate_alias_allowed_final_symlink_refused_and_registration_failure_preserves_image(self):
+        alias = self.base / 'alias'
+        alias.symlink_to(self.parent, target_is_directory=True)
+        registered = self.store.register_native_image(alias / 'image.sfs')
+        self.assertEqual(registered['native_image']['directory'], str(self.parent))
+        link = self.parent / 'link.sfs'
+        link.symlink_to(self.image)
+        with self.assertRaises(StallionError):
+            self.store.register_native_image(link)
+        with patch.object(core, 'write_json', side_effect=OSError(errno.ENOSPC, 'full')):
+            with self.assertRaises(OSError):
+                self.store.register_native_image(self.image)
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+
+    def test_fallback_receipts_and_captured_signal_are_reported_by_cli(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from stallionfs.__main__ import main
+        for exception_type, status in ((MemoryError, 1), (KeyboardInterrupt, 130)):
+            details = {'ok': False, 'committed': True, 'outcome': 'committed', 'operation': 'restore',
+                       'receipt': {'status': 0, 'fence_succeeded': 3, 'committed_end': 65536, 'physical_end': 69632},
+                       'close_receipt': {'status': 0}}
+            error = exception_type('response interrupted')
+            error.native_image_carrier = {'data': bytearray(json.dumps(details).encode() + b'\0'),
+                                          'snapshot': 'before', 'recovery': 'prior-current'}
+            with patch.object(core, 'native_operation', side_effect=error), redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                result = main(['--root', str(self.store.root), '--json', 'rollback', self.workspace, 'before'])
+            self.assertEqual(result, status)
+            self.assertEqual(out.getvalue(), '')
+            observed = json.loads(err.getvalue())
+            self.assertTrue(observed['native_image_result']['committed'])
+            self.assertEqual(observed['native_image_result']['recovery'], 'prior-current')
+            self.assertEqual(observed['native_image_result']['receipt']['physical_end'], 69632)
+            self.assertIn('committed', observed['error'])
+
+    def test_response_exists_before_mutation_and_error_format_oom_retains_returned_receipts(self):
+        import inspect
+        from types import SimpleNamespace
+        import stallionfs
+        response_ids = []
+        result = {'ok': True, 'committed': True, 'receipt': {'status': 0, 'fence_succeeded': 3}}
+        def observe_response(*_args):
+            # The mocked boundary observes the response before mutation starts.
+            frame = inspect.currentframe().f_back
+            while frame.f_code.co_name not in ('snapshot', 'rollback'):
+                frame = frame.f_back
+            response = frame.f_locals['response']
+            self.assertIsNone(response['native_image_result'])
+            response_ids.append(id(response))
+            return result
+        with patch.object(core, 'native_operation', side_effect=observe_response):
+            snapshot = self.store.snapshot(self.workspace, name='before')
+            restored = self.store.rollback(self.workspace, 'before')
+        self.assertEqual(response_ids, [id(snapshot), id(restored)])
+        self.assertIs(snapshot['native_image_result'], result)
+        self.assertIs(restored['native_image_result'], result)
+        failed = {'ok': False, 'committed': True, 'outcome': 'committed', 'operation': 'restore',
+                  'error_code': errno.EIO, 'recovery': 'prior-current', 'receipt': result['receipt'],
+                  'close_receipt': {'status': 1, 'system_errno': errno.EIO}}
+        module = SimpleNamespace(restore=lambda *_args: failed)
+        with patch.object(stallionfs, '_image', module, create=True), patch.object(core.os, 'strerror', side_effect=MemoryError('format')):
+            with self.assertRaises(MemoryError) as raised:
+                self.real_native_operation(self.registration['native_image'], 'restore', 'before', 'prior-current')
+        self.assertIs(core.native_failure_details(raised.exception), failed)
+
+    def test_managed_close_errors_and_post_native_signal_preserve_original_result(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from itertools import product
+        from stallionfs.__main__ import main
+        for action, outcome in product(('snapshot', 'rollback'), ('committed', 'unknown')):
+            for boundary, exception_type in (('workspace', OSError), ('use', OSError),
+                                             ('workspace', KeyboardInterrupt)):
+                for delivery in ('direct', 'json', 'text'):
+                    with self.subTest(action=action, boundary=boundary,
+                                      exception=exception_type.__name__, delivery=delivery, outcome=outcome):
+                        original = (OSError(errno.EIO, 'managed descriptor close failed')
+                                    if exception_type is OSError else KeyboardInterrupt('post-native signal'))
+                        opened, injected, returned = [], [], []
+                        real_open, real_close = os.open, os.close
+                        def track_open(path, *args, **kwargs):
+                            fd = real_open(path, *args, **kwargs)
+                            if not opened and Path(path).name == f'{boundary}-{self.workspace}':
+                                opened.append(fd)
+                            return fd
+                        def fail_after_close(fd):
+                            real_close(fd)
+                            if opened == [fd] and not injected:
+                                injected.append(fd)
+                                raise original
+                        def mutate(_target, operation, *names):
+                            result = {'ok': outcome == 'committed', 'committed': outcome == 'committed', 'outcome': outcome,
+                                      'operation': operation, 'snapshot': names[0],
+                                      'recovery': names[1] if operation == 'restore' else None,
+                                      'receipt': {'status': 0 if outcome == 'committed' else 1,
+                                                  'generation': 2, 'fence_succeeded': 3 if outcome == 'committed' else 1},
+                                      'opened_receipt': {'status': 0, 'generation': 1},
+                                      'staged_receipt': {'status': 0, 'transaction_active': True},
+                                      'abort_receipt': {'status': 0, 'transaction_active': False},
+                                      'close_receipt': {'status': 0}}
+                            returned.append(result)
+                            if outcome == 'unknown':
+                                error = StallionError('unknown final fence outcome')
+                                error.native_image_result = result
+                                raise error
+                            return result
+                        with patch.object(os, 'open', side_effect=track_open), \
+                                patch.object(os, 'close', side_effect=fail_after_close), \
+                                patch.object(core, 'native_operation', side_effect=mutate):
+                            if delivery != 'direct':
+                                argv = (['snapshot', self.workspace, '--name', 'before'] if action == 'snapshot'
+                                        else ['rollback', self.workspace, 'before'])
+                                with redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                                    status = main(['--root', str(self.store.root),
+                                                   *(['--json'] if delivery == 'json' else []), *argv])
+                                self.assertEqual(status, 130 if exception_type is KeyboardInterrupt else 1)
+                                self.assertEqual(out.getvalue(), '')
+                                self.assertIn('the image change committed' if outcome == 'committed'
+                                              else 'image publication outcome is unknown', err.getvalue())
+                                if delivery == 'json':
+                                    observed = json.loads(err.getvalue())
+                                    self.assertEqual(observed['native_image_result'], returned[0])
+                                    if action == 'rollback':
+                                        self.assertIn('Recovery snapshot name: ' + returned[0]['recovery'], observed['notes'])
+                                elif action == 'rollback':
+                                    self.assertIn('Recovery snapshot name: ' + returned[0]['recovery'], err.getvalue())
+                            else:
+                                with self.assertRaises(exception_type) as raised:
+                                    if action == 'snapshot':
+                                        self.store.snapshot(self.workspace, name='before')
+                                    else:
+                                        self.store.rollback(self.workspace, 'before')
+                                self.assertIs(raised.exception, original)
+                                self.assertIs(core.native_failure_details(raised.exception), returned[0])
+                        self.assertEqual(len(returned), 1)  # Cleanup failure never retries native mutation.
+                        self.assertEqual(injected, opened)
+                        self.assertEqual(len(injected), 1)
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'requires native APFS clone and exchange')
 class LifecycleTests(unittest.TestCase):
     def setUp(self):

@@ -62,14 +62,25 @@ class Lifecycle:
             os.close(fd)
 
     @contextlib.contextmanager
-    def _workspace_lock(self, workspace, *, reconcile=True):
+    def _workspace_lock(self, workspace, *, reconcile=True, native_result=None):
         # Acquisition order: managed-use lease, workspace lock, retention lock.
-        with self._lease(workspace), core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
-            if reconcile:
-                self._reconcile(workspace)
-            yield
+        try:
+            with self._lease(workspace), core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
+                if reconcile:
+                    self._reconcile(workspace)
+                yield
+        except BaseException as error:
+            if native_result is not None and native_result[0] is not None:
+                try:
+                    error.native_image_result = native_result[0]
+                except (AttributeError, MemoryError):
+                    pass  # Preserve the original cleanup error; delivery may remain impossible.
+            raise
 
     def _payload(self, path, meta):
+        if meta.get('backend') == 'native-image':
+            target = core.native_target(meta)
+            return Path(target['directory']) / target['component']
         return path / ('workspace.sparseimage' if meta.get('backend') == 'image' else 'repo')
 
     def _state(self, workspace):
@@ -120,6 +131,8 @@ class Lifecycle:
                     raise core.StallionError('Workspace Git configuration contains external worktree or include references')
 
     def _closed_payload(self, path, meta, *, quiescent):
+        if meta.get('backend') == 'native-image':
+            raise core.StallionError('Native image registration does not authorize closure, cleanup or deletion')
         payload = self._payload(path, meta)
         if meta.get('backend') == 'image':
             from . import images
@@ -157,10 +170,19 @@ class Lifecycle:
             yield
 
     def snapshot(self, workspace, *, quiescent=False, name=''):
-        if not isinstance(name, str) or len(name) > 128:
-            raise core.StallionError('Snapshot name must be at most 128 characters')
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
+            if meta.get('backend') == 'native-image':
+                name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
+                response = {'id': name, 'name': name, 'workspace': workspace, 'backend': 'native-image',
+                            'native_image_result': None}
+                result = core.native_operation(core.native_target(meta), 'snapshot', name)
+                native_result[0] = result
+                response['native_image_result'] = result
+                return response
+            if not isinstance(name, str) or len(name) > 128:
+                raise core.StallionError('Snapshot name must be at most 128 characters')
             self._open(workspace, path, meta)
             payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
             value = uuid.uuid4().hex
@@ -175,6 +197,11 @@ class Lifecycle:
             return record
 
     def snapshots(self, workspace):
+        _, meta = self.object('workspaces', workspace)
+        if meta.get('backend') == 'native-image':
+            with self._workspace_lock(workspace):
+                _, meta = self.object('workspaces', workspace)
+                return core.native_operation(core.native_target(meta), 'snapshots')['snapshots']
         core.identifier(workspace, 32)
         result = []
         for path in sorted((self.root / 'snapshots').iterdir()):
@@ -200,6 +227,9 @@ class Lifecycle:
         journal = self.root / 'journals' / f'{workspace}.json'
         if not os.path.lexists(journal):
             return
+        registration = self.root / 'workspaces' / workspace / 'meta.json'
+        if registration.exists() and core.read_json(registration).get('backend') == 'native-image':
+            raise core.StallionError('Unexpected exchange journal for a native image registration; retained unchanged')
         record = core.read_json(journal)
         core.identifier(record.get('recovery'), 32)
         if record.get('workspace') != workspace or record.get('backend') not in ('folder', 'image'):
@@ -220,8 +250,18 @@ class Lifecycle:
         journal.unlink()
 
     def rollback(self, workspace, snapshot, *, quiescent=False):
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
+            if meta.get('backend') == 'native-image':
+                snapshot = self._native_name(snapshot)
+                recovery = 'recovery-' + uuid.uuid4().hex
+                response = {'workspace': workspace, 'snapshot': snapshot, 'recovery': recovery,
+                            'backend': 'native-image', 'native_image_result': None}
+                result = core.native_operation(core.native_target(meta), 'restore', snapshot, recovery)
+                native_result[0] = result
+                response['native_image_result'] = result
+                return response
             source, saved = self._snapshot(snapshot, workspace)
             if saved['backend'] != meta.get('backend', 'folder'):
                 raise core.StallionError('Snapshot backend does not match workspace')
@@ -258,7 +298,21 @@ class Lifecycle:
     def enroll(self, workspace, *, enabled=True):
         with self._workspace_lock(workspace):
             path, meta = self.object('workspaces', workspace)
+            if meta.get('backend') == 'native-image':
+                raise core.StallionError('External native images cannot be enrolled for cleanup')
             return self._open(workspace, path, meta, enrolled=enabled)
+
+    @staticmethod
+    def _native_name(name):
+        if not isinstance(name, str):
+            raise core.StallionError('Snapshot name must be text')
+        try:
+            raw = os.fsencode(name)
+        except UnicodeError as error:
+            raise core.StallionError('Snapshot name cannot be represented as filesystem bytes') from error
+        if not raw or len(raw) > 255 or raw in (b'.', b'..') or b'/' in raw or b'\0' in raw:
+            raise core.StallionError('Snapshot name must be one component of 1–255 bytes')
+        return name
 
     def close(self, workspace, *, quiescent=False):
         if not quiescent:
@@ -353,6 +407,8 @@ class Lifecycle:
 
     def _eligible(self, workspace, now, *, observe=False, generation=None):
         path, meta = self.object('workspaces', workspace)
+        if meta.get('backend') == 'native-image':
+            return None  # Registration never authorizes retirement of external data.
         state = core.read_json(self._state(workspace))
         if not self._valid_state(workspace, path, meta, state, now):
             return None

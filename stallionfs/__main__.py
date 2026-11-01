@@ -40,6 +40,9 @@ def main(argv=None):
     prepare.add_argument("--ref", default="HEAD")
     prepare.add_argument("--key", required=True, help="Toolchain/environment cache key; change when the environment changes")
     prepare.add_argument("--image-size", type=int, metavar="GIB", help="Store workspaces on separate APFS images with this capacity")
+    native = commands.add_parser('register-native-image', help='Register an existing closed native image without moving it')
+    native.add_argument('path')
+    native.add_argument('--name', default='')
     create = commands.add_parser("create", help="Clone a prepared seed")
     create.add_argument("seed")
     create.add_argument("--name", default="")
@@ -108,7 +111,7 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
-    from .core import StallionError, Store
+    from .core import StallionError, Store, native_failure_details
     try:
         store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)
         if args.action == "scan":
@@ -136,6 +139,9 @@ def main(argv=None):
                 else:
                     _scan.move(source, destination, replace=args.replace, exchange=args.exchange)
                 result, text = {"source": source, "destination": destination}, ""
+        elif args.action == 'register-native-image':
+            result = store.register_native_image(args.path, name=args.name)
+            text = result['id']
         elif args.action == "prepare":
             result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup, image_size=args.image_size)
             text = result["id"]
@@ -197,11 +203,29 @@ def main(argv=None):
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
         return result["returncode"] if args.action == "run" else 0
-    except (StallionError, OSError, shutil.Error, KeyboardInterrupt) as exc:
+    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)
-        notes = getattr(exc, "__notes__", ())
+        notes = list(getattr(exc, "__notes__", ()))
         error = {"error": message}
+        details = native_failure_details(exc)
+        if details is None and 'result' in locals() and isinstance(result, dict):
+            details = result.get('native_image_result')
+        if details is not None:
+            error['native_image_result'] = details
+            if interrupted or isinstance(exc, MemoryError):
+                if details.get('committed'):
+                    message = ('interrupted' if interrupted else 'response allocation failed') + '; the image change committed'
+                elif details.get('outcome') == 'unknown':
+                    message = ('interrupted' if interrupted else 'response allocation failed') + '; image publication outcome is unknown'
+            elif isinstance(exc, OSError):
+                if details.get('committed'):
+                    message += '; the image change committed'
+                elif details.get('outcome') == 'unknown':
+                    message += '; image publication outcome is unknown'
+            error['error'] = message
+            if details.get('recovery') and (details.get('committed') or details.get('outcome') == 'unknown'):
+                notes.append('Recovery snapshot name: ' + details['recovery'])
         if notes:
             error["notes"] = list(notes)
         print(json.dumps(error) if args.json else f"stallionfs: {message}", file=sys.stderr)

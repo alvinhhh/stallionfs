@@ -45,6 +45,7 @@ static int competing, cut, model, cut_at, events;
 static unsigned char *durable;
 static size_t durable_size;
 static int tracked_fd = -1, locked_fd = -1;
+static int expected_closed_fd = -1;
 static char order[256];
 static uint64_t read_at[2];
 static uint64_t watch_at[2], watch_size[2], watch_bytes[2];
@@ -305,7 +306,16 @@ int sfs_test_flock(int fd, int operation) {
 }
 int sfs_test_close(int fd) {
     assert(!clearing_cache);
-    closes++; struct stat st; assert(fstat(fd, &st) == 0);
+    closes++; struct stat st;
+    if (expected_closed_fd >= 0 && fd == expected_closed_fd) {
+        expected_closed_fd = -1;
+        assert(fstat(fd, &st) == -1 && errno == EBADF);
+        int result = close(fd); assert(result == -1 && errno == EBADF);
+        auxiliary[fd] = 0; memo_target_fd[fd] = 0;
+        if (fd == locked_fd) locked_fd = -1;
+        return result;
+    }
+    assert(fstat(fd, &st) == 0);
     int fail = (is("close") && closes == target) || (is("parent_close") && S_ISDIR(st.st_mode)) || ((is("aux_close") || is("aux_enospc_cleanup")) && auxiliary[fd]);
     int result = close(fd);
     auxiliary[fd] = 0; memo_target_fd[fd] = 0;
@@ -4604,6 +4614,432 @@ static void metadata_information(void) {
     assert(sfs_image_close(h, &r) == SFS_OK);
 }
 
+static void restore_seed(sfs_image **h, unsigned minor, sfs_inode *a, sfs_inode *b, sfs_inode *newer) {
+    sfs_result r; reset("", 0);
+    if (minor == 2) create(h);
+    else { sfs_metadata_initial initial = metadata_input(SFS_DIRECTORY); metadata_clock(1400);
+        OK(sfs_image_create_metadata_version(root, "image", TEST_CAPACITY, minor, &initial, h, &r)); }
+    initial_files(*h, a, b);
+    sfs_view view; OK(sfs_image_begin(*h, &r)); OK(sfs_image_snapshot(*h, "target", 6, &view, &r)); assert(view == 1); OK(sfs_image_commit(*h, &r));
+    change_files(*h, *a, *b); *newer = add(*h, 1, "newer-file", SFS_FILE); OK(sfs_image_commit(*h, &r));
+    OK(sfs_image_begin(*h, &r)); OK(sfs_image_snapshot(*h, "newer", 5, &view, &r)); assert(view == 2); OK(sfs_image_commit(*h, &r));
+}
+static void restore_no_payload(unsigned auxiliary_before) {
+    assert(!raw_hashes && !raw_hash_input && !aux_attempt_bytes && !aux_read_bytes && !aux_write_bytes);
+    assert(aux_created == auxiliary_before && !image_truncates && !overlay_clone_calls);
+    for (unsigned i = 0; i < watch_count; ++i) assert(!watch_bytes[i] && !watch_reads[i]);
+}
+static void restore_competitor(void) {
+    pid_t child = fork(); assert(child >= 0);
+    if (!child) {
+        fault = ""; competing = cut = model = 0; assert(close(locked_fd) == 0);
+        sfs_image *other = NULL; sfs_result r;
+        assert(sfs_image_open(root, "image", &other, &r) == SFS_BUSY && !other); _exit(0);
+    }
+    int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+}
+enum restore_outcome { RESTORE_OLD, RESTORE_NEW, RESTORE_UNCERTAIN };
+static void restore_state(sfs_image *h, const sfs_result *before, enum restore_outcome outcome) {
+    sfs_result r; sfs_view view = UINT32_MAX; sfs_entry entry;
+    OK(sfs_image_stat(h, 0, 1, &entry, &r)); assert(r.generation == before->generation || r.generation == before->generation + 1);
+    int restored = r.generation == before->generation + 1;
+    assert(outcome == RESTORE_UNCERTAIN || restored == (outcome == RESTORE_NEW));
+    expect(h, 0, 2, restored ? "old-a" : "new-a"); expect(h, 0, 3, restored ? "old-b" : "new-b");
+    OK(sfs_image_snapshot_view(h, "target", 6, &view, &r)); assert(view == 1); expect(h, view, 2, "old-a");
+    OK(sfs_image_snapshot_view(h, "newer", 5, &view, &r)); assert(view == 2); expect(h, view, 2, "new-a");
+    enum sfs_status status = sfs_image_snapshot_view(h, "recovery", 8, &view, &r);
+    assert(status == (restored ? SFS_OK : SFS_NOT_FOUND)); if (restored) { assert(view == 3); expect(h, view, 2, "new-a"); }
+}
+static void restore_reopen(const sfs_result *before, enum restore_outcome outcome) {
+    sfs_image *h = NULL; sfs_result r; reset("", 0);
+    enum sfs_status status = sfs_image_open(root, "image", &h, &r);
+    if (status == SFS_OK) { restore_state(h, before, outcome); OK(sfs_image_verify(h, &generous, &r)); close_image(h); return; }
+    assert(status == SFS_RECOVERY_REQUIRED && !h); sfs_recovery recovery;
+    OK(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r)); unsigned selected = 2;
+    for (unsigned i = 0; i < 2; ++i) if (recovery.slots[i].status == SFS_OK && recovery.slots[i].generation >= before->generation &&
+        (selected == 2 || recovery.slots[i].generation > recovery.slots[selected].generation)) selected = i;
+    assert(selected < 2); OK(sfs_image_select(h, selected, &generous, &r)); restore_state(h, before, outcome); close_image(h);
+}
+static void restore_basic(void) {
+    sfs_image *h; sfs_result r; sfs_inode a, b, newer; sfs_view recovery, view;
+    for (unsigned minor = 2; minor <= 6; ++minor) {
+        restore_seed(&h, minor, &a, &b, &newer); sfs_image_information before, after;
+        OK(sfs_image_get_information(h, &before, &r)); sfs_cookie cookie = {0}; sfs_entry entry; int found;
+        OK(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r)); assert(found);
+        size_t old_size; unsigned char *old = bytes("image", &old_size);
+        unsigned char *old_slot = old + (get64(old + 40) > get64(old + CELL + 40) ? 0 : CELL);
+        unsigned char catalog_rows[2 * 328]; unsigned char *old_catalog = record(old, record(old, old_slot + 48, old_size) + 120, old_size);
+        assert(get16(old_catalog + 70) == 2); memcpy(catalog_rows, old_catalog + 640, sizeof(catalog_rows));
+        recovery = UINT32_MAX; reset("", 0); clock_calls = 0; unsigned auxiliary_before = aux_created;
+        sfs_verify_budget small_unused = generous; small_unused.raw_cells = small_unused.auxiliary_bytes = small_unused.auxiliary_io_bytes = 1;
+        OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &small_unused, &recovery, &r));
+        assert(recovery == 3 && r.transaction_active && !r.poisoned && !r.fence_attempted && !r.fence_succeeded && !fulls && !slots && !clock_calls);
+        assert(r.coverage == SFS_COVERAGE_TOUCHED && r.generation == before.committed.generation && r.physical_end > before.committed.physical_end);
+        restore_no_payload(auxiliary_before); restore_competitor(); expect(h, 0, a, "new-a");
+        view = UINT32_MAX; assert(sfs_image_snapshot_view(h, "recovery", 8, &view, &r) == SFS_NOT_FOUND && view == UINT32_MAX);
+        view = UINT32_MAX; assert(sfs_image_prepare_restore(h, 1, "again", 5, &generous, &view, &r) == SFS_BUSY && view == UINT32_MAX && r.transaction_active);
+        OK(sfs_image_abort(h, &r)); restore_competitor(); close_image(h); open_image(&h); expect(h, 0, a, "new-a");
+        reset("", 0); clock_calls = 0; auxiliary_before = aux_created;
+        OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &recovery, &r)); restore_no_payload(auxiliary_before);
+        OK(sfs_image_commit(h, &r)); assert(r.fence_attempted == 3 && r.fence_succeeded == 3 && !r.transaction_active && !clock_calls);
+        OK(sfs_image_get_information(h, &after, &r)); assert(after.committed.generation == before.committed.generation + 1);
+        assert(after.committed.device == before.committed.device && after.committed.inode == before.committed.inode && !memcmp(after.committed.uuid, before.committed.uuid, 16));
+        assert(after.committed.committed_end > before.committed.committed_end); restore_state(h, &before.committed, RESTORE_NEW);
+        assert(sfs_image_next(h, 0, 1, &cookie, &entry, &found, &r) == SFS_STATE);
+        size_t now_size; unsigned char *now = bytes("image", &now_size); unsigned char *slot = now + (get64(now + 40) > get64(now + CELL + 40) ? 0 : CELL);
+        unsigned char *catalog = record(now, record(now, slot + 48, now_size) + 120, now_size);
+        assert(get16(catalog + 70) == 3 && !memcmp(catalog + 640, catalog_rows, sizeof(catalog_rows)));
+        assert(!memcmp(old + 8192, now + 8192, old_size - 8192)); free(old); free(now);
+        OK(sfs_image_begin(h, &r)); sfs_inode fresh = add(h, 1, "after", SFS_FILE); assert(fresh > newer); OK(sfs_image_commit(h, &r));
+        OK(sfs_image_prepare_restore(h, 1, "again", 5, &generous, &view, &r)); assert(view == 4); OK(sfs_image_commit(h, &r));
+        OK(sfs_image_snapshot_view(h, "recovery", 8, &view, &r)); assert(view == recovery); expect(h, view, a, "new-a");
+        close_image(h); open_image(&h); expect(h, 0, a, "old-a"); OK(sfs_image_verify(h, &generous, &r)); close_image(h); retain(4000 + (int)minor);
+    }
+    hardlink_create(&h, TEST_CAPACITY); OK(sfs_image_begin(h, &r));
+    a = add(h, 1, "a", SFS_FILE); b = symlink_add(h, 1, "sym", "a", 1);
+    OK(sfs_image_write(h, a, 2 * CELL + 1, "YZ", 2, &r)); OK(sfs_image_link(h, a, 1, "alias", 5, &r));
+    OK(sfs_image_set_xattr(h, a, "com.apple.ResourceFork", 22, "fork", 4, &r)); metadata_commit(h);
+    sfs_metadata_entry original = hardlink_get(h, 0, a, 2), original_root = metadata_get(h, 0, 1);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, "target", 6, &view, &r)); metadata_commit(h);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_unlink(h, 1, "alias", 5, &r)); OK(sfs_image_write(h, a, 0, "new", 3, &r));
+    OK(sfs_image_set_xattr(h, a, "com.apple.ResourceFork", 22, "changed", 7, &r)); metadata_commit(h);
+    reset("", 0); clock_calls = 0; unsigned auxiliary_before = aux_created;
+    OK(sfs_image_prepare_restore(h, view, "recovery", 8, &generous, &recovery, &r)); restore_no_payload(auxiliary_before);
+    OK(sfs_image_snapshot(h, "during", 6, &view, &r)); assert(view == 3);
+    metadata_commit(h); assert(!clock_calls); sfs_metadata_entry restored = hardlink_get(h, 0, a, 2), restored_root = metadata_get(h, 0, 1);
+    metadata_equal(&original, &restored); metadata_equal(&original_root, &restored_root);
+    sfs_entry alias; OK(sfs_image_lookup(h, 0, 1, "alias", 5, &alias, &r)); assert(alias.inode == a);
+    unsigned char data[2 * CELL + 3], expected[2 * CELL + 3] = {0}; expected[2 * CELL + 1] = 'Y'; expected[2 * CELL + 2] = 'Z'; size_t got;
+    OK(sfs_image_read(h, 0, a, 0, data, sizeof(data), &got, &r)); assert(got == sizeof(data) && !memcmp(data, expected, sizeof(data)));
+    symlink_expect(h, 0, b, "a", 1); xattr_expect(h, 0, a, "com.apple.ResourceFork", 22, "fork", 4);
+    xattr_expect(h, view, a, "com.apple.ResourceFork", 22, "changed", 7);
+    OK(sfs_image_verify(h, &generous, &r)); close_image(h); retain(4010);
+}
+static void restore_admission(void) {
+    sfs_image *h; sfs_result r; sfs_inode a, b, newer; sfs_view output, view; restore_seed(&h, 6, &a, &b, &newer);
+    size_t n; unsigned char *before = bytes("image", &n);
+    const char *bad[] = {"", ".", "..", "a/b", "a\0b"}; const size_t lengths[] = {0, 1, 2, 3, 3};
+    for (unsigned i = 0; i < 5; ++i) { output = UINT32_MAX; reset("", 0);
+        assert(sfs_image_prepare_restore(h, 1, bad[i], lengths[i], &generous, &output, &r) == SFS_INVALID && output == UINT32_MAX && !r.transaction_active && !writes); }
+    char long_name[256]; memset(long_name, 'x', sizeof(long_name)); output = UINT32_MAX;
+    assert(sfs_image_prepare_restore(h, 1, long_name, sizeof(long_name), &generous, &output, &r) == SFS_LIMIT && output == UINT32_MAX);
+    assert(sfs_image_prepare_restore(h, 0, "recover", 7, &generous, &output, &r) == SFS_INVALID);
+    assert(sfs_image_prepare_restore(h, 99, "recover", 7, &generous, &output, &r) == SFS_NOT_FOUND);
+    assert(sfs_image_prepare_restore(h, 1, "target", 6, &generous, &output, &r) == SFS_EXISTS);
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, NULL, &output, &r) == SFS_INVALID);
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, NULL, &r) == SFS_INVALID);
+    sfs_verify_budget zero = generous; zero.checks = 0;
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &zero, &output, &r) == SFS_INVALID);
+#ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
+    sfs_image_diagnostic_counters(h, UINT64_MAX, 0); reset("", 0);
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_LIMIT && !reads && !writes && !r.transaction_active);
+    sfs_image_diagnostic_counters(h, 0, 0);
+#endif
+    unchanged("image", before, n); free(before);
+    for (unsigned dirty = 0; dirty < 3; ++dirty) {
+        OK(sfs_image_begin(h, &r)); if (dirty == 1) add(h, 1, "pending", SFS_FILE); else if (dirty == 2) OK(sfs_image_write(h, a, 0, "pending", 7, &r));
+        before = bytes("image", &n); reset("", 0); output = UINT32_MAX;
+        assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_BUSY && output == UINT32_MAX && r.transaction_active && !writes);
+        unchanged("image", before, n); free(before); if (dirty == 2) { OK(sfs_image_commit(h, &r)); expect(h, 0, a, "pending"); } else OK(sfs_image_abort(h, &r));
+    }
+    OK(sfs_image_pin_configure(h, 4, UINT64_C(65536), &r)); sfs_pin pin;
+    OK(sfs_image_pin_acquire(h, a, &pin, &r)); output = UINT32_MAX;
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_BUSY && output == UINT32_MAX); OK(sfs_image_pin_release(h, pin, &r));
+    OK(sfs_image_pin_reserve(h, &pin, &r)); assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_BUSY); OK(sfs_image_pin_release(h, pin, &r));
+    OK(sfs_image_pin_acquire(h, a, &pin, &r)); OK(sfs_image_begin(h, &r)); OK(sfs_image_unlink(h, 1, "a", 1, &r)); OK(sfs_image_commit(h, &r));
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_BUSY); OK(sfs_image_pin_release(h, pin, &r));
+    assert(sfs_image_prepare_restore(h, 1, long_name, 255, &generous, &output, NULL) == SFS_OK && output == 3); OK(sfs_image_abort(h, &r));
+    for (unsigned stop = 0; stop < 4; ++stop) { sfs_verify_budget budget = generous; unsigned polls = 0;
+        if (stop == 0) budget.metadata_read_bytes = 1; else if (stop == 1) budget.metadata_hash_bytes = 1; else if (stop == 2) budget.checks = 1; else { budget.cancelled = cancel_now; budget.context = &polls; }
+        output = UINT32_MAX; reset("", 0); unsigned auxiliary_before = aux_created;
+        assert(sfs_image_prepare_restore(h, 1, "recover", 7, &budget, &output, &r) == SFS_INCOMPLETE && output == UINT32_MAX && !r.transaction_active && !r.poisoned && !writes && !fulls);
+        const enum sfs_incomplete_reason reasons[] = {SFS_INCOMPLETE_METADATA_READ, SFS_INCOMPLETE_METADATA_HASH, SFS_INCOMPLETE_CHECKS, SFS_INCOMPLETE_CANCELLED};
+        assert(r.incomplete_reason == reasons[stop]); if (stop == 3) assert(polls); restore_no_payload(auxiliary_before);
+    }
+    close_image(h); OK(sfs_image_open_readonly(root, "image", &h, &r));
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_STATE); close_image(h);
+    sfs_recovery inspected; OK(sfs_image_inspect(root, "image", &h, &inspected, &generous, &r));
+    unsigned latest = inspected.slots[0].generation > inspected.slots[1].generation ? 0 : 1;
+    OK(sfs_image_select(h, latest, &generous, &r)); reset("", 0);
+    assert(sfs_image_prepare_restore(h, 1, "recover", 7, &generous, &output, &r) == SFS_STATE && !writes); close_image(h); retain(4100);
+    const unsigned counts[] = {9, 31, 32};
+    for (unsigned i = 0; i < 3; ++i) { fixture f = indexed_fixture(4, 3, counts[i]); fixture_save(&f); open_image(&h); reset("", 0); output = UINT32_MAX;
+        enum sfs_status status = sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r);
+        if (counts[i] == 32) assert(status == SFS_LIMIT && output == UINT32_MAX && !writes && !r.transaction_active);
+        else { assert(status == SFS_OK && output == counts[i] + 1); OK(sfs_image_commit(h, &r)); for (unsigned j = 0; j < counts[i]; ++j) { char name[32]; int length = snprintf(name, sizeof(name), "snapshot-%u", j); OK(sfs_image_snapshot_view(h, name, (size_t)length, &view, &r)); assert(view == j + 1); } OK(sfs_image_verify(h, &generous, &r)); }
+        close_image(h); retain(4101 + (int)i);
+    }
+    /* Independent deep target and RAW corruption stay outside ROOT_ONLY reads. */
+    for (unsigned damage = 0; damage < 6; ++damage) {
+        fixture f = damage < 3 ? indexed_fixture(20, 60, 1) : damage == 3 ? xattr_fixture(1, 0, 1) : damage == 4 ? symlink_graph(1, 0, 0) : hardlink_fixture(2, 0, 1, 1);
+        unsigned char *catalog = record(f.p, record(f.p, f.p + 48, f.n) + 120, f.n), *ns = record(f.p, catalog + 648, f.n);
+        unsigned char *ref;
+        if (damage == 0) ref = catalog + 648;
+        else if (damage == 1) ref = raw_ref(f.p, inode_row(f.p, ns, 2, f.n), 0, f.n);
+        else if (damage == 2) {
+            unsigned char *index = record(f.p, ns + 64, f.n);
+            assert(get32(ns + 64) == 5 && get32(index + 8) == 5 && get32(index + 64) == 1 && get16(index + 68) == 1);
+            ref = index + 640 + 16;
+            uint64_t child_at = get64(ref + 8);
+            assert(get32(ref) == 5 && get64(ref + 16) == CELL && child_at >= 8192 && !(child_at % CELL)
+                && child_at < (uint64_t)(index - f.p) && child_at <= f.n && CELL <= f.n - child_at);
+            unsigned char *child = record(f.p, ref, f.n);
+            assert(get32(child + 8) == 5 && get32(child + 64) == 1 && get16(child + 68) == 0);
+        }
+        else if (damage == 3) ref = record(f.p, record(f.p, ns + 280, f.n) + 640 + 280, f.n) + 648;
+        else if (damage == 4) ref = record(f.p, record(f.p, ns + 64, f.n) + 640 + 32, f.n) + 648;
+        else ref = record(f.p, ns + 64, f.n) + 640 + 2 * 496 + 440;
+        uint64_t at = get64(ref + 8); fixture_save(&f); open_image(&h);
+        int fd = open("image", O_RDWR | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); unsigned char bad_byte;
+        assert(pread(fd, &bad_byte, 1, (off_t)at) == 1); bad_byte ^= 1; raw_write(fd, &bad_byte, 1, (off_t)at); assert(close(fd) == 0);
+        watch_at[0] = at; watch_size[0] = CELL; watch_count = 1; watch_clear(); reset("", 0); output = UINT32_MAX; unsigned auxiliary_before = aux_created;
+        enum sfs_status status = sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r);
+        fprintf(stderr, "restore-admission damage=%u target=%llu status=%d phase=%d errno=%d poisoned=%d transaction=%d\n",
+                damage, (unsigned long long)at, (int)status, (int)r.phase, r.system_errno, (int)r.poisoned, (int)r.transaction_active);
+        fflush(stderr);
+        if (!damage) assert(status == SFS_CORRUPT && output == UINT32_MAX && r.poisoned && !writes);
+        else { assert(status == SFS_OK); restore_no_payload(auxiliary_before); OK(sfs_image_commit(h, &r));
+            unsigned char value[16]; size_t got; sfs_entry entry; enum sfs_status later;
+            if (damage == 1) later = sfs_image_read(h, 0, 2, 0, value, 1, &got, &r);
+            else if (damage == 2) later = sfs_image_stat(h, 0, 2, &entry, &r);
+            else if (damage == 3) later = sfs_image_read_xattr(h, 0, 2, "key", 3, 0, value, sizeof(value), &got, &r);
+            else if (damage == 4) later = sfs_image_readlink(h, 0, 2, value, sizeof(value), &got, &r);
+            else later = sfs_image_verify(h, &generous, &r);
+            assert(later == SFS_CORRUPT && r.poisoned); }
+        watch_count = 0; close_image(h); retain(4110 + (int)damage);
+    }
+    restore_seed(&h, 2, &a, &b, &newer); before = bytes("image", &n); close_image(h); retain(4120);
+    unsigned char *slot = before + (get64(before + 40) > get64(before + CELL + 40) ? 0 : CELL);
+    unsigned newest_slot = slot == before ? 0 : 1; put64(slot + 40, UINT64_MAX); put64(before + (1 - newest_slot) * CELL + 40, UINT64_MAX - 1);
+    if (!newest_slot) { unsigned char temporary[CELL]; memcpy(temporary, before, CELL); memcpy(before, before + CELL, CELL); memcpy(before + CELL, temporary, CELL); }
+    slot_hash(before); slot_hash(before + CELL); save("image", before, n); open_image(&h); reset("", 0); output = UINT32_MAX;
+    assert(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r) == SFS_LIMIT && output == UINT32_MAX && !reads && !writes && !r.transaction_active);
+    unchanged("image", before, n); free(before); close_image(h); retain(4121);
+    fixture f = fixture_start(); fixture_node empty = {0}, history = namespace_cell(&f, empty, empty, 2, 0); unsigned char last[328] = {0};
+    put32(last, 32); memcpy(last + 8, history.ref, 56); put32(last + 64, 4); memcpy(last + 68, "last", 4);
+    fixture_node catalog = tree(&f, 4, last, 1), current = namespace_cell(&f, empty, empty, 3, 0); finish_fixture(&f, current, catalog); fixture_save(&f); open_image(&h); reset("", 0); output = UINT32_MAX;
+    assert(sfs_image_prepare_restore(h, 32, "recovery", 8, &generous, &output, &r) == SFS_LIMIT && output == UINT32_MAX && !writes && !r.transaction_active);
+    close_image(h); retain(4122);
+    restore_seed(&h, 2, &a, &b, &newer); before = bytes("image", &n);
+    slot = before + (get64(before + 40) > get64(before + CELL + 40) ? 0 : CELL);
+    unsigned char *ns = namespace_at(before, slot, n), *reference = raw_ref(before, inode_row(before, ns, a, n), 0, n);
+    uint64_t at = get64(reference + 8); free(before); int fd = open("image", O_RDWR | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0);
+    unsigned char bad_byte; assert(pread(fd, &bad_byte, 1, (off_t)at) == 1); bad_byte ^= 1; raw_write(fd, &bad_byte, 1, (off_t)at); assert(close(fd) == 0);
+    watch_at[0] = at; watch_size[0] = CELL; watch_count = 1; watch_clear(); reset("", 0); unsigned auxiliary_before = aux_created;
+    OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r)); restore_no_payload(auxiliary_before); OK(sfs_image_commit(h, &r));
+    OK(sfs_image_snapshot_view(h, "newer", 5, &view, &r)); assert(view == 2); OK(sfs_image_snapshot_view(h, "recovery", 8, &output, &r)); assert(output == 3);
+    expect(h, 0, a, "old-a"); unsigned char byte; size_t got;
+    assert(sfs_image_read(h, view, a, 0, &byte, 1, &got, &r) == SFS_CORRUPT && r.poisoned);
+    watch_count = 0; close_image(h); retain(4123);
+}
+static void restore_faults(void) {
+    sfs_image *h; sfs_result r; sfs_inode a, b, newer; sfs_view output;
+    restore_seed(&h, 2, &a, &b, &newer); sfs_image_information information; OK(sfs_image_get_information(h, &information, &r));
+    size_t n; unsigned char *base = bytes("image", &n); reset("", 0); uint64_t allocation_start = allocation_calls;
+    OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r)); uint64_t allocation_count = allocation_calls - allocation_start;
+    assert(allocation_count && allocation_count < 256); uint64_t prepared_cells = image_append_bytes / CELL; assert(prepared_cells >= 2);
+    close_image(h); retain(4200);
+    for (uint64_t ordinal = 1; ordinal <= allocation_count; ++ordinal) {
+        save("image", base, n); open_image(&h); reset("", 0); fail_allocation = allocation_calls + ordinal; output = UINT32_MAX;
+        assert(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r) == SFS_NOMEM && hit && output == UINT32_MAX);
+        assert(!r.poisoned && !r.transaction_active && r.system_errno == ENOMEM && !writes && !fulls); unchanged("image", base, n);
+        reset("", 0); OK(sfs_image_begin(h, &r)); OK(sfs_image_abort(h, &r)); close_image(h); retain(4210 + (int)ordinal);
+    }
+    fixture split = indexed_fixture(4, 3, 9); fixture_save(&split); open_image(&h);
+    size_t split_n; unsigned char *split_base = bytes("image", &split_n); reset("", 0); allocation_start = allocation_calls;
+    OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r)); assert(output == 10);
+    uint64_t split_allocations = allocation_calls - allocation_start, split_cells = image_append_bytes / CELL;
+    assert(split_allocations && split_allocations < 256 && split_cells > prepared_cells);
+    size_t staged_n; unsigned char *staged = bytes("image", &staged_n);
+    assert(staged_n == split_n + split_cells * CELL && get32(staged + staged_n - CELL + 64) == 4 && get16(staged + staged_n - CELL + 68) == 1);
+    free(staged); close_image(h); retain(4600);
+    for (uint64_t ordinal = 1; ordinal <= split_allocations; ++ordinal) {
+        save("image", split_base, split_n); open_image(&h); reset("", 0); fail_allocation = allocation_calls + ordinal; output = UINT32_MAX;
+        assert(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r) == SFS_NOMEM && hit && output == UINT32_MAX);
+        assert(!r.poisoned && !r.transaction_active && r.system_errno == ENOMEM && !writes && !fulls && !slots); unchanged("image", split_base, split_n);
+        reset("", 0); OK(sfs_image_begin(h, &r)); OK(sfs_image_abort(h, &r)); close_image(h); retain(4610 + (int)ordinal);
+    }
+    for (unsigned short_by = 0; short_by < 2; ++short_by) {
+        unsigned char *limited = malloc(split_n); assert(limited); memcpy(limited, split_base, split_n);
+        uint64_t split_capacity = split_n + (split_cells + 1 - short_by) * CELL;
+        for (unsigned slot = 0; slot < 2; ++slot) { put64(limited + slot * CELL + 144, split_capacity); slot_hash(limited + slot * CELL); }
+        save("image", limited, split_n); open_image(&h); reset("", 0); output = UINT32_MAX;
+        enum sfs_status status = sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r);
+        if (short_by) { assert(status == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY && !r.transaction_active && !r.poisoned && !writes && !fulls && output == UINT32_MAX); unchanged("image", limited, split_n); }
+        else { assert(status == SFS_OK && output == 10); OK(sfs_image_commit(h, &r)); assert(r.committed_end == split_capacity); OK(sfs_image_verify(h, &generous, &r)); }
+        close_image(h); free(limited); retain(4900 + (int)short_by);
+    }
+    free(split_base);
+    for (unsigned short_by = 0; short_by < 2; ++short_by) {
+        unsigned char *limited = malloc(n); assert(limited); memcpy(limited, base, n);
+        uint64_t capacity = n + (prepared_cells + 1 - short_by) * CELL;
+        for (unsigned slot = 0; slot < 2; ++slot) { put64(limited + slot * CELL + 144, capacity); slot_hash(limited + slot * CELL); }
+        save("image", limited, n); open_image(&h); reset("", 0); output = UINT32_MAX;
+        enum sfs_status status = sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r);
+        if (short_by) { assert(status == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY && !r.transaction_active && !r.poisoned && !writes && output == UINT32_MAX); unchanged("image", limited, n); }
+        else { assert(status == SFS_OK); OK(sfs_image_commit(h, &r)); assert(r.committed_end == capacity); }
+        close_image(h); free(limited); retain(4500 + (int)short_by);
+    }
+    unsigned char *unaligned = malloc(n); assert(unaligned); memcpy(unaligned, base, n);
+    uint64_t capacity = n + (prepared_cells + 2) * CELL;
+    for (unsigned slot = 0; slot < 2; ++slot) { put64(unaligned + slot * CELL + 144, capacity); slot_hash(unaligned + slot * CELL); }
+    save("image", unaligned, n); free(unaligned); int tail = open("image", O_RDWR | O_NOFOLLOW | O_CLOEXEC); assert(tail >= 0);
+    unsigned char abandoned[17]; memset(abandoned, 0xA5, sizeof(abandoned)); raw_write(tail, abandoned, sizeof(abandoned), (off_t)n); assert(close(tail) == 0);
+    open_image(&h); OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r)); OK(sfs_image_commit(h, &r)); assert(r.committed_end == capacity);
+    close_image(h); restore_reopen(&information.committed, RESTORE_NEW); retain(4502);
+    const char *prepare_faults[] = {"write_error", "write_zero", "enospc", "write_short", "write_eintr"};
+    for (unsigned i = 0; i < 5; ++i) {
+        save("image", base, n); open_image(&h); reset(prepare_faults[i], i == 2 ? 2 : 1); output = UINT32_MAX;
+        enum sfs_status status = sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r);
+        if (i < 3) assert(status == SFS_IO && output == UINT32_MAX && r.poisoned && !r.transaction_active && !fulls && !slots && r.system_errno == (i == 2 ? ENOSPC : EIO));
+        else { assert(status == SFS_OK); OK(sfs_image_abort(h, &r)); }
+        reset("", 0); close_image(h); restore_reopen(&information.committed, RESTORE_OLD); retain(4510 + (int)i);
+    }
+    const char *commit_faults[] = {"read_error", "", "record_error", "full", "slot_error", "slot_torn", "write_zero", "full", "write_short", "write_eintr"};
+    for (unsigned i = 0; i < 10; ++i) {
+        save("image", base, n); open_image(&h); OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r));
+        if (i == 1) sfs_image_clear_read_cache(h);
+        reset(commit_faults[i], i == 6 || i == 7 ? 2 : 1); if (i == 1) fail_allocation = allocation_calls + 1;
+        competing = i >= 3; enum sfs_status status = sfs_image_commit(h, &r);
+        if (i < 8) { assert(hit && status == (i == 1 ? SFS_NOMEM : i >= 4 ? SFS_OUTCOME_UNKNOWN : SFS_IO));
+            assert(!r.transaction_active && r.poisoned == (i != 1) && r.generation == information.committed.generation);
+            const enum sfs_phase phases[] = {SFS_PHASE_READ, SFS_PHASE_READ, SFS_PHASE_RECORDS, SFS_PHASE_RECORD_BARRIER,
+                                            SFS_PHASE_SLOT0, SFS_PHASE_SLOT0, SFS_PHASE_SLOT0, SFS_PHASE_COMMIT_BARRIER};
+            assert(r.phase == phases[i] && r.system_errno == (i == 1 ? ENOMEM : i == 5 ? ENOSPC : EIO));
+            assert(r.fence_attempted == (i < 3 ? 0u : i == 7 ? 3u : 1u) && r.fence_succeeded == (i < 4 ? 0u : 1u)); receipt("restore-commit-failure", &r); }
+        else assert(status == SFS_OK && r.fence_attempted == 3 && r.fence_succeeded == 3);
+        reset("", 0); close_image(h); restore_reopen(&information.committed, i >= 8 ? RESTORE_NEW : i == 7 ? RESTORE_UNCERTAIN : RESTORE_OLD); retain(4520 + (int)i);
+    }
+    for (unsigned modeled = 0; modeled < 2; ++modeled) for (unsigned point = 1; point <= 5; ++point) {
+        save("image", base, n); pid_t child = fork(); assert(child >= 0);
+        if (!child) {
+            open_image(&h); int fd = open("image", O_RDWR | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); capture(fd);
+            cut = 1; model = (int)modeled; cut_at = point == 5 ? 99 : (int)point;
+            OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r));
+            if (point == 5) { events = 0; cut_at = 1; stop_at(fd, NULL, 0, 0); }
+            sfs_image_commit(h, &r); _exit(92);
+        }
+        int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 91);
+        restore_reopen(&information.committed, point == 4 ? RESTORE_NEW : RESTORE_OLD); retain(4540 + (int)(modeled * 5 + point));
+    }
+    save("image", base, n); open_image(&h); OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &output, &r)); restore_competitor();
+    reset("close", 1); assert(sfs_image_close(h, &r) == SFS_IO && r.phase == SFS_PHASE_CLOSE && r.transaction_active); h = NULL;
+    restore_reopen(&information.committed, RESTORE_OLD); retain(4560); free(base);
+}
+
+static sfs_result catalog_expect(sfs_image *h, uint32_t index, sfs_view view, const void *name, size_t length) {
+    sfs_snapshot_entry entry, canary; memset(&entry, 0xa5, sizeof(entry)); memset(&canary, 0xa5, sizeof(canary));
+    sfs_result r; int found = 99;
+    uint64_t allocations_before = allocation_calls, reads_before = image_read_attempts;
+    uint64_t raw_before = raw_hash_input, metadata_before = metadata_hash_input;
+    uint64_t auxiliary_before = aux_read_bytes + aux_write_bytes, append_before = image_append_bytes;
+    unsigned created_before = aux_created; int writes_before = writes, fulls_before = fulls, syncs_before = syncs;
+    OK(sfs_image_snapshot_at(h, index, &entry, &found, &r));
+    assert(allocation_calls == allocations_before && image_read_attempts == reads_before);
+    assert(raw_hash_input == raw_before && metadata_hash_input == metadata_before);
+    assert(aux_read_bytes + aux_write_bytes == auxiliary_before && aux_created == created_before);
+    assert(image_append_bytes == append_before && writes == writes_before && fulls == fulls_before && syncs == syncs_before);
+    assert(r.phase == SFS_PHASE_NONE && !r.system_errno && r.coverage == SFS_COVERAGE_TOUCHED);
+    assert(!r.fence_attempted && !r.fence_succeeded && !r.poisoned);
+    if (!name) assert(!found && !memcmp(&entry, &canary, sizeof(entry)));
+    else {
+        assert(found == 1 && entry.view == view && entry.name_length == length && !memcmp(entry.name, name, length));
+        for (size_t i = length; i < SFS_NAME_MAX; ++i) assert(!entry.name[i]);
+        sfs_view resolved = UINT32_MAX; sfs_result lookup;
+        assert(sfs_image_snapshot_view(h, entry.name, entry.name_length, &resolved, &lookup) == SFS_OK && resolved == view);
+    }
+    return r;
+}
+static void snapshot_catalog(void) {
+    sfs_image *h; sfs_result r; sfs_view view; unsigned counts[] = {0, 1, 9, 10, 32};
+    for (unsigned test = 0; test < sizeof(counts) / sizeof(counts[0]); ++test) {
+        fixture f = indexed_fixture(1, 1, counts[test]); fixture_save(&f); reset("", 0); open_image(&h);
+        for (unsigned i = 0; i < counts[test]; ++i) {
+            char name[32]; int length = snprintf(name, sizeof(name), "snapshot-%u", i);
+            catalog_expect(h, i, i + 1, name, (size_t)length);
+        }
+        catalog_expect(h, counts[test], 0, NULL, 0); catalog_expect(h, 32, 0, NULL, 0); catalog_expect(h, UINT32_MAX, 0, NULL, 0);
+        if (counts[test] == 32) {
+            view = UINT32_MAX;
+            assert(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &view, &r) == SFS_LIMIT && view == UINT32_MAX);
+            OK(sfs_image_begin(h, &r)); assert(sfs_image_snapshot(h, "overflow", 8, &view, &r) == SFS_LIMIT && view == UINT32_MAX);
+            if (r.transaction_active) OK(sfs_image_abort(h, &r));
+            for (unsigned i = 0; i < 32; ++i) { char name[32]; int length = snprintf(name, sizeof(name), "snapshot-%u", i); catalog_expect(h, i, i + 1, name, (size_t)length); }
+        }
+        close_image(h); retain(5000 + (int)test);
+    }
+    /* Valid catalog keys can have gaps and need not be lexical name order. */
+    fixture f = indexed_fixture(1, 1, 2); unsigned char *root_record = record(f.p, f.p + 48, f.n);
+    unsigned char rows[2 * 328]; memcpy(rows, record(f.p, root_record + 120, f.n) + 640, sizeof(rows));
+    for (unsigned i = 0; i < 2; ++i) { unsigned char *row = rows + i * 328; put32(row, i ? 5 : 2); put32(row + 64, 1); memset(row + 68, 0, 260); row[68] = i ? 'a' : 'z'; }
+    fixture_node ns = {0}; memcpy(ns.ref, root_record + 64, 56); fixture_node catalog = tree(&f, 4, rows, 2); finish_fixture(&f, ns, catalog);
+    fixture_save(&f); reset("", 0); open_image(&h); catalog_expect(h, 0, 2, "z", 1); catalog_expect(h, 1, 5, "a", 1); catalog_expect(h, 2, 0, NULL, 0);
+    close_image(h); retain(5005);
+
+    reset("", 0); create(&h); catalog_expect(h, 0, 0, NULL, 0);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, "z", 1, &view, &r)); assert(view == 1); OK(sfs_image_commit(h, &r));
+    sfs_result committed = catalog_expect(h, 0, 1, "z", 1); unsigned char name[SFS_NAME_MAX]; memset(name, 0x80, sizeof(name)); name[SFS_NAME_MAX - 1] = 0xff;
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, name, sizeof(name), &view, &r)); assert(view == 2);
+    sfs_result pending = catalog_expect(h, 1, 0, NULL, 0);
+    assert(pending.transaction_active && pending.generation == committed.generation && pending.committed_end == committed.committed_end);
+    assert(pending.physical_end > pending.committed_end && !memcmp(pending.uuid, committed.uuid, 16) && !memcmp(pending.root_digest, committed.root_digest, 32));
+    view = UINT32_MAX; assert(sfs_image_snapshot_view(h, name, sizeof(name), &view, &r) == SFS_NOT_FOUND && view == UINT32_MAX);
+    OK(sfs_image_abort(h, &r)); r = catalog_expect(h, 1, 0, NULL, 0);
+    assert(!r.transaction_active && r.committed_end == committed.committed_end && r.physical_end == pending.physical_end);
+    OK(sfs_image_begin(h, &r)); OK(sfs_image_snapshot(h, name, sizeof(name), &view, &r)); assert(view == 2); OK(sfs_image_commit(h, &r));
+    r = catalog_expect(h, 1, 2, name, sizeof(name)); assert(r.generation == committed.generation + 1 && r.physical_end == r.committed_end);
+    sfs_snapshot_entry entry, canary; memset(&entry, 0xa5, sizeof(entry)); memset(&canary, 0xa5, sizeof(canary)); int found = 99;
+    assert(sfs_image_snapshot_at(NULL, 0, &entry, &found, &r) == SFS_INVALID && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+    reset("owner", 1); assert(sfs_image_snapshot_at(h, 0, NULL, &found, &r) == SFS_INVALID && found == 99 && !hit);
+    assert(sfs_image_snapshot_at(h, 0, &entry, NULL, &r) == SFS_INVALID && !hit && !memcmp(&entry, &canary, sizeof(entry))); reset("", 0);
+    assert(sfs_image_snapshot_at(h, 0, &entry, &found, NULL) == SFS_OK && found == 1);
+    memset(&entry, 0xa5, sizeof(entry)); found = 99;
+    assert(sfs_image_snapshot_at(h, UINT32_MAX, &entry, &found, NULL) == SFS_OK && !found && !memcmp(&entry, &canary, sizeof(entry)));
+    close_image(h); retain(5006);
+
+    sfs_inode a, b, newer; restore_seed(&h, 6, &a, &b, &newer);
+    OK(sfs_image_pin_configure(h, 4, UINT64_C(65536), &r)); sfs_pin pin;
+    OK(sfs_image_pin_reserve(h, &pin, &r)); catalog_expect(h, 0, 1, "target", 6); OK(sfs_image_pin_release(h, pin, &r));
+    OK(sfs_image_pin_acquire(h, a, &pin, &r)); OK(sfs_image_begin(h, &r)); OK(sfs_image_pin_write(h, pin, 0, "pending", 7, &r));
+    r = catalog_expect(h, 1, 2, "newer", 5); assert(r.transaction_active); OK(sfs_image_abort(h, &r)); OK(sfs_image_pin_release(h, pin, &r));
+    OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &view, &r)); assert(view == 3);
+    catalog_expect(h, 0, 1, "target", 6); catalog_expect(h, 1, 2, "newer", 5); catalog_expect(h, 2, 0, NULL, 0);
+    sfs_view missing = UINT32_MAX; assert(sfs_image_snapshot_view(h, "recovery", 8, &missing, &r) == SFS_NOT_FOUND && missing == UINT32_MAX);
+    OK(sfs_image_abort(h, &r)); catalog_expect(h, 2, 0, NULL, 0);
+    OK(sfs_image_prepare_restore(h, 1, "recovery", 8, &generous, &view, &r)); OK(sfs_image_commit(h, &r));
+    catalog_expect(h, 0, 1, "target", 6); catalog_expect(h, 1, 2, "newer", 5); catalog_expect(h, 2, 3, "recovery", 8); catalog_expect(h, 3, 0, NULL, 0);
+    expect(h, 0, a, "old-a"); expect(h, 1, a, "old-a"); expect(h, 2, a, "new-a"); expect(h, 3, a, "new-a"); close_image(h);
+    OK(sfs_image_open_readonly(root, "image", &h, &r)); catalog_expect(h, 2, 3, "recovery", 8); restore_competitor();
+    assert(sfs_image_begin(h, &r) == SFS_STATE); close_image(h);
+    sfs_recovery recovery; OK(sfs_image_inspect(root, "image", &h, &recovery, &generous, &r));
+    memset(&entry, 0xa5, sizeof(entry)); found = 99;
+    assert(sfs_image_snapshot_at(h, 0, &entry, &found, &r) == SFS_STATE && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+    unsigned selected = recovery.slots[0].status == SFS_OK && (recovery.slots[1].status != SFS_OK || recovery.slots[0].generation > recovery.slots[1].generation) ? 0 : 1;
+    OK(sfs_image_select(h, selected, &generous, &r)); catalog_expect(h, 2, 3, "recovery", 8);
+    reset("owner", 1); found = 99;
+    assert(sfs_image_snapshot_at(h, 0, &entry, &found, &r) == SFS_IO && r.phase == SFS_PHASE_IDENTITY && r.system_errno == EINVAL && !r.poisoned && hit);
+    assert(found == 99 && !memcmp(&entry, &canary, sizeof(entry))); reset("", 0); catalog_expect(h, 2, 3, "recovery", 8); close_image(h); retain(5007);
+
+    for (unsigned damage = 0; damage < 3; ++damage) {
+        f = indexed_fixture(1, 1, 1); fixture_save(&f); reset("", 0); open_image(&h); OK(sfs_image_begin(h, &r));
+        int owned_fd = image_open_fd;
+        if (damage == 1) { struct stat st; assert(fstat(image_open_fd, &st) == 0 && ftruncate(image_open_fd, st.st_size + CELL) == 0); }
+        else if (damage == 2) assert(close(image_open_fd) == 0);
+        memset(&entry, 0xa5, sizeof(entry)); found = 99; reset(damage ? "" : "owner", 1);
+        assert(sfs_image_snapshot_at(h, UINT32_MAX, &entry, &found, &r) == SFS_IO);
+        assert(r.phase == SFS_PHASE_IDENTITY && r.system_errno == (damage == 0 ? EINVAL : damage == 1 ? ESTALE : EBADF));
+        assert(r.poisoned && !r.transaction_active && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+        assert(sfs_image_snapshot_at(h, 0, &entry, &found, &r) == SFS_POISONED && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
+        reset("", 0);
+        if (damage == 2) {
+            assert(owned_fd >= 0 && expected_closed_fd == -1); expected_closed_fd = owned_fd;
+            assert(sfs_image_close(h, &r) == SFS_IO && r.phase == SFS_PHASE_CLOSE && r.system_errno == EBADF);
+            assert(expected_closed_fd == -1 && closes == 2); h = NULL;
+        } else close_image(h);
+        retain(5008 + (int)damage);
+    }
+}
+
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -4615,6 +5051,10 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"budgets")) budgets(); else if(!strcmp(argv[1],"capacity")) capacity();
     else if(!strcmp(argv[1],"metadata")) metadata(); else if(!strcmp(argv[1],"metadata-codec")) metadata_codec(); else if(!strcmp(argv[1],"metadata-atomic")) metadata_atomic();
     else if(!strcmp(argv[1],"metadata-information")) metadata_information();
+    else if(!strcmp(argv[1],"restore-basic")) restore_basic();
+    else if(!strcmp(argv[1],"restore-admission")) restore_admission();
+    else if(!strcmp(argv[1],"restore-faults")) restore_faults();
+    else if(!strcmp(argv[1],"snapshot-catalog")) snapshot_catalog();
 #ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
     else if(!strcmp(argv[1],"diagnostic-receipts")) diagnostic_receipts();
 #endif
@@ -4639,7 +5079,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strcmp(argv[1],"cache")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)) assert(!clock_calls);
+    if(strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("PASS %s\n",argv[1]); return 0;
 }

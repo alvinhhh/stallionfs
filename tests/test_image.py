@@ -364,6 +364,23 @@ class ImageCore(unittest.TestCase):
     def test_create_reopen_atomic_snapshot_ranges_and_iteration(self):
         self.scenario('basic')
 
+    def test_restore_committed_views_metadata_aliases_and_recovery(self):
+        self.scenario('restore-basic')
+
+    def test_restore_admission_root_checks_budgets_and_unvisited_corruption(self):
+        try:
+            self.compile('diagnostic', '-DSFS_IMAGE_DIAGNOSTIC_TESTING=1')
+            self.scenario('restore-admission', 'diagnostic')
+        except BaseException:
+            type(self).failed = True
+            raise
+
+    def test_restore_atomic_capacity_allocations_fences_and_process_cuts(self):
+        self.scenario('restore-faults')
+
+    def test_snapshot_catalog_checked_names_views_and_read_receipts(self):
+        self.scenario('snapshot-catalog')
+
     def test_live_inode_pins_detached_batches_replacement_and_faults(self):
         """Included by normal test_image unittest discovery; owns a fresh fixture."""
         try:

@@ -326,10 +326,36 @@ enum sfs_status sfs_image_resize(sfs_image *, sfs_inode, uint64_t size, sfs_resu
 /* Snapshot retains the last committed current namespace, even inside a tx. */
 enum sfs_status sfs_image_snapshot(sfs_image *, const void *name, size_t length,
                                  sfs_view *out, sfs_result *);
+/* Start a fresh transaction, retaining the same handle and inode lock. Refuses
+ * existing transactions/batches and all active pins unchanged. Stage a committed
+ * snapshot as current, plus the prior current under a unique recovery name;
+ * commit or abort explicitly. recovery_view is provisional until commit and is
+ * unchanged on failure; result always describes this invocation.
+ * Uses ordinary ROOT_ONLY checks, not unread payload certification. Positive
+ * verification budgets bound metadata reads/hashes/checks and cancellation;
+ * raw/auxiliary budget dimensions are unused. No auxiliary verifier is created.
+ * Failure discards only the fresh transaction owned by this call. */
+enum sfs_status sfs_image_prepare_restore(sfs_image *, sfs_view target_view,
+                                        const void *recovery_name, size_t length,
+                                        const sfs_verify_budget *, sfs_view *recovery_view,
+                                        sfs_result *);
 enum sfs_status sfs_image_commit(sfs_image *, sfs_result *);
 
 enum sfs_status sfs_image_snapshot_view(sfs_image *, const void *name, size_t length,
                                       sfs_view *out, sfs_result *);
+typedef struct {
+    sfs_view view;
+    size_t name_length;
+    uint8_t name[SFS_NAME_MAX];
+} sfs_snapshot_entry;
+/* Position in this handle's committed catalog, never a persistent snapshot ID.
+ * Copies exact component bytes without a terminator; unused name bytes are zero.
+ * Staged snapshots remain invisible. index >= count succeeds with found=0 and
+ * leaves out unchanged. Errors preserve out and found; both are required.
+ * The optional receipt describes the committed anchor, but physical_end can
+ * include staged or aborted appends. No payload validation or allocation occurs. */
+enum sfs_status sfs_image_snapshot_at(sfs_image *, uint32_t index,
+                                    sfs_snapshot_entry *out, int *found, sfs_result *);
 enum sfs_status sfs_image_lookup(sfs_image *, sfs_view, sfs_inode parent,
                                const void *name, size_t length, sfs_entry *, sfs_result *);
 enum sfs_status sfs_image_stat(sfs_image *, sfs_view, sfs_inode, sfs_entry *, sfs_result *);
