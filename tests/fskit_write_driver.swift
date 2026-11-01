@@ -498,7 +498,7 @@ func detachedTokenRoutes(_ parent: URL) throws {
     let refused: Error? = wait { v.removeItem(m.file, named: FSFileName(string: "file"), fromDirectory: m.root, replyHandler: $0) }
     let xattrRefused: Error? = wait { v.setXattr(named: FSFileName(string: "note"), to: Data(), on: m.file, policy: .alwaysSet, replyHandler: $0) }
 #endif
-    need(code(refused) == Int(EROFS) && code(xattrRefused) == Int(EROFS), "namespace and xattr setter stay refused in private mode")
+    need(code(refused) == Int(EROFS) && code(xattrRefused) == Int(EROFS), "contextless and pure refusal paths remain read-only")
     let no: Error? = wait { v.reclaimForTesting(m.file, eligible: false, replyHandler: $0) }; need(no == nil, "false reclaim replies nil")
     m.serial { need(v.ownsForTesting(m.file) && (m.file as! StallionItem).pin != nil, "false reclaim retains ownership") }
     let yes: Error? = wait { v.reclaimForTesting(m.file, eligible: true, replyHandler: $0) }; need(yes == nil, "controlled successful detached reclaim")
@@ -2850,12 +2850,282 @@ func symlinkQueued(_ parent: URL) throws {
 }
 #endif
 
+#if STALLION_CONTEXT_HANDLERS
+func setXattr(_ m: Mounted, name: FSFileName = FSFileName(string: "note"), value: Data?,
+              policy: FSVolume.SetXattrPolicy = .alwaysSet, item: FSItem? = nil,
+              caller: CallerIdentity? = nil) -> (FSSetXattrResult?, Error?) {
+    wait { done in m.volume.setXattrResultForTesting(name, value: value, item: item ?? m.file, policy: policy,
+        caller: caller ?? CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0,$1)) } }
+}
+func coreXattr(_ h: OpaquePointer, inode: UInt64, name: Data, view: sfs_view = 0, pin: sfs_pin? = nil) -> Data? {
+    var r = sfs_result(), size: UInt64 = 0
+    let status = name.withUnsafeBytes { bytes -> sfs_status in
+        if let pin { return sfs_image_pin_xattr_size(h,pin,bytes.baseAddress,bytes.count,&size,&r) }
+        return sfs_image_xattr_size(h,view,inode,bytes.baseAddress,bytes.count,&size,&r)
+    }
+    if status == SFS_NOT_FOUND { return nil }
+    need(status == SFS_OK && size <= UInt64(ReadOnlyLimits.xattrValue),"checked xattr size")
+    var data = Data(count:Int(size)), count = 0
+    let read = name.withUnsafeBytes { bytes in data.withUnsafeMutableBytes { output -> sfs_status in
+        if let pin { return sfs_image_pin_read_xattr(h,pin,bytes.baseAddress,bytes.count,0,output.baseAddress,output.count,&count,&r) }
+        return sfs_image_read_xattr(h,view,inode,bytes.baseAddress,bytes.count,0,output.baseAddress,output.count,&count,&r)
+    } }
+    need(read == SFS_OK && count == data.count,"exact complete binary xattr"); return data
+}
+func reopenedXattr(_ f: Fixture, name: Data = Data("note".utf8), view: sfs_view = 0) -> Data? {
+    fault(0,0); var h: OpaquePointer?, r = sfs_result()
+    need(sfs_image_open_readonly(f.url.path,"image.sfs",&h,&r) == SFS_OK,"xattr reopen")
+    let value = coreXattr(h!,inode:f.id,name:name,view:view)
+    need(sfs_image_close(h,&r) == SFS_OK,"xattr reopen close"); return value
+}
+func xattrMetadataUnchanged(_ before: sfs_metadata_entry, _ after: sfs_metadata_entry) {
+    need(before.entry.inode == after.entry.inode && before.entry.parent == after.entry.parent &&
+         before.entry.kind == after.entry.kind && before.entry.size == after.entry.size &&
+         before.entry.name_length == after.entry.name_length && sameBytes(before.entry.name,after.entry.name) &&
+         before.mode == after.mode && before.uid == after.uid && before.gid == after.gid && before.flags == after.flags &&
+         before.link_count == after.link_count && before.referenced_data_bytes == after.referenced_data_bytes,
+         "xattr preserves identity, data allocation, link count and permissions")
+    for (a,b) in [(before.birth,after.birth),(before.access,after.access),(before.modification,after.modification)] {
+        need(a.seconds == b.seconds && a.nanoseconds == b.nanoseconds,"xattr preserves other times")
+    }
+}
+func contextualXattrValues(_ parent: URL) throws {
+    let f = try Fixture(parent,"xattr-values"), m = try Mounted(f), v = m.volume
+    var oldView: sfs_view = 0
+    m.serial { try! v.diagnosticMutationForTesting { h,r in
+        need(sfs_image_snapshot(h,"before-xattr",12,&oldView,&r) == SFS_OK,"committed xattr snapshot")
+    } }
+    let before = namespaceMetadata(m,m.file), binary = Data([0,255,1,0,128])
+    let result = setXattr(m,value:binary,policy:.mustReplace)
+    need(result.0 != nil && result.1 == nil,"real set-xattr result")
+    let after = namespaceMetadata(m,m.alias); xattrMetadataUnchanged(before,after)
+    need(after.change.seconds != before.change.seconds || after.change.nanoseconds != before.change.nanoseconds,"xattr updates ctime")
+    m.serial {
+        need(coreXattr(m.coreHandle,inode:f.id,name:Data("note".utf8)) == binary,"hardlink alias xattr")
+        need(coreXattr(m.coreHandle,inode:f.id,name:Data("note".utf8),view:oldView) == Data("value".utf8),"snapshot retains previous xattr")
+        try! v.linkAccessForTesting(m.file,access:[.writeXattr,.readAttributes],caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())))
+        let refused: [FSVolume.AccessMask] = [[.writeXattr,.delete],[.writeXattr,.writeSecurity]]
+        for mask in refused {
+            do { try v.linkAccessForTesting(m.file,access:mask,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))); need(false,"xattr granted unrelated access") }
+            catch { need(code(error) == Int(EACCES),"mixed xattr mask delegates unrelated bits") }
+        }
+    }
+    let absent = FSFileName(string:"org.example.binary"), anchor = v.anchor, commits = v.diagnosticSnapshot().0.commits
+    for policy in [FSVolume.SetXattrPolicy.mustReplace,.delete] {
+        need(code(setXattr(m,name:absent,value:policy == .delete ? nil : binary,policy:policy).1) == Int(ENOATTR),"missing attribute policy")
+    }
+    need(code(setXattr(m,value:binary,policy:.mustCreate).1) == Int(EEXIST),"create existing attribute")
+    for policy in [FSVolume.SetXattrPolicy.alwaysSet,.mustCreate,.mustReplace] {
+        need(code(setXattr(m,name:absent,value:nil,policy:policy).1) == Int(EINVAL),"nil is not an empty set")
+    }
+    need(anchorMatches(v.anchor,anchor) && v.diagnosticSnapshot().0.commits == commits && v.diagnosticSnapshot().2 == nil,"policy failures neither commit nor poison delivery")
+    let unchanged = namespaceMetadata(m,m.file)
+    need(unchanged.change.seconds == after.change.seconds && unchanged.change.nanoseconds == after.change.nanoseconds,"policy failure preserves ctime")
+    need(setXattr(m,name:absent,value:Data(),policy:.mustCreate).1 == nil,"empty attribute creates")
+    m.serial { need(coreXattr(m.coreHandle,inode:f.id,name:absent.data) == Data(),"empty attribute remains present") }
+    need(setXattr(m,name:absent,value:binary,policy:.mustReplace).1 == nil,"replace empty attribute")
+    need(setXattr(m,name:absent,value:Data([9]),policy:.delete).1 == nil,"delete ignores supplied value")
+    need(setXattr(m,value:nil,policy:.delete).1 == nil,"nil delete")
+    need(setXattr(m,value:binary,policy:.mustCreate).1 == nil,"create after delete")
+    let names: [Data] = [Data("com.apple.FinderInfo".utf8),Data("com.apple.quarantine".utf8),Data("com.apple.ResourceFork".utf8),
+        Data("org.example/value".utf8),Data(".".utf8),Data("..".utf8),Data([0xc3,0xa9]),Data([0x65,0xcc,0x81]),Data([0xff]),Data(repeating:120,count:255)]
+    var delivered: [(Data,Data)] = []
+    for raw in names {
+        try writableXattrName(raw)
+        let name = FSFileName(data:raw), value = name.data == Data("com.apple.FinderInfo".utf8) ? Data(repeating:7,count:32) : binary
+        need(setXattr(m,name:name,value:value).1 == nil,"ordinary delivered opaque name accepted")
+        delivered.append((name.data,value))
+        m.serial { need(coreXattr(m.coreHandle,inode:f.id,name:name.data) == value,"delivered name bytes roundtrip") }
+    }
+    let truncated = FSFileName(data:Data([97,0,98]))
+    need(truncated.data == Data([97]) && setXattr(m,name:truncated,value:binary).1 == nil,"callback receives constructor's NUL prefix only")
+    for (bytes,expected) in [(Data(),EINVAL),(Data([97,0,98]),EINVAL),(Data(repeating:97,count:256),ENAMETOOLONG)] {
+        do { try writableXattrName(bytes); need(false,"raw invalid name accepted") }
+        catch { need(code(error) == Int(expected),"raw-name validator independently rejects") }
+    }
+    let large = FSFileName(string:"large"), limit = Data(repeating:0xa5,count:ReadOnlyLimits.xattrValue)
+    need(setXattr(m,name:large,value:limit).1 == nil,"one MiB boundary accepted")
+    let largeAnchor = v.anchor
+    need(code(setXattr(m,name:large,value:Data(count:ReadOnlyLimits.xattrValue+1)).1) == Int(E2BIG) &&
+         code(setXattr(m,name:large,value:Data(count:ReadOnlyLimits.xattrValue+1),policy:.delete).1) == Int(E2BIG) && anchorMatches(largeAnchor,v.anchor),"set and ignored delete data stay bounded")
+    m.close()
+    need(reopenedXattr(f) == binary && reopenedXattr(f,view:oldView) == Data("value".utf8),"reopened current and historical values")
+    for (name,value) in delivered { need(reopenedXattr(f,name:name) == value,"reopened ordinary xattr bytes") }
+    need(reopenedXattr(f,name:large.data) == limit && reopenedXattr(f,name:absent.data) == nil && f.contents() == Data("original".utf8),"reopened value limit, deletion and unchanged file bytes")
+}
+func contextualXattrRefusals(_ parent: URL) throws {
+    for index in 0..<5 {
+        let f = try Fixture(parent,"xattr-policy-\(index)",mode:index == 0 ? 0o400 : index == 1 ? 0o1600 : 0o600,
+            acl:index == 2,owner:index == 3 ? geteuid()+1 : geteuid(),sourceFlags:index == 4 ? 1 : 0)
+        let m = try Mounted(f), v = m.volume, anchor = v.anchor
+        let expected = [EACCES,EACCES,ENOTSUP,EACCES,ENOTSUP][index]
+        need(code(setXattr(m,value:Data([1])).1) == Int(expected),"xattr mode/ACL/owner/flags refusal")
+        m.serial { do { try v.linkAccessForTesting(m.file,access:.writeXattr,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))); need(false,"access check bypassed xattr policy") }
+            catch { need(code(error) == Int(expected),"access and setter share xattr policy") } }
+        need(anchorMatches(v.anchor,anchor) && v.diagnosticSnapshot().0.commits == 0,"refused xattr unchanged")
+        m.close(); need(reopenedXattr(f) == Data("value".utf8),"refused xattr persists original")
+    }
+    let f = try Fixture(parent,"xattr-refusals",directory:true), m = try Mounted(f), v = m.volume, anchor = v.anchor
+    for name in ["com.apple.system.Security","com.apple.system.anything","com.apple.acl.text","com.apple.decmpfs","com.apple.macl","com.apple.provenance"] {
+        need(code(setXattr(m,name:FSFileName(string:name),value:Data()).1) == Int(ENOTSUP),"unsupported policy metadata refused")
+    }
+    for caller in [CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())),CallerIdentity(uid:-1,gid:Int(getegid())),CallerIdentity(uid:Int(geteuid()),gid:-1)] {
+        need(code(setXattr(m,value:Data(),caller:caller).1) == Int(EACCES),"foreign/unrepresentable xattr caller")
+    }
+    if geteuid() != 0 { need(code(setXattr(m,value:Data(),caller:CallerIdentity(uid:0,gid:0)).1) == Int(EACCES),"root has no xattr owner bypass") }
+    let directory = namespaceLookup(m,"dir")
+    for item in [m.root,m.link,directory] { need(code(setXattr(m,value:Data(),item:item).1) == Int(ENOTSUP),"nonregular xattr target refused") }
+    need(code(setXattr(m,value:Data(),item:StallionItem(f.id)).1) == Int(EINVAL),"foreign canonical item refused")
+    m.serial { var r = sfs_result(); need(sfs_image_begin(m.coreHandle,&r) == SFS_OK,"active transaction refusal setup") }
+    need(code(setXattr(m,value:Data()).1) == Int(EBUSY),"xattr cannot enter an existing transaction")
+    m.serial { var r = sfs_result(); need(sfs_image_abort(m.coreHandle,&r) == SFS_OK,"original transaction remains caller-owned") }
+    need(anchorMatches(v.anchor,anchor) && v.diagnosticSnapshot().0.commits == 0,"preflight refusals never mutate")
+    let released: Error? = wait { v.reclaimForTesting(m.file,eligible:true,replyHandler:$0) }
+    need(released == nil && code(setXattr(m,value:Data()).1) == Int(EINVAL),"reclaimed target refused")
+    let directoryReleased: Error? = wait { v.reclaimForTesting(directory,eligible:true,replyHandler:$0) }
+    need(directoryReleased == nil,"release retained xattr refusal directory")
+    m.close(); need(reopenedXattr(f) == Data("value".utf8),"all refusals preserve original")
+    let roFixture = try Fixture(parent,"xattr-readonly"), ro = try Mounted(roFixture,writable:false)
+    need(code(setXattr(ro,value:Data()).1) == Int(EROFS),"unbound readonly contextual setter refused"); ro.close()
+    let detachedFixture = try Fixture(parent,"xattr-detached"), detached = try Mounted(detachedFixture)
+    detached.serial { try! detached.volume.diagnosticMutationForTesting { h,r in
+        need(sfs_image_unlink_expected(h,1,"file",4,detachedFixture.id,&r) == SFS_OK &&
+             sfs_image_unlink_expected(h,1,"alias",5,detachedFixture.id,&r) == SFS_OK,"controlled core detach; no contextual final unlink")
+    } }
+    need(setXattr(detached,value:Data([0,255]),policy:.mustReplace).1 == nil,"detached pin xattr mutation")
+    detached.serial {
+        need(coreXattr(detached.coreHandle,inode:detachedFixture.id,name:Data("note".utf8),pin:(detached.file as! StallionItem).pin!) == Data([0,255]),"detached value isolated")
+        var r = sfs_result(), e = sfs_entry()
+        need(sfs_image_lookup(detached.coreHandle,0,1,"file",4,&e,&r) == SFS_NOT_FOUND &&
+             sfs_image_lookup(detached.coreHandle,0,1,"alias",5,&e,&r) == SFS_NOT_FOUND,"xattr does not resurrect names")
+    }
+    need(setXattr(detached,value:nil,policy:.delete).1 == nil,"detached xattr delete"); detached.close()
+}
+func contextualXattrFailures(_ parent: URL) throws {
+    for mode in 0..<8 {
+        let f = try Fixture(parent,"xattr-failure-\(mode)"), m = try Mounted(f), v = m.volume, anchor = v.anchor
+        m.serial {
+            if mode == 0 { v.rejectResultForTesting = { $0 == "FSSetXattrResult" } }
+            if mode == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if mode == 2 { v.diagnosticBeforePrepare = { sfs_image_clear_read_cache(m.coreHandle); fault(8,1) } }
+        }
+        if mode == 3 { fault(7,1) }
+        if mode == 4 { fault(1,1) }
+        if mode == 5 || mode == 6 { fault(4,Int32(mode-4)) }
+        if mode == 7 { fault(6,1) }
+        let result = setXattr(m,value:Data([8,0,255]))
+        let expected = mode == 0 || mode == 2 ? EIO : mode == 1 ? EACCES : mode == 3 ? ENOMEM : mode == 7 ? ENXIO : ENOSPC
+        need(result.0 == nil && code(result.1) == Int(expected) && anchorMatches(v.anchor,anchor),"xattr failure never acknowledges a result")
+        if mode >= 2 { need(hits() > 0,"real core fault reached") }
+        if mode == 5 || mode == 6 {
+            let failure = v.diagnosticSnapshot().2!
+            need(failure.result.status == (mode == 5 ? SFS_IO : SFS_OUTCOME_UNKNOWN) &&
+                 failure.result.phase == (mode == 5 ? SFS_PHASE_RECORD_BARRIER : SFS_PHASE_COMMIT_BARRIER) &&
+                 failure.result.poisoned != 0,"original xattr fence receipt retained")
+            fault(0,0); need(code(setXattr(m,value:Data()).1) == Int(ENOSPC),"xattr fence failure stays sticky")
+        }
+        if mode == 0 {
+            m.serial { var r = sfs_result(), info = sfs_image_information()
+                need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.transaction_active == 0 && anchorMatches(r,anchor),"result failure verified abort") }
+            need(code(m.sync()) == Int(EIO),"xattr constructor failure survives sync")
+        }
+        fault(0,0); m.close()
+        let persisted = reopenedXattr(f)
+        if mode != 6 { need(persisted == Data("value".utf8),"failed xattr leaves acknowledged value") }
+        else { need(persisted == Data("value".utf8) || persisted == Data([8,0,255]),"unknown xattr publication is one complete state") }
+        need(f.contents() == Data("original".utf8),"xattr fault never changes file data")
+    }
+    let f = try Fixture(parent,"xattr-capacity",capacity:128*1024), m = try Mounted(f), anchor = m.volume.anchor
+    let result = setXattr(m,value:Data(count:ReadOnlyLimits.xattrValue))
+    need(result.0 == nil && code(result.1) == Int(ENOSPC) && anchorMatches(m.volume.anchor,anchor),"real xattr append capacity refuses atomically")
+    let failure = m.volume.diagnosticSnapshot().2!
+    need(failure.result.status == SFS_LIMIT && failure.result.limit_reason == SFS_LIMIT_APPEND_CAPACITY,"capacity receipt preserves limit reason")
+    m.close(); need(reopenedXattr(f) == Data("value".utf8),"capacity failure preserves original xattr")
+}
+func contextualXattrQueue(_ parent: URL) throws {
+    let f = try Fixture(parent,"xattr-queue"), m = try Mounted(f), v = m.volume
+    let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), replies = DispatchGroup()
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), name = FSFileName(string:"race"), data = Data([0,255])
+    var outcomes: [Int] = []
+    v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release xattr policy race") }
+    need(held.wait(timeout:.now()+20) == .success,"hold xattr queue")
+    for _ in 0..<2 {
+        replies.enter(); v.setXattrResultForTesting(name,value:data,item:m.file,policy:.mustCreate,caller:caller) { result,error in
+            need((result != nil) == (error == nil),"xattr result and error exclusive"); outcomes.append(code(error)); replies.leave()
+        }
+    }
+    let deletedName = FSFileName(string:"note")
+    replies.enter(); v.setXattrResultForTesting(deletedName,value:data,item:m.file,policy:.delete,caller:caller) { result,error in
+        need(result != nil && error == nil,"queued delete ignores retained value"); replies.leave()
+    }
+    let charged = v.linkBudgetForTesting
+    need(charged.0 == 3 && charged.1 == 2*(ReadOnlyLimits.callbackOverhead+name.data.count+data.count) +
+         ReadOnlyLimits.callbackOverhead+deletedName.data.count+data.count,"queued xattrs charge name and value, including ignored delete bytes")
+    release.signal(); need(replies.wait(timeout:.now()+20) == .success,"both xattr policies finish")
+    m.serial {}
+    need(outcomes == [0,Int(EEXIST)] && v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"serialized create-only policy and ticket release")
+    m.close(); need(reopenedXattr(f,name:name.data) == data && reopenedXattr(f) == nil,"policy-race winner and deletion persist")
+    let failedFixture = try Fixture(parent,"xattr-queued-failure"), failed = try Mounted(failedFixture), fv = failed.volume, anchor = fv.anchor
+    let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), done = DispatchGroup()
+    fv.enqueue { fv.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }; entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"release failing xattr queue") }
+    need(entered.wait(timeout:.now()+20) == .success,"hold failing xattr queue")
+    for index in 0..<2 {
+        done.enter(); fv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:failed.file,policy:.alwaysSet,caller:caller) { result,error in
+            need(result == nil && code(error) == Int(ENOMEM),"queued xattr returns first failure")
+            if index == 0 { fv.diagnosticBeforePrepare = nil }; done.leave()
+        }
+    }
+    resume.signal(); need(done.wait(timeout:.now()+20) == .success,"drain failing xattr queue")
+    need(anchorMatches(fv.anchor,anchor) && fv.diagnosticSnapshot().0.commits == 0 && code(failed.sync()) == Int(ENOMEM),"no later xattr commit after delivery failure")
+    failed.serial {}
+    need(fv.linkBudgetForTesting.0 == 0 && fv.linkBudgetForTesting.1 == 0,"failed xattr tickets returned")
+    failed.close(); need(reopenedXattr(failedFixture) == Data("value".utf8),"queued failure preserves reopened xattr")
+    let budgetFixture = try Fixture(parent,"xattr-admission"), budgetMount = try Mounted(budgetFixture), bv = budgetMount.volume
+    let blocked = DispatchSemaphore(value:0), unblock = DispatchSemaphore(value:0), drained = DispatchGroup()
+    bv.enqueue { blocked.signal(); need(unblock.wait(timeout:.now()+20) == .success,"release saturated xattr queue") }
+    need(blocked.wait(timeout:.now()+20) == .success,"hold saturated xattr queue")
+    for _ in 0..<ReadOnlyLimits.callbacks {
+        drained.enter(); bv.enqueue(rejected:{ _ in need(false,"fill xattr callback budget") }) { drained.leave() }
+    }
+    let full = bv.linkBudgetForTesting
+    need(code(setXattr(budgetMount,value:data).1) == Int(EAGAIN) && bv.linkBudgetForTesting.0 == full.0 &&
+         bv.linkBudgetForTesting.1 == full.1,"xattr saturation rejects without consuming a ticket")
+    unblock.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain saturated xattr queue")
+    let cutoff = DispatchSemaphore(value:0), continueCutoff = DispatchSemaphore(value:0), completed = DispatchGroup()
+    bv.enqueue { cutoff.signal(); need(continueCutoff.wait(timeout:.now()+20) == .success,"release xattr unmount cutoff") }
+    need(cutoff.wait(timeout:.now()+20) == .success,"hold xattr before unmount")
+    completed.enter(); bv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:budgetMount.file,policy:.alwaysSet,caller:caller) { result,error in
+        need(result != nil && error == nil,"precutoff xattr commits"); completed.leave()
+    }
+    completed.enter(); bv.unmount { completed.leave() }
+    need(code(setXattr(budgetMount,value:data,policy:.delete).1) == Int(EAGAIN),"postcutoff xattr immediately refused")
+    continueCutoff.signal(); need(completed.wait(timeout:.now()+20) == .success,"xattr and ordered unmount complete")
+    need(code(setXattr(budgetMount,value:data).1) == Int(ENXIO) && bv.linkBudgetForTesting.0 == 0 &&
+         bv.linkBudgetForTesting.1 == 0,"unmounted xattr refuses and releases all tickets")
+    budgetMount.close(); need(reopenedXattr(budgetFixture) == data,"only precutoff xattr persists")
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
+#if STALLION_CONTEXT_HANDLERS
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-unhooked" {
+            try contextualXattrValues(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
+            print("PASS contextual xattr policies, binary values and persistence with unhooked core")
+            return
+        }
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-focused" {
+            let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
+            try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
+            print("PASS contextual xattr policies, authorization, failure atomicity and queued admission")
+            return
+        }
+#endif
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
         try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent)
+        try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent)

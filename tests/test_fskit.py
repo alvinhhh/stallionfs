@@ -140,6 +140,7 @@ class FSKitInterfaces(unittest.TestCase):
                          'removecommitreceiptfortesting', 'removeresultfortesting',
                          'renameitemhandler', 'renamepreflightfortesting', 'renameresultfortesting',
                          'createinput', 'createentryhandler', 'createsymlinkhandler', 'symlinkresultfortesting',
+                         'checkxattrownerpolicy', 'writablexattrname', 'setxattrhandler', 'setxattrresultfortesting',
                          'sqlite')
             for variant in ('legacy', 'context'):
                 directory = self.base / variant
@@ -171,6 +172,20 @@ class FSKitInterfaces(unittest.TestCase):
                 symbols = self.command(variant + '-normal-symbols', [self.tools['nm'], extension], 90)
                 self.assertIn(' U _NSExtensionMain', symbols.stdout)
                 self.assertFalse(any(word in symbols.stdout.lower() for word in forbidden))
+            unhooked = self.base / 'context-xattr-unhooked'
+            unhooked.mkdir(mode=0o700)
+            unhooked_images = unhooked / 'images'
+            unhooked_images.mkdir(mode=0o700)
+            unhooked_executable = unhooked / 'write-check'
+            self.command('context-xattr-unhooked-build', [
+                self.tools['swiftc'], '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_ADAPTER_CHECK',
+                '-D', 'STALLION_WRITE_DIAGNOSTIC', '-swift-version', '6', '-strict-concurrency=complete',
+                '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit', '-g', '-Onone', '-parse-as-library',
+                '-module-cache-path', unhooked / 'cache', *sources, tests / 'fskit_write_driver.swift',
+                normal, hooks, '-o', unhooked_executable], 180, swift='context')
+            child = self.command('context-xattr-unhooked-run', [unhooked_executable, '--xattr-unhooked', unhooked_images], 180)
+            self.assertEqual(child.stdout, 'PASS contextual xattr policies, binary values and persistence with unhooked core\n')
+            self.assertEqual(child.stderr, '')
             cls.failed = False
         except BaseException as error:
             capture._latch_command('fskit_interfaces', repr(error))

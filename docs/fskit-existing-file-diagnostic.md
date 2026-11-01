@@ -6,12 +6,34 @@ The default FSKit build remains read-only. The additional
 image UUID before loading a writable path resource. Without that binding it
 also remains read-only. It does not provide an installed writable launch path.
 
-Only existing regular files can be written or resized. All namespace changes,
-xattr changes and other supported metadata setters remain refused. Files must
+Only existing regular files can be written or resized. Files must
 belong to the image owner and permit owner writes; setuid/setgid files and files
 with a native security-descriptor xattr are refused. This is not complete
 POSIX/ACL authorization. The legacy write callback has no caller context;
 installed access routing is unqualified.
+
+With `STALLION_CONTEXT_HANDLERS`, the private diagnostic also permits setting
+and deleting regular-file xattrs through the caller-aware handler. The caller
+and file must be the volume owner, owner-write permission must be present, and
+flags and special mode bits must be zero. Access checks use the same policy.
+Existing security-descriptor targets remain refused. General opaque names are
+preserved; `com.apple.system.*`, `com.apple.acl.text`, `com.apple.decmpfs`,
+`com.apple.macl` and `com.apple.provenance` remain unsupported because this
+adapter supplies no corresponding security, ACL or compression semantics.
+Ordinary vendor, FinderInfo, quarantine and resource-fork bytes are retained;
+this does not establish Gatekeeper, MAC or mounted stream behavior.
+
+The four set policies distinguish absent values from zero-length attributes.
+Create-only fails EEXIST if present; replace/delete fail ENOATTR if absent.
+Nondelete policies require nonnil data. Delete permits nil and ignores bounded
+supplied data. Name plus value bytes are charged before submission, including
+ignored delete data. Values are limited to1MiB. The core/adapter name limit is
+255 delivered bytes with no NUL; slash and dot names are not path components.
+FSFileName construction terminates at NUL, so validation sees only delivered
+bytes. Darwin's public syscall header has a separate127-byte name bound;
+direct tests do not establish mounted delivery of longer or arbitrary names.
+One serialized committed-state check precedes one existing durable transaction;
+result construction precedes commit. Contextless xattr setters remain read-only.
 
 A delivered write streams borrowed bytes in at most64KiB core calls within one
 transaction. One successful commit executes both existing full-storage fences
