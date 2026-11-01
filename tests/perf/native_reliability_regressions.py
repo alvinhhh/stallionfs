@@ -1,7 +1,16 @@
 """Focused false-positive regressions for the closed-image campaign oracle."""
 import copy
 import errno
+import json
+from pathlib import Path
+import signal
+import subprocess
+import tempfile
+import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
+import native_reliability as runner
 from native_reliability import Campaign, detection_observed, expected, fault_expectation, sha
 
 
@@ -162,6 +171,201 @@ class OracleRegressions(unittest.TestCase):
         self.assertEqual(self.classify(row),"integrity_refusal")
         self.assertTrue(detection_observed(dict(mutation=dict(changed=True),
             outcome="integrity_refusal",observation=row),"current/file"))
+
+
+class SupervisionRegressions(unittest.TestCase):
+    """Mock every process, signal and pipe; only disposable receipt files exist."""
+
+    def invoke_mock(self, result=0, expired=False, existing_group=False, signal_error=None,
+                    wait_error=None, event=None, already_reaped=False, close_error=False, selector_error=None,
+                    log_close_error=None):
+        trace = []
+        child = mock.Mock(pid=43210, returncode=0 if already_reaped else None)
+        child.poll.side_effect = lambda: trace.append('poll') or child.returncode
+
+        def wait(**kwargs):
+            trace.append('wait')
+            if wait_error:
+                raise wait_error
+            child.returncode = result
+            return result
+
+        child.wait.side_effect = wait
+        if close_error:
+            child.stdout.close.side_effect = RuntimeError('mock stream close failure')
+        selector = mock.Mock()
+        selector.get_map.side_effect = ([{1: 1}, {}] if event else None)
+        selector.get_map.return_value = {1: 1} if expired else {}
+        selector.select.return_value = [(SimpleNamespace(fileobj=child.stdout, fd=42), 1)]
+        item = dict(event='ack', status=0, generation=4, fence_attempted=3,
+                    fence_succeeded=3, poisoned=0, transaction_active=0)
+        clock = iter([1, 101, 101]) if expired else None
+
+        def monotonic():
+            return next(clock, 101) if clock else 1
+
+        def killpg(pid, number):
+            self.assertEqual(pid, child.pid)
+            trace.append('kill' if number else 'probe')
+            if number:
+                self.assertEqual(number, signal.SIGKILL)
+                if signal_error:
+                    raise signal_error
+            elif not existing_group:
+                raise ProcessLookupError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            campaign = Campaign.__new__(Campaign)
+            campaign.output = campaign.scratch = Path(directory)
+            campaign.deadline, campaign.groups, campaign.report = 100, set(), {}
+            campaign.bounds = mock.Mock()
+            caught, returned = None, None
+            original_open = Path.open
+
+            def open_receipt(path, *args, **kwargs):
+                stream = original_open(path, *args, **kwargs)
+                if path.name.endswith('.stderr.log') and log_close_error is not None:
+                    wrapped = mock.Mock(wraps=stream)
+
+                    def fail_close():
+                        stream.close()
+                        raise log_close_error
+
+                    wrapped.close.side_effect = fail_close
+                    return wrapped
+                return stream
+
+            with mock.patch.object(runner.subprocess, 'Popen', return_value=child), \
+                    mock.patch.object(runner.selectors, 'DefaultSelector', return_value=selector, side_effect=selector_error), \
+                    mock.patch.object(runner.os, 'read', return_value=json.dumps(item).encode() + b'\n'), \
+                    mock.patch.object(runner.os, 'killpg', side_effect=killpg) as signals, \
+                    mock.patch.object(runner.os, 'fsync', side_effect=lambda fd: trace.append('ledger_fsync')), \
+                    mock.patch.object(Path, 'open', new=open_receipt), \
+                    mock.patch.object(runner.time, 'monotonic', side_effect=monotonic):
+                try:
+                    returned = campaign.invoke(['mock-command'], 'mock', 100, event=event,
+                                               manifest=expected(1) if event else None, ack_generation=4)
+                except BaseException as error:
+                    caught = error
+            receipt = json.loads((Path(directory) / 'mock.json').read_text())
+            calls = [call.args for call in signals.call_args_list]
+            return returned, caught, receipt, campaign.report, calls, trace
+
+    def test_reaped_leader_with_existing_or_reused_group_is_never_killed(self):
+        _, error, receipt, report, calls, _ = self.invoke_mock(result=7, existing_group=True)
+        self.assertIn('owned child failed', str(error))
+        self.assertTrue(all(number == 0 for _, number in calls))
+        self.assertEqual(receipt['signal_requests'][0]['outcome'], 'skip_already_reaped')
+        self.assertFalse(receipt['signal_requests'][0]['attempted'])
+        self.assertFalse(receipt['process_group_exit_verified'])
+        self.assertTrue(report['completion_uncertain'])
+
+    def test_owned_timeout_records_guarded_signal_and_reap(self):
+        _, error, receipt, report, calls, trace = self.invoke_mock(result=-signal.SIGKILL, expired=True)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertTrue(receipt['timed_out'])
+        self.assertEqual(receipt['signal_requests'][0]['outcome'], 'signal_sent')
+        self.assertTrue(receipt['signal_requests'][0]['attempted'])
+        self.assertEqual(receipt['cleanup_wait']['outcome'], 'reaped')
+        self.assertTrue(receipt['process_group_exit_verified'])
+        self.assertNotIn('completion_uncertain', report)
+        self.assertLess(trace.index('poll'), trace.index('kill'))
+        self.assertLess(trace.index('kill'), trace.index('wait'))
+        self.assertEqual(sum(number != 0 for _, number in calls), 1)
+
+    def test_ack_is_logged_then_guarded_before_kill_and_wait(self):
+        result, error, receipt, _, _, trace = self.invoke_mock(result=-signal.SIGKILL, event='ack')
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        self.assertEqual(receipt['signal_requests'][0]['reason'], 'requested_ack')
+        self.assertLess(trace.index('ledger_fsync'), trace.index('poll'))
+        self.assertLess(trace.index('poll'), trace.index('kill'))
+        self.assertLess(trace.index('kill'), trace.index('wait'))
+
+    def test_ack_from_already_reaped_producer_cannot_authorize_kill(self):
+        _, error, receipt, _, calls, _ = self.invoke_mock(event='ack', already_reaped=True)
+        self.assertIn('not safely signalled', str(error))
+        self.assertTrue(all(number == 0 for _, number in calls))
+        self.assertTrue(all(request['outcome'] == 'skip_already_reaped' for request in receipt['signal_requests']))
+
+    def test_signal_and_wait_errors_retain_original_timeout(self):
+        timeout = subprocess.TimeoutExpired('mock-command', 1)
+        _, error, receipt, report, _, _ = self.invoke_mock(expired=True, existing_group=True,
+            signal_error=PermissionError(errno.EPERM, 'mock denied'), wait_error=timeout)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(str(error), 'owned child deadline')
+        self.assertEqual(receipt['signal_requests'][0]['outcome'], 'signal_error')
+        self.assertEqual(receipt['cleanup_wait']['outcome'], 'wait_error')
+        self.assertTrue(report['completion_uncertain'])
+        self.assertFalse(receipt['process_group_exit_verified'])
+
+    def test_cleanup_close_error_does_not_mask_original_command_error(self):
+        _, error, receipt, report, calls, _ = self.invoke_mock(result=7, close_error=True)
+        self.assertIn('owned child failed', str(error))
+        self.assertEqual(receipt['cleanup_errors'][0]['stage'], 'stdout')
+        self.assertTrue(report['completion_uncertain'])
+        self.assertTrue(all(number == 0 for _, number in calls))
+
+    def test_outer_buffered_log_close_preserves_original_timeout_and_records_failure(self):
+        _, error, receipt, report, _, _ = self.invoke_mock(result=-signal.SIGKILL, expired=True,
+            log_close_error=OSError('mock buffered log close failure'))
+        self.assertIs(type(error), TimeoutError)
+        self.assertEqual(str(error), 'owned child deadline')
+        self.assertEqual(receipt['supervision_error'], 'TimeoutError: owned child deadline')
+        self.assertEqual(receipt['cleanup_errors'][0]['stage'], 'stderr_log_close')
+        self.assertTrue(report['completion_uncertain'])
+        self.assertFalse(receipt['process_group_exit_verified'])
+        self.assertTrue(any('Buffered stderr log' in note for note in error.__notes__))
+
+    def test_poll_error_never_authorizes_destructive_signal(self):
+        child = mock.Mock(pid=43210)
+        child.poll.side_effect = OSError('mock poll error')
+        receipt = {}
+        with mock.patch.object(runner.os, 'killpg') as signals:
+            self.assertFalse(runner.request_group_kill(child, receipt, 'mock'))
+            signals.assert_not_called()
+        self.assertEqual(receipt['signal_requests'][0]['outcome'], 'skip_poll_error')
+        self.assertTrue(receipt['completion_uncertain'])
+
+    def test_group_probe_error_after_reap_is_read_only_and_uncertain(self):
+        child = mock.Mock(pid=43210, returncode=0)
+        receipt = {}
+        with mock.patch.object(runner.os, 'killpg', side_effect=PermissionError('mock probe denied')) as signals:
+            self.assertFalse(runner.group_exit_observed(child, receipt))
+            signals.assert_called_once_with(child.pid, 0)
+        self.assertEqual(receipt['group_exit_observation']['outcome'], 'probe_error')
+        self.assertTrue(receipt['completion_uncertain'])
+
+    def test_selector_setup_error_still_cleans_up_owned_leader(self):
+        original = RuntimeError('mock selector unavailable')
+        _, error, receipt, _, _, _ = self.invoke_mock(result=-signal.SIGKILL, selector_error=original)
+        self.assertIs(error, original)
+        self.assertEqual(receipt['signal_requests'][0]['outcome'], 'signal_sent')
+        self.assertEqual(receipt['cleanup_wait']['outcome'], 'reaped')
+        self.assertTrue(receipt['process_group_exit_verified'])
+
+    def test_uncertain_case_retains_without_read_or_delete_and_preserves_error(self):
+        campaign = Campaign.__new__(Campaign)
+        campaign.deadline = time.monotonic() + 10
+        campaign.check_pins = mock.Mock()
+        campaign.specimen = mock.Mock(return_value=Path('/nonexistent-mocked-specimen'))
+        campaign.report = dict(cases=[], case_plan=[dict(id='mock', family='post_ack_kill')],
+                               retained_specimens=[])
+        campaign.save = mock.Mock(side_effect=OSError('mock retention receipt failure'))
+        original = RuntimeError('original supervision failure')
+
+        def action(*args):
+            campaign.report['completion_uncertain'] = True
+            raise original
+
+        with mock.patch.object(Path, 'read_bytes') as read, mock.patch.object(runner.shutil, 'rmtree') as remove:
+            with self.assertRaises(RuntimeError) as caught:
+                campaign.case('mock', None, 'post_ack_kill', action)
+            self.assertIs(caught.exception, original)
+            read.assert_not_called()
+            remove.assert_not_called()
+        self.assertEqual(campaign.report['retained_specimens'], ['mock'])
+        self.assertTrue(campaign.report['cases'][0]['retained_without_further_observation'])
 
 
 if __name__=="__main__":unittest.main()

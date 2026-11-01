@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded closed-image acknowledgement and corruption campaign for macOS."""
 import argparse
+from contextlib import contextmanager
 import errno
 import hashlib
 import json
@@ -20,6 +21,102 @@ MAX_CASES, MAX_BYTES, CASE_SECONDS, TOTAL_SECONDS = 80, 512 * 1024 * 1024, 15, 6
 CELL = 4096
 CALL_RESERVATION = 48 * 1024 * 1024
 CLEANUP_GRACE=2
+
+
+def request_group_kill(child, receipt, reason):
+    """Only an unreaped direct child reserves the PID used as this private PGID.
+
+    The controller is single-threaded: no other waiter may reap this child
+    between poll() and killpg(). A cached/reaped PID never authorizes a signal.
+    """
+    request = dict(reason=reason, pid=child.pid, signal=int(signal.SIGKILL), attempted=False)
+    receipt.setdefault("signal_requests", []).append(request)
+    try:
+        returncode = child.poll()
+    except BaseException as error:
+        request.update(outcome="skip_poll_error", error=f"{type(error).__name__}: {error}")
+        receipt["completion_uncertain"] = True
+        return False
+    request["poll_returncode"] = returncode
+    if returncode is not None:
+        request["outcome"] = "skip_already_reaped"
+        return False
+    request["attempted"] = True
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except BaseException as error:
+        request.update(outcome="signal_error", error=f"{type(error).__name__}: {error}",
+                       errno=getattr(error, "errno", None))
+        receipt["completion_uncertain"] = True
+        return False
+    request["outcome"] = "signal_sent"
+    return True
+
+
+def cleanup_wait(child, receipt, until):
+    wait = dict(attempted=False)
+    receipt["cleanup_wait"] = wait
+    if child.returncode is not None:
+        wait.update(outcome="already_reaped", returncode=child.returncode)
+        return
+    wait["attempted"] = True
+    try:
+        child.wait(timeout=max(.001, until-time.monotonic()))
+    except BaseException as error:
+        wait.update(outcome="wait_error", error=f"{type(error).__name__}: {error}")
+        receipt["completion_uncertain"] = True
+    else:
+        wait.update(outcome="reaped", returncode=child.returncode)
+
+
+def group_exit_observed(child, receipt):
+    """Read-only reconciliation; an existing group after reap is ambiguous."""
+    observation = dict(pid=child.pid, signal=0)
+    receipt["group_exit_observation"] = observation
+    try:
+        os.killpg(child.pid, 0)
+    except ProcessLookupError:
+        observation["outcome"] = "absent"
+    except BaseException as error:
+        observation.update(outcome="probe_error", error=f"{type(error).__name__}: {error}")
+        receipt["completion_uncertain"] = True
+    else:
+        observation["outcome"] = "exists_after_reap" if child.returncode is not None else "leader_unreaped"
+        receipt["completion_uncertain"] = True
+    if child.returncode is None:
+        receipt["completion_uncertain"] = True
+    return observation["outcome"] == "absent" and not receipt.get("completion_uncertain", False)
+
+
+@contextmanager
+def receipt_log(path, receipt_path, receipt, report):
+    """A buffered log close must not replace the supervision exception."""
+    stream = path.open("wb")
+    primary_error = None
+    try:
+        yield stream
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            stream.close()
+        except BaseException as error:
+            failure = dict(stage="stderr_log_close", error=f"{type(error).__name__}: {error}")
+            receipt.setdefault("cleanup_errors", []).append(failure)
+            report.setdefault("cleanup_errors", []).append(failure)
+            receipt.update(completion_uncertain=True, process_group_exit_verified=False)
+            report["completion_uncertain"] = True
+            original = primary_error if primary_error is not None else error
+            if primary_error is not None and hasattr(original, "add_note"):
+                original.add_note("Buffered stderr log cleanup also failed: " + failure["error"])
+            try:
+                receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+            except BaseException as save_error:
+                if hasattr(original, "add_note"):
+                    original.add_note(f"Updated cleanup receipt also failed: {type(save_error).__name__}: {save_error}")
+            if primary_error is None:
+                raise error
 
 
 def fault_expectation(name,ordinal):
@@ -113,6 +210,8 @@ class Campaign:
             return False
         except ProcessLookupError:
             return True
+        except OSError:
+            return False
 
     def invoke(self, argv, label, deadline, event=None, manifest=None, json_lines=True,
                event_fields=None, ack_generation=None):
@@ -124,15 +223,17 @@ class Campaign:
         receipt = dict(label=label, command=Path(str(argv[0])).name, events=[], expected_event=event,
                        timed_out=False, process_group_exit_verified=False)
         log = self.output / (label + ".stderr.log")
-        with log.open("wb") as errors:
+        with receipt_log(log, self.output / (label + ".json"), receipt, self.report) as errors:
             child = subprocess.Popen([str(a) for a in argv], cwd=self.scratch, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, start_new_session=True)
             self.groups.add(child.pid)
-            selector = selectors.DefaultSelector()
-            selector.register(child.stdout, selectors.EVENT_READ)
-            selector.register(child.stderr, selectors.EVENT_READ)
+            selector = None
             pending, matched, captured, error_bytes = b"", False, 0, 0
+            primary_error = None
             try:
+                selector = selectors.DefaultSelector()
+                selector.register(child.stdout, selectors.EVENT_READ)
+                selector.register(child.stderr, selectors.EVENT_READ)
                 while selector.get_map():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -177,8 +278,9 @@ class Campaign:
                             if item.get("event") == event:
                                 if any(item.get(key) != value for key, value in (event_fields or {}).items()):
                                     raise RuntimeError("interruption receipt differs from requested cut")
-                                matched = True
-                                os.killpg(child.pid, signal.SIGKILL)
+                                matched = request_group_kill(child, receipt, "requested_" + event)
+                                if not matched:
+                                    raise RuntimeError("requested interruption was not safely signalled")
                 child.wait(timeout=max(.001, deadline - time.monotonic()))
                 receipt["returncode"] = child.returncode
                 if pending.strip() and json_lines:
@@ -189,20 +291,34 @@ class Campaign:
                     raise RuntimeError("requested interruption event was not observed")
                 if child.returncode and not (matched and child.returncode == -signal.SIGKILL):
                     raise RuntimeError("owned child failed; stderr retained")
-            except BaseException:
-                if not self.gone(child.pid):
-                    os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=max(.001,cleanup_until-time.monotonic()))
+            except BaseException as error:
+                primary_error = error
+                receipt["supervision_error"] = f"{type(error).__name__}: {error}"
+                request_group_kill(child, receipt, "exception_cleanup")
+                cleanup_wait(child, receipt, cleanup_until)
                 raise
             finally:
-                selector.close()
-                child.stdout.close()
-                child.stderr.close()
-                until = cleanup_until
-                while not self.gone(child.pid) and time.monotonic() < until:
-                    time.sleep(.01)
-                receipt["process_group_exit_verified"] = self.gone(child.pid)
-                (self.output / (label + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
+                closes = [("stdout", child.stdout.close), ("stderr", child.stderr.close)]
+                if selector is not None:
+                    closes.insert(0, ("selector", selector.close))
+                for stage, close in closes:
+                    try:
+                        close()
+                    except BaseException as error:
+                        receipt.setdefault("cleanup_errors", []).append(dict(stage=stage, error=f"{type(error).__name__}: {error}"))
+                        receipt["completion_uncertain"] = True
+                receipt["returncode"] = child.returncode
+                receipt["process_group_exit_verified"] = group_exit_observed(child, receipt)
+                if receipt.get("completion_uncertain"):
+                    self.report["completion_uncertain"] = True
+                try:
+                    (self.output / (label + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
+                except BaseException as error:
+                    self.report["completion_uncertain"] = True
+                    if primary_error is None:
+                        raise
+                    if hasattr(primary_error, "add_note"):
+                        primary_error.add_note(f"Receipt cleanup also failed: {type(error).__name__}: {error}")
         if not receipt["process_group_exit_verified"]:
             raise RuntimeError("owned process group exit uncertain")
         self.bounds()
@@ -404,15 +520,27 @@ class Campaign:
             if not row["oracle_passed"]:
                 raise RuntimeError(label + ": " + row["outcome"])
         finally:
-            row["image_sha256"] = sha((directory / "image.sfs").read_bytes())
-            late=time.monotonic()>=min(deadline,self.deadline)
-            if late:row.update(outcome="unresolved",oracle_passed=False,deadline_exceeded=True)
-            if row["oracle_passed"] and row["outcome"] in ("acknowledged_state_preserved", "complete_allowed_state"):
-                shutil.rmtree(directory)
-            else:
+            if self.report.get("completion_uncertain"):
+                row["retained_without_further_observation"] = True
                 self.report["retained_specimens"].append(label)
-            self.save()
-            if late:raise TimeoutError("case work deadline before accepting outcome")
+                primary_error = sys.exc_info()[1]
+                try:
+                    self.save()
+                except BaseException as error:
+                    if primary_error is None:
+                        raise
+                    if hasattr(primary_error, "add_note"):
+                        primary_error.add_note(f"Retention receipt also failed: {type(error).__name__}: {error}")
+            else:
+                row["image_sha256"] = sha((directory / "image.sfs").read_bytes())
+                late=time.monotonic()>=min(deadline,self.deadline)
+                if late:row.update(outcome="unresolved",oracle_passed=False,deadline_exceeded=True)
+                if row["oracle_passed"] and row["outcome"] in ("acknowledged_state_preserved", "complete_allowed_state"):
+                    shutil.rmtree(directory)
+                else:
+                    self.report["retained_specimens"].append(label)
+                self.save()
+                if late:raise TimeoutError("case work deadline before accepting outcome")
 
     def compile(self, cc):
         tests, core = REPO / "tests", REPO / "filesystem"
@@ -680,7 +808,7 @@ def main():
     finally:
         campaign.report["incomplete_case_ids"]=[spec["id"] for spec in campaign.report["case_plan"]
             if not any(row["id"]==spec["id"] and row["oracle_passed"] for row in campaign.report["cases"])]
-        uncertain=any(not campaign.gone(pid) for pid in campaign.groups)
+        uncertain=campaign.report.get("completion_uncertain",False) or any(not campaign.gone(pid) for pid in campaign.groups)
         try:
             identity=(campaign.scratch.stat().st_dev,campaign.scratch.stat().st_ino)
             unsafe=uncertain or campaign.scratch.is_symlink() or identity!=campaign.identity

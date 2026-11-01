@@ -93,12 +93,15 @@ def main():
     report = dict(schema=1, passed=False, samples=[], summary={}, root=str(root), count=args.count,
                   repetitions=args.repetitions, warmups=1, seed=20261101, timeout_seconds=args.timeout,
                   tools=dict(sfs=sfs, python=python, cp="/bin/cp"),
+                  clone_policies={"installed_cli":"mandatory", "installed_api":"mandatory", "native_cp":"fallback_capable"},
                   source_hashes={p.name: sha(p) for p in (SCRIPT, SCRIPT.with_name("real_world.py"))},
                   system=dict(platform=platform.platform(), kernel=platform.release(), python=sys.version),
                   notes=["Existing API launch amortization hypothesis; no new clone algorithm or universal speed claim.",
-                         "Each batch times the selected worker interpreter startup, imports and all clone operations.",
+                         "Each batch times the selected worker interpreter startup, imports and all requested operations.",
+                         "Parent wall includes exit observation at a 10 ms polling interval and scheduling delay.",
                          "wait4 CPU includes waited descendants; RSS is the largest process high-water, not concurrent tree RAM.",
                          "Warm-cache; no purge. Setup, full verification, mutation checks and cleanup are outside timing.",
+                         "Native cp -c permits copy fallback; its timing is not a mandatory-clone comparison.",
                          "Independent bytes/mode/type/inode checks do not establish physical extent sharing."])
     def save():
         output.write_text(json.dumps(report, indent=2) + "\n")
@@ -115,9 +118,13 @@ def main():
                 source = directory / "source"
                 source.write_bytes(DATA)
                 source.chmod(0o640)
-                sample = dict(variant=variant, repetition=repetition, warmup=repetition < 0, status="failed")
+                sample = dict(variant=variant, clone_policy=report["clone_policies"][variant],
+                              repetition=repetition, warmup=repetition < 0, status="failed")
                 report["samples"].append(sample)
                 sample.update(execute([python, "-I", SCRIPT, "--worker", variant, directory, sfs, args.count], scratch, args.timeout))
+                if not sample['process_group_quiescent']:
+                    report['retain_scratch'] = True
+                    raise RuntimeError('Worker process group completion is uncertain; scratch retained')
                 save()
                 if sample["returncode"] or sample["timed_out"] or sample["output_truncated"]:
                     raise RuntimeError(f"{variant} worker failed; partial receipts retained")
@@ -136,9 +143,14 @@ def main():
         report["passed"] = True
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
+        if getattr(error, 'process_group_uncertain', False):
+            report['retain_scratch'] = True
+            report['supervision_failure'] = getattr(error, 'process_supervision', {})
     finally:
         os.chdir(prior_cwd)
         try:
+            if report.get('retain_scratch'):
+                raise RuntimeError('Scratch retained because process completion is uncertain')
             if scratch.is_symlink() or (scratch.stat().st_dev, scratch.stat().st_ino) != identity:
                 raise RuntimeError("scratch identity changed; cleanup refused")
             shutil.rmtree(scratch)

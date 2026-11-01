@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -19,6 +20,236 @@ SPEC = importlib.util.spec_from_file_location(
     'real_world_benchmark', Path(__file__).parent / 'perf' / 'real_world.py')
 BENCHMARK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCHMARK)
+
+
+class OwnedProcessSupervision(unittest.TestCase):
+    """All PIDs, waits, clocks and signals in these lifecycle checks are mocked."""
+
+    @contextlib.contextmanager
+    def child(self, *, probe='absent', initially_exited=True, exits_on_signal=signal.SIGKILL,
+              exits_on_observation=None, observe_errors=None, reap_error=None, signal_errors=None):
+        child = SimpleNamespace(pid=424242, returncode=None)
+        usage = SimpleNamespace(ru_utime=.1, ru_stime=.2, ru_maxrss=1024)
+        events, signals = [], []
+        state = {'reaped': False, 'observations': 0, 'exited': initially_exited, 'now': 0., 'sleeps': 0}
+
+        def waitid(kind, pid, flags):
+            self.assertEqual((kind, pid), (os.P_PID, child.pid))
+            self.assertEqual(flags, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            self.assertFalse(state['reaped'], 'waitid must never inspect a reused PID')
+            events.append('observe')
+            state['observations'] += 1
+            error = (observe_errors or {}).get(state['observations'])
+            if error:
+                raise error
+            if state['observations'] == exits_on_observation:
+                state['exited'] = True
+            return SimpleNamespace(si_pid=child.pid) if state['exited'] else None
+
+        def wait4(pid, flags):
+            self.assertEqual((pid, flags), (child.pid, 0))
+            self.assertTrue(state['exited'], 'a live child must never enter blocking wait4')
+            events.append('reap')
+            state['reaped'] = True
+            if reap_error:
+                raise reap_error
+            return pid, 0, usage
+
+        def killpg(pid, number):
+            self.assertEqual(pid, child.pid)
+            signals.append(number)
+            events.append(f'signal:{number}')
+            if number:
+                self.assertFalse(state['reaped'], 'destructive signal targeted a reused PID')
+                error = (signal_errors or {}).get(number)
+                if error:
+                    raise error
+                if number == exits_on_signal:
+                    state['exited'] = True
+            else:
+                self.assertTrue(state['reaped'])
+                if probe == 'absent':
+                    raise ProcessLookupError()
+                if isinstance(probe, BaseException):
+                    raise probe
+
+        def sleep(duration):
+            self.assertGreaterEqual(duration, 0)
+            self.assertLessEqual(duration, .01)
+            state['sleeps'] += 1
+            self.assertLess(state['sleeps'], 1000, 'supervision exceeded its bounded observation window')
+            state['now'] += duration
+
+        with mock.patch.object(BENCHMARK.os, 'waitid', side_effect=waitid), \
+                mock.patch.object(BENCHMARK.os, 'wait4', side_effect=wait4) as reaper, \
+                mock.patch.object(BENCHMARK.os, 'killpg', side_effect=killpg), \
+                mock.patch.object(BENCHMARK.time, 'monotonic', side_effect=lambda: state['now']), \
+                mock.patch.object(BENCHMARK.time, 'sleep', side_effect=sleep):
+            yield child, usage, events, signals, reaper, state
+
+    def test_exit_observation_clock_precedes_reap(self):
+        with self.child() as (child, expected_usage, events, signals, reaper, state):
+            def exit_clock():
+                events.append('exit_clock')
+                return 123.5
+            usage, ended, receipt = BENCHMARK.wait_owned_process(child, 5, exit_clock=exit_clock)
+            self.assertIs(usage, expected_usage)
+            self.assertEqual(ended, 123.5)
+            self.assertEqual(events, ['observe', 'exit_clock', 'reap', 'signal:0'])
+            self.assertEqual(signals, [0])
+            self.assertEqual(receipt['post_reap_group_probe']['outcome'], 'absent_at_check')
+            self.assertEqual(receipt['signals'], [])
+            self.assertTrue(receipt['child_reaped'])
+            self.assertEqual(child.returncode, 0)
+
+    def test_reused_group_or_probe_error_never_causes_a_destructive_signal(self):
+        for probe in ('present', PermissionError(1, 'probe denied')):
+            with self.subTest(probe=probe), self.child(probe=probe) as data:
+                child, _, events, signals, reaper, state = data
+                with self.assertRaises(RuntimeError) as caught:
+                    BENCHMARK.wait_owned_process(child, 5)
+                self.assertTrue(caught.exception.process_group_uncertain)
+                receipt = caught.exception.process_supervision
+                self.assertEqual(signals, [0])
+                self.assertEqual(receipt['post_reap_group_probe']['outcome'],
+                                 'present' if probe == 'present' else 'error')
+                self.assertEqual(receipt['signals'], [{'signal': int(signal.SIGKILL),
+                    'reason': 'post_reap_group_uncertain', 'attempted': False,
+                    'outcome': 'skipped_pid_reuse_possible'}])
+                reaper.assert_called_once()
+
+    def test_timeout_records_term_and_kill_before_reap(self):
+        with self.child(initially_exited=False) as (child, _, events, signals, reaper, state):
+            _, _, receipt = BENCHMARK.wait_owned_process(child, 0, graceful=True)
+            self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL, 0])
+            self.assertTrue(receipt['timed_out'])
+            self.assertEqual([r['reason'] for r in receipt['signals']], ['timeout', 'timeout_grace_expired'])
+            self.assertTrue(all(r['attempted'] and r['outcome'] == 'sent' for r in receipt['signals']))
+            self.assertLess(events.index(f'signal:{signal.SIGKILL}'), events.index('reap'))
+            self.assertLessEqual(state['now'], 2.02)
+
+    def test_failed_sigkill_with_live_child_returns_uncertain_without_reap(self):
+        with self.child(initially_exited=False,
+                        signal_errors={signal.SIGKILL: PermissionError(1, 'signal denied')}) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaises(RuntimeError) as caught:
+                BENCHMARK.wait_owned_process(child, 0)
+            receipt = caught.exception.process_supervision
+            self.assertTrue(caught.exception.process_group_uncertain)
+            self.assertFalse(state['exited'])
+            self.assertEqual(state['now'], 0)
+            self.assertEqual(signals, [signal.SIGKILL])
+            self.assertEqual(receipt['signals'][0]['outcome'], 'error')
+            self.assertTrue(receipt['signals'][0]['attempted'])
+            self.assertEqual(receipt['signals'][0]['errno'], 1)
+            reaper.assert_not_called()
+
+    def test_failed_timeout_ownership_check_returns_uncertain_without_signal_or_reap(self):
+        with self.child(initially_exited=False, observe_errors={2: ChildProcessError(10, 'not our child')}) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaises(RuntimeError) as caught:
+                BENCHMARK.wait_owned_process(child, 0)
+            self.assertTrue(caught.exception.process_group_uncertain)
+            self.assertFalse(state['exited'])
+            self.assertEqual(state['now'], 0)
+            self.assertEqual(signals, [])
+            self.assertEqual(caught.exception.process_supervision['signals'][0]['outcome'],
+                             'skipped_child_ownership_unverified')
+            reaper.assert_not_called()
+
+    def test_successful_sigkill_without_observed_exit_expires_without_reap(self):
+        with self.child(initially_exited=False, exits_on_signal=None) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaisesRegex(RuntimeError, 'termination grace') as caught:
+                BENCHMARK.wait_owned_process(child, .25)
+            self.assertTrue(caught.exception.process_group_uncertain)
+            self.assertFalse(state['exited'])
+            self.assertGreaterEqual(state['now'], 2.25)
+            self.assertLessEqual(state['now'], 2.26)
+            self.assertEqual(signals, [signal.SIGKILL])
+            reaper.assert_not_called()
+
+    def test_failed_escalation_after_term_does_not_reap_live_child(self):
+        with self.child(initially_exited=False,
+                        signal_errors={signal.SIGKILL: PermissionError(1, 'signal denied')}) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaises(RuntimeError):
+                BENCHMARK.wait_owned_process(child, 0, graceful=True)
+            self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+            self.assertFalse(state['exited'])
+            self.assertLessEqual(state['now'], 2.01)
+            reaper.assert_not_called()
+
+    def test_exit_at_signal_ownership_check_skips_destructive_signal(self):
+        with self.child(initially_exited=False, exits_on_observation=2) as data:
+            child, _, events, signals, reaper, state = data
+            _, _, receipt = BENCHMARK.wait_owned_process(child, 0)
+            self.assertEqual(signals, [0])
+            self.assertEqual(receipt['signals'][0]['outcome'], 'skipped_child_exited')
+            self.assertFalse(receipt['signals'][0]['attempted'])
+
+    def test_observation_exception_kills_only_before_reap(self):
+        for failure in (RuntimeError('observation failed'), KeyboardInterrupt('interrupted')):
+            with self.subTest(failure=type(failure).__name__), \
+                    self.child(initially_exited=False, observe_errors={1: failure}) as data:
+                child, _, events, signals, reaper, state = data
+                with self.assertRaises(type(failure)) as caught:
+                    BENCHMARK.wait_owned_process(child, 5)
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(failure.process_group_uncertain)
+                self.assertEqual(signals, [signal.SIGKILL, 0])
+                self.assertEqual(failure.process_supervision['signals'][0]['reason'], 'wait_exception')
+                self.assertTrue(failure.process_supervision['child_reaped'])
+
+    def test_exception_cleanup_with_live_child_has_bounded_grace_and_preserves_error(self):
+        failure = KeyboardInterrupt('initial interruption')
+        with self.child(initially_exited=False, exits_on_signal=None, observe_errors={1: failure}) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                BENCHMARK.wait_owned_process(child, 5)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(signals, [signal.SIGKILL])
+            self.assertLessEqual(state['now'], 2.01)
+            self.assertEqual(failure.process_supervision['cleanup_errors'][0]['phase'], 'exit_observation')
+            reaper.assert_not_called()
+
+    def test_cleanup_wait_errors_do_not_replace_the_original_exception(self):
+        for phase in ('observation', 'reap'):
+            failure, secondary = KeyboardInterrupt('initial interruption'), OSError('cleanup wait failed')
+            errors = {1: failure, **({3: secondary} if phase == 'observation' else {})}
+            with self.subTest(phase=phase), self.child(initially_exited=False, observe_errors=errors,
+                    reap_error=secondary if phase == 'reap' else None) as data:
+                child, _, events, signals, reaper, state = data
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    BENCHMARK.wait_owned_process(child, 5)
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(failure.process_group_uncertain)
+                self.assertEqual(failure.process_supervision['cleanup_errors'][0]['error'], str(secondary))
+                self.assertEqual(signals, [signal.SIGKILL])
+
+    def test_wait4_exception_after_kernel_reap_never_signals_or_reaps_again(self):
+        for failure in (ChildProcessError('already reaped'), KeyboardInterrupt('after kernel reap')):
+            with self.subTest(failure=type(failure).__name__), self.child(reap_error=failure) as data:
+                child, _, events, signals, reaper, state = data
+                with self.assertRaises(type(failure)) as caught:
+                    BENCHMARK.wait_owned_process(child, 5)
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(failure.process_group_uncertain)
+                self.assertTrue(failure.process_supervision['reap_started'])
+                self.assertEqual(signals, [])
+                reaper.assert_called_once()
+
+    def test_lost_child_ownership_skips_exception_signal_and_reap(self):
+        failure = ChildProcessError(10, 'child unavailable')
+        with self.child(initially_exited=False, observe_errors={1: failure, 2: failure}) as data:
+            child, _, events, signals, reaper, state = data
+            with self.assertRaises(ChildProcessError) as caught:
+                BENCHMARK.wait_owned_process(child, 5)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(signals, [])
+            reaper.assert_not_called()
+            self.assertEqual(failure.process_supervision['signals'][0]['outcome'],
+                             'skipped_child_ownership_unverified')
 
 
 class RealWorldValidity(unittest.TestCase):
@@ -77,6 +308,39 @@ class RealWorldValidity(unittest.TestCase):
         self.assertFalse(summary['comparisons']['sfs_jobs1']['peak_rss_bytes']['available'])
         self.assertIn('baseline_over_variant_median', summary['comparisons']['sfs_jobs1']['wall_s'])
 
+    def test_fallback_or_unknown_clone_policy_cannot_become_a_mandatory_clone_win(self):
+        def row(variant, repetition, policy):
+            sample = {'case': 'clone', 'variant': variant, 'repetition': repetition,
+                      'warmup': repetition == -1, 'status': 'passed',
+                      'wall_s': 2 if variant == 'native_cp' else 1,
+                      'cpu_s': .5, 'peak_rss_bytes': 1024}
+            if policy is not None:
+                sample['clone_policy'] = policy
+            return sample
+
+        self.assertEqual(BENCHMARK.clone_policy('native_cp', 'darwin'), 'fallback_capable')
+        self.assertEqual(BENCHMARK.clone_policy('native_cp', 'linux'), 'mandatory')
+        for baseline_policy, candidate_policy in [('fallback_capable', 'mandatory'),
+                                                  ('unknown', 'mandatory'), (None, 'mandatory'),
+                                                  ('mandatory', None)]:
+            with self.subTest(baseline=baseline_policy, candidate=candidate_policy):
+                samples = [row(variant, i, policy) for i in (-1, 0, 1)
+                           for variant, policy in [('native_cp', baseline_policy),
+                                                   ('sfs_jobs1', candidate_policy)]]
+                summary = BENCHMARK.summarize(samples, expected_repetitions=2)['clone']
+                self.assertEqual(summary['variants']['native_cp']['wall_s']['median'], 2)
+                self.assertEqual(summary['variants']['sfs_jobs1']['wall_s']['median'], 1)
+                self.assertNotIn('sfs_jobs1', summary['comparisons'])
+                self.assertIn('sfs_jobs1', summary['comparison_exclusions'])
+        mandatory = [row(variant, i, 'mandatory') for i in (-1, 0, 1)
+                     for variant in ('native_cp', 'sfs_jobs1')]
+        self.assertEqual(BENCHMARK.summarize(mandatory, expected_repetitions=2)['clone']
+                         ['comparisons']['sfs_jobs1']['wall_s']['wins'], 2)
+        mandatory[0]['clone_policy'] = 'fallback_capable'
+        inconsistent = BENCHMARK.summarize(mandatory, expected_repetitions=2)['clone']
+        self.assertFalse(inconsistent['variants']['native_cp']['mandatory_clone_comparison_eligible'])
+        self.assertNotIn('sfs_jobs1', inconsistent['comparisons'])
+
     def test_incomplete_or_duplicate_measurements_cannot_become_wins(self):
         def row(variant, repetition):
             return {'case': 'scan', 'variant': variant, 'repetition': repetition,
@@ -100,8 +364,52 @@ class RealWorldValidity(unittest.TestCase):
     def test_uncertain_interrupt_retains_fixture_before_inspection_or_deletion(self):
         self.check_uncertain_failure(KeyboardInterrupt('injected uncertain interruption'))
 
+    def test_uncertain_return_retains_fixture_before_inspection_or_deletion(self):
+        self.check_uncertain_failure(None)
+
+    def test_swapped_scratch_directory_or_symlink_cannot_be_deleted(self):
+        for replacement_kind in ('directory', 'symlink'):
+            with self.subTest(replacement=replacement_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / 'result.json'
+                retained = {}
+
+                def swap_scratch(argv, scratch, **kwargs):
+                    scratch = Path(scratch)
+                    (scratch / 'original-marker').write_bytes(b'original owned directory')
+                    original = scratch.with_name(scratch.name + '-original')
+                    scratch.rename(original)
+                    if replacement_kind == 'directory':
+                        scratch.mkdir()
+                        replacement = scratch
+                    else:
+                        replacement = root / 'fresh-symlink-target'
+                        replacement.mkdir()
+                        scratch.symlink_to(replacement, target_is_directory=True)
+                    (replacement / 'replacement-marker').write_bytes(b'replacement must remain')
+                    retained.update(original=original, replacement=replacement, scratch=scratch)
+                    raise RuntimeError('injected setup failure after scratch swap')
+
+                argv = ['real_world.py', '--root', str(root), '--output', str(output),
+                        '--files', '2', '--directories', '1', '--repetitions', '1']
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(BENCHMARK, 'execute', side_effect=swap_scratch), \
+                        mock.patch.object(BENCHMARK.shutil, 'which', return_value=sys.executable), \
+                        mock.patch.object(BENCHMARK.shutil, 'rmtree') as removed, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(BENCHMARK.main(), 1)
+                    removed.assert_not_called()
+                report = json.loads(output.read_text())
+                self.assertTrue(report['retain_scratch'])
+                self.assertIn('identity changed; cleanup refused', report['cleanup'])
+                self.assertEqual((retained['original'] / 'original-marker').read_bytes(), b'original owned directory')
+                self.assertEqual((retained['replacement'] / 'replacement-marker').read_bytes(), b'replacement must remain')
+                self.assertEqual(retained['scratch'].is_symlink(), replacement_kind == 'symlink')
+
     def check_uncertain_failure(self, failure):
-        failure.process_group_uncertain = True
+        if failure is not None:
+            failure.process_group_uncertain = True
+            failure.process_supervision = {'signals': [], 'post_reap_group_probe': {'outcome': 'present'}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / 'result.json'
@@ -119,7 +427,10 @@ class RealWorldValidity(unittest.TestCase):
             def fake_execute(argv, scratch, **kwargs):
                 if kwargs.get('measurement_helper'):
                     failed[0] = True
-                    raise failure
+                    if failure is not None:
+                        raise failure
+                    return {'returncode': 0, 'timed_out': False, 'output_truncated': False,
+                            'process_group_quiescent': False, 'stdout': '', 'stderr': ''}
                 if '-o' in argv:
                     Path(argv[-1]).write_bytes(b'placeholder helper; never executed')
                 return {'returncode': 0, 'timed_out': False, 'output_truncated': False,
@@ -143,9 +454,26 @@ class RealWorldValidity(unittest.TestCase):
             self.assertTrue(report['retain_scratch'])
             self.assertIn('retained', report['cleanup'])
             self.assertEqual(report['samples'][0]['status'], 'failed')
-            self.assertTrue(any(type(failure).__name__ in error for error in report['errors']))
+            if failure is not None:
+                self.assertTrue(any(type(failure).__name__ in error for error in report['errors']))
+                self.assertEqual(report['samples'][0]['supervision'], failure.process_supervision)
             self.assertTrue((Path(report['scratch']) / 'source/d000/f000000').is_file())
             self.assertTrue((Path(report['scratch']) / 'sentinel').is_file())
+
+    def test_uncertain_setup_stops_before_launching_a_second_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, output = Path(directory), Path(directory) / 'result.json'
+            argv = ['real_world.py', '--root', str(root), '--output', str(output),
+                    '--files', '2', '--directories', '1', '--repetitions', '1']
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(BENCHMARK, 'execute', return_value={'process_group_quiescent': False}) as launched, \
+                    mock.patch.object(BENCHMARK.shutil, 'which', return_value=sys.executable), \
+                    mock.patch.object(BENCHMARK.shutil, 'rmtree') as removed, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(BENCHMARK.main(), 1)
+                launched.assert_called_once()
+                removed.assert_not_called()
+            self.assertTrue(json.loads(output.read_text())['retain_scratch'])
 
     @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'Requires wait4 resource accounting')
     def test_timeout_terminates_and_reaps_owned_child(self):
@@ -159,6 +487,108 @@ class RealWorldValidity(unittest.TestCase):
             pid = int(result['stdout'].strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+
+class UncertainCompletionConsumers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        for name in ('real_apps', 'real_batch'):
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).parent / 'perf' / (name + '.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            setattr(cls, name, module)
+
+    def failure(self, kind):
+        failure = kind('injected completion uncertainty')
+        failure.process_group_uncertain = True
+        failure.process_supervision = {'signals': [], 'post_reap_group_probe': {'outcome': 'present'}}
+        return failure
+
+    def test_application_wrapper_uses_observation_clock_and_returns_receipt(self):
+        receipt = {'timed_out': False, 'post_reap_group_probe': {'outcome': 'absent_at_check'}}
+        with mock.patch.dict(sys.modules, {'real_world': BENCHMARK}), \
+                mock.patch.object(BENCHMARK, 'wait_owned_process', return_value=('usage', 123, receipt)) as waited:
+            self.assertEqual(self.real_apps.bounded_wait('child', 5), ('usage', 123, False, True, receipt))
+            waited.assert_called_once_with('child', 5, exit_clock=self.real_apps.time.perf_counter)
+
+    def test_application_supervisor_initialization_failure_marks_completion_uncertain(self):
+        failure = RuntimeError('watchdog initialization failed')
+        with mock.patch.dict(sys.modules, {'real_world': BENCHMARK}), \
+                mock.patch.object(BENCHMARK, 'wait_owned_process', side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                self.real_apps.bounded_wait('child', 5)
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(failure.process_group_uncertain)
+
+    def test_execute_supervisor_initialization_failure_marks_completion_uncertain(self):
+        failure = RuntimeError('watchdog initialization failed')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(BENCHMARK.subprocess, 'Popen', return_value=SimpleNamespace(pid=424242)), \
+                mock.patch.object(BENCHMARK, 'wait_owned_process', side_effect=failure), \
+                mock.patch.object(BENCHMARK.os, 'killpg') as signaled:
+            with self.assertRaises(RuntimeError) as caught:
+                BENCHMARK.execute(['mock-command'], directory)
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(failure.process_group_uncertain)
+            signaled.assert_not_called()
+
+    def test_batch_uncertainty_stops_before_verification_or_cleanup(self):
+        for kind in (None, RuntimeError, KeyboardInterrupt):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root, output = Path(directory), Path(directory) / 'result.json'
+                failure = self.failure(kind) if kind else None
+                argv = ['real_batch.py', '--root', str(root), '--output', str(output),
+                        '--sfs', sys.executable, '--count', '2', '--repetitions', '1']
+                with mock.patch.object(sys, 'argv', argv), mock.patch.object(sys, 'platform', 'darwin'), \
+                        mock.patch.dict(sys.modules, {'real_world': BENCHMARK}), \
+                        mock.patch.object(BENCHMARK, 'execute', side_effect=failure,
+                            return_value={'process_group_quiescent': False}) as launched, \
+                        mock.patch.object(self.real_batch.shutil, 'which', return_value=sys.executable), \
+                        mock.patch.object(self.real_batch, 'verify') as verified, \
+                        mock.patch.object(self.real_batch.shutil, 'rmtree') as removed, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.real_batch.main(), 1)
+                    launched.assert_called_once()
+                    verified.assert_not_called()
+                    removed.assert_not_called()
+                report = json.loads(output.read_text())
+                self.assertTrue(report['retain_scratch'])
+                self.assertFalse(report['cleanup_verified'])
+                self.assertTrue(Path(report['retained_scratch']).is_dir())
+                if failure:
+                    self.assertEqual(report['supervision_failure'], failure.process_supervision)
+
+    def test_application_uncertainty_stops_before_receipt_read_or_cleanup(self):
+        for kind in (None, RuntimeError, KeyboardInterrupt):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root, output = Path(directory), Path(directory) / 'results'
+                failure = self.failure(kind) if kind else None
+                usage = SimpleNamespace(ru_utime=0, ru_stime=0, ru_maxrss=0)
+                supervision = {'post_reap_group_probe': {'outcome': 'present'}}
+                argv = ['real_apps.py', '--root', str(root), '--output', str(output), '--smoke']
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(self.real_apps, 'bounded_wait', side_effect=failure,
+                            return_value=(usage, 1, False, False, supervision)) as waited, \
+                        mock.patch.object(self.real_apps.shutil, 'which', return_value=sys.executable), \
+                        mock.patch.object(self.real_apps.subprocess, 'run',
+                            return_value=SimpleNamespace(stdout='mock compiler', returncode=0)), \
+                        mock.patch.object(self.real_apps.subprocess, 'Popen',
+                            return_value=SimpleNamespace(pid=424242, returncode=0)), \
+                        mock.patch.object(Path, 'read_text') as inspected, \
+                        mock.patch.object(self.real_apps.shutil, 'rmtree') as removed, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.real_apps.main(), 1)
+                    waited.assert_called_once()
+                    inspected.assert_not_called()
+                    removed.assert_not_called()
+                report = json.loads((output / 'result.json').read_text())
+                self.assertTrue(report['retain_scratch'])
+                self.assertFalse(report['cleanup_verified'])
+                self.assertTrue(Path(report['retained_scratch']).is_dir())
+                if failure:
+                    self.assertEqual(report['supervision_failure'], failure.process_supervision)
+                else:
+                    self.assertEqual(report['runs'][0]['supervision'], supervision)
 
 
 @unittest.skipUnless(sys.platform in ('darwin', 'linux') and shutil.which('cc'),
