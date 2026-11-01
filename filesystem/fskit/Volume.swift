@@ -1477,11 +1477,26 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
     }
 #if STALLION_WRITE_DIAGNOSTIC
+    private enum CreateInput {
+        case item(FSItem.ItemType)
+        case symbolicLink(Data)
+        var target: Data? {
+            if case .symbolicLink(let bytes) = self { return bytes }
+            return nil
+        }
+    }
     private struct CreateAttributes {
+        let kind: sfs_kind
         let initial: sfs_metadata_initial
         let consumed: FSItem.Attribute
-        init(_ attributes: FSItem.SetAttributesRequest, type: FSItem.ItemType, caller: CallerIdentity, owner: uid_t) throws {
-            guard type == .file else { throw POSIXError(.ENOTSUP) }
+        init(_ attributes: FSItem.SetAttributesRequest, input: CreateInput, caller: CallerIdentity, owner: uid_t) throws {
+            let modeKind: UInt32
+            switch input {
+            case .item(.file): kind = SFS_FILE; modeKind = UInt32(S_IFREG)
+            case .item(.directory): kind = SFS_DIRECTORY; modeKind = UInt32(S_IFDIR)
+            case .symbolicLink: kind = SFS_SYMLINK; modeKind = UInt32(S_IFLNK)
+            default: throw POSIXError(.ENOTSUP)
+            }
             let unsupported: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID,
                 .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
                 .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
@@ -1490,13 +1505,13 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard let uid = uid_t(exactly: caller.uid), let gid = gid_t(exactly: caller.gid),
                   uid == owner, attributes.uid == uid, attributes.gid == gid else { throw POSIXError(.EACCES) }
             let mode = attributes.mode, kind = mode & UInt32(S_IFMT)
-            guard kind == 0 || kind == UInt32(S_IFREG) else { throw POSIXError(.EINVAL) }
+            guard kind == 0 || kind == modeKind else { throw POSIXError(.EINVAL) }
             guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
             var used: FSItem.Attribute = [.mode, .uid, .gid]
             if attributes.isValid(.flags) { guard attributes.flags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
-            if attributes.isValid(.size) { guard attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
+            if attributes.isValid(.size) { guard self.kind != SFS_SYMLINK, attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
             var value = sfs_metadata_initial()
-            value.mode = UInt32(S_IFREG) | (mode & 0o777); value.uid = uid; value.gid = gid
+            value.mode = modeKind | (mode & 0o777); value.uid = uid; value.gid = gid
             initial = value; consumed = used
         }
     }
@@ -1543,16 +1558,40 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func createItemHandler(_ name: FSFileName, type: FSItem.ItemType, directory: FSItem,
                                    attributes: FSItem.SetAttributesRequest, caller: CallerIdentity,
                                    reply: @escaping (FSCreateItemResult?, Error?) -> Void) {
+        createEntryHandler(name, input: .item(type), directory: directory, attributes: attributes, caller: caller,
+                           resultType: FSCreateItemResult.self, construct: { item, name, child, parent in
+            FSCreateItemResult(newItem: item, newItemName: name, newItemAttributes: child, directoryAttributes: parent, freeSpace: nil)
+        }, reply: reply)
+    }
+    private func createSymlinkHandler(_ name: FSFileName, directory: FSItem, attributes: FSItem.SetAttributesRequest,
+                                      linkContents: FSFileName, caller: CallerIdentity,
+                                      reply: @escaping (FSCreateSymlinkResult?, Error?) -> Void) {
+        // FSFileName may already have truncated a NUL suffix. Only delivered bytes are available here.
+        createEntryHandler(name, input: .symbolicLink(linkContents.data), directory: directory, attributes: attributes, caller: caller,
+                           resultType: FSCreateSymlinkResult.self, construct: { item, name, child, parent in
+            FSCreateSymlinkResult(newItem: item, newItemName: name, newItemAttributes: child, directoryAttributes: parent, freeSpace: nil)
+        }, reply: reply)
+    }
+    private func createEntryHandler<Result: FSCreateItemResult>(_ name: FSFileName, input: CreateInput, directory: FSItem,
+                                   attributes: FSItem.SetAttributesRequest, caller: CallerIdentity, resultType: Result.Type,
+                                   construct: @escaping (StallionItem, FSFileName, FSItem.Attributes, FSItem.Attributes) -> Result?,
+                                   reply: @escaping (Result?, Error?) -> Void) {
         attributes.consumedAttributes = []
         guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
-        let bytes = name.data
+        let bytes = name.data, target = input.target
+        let charge = bytes.count.addingReportingOverflow(target?.count ?? 0)
         let values: CreateAttributes
         do {
             try component(bytes)
             guard bytes != Data(".".utf8), bytes != Data("..".utf8) else { throw POSIXError(.EINVAL) }
-            values = try CreateAttributes(attributes, type: type, caller: caller, owner: owner)
+            if let target {
+                guard target.count <= Int(SFS_SYMLINK_MAX) else { throw POSIXError(.ENAMETOOLONG) }
+                guard !target.isEmpty && !target.contains(0) else { throw POSIXError(.EINVAL) }
+            }
+            guard !charge.overflow else { throw POSIXError(.E2BIG) }
+            values = try CreateAttributes(attributes, input: input, caller: caller, owner: owner)
         } catch { reply(nil, error); return }
-        enqueue(retainedBytes: bytes.count, namespaceOperation: true, rejected: { reply(nil, $0) }) {
+        enqueue(retainedBytes: charge.partialValue, namespaceOperation: true, rejected: { reply(nil, $0) }) {
             var receipt = sfs_result(), created: StallionItem?
             var ownsPending = false
             do {
@@ -1564,12 +1603,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 guard self.resource.isWritable else { throw POSIXError(.EACCES) }
                 let parent = try self.id(directory), parentMetadata = try self.metadata(parent)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
-                try self.ownerAccess(parentMetadata, inode: parent, access: [.addFile, .search], caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: values.kind == SFS_DIRECTORY ? .search : [.addFile, .search], caller: caller)
                 var found = sfs_entry()
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
                 guard anchorMatches(receipt, self.anchor) else { let e = POSIXError(.ESTALE); self.latch(e); throw e }
-                let requirements = ResultRequirements(FSCreateItemResult.self), request = try requirements.request()
+                let requirements = ResultRequirements(resultType), request = try requirements.request()
                 guard self.pendingCreate == nil, self.items.count < self.itemLimit else { throw POSIXError(.ENFILE) }
                 self.pendingCreate = PendingCreate(); ownsPending = true
                 var pin = sfs_pin()
@@ -1586,7 +1625,13 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     try self.createStageForTesting?("before-add", nil)
 #endif
                     var initial = values.initial, inode: UInt64 = 0
-                    let status = bytes.withUnsafeBytes { sfs_image_add_metadata(h, parent, $0.baseAddress, $0.count, SFS_FILE, &initial, &inode, &r) }
+                    let status = bytes.withUnsafeBytes { name -> sfs_status in
+                        if let target {
+                            return target.withUnsafeBytes { sfs_image_symlink_metadata(h, parent, name.baseAddress, name.count,
+                                                                                     $0.baseAddress, $0.count, &initial, &inode, &r) }
+                        }
+                        return sfs_image_add_metadata(h, parent, name.baseAddress, name.count, values.kind, &initial, &inode, &r)
+                    }
                     try self.check(status, r)
                     self.pendingCreate?.inode = inode
 #if STALLION_ADAPTER_CHECK
@@ -1613,10 +1658,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     var childEvidence = ParentEvidence(), parentEvidence = ParentEvidence()
                     let childAttributes = try self.preparedResultAttributes(child, request, requirements, parents: &childEvidence)
                     let parentAttributes = try self.preparedResultAttributes(directoryMetadata, request, requirements, parents: &parentEvidence)
-                    return try self.handlerResult(FSCreateItemResult.self) {
-                        FSCreateItemResult(newItem: item, newItemName: name, newItemAttributes: childAttributes,
-                                           directoryAttributes: parentAttributes, freeSpace: nil)
-                    }
+                    return try self.handlerResult(resultType) { construct(item, name, childAttributes, parentAttributes) }
                 }, receipt: &receipt)
 #if STALLION_ADAPTER_CHECK
                 self.createOutcomeForTesting = self.pendingCreate!.outcome
@@ -1639,9 +1681,20 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                                 reply: @escaping (FSCreateItemResult?, Error?) -> Void) {
         createItemHandler(name, type: type, directory: directory, attributes: attributes, caller: caller, reply: reply)
     }
+    func symlinkResultForTesting(_ name: FSFileName, directory: FSItem, attributes: FSItem.SetAttributesRequest,
+                                 linkContents: FSFileName, caller: CallerIdentity,
+                                 reply: @escaping (FSCreateSymlinkResult?, Error?) -> Void) {
+        createSymlinkHandler(name, directory: directory, attributes: attributes, linkContents: linkContents, caller: caller, reply: reply)
+    }
 #endif
 #endif
-    func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, context: FSContext, replyHandler: @escaping (FSCreateSymlinkResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes: FSItem.SetAttributesRequest, linkContents: FSFileName, context: FSContext, replyHandler: @escaping (FSCreateSymlinkResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        createSymlinkHandler(name, directory: directory, attributes: attributes, linkContents: linkContents, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
     func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler: @escaping (FSCreateLinkResult?, Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC
         createLinkHandler(item, name: name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
@@ -1713,8 +1766,169 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     var linkBudgetForTesting: (Int, Int) { callbacks.snapshotForTesting }
 #endif
 #endif
-    func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
-    func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler: @escaping (FSRenameItemResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
+    func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        removeItemHandler(item, name: name, directory: directory, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private func removeItemHandler(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
+                                   reply: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        let bytes = name.data
+        var validation: Error?
+        do {
+            try component(bytes)
+            guard bytes != Data(".".utf8), bytes != Data("..".utf8) else { throw POSIXError(.EINVAL) }
+        } catch { validation = error }
+        enqueue(retainedBytes: bytes.count, namespaceOperation: true, validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result()
+            do {
+                if let error = self.deliveryError() { throw error }
+                let h = try self.ready(mounted: true)
+                guard self.pendingCreate == nil else { throw POSIXError(.EBUSY) }
+#if STALLION_ADAPTER_CHECK
+                self.removePreflightForTesting?()
+#endif
+                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                let source = try self.id(item), parent = try self.id(directory)
+                let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
+                guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
+                guard sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
+                try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
+                try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: .search, caller: caller)
+                var found = sfs_entry()
+                let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
+                try self.check(status, receipt)
+                guard found.inode == source else { throw POSIXError(.ESTALE) }
+                let requirements = ResultRequirements(FSRemoveItemResult.self), request = try requirements.request()
+                // Detached pins have no parent identity. Do not invent one for a result.
+                guard sourceMetadata.link_count != 1 || !requirements.sdk.contains(.parentID) else { throw POSIXError(.ENOTSUP) }
+#if STALLION_ADAPTER_CHECK
+                self.removeMutationForTesting = true
+                defer { self.removeMutationForTesting = false }
+#endif
+                let result = try self.mutate({ h, r in
+                    let status = bytes.withUnsafeBytes { sfs_image_unlink_expected(h, parent, $0.baseAddress, $0.count, source, &r) }
+                    try self.check(status, r)
+                }, prepare: { h, r in
+                    let sourceMetadata = try self.transactionMetadata(h, inode: source, receipt: &r)
+                    let parentMetadata = try self.transactionMetadata(h, inode: parent, receipt: &r)
+                    var sourceEvidence = ParentEvidence(), parentEvidence = ParentEvidence()
+                    let removed = try self.preparedResultAttributes(sourceMetadata, request, requirements, parents: &sourceEvidence)
+                    let parentAttributes = try self.preparedResultAttributes(parentMetadata, request, requirements, parents: &parentEvidence)
+                    return try self.handlerResult(FSRemoveItemResult.self) {
+                        FSRemoveItemResult(itemAttributes: removed, directoryAttributes: parentAttributes, freeSpace: nil)
+                    }
+                }, receipt: &receipt)
+                reply(result, nil)
+            } catch { reply(nil, error) }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    private var removeMutationForTesting = false
+    var removePreflightForTesting: (() -> Void)?
+    var removeCommitReceiptForTesting: ((sfs_result, inout sfs_result) -> Void)?
+    func removeResultForTesting(_ item: FSItem, name: FSFileName, directory: FSItem, caller: CallerIdentity,
+                                reply: @escaping (FSRemoveItemResult?, Error?) -> Void) {
+        removeItemHandler(item, name: name, directory: directory, caller: caller, reply: reply)
+    }
+#endif
+#endif
+    func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler: @escaping (FSRenameItemResult?, Error?) -> Void) {
+#if STALLION_WRITE_DIAGNOSTIC
+        renameItemHandler(item, sourceDirectory: sourceDirectory, sourceName: sourceName, destinationName: destinationName,
+                          destinationDirectory: destinationDirectory, overItem: overItem, caller: CallerIdentity(context), reply: replyHandler)
+#else
+        refuse { replyHandler(nil, $0) }
+#endif
+    }
+#if STALLION_WRITE_DIAGNOSTIC
+    private func renameItemHandler(_ item: FSItem, sourceDirectory: FSItem, sourceName: FSFileName,
+                                   destinationName: FSFileName, destinationDirectory: FSItem, overItem: FSItem?,
+                                   caller: CallerIdentity, reply: @escaping (FSRenameItemResult?, Error?) -> Void) {
+        guard diagnosticWritable else { refuse { reply(nil, $0) }; return }
+        let oldBytes = sourceName.data, newBytes = destinationName.data
+        let charge = oldBytes.count.addingReportingOverflow(newBytes.count)
+        var validation: Error?
+        do {
+            guard overItem == nil else { throw POSIXError(.ENOTSUP) }
+            guard !charge.overflow else { throw POSIXError(.E2BIG) }
+            for bytes in [oldBytes, newBytes] {
+                try component(bytes)
+                guard bytes != Data(".".utf8), bytes != Data("..".utf8) else { throw POSIXError(.EINVAL) }
+            }
+        } catch { validation = error }
+        enqueue(retainedBytes: charge.overflow ? Int.max : charge.partialValue, namespaceOperation: true,
+                validationError: validation, rejected: { reply(nil, $0) }) {
+            var receipt = sfs_result()
+            do {
+                if let error = self.deliveryError() { throw error }
+                let h = try self.ready(mounted: true)
+                guard self.pendingCreate == nil else { throw POSIXError(.EBUSY) }
+#if STALLION_ADAPTER_CHECK
+                self.renamePreflightForTesting?()
+#endif
+                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                let source = try self.id(item), oldParent = try self.id(sourceDirectory), newParent = try self.id(destinationDirectory)
+                let sourceMetadata = try self.metadata(source), oldMetadata = try self.metadata(oldParent), newMetadata = try self.metadata(newParent)
+                guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
+                guard source != 1, sourceMetadata.link_count == 1,
+                      sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags == 0, oldMetadata.flags == 0, newMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
+                try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
+                try checkLinkParentPolicy(oldMetadata, owner: self.owner, caller: caller)
+                try self.ownerAccess(oldMetadata, inode: oldParent, access: .search, caller: caller)
+                try checkLinkParentPolicy(newMetadata, owner: self.owner, caller: caller)
+                try self.ownerAccess(newMetadata, inode: newParent, access: .search, caller: caller)
+                var found = sfs_entry()
+                let oldStatus = oldBytes.withUnsafeBytes { sfs_image_lookup(h, 0, oldParent, $0.baseAddress, $0.count, &found, &receipt) }
+                try self.check(oldStatus, receipt)
+                guard found.inode == source else { throw POSIXError(.ESTALE) }
+                let newStatus = newBytes.withUnsafeBytes { sfs_image_lookup(h, 0, newParent, $0.baseAddress, $0.count, &found, &receipt) }
+                if newStatus != SFS_NOT_FOUND { try self.check(newStatus, receipt); throw POSIXError(.EEXIST) }
+                guard anchorMatches(receipt, self.anchor) else { let error = POSIXError(.ESTALE); self.latch(error); throw error }
+                let requirements = ResultRequirements(FSRenameItemResult.self), request = try requirements.request()
+                let result = try self.mutate({ h, r in
+                    let status = oldBytes.withUnsafeBytes { old in newBytes.withUnsafeBytes { new in
+                        sfs_image_rename_replace(h, oldParent, old.baseAddress, old.count, source,
+                                                 newParent, new.baseAddress, new.count, 0, &r)
+                    } }
+                    try self.check(status, r)
+                }, prepare: { h, r in
+                    let movedMetadata = try self.transactionMetadata(h, inode: source, receipt: &r)
+                    let sourceParentMetadata = try self.transactionMetadata(h, inode: oldParent, receipt: &r)
+                    let destinationParentMetadata = try self.transactionMetadata(h, inode: newParent, receipt: &r)
+                    var movedEvidence = ParentEvidence(), oldEvidence = ParentEvidence(), newEvidence = ParentEvidence()
+                    let moved = try self.preparedResultAttributes(movedMetadata, request, requirements, parents: &movedEvidence)
+                    let oldDirectory = try self.preparedResultAttributes(sourceParentMetadata, request, requirements, parents: &oldEvidence)
+                    let newDirectory = try self.preparedResultAttributes(destinationParentMetadata, request, requirements, parents: &newEvidence)
+                    let storedName = FSFileName(data: newBytes)
+                    return try self.handlerResult(FSRenameItemResult.self) {
+                        FSRenameItemResult(newName: storedName, renamedItemAttributes: moved, sourceDirectoryAttributes: oldDirectory,
+                                           destinationDirectoryAttributes: newDirectory, overItemAttributes: nil, freeSpace: nil)
+                    }
+                }, receipt: &receipt)
+                reply(result, nil)
+            } catch { reply(nil, error) }
+        }
+    }
+#if STALLION_ADAPTER_CHECK
+    var renamePreflightForTesting: (() -> Void)?
+    func renameResultForTesting(_ item: FSItem, sourceDirectory: FSItem, sourceName: FSFileName,
+                                destinationName: FSFileName, destinationDirectory: FSItem, overItem: FSItem? = nil,
+                                caller: CallerIdentity, reply: @escaping (FSRenameItemResult?, Error?) -> Void) {
+        renameItemHandler(item, sourceDirectory: sourceDirectory, sourceName: sourceName, destinationName: destinationName,
+                          destinationDirectory: destinationDirectory, overItem: overItem, caller: caller, reply: reply)
+    }
+#endif
+#endif
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler: @escaping (FSSetXattrResult?, Error?) -> Void) { refuse { replyHandler(nil, $0) } }
 #endif
 #if STALLION_ADAPTER_CHECK
@@ -1845,6 +2059,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             accountCommit(receipt)
 #if STALLION_ADAPTER_CHECK
             if pendingCreate != nil, status == SFS_OK { createCommitReceiptForTesting?(&receipt) }
+            if removeMutationForTesting, status == SFS_OK {
+                let committedReceipt = receipt
+                removeCommitReceiptForTesting?(committedReceipt, &receipt)
+            }
 #endif
 #else
             let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
