@@ -64,6 +64,7 @@ class NativeSuite(unittest.TestCase):
         self.commands = []
         self.measured = []
         self.fixture_calls = []
+        self.large_fixture_calls = []
         self.cache_calls = []
         self.snapshot_calls = []
         self.snapshot_options = []
@@ -194,7 +195,7 @@ class NativeSuite(unittest.TestCase):
                 'cpu_s': 0.2, 'rss_bytes': 16384, 'io_input_blocks': 0, 'io_output_blocks': 1,
                 'precision_floor': {'wall_s': 1e-9, 'user_s': 0.01, 'system_s': 0.01, 'cpu_s': 0.02}}
 
-    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, digest=None, system='Darwin'):
+    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, digest=None, system='Darwin', free_space=None):
         fixture_names = (fixture,) if fixture_names is None else fixture_names
         argv = ['native_suite.py', *([] if system == 'Linux' else ['--binary', str(self.binary)]), '--scratch', str(self.root),
                 '--output', str(self.output), '--fixtures', *fixture_names, '--copy-tools', *copy_tools,
@@ -226,7 +227,7 @@ class NativeSuite(unittest.TestCase):
                 mock.patch.object(suite.native_fixtures, 'verify_metadata_coverage', side_effect=coverage or self.verify_metadata_coverage),
                 mock.patch.object(suite.fileops, 'no_mounts_below'),
                 mock.patch.object(suite.fileops, 'manifest', side_effect=warm_manifest),
-                mock.patch.object(suite.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(2**60, 0, 2**60)),
+                mock.patch.object(suite.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(2**60, 0, 2**60 if free_space is None else free_space)),
                 mock.patch.object(suite.native_metrics, 'collect', side_effect=collector or self.collect),
                 mock.patch.object(suite.native_correctness, 'snapshot', side_effect=self.snapshot),
                 mock.patch.object(suite.native_correctness, 'compare', side_effect=self.compare),
@@ -239,6 +240,7 @@ class NativeSuite(unittest.TestCase):
             for patch in patches: stack.enter_context(patch)
             if system == 'Linux':
                 def tiny_large(base, name, specification):
+                    self.large_fixture_calls.append((name, dict(specification)))
                     path = base/name; path.write_bytes(b'tiny Linux coordinator fixture')
                     return path
                 read_text = Path.read_text
@@ -254,27 +256,53 @@ class NativeSuite(unittest.TestCase):
         return json.loads(self.output.read_text())
 
     def test_linux_single_native_method_has_twenty_rows_and_descriptive_summaries(self):
-        with mock.patch.object(suite.native_metrics, 'compare_paired', side_effect=AssertionError('Linux must not compare pairs')):
-            report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb')
-        self.assertEqual(self.exit_code, 0)
+        for fixture, specification in (('docs_5k_100mb', {'files': 5000, 'bytes': 100000000}),
+                                       ('dependencies_100k', {'files': 100000, 'bytes': 102400000})):
+            with self.subTest(fixture=fixture), mock.patch.object(suite.native_metrics, 'compare_paired', side_effect=AssertionError('Linux must not compare pairs')):
+                self.output = self.root/(fixture + '.json'); self.measured.clear()
+                report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture=fixture)
+                # The real original specification reaches the generator; this
+                # coordinator test substitutes only a tiny payload, not a 100k run.
+                self.assertEqual(self.large_fixture_calls[-1], (fixture, specification))
+                self.assertEqual(self.exit_code, 0)
+                self.assertTrue(report['passed'])
+                self.assertNotIn('all_metrics_won', report)
+                self.assertNotIn('binary', report['selection'])
+                self.assertNotIn('version', report)
+                self.assertEqual(len(report['rows']), 20)
+                for phase in ('timing', 'resources'):
+                    rows = [row for row in report['rows'] if row['phase'] == phase]
+                    self.assertEqual([row['sample'] for row in rows], list(range(10)))
+                    self.assertEqual({row['method'] for row in rows}, {'gnu-cp'})
+                    self.assertTrue(all(row['fixture'] == fixture and row['validated'] and row['source_unchanged']
+                                        and 'pair_id' not in row for row in rows))
+                base = Path(report['fixture_root'])
+                self.assertEqual(self.measured, [['/bin/cp', '-a', '--reflink=never', '--',
+                                                 str(base/fixture), str(base/'destination')]] * 20)
+                self.assertEqual(len(report['comparisons']), 2)
+                self.assertTrue(all(row['complete'] and row['kind'] == 'descriptive' for row in report['comparisons']))
+                self.assertEqual(report['comparisons'][0]['metrics']['wall_s']['n'], 10)
+                self.assertEqual(set(report['executables']), {'/bin/cp', '/usr/bin/time', '/usr/sbin/zfs'})
+                self.assertEqual(report['environment']['memory_bytes'], 4*1024**3)
+                self.assertEqual(report['environment']['host_storage'], 'unobserved by guest')
+                self.assertFalse(any(str(self.binary) in argv for argv in self.commands))
+
+    def test_linux_dependencies_reserve_boundary_precedes_generation(self):
+        with self.assertRaisesRegex(RuntimeError, 'Insufficient space for dependencies_100k'):
+            self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',),
+                           fixture='dependencies_100k', free_space=3171483647)
+        self.assertEqual(self.large_fixture_calls, [])
+        self.assertEqual(self.metadata_calls, [])
+        self.assertEqual(self.measured, [])
+        self.output = self.root/'reserve-admitted.json'
+        report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',),
+                                fixture='dependencies_100k', free_space=3171483648)
         self.assertTrue(report['passed'])
-        self.assertNotIn('all_metrics_won', report)
-        self.assertNotIn('binary', report['selection'])
-        self.assertNotIn('version', report)
-        self.assertEqual(len(report['rows']), 20)
-        for phase in ('timing', 'resources'):
-            rows = [row for row in report['rows'] if row['phase'] == phase]
-            self.assertEqual([row['sample'] for row in rows], list(range(10)))
-            self.assertEqual({row['method'] for row in rows}, {'gnu-cp'})
-            self.assertTrue(all('pair_id' not in row for row in rows))
-        self.assertTrue(all(argv[:4] == ['/bin/cp', '-a', '--reflink=never', '--'] and len(argv) == 6 for argv in self.measured))
-        self.assertEqual(len(report['comparisons']), 2)
-        self.assertTrue(all(row['complete'] and row['kind'] == 'descriptive' for row in report['comparisons']))
-        self.assertEqual(report['comparisons'][0]['metrics']['wall_s']['n'], 10)
-        self.assertEqual(set(report['executables']), {'/bin/cp', '/usr/bin/time', '/usr/sbin/zfs'})
-        self.assertEqual(report['environment']['memory_bytes'], 4*1024**3)
-        self.assertEqual(report['environment']['host_storage'], 'unobserved by guest')
-        self.assertFalse(any(str(self.binary) in argv for argv in self.commands))
+        self.assertEqual(self.exit_code, 0)
+        self.assertEqual(self.large_fixture_calls, [('dependencies_100k', {'files': 100000, 'bytes': 102400000})])
+        self.assertEqual(len(self.metadata_calls), 1)
+        self.assertEqual(len(self.coverage_calls), 1)
+        self.assertEqual(len(self.measured), 20)
 
     def test_linux_required_reflink_has_separate_api_and_pool_evidence(self):
         def no_darwin_sharing(*_args):
@@ -444,11 +472,21 @@ class NativeSuite(unittest.TestCase):
 
     def test_linux_unsupported_selections_fail_before_artifacts_or_commands(self):
         for options in ({'fixture': 'tiny_4kib'}, {'operations': ('scan',)}, {'operations': ('clone',)},
+                        {'fixture': 'git_50k_2gb'}, {'fixture': 'cache_200k_10gb'}, {'fixture': 'dataset_2k_50gb'},
+                        {'fixture': 'dependencies_100k', 'operations': ('clone',), 'copy_tools': ('cp-clone',)},
+                        {'fixture_names': ('docs_5k_100mb', 'dependencies_100k')},
                         {'operations': ('clone', 'copy'), 'copy_tools': ('cp-clone', 'cp')},
                         {'operations': ('move',)}, {'operations': ('delete',)}, {'cache': ('cold',)},
                         {'copy_tools': ('cp-clone',)}, {'extra': ('--jobs', '1')},
                         {'extra': ('--runs', '2')}, {'extra': ('--samples', '11')},
-                        {'extra': ('--binary', str(self.binary))}):
+                        {'extra': ('--binary', str(self.binary))},
+                        {'fixture': 'dependencies_100k', 'cache': ('cold',)},
+                        {'fixture': 'dependencies_100k', 'extra': ('--runs', '2')},
+                        {'fixture': 'dependencies_100k', 'extra': ('--jobs', '1')},
+                        {'fixture': 'dependencies_100k', 'extra': ('--binary', str(self.binary))},
+                        {'fixture': 'dependencies_100k', 'extra': ('--node', str(self.binary))},
+                        {'fixture': 'dependencies_100k', 'extra': ('--npm', str(self.binary))},
+                        {'fixture': 'dependencies_100k', 'extra': ('--npm-cache', str(self.root))}):
             defaults = {'system': 'Linux', 'operations': ('copy',), 'copy_tools': ('cp',), 'fixture': 'docs_5k_100mb'}
             with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, 'Linux admits only'):
                 self.run_suite(**(defaults | options))
@@ -464,7 +502,7 @@ class NativeSuite(unittest.TestCase):
             row = collect(argv, **kwargs)
             row['ok'] = False
             return row
-        report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', collector=failure)
+        report = self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='dependencies_100k', collector=failure)
         self.assertEqual(self.exit_code, 1)
         self.assertFalse(report['passed'])
         self.assertEqual(len(report['rows']), 1)
@@ -475,7 +513,7 @@ class NativeSuite(unittest.TestCase):
     def test_linux_qualification_failure_retains_fixture_before_measurement(self):
         def unavailable(*_args): raise RuntimeError('POSIX ACL or sparse hole unavailable')
         with self.assertRaisesRegex(RuntimeError, 'POSIX ACL or sparse hole unavailable'):
-            self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', coverage=unavailable)
+            self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='dependencies_100k', coverage=unavailable)
         report = json.loads(self.output.read_text())
         self.assertTrue(Path(report['retained_fixture']).is_dir())
         self.assertFalse(report['passed'])
@@ -490,7 +528,7 @@ class NativeSuite(unittest.TestCase):
                 else: Path(argv[-2]).write_bytes(b'source changed')
                 return row
             with self.subTest(failure=failure), self.assertRaises(RuntimeError):
-                self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='docs_5k_100mb', collector=collect)
+                self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='dependencies_100k', collector=collect)
             report = json.loads(self.output.read_text())
             self.assertTrue(Path(report['retained_fixture']).is_dir())
             self.assertFalse(report.get('cleanup_passed', False))
