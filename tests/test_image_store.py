@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from stallionfs.core import StallionError, Store, git, read_json, remove_tree, write_json
 if __package__:
-    from .image_failure_diagnostics import failure_scope
+    from .image_failure_diagnostics import failure_scope, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope
+    from image_failure_diagnostics import failure_scope, observe_seed_create
 
 
 class ImageFixture:
@@ -234,7 +234,8 @@ class ImageStoreTests(unittest.TestCase):
             (source / "file").write_text("original\n")
             git(source, "add", ".")
             git(source, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Fixture")
-            seed = fixture.call(store.prepare, source, key="image-lifecycle", image_size=1)
+            with observe_seed_create(base):
+                seed = fixture.call(store.prepare, source, key="image-lifecycle", image_size=1)
             workspace = fixture.call(store.create, seed["id"])
             value, repo = workspace["id"], Path(workspace["path"])
             (repo / "file").write_text("snapshot state\n")

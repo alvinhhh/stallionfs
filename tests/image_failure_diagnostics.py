@@ -1,4 +1,4 @@
-"""Bounded image-test observations around explicitly selected detach operations."""
+"""Bounded image-test observations around explicitly selected native operations."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import patch
 
 ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64 * 1024
 BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
@@ -33,7 +34,262 @@ _fields = {
 _fields['observation'] = _fields['failure']
 _scope = ContextVar("image_failure_scope", default=None)
 _detach_observation = ContextVar("image_detach_observation", default=None)
+_create_scope = ContextVar("image_create_observation", default=None)
+_create_patch_lock = threading.Lock()
+_active_create = None
 _device = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
+
+
+@contextmanager
+def observe_seed_create(base):
+    """Select only the initial seed creation in the snapshot/rollback fixture."""
+    previous = _create_scope.get()
+    if previous is not None:
+        previous['disabled'] = True
+        active = _active_create
+        if active is not None:
+            active.disarm()
+        yield
+        return
+    token = _create_scope.set(dict(base=Path(base), used=False, disabled=False))
+    try:
+        yield
+    finally:
+        _create_scope.reset(token)
+
+
+class CreateObservation:
+    """Status only; the ordinary communicate remains the pipe reader and waiter."""
+    def __init__(self, argv):
+        self.argv, self.owner = argv, threading.get_ident()
+        self.child = self.thread = None
+        self.ready, self.done, self.disarmed = (threading.Event() for _ in range(3))
+        self.query_stopped = threading.Event()
+        self.gate = threading.Lock()
+        self.in_flight = False
+        self.query_uncertain = self.shutdown_uncertain = False
+        self.outcome = 'pending'
+        self.start = None
+        self.records = self.bytes = 0
+        self.write_unavailable = False
+
+    def constructor_entry(self, child, args, kwargs):
+        argv = args[0] if args else kwargs.get('args')
+        if (self.child is None and threading.get_ident() == self.owner and
+                isinstance(argv, (list, tuple)) and tuple(argv) == self.argv):
+            self.child = child
+        else:
+            # Before the foreign constructor can spawn or reap anything.
+            self.disarm()
+
+    def disarm(self):
+        self.disarmed.set()
+        self.stop_queries()
+
+    def launch(self):
+        try:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        except Exception:
+            self.shutdown_uncertain = True
+            self.thread = None
+
+    def communicating(self, child):
+        if child is self.child:
+            self.start = time.monotonic()
+            self.ready.set()
+
+    def stop_queries(self):
+        # Never wait for a query/property/log write to finish before stopping.
+        self.query_stopped.set()
+        if self.gate.acquire(blocking=False):
+            try:
+                if self.in_flight:
+                    self.query_uncertain = True
+            finally:
+                self.gate.release()
+        else:
+            self.query_uncertain = True
+
+    def close(self):
+        self.stop_queries()
+        self.done.set()
+        self.ready.set()
+        if self.thread is not None:
+            try:
+                self.thread.join(0.05)
+                self.shutdown_uncertain |= self.thread.is_alive()
+            except Exception:
+                self.shutdown_uncertain = True
+
+    def _emit(self, phase, **values):
+        # Called only by the daemon. No TextIO lock, flush, retry or fd mutation.
+        if self.write_unavailable or self.records >= 4:
+            return
+        data = (json.dumps(dict(kind='create_status', phase=phase, **values),
+                           sort_keys=True) + '\n').encode('ascii')
+        if len(data) > 1024 or self.bytes + len(data) > 4096:
+            self.write_unavailable = True
+            return
+        self.records += 1
+        self.bytes += len(data)
+        try:
+            self.write_unavailable = os.write(2, data) != len(data)
+        except Exception:
+            self.write_unavailable = True
+
+    def _sample(self):
+        unknown = dict(state='unknown', byte_counts='unobserved', eof='unobserved',
+                       api='unobserved', returncode_before=None, returncode_after=None)
+        child = self.child
+        try:
+            before = child.returncode
+            unknown['returncode_before'] = before
+            closed = dict(stdout_closed=child.stdout.closed, stderr_closed=child.stderr.closed)
+            if before is not None:
+                return unknown | closed
+            required = ('waitid', 'P_PID', 'WEXITED', 'WNOHANG', 'WNOWAIT')
+            if not all(hasattr(os, name) for name in required):
+                return unknown | closed | dict(api='unavailable', reason='api_unavailable')
+            unknown['api'] = 'available'
+            pid = child.pid
+            # Properties above may block: recheck at the final query admission.
+            with self.gate:
+                if self.query_stopped.is_set() or self.disarmed.is_set():
+                    return unknown | closed | dict(reason='stopped_or_disarmed')
+                self.in_flight = True
+            try:
+                status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            finally:
+                with self.gate:
+                    if self.query_stopped.is_set() or self.disarmed.is_set():
+                        self.query_uncertain = True
+                    self.in_flight = False
+            after = child.returncode
+            unknown['returncode_after'] = after
+            if self.query_stopped.is_set() or self.disarmed.is_set() or after is not None:
+                return unknown | closed | dict(reason='completion_or_disarm_race')
+            if status is None:
+                return unknown | closed | dict(state='no_exit_observed')
+            if status.si_pid != pid:
+                return unknown | closed | dict(reason='identity_mismatch')
+            codes = {getattr(os, 'CLD_EXITED', None): 'exit',
+                     getattr(os, 'CLD_KILLED', None): 'signal',
+                     getattr(os, 'CLD_DUMPED', None): 'signal_core'}
+            category = codes.get(status.si_code)
+            if category is None:
+                return unknown | closed | dict(reason='unknown_status_code')
+            return unknown | closed | dict(state='exited_status_observed', category=category,
+                                          status=status.si_status)
+        except Exception:
+            return unknown | dict(reason='observation_unavailable')
+
+    def _run(self):
+        try:
+            self._emit('start', elapsed_seconds=0)
+            self.ready.wait()
+            if not self.done.is_set():
+                for checkpoint in (60, 120):
+                    if self.done.wait(max(0, self.start + checkpoint - time.monotonic())):
+                        break
+                    sample = self._sample()
+                    if self.done.is_set():
+                        break
+                    self._emit(str(checkpoint), elapsed_seconds=max(0, time.monotonic() - self.start), **sample)
+            self.done.wait()
+            self._emit('finish', outcome=self.outcome, query_uncertain=self.query_uncertain,
+                       disarmed=self.disarmed.is_set(), elapsed_seconds=None if self.start is None
+                       else max(0, time.monotonic() - self.start))
+        except Exception:
+            self.write_unavailable = True
+
+
+def _observed_create(original, args):
+    global _active_create
+    scope = _create_scope.get()
+    if scope is None or scope['used'] or scope['disabled']:
+        return original(*args, '-verbose')
+    scope['used'] = True
+    try:
+        base, image = scope['base'], Path(args[-1])
+        _private(base, True)
+        _private(image.parent, True)
+        if (base.resolve() != base or image.resolve() != image or
+                image.parent.parent != base / 'store' / 'staging' or
+                not image.parent.name.startswith('build-') or image.name != 'workspace.sparseimage'):
+            raise ValueError('unbound creation')
+    except Exception:
+        return original(*args, '-verbose')
+    if not _create_patch_lock.acquire(blocking=False):
+        active = _active_create
+        if active is not None:
+            active.disarm()
+        return original(*args, '-verbose')
+    try:
+        saved = subprocess.Popen
+        try:
+            observation = CreateObservation(tuple(str(arg) for arg in (*args, '-verbose')))
+
+            class ObservedPopen(saved):
+                def __init__(self, *argv, **kwargs):
+                    try:
+                        observation.constructor_entry(self, argv, kwargs)
+                    except Exception:
+                        observation.disarm()
+                    super().__init__(*argv, **kwargs)
+
+                def communicate(self, *argv, **kwargs):
+                    selected = self is observation.child
+                    if selected:
+                        try:
+                            observation.communicating(self)
+                        except Exception:
+                            observation.disarm()
+                    try:
+                        return super().communicate(*argv, **kwargs)
+                    finally:
+                        if selected:
+                            try:
+                                observation.stop_queries()
+                            except Exception:
+                                observation.query_uncertain = True
+
+            patcher = patch.object(subprocess, 'Popen', ObservedPopen)
+            patcher.__enter__()
+        except Exception:
+            # Setup failure must not prevent or repeat the requested command.
+            subprocess.Popen = saved
+            return original(*args, '-verbose')
+        _active_create = observation
+        try:
+            try:
+                observation.launch()
+            except Exception:
+                observation.shutdown_uncertain = True
+            try:
+                result = original(*args, '-verbose')
+                observation.outcome = 'returned'
+                return result
+            except BaseException:
+                observation.outcome = 'raised'
+                raise
+            finally:
+                try:
+                    observation.close()
+                except Exception:
+                    observation.shutdown_uncertain = True
+                    observation.query_uncertain = True
+                    observation.query_stopped.set()
+                    observation.done.set()
+                    observation.ready.set()
+        finally:
+            try:
+                patcher.__exit__(None, None, None)
+            except Exception:
+                subprocess.Popen = saved
+    finally:
+        _active_create = None
+        _create_patch_lock.release()
 
 
 @contextmanager
@@ -658,6 +914,8 @@ def install(images, directory):
             if 'start_ns' not in observation:
                 observation['start_ns'], observation['start_mono'] = time.time_ns(), time.monotonic()
         try:
+            if args[1] == 'create':
+                return _observed_create(original, args)
             return original(*args, '-verbose')
         except Exception as error:
             if observation is not None:
