@@ -33,7 +33,9 @@ class NativeScripts(build_scripts):
 
 setup(
     ext_modules=[Extension("stallionfs._scan", ["stallionfs/_scan.c", "stallionfs/_tree.c", "stallionfs/_walk.c"],
-                           depends=[HEADER], extra_compile_args=FLAGS)],
+                           depends=[HEADER], extra_compile_args=FLAGS),
+                 Extension("stallionfs._image", ["stallionfs/_image.c", "filesystem/image.c"],
+                           include_dirs=["filesystem"], depends=["filesystem/image.h"], extra_compile_args=FLAGS)],
     scripts=["stallionfs/_main.c"],
     cmdclass={"build_scripts": NativeScripts},
 )

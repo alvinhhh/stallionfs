@@ -42,3 +42,47 @@ Mutable lifecycle and journal finalization use atomic replacement of a complete 
 Cooperative folder sessions persist their opt-in against the current lifecycle generation before command launch. Cleanup apply and the post-run observer can record the first free-lease observation only under the use lease and workspace lock, after checking generation, enrollment, identity, folder backend, and the absence of a pending rollback journal. They never infer closure from PID disappearance. Ordinary reopen replaces the generation and clears the opt-in. A seven-day idle grace reuses the protected retirement path; it adds no permanent deletion path.
 
 Cleanup and idle observation take a shared store lock before each workspace's use lease, reread the policy, and retain the store lock through that item's checks and changes. Disabling cleanup waits for an active item to finish and prevents later items from starting. Opportunistic passes attempt eight valid workspace ID names in lexical order, starting after the saved cursor and wrapping safely when names disappear. Cursor updates take the exclusive store lock after workspace locks are released, preserve the current settings, and apply only if the observed cursor still matches. Explicit preview and apply scan the full collection. Preview neither observes idle state nor advances the cursor; cleanup and idle observation leave pending rollback journals unchanged.
+## Native image registrations
+
+Native registrations contain metadata referencing an external backing file.
+They are not folder workspaces or APFS sparse-image copies. Their snapshots and
+recovery roots remain in the native image's authoritative catalog; no host
+snapshot index or whole-file exchange is used. Existing protected cleanup for
+folder/APFS workspaces remains separate. Native registrations are ineligible for
+cleanup and cannot authorize deletion of external backing data.
+
+Native snapshot, listing and restore hold their managed-use lease, workspace lock, canonical
+parent guard and one core backing-inode lock through commit/abort and consumed
+close. They recheck registered parent/file device-inode identity and image UUID.
+Registration inspects the external image under the core lock before creating its
+managed ID and writes only the external-reference metadata.
+The current known FSKit loader opens through that same core lock; actual mounted
+drain, kernel writeback, cache invalidation and reactivation remain unqualified.
+This cooperative storage model does not contain adversarial same-user path
+changes or programs writing without the core lock. The immediate parent's ACL
+is checked; there is no claim that every ancestor is symlink-free.
+
+Restore uses ordinary ROOT_ONLY integrity checks, preserves retained snapshots
+and inode high-water, and adds the prior current as a recovery root in one
+unchanged two-fence transaction. It does not certify unread payloads or reclaim
+append capacity. Full reachable verification remains a separate operation.
+`committed_end` is the selected committed extent; `physical_end` can also include
+staged or aborted append data. A successful close is not a commit certificate.
+
+Production restore budgets allow 512 MiB each of metadata reads and hashes and
+50 million checks. RAW/auxiliary dimensions are positive but unused. Exhaustion
+reports the actual INCOMPLETE reason without automatic enlargement/retry. The
+bridge holds the GIL and checks Python signals and a 30-second cooperative
+deadline before commit; blocking I/O and the commit itself may outlast it.
+Cancellation before publication aborts only the owned transaction. Signals or
+response-allocation failure after commit preserve the actual operation and
+cleanup receipts and recovery name when a response can be delivered. A pending
+signal never replaces known commit state or triggers an automatic rollback.
+
+An unknown final-fence outcome belongs to that invocation. No separate global
+uncertainty ledger is created. A later explicit call freshly validates both
+slots/current ROOT_ONLY state; healthy reopen is an observation, not retroactive
+proof that an earlier fence completed. Malformed pairs refuse normal admission.
+Physical power-loss recovery, native lifecycle cleanup, installed mounting and
+performance acceptance require separate qualification.
+

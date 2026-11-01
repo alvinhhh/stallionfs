@@ -1314,6 +1314,19 @@ enum sfs_status sfs_image_snapshot_view(sfs_image *h, const void *name, size_t l
     for (unsigned i = 0; i < h->live.count; ++i) if (h->live.snapshots[i].length == length && !memcmp(h->live.snapshots[i].name, name, length)) { *out = h->live.snapshots[i].view; result(h, SFS_OK, SFS_PHASE_NONE, 0, r); if (r) r->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK; }
     return result(h, SFS_NOT_FOUND, SFS_PHASE_NONE, 0, r);
 }
+enum sfs_status sfs_image_snapshot_at(sfs_image *h, uint32_t index, sfs_snapshot_entry *out, int *found, sfs_result *r) {
+    enum sfs_status e = ready(h, 0, 0, r); if (e) return e;
+    if (!out || !found) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, r);
+    int present = index < h->live.count;
+    if (present) {
+        const snapshot *snap = &h->live.snapshots[index];
+        sfs_snapshot_entry entry = { .view = snap->view, .name_length = snap->length };
+        memcpy(entry.name, snap->name, entry.name_length); *out = entry;
+    }
+    *found = present; result(h, SFS_OK, SFS_PHASE_NONE, 0, r);
+    if (r) r->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+}
 enum sfs_status sfs_image_stat(sfs_image *h, sfs_view view, sfs_inode id, sfs_entry *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
@@ -2012,6 +2025,66 @@ enum sfs_status sfs_image_snapshot(sfs_image *h, const void *name, size_t length
     int error = r.error; arena_free(a); if (e) return mutation_failure(h, e, r.phase, error, late, result_out);
     if (remaining) return mutation_failure(h, SFS_CORRUPT, r.phase, 0, late, result_out);
     h->staged.catalog = root; h->staged.snapshots[h->staged.count++] = snap; *out = snap.view; result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+}
+
+enum sfs_status sfs_image_prepare_restore(sfs_image *h, sfs_view view, const void *name, size_t length,
+                                        const sfs_verify_budget *budget, sfs_view *out, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 1, 0, result_out); if (e) return e;
+    if (h->transaction || h->batch) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, result_out);
+    if (h->pins) {
+        if (h->pins->changed != PIN_NONE) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, result_out);
+        for (uint32_t i = 0; i < h->pins->count; ++i)
+            if (h->pins->slots[i].state != PIN_FREE) return result(h, SFS_BUSY, SFS_PHASE_NONE, 0, result_out);
+    }
+    if (!out || !view || !valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    h->limit_reason = SFS_LIMIT_STRUCTURE; e = input_name(h, name, length, result_out); if (e) return e;
+    if (h->current.generation == UINT64_MAX || h->epoch == UINT64_MAX) return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    sfs_verify_budget remaining_budget = *budget; reader rd = current_reader(h, 0); rd.budget = &remaining_budget; cache_clear(h);
+    state verified; namespace target_ns; int selected = -1;
+    e = reconcile(&rd, &verified);
+    if (!e) {
+        for (unsigned i = 0; i < verified.count; ++i) {
+            if (verified.snapshots[i].view == view) selected = (int)i;
+            if (verified.snapshots[i].length == length && !memcmp(verified.snapshots[i].name, name, length))
+                return result(h, SFS_EXISTS, SFS_PHASE_NONE, 0, result_out);
+        }
+        if (selected < 0) return result(h, SFS_NOT_FOUND, SFS_PHASE_NONE, 0, result_out);
+        if (verified.count == SFS_SNAPSHOT_MAX || verified.snapshots[verified.count - 1].view == SFS_SNAPSHOT_MAX)
+            return result(h, SFS_LIMIT, SFS_PHASE_ADMISSION, 0, result_out);
+        e = namespace_read(&rd, verified.snapshots[selected].ns, verified.catalog.offset, &target_ns);
+    }
+    if (!e && stable(h)) e = io_failure(&rd, SFS_PHASE_IDENTITY);
+    if (e) {
+        read_result(h, e, rd.phase, e == SFS_IO || e == SFS_RECOVERY_REQUIRED ? rd.error : e == SFS_NOMEM ? ENOMEM : 0, result_out);
+        if (result_out && e == SFS_INCOMPLETE) result_out->incomplete_reason = rd.incomplete;
+        return e;
+    }
+    state candidate = verified; candidate.ns = target_ns;
+    if (candidate.ns.next_inode < verified.ns.next_inode) candidate.ns.next_inode = verified.ns.next_inode;
+    snapshot snap = { .view = verified.snapshots[verified.count - 1].view + 1,
+                      .length = (uint32_t)length, .ns = verified.ns.ref }; memcpy(snap.name, name, length);
+    uint8_t row[MAX_ROW] = {0}; put32(row, snap.view); encode_ref(row + 8, &snap.ns); put32(row + 64, snap.length); memcpy(row + 68, snap.name, length);
+    e = sfs_image_begin(h, result_out); if (e) return e;
+    reader r = current_reader(h, 1); int late = 0; arena *a = arena_new(h, 0);
+    if (!a) { e = SFS_NOMEM; goto failed; }
+    tree catalog = make_tree(a, &r, verified.catalog, MAP_SNAPSHOT, 0, UINT64_MAX, UINT64_MAX);
+    e = tree_put(&catalog, row); if (e) goto failed;
+    uint64_t cells = pending_cells(&catalog), remaining = cells + 1;
+    if (!reserve_cells(h, cells + 2)) { e = SFS_LIMIT; goto failed; }
+    late = 1; r.phase = SFS_PHASE_RECORDS;
+    e = write_namespace(h, &candidate.ns, &remaining); if (e) { if (e == SFS_IO) r.error = errno; goto failed; }
+    e = seal_tree(&catalog, &candidate.catalog, &remaining); if (e) { if (e == SFS_IO) r.error = errno; goto failed; }
+    if (remaining) { e = SFS_CORRUPT; goto failed; }
+    candidate.snapshots[candidate.count++] = snap; h->staged = candidate; arena_free(a); *out = snap.view;
+    result(h, SFS_OK, SFS_PHASE_NONE, 0, result_out); if (result_out) result_out->coverage = SFS_COVERAGE_TOUCHED; return SFS_OK;
+failed:
+    arena_free(a); mutation_failure(h, e, r.phase, r.error, late, result_out);
+    /* Admission refused every caller-owned transaction; only this fresh one
+     * can remain after an early allocation failure. Keep its primary receipt. */
+    if (h->transaction) discard(h);
+    if (result_out) result_out->transaction_active = h->transaction;
+    return e;
 }
 
 static void release_clean(tree *t, unsigned id) {
