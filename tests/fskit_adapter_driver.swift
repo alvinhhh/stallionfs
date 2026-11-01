@@ -269,8 +269,8 @@ func generalNamespaceChecks(_ parent: URL) throws {
         var h: OpaquePointer?, r = sfs_result(), info = sfs_image_information()
         need(sfs_image_open_readonly(url.path, "image.sfs", &h, &r) == SFS_OK, "general open")
         need(sfs_image_get_information(h, &info, &r) == SFS_OK && info.minor == 6, "general information")
-        let v = StallionVolume(handle: h!, resource: FSPathURLResource(url: url, writable: false), scope: false,
-                              anchor: info.committed, queue: DispatchQueue(label: "sfs.general"), itemLimit: 2)
+        let v = StallionVolume(admission: .forTesting(handle: h!, anchor: info.committed), resource: FSPathURLResource(url: url, writable: false), scope: false,
+                              queue: DispatchQueue(label: "sfs.general"), itemLimit: 2)
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
         need(activated.0 != nil && activated.1 == nil, "general activation")
         let mounted: Error? = wait { v.mount(arguments: [], replyHandler: $0) }; need(mounted == nil, "general mount")
@@ -385,7 +385,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(sfs_image_open_readonly(url.path, "image.sfs", &handle, &r) == SFS_OK && handle != nil && anchorMatches(r), "real readonly admission")
         need(r.coverage == SFS_COVERAGE_ROOT_ONLY, "root-only admission")
         let queue = DispatchQueue(label: "sfs.offline")
-        let volume = StallionVolume(handle: handle!, resource: path, scope: false, anchor: r, queue: queue)
+        let volume = StallionVolume(admission: .forTesting(handle: handle!, anchor: r), resource: path, scope: false, queue: queue)
         let inactive: Error? = wait { done in volume.mount(arguments: [], replyHandler: done) }
         need(inactive != nil, "inactive mount refused")
         let rootReply: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
@@ -565,8 +565,8 @@ func generalNamespaceChecks(_ parent: URL) throws {
         var poisonedHandle: OpaquePointer?, poisonedAnchor = sfs_result()
         need(sfs_image_open_readonly(url.path, "image.sfs", &poisonedHandle, &poisonedAnchor) == SFS_OK &&
              poisonedHandle != nil && anchorMatches(poisonedAnchor), "fatal case readonly admission")
-        let poisoned = StallionVolume(handle: poisonedHandle!, resource: path, scope: false,
-                                      anchor: poisonedAnchor, queue: DispatchQueue(label: "sfs.offline.fatal"))
+        let poisoned = StallionVolume(admission: .forTesting(handle: poisonedHandle!, anchor: poisonedAnchor), resource: path, scope: false,
+                                      queue: DispatchQueue(label: "sfs.offline.fatal"))
         let poisonRoot: (FSItem?, Error?) = wait { done in poisoned.activate { done(($0, $1)) } }
         need(poisonRoot.0 != nil && poisonRoot.1 == nil, "fatal case activation")
         let poisonMount: Error? = wait { done in poisoned.mount(arguments: [], replyHandler: done) }
@@ -610,8 +610,8 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(sfs_image_open_readonly(url.path, "image.sfs", &prefixHandle, &prefixAnchor) == SFS_OK &&
              prefixHandle != nil && anchorMatches(prefixAnchor), "prefix case readonly admission")
         let borrowedPrefixHandle = prefixHandle!
-        let prefixVolume = StallionVolume(handle: borrowedPrefixHandle, resource: path, scope: false,
-                                          anchor: prefixAnchor, queue: DispatchQueue(label: "sfs.offline.prefix"))
+        let prefixVolume = StallionVolume(admission: .forTesting(handle: borrowedPrefixHandle, anchor: prefixAnchor), resource: path, scope: false,
+                                          queue: DispatchQueue(label: "sfs.offline.prefix"))
         let prefixRoot: (FSItem?, Error?) = wait { done in prefixVolume.activate { done(($0, $1)) } }
         need(prefixRoot.0 != nil && prefixRoot.1 == nil, "prefix case activation")
         let prefixMount: Error? = wait { done in prefixVolume.mount(arguments: [], replyHandler: done) }
