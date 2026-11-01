@@ -218,8 +218,9 @@ static int same_acl(int input, int output) {
     errno = error;
     return error ? -1 : 0;
 }
-/* Check silent xattr skips without rereading ordinary values or resource forks. */
+/* Verify ordinary xattr bytes; resource forks retain length and callback checks. */
 static int same_xattrs(int input, int output, const struct copy_progress *progress) {
+    unsigned char source_inline[256], destination_inline[256];
     ssize_t length = flistxattr(input, NULL, 0, XATTR_SHOWCOMPRESSION);
     if (length < 0) return -1;
     char *names = malloc((size_t)length + 1);
@@ -237,6 +238,45 @@ static int same_xattrs(int input, int output, const struct copy_progress *progre
         size_t remaining = (size_t)(length - offset), size = strnlen(name, remaining);
         if (!size || size == remaining) { error = EIO; break; }
         offset += (ssize_t)size + 1;
+        if (strcmp(name, "com.apple.quarantine") && strcmp(name, "com.apple.ResourceFork")) {
+            count++;
+            unsigned char *allocated = NULL;
+            unsigned char *source_value = source_inline, *destination_value = destination_inline;
+            errno = 0;
+            ssize_t a = fgetxattr(input, name, source_value, sizeof(source_inline), 0, XATTR_SHOWCOMPRESSION);
+            if (a < 0 && errno == ERANGE) {
+                errno = 0;
+                a = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+                if (a < 0) error = errno ? errno : EIO;
+                else if ((size_t)a <= sizeof(source_inline)) error = ESTALE;
+                else if ((uintmax_t)a > SIZE_MAX / 2) error = EOVERFLOW;
+                else {
+                    errno = 0;
+                    allocated = malloc((size_t)a * 2);
+                    if (!allocated) error = errno ? errno : ENOMEM;
+                    else {
+                        source_value = allocated;
+                        destination_value = allocated + (size_t)a;
+                        errno = 0;
+                        ssize_t actual = fgetxattr(input, name, source_value, (size_t)a, 0, XATTR_SHOWCOMPRESSION);
+                        if (actual < 0) error = errno ? errno : EIO;
+                        else if (actual != a) error = ESTALE;
+                    }
+                }
+            } else if (a < 0) error = errno ? errno : EIO;
+            else if ((size_t)a > sizeof(source_inline)) error = ESTALE;
+            if (!error) {
+                errno = 0;
+                size_t capacity = allocated ? (size_t)a : sizeof(destination_inline);
+                ssize_t b = fgetxattr(output, name, destination_value, capacity, 0, XATTR_SHOWCOMPRESSION);
+                if (b < 0) error = errno ? errno : EIO;
+                else if (b != a) error = allocated ? ESTALE : ENOTSUP;
+            }
+            if (!error && memcmp(source_value, destination_value, (size_t)a)) error = ENOTSUP;
+            free(allocated);
+            continue;
+        }
+        /* Resource forks retain length and callback verification; quarantine also checks bytes. */
         ssize_t a = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
         if (a < 0) { error = errno; break; }
         ssize_t b = fgetxattr(output, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
@@ -302,6 +342,13 @@ static int ordinary_metadata(int input, int output, const struct stat *identity,
     if (!copy) return -1;
     if (copyfile_state_set(copy, COPYFILE_STATE_STATUS_CB, (void *)copy_status) ||
         copyfile_state_set(copy, COPYFILE_STATE_STATUS_CTX, progress)) error = errno;
+    /* Set tracking before copied ownership, ACLs, or immutable flags can prevent it. */
+    if (!error && (before.st_flags & UF_TRACKED)) {
+        if (fstat(output, &destination)) error = errno;
+        else if (!(destination.st_flags & UF_TRACKED) &&
+            fchflags(output, destination.st_flags | UF_TRACKED)) error = errno;
+        flags |= COPYFILE_PRESERVE_DST_TRACKED;
+    }
     if (!error && fcopyfile(input, output, copy, flags)) error = progress->error ? progress->error : errno;
     if (copyfile_state_free(copy) && !error) error = errno;
     if (!error && copy_stopped(progress)) error = progress->error;

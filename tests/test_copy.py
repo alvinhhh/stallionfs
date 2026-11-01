@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 
+UF_TRACKED = getattr(stat, 'UF_TRACKED', 0x00000040)
 MACOS_13 = sys.platform == 'darwin' and int(platform.mac_ver()[0].split('.')[0]) >= 13
 
 
@@ -95,6 +96,68 @@ class OrdinaryCopy(unittest.TestCase):
         self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
         destination.write_bytes(b'changed')
         self.assertEqual(source.read_bytes(), bytes(range(256)) * 16)
+
+    def test_tracked_files_preserve_flags_for_each_mode_and_entrypoint(self):
+        for flags in (0, UF_TRACKED):
+            for mode in (0o600, 0o640, 0o644):
+                source = self.base / f'source-{flags}-{mode:o}'
+                source.mkdir(mode=0o750)
+                file = source / 'data'
+                file.write_bytes(bytes(range(256)) * 16)
+                file.chmod(mode)
+                os.chflags(file, flags)
+                os.utime(file, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
+                for kind, operand in (('file', file), ('tree', source)):
+                    with self.subTest(flags=flags, mode=oct(mode), kind=kind):
+                        before = self.checks.snapshot(operand)
+                        destination = self.base / f'copy-{flags}-{mode:o}-{kind}'
+                        self.copy(operand, destination, jobs=1)
+                        self.assert_preserved(before, destination)
+                        self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(operand))['unchanged'])
+
+    def test_tracked_tree_preserves_metadata_hardlinks_and_blocking_flags(self):
+        source = self.base / 'source'
+        source.mkdir(mode=0o750)
+        nested = source / 'nested'
+        nested.mkdir()
+        file = nested / 'data'
+        file.write_bytes(bytes(range(256)) * 16)
+        os.link(file, nested / 'alias')
+        outside = self.base / 'outside'
+        outside.write_bytes(b'outside remains unchanged')
+        link = nested / 'link'
+        link.symlink_to(outside)
+        receipt = self.fixtures.enrich_metadata(source, receipt={})
+        for path in (source, nested, file, link):
+            try:
+                os.chflags(path, path.lstat().st_flags | UF_TRACKED, follow_symlinks=False)
+            except OSError as error:
+                self.skipTest(f'Tracked {"symlink" if path == link else "file/directory"} fixture unavailable: {error}')
+        protected = []
+        try:
+            for name, flag in (('immutable', stat.UF_IMMUTABLE), ('append', stat.UF_APPEND)):
+                path = nested / name
+                path.write_bytes(b'protected content')
+                os.chflags(path, UF_TRACKED | flag)
+                protected.append(path)
+            before = self.checks.snapshot(source)
+            outside_before = self.checks.snapshot(outside)
+            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+            for jobs in (1, 2, 4):
+                with self.subTest(jobs=jobs):
+                    destination = self.base / f'copy-{jobs}'
+                    self.copy(source, destination, jobs=jobs)
+                    protected.extend(destination / 'nested' / path.name for path in protected[:2])
+                    self.assert_preserved(before, destination)
+                    self.assertEqual((destination / 'nested/data').stat().st_ino,
+                                     (destination / 'nested/alias').stat().st_ino)
+                    self.assertEqual((destination / 'nested/data').stat().st_nlink, 2)
+                    self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
+            self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+        finally:
+            for path in protected:
+                if path.exists():
+                    os.chflags(path, path.stat().st_flags & ~(stat.UF_IMMUTABLE | stat.UF_APPEND))
 
     def test_privileged_mode_bits_when_fixture_supported(self):
         source = self.base / 'source'

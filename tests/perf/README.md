@@ -23,7 +23,7 @@ macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource
 
 RSS means `/usr/bin/time -lp reported maximum RSS`: the maximum individual child-process peak, excluding whole-system, aggregate descendant, kernel and server memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
 
-The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`). Its five native C/header hashes match current source. This is native-content equivalence, not a new build of the newer main or managed Python lifecycle. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
+The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`), before the current native changes. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
 
 ### Measured commands and inputs
 
