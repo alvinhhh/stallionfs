@@ -8,8 +8,40 @@ import SFSImage
 struct StallionExtension: UnaryFileSystemExtension {
     var fileSystem: StallionFileSystem { StallionFileSystem() }
 }
+// A load keeps the exact core-open access selected before its handle exists.
+// Only this file can construct a production admission after that open succeeds.
+struct ImageAdmission {
+    enum Access: Equatable { case readOnly, contextualWrites, fixtureWritable }
+    let handle: OpaquePointer
+    let anchor: sfs_result
+    let access: Access
+    fileprivate init(handle: OpaquePointer, anchor: sfs_result, access: Access) {
+        self.handle = handle; self.anchor = anchor; self.access = access
+    }
+#if STALLION_ADAPTER_CHECK
+    static func forTesting(handle: OpaquePointer, anchor: sfs_result, writable: Bool = false) -> ImageAdmission {
+#if STALLION_WRITE_DIAGNOSTIC
+        return ImageAdmission(handle: handle, anchor: anchor, access: writable ? .fixtureWritable : .readOnly)
+#else
+        precondition(!writable)
+        return ImageAdmission(handle: handle, anchor: anchor, access: .readOnly)
+#endif
+    }
+#endif
+}
 final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchecked Sendable {
-    private let queue = DispatchQueue(label: "sfs.readonly")
+    // Candidate opt-in: compile contextual handlers plus STALLION_CONTEXT_WRITES
+    // and construct with .contextualWrites. The public entry point stays RO.
+    // Writable acquisition uses delivered caller context; data I/O additionally
+    // requires the canonical item's retained write mode from a successful open.
+    // Kernel cache/descriptor ordering still requires mounted qualification.
+    enum AccessPolicy: Equatable { case readOnly, contextualWrites }
+    private let accessPolicy: AccessPolicy
+    init(accessPolicy: AccessPolicy = .readOnly) {
+        self.accessPolicy = accessPolicy
+        super.init()
+    }
+    private let queue = DispatchQueue(label: "sfs.volume")
     private var resource: FSPathURLResource?
     private var volume: StallionVolume?
     private var unloadedURL: URL?
@@ -28,15 +60,15 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         guard let path = resource as? FSPathURLResource else { return true }
         return path.url.absoluteString.utf8.count <= 4096
     }
-    private func open(_ path: FSPathURLResource, writing: Bool = false) throws -> (OpaquePointer, sfs_result, Bool) {
+    private func open(_ path: FSPathURLResource, access: ImageAdmission.Access = .readOnly, expectedUUID: UUID? = nil) throws -> (ImageAdmission, Bool) {
         guard !path.isRevoked && path.url.isFileURL else { throw POSIXError(.EACCES) }
         let scoped = path.url.startAccessingSecurityScopedResource()
         var handle: OpaquePointer?, r = sfs_result()
         do {
             let status: sfs_status
-#if STALLION_WRITE_DIAGNOSTIC
-            if writing {
-                guard diagnosticUUID != nil && path.isWritable else { throw POSIXError(.EACCES) }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if access != .readOnly {
+                guard path.isWritable else { throw POSIXError(.EACCES) }
                 status = sfs_image_open(path.url.path, "image.sfs", &handle, &r)
             } else { status = sfs_image_open_readonly(path.url.path, "image.sfs", &handle, &r) }
 #else
@@ -48,16 +80,14 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
             guard infoStatus == SFS_OK else { throw sfsError(infoStatus, r) }
             guard information.major == 0 && information.minor == 6 && information.root_inode == 1 else { throw POSIXError(.ENOTSUP) }
             let anchor = information.committed; var root = sfs_metadata_entry()
-#if STALLION_WRITE_DIAGNOSTIC
-            if writing {
-                guard let expected = diagnosticUUID,
+            if access == .fixtureWritable {
+                guard let expected = expectedUUID,
                     rawBytes(anchor.uuid) == withUnsafeBytes(of: expected.uuid, { Array($0) }) else { throw POSIXError(.EACCES) }
             }
-#endif
             let stat = sfs_image_stat_metadata(opened, 0, 1, &root, &r)
             guard stat == SFS_OK else { throw sfsError(stat, r) }
             guard !path.isRevoked && anchorMatches(r, anchor) && root.entry.inode == 1 && root.entry.kind == SFS_DIRECTORY && root.link_count == 1 else { throw POSIXError(.EIO) }
-            return (opened, anchor, scoped)
+            return (ImageAdmission(handle: opened, anchor: anchor, access: access), scoped)
         } catch {
             var closeFailure: Error?
             if let owned = handle { handle = nil; let status = sfs_image_close(owned, &r); if status != SFS_OK { closeFailure = sfsError(status, r) } }
@@ -74,7 +104,8 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         enqueue(rejected: { replyHandler(nil, $0) }) {
         guard let path = resource as? FSPathURLResource else { replyHandler(.notRecognized, nil); return }
         do {
-            let (handle, anchor, scoped) = try self.open(path)
+            let (opened, scoped) = try self.open(path)
+            let handle = opened.handle, anchor = opened.anchor
             var r = sfs_result(); let status = sfs_image_close(handle, &r)
             if scoped { path.url.stopAccessingSecurityScopedResource() }
             guard status == SFS_OK else { throw sfsError(status, r) }
@@ -87,25 +118,55 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         }
     } }
     func loadResource(resource: FSResource, options: FSTaskOptions, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
-        guard options.taskOptions.count <= 64 && options.taskOptions.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(nil, POSIXError(.E2BIG)); return }
-        loadResource(resource: resource, force: options.taskOptions.contains("-f"), replyHandler: replyHandler)
+        loadResource(resource: resource, arguments: options.taskOptions, replyHandler: replyHandler)
+    }
+    // Shared decoder also permits direct checks without fabricating FSTaskOptions,
+    // whose public initializer is unavailable in the SDK.
+    func loadResource(resource: FSResource, arguments: [String], replyHandler: @escaping (FSVolume?, Error?) -> Void) {
+        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(nil, POSIXError(.E2BIG)); return }
+        loadResource(resource: resource, force: arguments.contains("-f"), readOnly: arguments.contains("--rdonly"), replyHandler: replyHandler)
     }
     func loadResource(resource: FSResource, force: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
+        loadResource(resource: resource, force: force, readOnly: false, replyHandler: replyHandler)
+    }
+    private func loadResource(resource: FSResource, force: Bool, readOnly: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
         guard boundedResource(resource) else { replyHandler(nil, POSIXError(.ENAMETOOLONG)); return }
         enqueue(rejected: { replyHandler(nil, $0) }) {
         guard self.resource == nil && self.unloadedURL == nil, let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
         guard !force else { replyHandler(nil, POSIXError(.ENOTSUP)); return }
         do {
-            var writing = false
+            // --rdonly wins before open, even over a private fixture binding.
+            let expected: UUID?
 #if STALLION_WRITE_DIAGNOSTIC
-            writing = self.diagnosticUUID != nil
+            expected = self.diagnosticUUID
+#else
+            expected = nil
 #endif
-            let (handle, anchor, scoped) = try self.open(path, writing: writing)
-            let loaded = StallionVolume(handle: handle, resource: path, scope: scoped, anchor: anchor, queue: self.queue)
-#if STALLION_WRITE_DIAGNOSTIC
-            if let expected = self.diagnosticUUID {
-                do { try loaded.enableWriteDiagnostic(expectedUUID: expected) }
-                catch { _ = loaded.unload(); throw error }
+            let access: ImageAdmission.Access
+            if readOnly { access = .readOnly }
+            else if expected != nil {
+                guard path.isWritable else { throw POSIXError(.EACCES) }
+                access = .fixtureWritable
+            } else if self.accessPolicy == .contextualWrites {
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+                access = path.isWritable ? .contextualWrites : .readOnly
+#else
+                throw POSIXError(.ENOTSUP)
+#endif
+            } else { access = .readOnly }
+            let (opened, scoped) = try self.open(path, access: access, expectedUUID: expected)
+            let loaded = StallionVolume(admission: opened, resource: path, scope: scoped, queue: self.queue)
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+            if access != .readOnly {
+                do { try loaded.enableAdmittedWrites() }
+                catch {
+                    let cleanup = loaded.unload()
+                    if let closeFailure = cleanup.error {
+                        let first = error as NSError
+                        throw NSError(domain: first.domain, code: first.code, userInfo: [NSUnderlyingErrorKey: closeFailure])
+                    }
+                    throw error
+                }
             }
 #endif
             self.resource = path; self.volume = loaded; self.containerStatus = .ready; replyHandler(loaded, nil)

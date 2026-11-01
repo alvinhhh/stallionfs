@@ -121,7 +121,7 @@ class FSKitInterfaces(unittest.TestCase):
             forbidden = ('sfs_diag_', 'sfs_image_diagnostic_', 'enablewritediagnostic', 'diagnosticwrite',
                          'sfs_test_', 'fixtureidentity', 'reclaimfortesting', 'ownsfortesting',
                          'diagnostictracestoragefortesting', 'diagnosticreadfortesting',
-                         'diagnosticclosemodesfortesting', 'diagnosticmutationfortesting', 'diagnosticsetattributes',
+                         'diagnosticclosemodesfortesting', 'diagnosticmutationfortesting', 'diagnosticsetattributes', 'performwrite', 'setwritableattributes', 'enableadmittedwrites',
                          'writecountfortesting', 'setattributesvaluefortesting', 'refusedmutationfortesting',
                          'activateresultfortesting', 'lookupresultfortesting', 'attributesresultfortesting',
                          'readlinkresultfortesting', 'xattrresultfortesting', 'xattrsresultfortesting',
@@ -152,9 +152,10 @@ class FSKitInterfaces(unittest.TestCase):
                          '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit',
                          '-g', '-Onone', '-parse-as-library']
                 executable = directory / 'write-check'
+                mutation_defines = ['-D', 'STALLION_CONTEXT_WRITES'] if variant == 'context' else []
                 self.command(variant + '-write-build', [*swift, '-module-cache-path', directory / 'write-cache',
                              '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
-                             *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', executable],
+                             *mutation_defines, *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', executable],
                              180, swift=variant)
                 child = self.command(variant + '-write-run', [executable, images], 180)
                 lines = child.stdout.splitlines()
@@ -172,6 +173,42 @@ class FSKitInterfaces(unittest.TestCase):
                 symbols = self.command(variant + '-normal-symbols', [self.tools['nm'], extension], 90)
                 self.assertIn(' U _NSExtensionMain', symbols.stdout)
                 self.assertFalse(any(word in symbols.stdout.lower() for word in forbidden))
+            # Genuine core and no diagnostic flag: exercise retained-open
+            # admission without claiming installed descriptor/cache routing.
+            for variant in ('legacy', 'context'):
+                directory = self.base / (variant + '-admission')
+                directory.mkdir(mode=0o700)
+                images = directory / 'images'
+                images.mkdir(mode=0o700)
+                defines = ['-D', 'STALLION_CONTEXT_WRITES', '-D', 'STALLION_ADAPTER_CHECK']
+                if variant == 'context':
+                    defines += ['-D', 'STALLION_CONTEXT_HANDLERS']
+                executable = directory / 'admission-check'
+                self.command(variant + '-admission-build', [self.tools['swiftc'], *defines,
+                             '-swift-version', '6', '-strict-concurrency=complete', '-target', target,
+                             '-sdk', self.sdk, '-I', filesystem / 'fskit', '-g', '-Onone', '-parse-as-library',
+                             '-module-cache-path', directory / 'cache', *sources,
+                             tests / 'fskit_write_driver.swift', normal, hooks, '-o', executable], 180, swift=variant)
+                child = self.command(variant + '-admission-run', [executable, '--access-policy', images], 180)
+                self.assertEqual(child.stdout, 'PASS immutable read-only selection, contextual open grants and retained-write delivery\n')
+                self.assertEqual(child.stderr, '')
+            module = self.base / 'context-admission-module'
+            self.command('context-admission-module-build', [self.tools['swiftc'],
+                         '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                         '-swift-version', '6', '-strict-concurrency=complete', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-g', '-Onone', '-parse-as-library',
+                         '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
+                         '-module-cache-path', self.base / 'context-admission-module-cache',
+                         *sources, normal, '-o', module], 180, swift='context')
+            symbols = self.command('context-admission-module-symbols', [self.tools['nm'], module], 90).stdout.lower()
+            self.assertIn(' u _nsextensionmain', symbols)
+            self.assertIn('enableadmittedwrites', symbols)
+            self.assertIn('setxattrhandler', symbols)
+            self.assertIn('performwrite', symbols)
+            self.assertFalse(any(word in symbols for word in
+                                 ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
+                                  'fixturewritablemetadata', 'fixtureidentity', 'privatetestidentity',
+                                  'fortesting', 'reclaimfortesting', 'createabortfortesting')))
             unhooked = self.base / 'context-xattr-unhooked'
             unhooked.mkdir(mode=0o700)
             unhooked_images = unhooked / 'images'
@@ -185,6 +222,12 @@ class FSKitInterfaces(unittest.TestCase):
                 normal, hooks, '-o', unhooked_executable], 180, swift='context')
             child = self.command('context-xattr-unhooked-run', [unhooked_executable, '--xattr-unhooked', unhooked_images], 180)
             self.assertEqual(child.stdout, 'PASS contextual xattr policies, binary values and persistence with unhooked core\n')
+            self.assertEqual(child.stderr, '')
+            disabled_images = unhooked / 'admission-disabled-images'
+            disabled_images.mkdir(mode=0o700)
+            child = self.command('context-admission-disabled-run',
+                                 [unhooked_executable, '--access-policy', disabled_images], 180)
+            self.assertEqual(child.stdout, 'PASS immutable read-only selection, contextual open grants and retained-write delivery\n')
             self.assertEqual(child.stderr, '')
             cls.failed = False
         except BaseException as error:
