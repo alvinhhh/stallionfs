@@ -305,6 +305,8 @@ def main():
     parser.add_argument('--root', type=Path, required=True, help='Existing writable filesystem directory')
     parser.add_argument('--output', type=Path, required=True, help='New JSON path; sibling CSV must also be absent')
     parser.add_argument('--sfs', help='Optional installed sfs executable')
+    parser.add_argument('--stop-on-sfs-failure', action='store_true',
+                        help='Stop and retain scratch evidence after the first failed SFS sample')
     parser.add_argument('--repetitions', type=int, default=10)
     parser.add_argument('--files', type=int, default=10000)
     parser.add_argument('--directories', type=int, default=100, help='Use 1 for a flat file layout')
@@ -378,6 +380,37 @@ def main():
             writer = csv.DictWriter(stream, fields, extrasaction='ignore')
             writer.writeheader(); writer.writerows(report['samples'])
 
+    def retain_uncertain_completion(exc, sample=None):
+        report['retain_scratch'] = True
+        report.pop('retention_reason', None)
+        report.pop('stopped_on_sfs_failure', None)
+        report['supervision_failure'] = getattr(exc, 'process_supervision', {})
+        if sample is not None:
+            sample['supervision'] = report['supervision_failure']
+
+    def record_sample_failure(sample, exc, prefix=''):
+        error = prefix + f'{type(exc).__name__}: {exc}'
+        sample['status'] = 'failed'
+        if 'error' in sample:
+            sample.setdefault('secondary_errors', []).append(error)
+        else:
+            sample['error'] = error
+        report['errors'].append(f"{sample['case']}/{sample['variant']}/{sample['repetition']}: {error}")
+        if getattr(exc, 'process_group_uncertain', False):
+            retain_uncertain_completion(exc, sample)
+
+    def retain_failure_evidence(sample):
+        if (not report.get('retain_scratch') and args.stop_on_sfs_failure
+                and sample['variant'].startswith('sfs_jobs') and sample['status'] == 'failed'):
+            report.update(retain_scratch=True, retention_reason='sfs_sample_failure',
+                          stopped_on_sfs_failure=len(report['samples']) - 1)
+
+    def stop_after_sample_failure(sample, exc):
+        retain_failure_evidence(sample)
+        if report.get('retain_scratch'):
+            raise exc
+
+    active_sample = None
     try:
         report['tools'] = {k: {'path': v, 'sha256': sha(v)} for k, v in tools.items()}
         report['setup'].append(execute([tools['cc'], '--version'], scratch))
@@ -432,10 +465,14 @@ def main():
                     if case == 'clone':
                         sample['clone_policy'] = report['clone_policies'][variant]
                     report['samples'].append(sample)
+                    active_sample = sample
                     if (case, variant) in unavailable:
-                        sample['status'] = 'skipped_unsupported'; save(); continue
+                        sample['status'] = 'skipped_unsupported'; save()
+                        active_sample = None
+                        continue
                     target = scratch / 'target'
                     stop = False
+                    interrupted = None
                     try:
                         if target.exists() or target.is_symlink():
                             raise RuntimeError('Unexpected existing target')
@@ -504,54 +541,63 @@ def main():
                         if sample['status'] == 'pending':
                             sample['status'] = 'passed'
                     except BaseException as exc:
-                        if getattr(exc, 'process_group_uncertain', False):
-                            report['retain_scratch'] = True
-                            sample['supervision'] = getattr(exc, 'process_supervision', {})
-                        sample.update(status='failed', error=f'{type(exc).__name__}: {exc}')
-                        report['errors'].append(f'{case}/{variant}/{repetition}: {type(exc).__name__}: {exc}')
+                        record_sample_failure(sample, exc)
+                        stop_after_sample_failure(sample, exc)
+                        if not isinstance(exc, Exception):
+                            interrupted = exc
+                    try:
+                        if manifest(dataset) != expected or sha(sentinel) != sentinel_hash:
+                            raise RuntimeError('Source or sentinel changed')
+                        sample['source_unchanged'] = True
+                    except BaseException as exc:
+                        record_sample_failure(sample, exc, 'Source verification failed: ')
+                        stop_after_sample_failure(sample, exc)
                         if not isinstance(exc, Exception):
                             raise
-                    finally:
-                        if report.get('retain_scratch'):
-                            raise RuntimeError('Uncertain process completion; scratch retained without further inspection')
-                        try:
-                            if manifest(dataset) != expected or sha(sentinel) != sentinel_hash:
-                                raise RuntimeError('Source or sentinel changed')
-                            sample['source_unchanged'] = True
-                        except Exception as exc:
-                            sample.update(status='failed', error=str(exc))
-                            report['errors'].append(str(exc)); stop = True
-                        try:
-                            if target.is_symlink(): target.unlink()
-                            elif target.exists(): shutil.rmtree(target)
-                        except Exception as exc:
-                            sample.update(status='failed', error='Target cleanup failed: ' + str(exc))
-                            report['errors'].append(sample['error']); stop = True
-                        save()
+                        stop = True
+                    try:
+                        if target.is_symlink(): target.unlink()
+                        elif target.exists(): shutil.rmtree(target)
+                    except BaseException as exc:
+                        record_sample_failure(sample, exc, 'Target cleanup failed: ')
+                        stop_after_sample_failure(sample, exc)
+                        if not isinstance(exc, Exception):
+                            raise
+                        stop = True
+                    save()
+                    if interrupted is not None:
+                        raise interrupted
                     if stop:
                         raise RuntimeError('Stopped after unsafe source state or failed cleanup')
+                    active_sample = None
         report['passed'] = not report['errors']
     except BaseException as exc:
         report['passed'] = False
+        if active_sample is not None and active_sample['status'] != 'failed':
+            record_sample_failure(active_sample, exc)
         report['errors'].append(f'{type(exc).__name__}: {exc}')
         if getattr(exc, 'process_group_uncertain', False):
-            report['retain_scratch'] = True
-            report['supervision_failure'] = getattr(exc, 'process_supervision', {})
+            retain_uncertain_completion(exc)
+        if active_sample is not None:
+            retain_failure_evidence(active_sample)
     finally:
         try:
-            if report.get('retain_scratch'):
+            if report.get('retention_reason') == 'sfs_sample_failure':
+                report['cleanup'] = 'retained_failure_evidence'
+            elif report.get('retain_scratch'):
                 raise RuntimeError('Scratch retained because process completion is uncertain')
-            current_scratch = scratch.lstat()
-            if (scratch.parent != root or not scratch.name.startswith('sfs-real-world-')
-                    or not stat.S_ISDIR(current_scratch.st_mode)
-                    or (current_scratch.st_dev, current_scratch.st_ino) != scratch_identity):
-                raise RuntimeError('Scratch identity changed; cleanup refused')
-            shutil.rmtree(scratch)
-            report['cleanup'] = 'passed'
-        except Exception as exc:
+            else:
+                current_scratch = scratch.lstat()
+                if (scratch.parent != root or not scratch.name.startswith('sfs-real-world-')
+                        or not stat.S_ISDIR(current_scratch.st_mode)
+                        or (current_scratch.st_dev, current_scratch.st_ino) != scratch_identity):
+                    raise RuntimeError('Scratch identity changed; cleanup refused')
+                shutil.rmtree(scratch)
+                report['cleanup'] = 'passed'
+        except BaseException as exc:
             report['passed'] = False
             report['retain_scratch'] = True
-            report['cleanup'] = 'failed: ' + str(exc)
+            report['cleanup'] = f'failed: {type(exc).__name__}: {exc}'
         save()
     print(json.dumps({'passed': report['passed'], 'output': str(output), 'cleanup': report['cleanup']}))
     return 0 if report['passed'] else 1
