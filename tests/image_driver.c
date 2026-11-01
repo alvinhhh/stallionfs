@@ -45,6 +45,7 @@ static int competing, cut, model, cut_at, events;
 static unsigned char *durable;
 static size_t durable_size;
 static int tracked_fd = -1, locked_fd = -1;
+static int expected_closed_fd = -1;
 static char order[256];
 static uint64_t read_at[2];
 static uint64_t watch_at[2], watch_size[2], watch_bytes[2];
@@ -305,7 +306,16 @@ int sfs_test_flock(int fd, int operation) {
 }
 int sfs_test_close(int fd) {
     assert(!clearing_cache);
-    closes++; struct stat st; assert(fstat(fd, &st) == 0);
+    closes++; struct stat st;
+    if (expected_closed_fd >= 0 && fd == expected_closed_fd) {
+        expected_closed_fd = -1;
+        assert(fstat(fd, &st) == -1 && errno == EBADF);
+        int result = close(fd); assert(result == -1 && errno == EBADF);
+        auxiliary[fd] = 0; memo_target_fd[fd] = 0;
+        if (fd == locked_fd) locked_fd = -1;
+        return result;
+    }
+    assert(fstat(fd, &st) == 0);
     int fail = (is("close") && closes == target) || (is("parent_close") && S_ISDIR(st.st_mode)) || ((is("aux_close") || is("aux_enospc_cleanup")) && auxiliary[fd]);
     int result = close(fd);
     auxiliary[fd] = 0; memo_target_fd[fd] = 0;
@@ -5012,6 +5022,7 @@ static void snapshot_catalog(void) {
 
     for (unsigned damage = 0; damage < 3; ++damage) {
         f = indexed_fixture(1, 1, 1); fixture_save(&f); reset("", 0); open_image(&h); OK(sfs_image_begin(h, &r));
+        int owned_fd = image_open_fd;
         if (damage == 1) { struct stat st; assert(fstat(image_open_fd, &st) == 0 && ftruncate(image_open_fd, st.st_size + CELL) == 0); }
         else if (damage == 2) assert(close(image_open_fd) == 0);
         memset(&entry, 0xa5, sizeof(entry)); found = 99; reset(damage ? "" : "owner", 1);
@@ -5019,7 +5030,12 @@ static void snapshot_catalog(void) {
         assert(r.phase == SFS_PHASE_IDENTITY && r.system_errno == (damage == 0 ? EINVAL : damage == 1 ? ESTALE : EBADF));
         assert(r.poisoned && !r.transaction_active && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
         assert(sfs_image_snapshot_at(h, 0, &entry, &found, &r) == SFS_POISONED && found == 99 && !memcmp(&entry, &canary, sizeof(entry)));
-        reset("", 0); if (damage == 2) { assert(sfs_image_close(h, &r) == SFS_IO && r.phase == SFS_PHASE_CLOSE); h = NULL; } else close_image(h);
+        reset("", 0);
+        if (damage == 2) {
+            assert(owned_fd >= 0 && expected_closed_fd == -1); expected_closed_fd = owned_fd;
+            assert(sfs_image_close(h, &r) == SFS_IO && r.phase == SFS_PHASE_CLOSE && r.system_errno == EBADF);
+            assert(expected_closed_fd == -1 && closes == 2); h = NULL;
+        } else close_image(h);
         retain(5008 + (int)damage);
     }
 }
