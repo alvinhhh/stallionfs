@@ -11,14 +11,12 @@ from pathlib import Path
 import platform
 import random
 import resource
-import signal
 import shutil
 import sqlite3
 import statistics
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 SCRIPT = Path(__file__).resolve()
@@ -231,43 +229,15 @@ def summarize(samples):
                 population_stdev=statistics.pstdev(samples))
 
 
-def group_gone(pid):
-    try:
-        os.killpg(pid, 0)
-        return False
-    except ProcessLookupError:
-        return True
-
-
 def bounded_wait(child, timeout):
-    done, expired = threading.Event(), threading.Event()
-    def terminate():
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    def watchdog():
-        if not done.wait(timeout):
-            expired.set()
-            terminate()
-    watcher = threading.Thread(target=watchdog, daemon=True)
-    watcher.start()
     try:
-        _, status, usage = os.wait4(child.pid, 0)
-        elapsed_done = time.perf_counter()
-        child.returncode = os.waitstatus_to_exitcode(status)
-    except BaseException:
-        terminate()
-        os.wait4(child.pid, 0)
+        from real_world import wait_owned_process
+        usage, elapsed_done, supervision = wait_owned_process(child, timeout, exit_clock=time.perf_counter)
+    except BaseException as error:
+        error.process_group_uncertain = True
         raise
-    finally:
-        done.set()
-        watcher.join()
-    # Outside measured wall time: never remove scratch while descendants remain.
-    until = time.monotonic() + 2
-    while not group_gone(child.pid) and time.monotonic() < until:
-        time.sleep(0.01)
-    return usage, elapsed_done, expired.is_set(), group_gone(child.pid)
+    exited = supervision['post_reap_group_probe']['outcome'] == 'absent_at_check'
+    return usage, elapsed_done, supervision['timed_out'], exited, supervision
 
 
 def main():
@@ -295,7 +265,9 @@ def main():
                   seed=SEED, timeout_seconds=args.timeout, provenance=dict(platform=platform.platform(), kernel=platform.release(),
                   python=sys.version, executable=sys.executable, sqlite=sqlite3.sqlite_version,
                   compiler=cc, compiler_version=compiler.stdout.strip(), compiler_version_exit=compiler.returncode,
-                  source_sha256=hashlib.sha256(SCRIPT.read_bytes()).hexdigest()), runs=[], summary={},
+                  source_sha256=hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+                  supervisor_source_sha256=hashlib.sha256(SCRIPT.with_name('real_world.py').read_bytes()).hexdigest()),
+                  runs=[], summary={},
                   workload=dict(generated_part_units=2 if args.smoke else 32,
                                 translation_units=3 if args.smoke else 33, writers=2,
                   rows_per_writer=8 if args.smoke else 500, rows_per_transaction=4 if args.smoke else 25,
@@ -304,12 +276,12 @@ def main():
                   interpretation=["No cache purge: read stages are warm-cache; all filesystem roots use the same procedure.",
                   "Uses os.fsync on every OS; macOS F_FULLFSYNC is not requested. Not a power-loss durability test.",
                   "Child process startup/runtime costs are included in application measurements.",
+                  "Parent worker-envelope wall includes exit observation at a 10 ms polling interval and scheduling delay; worker-stage timings are unchanged.",
                   "CPU is summed child usage for application stages; RSS is maximum single-process high-water, not tree sum.",
                   "I/O stage CPU is worker self usage; RSS includes setup/prior-stage high-water.",
                   "Correctness checks and data generation are outside timed stages; worker envelope includes both."])
     scratch = Path(tempfile.mkdtemp(prefix=".stallionfs-real-apps-", dir=root))
     identity = (scratch.stat().st_dev, scratch.stat().st_ino)
-    owned_groups = set()
     def save():
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     try:
@@ -327,16 +299,21 @@ def main():
                     child = subprocess.Popen([sys.executable, str(SCRIPT), "--worker", str(directory), case,
                                               cc, str(args.jobs), str(int(args.smoke)), str(receipt)],
                                              stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
-                    owned_groups.add(child.pid)
-                    usage, ended, timed_out, exited = bounded_wait(child, args.timeout)
-                try:
-                    row = json.loads(receipt.read_text())
-                except (OSError, json.JSONDecodeError) as error:
-                    row = dict(case=case, correct=False, receipt_error=str(error))
+                    usage, ended, timed_out, exited, supervision = bounded_wait(child, args.timeout)
+                    if not exited:
+                        result['retain_scratch'] = True
+                if not exited:
+                    row = dict(case=case, correct=False)
+                else:
+                    try:
+                        row = json.loads(receipt.read_text())
+                    except (OSError, json.JSONDecodeError) as error:
+                        row = dict(case=case, correct=False, receipt_error=str(error))
                 if timed_out or not exited:
                     row.update(correct=False, error="case deadline exceeded" if timed_out else "worker group exit unverified")
                 row.update(iteration=iteration, warmup=iteration < 0, exit_code=child.returncode, timed_out=timed_out,
-                           process_group_exit_verified=exited, worker_envelope=dict(wall_seconds=ended-started,
+                           process_group_exit_verified=exited, supervision=supervision,
+                           worker_envelope=dict(wall_seconds=ended-started,
                            user_seconds=usage.ru_utime, system_seconds=usage.ru_stime,
                            cpu_seconds=usage.ru_utime+usage.ru_stime, peak_rss_bytes=rss_bytes(usage)))
                 result["runs"].append(row)
@@ -356,9 +333,12 @@ def main():
         result["passed"] = True
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
+        if getattr(error, 'process_group_uncertain', False):
+            result['retain_scratch'] = True
+            result['supervision_failure'] = getattr(error, 'process_supervision', {})
     finally:
         try:
-            if any(not group_gone(pid) for pid in owned_groups):
+            if result.get('retain_scratch'):
                 result["retained_scratch"] = str(scratch)
                 raise RuntimeError("owned worker group exit uncertain; scratch retained")
             if scratch.is_symlink() or (scratch.stat().st_dev, scratch.stat().st_ino) != identity:
