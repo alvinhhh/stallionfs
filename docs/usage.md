@@ -189,3 +189,39 @@ sfs purge trash WORKSPACE_ID
 ```
 
 `purge` is deliberate permanent deletion. Inspect the data first. Interrupted deletion retains its remainder in staging and reports that path, keeping usable snapshot listings clear of partial entries. Pending rollback journals and mounted images prevent purging. Keep any previous rollback repository you need by copying `recovery/RECOVERY_ID/repo` to a new path before purging its slot; image recovery remains a closed `workspace.sparseimage` backing file.
+## Closed native images
+
+Register an existing native image without moving or copying its backing file:
+
+```sh
+workspace=$(sfs register-native-image /private/owned/image.sfs --name work)
+sfs snapshot "$workspace" --name before-edit
+sfs snapshots "$workspace"
+sfs rollback "$workspace" before-edit
+```
+
+Native snapshot IDs are their names. Rollback retains the previous current
+namespace under the returned recovery name, in the same durable commit. Listing
+shows both ordinary and recovery snapshots. Names use filesystem bytes without
+normalization and must be one component of 1–255 bytes. The catalog holds at
+most 32 snapshots; full catalogs fail without evicting an existing root.
+
+These commands operate on closed images. The managed lease and ordinary core
+exclusive inode lock reject cooperating active users, including the current
+FSKit loader while it retains its core handle. They do not detect arbitrary
+noncooperating writers or qualify mounted kernel caching. Native mount/run,
+cleanup enrollment, retirement and removal are unsupported by these commands.
+Registering an external file grants no authority to delete it.
+
+The immediate parent must be private, owned and local writable APFS. Registration
+resolves parent aliases once and records the actual parent/file identities and
+image UUID; the final image must not be a symlink. Replacing or moving a recorded
+parent/backing inode requires explicit re-registration. Intermediate ancestors
+are not claimed to be locked or symlink-free.
+
+Use `--json` for operation, staging, abort and consumed-close receipts. A failed
+command can report a committed change or unknown publication; it does not imply
+rollback. Preserve its recovery name and inspect the image before repeating the
+operation. Later explicitly requested calls use fresh ordinary validation;
+malformed slot pairs require explicit recovery rather than automatic repair.
+

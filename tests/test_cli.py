@@ -9,8 +9,256 @@ import sys
 import sysconfig
 import tempfile
 import unittest
+import hashlib
+import fcntl
+import textwrap
 
 from stallionfs import __version__
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'Native image CLI requires macOS/APFS')
+class NativeImageCLI(unittest.TestCase):
+    """Installed ordinary bridge plus isolated diagnostic linkage of the same source."""
+    @classmethod
+    def setUpClass(cls):
+        import test_image as capture
+        cls.capture = capture
+        destination = os.environ.get('STALLIONFS_NATIVE_CLI_ARTIFACT_DIR')
+        cls.keep_artifacts = destination is not None
+        if destination:
+            cls.artifacts = Path(destination).resolve()
+            cls.artifacts.mkdir(mode=0o700)  # Fresh path only; never reuse prior products.
+        else:
+            cls.artifacts = Path(tempfile.mkdtemp(prefix='stallionfs-native-cli-')).resolve()
+        cls.failed = True
+        cls.sequence = 0
+        cls.previous = capture._install_command_handlers()
+        cls.addClassCleanup(cls.finish)
+        source = Path(__file__).resolve().parents[1]
+        tests, filesystem = source / 'tests', source / 'filesystem'
+        clang = cls.owned('find-clang', ['/usr/bin/xcrun', '--find', 'clang'], 15).stdout.strip()
+        sdk = cls.owned('find-sdk', ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'], 15).stdout.strip()
+        flags = [clang, '-std=c11', '-Wall', '-Wextra', '-O1', '-g', '-isysroot', sdk, '-I', filesystem,
+                 '-I', sysconfig.get_path('include')]
+        cls.fixture = cls.artifacts / 'fixture'
+        cls.owned('fixture-build', [*flags, tests / 'native_image_fixture.c', filesystem / 'image.c', '-o', cls.fixture])
+        normal = cls.artifacts / 'diagnostic-core.o'
+        replacements = ('pwrite', 'malloc', 'calloc', 'clock_gettime')
+        cls.owned('diagnostic-core', [*flags, *(f'-D{name}=sfs_diag_{name}' for name in replacements),
+                    '-Dpread=sfs_bridge_test_pread', '-Dfcntl=sfs_bridge_test_fcntl', '-Dclose=sfs_bridge_test_close',
+                    '-include', tests / 'native_image_bridge_hooks.h', '-c', filesystem / 'image.c', '-o', normal])
+        bridge = cls.artifacts / 'diagnostic-bridge.o'
+        cls.owned('diagnostic-bridge', [*flags, '-Dclock_gettime=sfs_bridge_test_clock',
+                    '-DPyLong_FromLongLong=sfs_bridge_test_signed', '-DPyLong_FromUnsignedLongLong=sfs_bridge_test_unsigned',
+                    '-Dsfs_image_snapshot=sfs_bridge_test_snapshot', '-Dsfs_image_prepare_restore=sfs_bridge_test_restore',
+                    '-include', tests / 'native_image_bridge_hooks.h', '-c', source / 'stallionfs/_image.c', '-o', bridge])
+        hooks = cls.artifacts / 'diagnostic-hooks.o'
+        cls.owned('diagnostic-hooks', [*flags, '-c', tests / 'native_image_bridge_hooks.c', '-o', hooks])
+        cls.diagnostic = cls.artifacts / ('_image' + sysconfig.get_config_var('EXT_SUFFIX'))
+        cls.owned('diagnostic-link', [clang, '-bundle', '-undefined', 'dynamic_lookup', bridge, normal, hooks, '-o', cls.diagnostic])
+        cls.failed = False
+
+    @classmethod
+    def owned(cls, label, argv, timeout=90):
+        cls.sequence += 1
+        child = cls.capture._owned_command([str(value) for value in argv], cwd=cls.artifacts,
+                    timeout=timeout, stem=cls.artifacts / f'{cls.sequence:03}-{label}')
+        if child.returncode:
+            cls.failed = True
+            raise AssertionError(f'{label} failed: {child.stderr[-4000:]}')
+        return child
+
+    @classmethod
+    def finish(cls):
+        cls.capture._restore_command_handlers(cls.previous)
+        state = cls.capture._command_state
+        if state['failure'] is not None or state['active'] is not None or state['first_signal'] is not None or state['signal_count']:
+            cls.failed = True
+        if cls.failed or cls.keep_artifacts:
+            print(f'Native CLI evidence retained: {cls.artifacts}', file=sys.stderr)
+        else:
+            shutil.rmtree(cls.artifacts)
+
+    def setUp(self):
+        self.prior_failures = len(self._outcome.result.failures) + len(self._outcome.result.errors)
+        self.base = self.artifacts / self._testMethodName
+        self.base.mkdir(mode=0o700)
+        self.store = self.base / 'store'
+        self.launcher = Path(sysconfig.get_path('scripts')) / 'sfs'
+        self.assertTrue(self.launcher.is_file(), 'Install the candidate wheel before this test')
+
+    def tearDown(self):
+        if len(self._outcome.result.failures) + len(self._outcome.result.errors) > self.prior_failures:
+            type(self).failed = True
+
+    def command(self, *args, status=0):
+        # The capture expects a clean child; the small adapter records the public
+        # command's intentional nonzero status without treating it as a crash.
+        script = 'import json,subprocess,sys; p=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=15); print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))'
+        child = self.owned('public-cli', [sys.executable, '-I', '-c', script, self.launcher,
+                            '--root', self.store, '--json', *args], 25)
+        observed = json.loads(child.stdout)
+        self.assertEqual(observed['returncode'], status, observed['stderr'])
+        return json.loads(observed['stdout'] if status == 0 else observed['stderr'])
+
+    def seed(self, suffix='image'):
+        directory = self.base / suffix
+        directory.mkdir(mode=0o700)
+        self.owned('seed', [self.fixture, 'seed', directory])
+        return directory
+
+    def register(self, directory):
+        return self.command('register-native-image', directory / 'image.sfs')['id']
+
+    def test_installed_registration_snapshot_rollback_exact_state_and_recovery(self):
+        directory = self.seed()
+        image = directory / 'image.sfs'
+        identity, digest = (image.stat().st_dev, image.stat().st_ino), hashlib.sha256(image.read_bytes()).hexdigest()
+        workspace = self.register(directory)
+        self.assertEqual((image.stat().st_dev, image.stat().st_ino), identity)
+        self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), digest)
+        self.assertEqual(self.command('snapshot', workspace, '--name', 'before')['id'], 'before')
+        newer = self.owned('edit', [self.fixture, 'edit', directory]).stdout.strip()
+        self.command('snapshot', workspace, '--name', 'newer')
+        before = self.command('snapshots', workspace)
+        restored = self.command('rollback', workspace, 'before')
+        self.assertTrue(restored['native_image_result']['committed'])
+        self.assertEqual(restored['native_image_result']['receipt']['fence_succeeded'], 3)
+        self.assertEqual(restored['native_image_result']['close_receipt']['status'], 0)
+        after = self.command('snapshots', workspace)
+        self.assertEqual(after[:len(before)], before)
+        self.assertEqual(after[-1]['id'], restored['recovery'])
+        self.owned('verify-target', [self.fixture, 'verify', directory, 'before', newer])
+        self.owned('verify-recovery', [self.fixture, 'verify-edited', directory, restored['recovery']])
+        self.assertEqual((image.stat().st_dev, image.stat().st_ino), identity)
+        for kind in ('snapshots', 'recovery', 'journals'):
+            self.assertEqual(list((self.store / kind).iterdir()), [])
+        from stallionfs import _image
+        symbols = self.owned('production-symbols', ['/usr/bin/nm', _image.__file__]).stdout.lower()
+        self.assertFalse(any(word in symbols for word in ('sfs_diag_', 'sfs_bridge_test_', 'sfs_image_diagnostic_')))
+
+    def test_duplicate_registrations_share_inode_lock_and_native_data_is_not_cleanup_owned(self):
+        from stallionfs.core import Store
+        directory = self.seed()
+        first, second = self.register(directory), self.register(directory)
+        image = directory / 'image.sfs'
+        with image.open('rb') as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.command('snapshot', second, '--name', 'blocked', status=1)
+            self.assertEqual(blocked['native_image_result']['error_code'], __import__('errno').EBUSY)
+        with Store(self.store)._lease(first):
+            self.assertIn('managed use', self.command('snapshot', first, '--name', 'blocked', status=1)['error'])
+        self.command('snapshot', first, '--name', 'visible')
+        self.assertEqual(self.command('snapshots', second)[0]['id'], 'visible')
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        for args in (('enroll', first), ('close', first, '--quiescent'), ('remove', first), ('mount', first), ('unmount', first)):
+            self.command(*args, status=1)
+        self.command('cleanup', '--enable')
+        self.assertEqual(self.command('cleanup', '--apply')['retired'], [])
+        self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), digest)
+
+    def test_registration_alias_and_identity_failures_and_fresh_reopen(self):
+        directory = self.seed()
+        alias = self.base / 'alias'; alias.symlink_to(directory, target_is_directory=True)
+        workspace = self.command('register-native-image', alias / 'image.sfs')['id']
+        final_link = directory / 'link.sfs'; final_link.symlink_to(directory / 'image.sfs')
+        self.command('register-native-image', final_link, status=1)
+        directory.chmod(0o755)
+        try:
+            self.command('snapshot', workspace, '--name', 'never', status=1)
+        finally:
+            directory.chmod(0o700)
+        original = directory / 'image.sfs'
+        old = directory / 'old.sfs'; original.rename(old); shutil.copy2(old, original)
+        mismatch = self.command('snapshot', workspace, '--name', 'never', status=1)
+        self.assertEqual(mismatch['native_image_result']['error_code'], __import__('errno').ESTALE)
+        original.unlink(); old.rename(original)
+        self.command('snapshot', workspace, '--name', 'valid')
+        # A malformed pair cannot be hidden by a prior healthy registration.
+        with original.open('r+b') as stream:
+            byte = stream.read(1); stream.seek(0); stream.write(bytes([byte[0] ^ 1])); stream.flush(); os.fsync(stream.fileno())
+        failed = self.command('snapshots', workspace, status=1)
+        self.assertFalse(failed['native_image_result']['ok'])
+        self.assertNotEqual(failed['native_image_result']['receipt']['status'], 0)
+
+    def test_no_implicit_eviction_when_snapshot_catalog_is_full(self):
+        directory = self.seed(); workspace = self.register(directory)
+        for index in range(32):
+            self.command('snapshot', workspace, '--name', f'root-{index}')
+        before = self.command('snapshots', workspace)
+        failed = self.command('rollback', workspace, 'root-0', status=1)
+        self.assertFalse(failed['native_image_result']['committed'])
+        self.assertFalse(failed['native_image_result']['commit_attempted'])
+        self.assertEqual(self.command('snapshots', workspace), before)
+        self.command('snapshot', workspace, '--name', 'overflow', status=1)
+        self.assertEqual(self.command('snapshots', workspace), before)
+
+    def test_diagnostic_receipts_signals_deadline_and_transient_output_allocation(self):
+        script = textwrap.dedent('''
+            import ctypes, importlib.util, io, json, sys
+            from contextlib import redirect_stdout, redirect_stderr
+            import stallionfs
+            from stallionfs.__main__ import main
+            module_path, root, workspace, case, kind, ordinal, flags, deadline = sys.argv[1:]
+            spec = importlib.util.spec_from_file_location('stallionfs._image', module_path)
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            sys.modules['stallionfs._image'] = module; stallionfs._image = module
+            control = ctypes.CDLL(module_path).sfs_bridge_test_configure
+            control.argtypes = [ctypes.c_int] * 4; control.restype = None
+            control(int(kind), int(ordinal), int(flags), int(deadline))
+            if case == 'format-oom':
+                from stallionfs import core
+                original_strerror = core.os.strerror
+                def fail_format(_number):
+                    core.os.strerror = original_strerror
+                    raise MemoryError('transient error formatting failure')
+                core.os.strerror = fail_format
+            operation = ['snapshots',workspace] if case == 'list-oom' else ['rollback', workspace, 'base'] if case in ('budget','prepare-signal','oom','signal-oom','close-oom','format-oom') else ['snapshot',workspace,'--name','attempt']
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                status = main(['--root',root,'--json',*operation])
+            expected = 130 if case in ('stage-signal','prepare-signal','signal-oom') else 1
+            assert status == expected, (case,status,out.getvalue(),err.getvalue())
+            assert out.getvalue() == ''
+            error = json.loads(err.getvalue()); result = error['native_image_result']
+            if case in ('close','oom','signal-oom','close-oom','format-oom'):
+                assert result['committed'] and result['receipt']['status'] == 0 and result['receipt']['fence_succeeded'] == 3
+                if case in ('oom','signal-oom','close-oom'):
+                    assert result['recovery'].startswith('recovery-') and not result['response_complete']
+                    assert result['staged_receipt']['physical_end'] > result['staged_receipt']['committed_end']
+                    assert (result['close_receipt']['status'] == 0) == (case != 'close-oom')
+                else: assert result['close_receipt']['status'] != 0
+            elif case == 'final-fence':
+                assert result['outcome'] == 'unknown' and result['receipt']['fence_attempted'] == 3 and result['receipt']['fence_succeeded'] == 1
+            elif case == 'first-fence':
+                assert not result['committed'] and result['receipt']['fence_attempted'] == 1 and result['receipt']['fence_succeeded'] == 0
+            elif case in ('budget','prepare-signal'):
+                assert not result['committed'] and result['receipt']['incomplete_reason'] != 0 and not result['receipt']['transaction_active']
+            elif case in ('stage-signal','deadline'):
+                assert not result['committed'] and result['abort_attempted'] and result['abort_receipt']['status'] == 0
+                assert result['staged_receipt']['transaction_active']
+            elif case == 'list-oom':
+                assert not result['committed'] and not result['response_complete'] and 'snapshots' not in result
+            if case == 'signal-oom': assert result['interrupted'] and 'interrupted' in error['error']
+            print(json.dumps(error))
+        ''')
+        cases = [('first-fence',4,1,0,0), ('final-fence',4,2,0,0), ('close',0,0,1,0),
+                 ('stage-signal',0,0,4,0), ('prepare-signal',0,0,8,0), ('budget',0,0,16,0),
+                 ('deadline',0,0,0,5), ('oom',0,0,32,0), ('signal-oom',0,0,34,0),
+                 ('close-oom',0,0,33,0), ('format-oom',0,0,1,0), ('list-oom',0,0,64,0)]
+        for index, (case, kind, ordinal, flags, deadline) in enumerate(cases):
+            with self.subTest(case=case):
+                directory = self.seed(f'case-{index}'); workspace = self.register(directory)
+                self.command('snapshot', workspace, '--name', 'base')
+                child = self.owned('diagnostic-case', [sys.executable, '-I', '-c', script, self.diagnostic,
+                            self.store, workspace, case, kind, ordinal, flags, deadline])
+                observed = json.loads(child.stdout)['native_image_result']
+                roots = self.command('snapshots', workspace)
+                if case in ('close','oom','signal-oom','close-oom','format-oom'):
+                    self.assertEqual(len(roots), 2)
+                    if observed.get('recovery'):
+                        self.assertEqual(roots[-1]['id'], observed['recovery'])
+                elif case != 'final-fence':
+                    self.assertEqual([row['id'] for row in roots], ['base'])
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Native launcher requires macOS')
