@@ -305,9 +305,10 @@ is also validated and preserved byte for byte.
 
 ## Linux/OpenZFS native references
 
-Linux admits one existing workload, `docs_5k_100mb`, with warm cache, ten direct
-and ten resource samples, one run, and no StallionFS binary or worker-count
-option. Select one method per new report:
+Linux admits `docs_5k_100mb` with copy/cp or clone/cp-clone, and
+`dependencies_100k` with copy/cp. Both require warm cache, ten direct and ten
+resource samples, one run, and no StallionFS binary or worker-count option.
+Select one workload and method per new report:
 
 ```sh
 python tests/perf/native_suite.py --scratch /path/on/zfs \

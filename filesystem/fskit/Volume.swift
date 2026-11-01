@@ -1879,7 +1879,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let sourceMetadata = try self.metadata(source), oldMetadata = try self.metadata(oldParent), newMetadata = try self.metadata(newParent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard source != 1, sourceMetadata.link_count == 1,
-                      sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
+                      sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.flags == 0, oldMetadata.flags == 0, newMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)

@@ -255,7 +255,7 @@ def main():
     p.add_argument('--fixtures', nargs='+', choices=[*fileops.SAMPLES, *PROFILES, *native_fixtures.PROFILES, *native_fixtures.SCAN_PROFILES, 'installed_dependencies'],
                    default=['docs_5k_100mb'] if linux else list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
     p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=['cp'] if linux else list(COPY_TOOLS),
-                   help='Linux admits copy/cp or clone/cp-clone; macOS clone references and ordinary cp -Rp')
+                   help='Linux: docs copy/cp or clone/cp-clone, dependencies_100k copy/cp; macOS clone references and ordinary cp -Rp')
     p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['copy'] if linux else ['clone', 'move', 'delete'])
     p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
@@ -267,11 +267,13 @@ def main():
         fileops.require(len(selection) == len(set(selection)), 'Duplicate benchmark selectors are not allowed')
     fileops.require(system in ('Darwin', 'Linux'), 'macOS or Linux is required')
     if linux:
-        fileops.require(a.fixtures == ['docs_5k_100mb'] and a.cache == ['warm']
-                        and (a.operations, a.copy_tools) in ((['copy'], ['cp']), (['clone'], ['cp-clone']))
+        fileops.require((a.fixtures, a.operations, a.copy_tools) in (
+                            (['docs_5k_100mb'], ['copy'], ['cp']),
+                            (['docs_5k_100mb'], ['clone'], ['cp-clone']),
+                            (['dependencies_100k'], ['copy'], ['cp'])) and a.cache == ['warm']
                         and a.samples == 10 and a.runs == 1
                         and all(value is None for value in (a.binary, a.jobs, a.node, a.npm, a.npm_cache)),
-                        'Linux admits only docs_5k_100mb, warm copy/cp or clone/cp-clone, 10 samples per phase, one run and no binary or jobs')
+                        'Linux admits only warm docs_5k_100mb copy/cp or clone/cp-clone, or dependencies_100k copy/cp, 10 samples per phase, one run and no binary, jobs or install arguments')
     else:
         fileops.require(a.binary is not None, 'An installed executable is required')
     fileops.require(a.samples >= 10 and a.runs >= 1, 'At least 10 samples and 1 collection run are required')
