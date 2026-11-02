@@ -1,6 +1,7 @@
 """Compare installed CLI cases, including startup, on private fixtures."""
 import argparse
 import base64
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -215,6 +216,86 @@ def paired_plain_effects(rows):
     }
 
 
+
+CLI_DELETE_FIXTURE_POLICY = 'cli-delete-uf-tracked-v1'
+_DARWIN_FCHFLAGS = None
+
+
+def _fchflags(descriptor, flags):
+    """Call Darwin's descriptor flag setter with its public C signature."""
+    global _DARWIN_FCHFLAGS
+    require(sys.platform == 'darwin', 'Tracked CLI fixtures require Darwin fchflags')
+    if _DARWIN_FCHFLAGS is None:
+        library = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        setter = library.fchflags
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint32]
+        setter.restype = ctypes.c_int
+        _DARWIN_FCHFLAGS = setter
+    result = _DARWIN_FCHFLAGS(descriptor, flags)
+    if result == -1:
+        code = ctypes.get_errno()
+        raise OSError(code, 'fchflags failed: ' + os.strerror(code))
+    require(result == 0, 'Unexpected fchflags return value')
+
+
+def initialize_tracked_delete_operand(target, root_identity, source_identity, evidence):
+    """Initialize only a fresh owned independent operand before its prepared snapshot."""
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+              'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+    stable = fields[:8]
+    def metadata(info):
+        return {name: getattr(info, name, None) for name in fields}
+    descriptor = None
+    evidence.update(policy=CLI_DELETE_FIXTURE_POLICY, status='running', descriptor_closed=False)
+    try:
+        require(target.is_absolute() and target.name == 'target', 'Invalid tracked delete operand')
+        root = target.parent.lstat()
+        require(stat.S_ISDIR(root.st_mode) and stat.S_IMODE(root.st_mode) == 0o700
+                and root.st_uid == os.getuid() and (root.st_dev, root.st_ino) == root_identity,
+                'Tracked operand root changed')
+        initial = metadata(target.lstat())
+        evidence['initial_metadata'] = dict(initial)
+
+        def valid(value):
+            require(stat.S_ISREG(value['st_mode']) and stat.S_IMODE(value['st_mode']) == 0o640
+                    and value['st_size'] == 4096 and value['st_nlink'] == 1
+                    and value['st_uid'] == os.getuid() and value['st_dev'] == root_identity[0]
+                    and (value['st_dev'], value['st_ino']) != source_identity,
+                    'Tracked operand must be an owned independent regular file')
+            require(value['st_flags'] in (0, stat.UF_TRACKED), 'Unexpected initial tracked operand flags')
+
+        valid(initial)
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        opened = metadata(os.fstat(descriptor))
+        valid(opened)
+        require(all(opened[name] == initial[name] for name in stable),
+                'Tracked operand identity or metadata changed while opening')
+        _fchflags(descriptor, stat.UF_TRACKED)
+        final = metadata(os.fstat(descriptor))
+        evidence['final_metadata'] = dict(final)
+        require(final['st_flags'] == stat.UF_TRACKED
+                and all(final[name] == initial[name] for name in stable),
+                'Tracked operand initialization changed protected metadata or flags')
+        require(metadata(target.lstat()) == final, 'Tracked operand path changed during initialization')
+    except BaseException as error:
+        evidence.update(status='failed', error=f'{type(error).__name__}: {error}')
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+                evidence['descriptor_closed'] = True
+            except BaseException as close_error:
+                evidence['close_error'] = f'{type(close_error).__name__}: {close_error}'
+                error.add_note('Tracked operand close failed: ' + evidence['close_error'])
+        raise
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        evidence.update(status='failed', close_error=f'{type(error).__name__}: {error}')
+        raise
+    evidence.update(status='complete', descriptor_closed=True)
+    return final
+
+
 def native_delete_pins(runtime, cache):
     sources = source_hashes()
     sources.update({Path(module.__file__).name: digest(Path(module.__file__))
@@ -228,6 +309,8 @@ def native_delete_pins(runtime, cache):
 
 
 def native_delete_comparison(rows, phase, samples):
+    require(all(row.get('fixture_policy') == CLI_DELETE_FIXTURE_POLICY for row in rows),
+            'CLI delete fixture policies differ or are untagged')
     require(all(row['method'] in ('native', 'candidate') for row in rows), 'Unexpected CLI delete method')
     expected = set(range(1, 32 if phase == 'timing' else samples + 1))
     methods = {}
@@ -259,12 +342,14 @@ def native_delete(args):
     pins = native_delete_pins(runtime, args.cache)
     inventory = json.loads(command([binary, '--json', 'volumes']).stdout)
     volume = scratch_volume(inventory, scratch)
-    report = {'schema': 1, 'case_id': 'cli/delete/tiny_4kib', 'status': 'running', 'passed': False,
+    report = {'schema': 1, 'case_id': 'cli/delete/tiny_4kib', 'fixture_policy': CLI_DELETE_FIXTURE_POLICY,
+              'status': 'running', 'passed': False,
               'qualified': False, 'all_metrics_won': False, 'cleanup_passed': False,
               'timing_pairs': 31, 'timing_warmup_id': 0, 'resource_pairs': args.samples,
               'cache': args.cache, 'pins': pins, 'volume': volume, 'cold_cache_unavailable': None,
               'cache_condition': 'Full source and candidate-based mount checks precede conditioning. After conditioning, identical root/operand metadata checks precede both methods without candidate execution or fixture file-content reads. Fully cold metadata residency is not established.',
               'limits': ['Only the original 4 KiB/0640 CLI fixture is scored; this is not the enriched native-delete case.',
+                         'Each fresh owned operand is initialized once to UF_TRACKED=64 before its prepared snapshot and outside measurement; deletion cost is not equivalent to historical untracked or untagged fixtures.',
                          'Timing includes command startup; CPU is completed-command/reaped-child CPU from native_metrics, not legacy harness-plus-child cpu_s.',
                          'RSS is the measured individual-process peak, not simultaneous process-tree or whole-system memory. Footprint is unavailable.',
                          'JSON candidate calls are independently paired with fresh plain-output rm calls.',
@@ -370,7 +455,8 @@ def native_delete(args):
         for form in ('plain', 'json'):
             for cache in args.cache:
                 for phase in ('timing', 'resources'):
-                    key = {'case_id': report['case_id'], 'output': form, 'cache': cache, 'phase': phase,
+                    key = {'case_id': report['case_id'], 'fixture_policy': CLI_DELETE_FIXTURE_POLICY,
+                           'output': form, 'cache': cache, 'phase': phase,
                            'reference': '/bin/rm -f', 'reference_output': 'plain', 'paired': True}
                     if cache == 'cold' and report['cold_cache_unavailable']:
                         record('unavailable', key | {'reason': report['cold_cache_unavailable']})
@@ -398,9 +484,22 @@ def native_delete(args):
                             require(completed.returncode == 0, 'CLI operand setup failed; preserve fixture')
                             verify_clone(source, target, expected['tiny_4kib'])
                             sources()
-                            prepared = operand()
-                            setup['operand_metadata'] = dict(prepared)
-                            setup['operand_metadata_stage'] = 'before_content_validation'
+                            setup['tracked_initialization'] = {}
+                            try:
+                                initialized = initialize_tracked_delete_operand(target,
+                                    (identity.st_dev, identity.st_ino), identities['tiny_4kib'],
+                                    setup['tracked_initialization'])
+                                prepared = operand()
+                                setup['operand_metadata'] = dict(prepared)
+                                setup['operand_metadata_stage'] = 'before_content_validation'
+                                require(prepared == initialized,
+                                        'Tracked operand changed before prepared snapshot')
+                            except BaseException as error:
+                                try:
+                                    record('preparation', setup, setup_id)
+                                except BaseException as journal_error:
+                                    error.add_note('Tracked preparation reporting failed: ' + repr(journal_error))
+                                raise
                             setup['validated'] = True
                             record('preparation', setup, setup_id)
                             argv = ['/bin/rm', '-f', str(target)] if method == 'native' else [

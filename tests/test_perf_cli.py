@@ -2,6 +2,8 @@
 from contextlib import ExitStack, redirect_stderr
 import base64
 import copy
+import ctypes
+import errno
 import importlib.util
 import io
 import json
@@ -36,6 +38,25 @@ class NativeDelete(unittest.TestCase):
         stack.enter_context(mock.patch.object(cli, 'installed', return_value={'binary': binary}))
         stack.enter_context(mock.patch.object(cli, 'scratch_volume', return_value={'filesystem': 'apfs'}))
         self.events = []
+        self.tracked_flags = {}
+        original_lstat, original_fstat = Path.lstat, os.fstat
+        def tracked_info(info):
+            flags = self.tracked_flags.get((info.st_dev, info.st_ino))
+            if flags is None:
+                return info
+            values = {name: getattr(info, name, None) for name in (
+                'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+                'st_mtime_ns', 'st_ctime_ns', 'st_flags')}
+            return SimpleNamespace(**(values | {'st_flags': flags}))
+        stack.enter_context(mock.patch.object(Path, 'lstat',
+            new=lambda path, *a, **kw: tracked_info(original_lstat(path, *a, **kw))))
+        stack.enter_context(mock.patch.object(cli.os, 'fstat',
+            side_effect=lambda fd: tracked_info(original_fstat(fd))))
+        def track(fd, flags):
+            info = original_fstat(fd)
+            self.assertEqual(flags, stat.UF_TRACKED)
+            self.tracked_flags[(info.st_dev, info.st_ino)] = flags
+        self.track = stack.enter_context(mock.patch.object(cli, '_fchflags', side_effect=track))
         self.mounts = stack.enter_context(mock.patch.object(
             cli, 'no_mounts_below', side_effect=lambda *_: self.events.append('mount')))
         self.pins_value = {'runtime': {'candidate': 'controlled fixture'}, 'cold_tools': {
@@ -122,6 +143,23 @@ class NativeDelete(unittest.TestCase):
             self.assertFalse(state['qualified'])
             self.assertEqual((state['timing_pairs'], state['resource_pairs']), (31, 12))
             self.assertEqual(len(rows), 176)
+            self.assertEqual(self.track.call_count, 176)
+            self.assertEqual(state['fixture_policy'], cli.CLI_DELETE_FIXTURE_POLICY)
+            self.assertTrue(all(row['fixture_policy'] == cli.CLI_DELETE_FIXTURE_POLICY
+                                for row in rows + comparisons))
+            journal = cli.native_report.ReportJournal.open_existing(self.output)
+            try:
+                preparations = list(journal.iter_latest('preparation'))
+            finally:
+                journal.close()
+            for setup in preparations:
+                initialization = setup['tracked_initialization']
+                self.assertEqual(setup['fixture_policy'], cli.CLI_DELETE_FIXTURE_POLICY)
+                self.assertEqual(initialization['policy'], cli.CLI_DELETE_FIXTURE_POLICY)
+                self.assertEqual(initialization['status'], 'complete')
+                self.assertTrue(initialization['descriptor_closed'])
+                self.assertEqual(initialization['final_metadata'], setup['operand_metadata'])
+                self.assertEqual(setup['operand_metadata']['st_flags'], stat.UF_TRACKED)
             self.assertEqual(len(comparisons), 4)
             self.assertEqual({row['preparation_id'] for row in rows}, set(range(176)))
             self.assertEqual(json.loads(self.output.with_name(self.output.name + '.manifest').read_text())['event_count'], 1060)
@@ -184,6 +222,65 @@ class NativeDelete(unittest.TestCase):
                 self.collect.assert_not_called()
                 self.assertTrue((self.base / 'target').exists())
                 self.retained()
+
+    def test_tracked_initialization_errno_retains_preparation_before_conditioning(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self.configure(stack, Path(directory))
+            self.track.side_effect = OSError('fchflags denied')
+            with self.assertRaisesRegex(OSError, 'fchflags denied'):
+                cli.native_delete(self.args)
+            self.condition.assert_not_called()
+            self.collect.assert_not_called()
+            state, rows, comparisons = self.retained()
+            self.assertEqual(rows, [])
+            self.assertEqual(comparisons, [])
+            self.assertTrue((self.base / 'target').exists())
+            journal = cli.native_report.ReportJournal.open_existing(self.output)
+            try:
+                preparations = list(journal.iter_latest('preparation'))
+            finally:
+                journal.close()
+            self.assertEqual(len(preparations), 1)
+            initialization = preparations[0]['tracked_initialization']
+            self.assertEqual(initialization['status'], 'failed')
+            self.assertTrue(initialization['descriptor_closed'])
+            self.assertIn('fchflags denied', initialization['error'])
+            self.assertFalse(preparations[0]['validated'])
+            self.assertNotIn('operand_metadata', preparations[0])
+
+    def test_post_initialization_drift_cannot_rebase_the_prepared_snapshot(self):
+        for field in ('st_flags', 'st_ctime_ns'):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                self.configure(stack, Path(directory))
+                original_init, original_lstat = cli.initialize_tracked_delete_operand, Path.lstat
+                initialized = []
+                def initialize(*args):
+                    result = original_init(*args)
+                    initialized.append(result)
+                    return result
+                def lstat(path, *args, **kwargs):
+                    info = original_lstat(path, *args, **kwargs)
+                    if initialized and path == self.base / 'target':
+                        values = {name: getattr(info, name, None) for name in initialized[0]}
+                        values[field] = 0 if field == 'st_flags' else values[field] + 1
+                        return SimpleNamespace(**values)
+                    return info
+                stack.enter_context(mock.patch.object(cli, 'initialize_tracked_delete_operand', side_effect=initialize))
+                stack.enter_context(mock.patch.object(Path, 'lstat', new=lstat))
+                with self.assertRaisesRegex(RuntimeError, 'changed before prepared snapshot'):
+                    cli.native_delete(self.args)
+                self.condition.assert_not_called()
+                self.collect.assert_not_called()
+                self.retained()
+                journal = cli.native_report.ReportJournal.open_existing(self.output)
+                try:
+                    setup = list(journal.iter_latest('preparation'))[0]
+                finally:
+                    journal.close()
+                self.assertFalse(setup['validated'])
+                self.assertEqual(setup['tracked_initialization']['final_metadata'], initialized[0])
+                self.assertNotEqual(setup['operand_metadata'][field], initialized[0][field])
+                self.assertEqual(setup['operand_metadata_stage'], 'before_content_validation')
 
     def test_prepared_diagnostic_snapshot_precedes_content_validation(self):
         fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
@@ -268,6 +365,7 @@ class NativeDelete(unittest.TestCase):
                 else:
                     mismatch = caught.exception.operand_metadata_mismatch
                     self.assertEqual(mismatch['expected'], prepared[0])
+                    self.assertEqual(prepared[0]['st_flags'], stat.UF_TRACKED)
                     self.assertEqual(mismatch['observed'], observed[0])
                     self.assertEqual(mismatch['changed_fields'], [field])
                     self.assertEqual(mismatch['stage'], 'before_conditioning')
@@ -344,11 +442,12 @@ class NativeDelete(unittest.TestCase):
     def test_pair_closure_rejects_short_duplicate_invalid_and_extra_ids(self):
         for phase, count in (('timing', 31), ('resources', 10)):
             rows = [dict(method=method, pair_id=index, phase=phase, warmup=index == 0,
-                         ok=True, validated=True, wall_s=0.01, cpu_s=0.01, rss_bytes=4096)
+                         ok=True, validated=True, fixture_policy=cli.CLI_DELETE_FIXTURE_POLICY,
+                         wall_s=0.01, cpu_s=0.01, rss_bytes=4096)
                     for method in ('native', 'candidate')
                     for index in (range(32) if phase == 'timing' else range(1, count + 1))]
             self.assertTrue(cli.native_delete_comparison(rows, phase, 10))
-            for change in ('short', 'duplicate', 'extra', 'invalid', 'warmup'):
+            for change in ('short', 'duplicate', 'extra', 'invalid', 'warmup', 'historical', 'mixed-policy'):
                 altered = copy.deepcopy(rows)
                 if change == 'short':
                     altered = [row for row in altered if row['pair_id'] <= 10] if phase == 'timing' else altered[:-1]
@@ -358,8 +457,12 @@ class NativeDelete(unittest.TestCase):
                     altered.append({**altered[-1], 'pair_id': 99})
                 elif change == 'invalid':
                     altered[-1]['validated'] = False
-                else:
+                elif change == 'warmup':
                     altered.append({**altered[-1], 'pair_id': 0, 'warmup': True})
+                elif change == 'historical':
+                    altered[-1].pop('fixture_policy')
+                else:
+                    altered[-1]['fixture_policy'] = 'historical-untracked'
                 with self.subTest(phase=phase, change=change), self.assertRaises(RuntimeError):
                     cli.native_delete_comparison(altered, phase, 10)
 
@@ -599,3 +702,229 @@ class NativeDelete(unittest.TestCase):
                     self.assertEqual(self.collect.call_count, 1)
                 elif failure != 'cleanup':
                     self.collect.assert_not_called()
+
+
+class TrackedOperandInitialization(unittest.TestCase):
+    def boundary(self, stack, *, initial_flags=0, initial_change=None, final_change=None,
+                 opened_change=None, path_final_change=None):
+        self.target = Path('/owned/target')
+        self.initial = dict(st_dev=10, st_ino=20, st_mode=stat.S_IFREG | 0o640,
+                            st_nlink=1, st_uid=os.getuid(), st_gid=20, st_size=4096,
+                            st_mtime_ns=100, st_ctime_ns=200, st_flags=initial_flags)
+        self.initial.update(initial_change or {})
+        self.final = self.initial | {'st_ctime_ns': 300, 'st_flags': stat.UF_TRACKED}
+        self.final.update(final_change or {})
+        opened = self.initial | (opened_change or {})
+        root = SimpleNamespace(st_dev=10, st_ino=5, st_mode=stat.S_IFDIR | 0o700,
+                               st_uid=os.getuid())
+        path_reads = iter((SimpleNamespace(**self.initial),
+                           SimpleNamespace(**(self.final | (path_final_change or {})))))
+        stack.enter_context(mock.patch.object(Path, 'lstat',
+            new=lambda path: root if path == self.target.parent else next(path_reads)))
+        self.open = stack.enter_context(mock.patch.object(cli.os, 'open', return_value=99))
+        self.fstat = stack.enter_context(mock.patch.object(cli.os, 'fstat',
+            side_effect=[SimpleNamespace(**opened), SimpleNamespace(**self.final)]))
+        self.flags = stack.enter_context(mock.patch.object(cli, '_fchflags'))
+        self.close = stack.enter_context(mock.patch.object(cli.os, 'close'))
+        self.evidence = {}
+
+    def initialize(self):
+        return cli.initialize_tracked_delete_operand(self.target, (10, 5), (10, 7), self.evidence)
+
+    def test_zero_or_tracked_flags_initialize_once_and_close_before_snapshot(self):
+        for initial in (0, stat.UF_TRACKED):
+            with self.subTest(initial=initial), ExitStack() as stack:
+                self.boundary(stack, initial_flags=initial)
+                self.assertEqual(self.initialize(), self.final)
+                self.open.assert_called_once_with(self.target,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                self.flags.assert_called_once_with(99, stat.UF_TRACKED)
+                self.close.assert_called_once_with(99)
+                self.assertEqual(self.evidence, {'policy': cli.CLI_DELETE_FIXTURE_POLICY,
+                    'status': 'complete', 'descriptor_closed': True,
+                    'initial_metadata': self.initial, 'final_metadata': self.final})
+
+    def test_other_initial_flags_and_unsafe_operands_are_rejected_before_mutation(self):
+        changes = ({'st_flags': 1}, {'st_flags': 65}, {'st_uid': os.getuid() + 1},
+                   {'st_mode': stat.S_IFLNK | 0o640}, {'st_nlink': 2},
+                   {'st_dev': 11}, {'st_ino': 7})
+        for change in changes:
+            with self.subTest(change=change), ExitStack() as stack:
+                self.boundary(stack, initial_change=change)
+                with self.assertRaises(RuntimeError):
+                    self.initialize()
+                self.flags.assert_not_called()
+                self.close.assert_not_called()
+                self.assertEqual(self.evidence['status'], 'failed')
+
+    def test_opened_identity_and_other_eight_fields_cannot_change(self):
+        changes = {'st_dev': 11, 'st_ino': 21, 'st_mode': stat.S_IFREG | 0o600,
+                   'st_nlink': 2, 'st_uid': os.getuid() + 1, 'st_gid': 21,
+                   'st_size': 2048, 'st_mtime_ns': 101}
+        for field, value in changes.items():
+            with self.subTest(field=field), ExitStack() as stack:
+                self.boundary(stack, opened_change={field: value})
+                with self.assertRaises(RuntimeError):
+                    self.initialize()
+                self.flags.assert_not_called()
+                self.close.assert_called_once_with(99)
+                self.assertTrue(self.evidence['descriptor_closed'])
+
+    def test_post_initialization_flags_and_other_eight_fields_are_checked(self):
+        changes = {'st_dev': 11, 'st_ino': 21, 'st_mode': stat.S_IFREG | 0o600,
+                   'st_nlink': 2, 'st_uid': os.getuid() + 1, 'st_gid': 21,
+                   'st_size': 2048, 'st_mtime_ns': 101, 'st_flags': 0, 'path_identity': 21}
+        for field, value in changes.items():
+            with self.subTest(field=field), ExitStack() as stack:
+                if field == 'path_identity':
+                    self.boundary(stack, path_final_change={'st_ino': value})
+                else:
+                    self.boundary(stack, final_change={field: value})
+                with self.assertRaises(RuntimeError):
+                    self.initialize()
+                self.flags.assert_called_once_with(99, stat.UF_TRACKED)
+                self.close.assert_called_once_with(99)
+                self.assertEqual(self.evidence['status'], 'failed')
+
+    def test_open_flag_and_close_errors_fail_without_retry_and_preserve_primary(self):
+        for failure in ('open', 'fstat-before', 'flags', 'fstat-after', 'close', 'flags-and-close'):
+            with self.subTest(failure=failure), ExitStack() as stack:
+                self.boundary(stack)
+                if failure == 'open':
+                    self.open.side_effect = OSError('open denied')
+                if failure == 'fstat-before':
+                    self.fstat.side_effect = OSError('initial fstat failed')
+                if failure == 'fstat-after':
+                    self.fstat.side_effect = [SimpleNamespace(**self.initial), OSError('final fstat failed')]
+                if failure in ('flags', 'flags-and-close'):
+                    self.flags.side_effect = OSError('flags denied')
+                if failure in ('close', 'flags-and-close'):
+                    self.close.side_effect = OSError('close failed')
+                with self.assertRaises(OSError) as caught:
+                    self.initialize()
+                self.assertEqual(self.evidence['status'], 'failed')
+                self.assertEqual(self.open.call_count, 1)
+                self.assertEqual(self.flags.call_count, int(failure not in ('open', 'fstat-before')))
+                self.assertEqual(self.close.call_count, int(failure != 'open'))
+                if failure == 'flags-and-close':
+                    self.assertIn('flags denied', str(caught.exception))
+                    self.assertIn('close failed', caught.exception.__notes__[0])
+                    self.assertIn('close failed', self.evidence['close_error'])
+
+
+class DarwinFlagBinding(unittest.TestCase):
+    def test_public_symbol_signature_is_cached_and_success_ignores_stale_errno(self):
+        setter = mock.Mock(return_value=0)
+        library = SimpleNamespace(fchflags=setter)
+        with mock.patch.object(cli.sys, 'platform', 'darwin'), \
+                mock.patch.object(cli, '_DARWIN_FCHFLAGS', None), \
+                mock.patch.object(cli.ctypes, 'CDLL', return_value=library) as load, \
+                mock.patch.object(cli.ctypes, 'get_errno', return_value=errno.EACCES) as error:
+            cli._fchflags(7, stat.UF_TRACKED)
+            cli._fchflags(8, stat.UF_TRACKED)
+            load.assert_called_once_with('/usr/lib/libSystem.B.dylib', use_errno=True)
+            self.assertEqual(setter.argtypes, [ctypes.c_int, ctypes.c_uint32])
+            self.assertIs(setter.restype, ctypes.c_int)
+            self.assertEqual((ctypes.sizeof(ctypes.c_int), ctypes.sizeof(ctypes.c_uint32)), (4, 4))
+            self.assertEqual(setter.call_args_list, [mock.call(7, 64), mock.call(8, 64)])
+            error.assert_not_called()
+
+    def test_failed_symbol_resolution_is_not_cached_and_never_calls_a_setter(self):
+        for failure in ('platform', 'library', 'symbol'):
+            with self.subTest(failure=failure), \
+                    mock.patch.object(cli.sys, 'platform', 'other' if failure == 'platform' else 'darwin'), \
+                    mock.patch.object(cli, '_DARWIN_FCHFLAGS', None), \
+                    mock.patch.object(cli.ctypes, 'CDLL') as load:
+                if failure == 'library':
+                    load.side_effect = OSError('library unavailable')
+                else:
+                    load.return_value = SimpleNamespace()
+                with self.assertRaises((RuntimeError, OSError, AttributeError)):
+                    cli._fchflags(7, 64)
+                self.assertIsNone(cli._DARWIN_FCHFLAGS)
+                self.assertEqual(load.call_count, int(failure != 'platform'))
+
+    def test_minus_one_captures_exact_errno_and_other_nonzero_returns_fail(self):
+        for result in (-1, 1):
+            with self.subTest(result=result), \
+                    mock.patch.object(cli.sys, 'platform', 'darwin'), \
+                    mock.patch.object(cli, '_DARWIN_FCHFLAGS', mock.Mock(return_value=result)) as setter, \
+                    mock.patch.object(cli.ctypes, 'get_errno', return_value=errno.EPERM) as error:
+                with self.assertRaises(OSError if result == -1 else RuntimeError) as caught:
+                    cli._fchflags(7, 64)
+                setter.assert_called_once_with(7, 64)
+                if result == -1:
+                    self.assertEqual(caught.exception.errno, errno.EPERM)
+                    error.assert_called_once_with()
+                else:
+                    error.assert_not_called()
+
+    def test_real_darwin_binding_initializes_one_fresh_owned_file(self):
+        self.assertEqual(sys.platform, 'darwin', 'This binding admission requires the target Mac')
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-cli-tracked-binding-'))
+        base.chmod(0o700)
+        target, source = base / 'target', base / 'tiny'
+        content = bytes(range(256)) * 16
+        held = None
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+                  'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+        def metadata(info):
+            return {name: getattr(info, name, None) for name in fields}
+        try:
+            for path in (source, target):
+                with path.open('xb') as stream:
+                    stream.write(content)
+                path.chmod(0o640)
+            root, protected = base.lstat(), source.lstat()
+            self.assertEqual(stat.S_IMODE(root.st_mode), 0o700)
+            self.assertEqual(root.st_uid, os.getuid())
+            held = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            self.assertEqual(os.read(held, len(content) + 1), content)
+            self.assertEqual(os.read(held, 1), b'')
+            before = metadata(os.fstat(held))
+            self.assertEqual(metadata(target.lstat()), before)
+            self.assertEqual(stat.S_IMODE(before['st_mode']), 0o640)
+            self.assertEqual(before['st_size'], 4096)
+            self.assertEqual(before['st_uid'], os.getuid())
+            self.assertEqual(before['st_nlink'], 1)
+            self.assertNotEqual((before['st_dev'], before['st_ino']), (protected.st_dev, protected.st_ino))
+            evidence = {}
+            with mock.patch.object(cli, '_DARWIN_FCHFLAGS', None), \
+                    mock.patch.object(cli, '_fchflags', wraps=cli._fchflags) as call:
+                final = cli.initialize_tracked_delete_operand(target,
+                    (root.st_dev, root.st_ino), (protected.st_dev, protected.st_ino), evidence)
+                self.assertEqual(call.call_count, 1)
+                self.assertEqual(call.call_args.args[1], stat.UF_TRACKED)
+                self.assertNotEqual(call.call_args.args[0], held)
+            self.assertEqual(final['st_flags'], stat.UF_TRACKED)
+            self.assertEqual({name: final[name] for name in fields[:8]},
+                             {name: before[name] for name in fields[:8]})
+            self.assertEqual(metadata(os.fstat(held)), final)
+            self.assertEqual(metadata(target.lstat()), final)
+            self.assertEqual(evidence['final_metadata'], final)
+            self.assertEqual(evidence['status'], 'complete')
+            self.assertTrue(evidence['descriptor_closed'])
+            os.lseek(held, 0, os.SEEK_SET)
+            self.assertEqual(os.read(held, len(content) + 1), content)
+            self.assertEqual(os.read(held, 1), b'')
+            self.assertEqual(metadata(os.fstat(held)), final)
+            self.assertEqual(metadata(target.lstat()), final)
+            closing, held = held, None
+            os.close(closing)
+            self.assertEqual((base.lstat().st_dev, base.lstat().st_ino), (root.st_dev, root.st_ino))
+            self.assertEqual(set(base.iterdir()), {source, target})
+            self.assertEqual(metadata(target.lstat()), final)
+            self.assertEqual((source.lstat().st_dev, source.lstat().st_ino), (protected.st_dev, protected.st_ino))
+            self.assertEqual(source.read_bytes(), content)
+            target.unlink()
+            source.unlink()
+            base.rmdir()
+        except BaseException as error:
+            if held is not None:
+                closing, held = held, None
+                try:
+                    os.close(closing)
+                except BaseException as close_error:
+                    error.add_note('Held descriptor close failed: ' + repr(close_error))
+            error.add_note('Fresh tracked binding fixture retained if not already removed: ' + str(base))
+            raise
