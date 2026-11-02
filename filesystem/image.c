@@ -324,9 +324,9 @@ static enum sfs_status aux_finish(reader *r, enum sfs_status first) {
     if (!first && error) { r->error = error; r->phase = SFS_PHASE_VERIFY_AUX; return SFS_IO; }
     return first;
 }
-static enum sfs_status aux_bytes(reader *r, uint64_t at, uint8_t **out) {
+static enum sfs_status aux_bytes(reader *r, uint64_t at, aux_entry **out) {
     auxiliary *a = r->aux; uint64_t block = at / CELL;
-    for (unsigned i = 0; i < a->count; ++i) if (a->entries[i].valid && a->entries[i].block == block) { a->entries[i].stamp = ++a->clock; *out = a->entries[i].bytes + at % CELL; return SFS_OK; }
+    for (unsigned i = 0; i < a->count; ++i) if (a->entries[i].valid && a->entries[i].block == block) { a->entries[i].stamp = ++a->clock; *out = &a->entries[i]; return SFS_OK; }
     unsigned slot = a->count;
     if (slot == CACHE_COUNT) { slot = 0; for (unsigned i = 1; i < a->count; ++i) if (a->entries[i].stamp < a->entries[slot].stamp) slot = i; }
     else { a->entries[slot].bytes = calloc(1, CELL); if (!a->entries[slot].bytes) return SFS_NOMEM; a->count++; }
@@ -340,13 +340,14 @@ static enum sfs_status aux_bytes(reader *r, uint64_t at, uint8_t **out) {
     size_t n = a->length - offset < CELL ? (size_t)(a->length - offset) : CELL;
     e = charge(r, SFS_INCOMPLETE_AUX_IO, n); if (e) return e;
     memset(v->bytes, 0, CELL); if (read_exact(a->fd, v->bytes, n, offset)) return io_failure(r, SFS_PHASE_VERIFY_AUX);
-    v->block = block; v->stamp = ++a->clock; v->valid = 1; *out = v->bytes + at % CELL; return SFS_OK;
+    v->block = block; v->stamp = ++a->clock; v->valid = 1; *out = v; return SFS_OK;
 }
 static enum sfs_status memo(reader *r, const reference *ref, uint8_t entry[128], int writing) {
     if (!r->aux) { if (!writing) memset(entry, 0, 128); return SFS_OK; }
-    uint64_t at = (ref->offset / CELL) * 128; uint8_t *p; enum sfs_status e = aux_bytes(r, at, &p); if (e) return e;
+    uint64_t at = (ref->offset / CELL) * 128; aux_entry *selected; enum sfs_status e = aux_bytes(r, at, &selected); if (e) return e;
+    uint8_t *p = selected->bytes + at % CELL;
     if (!writing) { memcpy(entry, p, 128); if (get32(entry + 4) && (get32(entry + 4) != ref->type || memcmp(entry + 8, ref->digest, 32))) return SFS_CORRUPT; if (!zero(entry + 64, 64)) return SFS_CORRUPT; }
-    else { memcpy(p, entry, 128); for (unsigned i = 0; i < r->aux->count; ++i) if (r->aux->entries[i].valid && r->aux->entries[i].block == at / CELL) { r->aux->entries[i].dirty = 1; break; } }
+    else { memcpy(p, entry, 128); selected->dirty = 1; }
     return SFS_OK;
 }
 static enum sfs_status metadata(reader *r, const reference *ref, unsigned type, uint64_t before, const uint8_t **out) {
