@@ -79,6 +79,8 @@ def stages(args, cycle):
          '--copy-tools', 'cp-clone', 'cp', 'ditto', 'rsync', '--fixtures', *FILES, *runtime]),
         ('native-copy', 'native_suite.py', [*native, '--operations', 'copy',
          '--copy-tools', 'cp', '--fixtures', 'tiny_4kib']),
+        ('native-cli-delete', 'cli.py', ['--native-delete', '--cache', *args.cache,
+         '--candidate', str(args.binary)]),
         ('native-scan', 'native_suite.py', [*native, '--operations', 'scan', '--fixtures', *SCANS]),
         ('scan-api', 'scan.py', ['--files', '20000', '--memory', '--cache', 'warm']),
         *([('scan-api-cold', 'scan.py', ['--files', '20000', '--memory', '--cache', 'cold'])]
@@ -127,7 +129,7 @@ def outcome(name, output):
     fields = ('status', 'passed', 'cleanup_passed', 'retained_fixture',
               'completion_uncertain', 'error', 'cleanup_error', 'cold_cache_unavailable',
               'cache', 'cold_cache_receipt', 'denial_source_verification', 'denial_runtime_verified',
-              'cold_tool_identity_verified', 'cold_tool_content_verified')
+              'cold_tool_identity_verified', 'cold_tool_content_verified', 'case_id', 'source_checks_passed')
     return {key: state[key] for key in fields if key in state}, evidence
 
 
@@ -143,14 +145,24 @@ def safe_to_continue(name, code, state, evidence):
                    and state.get('cold_tool_identity_verified') is True
                    and isinstance(sources, dict) and bool(sources)
                    and all(isinstance(row, dict) and row.get('unchanged') is True for row in sources.values()))
+    cli_denied = (name == 'native-cli-delete' and isinstance(state.get('cache'), list)
+                  and 'cold' in state['cache'] and bool(state.get('cold_cache_unavailable'))
+                  and isinstance(receipt, dict) and receipt.get('mode') == 'cold'
+                  and type(receipt.get('exit_code')) is int and receipt['exit_code'] > 0
+                  and not receipt.get('completion_uncertain')
+                  and state.get('denial_runtime_verified') is True
+                  and state.get('cold_tool_identity_verified') is True)
     terminal = (state.get('status') == 'complete' and state.get('cleanup_passed') is True
                 and type(state.get('passed')) is bool and evidence['final_report_exists']
                 and (name not in ('scan-api', 'scan-api-cold') or
                      state.get('cache') == ('cold' if name == 'scan-api-cold' else 'warm'))
+                and (name != 'native-cli-delete' or (state.get('case_id') == 'cli/delete/tiny_4kib'
+                     and state.get('source_checks_passed') is True))
                 and not any(state.get(key) for key in
                             ('retained_fixture', 'completion_uncertain', 'error', 'cleanup_error')))
     return terminal and ((code == 0 and state['passed']) or
-                         ((name.startswith('native-') or cold_denied) and code == 1 and not state['passed']))
+                         (((name.startswith('native-') and name != 'native-cli-delete') or cold_denied or cli_denied)
+                          and code == 1 and not state['passed']))
 
 
 def collect(args):
@@ -170,7 +182,7 @@ def collect(args):
                   'Representative photo workload; the current PNG corpus is synthetic',
                   'Mounted FSKit serving-process resources and deferred writes',
                   'External-drive repeat coverage; only the supplied scratch location is used',
-                  'CLI JSON/startup-only cases and mounted-image steady-state I/O are outside this campaign'],
+                  'Other CLI JSON/startup-only cases and mounted-image steady-state I/O are outside this campaign'],
               'cold_cache': ('Purge-conditioned native and API scanner stages requested; denied purges remain failures in child reports. Device-cache eviction is not established'
                              if 'cold' in args.cache else 'Unavailable: cold-cache stages were not selected'),
               'limits': ['Node executable, npm entrypoint and package manifest are pinned; the entire npm tree is not pinned',
@@ -196,7 +208,8 @@ def collect(args):
                     if name == 'scan-api-cold':
                         argv = None
                     else:
-                        start, end = argv.index('--cache') + 1, argv.index('--operations')
+                        start = argv.index('--cache') + 1
+                        end = argv.index('--candidate') if name == 'native-cli-delete' else argv.index('--operations')
                         remaining = [cache for cache in argv[start:end] if cache != 'cold']
                         argv = [*argv[:start], *remaining, *argv[end:]] if remaining else None
                 row = {'cycle': cycle, 'stage': name, 'argv': argv, 'output': str(output),

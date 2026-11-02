@@ -1,5 +1,6 @@
-"""Compare two installed CLIs, including startup, on small private fixtures."""
+"""Compare installed CLI cases, including startup, on private fixtures."""
 import argparse
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,8 +13,14 @@ import shutil
 import stat
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
+
+import fileops as f
+import native_metrics
+import native_report
+import native_suite
 
 from fileops import (REPO, ChildCompletionUnknown, command, cpu_usage, digest, fingerprint_sources, manifest,
                      no_mounts_below, remove_fixture, require, scratch_volume,
@@ -208,13 +215,316 @@ def paired_plain_effects(rows):
     }
 
 
+def native_delete_pins(runtime, cache):
+    sources = source_hashes()
+    sources.update({Path(module.__file__).name: digest(Path(module.__file__))
+                    for module in (f, native_metrics, native_report, native_suite)})
+    result = {'runtime': runtime_hashes(runtime), 'source': sources,
+              'python': digest(Path(sys.executable).resolve()),
+              'tools': {name: digest(Path(name)) for name in ('/bin/rm', '/bin/cp', '/usr/bin/time')}}
+    if 'cold' in cache:
+        result['cold_tools'] = f.cold_tool_provenance()
+    return result
+
+
+def native_delete_comparison(rows, phase, samples):
+    require(all(row['method'] in ('native', 'candidate') for row in rows), 'Unexpected CLI delete method')
+    expected = set(range(1, 32 if phase == 'timing' else samples + 1))
+    methods = {}
+    for method in ('native', 'candidate'):
+        warmups = [row for row in rows if row['method'] == method and row['warmup']]
+        require((len(warmups) == 1 and warmups[0]['pair_id'] == 0) if phase == 'timing' else not warmups,
+                'Incorrect planned CLI delete warmup')
+        selected = [row for row in rows if row['method'] == method and not row['warmup']]
+        ids = [row['pair_id'] for row in selected]
+        require(all(type(value) is int for value in ids) and len(ids) == len(expected)
+                and set(ids) == expected, 'Incomplete or duplicate planned CLI delete pairs')
+        require(all(row['phase'] == phase and row.get('ok') is True and row.get('validated') is True
+                    and not row.get('completion_uncertain') for row in selected + warmups),
+                'Invalid planned CLI delete measurement')
+        methods[method] = selected
+    return {metric: native_metrics.compare_paired(methods['native'], methods['candidate'], metric)
+            for metric in (('wall_s', 'cpu_s') if phase == 'timing' else ('rss_bytes',))}
+
+
+def native_delete(args):
+    """Collect only the existing CLI tiny-delete case against fresh rm calls."""
+    require(platform.system() == 'Darwin', 'This comparison requires macOS')
+    scratch = args.scratch.expanduser().resolve(strict=True)
+    output = args.output.expanduser().absolute()
+    require(scratch.is_dir() and output.parent.is_dir(), 'Scratch and output parent must exist')
+    require(shutil.disk_usage(scratch).free >= 256 * 1024**2, 'At least 256 MiB free is required')
+    runtime = installed(args.candidate.expanduser().resolve(strict=True))
+    binary = runtime['binary']
+    pins = native_delete_pins(runtime, args.cache)
+    inventory = json.loads(command([binary, '--json', 'volumes']).stdout)
+    volume = scratch_volume(inventory, scratch)
+    report = {'schema': 1, 'case_id': 'cli/delete/tiny_4kib', 'status': 'running', 'passed': False,
+              'qualified': False, 'all_metrics_won': False, 'cleanup_passed': False,
+              'timing_pairs': 31, 'timing_warmup_id': 0, 'resource_pairs': args.samples,
+              'cache': args.cache, 'pins': pins, 'volume': volume, 'cold_cache_unavailable': None,
+              'cache_condition': 'Full source and candidate-based mount checks precede conditioning. After conditioning, identical root/operand metadata checks precede both methods without candidate execution or fixture file-content reads. Fully cold metadata residency is not established.',
+              'limits': ['Only the original 4 KiB/0640 CLI fixture is scored; this is not the enriched native-delete case.',
+                         'Timing includes command startup; CPU is completed-command/reaped-child CPU from native_metrics, not legacy harness-plus-child cpu_s.',
+                         'RSS is the measured individual-process peak, not simultaneous process-tree or whole-system memory. Footprint is unavailable.',
+                         'JSON candidate calls are independently paired with fresh plain-output rm calls.',
+                         'Purge conditioning does not establish complete OS/device-cache eviction.',
+                         'After conditioning only root/operand metadata is checked; mount checks use the candidate before conditioning and after measurement. Stable owned trees are required; cache residency is not guaranteed.',
+                         'Unreadable cold-tool contents remain unverified; matching metadata establishes observed identity stability only.',
+                         'Stable owned fixtures only; concurrent hostile path replacement is not contained.',
+                         'No release qualification or tiny-command saving target is established by collection.']}
+    journal = native_report.ReportJournal(output)
+    journal_failed = False
+    counters = dict.fromkeys(('rows', 'preparation', 'comparisons', 'unavailable'), 0)
+    base = None
+    cleaned = False
+
+    def checkpoint():
+        nonlocal journal_failed
+        try:
+            journal.checkpoint(report)
+        except BaseException:
+            journal_failed = True
+            raise
+
+    def record(kind, value, index=None):
+        nonlocal journal_failed
+        if index is None:
+            index = counters[kind]
+            counters[kind] += 1
+        try:
+            journal.append(kind, index, value)
+        except BaseException:
+            journal_failed = True
+            raise
+        return index
+
+    try:
+        checkpoint()
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-cli-delete-', dir=scratch))
+        base.chmod(0o700)
+        identity = base.lstat()
+        report['fixture_root'] = str(base)
+        checkpoint()
+        roots, _ = make_fixtures(base)
+        require(roots == {'tiny_4kib': base / 'tiny', 'empty': base / 'empty', 'nested_1000': base / 'nested'},
+                'CLI fixture roots differ from the existing case')
+        tiny = roots['tiny_4kib'].lstat()
+        require(stat.S_ISREG(tiny.st_mode) and stat.S_IMODE(tiny.st_mode) == 0o640
+                and roots['tiny_4kib'].read_bytes() == bytes(range(256)) * 16,
+                'CLI tiny fixture bytes or mode differ')
+        expected = {name: content_manifest(path) for name, path in roots.items()}
+        identities = {name: (path.lstat().st_dev, path.lstat().st_ino) for name, path in roots.items()}
+        report['fixtures'] = {name: {'manifest_sha256': hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest(),
+                                     'root_identity': identities[name]} for name, value in expected.items()}
+        source = roots['tiny_4kib']
+        target = base / 'target'
+        unused_store = base / 'unused-store'
+        environment = dict(os.environ, STALLIONFS_HOME=str(unused_store), PYTHONDONTWRITEBYTECODE='1')
+        environment.pop('PYTHONPATH', None)
+        environment.pop('PYTHONHOME', None)
+
+        def owned(*, mounts=True):
+            current = base.lstat()
+            require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700
+                    and current.st_uid == os.getuid()
+                    and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino),
+                    'Private fixture root changed; preserve it')
+            if mounts:
+                no_mounts_below(binary, base)
+
+        def sources():
+            owned()
+            require(not os.path.lexists(unused_store), 'Command created an unnecessary store')
+            require((base / 'outside-sentinel').read_bytes() == b'keep outside linked trees\n', 'Sentinel changed')
+            for name, path in roots.items():
+                info = path.lstat()
+                require((info.st_dev, info.st_ino) == identities[name]
+                        and content_manifest(path) == expected[name], 'CLI source fixture changed: ' + name)
+
+        def operand(prepared=None, *, contents=True, mounts=True):
+            owned(mounts=mounts)
+            require(target.is_absolute() and target.parent == base and target.name == 'target', 'Invalid delete operand')
+            info = target.lstat()
+            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1,
+                    'Delete operand must be an independent regular file')
+            require((info.st_dev, info.st_ino) != identities['tiny_4kib'], 'Delete operand aliases protected source')
+            metadata = {name: getattr(info, name, None) for name in (
+                'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+                'st_mtime_ns', 'st_ctime_ns', 'st_flags')}
+            if prepared is not None:
+                require(metadata == prepared, 'Delete operand metadata changed')
+            if contents:
+                require(content_manifest(target) == expected['tiny_4kib'], 'Delete operand differs from CLI fixture')
+            return metadata
+
+        rng = random.Random(SEED)
+        for form in ('plain', 'json'):
+            for cache in args.cache:
+                for phase in ('timing', 'resources'):
+                    key = {'case_id': report['case_id'], 'output': form, 'cache': cache, 'phase': phase,
+                           'reference': '/bin/rm -f', 'reference_output': 'plain', 'paired': True}
+                    if cache == 'cold' and report['cold_cache_unavailable']:
+                        record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                        checkpoint()
+                        continue
+                    rows = []
+                    denied = False
+                    rounds = range(32) if phase == 'timing' else range(1, args.samples + 1)
+                    for pair_id in rounds:
+                        order = ['native', 'candidate']
+                        rng.shuffle(order)
+                        for method in order:
+                            sources()
+                            require(not os.path.lexists(target), 'Stale delete operand')
+                            setup = key | {'pair_id': pair_id, 'method': method,
+                                           'argv': ['/bin/cp', '-cRp', str(source), str(target)], 'validated': False}
+                            setup_id = record('preparation', setup)
+                            report['active_operation'] = setup
+                            checkpoint()
+                            completed = command(setup['argv'], check=False, timeout=120, environment=environment)
+                            setup.update(exit_code=completed.returncode,
+                                stdout_b64=base64.b64encode(completed.stdout).decode(),
+                                stderr_b64=base64.b64encode(completed.stderr).decode())
+                            record('preparation', setup, setup_id)
+                            require(completed.returncode == 0, 'CLI operand setup failed; preserve fixture')
+                            verify_clone(source, target, expected['tiny_4kib'])
+                            sources()
+                            prepared = operand()
+                            setup['validated'] = True
+                            record('preparation', setup, setup_id)
+                            argv = ['/bin/rm', '-f', str(target)] if method == 'native' else [
+                                str(binary), *(['--json'] if form == 'json' else []), 'delete', str(target)]
+                            row = key | {'pair_id': pair_id, 'warmup': phase == 'timing' and pair_id == 0,
+                                         'method': method, 'argv': argv, 'ok': False, 'validated': False}
+                            row_id = record('rows', row)
+                            report['active_operation'] = row
+                            checkpoint()
+                            sources()
+                            operand(prepared)
+                            conditioning = native_suite.cache_prepare(cache, 120)
+                            row['cache_receipt'] = conditioning
+                            if cache == 'cold':
+                                code = conditioning.get('exit_code')
+                                require(type(code) is int and code >= 0, 'Purge did not establish normal completion')
+                                if code:
+                                    report['cold_cache_unavailable'] = 'cache purge unavailable; no further purge retries'
+                                    report['cold_cache_receipt'] = conditioning
+                                    row['unavailable'] = report['cold_cache_unavailable']
+                                    record('rows', row, row_id)
+                                    sources()
+                                    operand(prepared)
+                                    require(native_delete_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+                                    remove_fixture(target)
+                                    record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                                    report.pop('active_operation', None)
+                                    checkpoint()
+                                    denied = True
+                                    break
+                            operand(prepared, contents=False, mounts=False)
+                            receipt = native_metrics.collect(argv, timeout_s=120, env=environment, phase=phase)
+                            row.update(receipt)
+                            record('rows', row, row_id)
+                            checkpoint()
+                            require(not row.get('completion_uncertain') and row.get('ok') is True
+                                    and row.get('exit_code') == 0, 'CLI measurement failed or uncertain')
+                            stderr = base64.b64decode(row['stderr_b64'], validate=True)
+                            require(not (native_metrics.time_diagnostics(stderr) if phase == 'resources' else stderr),
+                                    'Delete command emitted diagnostics')
+                            stdout = base64.b64decode(row['stdout_b64'], validate=True)
+                            if method == 'candidate' and form == 'json':
+                                require(json.loads(stdout) == {'path': str(target)}, 'CLI delete JSON contract differs')
+                            else:
+                                require(stdout == b'', 'Delete command output differs')
+                            require(not os.path.lexists(target), 'Delete did not complete before returning')
+                            sources()
+                            if phase == 'resources':
+                                require(type(row.get('rss_bytes')) is int and row['rss_bytes'] > 0, 'Peak RSS unavailable')
+                            row['validated'] = True
+                            record('rows', row, row_id)
+                            rows.append(row)
+                            report.pop('active_operation', None)
+                            checkpoint()
+                        if denied:
+                            break
+                    if not denied:
+                        record('comparisons', key | {'metrics': native_delete_comparison(rows, phase, args.samples),
+                                                     'footprint': 'unavailable'})
+                        checkpoint()
+        sources()
+        report['source_checks_passed'] = True
+        require(not os.path.lexists(target), 'Unconsumed delete operand remains')
+        require(native_delete_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+        checkpoint()
+        try:
+            journal.verify()
+        except BaseException:
+            journal_failed = True
+            raise
+        owned()
+        remove_fixture(base)
+        cleaned = True
+        report.update(status='complete', passed=report['cold_cache_unavailable'] is None, cleanup_passed=True)
+        if 'cold' in args.cache:
+            report['cold_tool_identity_verified'] = True
+            report['cold_tool_content_verified'] = all(row['content_hash_status'] == 'available'
+                and row['sha256'] is not None for row in pins['cold_tools'].values())
+        if report['cold_cache_unavailable']:
+            report['denial_runtime_verified'] = True
+        checkpoint()
+        journal.finish(report)
+    except BaseException as error:
+        report.update(status='failed', passed=False, error=f'{type(error).__name__}: {error}')
+        if hasattr(error, 'receipt'):
+            report['command_receipt'] = error.receipt
+        if base is not None and not cleaned:
+            report['retained_fixture'] = str(base)
+        if not journal_failed:
+            try:
+                checkpoint()
+                journal.finish(report)
+            except BaseException as secondary:
+                error.add_note('Report closeout also failed: ' + str(secondary))
+        raise
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            journal.close()
+        except BaseException as secondary:
+            if primary is None:
+                raise
+            primary.add_note('Journal close also failed: ' + str(secondary))
+    return 0 if report['passed'] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, required=True, help="Older installed CLI in a virtual environment")
-    parser.add_argument("--candidate", type=Path, required=True, help="New installed CLI in a separate virtual environment")
+    parser.add_argument("--baseline", type=Path, help="Older installed CLI for legacy two-release comparisons")
+    parser.add_argument("--candidate", type=Path, required=True, help="Installed candidate CLI")
     parser.add_argument("--scratch", type=Path, required=True, help="Existing writable APFS directory")
-    parser.add_argument("--output", type=Path, required=True, help="New sanitized JSON result path")
+    parser.add_argument("--output", type=Path, required=True, help="New report path")
+    parser.add_argument('--native-delete', action='store_true', help='Collect the existing tiny-delete case against rm')
+    parser.add_argument('--samples', type=int, help='Native delete resource pairs, 10–100; timing always uses 31 pairs')
+    parser.add_argument('--cache', nargs='+', choices=('warm', 'cold'), help='Native delete cache modes')
     args = parser.parse_args()
+    if args.native_delete:
+        if args.baseline is not None:
+            parser.error('--native-delete uses the candidate and rm; do not supply --baseline')
+        args.samples = args.samples if args.samples is not None else 10
+        args.cache = args.cache if args.cache is not None else ['warm']
+        if not 10 <= args.samples <= 100 or len(args.cache) != len(set(args.cache)):
+            parser.error('Use 10–100 resource pairs and distinct cache modes')
+        deadline = 'STALLIONFS_BENCHMARK_DEADLINE'
+        supplied_deadline = deadline in os.environ
+        if not supplied_deadline:
+            os.environ[deadline] = str(time.monotonic() + 600)
+        try:
+            return native_delete(args)
+        finally:
+            if not supplied_deadline:
+                os.environ.pop(deadline, None)
+    if args.baseline is None or args.samples is not None or args.cache is not None:
+        parser.error('Legacy comparisons require --baseline; --samples and --cache apply only to --native-delete')
     require(platform.system() == "Darwin", "This comparison requires macOS")
     scratch = args.scratch.expanduser().resolve(strict=True)
     output_arg = args.output.expanduser().absolute()
@@ -376,4 +686,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

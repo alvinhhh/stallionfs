@@ -95,7 +95,8 @@ npm cache containing the locked fixture dependencies:
 
 The output directory must be new. Three outer cycles each collect all 13 existing
 native file-operation fixtures (including installed dependencies), the existing
-ordinary-copy comparison on `tiny_4kib` against `cp -Rp`, the three
+ordinary-copy comparison on `tiny_4kib` against `cp -Rp`, the existing CLI tiny-delete
+comparison against `rm -f`, the three
 native command scan layouts, the 20,000-file scanner API comparison with memory,
 and folder-workspace lifecycle comparisons at concurrency one and four. Each
 stage uses ten measured rounds by default (`--samples`, minimum ten). Native
@@ -104,7 +105,7 @@ are not run again. This includes the existing 50 GB dataset and its copies.
 
 `--cache warm cold` is the default for native command stages. The API scanner
 always has a warm stage and adds a separate purge-conditioned stage when cold
-was requested: 15 planned stages for warm selection, 18 with cold. Workspace
+was requested: 18 planned stages for warm selection, 21 with cold. Workspace
 stages remain warm. A denied purge is retained and never retried by later stages:
 warm work continues only after confirmed source/runtime validation and cleanup;
 later cold API stages, and native stages requested only cold, are unavailable.
@@ -125,7 +126,7 @@ precision and observed variation. `all_metrics_won` remains a placeholder, not
 an implemented release decision. Finder, mounted FSKit resources,
 workspace cold coverage/peak memory/full metadata equivalence, external-drive repeats,
 replacement/exchange moves, mount listing, image/recovery workflows and
-CLI JSON/startup-only cases remain outside this campaign, as does mounted-image
+Other CLI JSON/startup-only cases remain outside this campaign, as does mounted-image
 steady-state I/O. Child reports retain their
 measurement limits and failures. Review local paths before publishing reports.
 
@@ -144,6 +145,23 @@ for a single native diagnostic run. It omits the campaign's API and workspace
 stages and does not establish a complete acceptance suite.
 
 ## CLI startup and structured output
+
+The full campaign collects only `cli/delete/tiny_4kib` from this CLI matrix.
+Each plain/JSON and cache group uses fresh paired `rm -f` references: 31 timing
+pairs plus warmup 0, and `--samples` resource pairs (minimum ten). Candidate JSON
+output is checked independently. Direct CPU covers command/reaped-child work;
+resource comparisons use RSS only, with footprint unavailable. Full source and
+candidate-based mount checks precede conditioning and follow measurement. Between
+conditioning and either method, only root/operand metadata is checked, without
+candidate execution or fixture file-content reads; fully cold metadata is not
+established. This requires stable owned trees. The original
+4 KiB/0640 fixture and every created root are validated; this case is separate
+from the enriched native-delete workload. Failed validation or uncertain work
+retains the owned fixture. A report-write failure after verified cleanup fails
+the command and retains available journal evidence, without claiming fixture retention.
+
+Use `cli.py --native-delete --candidate ... --scratch ... --output ...` for that
+collection. It does not use an older StallionFS release as a native reference.
 
 The baseline path must contain a separately installed release:
 

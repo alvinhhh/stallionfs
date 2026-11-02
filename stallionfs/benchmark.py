@@ -33,7 +33,7 @@ def parser(commands):
     p.add_argument('--full', action='store_true', help='Collect the full existing campaign; report required coverage gaps')
     p.add_argument('--fixtures', nargs='+', choices=FIXTURES, help='Select existing native fixtures')
     p.add_argument('--operations', nargs='+', choices=('copy', 'clone', 'move', 'delete', 'scan'))
-    p.add_argument('--samples', type=int, choices=range(10, 101), default=10, metavar='N', help='Measured pairs per phase, 10–100 (default: 10)')
+    p.add_argument('--samples', type=int, choices=range(10, 101), default=10, metavar='N', help='Configurable phase pairs, 10–100; CLI delete timing uses 31 (default: 10)')
     p.add_argument('--scratch', type=Path, help='Existing parent for new disposable storage')
     p.add_argument('--jobs', type=int, choices=range(1, 5), default=4, help='Native workers, 1–4 (default: 4)')
     p.add_argument('--output', type=Path, help='New JSON summary file; default is inside the run directory')
@@ -47,7 +47,8 @@ def parser(commands):
 
 def _catalog():
     return {'cases': [{'id': case['id'], 'required_set': case['required_set'],
-                       'catalog_only': case['required_set'] in ('CLI-SCAN', 'CLI-VOLUMES', 'CLI-TINY')}
+                       'catalog_only': case['required_set'] in ('CLI-SCAN', 'CLI-VOLUMES', 'CLI-TINY')
+                                       and case['id'] != 'cli/delete/tiny_4kib'}
                       for case in CASES], 'quick': ['native/copy/tiny_4kib',
             'fileops/move/tiny_4kib', 'fileops/delete/tiny_4kib'],
             'full': 'Existing three-cycle collection, with required coverage gaps retained',
@@ -172,14 +173,16 @@ def _coverage(cache, *, collected=True):
     for case in CASES:
         family = case['required_set']
         native = family.startswith('TREE-') or family == 'COMMAND-SCAN'
-        collector = ('native-scan' if family == 'COMMAND-SCAN' else 'native-files' if native
+        collector = ('native-cli-delete' if case['id'] == 'cli/delete/tiny_4kib'
+                     else 'native-scan' if family == 'COMMAND-SCAN' else 'native-files' if native
                      else 'native-copy' if family == 'ORDINARY-COPY'
                      else 'scan-api' if family == 'API-SCAN' else 'workspaces' if family == 'WORKSPACE' else None)
         required = []
         outputs = (('api',) if family in ('API-SCAN', 'WORKSPACE') else
                    ('json',) if family == 'COMMAND-SCAN' else
                    ('plain',) if native or family == 'ORDINARY-COPY' else ('plain', 'json'))
-        references = (('cp-clone', 'cp', 'ditto', 'rsync') if family == 'TREE-CLONE'
+        references = (('/bin/rm -f',) if case['id'] == 'cli/delete/tiny_4kib'
+                      else ('cp-clone', 'cp', 'ditto', 'rsync') if family == 'TREE-CLONE'
                       else ('bulk_serial-vs-posix', 'bulk-vs-posix') if family == 'API-SCAN'
                       else ('recorded-native-reference',))
         for mode in ('warm', 'cold'):
@@ -274,7 +277,7 @@ def _collect(args, resources, binary, root, fixtures, operations):
         path = root / 'campaign/campaign.json'
         state = json.loads(path.read_text()) if path.is_file() else {}
         stages = state.get('stages', [])
-        planned = ('native-files', 'native-copy', 'native-scan', 'scan-api',
+        planned = ('native-files', 'native-copy', 'native-cli-delete', 'native-scan', 'scan-api',
                    *(('scan-api-cold',) if 'cold' in args.cache else ()), 'workspaces')
         expected = [(cycle, stage) for cycle in range(1, 4) for stage in planned]
         complete = (state.get('status') == 'complete'
