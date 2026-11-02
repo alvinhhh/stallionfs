@@ -28,6 +28,19 @@ python3 tests/perf/real_world.py --root /path/to/scratch \
 
 Reports record `selected_plan`, exact scheduled `expected_samples` counts and each attempted command's argv; explicit SFS variants also record `strategy` in JSON and CSV. A stopped run can have fewer rows than scheduled. The selectors use the existing native command supervisor, resource units, postconditions, failure retention and summary arithmetic. Strategy labels record requests and do not establish materialized storage equivalence with `ditto`.
 
+For a contemporary automatic-copy baseline, add `--baseline-sfs /path/to/baseline/sfs` while `--sfs` names the candidate. This option requires macOS, copy only, `--jobs 1`, `--copy-references ditto` and `--copy-strategies materialized,auto`; the strategy order is significant. It appends `sfs_jobs1_baseline_auto`, using the baseline executable with `--strategy=auto`; candidate materialized/auto and native ditto remain unchanged. With ten repetitions, the four variants produce four warmups and 40 measured rows, 44 total. Omitting `--baseline-sfs` preserves the existing defaults and three-variant copy screen.
+
+```sh
+python3 tests/perf/real_world.py --root /path/to/scratch \
+  --output /path/to/new-paired-copy-results.json --sfs /path/to/candidate/sfs \
+  --baseline-sfs /path/to/baseline/sfs \
+  --operations copy --copy-references ditto --copy-strategies materialized,auto \
+  --jobs 1 --repetitions 10 --files 10000 --directories 100 \
+  --stop-on-sfs-failure
+```
+
+Reports retain both executable paths and hashes, the baseline parameter, and the actual argv for every sample. The baseline automatic-copy variant participates in the same shuffle, validation, metrics and failure-retention rules as the candidate. Existing native-relative summaries retain their meaning; compare candidate-auto and baseline-auto raw rows by matching repetition. Retain every failed or incomplete observation and report missing pairs; exclude them from paired timing estimates without replacing them or presenting an incomplete screen as successful. Match build configuration and runtime conditions before attributing a difference to code. This option adds no workload, storage-mechanism inference or broader correctness/durability qualification.
+
 Optional `--expected-fixture-sha256` accepts a 64-digit hexadecimal canonical manifest digest. The runner compares it with the existing generated fixture manifest before any workload command. A mismatch fails the run with no samples, retains the generated fixture, and records both digests in `fixture_guard`, `retention_reason=fixture_manifest_mismatch` and `cleanup=retained_fixture_mismatch`. This retention reason is distinct from process-completion uncertainty. Omitting the option leaves fixture admission unchanged. The default CSV header is unchanged; a `strategy` column is added only with an explicit copy-strategy selector.
 
 Copy and clone validation checks every file hash, mode, symlink target, directory mode and hardlink group. Source/destination regular inodes must differ. One measured clone is edited to check source isolation. Every operation rechecks the original fixture and an independent sentinel outside timing. ACLs, xattrs, ownership, timestamps, physical extent sharing and power-loss survival are not established by this runner.

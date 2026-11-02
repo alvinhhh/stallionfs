@@ -301,12 +301,43 @@ class RealWorldSelectors(unittest.TestCase):
         self.assertEqual(mixed['clone'], {'native_cp': {}, 'sfs_jobs1': {'jobs': 1}, 'sfs_jobs4': {'jobs': 4}})
         self.assertEqual(len(mixed['copy']), 5)
 
+    def test_baseline_copy_screen_routes_four_variants_to_distinct_tools(self):
+        plan = BENCHMARK.selected_plan([1], 'candidate-sfs', 'copy', 'ditto',
+                                       'materialized,auto', 'darwin', baseline_sfs='baseline-sfs')
+        self.assertEqual(list(plan['copy']), ['native_ditto', 'sfs_jobs1_materialized',
+                                             'sfs_jobs1_auto', 'sfs_jobs1_baseline_auto'])
+        self.assertEqual(plan['copy']['sfs_jobs1_baseline_auto'],
+                         {'jobs': 1, 'strategy': 'auto', 'artifact': 'baseline'})
+        tools = {'sfs': '/candidate/sfs', 'sfs_baseline': '/baseline/sfs', 'ditto': '/usr/bin/ditto'}
+        for variant, metadata in plan['copy'].items():
+            with self.subTest(variant=variant):
+                expected = (['/usr/bin/ditto', '--rsrc', '--extattr', '--acl', 'source', 'target']
+                            if variant == 'native_ditto' else [
+                                '/baseline/sfs' if metadata.get('artifact') == 'baseline' else '/candidate/sfs',
+                                '--json', 'copy', 'source', 'target', '--jobs', '1',
+                                '--strategy=' + metadata['strategy']])
+                self.assertEqual(BENCHMARK.workload_command('copy', variant, metadata, tools,
+                    'source', 'target', None, 'darwin'), expected)
+
+    def test_baseline_rejects_unsupported_screen_combinations(self):
+        arguments = dict(worker_counts=[1], sfs='candidate-sfs', operations='copy',
+                         copy_references='ditto', copy_strategies='materialized,auto',
+                         platform_name='darwin', baseline_sfs='baseline-sfs')
+        for change in ({'platform_name': 'linux'}, {'sfs': None}, {'operations': 'copy,clone'},
+                       {'worker_counts': [2]}, {'worker_counts': [1, 4]}, {'copy_references': 'cp'},
+                       {'copy_strategies': 'auto,materialized'}, {'copy_strategies': None}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                BENCHMARK.selected_plan(**(arguments | change))
+
     def test_invalid_selectors_fail_before_output_or_scratch_access(self):
         invalid = [('--operations', ''), ('--operations', 'copy,copy'), ('--operations', 'unknown'),
                    ('--copy-references', ''), ('--copy-references', 'ditto,ditto'),
                    ('--copy-references', 'unknown'), ('--copy-strategies', ''),
                    ('--copy-strategies', 'auto,auto'), ('--copy-strategies', 'clone'),
                    ('--operations', 'scan', '--copy-references', 'ditto'),
+                   ('--baseline-sfs', 'baseline-sfs'),
+                   ('--operations', 'copy', '--copy-references', 'ditto', '--jobs', '1',
+                    '--copy-strategies', 'auto', '--baseline-sfs', 'baseline-sfs'),
                    ('--expected-fixture-sha256', ''), ('--expected-fixture-sha256', 'f' * 63),
                    ('--expected-fixture-sha256', 'g' * 64)]
         for options in invalid:
@@ -636,7 +667,7 @@ class SfsFailureRetention(unittest.TestCase):
     @contextlib.contextmanager
     def scenario(self, failure_kind, *, stop=True, measured=False, exception_type=OSError,
                  uncertain=False, secondary_cleanup_failure=False, extra_args=(), failed_variant=None,
-                 shuffle=False):
+                 shuffle=False, expected_returncode=1):
         with tempfile.TemporaryDirectory() as directory:
             root, output = Path(directory), Path(directory) / 'result.json'
             expected = {'entries': {}, 'hardlinks': [['d000/f000000', 'hardlink-alias']]}
@@ -719,6 +750,8 @@ class SfsFailureRetention(unittest.TestCase):
                 if should_fail() and Path(path).name == 'sentinel' and failure_kind == 'sentinel_check':
                     state['failed'] = True
                     return 'changed-sentinel-sha256'
+                if Path(path).parent == Path('/simulated/bin'):
+                    return 'simulated-tool-sha256-' + Path(path).name
                 return 'simulated-sha256'
 
             def execute(argv, scratch, **kwargs):
@@ -728,12 +761,14 @@ class SfsFailureRetention(unittest.TestCase):
                         Path(argv[-1]).write_bytes(b'simulated helper; never executed')
                     return dict(receipt)
                 command = Path(argv[0]).name
-                if command == 'sfs':
+                if command in ('sfs', 'baseline-sfs'):
                     case, variant = argv[2], 'sfs_jobs1'
                     strategy = next((arg.removeprefix('--strategy=') for arg in argv
                                      if isinstance(arg, str) and arg.startswith('--strategy=')), None)
                     if strategy:
                         variant += '_' + strategy
+                    if command == 'baseline-sfs':
+                        variant = 'sfs_jobs1_baseline_auto'
                 elif command == 'scan-posix':
                     case, variant = 'scan', 'native_posix'
                 elif command == 'rm':
@@ -790,9 +825,69 @@ class SfsFailureRetention(unittest.TestCase):
                 stack.enter_context(mock.patch.object(BENCHMARK.random.Random, 'shuffle',
                                                      autospec=True, side_effect=shuffle_variants))
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-                self.assertEqual(BENCHMARK.main(), 1)
+                self.assertEqual(BENCHMARK.main(), expected_returncode)
             report = json.loads(output.read_text())
             yield report, state, receipt, supervision
+
+    def test_baseline_screen_records_44_rows_and_both_artifact_bindings(self):
+        options = ('--operations', 'copy', '--copy-references', 'ditto',
+                   '--copy-strategies', 'materialized,auto', '--baseline-sfs', 'baseline-sfs',
+                   '--repetitions', '10')
+        with mock.patch.object(sys, 'platform', 'darwin'), \
+                self.scenario('none', extra_args=options, expected_returncode=0, shuffle=True) as data:
+            report, state, _, _ = data
+            variants = {'native_ditto', 'sfs_jobs1_materialized', 'sfs_jobs1_auto', 'sfs_jobs1_baseline_auto'}
+            self.assertTrue(report['passed'])
+            self.assertEqual(report['cleanup'], 'passed')
+            self.assertEqual(report['expected_samples'], {'warmup': 4, 'measured': 40, 'total': 44})
+            self.assertEqual(len(report['samples']), 44)
+            self.assertEqual(len(state['executions']), 44)
+            self.assertEqual(report['parameters']['baseline_sfs'], 'baseline-sfs')
+            self.assertEqual(set(report['tools']), {'cc', 'ditto', 'sfs', 'sfs_baseline'})
+            for key, name in (('sfs', 'sfs'), ('sfs_baseline', 'baseline-sfs')):
+                self.assertEqual(report['tools'][key], {'path': '/simulated/bin/' + name,
+                    'sha256': 'simulated-tool-sha256-' + name})
+            for repetition in range(-1, 10):
+                group = [s for s in report['samples'] if s['repetition'] == repetition]
+                self.assertEqual({s['variant'] for s in group}, variants)
+                self.assertEqual(len(group), 4)
+                self.assertTrue(all(s['warmup'] == (repetition == -1) for s in group))
+            baseline = [s for s in report['samples'] if s['variant'] == 'sfs_jobs1_baseline_auto']
+            self.assertEqual(len(baseline), 11)
+            self.assertEqual(report['summary']['copy']['variants']['sfs_jobs1_baseline_auto']['n'], 10)
+            for sample in baseline:
+                self.assertEqual(sample['artifact'], 'baseline')
+                self.assertEqual(sample['strategy'], 'auto')
+                self.assertEqual(sample['argv'][0], '/simulated/bin/baseline-sfs')
+                self.assertEqual(sample['argv'][-1], '--strategy=auto')
+            for sample in report['samples']:
+                if sample['variant'] in ('sfs_jobs1_materialized', 'sfs_jobs1_auto'):
+                    self.assertEqual(sample['argv'][0], '/simulated/bin/sfs')
+
+    def test_baseline_failure_retains_warmup_and_measured_evidence_before_inspection(self):
+        options = ('--operations', 'copy', '--copy-references', 'ditto',
+                   '--copy-strategies', 'materialized,auto', '--baseline-sfs', 'baseline-sfs',
+                   '--repetitions', '2')
+        for failure in ('command', 'integrity'):
+            for measured in (False, True):
+                with self.subTest(failure=failure, measured=measured), \
+                        mock.patch.object(sys, 'platform', 'darwin'), \
+                        self.scenario(failure, measured=measured, extra_args=options,
+                                      failed_variant='sfs_jobs1_baseline_auto') as data:
+                    report, state, _, _ = data
+                    self.assertFalse(report['passed'])
+                    self.assertEqual(state['after_failure'], [])
+                    self.assertEqual(report['retention_reason'], 'sfs_sample_failure')
+                    self.assertEqual(report['cleanup'], 'retained_failure_evidence')
+                    self.assertEqual(report['stopped_on_sfs_failure'], len(report['samples']) - 1)
+                    self.assertEqual(len(state['executions']), len(report['samples']))
+                    self.assertEqual(len(report['samples']), 8 if measured else 4)
+                    failed = report['samples'][-1]
+                    self.assertEqual(failed['variant'], 'sfs_jobs1_baseline_auto')
+                    self.assertEqual(failed['warmup'], not measured)
+                    self.assertEqual(failed['status'], 'failed')
+                    self.assertEqual(failed['argv'][0], '/simulated/bin/baseline-sfs')
+                    self.assertEqual((state['scratch'] / 'target/partial-marker').read_bytes(), b'retain this target')
 
     def test_explicit_copy_screen_records_33_rows_resources_and_failed_variant_eligibility(self):
         options = ('--operations', 'copy', '--copy-references', 'ditto',

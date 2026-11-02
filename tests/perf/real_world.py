@@ -245,7 +245,7 @@ def copy_comparison_policy(variant, platform_name=None):
 
 
 def selected_plan(worker_counts, sfs, operations=None, copy_references=None,
-                  copy_strategies=None, platform_name=None):
+                  copy_strategies=None, platform_name=None, baseline_sfs=None):
     """Resolve selectors without launching commands or touching the fixture."""
     platform_name = sys.platform if platform_name is None else platform_name
 
@@ -265,6 +265,10 @@ def selected_plan(worker_counts, sfs, operations=None, copy_references=None,
         raise ValueError('Copy selectors require copy in --operations')
     if copy_strategies is not None and not sfs:
         raise ValueError('--copy-strategies requires --sfs')
+    if baseline_sfs and (platform_name != 'darwin' or not sfs or cases != ['copy']
+            or worker_counts != [1] or tuple(references) != ('ditto',)
+            or tuple(strategies) != ('materialized', 'auto')):
+        raise ValueError('--baseline-sfs requires the jobs1 materialized/auto/ditto copy screen on macOS')
     plan = {}
     for case in cases:
         native = ['native_' + r for r in references] if case == 'copy' else [
@@ -275,6 +279,8 @@ def selected_plan(worker_counts, sfs, operations=None, copy_references=None,
                 for strategy in strategies if case == 'copy' else (None,):
                     variant = 'sfs_jobs' + str(jobs) + ('_' + strategy if strategy else '')
                     variants[variant] = {'jobs': jobs, **({'strategy': strategy} if strategy else {})}
+        if baseline_sfs:
+            variants['sfs_jobs1_baseline_auto'] = {'jobs': 1, 'strategy': 'auto', 'artifact': 'baseline'}
         if not variants:
             raise ValueError('Every selected operation requires at least one variant')
         plan[case] = variants
@@ -286,7 +292,8 @@ def workload_command(case, variant, metadata, tools, dataset, target, helper, pl
     platform_name = sys.platform if platform_name is None else platform_name
     if 'jobs' in metadata:
         path = dataset if case == 'scan' else target
-        argv = [tools['sfs'], '--json', case, path, '--jobs', str(metadata['jobs'])]
+        executable = tools['sfs_baseline'] if metadata.get('artifact') == 'baseline' else tools['sfs']
+        argv = [executable, '--json', case, path, '--jobs', str(metadata['jobs'])]
         if case in ('copy', 'clone'):
             argv.insert(3, dataset)
         if case == 'delete':
@@ -396,6 +403,7 @@ def main():
     parser.add_argument('--root', type=Path, required=True, help='Existing writable filesystem directory')
     parser.add_argument('--output', type=Path, required=True, help='New JSON path; sibling CSV must also be absent')
     parser.add_argument('--sfs', help='Optional installed sfs executable')
+    parser.add_argument('--baseline-sfs', help='Installed baseline for the jobs1 auto-copy comparison')
     parser.add_argument('--stop-on-sfs-failure', action='store_true',
                         help='Stop and retain scratch evidence after the first failed SFS sample')
     parser.add_argument('--repetitions', type=int, default=10)
@@ -427,7 +435,8 @@ def main():
     except ValueError:
         parser.error('--sfs-jobs requires distinct counts in 1,2,3,4')
     try:
-        plan = selected_plan(worker_counts, args.sfs, args.operations, args.copy_references, args.copy_strategies)
+        plan = selected_plan(worker_counts, args.sfs, args.operations, args.copy_references, args.copy_strategies,
+                             baseline_sfs=args.baseline_sfs)
     except ValueError as exc:
         parser.error(str(exc))
     root, output = args.root.resolve(strict=True), args.output.absolute()
@@ -443,6 +452,8 @@ def main():
         tools['ditto'] = shutil.which('ditto')
     if args.sfs:
         tools['sfs'] = shutil.which(args.sfs)
+    if args.baseline_sfs:
+        tools['sfs_baseline'] = shutil.which(args.baseline_sfs)
     if any(value is None for value in tools.values()):
         parser.error('Missing executable: ' + str(tools))
     # Exclusive creation refuses existing files and dangling symlinks.
