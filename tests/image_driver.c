@@ -43,7 +43,7 @@ static const char *fault = "";
 static int target, reads, writes, fulls, syncs, slots, records, locks, closes, hit;
 static int competing, cut, model, cut_at, events;
 static struct {
-    int enabled, mode, armed, complete, fd, injections, anchor, slot_written;
+    int enabled, mode, armed, complete, fd, injections, anchor, slot_written, initialization;
     unsigned reads;
     size_t consumed;
     uint64_t minimum;
@@ -51,9 +51,27 @@ static struct {
     sfs_inode *public_out, canary;
     unsigned char written[CELL];
 } append_readback;
+static struct {
+    int enabled, target_slot, fd, parent_fd, auxiliary_parent_fd, image_captured, calls[2], caller_unchanged[2], injections;
+    ssize_t real_count[2], returned_count[2];
+    uint64_t device, inode, parent_device, parent_inode;
+    int owned_close_calls[3], owned_close_results[3], owned_close_errors[3];
+    unsigned char intended[2][CELL];
+    int full_attempts, full_successes, parent_attempts, parent_successes;
+    int api_status, has_handle, close_attempted, close_status;
+    char fence_order[16];
+    sfs_result api_result, close_result;
+} creation_write;
 static unsigned char *durable;
 static size_t durable_size;
 static int tracked_fd = -1, locked_fd = -1;
+static void creation_assert_identity(int fd, int parent) {
+    int saved = errno; struct stat st; assert(!fstat(fd, &st));
+    assert((parent ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode)) &&
+           (uint64_t)st.st_dev == (parent ? creation_write.parent_device : creation_write.device) &&
+           (uint64_t)st.st_ino == (parent ? creation_write.parent_inode : creation_write.inode));
+    errno = saved;
+}
 static int expected_closed_fd = -1;
 static char order[256];
 static uint64_t read_at[2];
@@ -177,6 +195,7 @@ static void reset(const char *kind, int nth) {
     fault = kind; target = nth; reads = writes = fulls = syncs = slots = records = locks = closes = hit = events = 0;
     competing = cut = model = 0; tracked_fd = -1; order[0] = 0;
     memset(&append_readback, 0, sizeof(append_readback));
+    memset(&creation_write, 0, sizeof(creation_write));
     free(durable); durable = NULL; durable_size = 0;
     image_read_bytes = image_read_attempts = image_append_bytes = 0;
     aux_read_bytes = aux_write_bytes = aux_attempt_bytes = 0;
@@ -227,7 +246,9 @@ ssize_t sfs_test_pread(int fd, void *p, size_t n, off_t at) {
     int targeted_readback = append_readback.enabled && append_readback.armed && !append_readback.complete &&
         fd == append_readback.fd && at >= append_readback.offset && at < append_readback.offset + CELL;
     if (targeted_readback) {
-        if (append_readback.anchor) assert(fulls == 2 && slots == 1 && fd == locked_fd);
+        if (append_readback.anchor) assert(fulls == (append_readback.initialization ? 3 : 2) &&
+            slots == (append_readback.initialization ? 2 : 1) && fd == locked_fd);
+        if (append_readback.initialization) assert(syncs == 1);
         assert(at == append_readback.offset + (off_t)append_readback.consumed && n == CELL - append_readback.consumed);
         if (append_readback.public_out) assert(*append_readback.public_out == append_readback.canary);
         append_readback.reads++;
@@ -283,6 +304,22 @@ ssize_t sfs_test_pwrite(int fd, const void *p, size_t n, off_t at) {
     int slot = at < 8192;
     if (!slot) { struct stat st; assert(!fstat(fd, &st) && at >= st.st_size); }
     if (slot) { slots++; event(at < 4096 ? '0' : '1'); } else records++;
+    if (creation_write.enabled && slot) {
+        assert((at == 0 || at == CELL) && n == CELL && fulls == 1);
+        unsigned index = (unsigned)(at / CELL); struct stat st;
+        assert(!fstat(fd, &st) && S_ISREG(st.st_mode) && fd == locked_fd);
+        assert(creation_write.image_captured && fd == creation_write.fd &&
+               (uint64_t)st.st_dev == creation_write.device && (uint64_t)st.st_ino == creation_write.inode);
+        assert(!creation_write.calls[index]++);
+        memcpy(creation_write.intended[index], p, CELL);
+        unsigned char altered[CELL]; memcpy(altered, p, CELL);
+        if ((int)index == creation_write.target_slot) altered[72] ^= 1;
+        ssize_t count = pwrite(fd, altered, CELL, at); int saved = errno;
+        creation_write.real_count[index] = creation_write.returned_count[index] = count;
+        creation_write.caller_unchanged[index] = !memcmp(p, creation_write.intended[index], CELL);
+        if ((int)index == creation_write.target_slot && count == CELL) creation_write.injections++;
+        errno = saved; return count;
+    }
     if (is("write_eintr") && !hit++) { errno = EINTR; return -1; }
     if ((is("write_error") || is("write_zero") || is("enospc")) && writes == target) {
         hit++; errno = is("enospc") ? ENOSPC : EIO; return is("write_zero") ? 0 : -1;
@@ -297,10 +334,12 @@ ssize_t sfs_test_pwrite(int fd, const void *p, size_t n, off_t at) {
     if (cut && slot) stop_at(fd, p, n < 73 ? n : 73, at);
     ssize_t result = pwrite(fd, p, n, at);
     if (append_readback.enabled && !append_readback.armed && !append_readback.slot_written &&
-        slot == append_readback.anchor && n == CELL && result == CELL) {
+        slot == append_readback.anchor && n == CELL && result == CELL &&
+        (!append_readback.initialization || (uint64_t)at == append_readback.minimum)) {
         int saved = errno;
         assert(!(at % CELL));
-        if (append_readback.anchor) assert(fulls == 1 && slots == 1 && at == (off_t)append_readback.minimum);
+        if (append_readback.anchor) assert(fulls == 1 &&
+            slots == (append_readback.initialization ? (int)(at / CELL) + 1 : 1) && at == (off_t)append_readback.minimum);
         else assert((uint64_t)at >= append_readback.minimum);
         if (append_readback.public_out) assert(*append_readback.public_out == append_readback.canary);
         append_readback.armed = !append_readback.anchor; append_readback.slot_written = append_readback.anchor;
@@ -315,10 +354,20 @@ int sfs_test_fcntl(int fd, int command, ...) {
     assert(!clearing_cache);
     if (command == F_DUPFD_CLOEXEC) {
         va_list ap; va_start(ap, command); int minimum = va_arg(ap, int); va_end(ap);
-        return fcntl(fd, command, minimum);
+        if (creation_write.enabled) { assert(fd == creation_write.parent_fd); creation_assert_identity(fd, 1); }
+        int result = fcntl(fd, command, minimum); int saved = errno;
+        if (result >= 0 && creation_write.enabled) {
+            assert(creation_write.auxiliary_parent_fd == -1); creation_assert_identity(result, 1);
+            creation_write.auxiliary_parent_fd = result;
+        }
+        errno = saved; return result;
     }
     assert(command == F_FULLFSYNC);
     tracked_fd = fd; fulls++; event('F');
+    if (creation_write.enabled) {
+        assert(creation_write.image_captured && fd == creation_write.fd && fd == locked_fd);
+        creation_assert_identity(fd, 0); creation_write.full_attempts++;
+    }
     if (fulls == 1) {
         struct stat st; unsigned char last[CELL]; assert(!fstat(fd, &st) && st.st_size >= 16384 && !(st.st_size % CELL));
         assert(pread(fd, last, CELL, st.st_size - CELL) == CELL);
@@ -329,7 +378,8 @@ int sfs_test_fcntl(int fd, int command, ...) {
     if (competing) competitor();
     if ((is("full") || is("full_enospc")) && fulls == target) { hit++; errno = is("full_enospc") ? ENOSPC : EIO; return -1; }
     int result = fcntl(fd, command);
-    if (!result && append_readback.enabled && append_readback.anchor && fulls == 2) {
+    if (!result && creation_write.enabled) creation_write.full_successes++;
+    if (!result && append_readback.enabled && append_readback.anchor && fulls == (append_readback.initialization ? 3 : 2)) {
         assert(append_readback.slot_written && !append_readback.armed && fd == append_readback.fd);
         append_readback.armed = 1;
     }
@@ -341,7 +391,12 @@ int sfs_test_fsync(int fd) {
     assert(!clearing_cache);
     syncs++; event('D');
     if (is("parent_sync")) { hit++; errno = EIO; return -1; }
-    return fsync(fd);
+    if (creation_write.enabled) {
+        assert(fd == creation_write.parent_fd); creation_assert_identity(fd, 1); creation_write.parent_attempts++;
+    }
+    int result = fsync(fd);
+    if (!result && creation_write.enabled) creation_write.parent_successes++;
+    return result;
 }
 int sfs_test_flock(int fd, int operation) {
     assert(!clearing_cache);
@@ -364,11 +419,25 @@ int sfs_test_close(int fd) {
         return result;
     }
     assert(fstat(fd, &st) == 0);
+    int creation_close = -1;
+    if (creation_write.enabled) {
+        if (fd == creation_write.fd) creation_close = 0;
+        else if (fd == creation_write.parent_fd) creation_close = 1;
+        else if (fd == creation_write.auxiliary_parent_fd) creation_close = 2;
+        assert(creation_close >= 0); creation_assert_identity(fd, creation_close != 0);
+        assert(!creation_write.owned_close_calls[creation_close]++);
+    }
     int fail = (is("close") && closes == target) || (is("parent_close") && S_ISDIR(st.st_mode)) || ((is("aux_close") || is("aux_enospc_cleanup")) && auxiliary[fd]);
     int result = close(fd);
+    int saved_close_error = errno;
+    if (creation_close >= 0) {
+        creation_write.owned_close_results[creation_close] = result;
+        creation_write.owned_close_errors[creation_close] = result ? saved_close_error : 0;
+    }
     auxiliary[fd] = 0; memo_target_fd[fd] = 0;
     if (fd == locked_fd) locked_fd = -1;
     if (fail) { hit++; errno = EIO; return -1; }
+    errno = saved_close_error;
     return result;
 }
 int sfs_test_openat(int fd, const char *name, int flags, ...) {
@@ -377,11 +446,19 @@ int sfs_test_openat(int fd, const char *name, int flags, ...) {
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     if (is("create") && (flags & O_CREAT)) { hit++; errno = EACCES; return -1; }
     int result = openat(fd, name, flags, mode);
+    int saved_open_error = errno;
+    if (result >= 0 && creation_write.enabled) {
+        assert(!strcmp(name, "image") && (flags & O_CREAT) && !creation_write.image_captured && !fulls);
+        creation_assert_identity(fd, 1); struct stat st; assert(!fstat(result, &st) && S_ISREG(st.st_mode));
+        creation_write.fd = result; creation_write.parent_fd = fd; creation_write.image_captured = 1;
+        creation_write.device = (uint64_t)st.st_dev; creation_write.inode = (uint64_t)st.st_ino;
+    }
     if (result >= 0) {
         if (!strcmp(name,"image")) { image_open_fd=result; image_open_flags=flags; }
         assert(result < (int)sizeof(auxiliary)); auxiliary[result] = !strcmp(name, "memo");
         if (auxiliary[result]) { struct stat st; assert(!fstat(result, &st) && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0600 && st.st_uid == geteuid()); aux_created++; memo_target_open(result); }
     }
+    if (creation_write.enabled) errno = saved_open_error;
     return result;
 }
 int sfs_test_ftruncate(int fd, off_t size) {
@@ -508,6 +585,228 @@ static void inspect_unchanged(int *candidates) {
         close_image(h);
     } else assert(status != SFS_OK);
     unchanged("image", before, n); free(before);
+}
+static uint64_t creation_u64(const unsigned char *p) {
+    uint64_t v = 0; for (unsigned i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v;
+}
+static int creation_binding(const sfs_result *r) {
+    const unsigned char *intended = creation_write.intended[0];
+    return r->generation == creation_u64(intended + 40) && r->committed_end == creation_u64(intended + 104) &&
+           r->device == creation_write.device && r->inode == creation_write.inode &&
+           !memcmp(r->uuid, intended + 24, 16) && !memcmp(r->root_digest, intended + 72, 32);
+}
+static void creation_digest(const char *label, const unsigned char *p, size_t n) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH]; assert(n <= UINT32_MAX && CC_SHA256(p, (CC_LONG)n, digest));
+    printf("{\"creation_digest\":\"%s\",\"sha256\":\"", label);
+    for (unsigned i = 0; i < sizeof(digest); i++) printf("%02x", digest[i]);
+    printf("\"}\n");
+}
+static int creation_observed_status(enum sfs_status status) {
+    return status == SFS_OK || status == SFS_CORRUPT || status == SFS_RECOVERY_REQUIRED;
+}
+static void creation_success_alteration(void) {
+    int all_complete = 1, all_preserved = 1, loss = 0;
+    for (int which = 0; which < 3; which++) {
+        char label[80], proof_name[64];
+        assert(snprintf(proof_name, sizeof(proof_name), "creation-proof-%d.bin", which) < (int)sizeof(proof_name));
+        fflush(NULL); pid_t producer = fork(); assert(producer >= 0);
+        if (!producer) {
+            reset("", 0); creation_write.enabled = 1; creation_write.target_slot = which - 1;
+            creation_write.fd = creation_write.parent_fd = creation_write.auxiliary_parent_fd = -1;
+            struct stat parent_identity; assert(!stat(root, &parent_identity) && S_ISDIR(parent_identity.st_mode));
+            creation_write.parent_device = (uint64_t)parent_identity.st_dev;
+            creation_write.parent_inode = (uint64_t)parent_identity.st_ino;
+            sfs_image *h = NULL;
+            creation_write.api_status = sfs_image_create(root, "image", TEST_CAPACITY, &h, &creation_write.api_result);
+            creation_write.has_handle = h != NULL;
+            assert(strlen(order) < sizeof(creation_write.fence_order)); strcpy(creation_write.fence_order, order);
+            snprintf(label, sizeof(label), "creation-%d-api", which); receipt(label, &creation_write.api_result);
+            if (h) {
+                creation_write.close_attempted = 1;
+                creation_write.close_status = sfs_image_close(h, &creation_write.close_result);
+                snprintf(label, sizeof(label), "creation-%d-close", which); receipt(label, &creation_write.close_result);
+            }
+            save(proof_name, (const unsigned char *)&creation_write, sizeof(creation_write));
+            assert(!allocated); fflush(NULL); _exit(0);
+        }
+        int child_status; assert(waitpid(producer, &child_status, 0) == producer);
+        printf("{\"creation_case\":%d,\"producer_exited\":%s,\"producer_exit\":%d}\n", which,
+               WIFEXITED(child_status) ? "true" : "false", WIFEXITED(child_status) ? WEXITSTATUS(child_status) : -1);
+        assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+        reset("", 0); size_t proof_size; unsigned char *proof = bytes(proof_name, &proof_size);
+        assert(proof_size == sizeof(creation_write)); memcpy(&creation_write, proof, proof_size); free(proof);
+        creation_write.enabled = 0;
+        assert(creation_write.target_slot == which - 1 && creation_write.calls[0] == 1 && creation_write.calls[1] == 1 &&
+               creation_write.real_count[0] == CELL && creation_write.real_count[1] == CELL &&
+               creation_write.returned_count[0] == CELL && creation_write.returned_count[1] == CELL &&
+               creation_write.caller_unchanged[0] && creation_write.caller_unchanged[1] &&
+               creation_write.injections == (which != 0));
+        const unsigned char *intended = creation_write.intended[0];
+        assert(!memcmp(intended, creation_write.intended[1], CELL) && !memcmp(intended, "SFSIMG01", 8) &&
+               creation_u64(intended + 8) == (UINT64_C(2) << 32) && creation_u64(intended + 40) == 1);
+        struct stat identity; assert(!lstat("image", &identity) && S_ISREG(identity.st_mode) &&
+               (uint64_t)identity.st_dev == creation_write.device && (uint64_t)identity.st_ino == creation_write.inode);
+        size_t image_size; unsigned char *before = bytes("image", &image_size); assert(image_size == 4 * CELL);
+        for (unsigned slot = 0; slot < 2; slot++) {
+            unsigned changes = 0;
+            for (unsigned i = 0; i < CELL; i++) if (before[slot * CELL + i] != intended[i]) {
+                changes++; assert((int)slot == which - 1 && i == 72 && before[slot * CELL + i] == (unsigned char)(intended[i] ^ 1));
+            }
+            assert(changes == ((int)slot == which - 1 ? 1u : 0u));
+            /* The original checksum bytes remain unchanged. */
+            assert(!memcmp(before + slot * CELL + 112, intended + 112, 32));
+            snprintf(label, sizeof(label), "creation-%d-stored-slot%u", which, slot); creation_digest(label, before + slot * CELL, CELL);
+        }
+        snprintf(label, sizeof(label), "creation-%d-intended-slot", which); creation_digest(label, intended, CELL);
+        snprintf(label, sizeof(label), "creation-%d-image-before", which); creation_digest(label, before, image_size);
+        printf("{\"creation_case\":%d,\"target_slot\":%d,\"owned_device\":%llu,\"owned_inode\":%llu,\"slot_calls\":[%d,%d],\"real_counts\":[%lld,%lld],\"returned_counts\":[%lld,%lld],\"caller_unchanged\":[%d,%d],\"injections\":%d,\"full_attempts\":%d,\"full_successes\":%d,\"parent_attempts\":%d,\"parent_successes\":%d,\"fence_order\":\"%s\",\"create_status\":%d,\"create_handle\":%d,\"close_attempted\":%d,\"close_status\":%d}\n",
+               which, creation_write.target_slot, (unsigned long long)creation_write.device, (unsigned long long)creation_write.inode,
+               creation_write.calls[0], creation_write.calls[1], (long long)creation_write.real_count[0], (long long)creation_write.real_count[1],
+               (long long)creation_write.returned_count[0], (long long)creation_write.returned_count[1],
+               creation_write.caller_unchanged[0], creation_write.caller_unchanged[1], creation_write.injections,
+               creation_write.full_attempts, creation_write.full_successes, creation_write.parent_attempts, creation_write.parent_successes,
+               creation_write.fence_order, creation_write.api_status, creation_write.has_handle, creation_write.close_attempted, creation_write.close_status);
+        int acknowledged = creation_write.api_status == SFS_OK && creation_write.has_handle &&
+                           creation_write.api_result.status == SFS_OK;
+        int claim_matches = creation_write.api_result.coverage == SFS_COVERAGE_FULL_REACHABLE &&
+                            creation_binding(&creation_write.api_result);
+        int complete = creation_write.full_attempts == 3 && creation_write.full_successes == 3 &&
+                       creation_write.parent_attempts == 1 && creation_write.parent_successes == 1 &&
+                       !strcmp(creation_write.fence_order, "F01FDF") &&
+                       (!creation_write.has_handle || (creation_write.close_attempted && creation_write.close_status == SFS_OK));
+        for (unsigned owned = 0; owned < 3; owned++) complete &= creation_write.owned_close_calls[owned] == 1 &&
+            creation_write.owned_close_results[owned] == 0 && creation_write.owned_close_errors[owned] == 0;
+        printf("{\"creation_case\":%d,\"identity_captured_before_fences\":%s,\"image_fd\":%d,\"parent_fd\":%d,\"auxiliary_parent_fd\":%d,\"parent_device\":%llu,\"parent_inode\":%llu,\"real_close_roles\":[\"image\",\"parent\",\"auxiliary_parent\"],\"real_close_calls\":[%d,%d,%d],\"real_close_results\":[%d,%d,%d],\"real_close_errors\":[%d,%d,%d]}\n",
+               which, creation_write.image_captured ? "true" : "false", creation_write.fd, creation_write.parent_fd,
+               creation_write.auxiliary_parent_fd, (unsigned long long)creation_write.parent_device, (unsigned long long)creation_write.parent_inode,
+               creation_write.owned_close_calls[0], creation_write.owned_close_calls[1], creation_write.owned_close_calls[2],
+               creation_write.owned_close_results[0], creation_write.owned_close_results[1], creation_write.owned_close_results[2],
+               creation_write.owned_close_errors[0], creation_write.owned_close_errors[1], creation_write.owned_close_errors[2]);
+        complete &= creation_write.api_status == (int)creation_write.api_result.status &&
+                    (acknowledged || (creation_write.api_status == SFS_OUTCOME_UNKNOWN && !creation_write.has_handle));
+        sfs_image *h = NULL; sfs_result r; enum sfs_status opened = sfs_image_open(root, "image", &h, &r);
+        snprintf(label, sizeof(label), "creation-%d-ordinary-open", which); receipt(label, &r);
+        int exact = opened == SFS_OK && h && creation_binding(&r);
+        enum sfs_status first = opened;
+        if (opened == SFS_OK && h) {
+            sfs_entry entry; first = sfs_image_stat(h, 0, SFS_ROOT_INODE, &entry, &r);
+            snprintf(label, sizeof(label), "creation-%d-root", which); receipt(label, &r);
+            exact &= first == SFS_OK && entry.inode == SFS_ROOT_INODE && entry.kind == SFS_DIRECTORY && !entry.size;
+            if (first == SFS_OK) {
+                sfs_cookie cookie = {0}; int found = -1;
+                first = sfs_image_next(h, 0, SFS_ROOT_INODE, &cookie, &entry, &found, &r);
+                snprintf(label, sizeof(label), "creation-%d-entries", which); receipt(label, &r);
+                exact &= first == SFS_OK && found == 0;
+                if (first == SFS_OK) {
+                    sfs_snapshot_entry snapshot; found = -1;
+                    first = sfs_image_snapshot_at(h, 0, &snapshot, &found, &r);
+                    snprintf(label, sizeof(label), "creation-%d-snapshots", which); receipt(label, &r);
+                    exact &= first == SFS_OK && found == 0;
+                }
+            }
+        }
+        complete &= creation_observed_status(first) && ((opened == SFS_OK) == (h != NULL));
+        if (h) close_image(h);
+        h = NULL; enum sfs_status verify_open = sfs_image_open(root, "image", &h, &r);
+        snprintf(label, sizeof(label), "creation-%d-verify-open", which); receipt(label, &r);
+        int verified = 0, verify_attempted = verify_open == SFS_OK && h;
+        enum sfs_status verification_status = verify_open;
+        if (verify_attempted) {
+            verification_status = sfs_image_verify(h, &generous, &r);
+            snprintf(label, sizeof(label), "creation-%d-full-verify", which); receipt(label, &r);
+            verified = verification_status == SFS_OK && r.coverage == SFS_COVERAGE_FULL_REACHABLE && creation_binding(&r);
+        }
+        complete &= creation_observed_status(verification_status) && ((verify_open == SFS_OK) == (h != NULL));
+        if (h) close_image(h);
+        h = NULL; sfs_recovery recovery = {0}; enum sfs_status inspection = sfs_image_inspect(root, "image", &h, &recovery, &generous, &r);
+        snprintf(label, sizeof(label), "creation-%d-unselected-inspect", which); receipt(label, &r);
+        for (unsigned slot = 0; slot < 2; slot++) {
+            snprintf(label, sizeof(label), "creation-%d-inspect-slot%u", which, slot); receipt(label, &recovery.slots[slot]);
+            complete &= creation_observed_status(recovery.slots[slot].status);
+            if (recovery.slots[slot].status == SFS_OK) complete &= creation_binding(&recovery.slots[slot]) &&
+                recovery.slots[slot].coverage == SFS_COVERAGE_FULL_REACHABLE;
+        }
+        complete &= h != NULL && creation_observed_status(inspection);
+        if (h) close_image(h);
+        struct stat after; assert(!lstat("image", &after) && after.st_dev == identity.st_dev && after.st_ino == identity.st_ino);
+        unchanged("image", before, image_size); free(before);
+        int available = exact && verified;
+        int preserved = complete && acknowledged && claim_matches && available;
+        int unavailable_ack = complete && acknowledged && !available;
+        all_complete &= complete; all_preserved &= preserved; loss |= unavailable_ack || (complete && acknowledged && !claim_matches);
+        printf("{\"creation_case\":%d,\"observation_complete\":%s,\"create_acknowledged\":%s,\"create_claim_matches\":%s,\"ordinary_exact_empty\":%s,\"verify_attempted\":%s,\"full_verified\":%s,\"inspection_pair_valid\":%d,\"inspection_latest_may_be_unknown\":%d,\"recovery_selected\":false,\"preservation_pass\":%s,\"acknowledged_initialization_unavailable\":%s}\n",
+               which, complete ? "true" : "false", acknowledged ? "true" : "false", claim_matches ? "true" : "false", exact ? "true" : "false",
+               verify_attempted ? "true" : "false", verified ? "true" : "false", recovery.pair_valid, recovery.latest_may_be_unknown,
+               preserved ? "true" : "false", unavailable_ack ? "true" : "false");
+        fflush(stdout); assert(!allocated && !writes && !fulls && !syncs && !image_truncates);
+        if (!which) assert(preserved);
+        retain(4700 + which);
+    }
+    printf("{\"creation_three_complete\":%s,\"preservation_pass\":%s,\"unresolved_loss_risk\":%s,\"format_minor\":2,\"specimens_retained\":true}\n",
+           all_complete ? "true" : "false", all_preserved ? "true" : "false", loss ? "true" : all_complete ? "false" : "null");
+    fflush(stdout); assert(all_complete);
+}
+static void creation_corrective(void) {
+    /* Keep the diagnostic observations intact; correction requires explicit rejection. */
+    creation_success_alteration();
+    for (int which = 0; which < 3; which++) {
+        char proof_name[64]; snprintf(proof_name, sizeof(proof_name), "creation-proof-%d.bin", which);
+        size_t size; unsigned char *proof = bytes(proof_name, &size);
+        assert(size == sizeof(creation_write)); memcpy(&creation_write, proof, size); free(proof);
+        creation_write.enabled = 0;
+        if (!which) {
+            assert(creation_write.api_status == SFS_OK && creation_write.api_result.status == SFS_OK &&
+                   creation_write.has_handle && creation_write.close_attempted && creation_write.close_status == SFS_OK);
+        } else {
+            assert(creation_write.api_status == SFS_OUTCOME_UNKNOWN && creation_write.api_result.status == SFS_OUTCOME_UNKNOWN &&
+                   creation_write.api_result.phase == (which == 1 ? SFS_PHASE_SLOT0 : SFS_PHASE_SLOT1) &&
+                   !creation_write.api_result.system_errno && !creation_write.has_handle && !creation_write.close_attempted);
+        }
+        for (unsigned owned = 0; owned < 3; owned++) assert(creation_write.owned_close_calls[owned] == 1 &&
+            creation_write.owned_close_results[owned] == 0 && creation_write.owned_close_errors[owned] == 0);
+        printf("{\"creation_corrective_case\":%d,\"expected_outcome_checked\":true,\"rejected_changed_initialization\":%s}\n", which, which ? "true" : "false");
+    }
+    printf("{\"creation_false_ack_correction\":true,\"availability_repaired\":false,\"original_failure_preserved\":true}\n");
+}
+static void creation_readback_io(void) {
+    const char *modes[] = {"eintr", "short", "eof", "eio"};
+    for (unsigned slot = 0; slot < 2; slot++) for (unsigned mode = 0; mode < 4; mode++) {
+        reset("creation-readback", 0); int before_descriptors = descriptors();
+        append_readback.enabled = append_readback.anchor = append_readback.initialization = 1;
+        append_readback.mode = (int)mode; append_readback.minimum = slot * CELL;
+        sfs_image *h = NULL; sfs_result r;
+        enum sfs_status status = sfs_image_create(root, "image", TEST_CAPACITY, &h, &r);
+        sfs_result observed = r;
+        assert(append_readback.armed && append_readback.slot_written && append_readback.offset == (off_t)(slot * CELL) && hit);
+        assert(append_readback.reads == (mode == 0 ? 2u : mode == 1 ? (CELL + 16) / 17 : 1u));
+        assert(append_readback.injections == (mode == 1 ? (int)(CELL / 17) : 1));
+        assert(fulls == 3 && syncs == 1 && slots == 2 && !strcmp(order, "F01FDF") && !image_truncates);
+        char label[80]; snprintf(label, sizeof(label), "creation-readback-%u-%s", slot, modes[mode]); receipt(label, &observed);
+        printf("{\"creation_readback\":\"%s\",\"offset\":%llu,\"armed_after_final_fence\":true,\"reads\":%u,\"injections\":%d,\"bytes\":%zu,\"complete\":%d}\n",
+               label, (unsigned long long)append_readback.offset, append_readback.reads, append_readback.injections,
+               append_readback.consumed, append_readback.complete);
+        if (mode < 2) {
+            ok(status, &observed); assert(h && observed.coverage == SFS_COVERAGE_FULL_REACHABLE && observed.generation == 1 &&
+                !observed.system_errno && append_readback.complete && append_readback.consumed == CELL);
+            close_image(h);
+        } else {
+            assert(status == SFS_OUTCOME_UNKNOWN && observed.status == SFS_OUTCOME_UNKNOWN && !h &&
+                   observed.phase == (slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0) && observed.system_errno == EIO &&
+                   !append_readback.complete && !append_readback.consumed);
+        }
+        assert(closes == 3 && !allocated && descriptors() == before_descriptors && fulls == 3 && slots == 2);
+        unsigned char intended[CELL]; memcpy(intended, append_readback.written, CELL);
+        size_t n; unsigned char *before = bytes("image", &n);
+        assert(n == 4 * CELL && !memcmp(before, intended, CELL) && !memcmp(before + CELL, intended, CELL));
+        reset("", 0); open_image(&h);
+        sfs_entry entry; sfs_cookie cookie = {0}; int found = -1;
+        OK(sfs_image_next(h, 0, SFS_ROOT_INODE, &cookie, &entry, &found, &r)); assert(!found);
+        close_image(h); reset("", 0); open_image(&h); OK(sfs_image_verify(h, &generous, &r));
+        assert(r.coverage == SFS_COVERAGE_FULL_REACHABLE && r.generation == 1 &&
+               !memcmp(r.uuid, intended + 24, 16) && !memcmp(r.root_digest, intended + 72, 32));
+        close_image(h); assert(!allocated && descriptors() == before_descriptors);
+        unchanged("image", before, n); free(before); retain(4800 + (int)(slot * 4 + mode));
+    }
 }
 static void creation(void) {
     const char *cases[] = {"unsupported", "readonly", "create", "lock", "record_error", "full", "slot_torn", "slot_error", "slot_torn", "full", "parent_sync", "full", "identity", "parent_close"};
@@ -5231,6 +5530,9 @@ int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
     if(!strcmp(argv[1],"basic")) basic(); else if(!strcmp(argv[1],"creation")) creation();
+    else if(!strcmp(argv[1],"creation-success-alteration")) creation_success_alteration();
+    else if(!strcmp(argv[1],"creation-corrective")) creation_corrective();
+    else if(!strcmp(argv[1],"creation-readback")) creation_readback_io();
     else if(!strcmp(argv[1],"io")) io(); else if(!strcmp(argv[1],"append-readback")) append_readback_io(); else if(!strcmp(argv[1],"anchor-readback")) anchor_readback_io(); else if(!strcmp(argv[1],"cuts")) cuts();
     else if(!strcmp(argv[1],"review")) review(); else if(!strcmp(argv[1],"security")) security();
     else if(!strcmp(argv[1],"parser")) { parser(); contexts(); type_alias_context(); } else if(!strcmp(argv[1],"limits")) limits();
@@ -5268,5 +5570,5 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
     if(strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
-    printf("PASS %s\n",argv[1]); return 0;
+    printf("%s %s\n", (!strcmp(argv[1],"creation-success-alteration") || !strcmp(argv[1],"creation-corrective")) ? "COMPLETE" : "PASS", argv[1]); return 0;
 }

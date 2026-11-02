@@ -14,11 +14,11 @@ from native_reliability import (BoundImage, Campaign, CASE_SECONDS, REPO,
                                 expected, pattern, sha)
 
 CORE_PINS = {
-    "filesystem/image.c": "3ebaa19aef2852e88a31846505b09692a91cf3a301533c2e3ffdfcdda3bc3d17",
+    "filesystem/image.c": "4d82de781c14a168dd64eab402d99004a207adf3401c802b94422f35353923e8",
     "filesystem/image.h": "a335012f3103178baa7229ed405b1b9211a27e3c0b257bbd8f0bf91dc4dd6163",
 }
 CORRECTIVE_CORE_PINS = {
-    "filesystem/image.c": "3ebaa19aef2852e88a31846505b09692a91cf3a301533c2e3ffdfcdda3bc3d17",
+    "filesystem/image.c": "4d82de781c14a168dd64eab402d99004a207adf3401c802b94422f35353923e8",
     "filesystem/image.h": "a335012f3103178baa7229ed405b1b9211a27e3c0b257bbd8f0bf91dc4dd6163",
 }
 FAMILIES = (("control", 1), ("acknowledged_payload_success", 2), ("close_eio", 3))

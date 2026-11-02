@@ -1143,6 +1143,12 @@ static enum sfs_status create_image(const char *directory, const char *name, uin
     phase = SFS_PHASE_COMMIT_BARRIER; if (fullsync(h->fd)) goto io_failed;
     phase = SFS_PHASE_PARENT_BARRIER; if (fsync(parent)) goto io_failed;
     phase = SFS_PHASE_FINAL_BARRIER; if (fullsync(h->fd)) goto io_failed;
+    uint8_t observed[CELL];
+    for (unsigned slot = 0; slot < 2; slot++) {
+        phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0;
+        if (read_exact(h->fd, observed, CELL, slot * CELL)) goto io_failed;
+        if (memcmp(observed, b, CELL)) { code = SFS_CORRUPT; goto failed; }
+    }
     phase = SFS_PHASE_IDENTITY; struct stat ps, named;
     if (fstat(parent, &ps)) goto io_failed;
     if (!same_identity(&ps, &h->parent_identity)) { errno = ESTALE; goto io_failed; }
