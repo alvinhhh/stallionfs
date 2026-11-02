@@ -36,6 +36,22 @@ def descriptors():
     return found
 
 
+def compile_native_faults(base):
+    tests = Path(__file__).resolve().parent
+    source = tests.parent / 'stallionfs'
+    object_file, executable = base / 'tree.o', base / 'native-faults'
+    common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+              '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
+    replacements = ['openat', 'close', 'fstat', 'fstatat', 'fclonefileat', 'fcopyfile', 'unlinkat',
+                    'pthread_create', 'pthread_join', 'acl_size', 'acl_copy_ext', 'acl_get_fd_np',
+                    'acl_valid', 'acl_get_entry', 'lseek', 'fgetxattr', 'malloc', 'free']
+    subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
+                    '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)
+    subprocess.run([*common, str(tests / 'native_faults.c'), str(object_file), '-o', str(executable)],
+                   check=True, timeout=30)
+    return executable
+
+
 class FileOperations(unittest.TestCase):
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-fileops-')).resolve()
@@ -287,17 +303,7 @@ for jobs in (1, 4):
         subprocess.run([str(exe), str(self.base)], check=True, timeout=30)
 
     def test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup(self):
-        tests = Path(__file__).resolve().parent
-        source = tests.parent / 'stallionfs'
-        object_file, executable = self.base / 'tree.o', self.base / 'native-faults'
-        common = [*shlex.split(os.environ.get('CC', 'cc')), '-O2', '-g', '-Wall', '-Wextra', '-Werror',
-                  '-pthread', '-I', str(source), *shlex.split(os.environ.get('CFLAGS', ''))]
-        replacements = ['openat', 'fstat', 'fclonefileat', 'fcopyfile', 'unlinkat', 'pthread_create', 'pthread_join',
-                        'acl_size', 'acl_copy_ext', 'lseek', 'fgetxattr', 'malloc', 'free']
-        subprocess.run([*common, *(f'-D{name}=stallion_test_{name}' for name in replacements),
-                        '-c', str(source / '_tree.c'), '-o', str(object_file)], check=True, timeout=30)
-        subprocess.run([*common, str(tests / 'native_faults.c'), str(object_file), '-o', str(executable)],
-                       check=True, timeout=30)
+        executable = compile_native_faults(self.base)
         subprocess.run([str(executable), str(self.base)], check=True, timeout=30)
 
     @unittest.skipUnless(os.environ.get('STALLIONFS_TEST_IMAGES') == '1', 'Enable disposable APFS mount check')

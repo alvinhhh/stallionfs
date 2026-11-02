@@ -23,6 +23,9 @@ def main(argv=None):
         command.add_argument("source")
         command.add_argument("destination")
         command.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
+        if action == "copy":
+            command.add_argument("--strategy", choices=("materialized", "auto"), default="materialized",
+                                 help="Data transport; materialized by default")
     delete = commands.add_parser("delete", help="Permanently delete a file or directory without following links")
     delete.add_argument("path")
     delete.add_argument("-r", "--recursive", action="store_true")
@@ -138,11 +141,15 @@ def main(argv=None):
                 result, text = {"path": path}, ""
             else:
                 source, destination = args.source, args.destination
-                if args.action in {"clone", "copy"}:
-                    getattr(_scan, args.action)(source, destination, jobs=args.jobs)
+                if args.action == "copy":
+                    _scan.copy(source, destination, jobs=args.jobs, strategy=args.strategy)
+                elif args.action == "clone":
+                    _scan.clone(source, destination, jobs=args.jobs)
                 else:
                     _scan.move(source, destination, replace=args.replace, exchange=args.exchange)
                 result, text = {"source": source, "destination": destination}, ""
+                if args.action == "copy" and args.strategy == "auto":
+                    result["strategy"] = "auto"
         elif args.action == 'register-native-image':
             result = store.register_native_image(args.path, name=args.name)
             text = result['id']

@@ -60,6 +60,7 @@ struct tree {
     unsigned head, queued, live, exited;
     int parent_fd;
     enum operation operation;
+    enum stallion_copy_strategy copy_strategy;
     dev_t device;
     atomic_int error;
     char error_path[PATH_MAX];
@@ -151,7 +152,9 @@ static int unchanged_source(const struct stat *a, const struct stat *b) {
         same_time(a->st_mtimespec, b->st_mtimespec) && same_time(a->st_ctimespec, b->st_ctimespec) &&
         same_time(a->st_birthtimespec, b->st_birthtimespec);
 }
+enum copy_completion { COPY_COMPLETION_INCOMPLETE, COPY_COMPLETION_COPYFILE, COPY_COMPLETION_CLONE };
 struct copy_progress {
+    enum copy_completion completion;
     struct tree *tree;
     stallion_cancel_fn cancel;
     void *context;
@@ -177,16 +180,60 @@ static int copy_status(int what, int stage, copyfile_state_t state,
     }
     return COPYFILE_CONTINUE;
 }
-static int same_acl(int input, int output) {
-    acl_t source = acl_get_fd_np(input, ACL_TYPE_EXTENDED);
-    if (!source && errno == ENOENT) source = acl_init(0);
-    if (!source) return -1;
+/* One first-inode operation owns this snapshot, including ordered ACEs and flags. */
+struct acl_snapshot { char *bytes; ssize_t length; int empty; };
+static int snapshot_acl(int input, struct acl_snapshot *snapshot) {
+    errno = 0;
+    acl_t acl = acl_get_fd_np(input, ACL_TYPE_EXTENDED);
+    if (!acl && errno == ENOENT) acl = acl_init(0);
+    if (!acl) { if (!errno) errno = EIO; return -1; }
+    int error = 0;
+    acl_entry_t entry;
+    errno = 0;
+    if (acl_valid(acl)) error = errno ? errno : EIO;
+    if (!error) {
+        errno = 0;
+        if (acl_get_entry(acl, ACL_FIRST_ENTRY, &entry)) {
+            /* EINVAL marks the end of a validated Darwin ACL. */
+            if (errno == EINVAL) snapshot->empty = 1;
+            else error = errno ? errno : EIO;
+        }
+    }
+    if (!error) {
+        errno = 0;
+        snapshot->length = acl_size(acl);
+        if (snapshot->length <= 0) error = snapshot->length < 0 && errno ? errno : EIO;
+    }
+    if (!error) {
+        errno = 0;
+        snapshot->bytes = malloc((size_t)snapshot->length);
+        if (!snapshot->bytes) error = errno ? errno : ENOMEM;
+    }
+    if (!error) {
+        errno = 0;
+        ssize_t copied = acl_copy_ext(snapshot->bytes, acl, snapshot->length);
+        if (copied != snapshot->length) error = copied < 0 && errno ? errno : EIO;
+    }
+    acl_free(acl);
+    if (error) { free(snapshot->bytes); snapshot->bytes = NULL; }
+    errno = error;
+    return error ? -1 : 0;
+}
+static int same_acl(int input, int output, const struct acl_snapshot *snapshot) {
+    acl_t source = NULL;
+    if (!snapshot) {
+        errno = 0;
+        source = acl_get_fd_np(input, ACL_TYPE_EXTENDED);
+        if (!source && errno == ENOENT) source = acl_init(0);
+        if (!source) { if (!errno) errno = EIO; return -1; }
+    }
+    errno = 0;
     acl_t destination = acl_get_fd_np(output, ACL_TYPE_EXTENDED);
     if (!destination && errno == ENOENT) destination = acl_init(0);
-    int error = destination ? 0 : errno;
-    ssize_t a_length = 0, b_length = 0;
+    int error = destination ? 0 : errno ? errno : EIO;
+    ssize_t a_length = snapshot ? snapshot->length : 0, b_length = 0;
     char *a = NULL, *b = NULL;
-    if (!error) {
+    if (!error && !snapshot) {
         errno = 0;
         a_length = acl_size(source);
         if (a_length <= 0) error = a_length < 0 && errno ? errno : EIO;
@@ -197,10 +244,10 @@ static int same_acl(int input, int output) {
         if (b_length <= 0) error = b_length < 0 && errno ? errno : EIO;
     }
     if (!error && a_length != b_length) error = ENOTSUP;
-    if (!error && !(a = malloc((size_t)a_length))) error = errno;
-    if (!error && !(b = malloc((size_t)b_length))) error = errno;
+    if (!error && !snapshot && !(a = malloc((size_t)a_length))) error = errno ? errno : ENOMEM;
+    if (!error && !(b = malloc((size_t)b_length))) error = errno ? errno : ENOMEM;
     /* The external representation includes ordered ACEs and flags without name lookup. */
-    if (!error) {
+    if (!error && !snapshot) {
         errno = 0;
         ssize_t copied = acl_copy_ext(a, source, a_length);
         if (copied != a_length) error = copied < 0 && errno ? errno : EIO;
@@ -210,16 +257,81 @@ static int same_acl(int input, int output) {
         ssize_t copied = acl_copy_ext(b, destination, b_length);
         if (copied != b_length) error = copied < 0 && errno ? errno : EIO;
     }
-    if (!error && memcmp(a, b, (size_t)a_length)) error = ENOTSUP;
+    if (!error && memcmp(snapshot ? snapshot->bytes : a, b, (size_t)a_length)) error = ENOTSUP;
     free(a);
     free(b);
-    acl_free(source);
+    if (source) acl_free(source);
     if (destination) acl_free(destination);
     errno = error;
     return error ? -1 : 0;
 }
-/* Verify ordinary xattr bytes; resource forks retain length and callback checks. */
-static int same_xattrs(int input, int output, const struct copy_progress *progress) {
+/* This post-copy verifier uses only held descriptors and public 32-bit positions.
+ * Its conservative length ceiling does not preflight or bound the copy engine. */
+static int same_resource_fork(int input, int output, unsigned char *source_value,
+                               unsigned char *destination_value, struct copy_progress *progress) {
+    const char *name = "com.apple.ResourceFork";
+    if (copy_stopped(progress)) { errno = progress->error; return -1; }
+    int error = 0;
+    unsigned char *allocated = NULL;
+    size_t capacity = 256;
+    errno = 0;
+    ssize_t source_length = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+    if (source_length < 0) { errno = errno ? errno : EIO; return -1; }
+    errno = 0;
+    ssize_t destination_length = fgetxattr(output, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+    if (destination_length < 0) { errno = errno ? errno : EIO; return -1; }
+    if (source_length != destination_length) { errno = ENOTSUP; return -1; }
+    uint64_t length = (uint64_t)source_length, offset = 0;
+    if (length > (uint64_t)UINT32_MAX + 1) { errno = EOVERFLOW; return -1; }
+    if (length > capacity) {
+        capacity = length < 65536 ? (size_t)length : 65536;
+        if (capacity > SIZE_MAX / 2) { errno = EOVERFLOW; return -1; }
+        errno = 0;
+        allocated = malloc(capacity * 2);
+        if (!allocated) { errno = errno ? errno : ENOMEM; return -1; }
+        source_value = allocated;
+        destination_value = allocated + capacity;
+    }
+    for (;;) {
+        uint32_t position = 0;
+        size_t amount = 0;
+        if (!stallion_fork_chunk(length, offset, capacity, &position, &amount)) { error = EOVERFLOW; break; }
+        if (!amount) break;
+        if (copy_stopped(progress)) { error = progress->error; break; }
+        errno = 0;
+        ssize_t actual = fgetxattr(input, name, source_value, amount, position, XATTR_SHOWCOMPRESSION);
+        if (actual < 0) { error = errno ? errno : EIO; break; }
+        if ((size_t)actual != amount) { error = ESTALE; break; }
+        if (copy_stopped(progress)) { error = progress->error; break; }
+        errno = 0;
+        actual = fgetxattr(output, name, destination_value, amount, position, XATTR_SHOWCOMPRESSION);
+        if (actual < 0) { error = errno ? errno : EIO; break; }
+        if ((size_t)actual != amount) { error = ESTALE; break; }
+        if (memcmp(source_value, destination_value, amount)) { error = ENOTSUP; break; }
+        /* amount <= length-offset, so this 64-bit addition cannot pass length. */
+        offset += (uint64_t)amount;
+    }
+    if (!error && copy_stopped(progress)) error = progress->error;
+    if (!error) {
+        errno = 0;
+        ssize_t actual = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+        if (actual < 0) error = errno ? errno : EIO;
+        else if (actual != source_length) error = ESTALE;
+    }
+    if (!error) {
+        errno = 0;
+        ssize_t actual = fgetxattr(output, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
+        if (actual < 0) error = errno ? errno : EIO;
+        else if (actual != destination_length) error = ESTALE;
+    }
+    if (!error && copy_stopped(progress)) error = progress->error;
+    free(allocated);
+    errno = error;
+    return error ? -1 : 0;
+}
+/* Verify complete xattr bytes through held descriptors. */
+static int same_xattrs(int input, int output, struct copy_progress *progress) {
+    if (copy_stopped(progress)) { errno = progress->error; return -1; }
     unsigned char source_inline[256], destination_inline[256];
     ssize_t length = flistxattr(input, NULL, 0, XATTR_SHOWCOMPRESSION);
     if (length < 0) return -1;
@@ -234,6 +346,7 @@ static int same_xattrs(int input, int output, const struct copy_progress *progre
     if (!error && destination_length < 0) error = errno;
     if (!error && destination_length != length) error = ENOTSUP;
     for (ssize_t offset = 0; !error && offset < length;) {
+        if (copy_stopped(progress)) { error = progress->error; break; }
         const char *name = names + offset;
         size_t remaining = (size_t)(length - offset), size = strnlen(name, remaining);
         if (!size || size == remaining) { error = EIO; break; }
@@ -257,14 +370,18 @@ static int same_xattrs(int input, int output, const struct copy_progress *progre
                     else {
                         source_value = allocated;
                         destination_value = allocated + (size_t)a;
-                        errno = 0;
-                        ssize_t actual = fgetxattr(input, name, source_value, (size_t)a, 0, XATTR_SHOWCOMPRESSION);
-                        if (actual < 0) error = errno ? errno : EIO;
-                        else if (actual != a) error = ESTALE;
+                        if (copy_stopped(progress)) error = progress->error;
+                        else {
+                            errno = 0;
+                            ssize_t actual = fgetxattr(input, name, source_value, (size_t)a, 0, XATTR_SHOWCOMPRESSION);
+                            if (actual < 0) error = errno ? errno : EIO;
+                            else if (actual != a) error = ESTALE;
+                        }
                     }
                 }
             } else if (a < 0) error = errno ? errno : EIO;
             else if ((size_t)a > sizeof(source_inline)) error = ESTALE;
+            if (!error && copy_stopped(progress)) error = progress->error;
             if (!error) {
                 errno = 0;
                 size_t capacity = allocated ? (size_t)a : sizeof(destination_inline);
@@ -276,29 +393,40 @@ static int same_xattrs(int input, int output, const struct copy_progress *progre
             free(allocated);
             continue;
         }
-        /* Resource forks retain length and callback verification; quarantine also checks bytes. */
+        if (!strcmp(name, "com.apple.ResourceFork")) {
+            count++;
+            if (same_resource_fork(input, output, source_inline, destination_inline, progress)) error = errno;
+            continue;
+        }
         ssize_t a = fgetxattr(input, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
         if (a < 0) { error = errno; break; }
         ssize_t b = fgetxattr(output, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
         if (b < 0) { error = errno; break; }
         if (a != b) { error = ENOTSUP; break; }
-        if (strcmp(name, "com.apple.quarantine")) { count++; continue; }
         /* Quarantine bypasses the xattr callbacks and may be rewritten by copyfile. */
         if ((uintmax_t)a > (SIZE_MAX - 1) / 2) { error = EOVERFLOW; break; }
         char *values = malloc((size_t)a * 2 + 1);
         if (!values) { error = errno; break; }
-        if (fgetxattr(input, name, values, (size_t)a, 0, 0) != a ||
-            fgetxattr(output, name, values + a, (size_t)a, 0, 0) != a) error = errno ? errno : ESTALE;
-        else if (memcmp(values, values + a, (size_t)a)) error = ENOTSUP;
+        if (copy_stopped(progress)) error = progress->error;
+        else if (fgetxattr(input, name, values, (size_t)a, 0, 0) != a) error = errno ? errno : ESTALE;
+        if (!error && copy_stopped(progress)) error = progress->error;
+        if (!error && fgetxattr(output, name, values + a, (size_t)a, 0, 0) != a) error = errno ? errno : ESTALE;
+        if (!error && memcmp(values, values + a, (size_t)a)) error = ENOTSUP;
         free(values);
     }
-    if (!error && (progress->started != count || progress->finished != count)) error = EIO;
+    if (!error && copy_stopped(progress)) error = progress->error;
+    if (!error) {
+        if (progress->completion == COPY_COMPLETION_COPYFILE) {
+            if (progress->started != count || progress->finished != count) error = EIO;
+        } else if (progress->completion != COPY_COMPLETION_CLONE || progress->started || progress->finished) error = EIO;
+    }
     free(names);
     errno = error;
     return error ? -1 : 0;
 }
-static int same_sparse_ranges(int input, int output, off_t size) {
+static int same_sparse_ranges(int input, int output, off_t size, struct copy_progress *progress) {
     for (off_t position = 0; position < size;) {
+        if (copy_stopped(progress)) { errno = progress->error; return -1; }
         off_t a = lseek(input, position, SEEK_DATA);
         if (a < 0 && errno != ENXIO) return -1;
         if (a < 0) a = size;
@@ -318,10 +446,43 @@ static int same_sparse_ranges(int input, int output, off_t size) {
     }
     return 0;
 }
+struct copy_target { int parent; const char *name; const struct stat *opened; };
+/* A GID-only result is available only after every other check has succeeded. */
+static int verify_metadata(int input, int output, const struct stat *identity,
+                             struct copy_progress *progress, const struct acl_snapshot *acl,
+                             int allow_gid_difference, const struct copy_target *target) {
+    struct stat after, destination;
+    int error = 0, gid_difference = 0;
+    if (copy_stopped(progress)) error = progress->error;
+    if (!error && progress->completion != COPY_COMPLETION_COPYFILE && progress->completion != COPY_COMPLETION_CLONE) error = EIO;
+    if (!error && fstat(output, &destination)) error = errno;
+    if (!error) {
+        gid_difference = identity->st_gid != destination.st_gid;
+        if (identity->st_mode != destination.st_mode || identity->st_uid != destination.st_uid ||
+            (gid_difference && !allow_gid_difference) || identity->st_flags != destination.st_flags ||
+            !same_time(identity->st_mtimespec, destination.st_mtimespec) ||
+            (!S_ISDIR(identity->st_mode) && identity->st_size != destination.st_size)) error = ENOTSUP;
+    }
+    if (!error && same_acl(input, output, acl)) error = errno;
+    if (!error && same_xattrs(input, output, progress)) error = errno;
+    if (!error && S_ISREG(identity->st_mode) && same_sparse_ranges(input, output, identity->st_size, progress)) error = errno;
+    if (!error && fstat(input, &after)) error = errno;
+    if (!error && !unchanged_source(identity, &after)) error = ESTALE;
+    if (!error && copy_stopped(progress)) error = progress->error;
+    if (!error && target) {
+        struct stat named;
+        if (fstatat(target->parent, target->name, &named, AT_SYMLINK_NOFOLLOW)) error = errno;
+        else if (!same_object(target->opened, &named)) error = ESTALE;
+    }
+    errno = error;
+    return error ? -1 : gid_difference;
+}
 static int ordinary_metadata(int input, int output, const struct stat *identity,
-                              copyfile_flags_t flags, struct copy_progress *progress) {
-    struct stat before, after, destination;
+                              copyfile_flags_t flags, struct copy_progress *progress,
+                              const struct acl_snapshot *acl, const struct copy_target *target) {
+    struct stat before, destination;
     int error = 0;
+    progress->completion = COPY_COMPLETION_INCOMPLETE;
     if (copy_stopped(progress)) { errno = progress->error; return -1; }
     if (fstat(input, &before)) return -1;
     if (!unchanged_source(identity, &before)) { errno = ESTALE; return -1; }
@@ -341,7 +502,7 @@ static int ordinary_metadata(int input, int output, const struct stat *identity,
     copyfile_state_t copy = copyfile_state_alloc();
     if (!copy) return -1;
     if (copyfile_state_set(copy, COPYFILE_STATE_STATUS_CB, (void *)copy_status) ||
-        copyfile_state_set(copy, COPYFILE_STATE_STATUS_CTX, progress)) error = errno;
+        copyfile_state_set(copy, COPYFILE_STATE_STATUS_CTX, progress)) error = errno ? errno : EIO;
     /* Set tracking before copied ownership, ACLs, or immutable flags can prevent it. */
     if (!error && (before.st_flags & UF_TRACKED)) {
         if (fstat(output, &destination)) error = errno;
@@ -349,22 +510,12 @@ static int ordinary_metadata(int input, int output, const struct stat *identity,
             fchflags(output, destination.st_flags | UF_TRACKED)) error = errno;
         flags |= COPYFILE_PRESERVE_DST_TRACKED;
     }
-    if (!error && fcopyfile(input, output, copy, flags)) error = progress->error ? progress->error : errno;
-    if (copyfile_state_free(copy) && !error) error = errno;
+    if (!error && fcopyfile(input, output, copy, flags)) error = progress->error ? progress->error : errno ? errno : EIO;
+    if (copyfile_state_free(copy) && !error) error = errno ? errno : EIO;
     if (!error && copy_stopped(progress)) error = progress->error;
-    if (!error && fstat(output, &destination)) error = errno;
-    if (!error && (identity->st_mode != destination.st_mode || identity->st_uid != destination.st_uid ||
-        identity->st_gid != destination.st_gid || identity->st_flags != destination.st_flags ||
-        !same_time(identity->st_mtimespec, destination.st_mtimespec) ||
-        (!S_ISDIR(identity->st_mode) && identity->st_size != destination.st_size))) error = ENOTSUP;
-    if (!error && same_acl(input, output)) error = errno;
-    if (!error && same_xattrs(input, output, progress)) error = errno;
-    if (!error && S_ISREG(identity->st_mode) && same_sparse_ranges(input, output, identity->st_size)) error = errno;
-    if (!error && fstat(input, &after)) error = errno;
-    if (!error && !unchanged_source(identity, &after)) error = ESTALE;
-    if (!error && copy_stopped(progress)) error = progress->error;
-    errno = error;
-    return error ? -1 : 0;
+    if (!error) progress->completion = COPY_COMPLETION_COPYFILE;
+    if (error) { errno = error; return -1; }
+    return verify_metadata(input, output, identity, progress, acl, 0, target);
 }
 static int clear_acl(int fd) {
     acl_t acl = acl_init(0);
@@ -380,16 +531,51 @@ static int first_inode(enum operation operation, struct tree *tree, int input, i
     if (operation == CLONING) return fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
     struct copy_progress progress = {.tree = tree, .cancel = cancel, .context = context};
     if (copy_stopped(&progress)) { errno = progress.error; return -1; }
-    int output = -1, error = 0;
-    struct stat created, opened;
-    if (S_ISREG(identity->st_mode)) {
+    int output = -1, error = 0, cloned = 0;
+    struct stat created, opened, current;
+    struct acl_snapshot snapshot = {0};
+    const struct acl_snapshot *acl = NULL;
+    if (tree && tree->copy_strategy == STALLION_COPY_AUTO && S_ISREG(identity->st_mode) &&
+        identity->st_uid == geteuid() && (identity->st_mode & (S_IRUSR | S_IWUSR)) == (S_IRUSR | S_IWUSR) &&
+        !(identity->st_mode & (S_ISUID | S_ISGID)) && !identity->st_flags) {
+        if (fstat(input, &current)) { error = errno; goto done; }
+        if (!unchanged_source(identity, &current)) { error = ESTALE; goto done; }
+        if (snapshot_acl(input, &snapshot)) { error = errno; goto done; }
+        acl = &snapshot;
+        if (snapshot.empty) {
+            if (copy_stopped(&progress)) { error = progress.error; goto done; }
+            if (fstat(input, &current)) { error = errno; goto done; }
+            if (!unchanged_source(identity, &current)) { error = ESTALE; goto done; }
+            if (!fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL)) {
+                cloned = 1;
+                /* Observed entry/descriptor agreement relies on the stable private tree;
+                 * it cannot recover provenance after replacement before this lookup. */
+                if (fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) { error = errno; goto done; }
+                if (!S_ISREG(created.st_mode) || same_object(identity, &created)) { error = ESTALE; goto done; }
+                output = openat(parent, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+                if (output < 0) { error = errno; goto done; }
+                if (fstat(output, &opened)) { error = errno; goto done; }
+                if (!same_object(&created, &opened)) { error = ESTALE; goto done; }
+                progress.completion = COPY_COMPLETION_CLONE;
+            } else {
+                int clone_error = errno ? errno : EIO;
+                if (clone_error != ENOTSUP && clone_error != EOPNOTSUPP && clone_error != EXDEV) {
+                    error = clone_error; goto done;
+                }
+                if (!fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) { error = clone_error; goto done; }
+                if (errno != ENOENT) { error = errno; goto done; }
+                if (copy_stopped(&progress)) { error = progress.error; goto done; }
+            }
+        }
+    }
+    if (S_ISREG(identity->st_mode) && !cloned) {
         output = openat(parent, name, O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0600);
-        if (output < 0) return -1;
-    } else {
-        if (identity->st_size <= 0 || (uintmax_t)identity->st_size >= SIZE_MAX) { errno = EIO; return -1; }
+        if (output < 0) { error = errno; goto done; }
+    } else if (!S_ISREG(identity->st_mode)) {
+        if (identity->st_size <= 0 || (uintmax_t)identity->st_size >= SIZE_MAX) { error = EIO; goto done; }
         size_t capacity = (size_t)identity->st_size + 1;
         char *target = malloc(capacity);
-        if (!target) return -1;
+        if (!target) { error = errno; goto done; }
         ssize_t length = -1;
         if (__builtin_available(macOS 13.0, *)) length = freadlink(input, target, capacity);
         else errno = ENOTSUP;
@@ -413,11 +599,24 @@ static int first_inode(enum operation operation, struct tree *tree, int input, i
     if (!error && !same_object(&opened, &created)) error = ESTALE;
     /* Root leaves can inherit ACLs; tree children have ACL-empty private parents. */
     if (!error && !tree && clear_acl(output)) error = errno;
-    if (!error && ordinary_metadata(input, output, identity,
-        S_ISREG(identity->st_mode) ? COPYFILE_ALL | COPYFILE_DATA_SPARSE : COPYFILE_METADATA, &progress)) error = errno;
-    if (!error && fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW)) error = errno;
-    if (!error && !same_object(&opened, &created)) error = ESTALE;
+    const struct copy_target target = {parent, name, &opened};
+    if (!error && cloned) {
+        if (copy_stopped(&progress)) error = progress.error;
+        if (!error && fstat(input, &current)) error = errno;
+        if (!error && !unchanged_source(identity, &current)) error = ESTALE;
+        int verified = error ? -1 : verify_metadata(input, output, identity, &progress, acl, 1, &target);
+        if (!error && verified < 0) error = errno;
+        if (!error && verified) {
+            /* Full preverification, including the private entry identity, admitted
+             * only GID. Broad application needs a new real completion and verifier. */
+            progress.completion = COPY_COMPLETION_INCOMPLETE;
+            if (ordinary_metadata(input, output, identity, COPYFILE_METADATA, &progress, acl, &target)) error = errno;
+        }
+    } else if (!error && ordinary_metadata(input, output, identity,
+        S_ISREG(identity->st_mode) ? COPYFILE_ALL | COPYFILE_DATA_SPARSE : COPYFILE_METADATA, &progress, acl, &target)) error = errno;
+done:
     if (output >= 0 && close(output) && !error) error = errno;
+    free(snapshot.bytes);
     errno = error;
     return error ? -1 : 0;
 }
@@ -425,7 +624,7 @@ static int directory_metadata(struct tree *state, struct job *job, int input, in
                                stallion_cancel_fn cancel, void *context) {
     if (state->operation == CLONING) return fcopyfile(input, output, NULL, COPYFILE_METADATA);
     struct copy_progress progress = {.tree = state, .cancel = cancel, .context = context};
-    return ordinary_metadata(input, output, &job->source_stat, COPYFILE_METADATA, &progress);
+    return ordinary_metadata(input, output, &job->source_stat, COPYFILE_METADATA, &progress, NULL, NULL);
 }
 /* The marked ancestor chain remains owned until post-join metadata completes.
  * At most two traversal FDs exist at once, irrespective of depth/group count. */
@@ -753,7 +952,7 @@ static void *worker(void *context) {
 
 /* Takes ownership of source and destination, including on failure. */
 static int run_tree(int source, int destination, int parent, const char *name,
-                    const struct stat *identity, enum operation operation, unsigned workers,
+                    const struct stat *identity, enum operation operation, enum stallion_copy_strategy strategy, unsigned workers,
                     stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
     struct job *root = calloc(1, sizeof(*root));
     char *owned_name = strdup(name);
@@ -766,7 +965,7 @@ static int run_tree(int source, int destination, int parent, const char *name,
                         .inode = identity->st_ino, .source_stat = *identity, .pending = 1};
     struct tree state = {.mutex = PTHREAD_MUTEX_INITIALIZER, .available = PTHREAD_COND_INITIALIZER,
         .links_mutex = PTHREAD_MUTEX_INITIALIZER, .link_source = -1, .link_destination = -1,
-        .parent_fd = parent, .operation = operation, .device = identity->st_dev, .live = 1, .queued = 1};
+        .parent_fd = parent, .operation = operation, .copy_strategy = strategy, .device = identity->st_dev, .live = 1, .queued = 1};
     atomic_init(&state.error, 0);
     state.queue[0] = root;
     pthread_t threads[4];
@@ -974,7 +1173,7 @@ static int no_mounts(int fd) {
     return error ? -1 : 0;
 }
 
-static int clone_impl(const char *source_path, const char *destination_path, int directory_only, enum operation operation,
+static int clone_impl(const char *source_path, const char *destination_path, int directory_only, enum operation operation, enum stallion_copy_strategy strategy,
                       unsigned workers, stallion_cancel_fn cancel, void *context,
                       char *error_path, size_t capacity) {
     if (error_path && capacity) error_path[0] = 0;
@@ -1009,7 +1208,7 @@ static int clone_impl(const char *source_path, const char *destination_path, int
     /* Keep all children private until the final root-metadata copy. */
     if (!error && clear_acl(output)) error = errno;
     if (!error) {
-        int result = run_tree(input, output, source.parent, source.name, &identity, operation,
+        int result = run_tree(input, output, source.parent, source.name, &identity, operation, strategy,
                               workers, cancel, context, error_path, capacity);
         input = output = -1;
         if (result) error = errno;
@@ -1026,19 +1225,29 @@ done:
 }
 int stallion_copy(const char *source, const char *destination, unsigned workers,
                   stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
+    return stallion_copy_with_strategy(source, destination, STALLION_COPY_MATERIALIZED, workers,
+                                       cancel, context, error_path, capacity);
+}
+int stallion_copy_with_strategy(const char *source, const char *destination, enum stallion_copy_strategy strategy,
+                                unsigned workers, stallion_cancel_fn cancel, void *context,
+                                char *error_path, size_t capacity) {
+    if (strategy != STALLION_COPY_MATERIALIZED && strategy != STALLION_COPY_AUTO) {
+        path_error(error_path, capacity, destination ? destination : "");
+        errno = EINVAL; return -1;
+    }
     if (__builtin_available(macOS 13.0, *))
-        return clone_impl(source, destination, 0, COPYING, workers, cancel, context, error_path, capacity);
+        return clone_impl(source, destination, 0, COPYING, strategy, workers, cancel, context, error_path, capacity);
     path_error(error_path, capacity, destination ? destination : "");
     errno = ENOTSUP;
     return -1;
 }
 int stallion_clone(const char *source, const char *destination, unsigned workers,
                    stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
-    return clone_impl(source, destination, 0, CLONING, workers, cancel, context, error_path, capacity);
+    return clone_impl(source, destination, 0, CLONING, STALLION_COPY_MATERIALIZED, workers, cancel, context, error_path, capacity);
 }
 int stallion_clone_tree(const char *source, const char *destination, unsigned workers,
                         stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
-    return clone_impl(source, destination, 1, CLONING, workers, cancel, context, error_path, capacity);
+    return clone_impl(source, destination, 1, CLONING, STALLION_COPY_MATERIALIZED, workers, cancel, context, error_path, capacity);
 }
 int stallion_delete(const char *input, int recursive, int missing_ok, unsigned workers,
                     stallion_cancel_fn cancel, void *context, char *error_path, size_t capacity) {
@@ -1061,7 +1270,7 @@ int stallion_delete(const char *input, int recursive, int missing_ok, unsigned w
         else if (!same_object(&identity, &opened)) error = ESTALE;
         else if (no_mounts(fd)) error = errno;
         else {
-            int result = run_tree(fd, -1, path.parent, path.name, &identity, DELETING,
+            int result = run_tree(fd, -1, path.parent, path.name, &identity, DELETING, STALLION_COPY_MATERIALIZED,
                                   workers, cancel, context, error_path, capacity);
             fd = -1;
             if (result) error = errno;

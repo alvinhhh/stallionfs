@@ -3,6 +3,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Checked ResourceFork cursor arithmetic; a zero amount marks the end without
+ * converting a potentially unrepresentable terminal offset. */
+static inline int stallion_fork_chunk(uint64_t length, uint64_t offset, size_t capacity,
+                                       uint32_t *position, size_t *amount) {
+    if (length > (uint64_t)UINT32_MAX + 1 || offset > length || !capacity) return 0;
+    *amount = 0;
+    if (offset == length) return 1;
+    if (offset > UINT32_MAX) return 0;
+    uint64_t remaining = length - offset;
+    *amount = remaining < capacity ? (size_t)remaining : capacity;
+    *position = (uint32_t)offset;
+    return 1;
+}
+
 /* Called only on the invoking thread; return nonzero to cancel. */
 typedef int (*stallion_cancel_fn)(void *context);
 
@@ -32,10 +46,27 @@ int stallion_scan(const char *path, int bulk, unsigned workers, struct stallion_
  * must meet the directory-clone protection rules below. Leaf-copy parents must
  * not grant inheritable file access to other principals. Failures can leave
  * partial output at the requested destination; workers are joined before return.
+ * ResourceFork verification supports lengths through UINT32_MAX+1, a conservative
+ * verifier limit, not a filesystem maximum. It runs after the copy engine and
+ * does not guarantee early size refusal or an atomic source snapshot.
  */
 int stallion_copy(const char *source, const char *destination, unsigned workers,
                   stallion_cancel_fn cancel, void *context,
                   char *error_path, size_t error_capacity);
+
+enum stallion_copy_strategy { STALLION_COPY_MATERIALIZED, STALLION_COPY_AUTO };
+/* Same ordinary-copy contract. AUTO may clone eligible regular children within
+ * the private destination tree, then verifies ordinary-copy metadata on the clone.
+ * Only an admitted GID-only normalization applies metadata to a clone, followed
+ * by full verification.
+ * Only unsupported/cross-volume clone errors with an absent entry may fall back.
+ * Source and destination must remain stable; observed identity checks do not
+ * protect against same-user replacement before the first destination lookup.
+ */
+int stallion_copy_with_strategy(const char *source, const char *destination,
+                                enum stallion_copy_strategy strategy, unsigned workers,
+                                stallion_cancel_fn cancel, void *context,
+                                char *error_path, size_t error_capacity);
 
 /* Exact destination, which must not exist. Never falls back to byte copying.
  * Workers are joined before return; failures can leave a partial new destination.

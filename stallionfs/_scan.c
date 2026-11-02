@@ -66,10 +66,22 @@ static PyObject *scan_tree(PyObject *self, PyObject *args, PyObject *kwargs) {
 static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwargs, int operation) {
     (void)self;
     static char *names[] = {"source", "destination", "jobs", NULL};
+    static char *copy_names[] = {"source", "destination", "jobs", "strategy", NULL};
     PyObject *source, *destination;
     int jobs = 4;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O&O&|i", names,
-            PyUnicode_FSConverter, &source, PyUnicode_FSConverter, &destination, &jobs)) return NULL;
+    const char *strategy_name = "materialized";
+    enum stallion_copy_strategy strategy = STALLION_COPY_MATERIALIZED;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, operation == 2 ? "O&O&|is" : "O&O&|i",
+            operation == 2 ? copy_names : names, PyUnicode_FSConverter, &source,
+            PyUnicode_FSConverter, &destination, &jobs, &strategy_name)) return NULL;
+    if (operation == 2) {
+        if (!strcmp(strategy_name, "auto")) strategy = STALLION_COPY_AUTO;
+        else if (strcmp(strategy_name, "materialized")) {
+            Py_DECREF(source); Py_DECREF(destination);
+            PyErr_SetString(PyExc_ValueError, "strategy must be materialized or auto");
+            return NULL;
+        }
+    }
     if (jobs < 1 || jobs > 4) {
         Py_DECREF(source); Py_DECREF(destination);
         PyErr_SetString(PyExc_ValueError, "jobs must be between 1 and 4");
@@ -81,8 +93,12 @@ static PyObject *clone_operation(PyObject *self, PyObject *args, PyObject *kwarg
     char error_path[PATH_MAX] = {0};
     int result, error;
     Py_BEGIN_ALLOW_THREADS
-    result = (operation == 2 ? stallion_copy : operation == 1 ? stallion_clone_tree : stallion_clone)(PyBytes_AS_STRING(source), PyBytes_AS_STRING(destination), jobs,
-                           check_cancel, NULL, error_path, sizeof(error_path));
+    if (operation == 2)
+        result = stallion_copy_with_strategy(PyBytes_AS_STRING(source), PyBytes_AS_STRING(destination), strategy, jobs,
+                                            check_cancel, NULL, error_path, sizeof(error_path));
+    else
+        result = (operation == 1 ? stallion_clone_tree : stallion_clone)(PyBytes_AS_STRING(source), PyBytes_AS_STRING(destination), jobs,
+                                                                       check_cancel, NULL, error_path, sizeof(error_path));
     error = errno;
     Py_END_ALLOW_THREADS
     PyObject *value = operation_result(result, error,
@@ -209,7 +225,7 @@ static PyObject *private_directory(PyObject *self, PyObject *argument) {
 static PyMethodDef methods[] = {
     {"_private_directory", private_directory, METH_O, "Validate private directory ownership, mode and ACLs without changing them."},
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},
-    {"copy", (PyCFunction)(void(*)(void))copy_path, METH_VARARGS | METH_KEYWORDS, "Copy data and metadata to an exact new path."},
+    {"copy", (PyCFunction)(void(*)(void))copy_path, METH_VARARGS | METH_KEYWORDS, "Copy to an exact new path with materialized (default) or auto strategy."},
     {"clone", (PyCFunction)(void(*)(void))clone_path, METH_VARARGS | METH_KEYWORDS, "Clone to an exact new path without byte-copy fallback."},
     {"_clone_tree", (PyCFunction)(void(*)(void))clone_tree, METH_VARARGS | METH_KEYWORDS, "Clone a prepared directory; reject root symlinks."},
     {"delete", (PyCFunction)(void(*)(void))delete_path, METH_VARARGS | METH_KEYWORDS, "Delete a path; directories require recursive=True and mounts are refused."},
