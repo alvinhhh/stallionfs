@@ -173,6 +173,7 @@ def _coverage(cache, *, collected=True):
         family = case['required_set']
         native = family.startswith('TREE-') or family == 'COMMAND-SCAN'
         collector = ('native-scan' if family == 'COMMAND-SCAN' else 'native-files' if native
+                     else 'native-copy' if family == 'ORDINARY-COPY'
                      else 'scan-api' if family == 'API-SCAN' else 'workspaces' if family == 'WORKSPACE' else None)
         required = []
         outputs = (('api',) if family in ('API-SCAN', 'WORKSPACE') else
@@ -268,7 +269,7 @@ def _collect(args, resources, binary, root, fixtures, operations):
         state = json.loads(path.read_text()) if path.is_file() else {}
         stages = state.get('stages', [])
         expected = [(cycle, stage) for cycle in range(1, 4)
-                    for stage in ('native-files', 'native-scan', 'scan-api', 'workspaces')]
+                    for stage in ('native-files', 'native-copy', 'native-scan', 'scan-api', 'workspaces')]
         complete = (state.get('status') == 'complete'
                     and [(row.get('cycle'), row.get('stage')) for row in stages] == expected
                     and all(row.get('outcome', {}).get('passed') is True

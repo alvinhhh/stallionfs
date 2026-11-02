@@ -65,22 +65,29 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result['status'], 'complete')
         self.assertTrue(result['collection_passed'])
         self.assertFalse(result['all_metrics_won'])
-        expected = ['native-files', 'native-scan', 'scan-api', 'workspaces']
+        expected = ['native-files', 'native-copy', 'native-scan', 'scan-api', 'workspaces']
         self.assertEqual([row['stage'] for row in result['stages']], expected * 3)
-        self.assertEqual([row['cycle'] for row in result['stages']], [1] * 4 + [2] * 4 + [3] * 4)
-        self.assertEqual(len(self.calls), 12)
+        self.assertEqual([row['cycle'] for row in result['stages']], [1] * 5 + [2] * 5 + [3] * 5)
+        self.assertEqual(len(self.calls), 15)
         for argv, options in self.calls:
             self.assertEqual(argv[:2], [sys.executable, '-B'])
             self.assertEqual(argv[argv.index('--samples') + 1], '10')
             self.assertEqual(options['cwd'], self.output)
             self.assertFalse(options['check'])
             self.assertNotIn('shell', options)
-        files, scan, api, workspace = [argv for argv, _ in self.calls[:4]]
+        files, copy, scan, api, workspace = [argv for argv, _ in self.calls[:5]]
         self.assertEqual(files[files.index('--fixtures') + 1:files.index('--node')], list(campaign.FILES))
+        self.assertEqual(files[files.index('--operations') + 1:files.index('--copy-tools')],
+                         ['clone', 'move', 'delete'])
         self.assertEqual(len(campaign.FILES), 13)
         self.assertEqual(len(set(campaign.FILES)), 13)
+        for argv, _ in self.calls[1::5]:
+            self.assertEqual(Path(argv[2]).name, 'native_suite.py')
+            self.assertEqual(argv[argv.index('--operations') + 1:],
+                             ['copy', '--copy-tools', 'cp', '--fixtures', 'tiny_4kib'])
+            self.assertEqual(argv[argv.index('--binary') + 1], files[files.index('--binary') + 1])
         self.assertEqual(scan[scan.index('--fixtures') + 1:], list(campaign.SCANS))
-        for argv in (files, scan):
+        for argv in (files, copy, scan):
             self.assertEqual(argv[argv.index('--runs') + 1], '1')
             self.assertEqual(argv[argv.index('--cache') + 1:argv.index('--operations')], ['warm', 'cold'])
         self.assertIn('--memory', api)
@@ -108,7 +115,7 @@ class CampaignTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 1)
         self.assertEqual(self.run_mocked(failed_first), 1)
         report = self.report()
-        self.assertEqual(len(self.calls), 12)
+        self.assertEqual(len(self.calls), 15)
         self.assertEqual(report['status'], 'complete')
         self.assertFalse(report['collection_passed'])
         self.assertEqual(report['stages'][0]['status'], 'complete_with_failures')
@@ -126,25 +133,31 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(path, output.with_name(output.name + '.manifest'))
             return original(path)
         with mock.patch.object(campaign, 'read_small', side_effect=read):
-            state, evidence = campaign.outcome('native-files', output)
-        self.assertTrue(state['passed'])
-        self.assertIn('not independently verified', evidence['verification'])
+            for name in ('native-files', 'native-copy'):
+                state, evidence = campaign.outcome(name, output)
+                self.assertTrue(state['passed'])
+                self.assertIn('not independently verified', evidence['verification'])
         with output.with_name(output.name + '.journal').open('ab') as stream:
             stream.write(b'uncommitted')
-        with self.assertRaisesRegex(RuntimeError, 'uncommitted tail'):
-            campaign.outcome('native-files', output)
+        for name in ('native-files', 'native-copy'):
+            with self.assertRaisesRegex(RuntimeError, 'uncommitted tail'):
+                campaign.outcome(name, output)
 
     def test_denied_purge_is_not_retried_in_later_native_stages(self):
-        for cache, expected_calls in ((['warm', 'cold'], 12), (['cold'], 7)):
-            with self.subTest(cache=cache):
+        for cache, denied_stage, expected_calls, expected_skips in (
+                (['warm', 'cold'], 'native-files', 15, 0),
+                (['cold'], 'native-files', 7, 8),
+                (['warm', 'cold'], 'native-copy', 15, 0),
+                (['cold'], 'native-copy', 8, 7)):
+            with self.subTest(cache=cache, denied_stage=denied_stage):
                 self.calls = []
-                self.output = self.root / ('reports-' + '-'.join(cache))
+                self.output = self.root / ('reports-' + '-'.join(cache) + '-' + denied_stage)
                 self.args[self.args.index('--output-dir') + 1] = str(self.output)
                 def denied(argv, **kwargs):
-                    if self.calls:
+                    output = Path(argv[argv.index('--output') + 1])
+                    if output.name != 'cycle-1-' + denied_stage + '.json':
                         return self.child(argv, **kwargs)
                     self.calls.append((argv, kwargs))
-                    output = Path(argv[argv.index('--output') + 1])
                     writer = campaign.native_report.ReportJournal(output)
                     try:
                         writer.finish({'status': 'complete', 'passed': False, 'cleanup_passed': True,
@@ -157,14 +170,17 @@ class CampaignTests(unittest.TestCase):
                     self.assertEqual(campaign.main([*self.args, '--cache', *cache]), 1)
                 report = self.report()
                 self.assertEqual(len(self.calls), expected_calls)
-                self.assertEqual(len(report['stages']), 12)
+                self.assertEqual(len(report['stages']), 15)
                 self.assertEqual(report['cold_cache_unavailable'], 'purge denied')
                 self.assertFalse(report['collection_passed'])
-                for argv, _ in self.calls[1:]:
+                denied_index = next(index for index, (argv, _) in enumerate(self.calls)
+                                    if Path(argv[argv.index('--output') + 1]).name ==
+                                    'cycle-1-' + denied_stage + '.json')
+                for argv, _ in self.calls[denied_index + 1:]:
                     if Path(argv[2]).name == 'native_suite.py':
                         self.assertEqual(argv[argv.index('--cache') + 1:argv.index('--operations')], ['warm'])
                 skipped = [row for row in report['stages'] if row['status'] == 'unavailable']
-                self.assertEqual(len(skipped), 5 if cache == ['cold'] else 0)
+                self.assertEqual(len(skipped), expected_skips)
                 self.assertTrue(all(row['argv'] is None and row['planned_argv'] for row in skipped))
 
     def test_incomplete_uncertain_and_non_native_failures_cannot_continue(self):
@@ -204,6 +220,37 @@ class CampaignTests(unittest.TestCase):
             self.run_mocked(pins={'side_effect': [{'hash': 'before'}, {'hash': 'before'}, {'hash': 'after'}]})
         self.assertEqual(len(self.calls), 1)
         self.assertFalse(self.report()['stages'][0]['fingerprints_unchanged'])
+
+    def test_copy_stage_requires_native_journal_and_confirmed_cleanup(self):
+        for failure in ('missing-journal', 'uncommitted-tail', 'cleanup-failed'):
+            with self.subTest(failure=failure):
+                self.calls = []
+                self.output = self.root / ('reports-' + failure)
+                self.args[self.args.index('--output-dir') + 1] = str(self.output)
+                def failed_copy(argv, **kwargs):
+                    completed = self.child(argv, **kwargs)
+                    output = Path(argv[argv.index('--output') + 1])
+                    if output.name == 'cycle-1-native-copy.json':
+                        journal = output.with_name(output.name + '.journal')
+                        if failure == 'missing-journal':
+                            journal.unlink()
+                        elif failure == 'uncommitted-tail':
+                            with journal.open('ab') as stream:
+                                stream.write(b'uncommitted')
+                        else:
+                            manifest = output.with_name(output.name + '.manifest')
+                            state = json.loads(manifest.read_text())
+                            state['state']['cleanup_passed'] = False
+                            manifest.write_text(json.dumps(state))
+                    return completed
+                with self.assertRaises((OSError, RuntimeError)):
+                    self.run_mocked(failed_copy)
+                report = self.report()
+                self.assertEqual(len(self.calls), 2)
+                self.assertEqual(report['status'], 'stopped')
+                self.assertEqual(report['stages'][-1]['stage'], 'native-copy')
+                self.assertTrue(Path(report['stages'][-1]['output']).is_file())
+                self.assertTrue(Path(report['stages'][-1]['log']).is_file())
 
     def test_interruption_preserves_pending_identity_and_original_error(self):
         failure = KeyboardInterrupt()

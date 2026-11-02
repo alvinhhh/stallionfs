@@ -75,6 +75,8 @@ def stages(args, cycle):
     selections = (
         ('native-files', 'native_suite.py', [*native, '--operations', 'clone', 'move', 'delete',
          '--copy-tools', 'cp-clone', 'cp', 'ditto', 'rsync', '--fixtures', *FILES, *runtime]),
+        ('native-copy', 'native_suite.py', [*native, '--operations', 'copy',
+         '--copy-tools', 'cp', '--fixtures', 'tiny_4kib']),
         ('native-scan', 'native_suite.py', [*native, '--operations', 'scan', '--fixtures', *SCANS]),
         ('scan-api', 'scan.py', ['--files', '20000', '--memory']),
         ('workspaces', 'run.py', ['--methods', 'worktree_install', 'stallionfs_folder',

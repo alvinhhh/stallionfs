@@ -78,6 +78,22 @@ class BenchmarkCLI(unittest.TestCase):
         self.assertTrue(any(cell['status'] == 'inadmissible' for cell in row['required_cells']))
         self.assertFalse(any(cell['win'] for cell in row['required_cells']))
 
+    def test_ordinary_copy_coverage_is_selected_but_never_qualified(self):
+        for cache, collected in ((['warm'], True), (['warm', 'cold'], True),
+                                 (['cold'], True), (['cold'], False)):
+            with self.subTest(cache=cache, collected=collected):
+                row = next(row for row in benchmark._coverage(cache, collected=collected)
+                           if row['id'] == 'native/copy/tiny_4kib')
+                self.assertEqual(row['collector'], 'native-copy')
+                self.assertFalse(row['catalog_only'])
+                self.assertFalse(row['qualified'])
+                self.assertEqual(len(row['required_cells']), 4)
+                for cell in row['required_cells']:
+                    self.assertEqual(cell['output'], 'plain')
+                    self.assertEqual(cell['status'], 'collected_unverified'
+                                     if collected and cell['cache'] in cache else 'unavailable')
+                    self.assertFalse(cell['win'])
+
     def test_existing_output_and_sidecars_are_never_overwritten(self):
         for suffix in ('', '.journal', '.manifest'):
             with tempfile.TemporaryDirectory() as directory:
@@ -171,6 +187,46 @@ class BenchmarkCLI(unittest.TestCase):
             self.assertTrue(data['collection_complete'])
             self.assertFalse(data['required_coverage_complete'])
             self.assertEqual(len(data['cases']), 37)
+
+    def test_full_collection_requires_copy_stage_in_each_exact_cycle(self):
+        from stallionfs import _benchmark_budget as budget
+        for change in ('none', 'missing', 'duplicate', 'reordered', 'failed', 'cleanup-failed'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stages = [{'cycle': cycle, 'stage': stage,
+                           'outcome': {'passed': True, 'cleanup_passed': True}}
+                          for cycle in range(1, 4)
+                          for stage in ('native-files', 'native-copy', 'native-scan', 'scan-api', 'workspaces')]
+                if change == 'missing':
+                    del stages[6]
+                elif change == 'duplicate':
+                    stages.insert(7, stages[6])
+                elif change == 'reordered':
+                    stages[6], stages[7] = stages[7], stages[6]
+                elif change == 'failed':
+                    stages[6]['outcome']['passed'] = False
+                elif change == 'cleanup-failed':
+                    stages[6]['outcome']['cleanup_passed'] = False
+                def command(argv, **kwargs):
+                    kwargs['receipt']['exit_code'] = 0
+                    output = root / 'campaign'
+                    output.mkdir()
+                    (output / 'campaign.json').write_text(json.dumps({'status': 'complete', 'stages': stages}))
+                args = arguments(full=True, node=root/'node', npm=root/'npm-cli.js', npm_cache=root)
+                with mock.patch.object(budget, 'command', side_effect=command):
+                    if change != 'none':
+                        with self.assertRaisesRegex(RuntimeError, 'correctness and cleanup'):
+                            benchmark._collect(args, root, root/'sfs', root, [], [])
+                    else:
+                        result = benchmark._collect(args, root, root/'sfs', root, [], [])
+                        self.assertEqual(result['status'], 'incomplete')
+                        self.assertEqual(result['exit_code'], 2)
+                        self.assertTrue(result['collection_complete'])
+                        self.assertFalse(result['required_coverage_complete'])
+                        self.assertFalse(result['qualified'])
+                        row = next(row for row in result['cases'] if row['id'] == 'native/copy/tiny_4kib')
+                        self.assertEqual({cell['status'] for cell in row['required_cells']},
+                                         {'collected_unverified', 'unavailable'})
 
     def test_output_race_keeps_the_other_file(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -94,7 +94,8 @@ npm cache containing the locked fixture dependencies:
 ```
 
 The output directory must be new. Three outer cycles each collect all 13 existing
-native file-operation fixtures (including installed dependencies), the three
+native file-operation fixtures (including installed dependencies), the existing
+ordinary-copy comparison on `tiny_4kib` against `cp -Rp`, the three
 native command scan layouts, the 20,000-file scanner API comparison with memory,
 and folder-workspace lifecycle comparisons at concurrency one and four. Each
 stage uses ten measured rounds by default (`--samples`, minimum ten). Native
