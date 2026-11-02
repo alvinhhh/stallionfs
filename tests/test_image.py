@@ -405,6 +405,9 @@ class ImageCore(unittest.TestCase):
     def test_exact_io_errors_poisoning_and_no_implicit_recovery(self):
         self.scenario('io')
 
+    def test_append_readback_retry_and_rejection_preserve_committed_state(self):
+        self.scenario('append-readback')
+
     def test_process_cuts_and_separate_discard_unflushed_write_model(self):
         self.scenario('cuts')
 

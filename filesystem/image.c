@@ -788,11 +788,19 @@ static enum sfs_status append_prepared(sfs_image *h, unsigned type, const uint8_
     if (!*remaining || !reserve_cells(h, 1)) return SFS_LIMIT;
     uint64_t at; if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at)) return SFS_LIMIT;
     if (stable(h)) return SFS_IO;
-    reference ref = { .type = type, .offset = at, .length = CELL }; if (prepared) { if (prepared->type != type || prepared->offset != at || prepared->length != CELL) return SFS_CORRUPT; ref = *prepared; } else hash_cell(b, type, h->current.uuid, ref.digest, h->current.minor);
+    const anchor domain = h->current;
+    reference ref = { .type = type, .offset = at, .length = CELL }; if (prepared) { if (prepared->type != type || prepared->offset != at || prepared->length != CELL) return SFS_CORRUPT; ref = *prepared; } else hash_cell(b, type, domain.uuid, ref.digest, domain.minor);
+    const reference expected = ref;
     uint8_t padding[CELL] = {0}; uint64_t gap = h->eof < DATA_START ? DATA_START : h->eof;
     while (gap < at) { size_t n = at - gap < CELL ? (size_t)(at - gap) : CELL; if (write_exact(h->fd, padding, n, gap)) goto failed; gap += n; }
     if (write_exact(h->fd, b, CELL, at)) goto failed;
-    h->eof = at + CELL; (*remaining)--; *out = ref; return SFS_OK;
+    h->eof = at + CELL;
+    /* Accept the sealed reference only after descriptor bytes match it. */
+    uint8_t observed[CELL], digest[32];
+    if (read_exact(h->fd, observed, CELL, at)) goto failed;
+    hash_cell(observed, expected.type, domain.uuid, digest, domain.minor);
+    if (memcmp(digest, expected.digest, sizeof(digest))) return SFS_CORRUPT;
+    (*remaining)--; *out = expected; return SFS_OK;
 failed: { int error = errno; struct stat st; if (!fstat(h->fd, &st) && st.st_size >= 0) h->eof = (uint64_t)st.st_size; errno = error; return SFS_IO; }
 }
 static enum sfs_status append_cell(sfs_image *h, unsigned type, const uint8_t b[CELL], reference *out, uint64_t *remaining) { return append_prepared(h, type, b, out, remaining, NULL); }
