@@ -408,6 +408,9 @@ class ImageCore(unittest.TestCase):
     def test_append_readback_retry_and_rejection_preserve_committed_state(self):
         self.scenario('append-readback')
 
+    def test_anchor_readback_retry_and_uncertain_outcome_after_final_fence(self):
+        self.scenario('anchor-readback')
+
     def test_process_cuts_and_separate_discard_unflushed_write_model(self):
         self.scenario('cuts')
 

@@ -12,6 +12,7 @@
 #ifdef CAMPAIGN_GAPS
 #include <errno.h>
 void campaign_gap_configure(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, unsigned);
+void campaign_gap_anchor(uint64_t, const unsigned char [16]);
 int campaign_gap_begin_close(int);
 void campaign_gap_report(void);
 #endif
@@ -127,8 +128,9 @@ static void namespace_entries(sfs_view view, const char *label) {
 static int read_image(const char *directory) {
     enum sfs_status status=sfs_image_open_readonly(directory,"image.sfs",&image,&receipt);
     int opened=!status; sfs_view views[3]={0}; int selected_status[3]={SFS_OK,SFS_NOT_FOUND,SFS_NOT_FOUND};
-    printf("{\"event\":\"read\",\"open_status\":%d,\"generation\":%" PRIu64 ",\"open_coverage\":%d,\"root_digest\":\"",
-           status,receipt.generation,receipt.coverage);
+    printf("{\"event\":\"read\",\"open_status\":%d,\"generation\":%" PRIu64 ",\"open_coverage\":%d,"
+           "\"open_phase\":%d,\"open_errno\":%d,\"open_committed_end\":%" PRIu64 ",\"handle_present\":%s,\"root_digest\":\"",
+           status,receipt.generation,receipt.coverage,receipt.phase,receipt.system_errno,receipt.committed_end,image?"true":"false");
     hex(receipt.root_digest,32); printf("\",\"objects\":[");
     int first=1, baseline_status=-1, recovery_status=-1;
     const char *names[]={"file","alias","companion","link","root"};
@@ -185,11 +187,19 @@ static int read_image(const char *directory) {
 static int inspect_image(const char *directory) {
     sfs_recovery recovery={0};
     enum sfs_status status=sfs_image_inspect(directory,"image.sfs",&image,&recovery,&budget,&receipt);
-    printf("{\"event\":\"inspection\",\"status\":%d,\"pair_valid\":%s,\"latest_may_be_unknown\":%s,\"slots\":[",
-           status,recovery.pair_valid?"true":"false",recovery.latest_may_be_unknown?"true":"false");
-    for (unsigned i=0;i<2;++i) printf("%s{\"slot\":%u,\"status\":%d,\"generation\":%" PRIu64 ",\"full_reachable\":%s}",
-        i?",":"",i,recovery.slots[i].status,recovery.slots[i].generation,
-        recovery.slots[i].status==SFS_OK&&recovery.slots[i].coverage==SFS_COVERAGE_FULL_REACHABLE?"true":"false");
+    printf("{\"event\":\"inspection\",\"status\":%d,\"phase\":%d,\"errno\":%d,\"coverage\":%d,"
+           "\"handle_present\":%s,\"selection_attempted\":false,\"pair_valid\":%s,\"latest_may_be_unknown\":%s,\"slots\":[",
+           status,receipt.phase,receipt.system_errno,receipt.coverage,image?"true":"false",
+           recovery.pair_valid?"true":"false",recovery.latest_may_be_unknown?"true":"false");
+    for (unsigned i=0;i<2;++i) {
+        sfs_result *candidate=&recovery.slots[i];
+        printf("%s{\"slot\":%u,\"status\":%d,\"phase\":%d,\"errno\":%d,\"coverage\":%d,"
+               "\"generation\":%" PRIu64 ",\"committed_end\":%" PRIu64 ",\"root_digest\":\"",
+               i?",":"",i,candidate->status,candidate->phase,candidate->system_errno,candidate->coverage,
+               candidate->generation,candidate->committed_end);
+        hex(candidate->root_digest,32); printf("\",\"uuid\":\""); hex(candidate->uuid,16);
+        printf("\",\"full_reachable\":%s}",candidate->status==SFS_OK&&candidate->coverage==SFS_COVERAGE_FULL_REACHABLE?"true":"false");
+    }
     puts("]}");
     if (image) sfs_image_close(image,NULL);
     return 0;
@@ -199,12 +209,15 @@ static int verify_image(const char *directory) {
     uint64_t generation=receipt.generation;
     unsigned char opened_root[32]; memcpy(opened_root,receipt.root_digest,32);
     enum sfs_coverage open_coverage=receipt.coverage;
+    int open_phase=receipt.phase, open_errno=receipt.system_errno;
+    uint64_t open_end=receipt.committed_end;
     enum sfs_status verified=SFS_STATE;
     if (!opened) verified=sfs_image_verify(image,&budget,&receipt);
     int full=!opened&&!verified&&receipt.coverage==SFS_COVERAGE_FULL_REACHABLE;
     printf("{\"event\":\"verification\",\"open_status\":%d,\"generation\":%" PRIu64
-           ",\"open_coverage\":%d,\"verify_attempted\":%s,\"verify_status\":%d,\"full_reachable\":%s,\"root_digest\":\"",
-           opened,generation,open_coverage,!opened?"true":"false",verified,full?"true":"false");
+           ",\"open_coverage\":%d,\"open_phase\":%d,\"open_errno\":%d,\"open_committed_end\":%" PRIu64
+           ",\"handle_present\":%s,\"verify_attempted\":%s,\"verify_status\":%d,\"full_reachable\":%s,\"root_digest\":\"",
+           opened,generation,open_coverage,open_phase,open_errno,open_end,image?"true":"false",!opened?"true":"false",verified,full?"true":"false");
     hex(opened_root,32); puts("\"}");
     if (image) sfs_image_close(image,NULL);
     return 0;
@@ -212,12 +225,13 @@ static int verify_image(const char *directory) {
 #ifdef CAMPAIGN_GAPS
 static int gap_write_image(char **argv) {
     char *end=NULL; errno=0; unsigned long mode=strtoul(argv[3],&end,10);
-    if (errno || !*argv[3] || *end || mode<1 || mode>3) return 2;
+    if (errno || !*argv[3] || *end || mode<1 || mode>5) return 2;
     errno=0; uint64_t offset=strtoull(argv[4],&end,10);
     if (errno || !*argv[4] || *end || offset>4*1024*1024-4096) return 2;
     errno=0; unsigned long ordinal=strtoul(argv[5],&end,10);
     if (errno || !*argv[5] || *end || ordinal>1024 ||
-        (mode==1 ? offset || ordinal : offset<8192 || offset%4096 || !ordinal)) return 2;
+        (mode==1 ? offset || ordinal : mode>=4 ? offset>4096 || offset%4096 || ordinal!=1 :
+         offset<8192 || offset%4096 || !ordinal)) return 2;
     enum sfs_status status=sfs_image_open(argv[2],"image.sfs",&image,&receipt);
     if (status) { result("result",status); return 0; }
     struct stat parent;
@@ -227,6 +241,7 @@ static int gap_write_image(char **argv) {
     campaign_configure("none",0,0);
     campaign_gap_configure((unsigned)mode,receipt.device,receipt.inode,
         (uint64_t)parent.st_dev,(uint64_t)parent.st_ino,offset,(unsigned)ordinal);
+    if (mode>=4) campaign_gap_anchor(receipt.generation+1,receipt.uuid);
     status=sfs_image_begin(image,&receipt); result("begin",status);
     if (!status) { status=contents(1,0,0); result("write",status); }
     if (!status) status=sfs_image_commit(image,&receipt);

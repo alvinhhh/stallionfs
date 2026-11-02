@@ -10,6 +10,7 @@ from pathlib import Path
 import selectors
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -515,7 +516,7 @@ class Campaign:
                 binding=self.report["resolved_bindings"][str(spec["parity"])]
                 floor=binding["B_generation"] if family.startswith("acknowledged_") else binding["A_generation"]
                 row["explicit_recovery"]=self.inspect(directory,label+"-inspection",deadline,floor)
-            row["oracle_passed"] = row["outcome"] in ("acknowledged_state_preserved", "complete_allowed_state", "integrity_refusal")
+            row["oracle_passed"] = row["outcome"] in ("acknowledged_state_preserved", "complete_allowed_state", "integrity_refusal", "anchor_admission_refusal")
             row["acknowledged_data_preservation_established"]=row["outcome"]=="acknowledged_state_preserved"
             if not row["oracle_passed"]:
                 raise RuntimeError(label + ": " + row["outcome"])
@@ -532,9 +533,42 @@ class Campaign:
                     if hasattr(primary_error, "add_note"):
                         primary_error.add_note(f"Retention receipt also failed: {type(error).__name__}: {error}")
             else:
-                row["image_sha256"] = sha((directory / "image.sfs").read_bytes())
+                if "anchor_post_producer_sha256" in row:
+                    try:
+                        before = (directory / "image.sfs").lstat()
+                        row["image_sha256"] = sha((directory / "image.sfs").read_bytes())
+                        after = (directory / "image.sfs").lstat()
+                        row["anchor_case_final"] = dict(device=after.st_dev, inode=after.st_ino,
+                                                       bytes=after.st_size, sha256=row["image_sha256"])
+                        if (not stat.S_ISREG(before.st_mode) or not stat.S_ISREG(after.st_mode) or
+                            (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size) or
+                            [after.st_dev, after.st_ino] != row["anchor_post_producer_identity"] or
+                            row["image_sha256"] != row["anchor_post_producer_sha256"]):
+                            raise RuntimeError("anchor specimen changed at final case observation")
+                    except BaseException as error:
+                        row.update(outcome="unresolved", oracle_passed=False, preservation_pass=False,
+                                   acknowledged_data_preservation_established=False, unresolved_loss_risk=True,
+                                   classification="incomplete_anchor_final_observation", anchor_final_binding_failed=True,
+                                   anchor_final_error=f"{type(error).__name__}: {error}")
+                        self.report["unresolved_loss_risk"] = True
+                        if "corrective_expectations_pass" in row:
+                            row.update(corrective_expectations_pass=False, ordinary_availability_pass=False)
+                        try:
+                            self.save()
+                        except BaseException as save_error:
+                            if hasattr(error, "add_note"):
+                                error.add_note(f"Final failure receipt also failed: {type(save_error).__name__}: {save_error}")
+                        raise
+                else:
+                    row["image_sha256"] = sha((directory / "image.sfs").read_bytes())
                 late=time.monotonic()>=min(deadline,self.deadline)
                 if late:row.update(outcome="unresolved",oracle_passed=False,deadline_exceeded=True)
+                if late and "anchor_post_producer_sha256" in row:
+                    row.update(preservation_pass=False, acknowledged_data_preservation_established=False,
+                               unresolved_loss_risk=True, classification="incomplete_anchor_final_observation")
+                    self.report["unresolved_loss_risk"] = True
+                    if "corrective_expectations_pass" in row:
+                        row.update(corrective_expectations_pass=False, ordinary_availability_pass=False)
                 if not row.get("retain_specimen") and row["oracle_passed"] and row["outcome"] in ("acknowledged_state_preserved", "complete_allowed_state"):
                     shutil.rmtree(directory)
                 else:

@@ -2418,17 +2418,22 @@ enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     anchor next = h->current; next.generation++; uint8_t b[CELL]; envelope(b, ROOT, next.uuid, h->current.minor); encode_ref(b + 64, &h->staged.ns.ref); encode_ref(b + 120, &h->staged.catalog);
     uint64_t remaining = 1; e = append_cell(h, ROOT, b, &next.root, &remaining); if (e) return mutation_failure(h, e, SFS_PHASE_RECORDS, e == SFS_IO ? errno : 0, 1, out); next.end = h->eof;
     /* Finalize every reachable byte and the slot before the first fence. */
-    encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
+    encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0, error; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
     h->fence_attempted |= 1;
     if (fullsync(h->fd)) goto failed;
     h->fence_succeeded |= 1;
     phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0; published = 1; if (write_exact(h->fd, b, CELL, slot * ALIGNMENT)) goto failed;
     phase = SFS_PHASE_COMMIT_BARRIER; h->fence_attempted |= 2; if (fullsync(h->fd)) goto failed;
     h->fence_succeeded |= 2;
+    /* Verify the intended slot before promoting or acknowledging it. */
+    uint8_t observed[CELL];
+    if (read_exact(h->fd, observed, CELL, slot * ALIGNMENT)) goto failed;
+    if (memcmp(observed, b, CELL)) { error = 0; goto failed_with_error; }
     pins_promote(h);
     h->live = h->staged; memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; h->current = next; h->slots[slot] = next; h->slot_observed[slot] = 1; h->slot_status[slot] = SFS_OK;
     result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_ROOT_ONLY; return SFS_OK;
-failed: { int error = errno; discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out); }
+failed: error = errno;
+failed_with_error: discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out);
 }
 static enum sfs_status cookie_cursor(reader *r, const namespace *ns, uint64_t parent, const sfs_cookie *cookie, cursor *c) {
     const uint8_t *b = cookie->bytes; key prefix = name_key(parent, NULL, 0);

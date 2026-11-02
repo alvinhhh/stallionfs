@@ -16,12 +16,28 @@ static struct {
     ssize_t written, returned;
     unsigned char original_hash[32], replacement_hash[32];
 } gap;
+static struct {
+    uint64_t generation;
+    unsigned char uuid[16], original[4096];
+    unsigned fences, first_fence_ok, before_write_fences, original_checksum_valid;
+    int first_fence_fd;
+} gap_anchor;
 void campaign_gap_configure(unsigned mode, uint64_t device, uint64_t inode,
     uint64_t parent_device, uint64_t parent_inode, uint64_t offset, unsigned nth) {
     memset(&gap,0,sizeof(gap)); gap.mode=mode; gap.device=device; gap.inode=inode;
     gap.parent_device=parent_device; gap.parent_inode=parent_inode;
     gap.expected_offset=offset; gap.expected_ordinal=nth; gap.fd=-1;
     gap.written=gap.returned=-2; gap.image_real=gap.image_returned=gap.parent_result=-2;
+    memset(&gap_anchor,0,sizeof(gap_anchor)); gap_anchor.first_fence_fd=-1;
+}
+void campaign_gap_anchor(uint64_t generation, const unsigned char uuid[16]) {
+    gap_anchor.generation=generation; memcpy(gap_anchor.uuid,uuid,16);
+}
+static uint64_t gap_u64(const unsigned char *p) {
+    uint64_t value=0; for (unsigned i=0;i<8;++i) value|=(uint64_t)p[i]<<(8*i); return value;
+}
+static unsigned gap_u32(const unsigned char *p) {
+    unsigned value=0; for (unsigned i=0;i<4;++i) value|=(unsigned)p[i]<<(8*i); return value;
 }
 static int gap_identity(int fd, uint64_t device, uint64_t inode, int directory) {
     struct stat st;
@@ -48,6 +64,35 @@ static ssize_t gap_write(int fd, const void *data, size_t count, off_t offset, u
     gap.written=pwrite(fd,replacement,count,offset); int saved=errno;
     gap.returned=gap.written; gap.caller_unchanged=!memcmp(data,expected,count);
     if (gap.mode==2 && gap.written==(ssize_t)count) ++gap.write_hits;
+    errno=saved; return gap.returned;
+}
+static ssize_t gap_slot_write(int fd, const void *data, size_t count, off_t offset, unsigned nth) {
+    unsigned char checked[4096], replacement[4096], digest[32], caller_after[32];
+    const unsigned char *b=data;
+    ++gap.matches;
+    if (count!=4096 || gap.matches!=1 || nth!=1 || nth!=gap.expected_ordinal ||
+        (uint64_t)offset!=gap.expected_offset || offset!=(off_t)(gap_anchor.generation%2)*4096 ||
+        !gap_identity(fd,gap.device,gap.inode,0) || gap_anchor.fences!=1 ||
+        !gap_anchor.first_fence_ok || gap_anchor.first_fence_fd!=fd ||
+        memcmp(b,"SFSIMG01",8) || gap_u32(b+12)!=6 ||
+        memcmp(b+24,gap_anchor.uuid,16) || gap_u64(b+40)!=gap_anchor.generation ||
+        gap_u32(b+48)!=4 || gap_u64(b+64)!=4096 || gap_u64(b+56)<8192 ||
+        gap_u64(b+56)%4096 || gap_u64(b+56)>4*1024*1024-4096 ||
+        gap_u64(b+104)!=gap_u64(b+56)+4096 || gap_u64(b+144)!=4*1024*1024) {
+        gap.proof_error=1; return pwrite(fd,data,count,offset);
+    }
+    memcpy(checked,b,4096); memset(checked+112,0,32); CC_SHA256(checked,4096,digest);
+    if (memcmp(digest,b+112,32)) { gap.proof_error=1; return pwrite(fd,data,count,offset); }
+    gap_anchor.original_checksum_valid=1; gap_anchor.before_write_fences=gap_anchor.fences;
+    memcpy(gap_anchor.original,b,4096);
+    gap.fd=fd; gap.offset=(uint64_t)offset; gap.write_ordinal=nth; gap.requested=(unsigned)count;
+    CC_SHA256(b,4096,gap.original_hash); memcpy(replacement,b,4096);
+    if (gap.mode==5) replacement[72]^=1;
+    CC_SHA256(replacement,4096,gap.replacement_hash);
+    gap.written=pwrite(fd,replacement,count,offset); int saved=errno;
+    gap.returned=gap.written; CC_SHA256(data,4096,caller_after);
+    gap.caller_unchanged=!memcmp(caller_after,gap.original_hash,32);
+    if (gap.mode==5 && gap.written==4096) ++gap.write_hits;
     errno=saved; return gap.returned;
 }
 int campaign_gap_begin_close(int inject) {
@@ -87,6 +132,20 @@ void campaign_gap_report(void) {
     for (unsigned i=0;i<32;++i) printf("%02x",gap.original_hash[i]);
     printf("\",\"replacement_sha256\":\"");
     for (unsigned i=0;i<32;++i) printf("%02x",gap.replacement_hash[i]);
+    if (gap.mode>=4) {
+        const unsigned char *b=gap_anchor.original;
+        printf("\",\"first_fence_succeeded\":%u,\"first_fence_fd\":%d,\"fences_before_write\":%u,"
+               "\"original_checksum_valid\":%u,\"anchor_generation\":%" PRIu64 ",\"anchor_uuid\":\"",
+               gap_anchor.first_fence_ok,gap_anchor.first_fence_fd,gap_anchor.before_write_fences,
+               gap_anchor.original_checksum_valid,gap_u64(b+40));
+        for (unsigned i=24;i<40;++i) printf("%02x",b[i]);
+        printf("\",\"anchor_root_type\":%u,\"anchor_root_offset\":%" PRIu64 ",\"anchor_root_length\":%" PRIu64
+               ",\"anchor_end\":%" PRIu64 ",\"anchor_capacity\":%" PRIu64 ",\"anchor_root_digest\":\"",
+               gap_u32(b+48),gap_u64(b+56),gap_u64(b+64),gap_u64(b+104),gap_u64(b+144));
+        for (unsigned i=72;i<104;++i) printf("%02x",b[i]);
+        printf("\",\"anchor_slot_checksum\":\"");
+        for (unsigned i=112;i<144;++i) printf("%02x",b[i]);
+    }
     printf("\",\"close_armed\":%d,\"image_close_attempts\":%d,\"real_image_close_result\":%d,"
            "\"real_image_close_errno\":%d,\"returned_image_close_result\":%d,\"returned_image_close_errno\":%d,"
            "\"close_hits\":%d,\"parent_close_attempts\":%d,\"parent_close_identity_ok\":%d,"
@@ -118,7 +177,8 @@ ssize_t campaign_pwrite(int fd, const void *data, size_t count, off_t offset) {
     int slot = offset < 8192;
     unsigned position = slot ? ++campaign_slot_calls : ++records;
 #ifdef CAMPAIGN_GAPS
-    if (gap.mode && !slot) return gap_write(fd,data,count,offset,position);
+    if (gap.mode>=4 && slot) return gap_slot_write(fd,data,count,offset,position);
+    if (gap.mode && gap.mode<=3 && !slot) return gap_write(fd,data,count,offset,position);
 #endif
     if (slot && cut_point == 3) {
         size_t prefix = count < 73 ? count : 73;
@@ -158,6 +218,18 @@ int campaign_fcntl(int fd, int command, ...) {
         errno = EIO; return -1;
     }
     int status = fcntl(fd, command);
+#ifdef CAMPAIGN_GAPS
+    int anchor_errno=errno;
+    if (gap.mode>=4) {
+        ++gap_anchor.fences;
+        if (gap_anchor.fences==1 && !status && gap_identity(fd,gap.device,gap.inode,0)) {
+            gap_anchor.first_fence_ok=1; gap_anchor.first_fence_fd=fd;
+        }
+    }
+#endif
     if (!status) pause_at(campaign_fence_calls == 1 ? 2 : 4);
+#ifdef CAMPAIGN_GAPS
+    if (gap.mode>=4) errno=anchor_errno;
+#endif
     return status;
 }

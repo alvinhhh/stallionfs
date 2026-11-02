@@ -43,7 +43,7 @@ static const char *fault = "";
 static int target, reads, writes, fulls, syncs, slots, records, locks, closes, hit;
 static int competing, cut, model, cut_at, events;
 static struct {
-    int enabled, mode, armed, complete, fd, injections;
+    int enabled, mode, armed, complete, fd, injections, anchor, slot_written;
     unsigned reads;
     size_t consumed;
     uint64_t minimum;
@@ -227,6 +227,7 @@ ssize_t sfs_test_pread(int fd, void *p, size_t n, off_t at) {
     int targeted_readback = append_readback.enabled && append_readback.armed && !append_readback.complete &&
         fd == append_readback.fd && at >= append_readback.offset && at < append_readback.offset + CELL;
     if (targeted_readback) {
+        if (append_readback.anchor) assert(fulls == 2 && slots == 1 && fd == locked_fd);
         assert(at == append_readback.offset + (off_t)append_readback.consumed && n == CELL - append_readback.consumed);
         if (append_readback.public_out) assert(*append_readback.public_out == append_readback.canary);
         append_readback.reads++;
@@ -295,11 +296,15 @@ ssize_t sfs_test_pwrite(int fd, const void *p, size_t n, off_t at) {
     /* Fixed model events: first record, first fence, slot prefix, second fence. */
     if (cut && slot) stop_at(fd, p, n < 73 ? n : 73, at);
     ssize_t result = pwrite(fd, p, n, at);
-    if (append_readback.enabled && !append_readback.armed && !slot && n == CELL && result == CELL) {
+    if (append_readback.enabled && !append_readback.armed && !append_readback.slot_written &&
+        slot == append_readback.anchor && n == CELL && result == CELL) {
         int saved = errno;
-        assert((uint64_t)at >= append_readback.minimum && !(at % CELL));
+        assert(!(at % CELL));
+        if (append_readback.anchor) assert(fulls == 1 && slots == 1 && at == (off_t)append_readback.minimum);
+        else assert((uint64_t)at >= append_readback.minimum);
         if (append_readback.public_out) assert(*append_readback.public_out == append_readback.canary);
-        append_readback.armed = 1; append_readback.fd = fd; append_readback.offset = at;
+        append_readback.armed = !append_readback.anchor; append_readback.slot_written = append_readback.anchor;
+        append_readback.fd = fd; append_readback.offset = at;
         memcpy(append_readback.written, p, CELL); errno = saved;
     }
     if (result > 0 && !slot) image_append_bytes += (size_t)result;
@@ -324,6 +329,10 @@ int sfs_test_fcntl(int fd, int command, ...) {
     if (competing) competitor();
     if ((is("full") || is("full_enospc")) && fulls == target) { hit++; errno = is("full_enospc") ? ENOSPC : EIO; return -1; }
     int result = fcntl(fd, command);
+    if (!result && append_readback.enabled && append_readback.anchor && fulls == 2) {
+        assert(append_readback.slot_written && !append_readback.armed && fd == append_readback.fd);
+        append_readback.armed = 1;
+    }
     if (!result && model) capture(fd);
     if (!result && cut) stop_at(fd, NULL, 0, 0);
     return result;
@@ -660,6 +669,61 @@ static void append_readback_io(void) {
         else assert(found == SFS_NOT_FOUND);
         close_image(h); assert(!allocated && descriptors() == before_descriptors);
         unchanged("image", retained, retained_size); free(retained); retain(4500 + (int)(operation * 4 + mode));
+    }
+    free(baseline);
+}
+static void anchor_readback_io(void) {
+    sfs_image *h; sfs_result r; sfs_inode a, b;
+    reset("", 0); create(&h); initial_files(h, &a, &b); close_image(h);
+    size_t n; unsigned char *baseline = bytes("image", &n); assert(rename("image", "baseline") == 0);
+    const char *modes[] = {"eintr", "short", "eof", "eio"};
+    for (unsigned parity = 0; parity < 2; parity++) for (unsigned mode = 0; mode < 4; mode++) {
+        save("image", baseline, n); reset("", 0); int before_descriptors = descriptors(); open_image(&h);
+        if (!parity) { OK(sfs_image_begin(h, &r)); OK(sfs_image_commit(h, &r)); }
+        OK(sfs_image_verify(h, &generous, &r)); sfs_result prior = r;
+        uint64_t next_generation = prior.generation + 1; assert(next_generation % 2 == parity);
+        change_files(h, a, b); reset("anchor-readback", 0);
+        append_readback.enabled = append_readback.anchor = 1;
+        append_readback.mode = (int)mode; append_readback.minimum = parity * CELL;
+        enum sfs_status status = sfs_image_commit(h, &r); sfs_result observed = r;
+        assert(append_readback.slot_written && append_readback.armed && append_readback.fd == locked_fd &&
+               append_readback.offset == (off_t)(parity * CELL) && hit);
+        assert(append_readback.reads == (mode == 0 ? 2u : mode == 1 ? (CELL + 16) / 17 : 1u));
+        assert(append_readback.injections == (mode == 1 ? (int)(CELL / 17) : 1));
+        assert(slots == 1 && fulls == 2 && !syncs && !image_truncates &&
+               observed.fence_attempted == 3 && observed.fence_succeeded == 3 && !observed.transaction_active);
+        assert(!strcmp(order, parity ? "F1F" : "F0F"));
+        char label[80]; assert(snprintf(label, sizeof(label), "anchor-readback-%u-%s", parity, modes[mode]) < (int)sizeof(label));
+        receipt(label, &observed);
+        printf("{\"anchor_readback\":\"%s\",\"offset\":%llu,\"armed_after_final_fence\":true,\"reads\":%u,\"injections\":%d,\"bytes\":%zu,\"complete\":%d,\"slots\":%d,\"fulls\":%d}\n",
+               label, (unsigned long long)append_readback.offset, append_readback.reads,
+               append_readback.injections, append_readback.consumed, append_readback.complete, slots, fulls);
+        fflush(stdout);
+        if (mode < 2) {
+            ok(status, &observed);
+            assert(append_readback.complete && append_readback.consumed == CELL && !observed.poisoned &&
+                   !observed.system_errno && observed.generation == next_generation && observed.coverage == SFS_COVERAGE_ROOT_ONLY);
+        } else {
+            assert(status == SFS_OUTCOME_UNKNOWN && observed.status == SFS_OUTCOME_UNKNOWN &&
+                   observed.phase == SFS_PHASE_COMMIT_BARRIER && observed.system_errno == EIO && observed.poisoned);
+            assert(!append_readback.complete && !append_readback.consumed && observed.generation == prior.generation &&
+                   observed.committed_end == prior.committed_end && !memcmp(observed.root_digest, prior.root_digest, 32));
+            int written = writes;
+            assert(sfs_image_begin(h, &r) == SFS_POISONED && sfs_image_commit(h, &r) == SFS_POISONED);
+            assert(writes == written && slots == 1 && fulls == 2 && !image_truncates);
+        }
+        close_image(h); assert(!allocated && descriptors() == before_descriptors);
+        size_t retained_size; unsigned char *retained = bytes("image", &retained_size);
+        assert(slots == 1 && fulls == 2 && !syncs && !image_truncates);
+        assert(retained_size > n && !memcmp(retained + parity * CELL, append_readback.written, CELL));
+        reset("", 0); open_image(&h); expect(h, 0, a, "new-a"); expect(h, 0, b, "new-b");
+        close_image(h); assert(!allocated && descriptors() == before_descriptors);
+        /* A separate ordinary handle verifies the persisted, unaltered B even after read I/O uncertainty. */
+        reset("", 0); open_image(&h); OK(sfs_image_verify(h, &generous, &r));
+        assert(r.generation == next_generation && r.coverage == SFS_COVERAGE_FULL_REACHABLE &&
+               !memcmp(r.root_digest, retained + parity * CELL + 72, 32));
+        close_image(h); assert(!allocated && descriptors() == before_descriptors);
+        unchanged("image", retained, retained_size); free(retained); retain(4600 + (int)(parity * 4 + mode));
     }
     free(baseline);
 }
@@ -5167,7 +5231,7 @@ int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
     if(!strcmp(argv[1],"basic")) basic(); else if(!strcmp(argv[1],"creation")) creation();
-    else if(!strcmp(argv[1],"io")) io(); else if(!strcmp(argv[1],"append-readback")) append_readback_io(); else if(!strcmp(argv[1],"cuts")) cuts();
+    else if(!strcmp(argv[1],"io")) io(); else if(!strcmp(argv[1],"append-readback")) append_readback_io(); else if(!strcmp(argv[1],"anchor-readback")) anchor_readback_io(); else if(!strcmp(argv[1],"cuts")) cuts();
     else if(!strcmp(argv[1],"review")) review(); else if(!strcmp(argv[1],"security")) security();
     else if(!strcmp(argv[1],"parser")) { parser(); contexts(); type_alias_context(); } else if(!strcmp(argv[1],"limits")) limits();
     else if(!strcmp(argv[1],"indexes")) indexes(); else if(!strcmp(argv[1],"ranges")) ranges();
