@@ -34,7 +34,7 @@ class CampaignTests(unittest.TestCase):
             else:
                 path.write_text('fixture')
             self.args += ['--' + name, str(path)]
-        self.args += ['--output-dir', str(self.output)]
+        self.args += ['--output-dir', str(self.output), '--cache', 'warm']
 
     def child(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -47,6 +47,8 @@ class CampaignTests(unittest.TestCase):
             finally:
                 writer.close()
         else:
+            if Path(argv[2]).name == 'scan.py':
+                state['cache'] = argv[argv.index('--cache') + 1]
             campaign.f.write_new_json(output, state)
         kwargs['stdout'].write(b'stage log\n')
         return subprocess.CompletedProcess(argv, 0)
@@ -89,7 +91,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(scan[scan.index('--fixtures') + 1:], list(campaign.SCANS))
         for argv in (files, copy, scan):
             self.assertEqual(argv[argv.index('--runs') + 1], '1')
-            self.assertEqual(argv[argv.index('--cache') + 1:argv.index('--operations')], ['warm', 'cold'])
+            self.assertEqual(argv[argv.index('--cache') + 1:argv.index('--operations')], ['warm'])
         self.assertIn('--memory', api)
         self.assertEqual(api[api.index('--files') + 1], '20000')
         self.assertEqual(workspace[workspace.index('--methods') + 1:workspace.index('--concurrency')],
@@ -99,6 +101,51 @@ class CampaignTests(unittest.TestCase):
         for flag in ('--node', '--npm', '--npm-cache'):
             self.assertEqual(files[files.index(flag) + 1], workspace[workspace.index(flag) + 1])
         self.assertTrue(all(Path(row['log']).read_bytes() == b'stage log\n' for row in result['stages']))
+
+    def test_cold_request_adds_only_existing_api_cases_in_separate_stages(self):
+        self.args += ['--cache', 'warm', 'cold']
+        self.assertEqual(self.run_mocked(), 0)
+        report = self.report()
+        expected = ['native-files', 'native-copy', 'native-scan', 'scan-api', 'scan-api-cold', 'workspaces']
+        self.assertEqual([row['stage'] for row in report['stages']], expected * 3)
+        self.assertEqual(len(self.calls), 18)
+        for row in report['stages']:
+            if row['stage'] in ('scan-api', 'scan-api-cold'):
+                mode = 'cold' if row['stage'] == 'scan-api-cold' else 'warm'
+                self.assertEqual(row['cache'], [mode])
+                self.assertEqual(row['argv'][row['argv'].index('--files'):],
+                                 ['--files', '20000', '--memory', '--cache', mode])
+                self.assertEqual(row['argv'][row['argv'].index('--samples') + 1], '10')
+        self.assertFalse(report['all_metrics_won'])
+
+    @staticmethod
+    def cold_denial():
+        return {'status': 'complete', 'passed': False, 'cleanup_passed': True, 'cache': 'cold',
+                'cold_cache_unavailable': 'cache purge unavailable; no further purge retries',
+                'cold_cache_receipt': {'mode': 'cold', 'exit_code': 1, 'stderr': 'denied'},
+                'cold_tool_identity_verified': True, 'cold_tool_content_verified': False,
+                'denial_runtime_verified': True, 'denial_source_verification': {'flat': {'unchanged': True}}}
+
+    def test_only_confirmed_cold_api_denial_can_continue(self):
+        state = self.cold_denial()
+        evidence = {'final_report_exists': True}
+        self.assertTrue(campaign.safe_to_continue('scan-api-cold', 1, state, evidence))
+        for change in ({'cache': 'warm'}, {'cold_cache_receipt': {}}, {'cold_cache_unavailable': None},
+                       {'denial_runtime_verified': False}, {'denial_source_verification': {}},
+                       {'cold_tool_identity_verified': False}, {'cold_tool_identity_verified': None},
+                       {'denial_source_verification': {'flat': {'unchanged': False}}},
+                       {'cleanup_passed': False}, {'retained_fixture': '/keep'}, {'error': 'failed'},
+                       {'completion_uncertain': True},
+                       {'cold_cache_receipt': {'mode': 'cold', 'exit_code': -9}},
+                       {'cold_cache_receipt': {'mode': 'cold', 'exit_code': 1, 'completion_uncertain': True}}):
+            with self.subTest(change=change):
+                self.assertFalse(campaign.safe_to_continue('scan-api-cold', 1, {**state, **change}, evidence))
+        self.assertFalse(campaign.safe_to_continue('scan-api', 1, state, evidence))
+        self.assertFalse(campaign.safe_to_continue('scan-api-cold', 0, state, evidence))
+        self.assertFalse(campaign.safe_to_continue('scan-api-cold', 1, state, {'final_report_exists': False}))
+        healthy = {'status': 'complete', 'passed': True, 'cleanup_passed': True, 'cache': 'warm'}
+        self.assertFalse(campaign.safe_to_continue('scan-api-cold', 0, healthy, evidence))
+        self.assertFalse(campaign.safe_to_continue('scan-api', 0, {**healthy, 'cache': 'cold'}, evidence))
 
     def test_native_correctness_failure_continues_but_campaign_returns_failure(self):
         def failed_first(argv, **kwargs):
@@ -145,10 +192,12 @@ class CampaignTests(unittest.TestCase):
 
     def test_denied_purge_is_not_retried_in_later_native_stages(self):
         for cache, denied_stage, expected_calls, expected_skips in (
-                (['warm', 'cold'], 'native-files', 15, 0),
-                (['cold'], 'native-files', 7, 8),
-                (['warm', 'cold'], 'native-copy', 15, 0),
-                (['cold'], 'native-copy', 8, 7)):
+                (['warm', 'cold'], 'native-files', 15, 3),
+                (['cold'], 'native-files', 7, 11),
+                (['warm', 'cold'], 'native-copy', 15, 3),
+                (['cold'], 'native-copy', 8, 10),
+                (['warm', 'cold'], 'scan-api-cold', 16, 2),
+                (['cold'], 'scan-api-cold', 10, 8)):
             with self.subTest(cache=cache, denied_stage=denied_stage):
                 self.calls = []
                 self.output = self.root / ('reports-' + '-'.join(cache) + '-' + denied_stage)
@@ -158,6 +207,9 @@ class CampaignTests(unittest.TestCase):
                     if output.name != 'cycle-1-' + denied_stage + '.json':
                         return self.child(argv, **kwargs)
                     self.calls.append((argv, kwargs))
+                    if denied_stage == 'scan-api-cold':
+                        campaign.f.write_new_json(output, self.cold_denial())
+                        return subprocess.CompletedProcess(argv, 1)
                     writer = campaign.native_report.ReportJournal(output)
                     try:
                         writer.finish({'status': 'complete', 'passed': False, 'cleanup_passed': True,
@@ -170,8 +222,8 @@ class CampaignTests(unittest.TestCase):
                     self.assertEqual(campaign.main([*self.args, '--cache', *cache]), 1)
                 report = self.report()
                 self.assertEqual(len(self.calls), expected_calls)
-                self.assertEqual(len(report['stages']), 15)
-                self.assertEqual(report['cold_cache_unavailable'], 'purge denied')
+                self.assertEqual(len(report['stages']), 18)
+                self.assertTrue(report['cold_cache_unavailable'])
                 self.assertFalse(report['collection_passed'])
                 denied_index = next(index for index, (argv, _) in enumerate(self.calls)
                                     if Path(argv[argv.index('--output') + 1]).name ==
@@ -324,8 +376,10 @@ class CampaignTests(unittest.TestCase):
                      *(Path(name) for name in ('/bin/cp', '/bin/mv', '/bin/rm',
                        '/usr/bin/ditto', '/usr/bin/rsync', '/usr/bin/find',
                        '/usr/bin/stat', '/usr/bin/time', '/bin/chmod'))}
-            if 'cold' in cache:
-                files.update(map(Path, cold_tools))
+            tool_records = {name: {'sha256': None, 'content_hash_status': 'unavailable'} for name in cold_tools}
+            def digest(path):
+                self.assertNotIn(str(path), cold_tools)
+                return 'controlled fixture hash'
             with self.subTest(cache=cache), \
                     mock.patch.dict(sys.modules, {'stallionfs': mock.Mock(__file__=str(package / '__init__.py'))}), \
                     mock.patch.object(sys, 'executable', str(self.root / 'bin/python')), \
@@ -334,6 +388,13 @@ class CampaignTests(unittest.TestCase):
                     mock.patch.object(campaign.os, 'access', return_value=True), \
                     mock.patch.object(campaign.shutil, 'which', return_value='/usr/bin/git'), \
                     mock.patch.object(campaign.f, 'fingerprint_sources', return_value={}), \
-                    mock.patch.object(campaign.f, 'digest', return_value='hash'):
-                result = campaign.fingerprints(args)['runtime_sha256']
-                self.assertEqual(cold_tools.intersection(result), cold_tools if 'cold' in cache else set())
+                    mock.patch.object(campaign.f, 'digest', side_effect=digest), \
+                    mock.patch.object(campaign.f, 'cold_tool_provenance', return_value=tool_records) as tools:
+                result = campaign.fingerprints(args)
+                self.assertFalse(cold_tools.intersection(result['runtime_sha256']))
+                if 'cold' in cache:
+                    tools.assert_called_once_with()
+                    self.assertEqual(result['cold_tools'], tool_records)
+                else:
+                    tools.assert_not_called()
+                    self.assertNotIn('cold_tools', result)

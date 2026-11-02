@@ -55,8 +55,6 @@ def fingerprints(args):
              npm_manifest, git, '/bin/cp', '/bin/mv', '/bin/rm', '/usr/bin/ditto',
              '/usr/bin/rsync', '/usr/bin/find', '/usr/bin/stat', '/usr/bin/time',
              '/bin/chmod')}
-    if 'cold' in args.cache:
-        paths.update((Path('/usr/bin/sudo'), Path('/usr/sbin/purge')))
     paths.update(path for path in package.rglob('*') if path.suffix in ('.py', '.so') and path.is_file())
     f.require(all(path.is_file() for path in paths) and
               all(os.access(path, os.X_OK) for path in (args.binary, python, args.node)),
@@ -64,8 +62,12 @@ def fingerprints(args):
     source = f.fingerprint_sources()
     source.update({path.relative_to(f.REPO).as_posix(): f.digest(path)
                    for path in (*HERE.glob('*.py'), *(HERE / 'fixture' / name for name in native_fixtures.LOCKED_FILES))})
-    return {'source_sha256': source,
-            'runtime_sha256': {str(path): f.digest(path) for path in sorted(paths)}}
+    result = {'source_sha256': source,
+              'runtime_sha256': {str(path): f.digest(path) for path in sorted(paths)}}
+    if 'cold' in args.cache:
+        result['cold_tools'] = f.cold_tool_provenance()
+        result['cold_tool_limits'] = 'Matching metadata establishes observed identity stability only. Unavailable content hashes do not establish unchanged executable bytes.'
+    return result
 
 
 def stages(args, cycle):
@@ -78,7 +80,9 @@ def stages(args, cycle):
         ('native-copy', 'native_suite.py', [*native, '--operations', 'copy',
          '--copy-tools', 'cp', '--fixtures', 'tiny_4kib']),
         ('native-scan', 'native_suite.py', [*native, '--operations', 'scan', '--fixtures', *SCANS]),
-        ('scan-api', 'scan.py', ['--files', '20000', '--memory']),
+        ('scan-api', 'scan.py', ['--files', '20000', '--memory', '--cache', 'warm']),
+        *([('scan-api-cold', 'scan.py', ['--files', '20000', '--memory', '--cache', 'cold'])]
+          if 'cold' in args.cache else []),
         ('workspaces', 'run.py', ['--methods', 'worktree_install', 'stallionfs_folder',
          '--concurrency', '4', '--source-files', '1000', *runtime]),
     )
@@ -121,17 +125,32 @@ def outcome(name, output):
         evidence = {'summary': str(path), 'summary_sha256': f.digest(path)}
     evidence['final_report_exists'] = output.is_file()
     fields = ('status', 'passed', 'cleanup_passed', 'retained_fixture',
-              'completion_uncertain', 'error', 'cleanup_error', 'cold_cache_unavailable')
+              'completion_uncertain', 'error', 'cleanup_error', 'cold_cache_unavailable',
+              'cache', 'cold_cache_receipt', 'denial_source_verification', 'denial_runtime_verified',
+              'cold_tool_identity_verified', 'cold_tool_content_verified')
     return {key: state[key] for key in fields if key in state}, evidence
 
 
 def safe_to_continue(name, code, state, evidence):
+    receipt = state.get('cold_cache_receipt', {})
+    sources = state.get('denial_source_verification', {})
+    cold_denied = (name == 'scan-api-cold' and state.get('cache') == 'cold'
+                   and bool(state.get('cold_cache_unavailable'))
+                   and isinstance(receipt, dict) and receipt.get('mode') == 'cold'
+                   and type(receipt.get('exit_code')) is int and receipt['exit_code'] > 0
+                   and not receipt.get('completion_uncertain')
+                   and state.get('denial_runtime_verified') is True
+                   and state.get('cold_tool_identity_verified') is True
+                   and isinstance(sources, dict) and bool(sources)
+                   and all(isinstance(row, dict) and row.get('unchanged') is True for row in sources.values()))
     terminal = (state.get('status') == 'complete' and state.get('cleanup_passed') is True
                 and type(state.get('passed')) is bool and evidence['final_report_exists']
+                and (name not in ('scan-api', 'scan-api-cold') or
+                     state.get('cache') == ('cold' if name == 'scan-api-cold' else 'warm'))
                 and not any(state.get(key) for key in
                             ('retained_fixture', 'completion_uncertain', 'error', 'cleanup_error')))
     return terminal and ((code == 0 and state['passed']) or
-                         (name.startswith('native-') and code == 1 and not state['passed']))
+                         ((name.startswith('native-') or cold_denied) and code == 1 and not state['passed']))
 
 
 def collect(args):
@@ -147,12 +166,12 @@ def collect(args):
                   'Finder completion and resource comparisons',
                   'Workspace lifecycle peak memory and full metadata equivalence',
                   'Replacement/exchange moves, mount-record listing and image/recovery workflows',
-                  'Cold-cache API scanner and workspace measurements; those stages remain warm',
+                  'Cold-cache workspace measurements; that stage remains warm',
                   'Representative photo workload; the current PNG corpus is synthetic',
                   'Mounted FSKit serving-process resources and deferred writes',
                   'External-drive repeat coverage; only the supplied scratch location is used',
                   'CLI JSON/startup-only cases and mounted-image steady-state I/O are outside this campaign'],
-              'cold_cache': ('Purge-conditioned native stages requested; denied purges remain failures in child reports. Device-cache eviction is not established'
+              'cold_cache': ('Purge-conditioned native and API scanner stages requested; denied purges remain failures in child reports. Device-cache eviction is not established'
                              if 'cold' in args.cache else 'Unavailable: cold-cache stages were not selected'),
               'limits': ['Node executable, npm entrypoint and package manifest are pinned; the entire npm tree is not pinned',
                          'Native command CPU excludes shared services; native RSS is not simultaneous descendant memory',
@@ -170,14 +189,20 @@ def collect(args):
             for name, output, argv in stages(args, cycle):
                 f.require(fingerprints(args) == pins, 'Source or runtime changed before stage')
                 log = output.with_suffix('.log')
-                omitted = report['cold_cache_unavailable'] if name.startswith('native-') and 'cold' in args.cache else None
+                omitted = (report['cold_cache_unavailable']
+                           if 'cold' in args.cache and (name.startswith('native-') or name == 'scan-api-cold') else None)
                 planned = argv
                 if omitted:
-                    start, end = argv.index('--cache') + 1, argv.index('--operations')
-                    remaining = [cache for cache in argv[start:end] if cache != 'cold']
-                    argv = [*argv[:start], *remaining, *argv[end:]] if remaining else None
+                    if name == 'scan-api-cold':
+                        argv = None
+                    else:
+                        start, end = argv.index('--cache') + 1, argv.index('--operations')
+                        remaining = [cache for cache in argv[start:end] if cache != 'cold']
+                        argv = [*argv[:start], *remaining, *argv[end:]] if remaining else None
                 row = {'cycle': cycle, 'stage': name, 'argv': argv, 'output': str(output),
-                       'log': str(log), 'cache': args.cache if name.startswith('native-') else ['warm'], 'status': 'pending', 'started_utc': datetime.now(timezone.utc).isoformat()}
+                       'log': str(log), 'cache': args.cache if name.startswith('native-') else
+                       ['cold'] if name == 'scan-api-cold' else ['warm'],
+                       'status': 'pending', 'started_utc': datetime.now(timezone.utc).isoformat()}
                 if omitted:
                     row.update(planned_argv=planned, omitted_cold_cache=omitted)
                 report['stages'].append(row)

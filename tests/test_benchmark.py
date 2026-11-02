@@ -188,31 +188,39 @@ class BenchmarkCLI(unittest.TestCase):
             self.assertFalse(data['required_coverage_complete'])
             self.assertEqual(len(data['cases']), 37)
 
-    def test_full_collection_requires_copy_stage_in_each_exact_cycle(self):
+    def test_full_collection_requires_exact_cache_specific_stages(self):
         from stallionfs import _benchmark_budget as budget
-        for change in ('none', 'missing', 'duplicate', 'reordered', 'failed', 'cleanup-failed'):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+        changes = ('none', 'missing', 'duplicate', 'reordered', 'failed', 'cleanup-failed')
+        for cache, target, change in ((cache, target, change)
+                                     for cache in (['warm'], ['cold'], ['warm', 'cold'])
+                                     for target in ('native-copy', 'scan-api-cold' if 'cold' in cache else 'scan-api')
+                                     for change in changes):
+            with self.subTest(cache=cache, target=target, change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                planned = ['native-files', 'native-copy', 'native-scan', 'scan-api',
+                           *(['scan-api-cold'] if 'cold' in cache else []), 'workspaces']
                 stages = [{'cycle': cycle, 'stage': stage,
                            'outcome': {'passed': True, 'cleanup_passed': True}}
-                          for cycle in range(1, 4)
-                          for stage in ('native-files', 'native-copy', 'native-scan', 'scan-api', 'workspaces')]
+                          for cycle in range(1, 4) for stage in planned]
+                self.assertEqual(len(stages), 18 if 'cold' in cache else 15)
+                index = next(index for index, row in enumerate(stages)
+                             if row['cycle'] == 2 and row['stage'] == target)
                 if change == 'missing':
-                    del stages[6]
+                    del stages[index]
                 elif change == 'duplicate':
-                    stages.insert(7, stages[6])
+                    stages.insert(index + 1, stages[index])
                 elif change == 'reordered':
-                    stages[6], stages[7] = stages[7], stages[6]
+                    stages[index], stages[index + 1] = stages[index + 1], stages[index]
                 elif change == 'failed':
-                    stages[6]['outcome']['passed'] = False
+                    stages[index]['outcome']['passed'] = False
                 elif change == 'cleanup-failed':
-                    stages[6]['outcome']['cleanup_passed'] = False
+                    stages[index]['outcome']['cleanup_passed'] = False
                 def command(argv, **kwargs):
                     kwargs['receipt']['exit_code'] = 0
                     output = root / 'campaign'
                     output.mkdir()
                     (output / 'campaign.json').write_text(json.dumps({'status': 'complete', 'stages': stages}))
-                args = arguments(full=True, node=root/'node', npm=root/'npm-cli.js', npm_cache=root)
+                args = arguments(full=True, cache=cache, node=root/'node', npm=root/'npm-cli.js', npm_cache=root)
                 with mock.patch.object(budget, 'command', side_effect=command):
                     if change != 'none':
                         with self.assertRaisesRegex(RuntimeError, 'correctness and cleanup'):
@@ -224,9 +232,11 @@ class BenchmarkCLI(unittest.TestCase):
                         self.assertTrue(result['collection_complete'])
                         self.assertFalse(result['required_coverage_complete'])
                         self.assertFalse(result['qualified'])
+                        self.assertEqual(result['always_warm_collectors'], ['workspaces'])
                         row = next(row for row in result['cases'] if row['id'] == 'native/copy/tiny_4kib')
-                        self.assertEqual({cell['status'] for cell in row['required_cells']},
-                                         {'collected_unverified', 'unavailable'})
+                        for cell in row['required_cells']:
+                            self.assertEqual(cell['status'], 'collected_unverified'
+                                             if cell['cache'] in cache else 'unavailable')
 
     def test_output_race_keeps_the_other_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -363,12 +373,22 @@ class BenchmarkDeadline(unittest.TestCase):
         for case in benchmark._coverage(['warm', 'cold']):
             self.assertEqual({cell['output'] for cell in case['required_cells']}, modes[case['required_set']])
 
-    def test_api_and_workspaces_remain_warm_when_native_cache_selection_is_cold(self):
-        for case in benchmark._coverage(['cold']):
-            if case['required_set'] in ('API-SCAN', 'WORKSPACE'):
-                warm = [cell for cell in case['required_cells'] if cell['cache'] == 'warm' and cell['phase'] == 'timing']
-                self.assertTrue(all(cell['status'] == 'collected_unverified' for cell in warm))
-                self.assertTrue(all(cell['status'] == 'unavailable' for cell in case['required_cells'] if cell['cache'] == 'cold'))
+    def test_api_cache_cells_name_the_selected_stage_and_workspaces_stay_warm(self):
+        for cache, collected in ((['warm'], True), (['cold'], True),
+                                 (['warm', 'cold'], True), (['warm', 'cold'], False)):
+            for case in benchmark._coverage(cache, collected=collected):
+                if case['required_set'] == 'API-SCAN':
+                    self.assertEqual(len(case['required_cells']), 8)
+                    for cell in case['required_cells']:
+                        mode = cell['cache']
+                        self.assertEqual(cell['collector'], 'scan-api-cold' if mode == 'cold' else 'scan-api')
+                        self.assertEqual(cell['status'], 'collected_unverified'
+                                         if collected and (mode == 'warm' or mode in cache) else 'unavailable')
+                        self.assertFalse(cell['win'])
+                    self.assertFalse(case['qualified'])
+                elif case['required_set'] == 'WORKSPACE':
+                    self.assertTrue(all(cell['status'] == 'unavailable' for cell in case['required_cells']
+                                        if cell['cache'] == 'cold' or cell['phase'] == 'resources'))
 
     def test_list_marks_catalog_only_entries_without_starting_collectors(self):
         catalog = benchmark._catalog()

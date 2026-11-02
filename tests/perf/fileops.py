@@ -6,6 +6,7 @@ samples on failure; only a fully validated and cleaned run produces the result.
 """
 import argparse
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,34 @@ def require(condition, message):
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def cold_tool_provenance():
+    """Describe fixed tools without claiming unreadable contents were verified."""
+    def metadata(info):
+        return {name: getattr(info, name, None) for name in
+                ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_size',
+                 'st_mtime_ns', 'st_ctime_ns', 'st_flags')}
+
+    result = {}
+    for name in ('/usr/bin/sudo', '/usr/sbin/purge'):
+        path = Path(name)
+        entry, target = metadata(path.lstat()), metadata(path.stat())
+        require(stat.S_ISREG(target['st_mode']) and target['st_mode'] & 0o111,
+                'Cold tool is not a regular executable: ' + name)
+        sha, unavailable = None, None
+        try:
+            sha = digest(path)
+        except PermissionError as error:
+            if error.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            unavailable = {'errno': error.errno, 'reason': 'Content read permission denied'}
+        require(entry == metadata(path.lstat()) and target == metadata(path.stat()),
+                'Cold tool changed during provenance capture: ' + name)
+        result[name] = {'entry': entry, 'target': target, 'sha256': sha,
+                        'content_hash_status': 'unavailable' if unavailable else 'available',
+                        'sha256_unavailable': unavailable}
+    return result
 
 
 def command(arguments, *, check=True, timeout=120, environment=None):

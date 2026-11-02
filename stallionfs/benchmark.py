@@ -186,9 +186,13 @@ def _coverage(cache, *, collected=True):
             for output in outputs:
                 for reference in references:
                     for phase in ('timing', 'resources'):
-                        selected_mode = mode == 'warm' if family in ('API-SCAN', 'WORKSPACE') else mode in cache
+                        selected_mode = mode in cache
+                        if family == 'API-SCAN':
+                            selected_mode |= mode == 'warm'
+                        elif family == 'WORKSPACE':
+                            selected_mode = mode == 'warm'
                         available = collected and collector is not None and selected_mode
-                        available &= not (family in ('API-SCAN', 'WORKSPACE') and mode == 'cold')
+                        available &= not (family == 'WORKSPACE' and mode == 'cold')
                         available &= not (family == 'WORKSPACE' and phase == 'resources')
                         policy = not (family == 'TREE-CLONE' and reference in ('cp-clone', 'cp', 'ditto', 'rsync'))
                         status = 'collected_unverified' if available else 'unavailable'
@@ -199,6 +203,8 @@ def _coverage(cache, *, collected=True):
                             status, reason = 'inadmissible', 'Reference does not establish a mandatory-clone command contract'
                         required.append({'cache': mode, 'output': output, 'reference': reference,
                                          'phase': phase, 'status': status, 'reason': reason, 'win': False})
+                        if family == 'API-SCAN':
+                            required[-1]['collector'] = 'scan-api-cold' if mode == 'cold' else 'scan-api'
         result.append({'id': case['id'], 'required_set': family, 'collector': collector,
                        'catalog_only': collector is None,
                        'required_cells': required, 'qualified': False})
@@ -268,8 +274,9 @@ def _collect(args, resources, binary, root, fixtures, operations):
         path = root / 'campaign/campaign.json'
         state = json.loads(path.read_text()) if path.is_file() else {}
         stages = state.get('stages', [])
-        expected = [(cycle, stage) for cycle in range(1, 4)
-                    for stage in ('native-files', 'native-copy', 'native-scan', 'scan-api', 'workspaces')]
+        planned = ('native-files', 'native-copy', 'native-scan', 'scan-api',
+                   *(('scan-api-cold',) if 'cold' in args.cache else ()), 'workspaces')
+        expected = [(cycle, stage) for cycle in range(1, 4) for stage in planned]
         complete = (state.get('status') == 'complete'
                     and [(row.get('cycle'), row.get('stage')) for row in stages] == expected
                     and all(row.get('outcome', {}).get('passed') is True
@@ -278,7 +285,7 @@ def _collect(args, resources, binary, root, fixtures, operations):
             raise RuntimeError('Full collector did not complete correctness and cleanup; see retained campaign')
         return {'status': 'incomplete', 'collection_complete': True, 'required_coverage_complete': False,
                 'qualified': False, 'cases': _coverage(args.cache), 'comparisons': [],
-                'campaign': str(path), 'always_warm_collectors': ['scan-api', 'workspaces'], 'exit_code': 2}
+                'campaign': str(path), 'always_warm_collectors': ['workspaces'], 'exit_code': 2}
     state, comparisons = _read_native(root / 'native.json')
     if not (state.get('status') == 'complete' and state.get('passed') is True
             and state.get('cleanup_passed') is True and not state.get('retained_fixture')):

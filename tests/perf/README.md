@@ -102,10 +102,13 @@ stage uses ten measured rounds by default (`--samples`, minimum ten). Native
 stages use one internal repetition per outer cycle; the older fileops campaigns
 are not run again. This includes the existing 50 GB dataset and its copies.
 
-`--cache warm cold` is the default for native command stages. The API scanner and
-workspace stages remain warm. A denied purge is retained and never retried by
-later stages: warm work continues, or subsequent native stages are recorded as
-unavailable when only cold was requested. Nothing is installed or downloaded.
+`--cache warm cold` is the default for native command stages. The API scanner
+always has a warm stage and adds a separate purge-conditioned stage when cold
+was requested: 15 planned stages for warm selection, 18 with cold. Workspace
+stages remain warm. A denied purge is retained and never retried by later stages:
+warm work continues only after confirmed source/runtime validation and cleanup;
+later cold API stages, and native stages requested only cold, are unavailable.
+Nothing is installed or downloaded.
 
 `campaign.json` checkpoints stage arguments, exit status, log/report references
 and source/runtime fingerprints. Native status is read from the small manifest,
@@ -120,15 +123,23 @@ Release acceptance requires three consecutive complete suites with every require
 comparison correct and lower wall time plus lower CPU or lower peak RSS, beyond
 precision and observed variation. `all_metrics_won` remains a placeholder, not
 an implemented release decision. Finder, mounted FSKit resources,
-workspace peak memory/full metadata equivalence, external-drive repeats,
+workspace cold coverage/peak memory/full metadata equivalence, external-drive repeats,
 replacement/exchange moves, mount listing, image/recovery workflows and
 CLI JSON/startup-only cases remain outside this campaign, as does mounted-image
 steady-state I/O. Child reports retain their
 measurement limits and failures. Review local paths before publishing reports.
 
 API scanner attempts check source contents and metadata before and after each
-call. A small three-layout collection with separate memory children passed these
-checks; the complete campaign remains unqualified. Use `native_suite.py --runs 1`
+call. Cold attempts purge after the source precheck and immediately before the
+API call or fresh memory child launch. Complete OS/device-cache eviction is not
+established. Resource RSS includes child startup, imports and extension hashing
+before its fixture scan; it is not standalone API memory. Footprint is optional
+and reported as medians only; paired resource comparisons use RSS.
+Cold tools retain entry and target metadata plus content hashes when readable.
+Permission-denied content reads are reported with an unavailable hash; matching
+metadata establishes observed identity stability, not unchanged executable bytes.
+Missing tools, metadata failures and changed identity, hash or readability stop collection.
+The complete campaign remains unqualified. Use `native_suite.py --runs 1`
 for a single native diagnostic run. It omits the campaign's API and workspace
 stages and does not establish a complete acceptance suite.
 
