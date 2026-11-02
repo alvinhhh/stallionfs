@@ -342,7 +342,7 @@ def native_delete(args):
                 require((info.st_dev, info.st_ino) == identities[name]
                         and content_manifest(path) == expected[name], 'CLI source fixture changed: ' + name)
 
-        def operand(prepared=None, *, contents=True, mounts=True):
+        def operand(prepared=None, *, contents=True, mounts=True, stage=None):
             owned(mounts=mounts)
             require(target.is_absolute() and target.parent == base and target.name == 'target', 'Invalid delete operand')
             info = target.lstat()
@@ -352,8 +352,16 @@ def native_delete(args):
             metadata = {name: getattr(info, name, None) for name in (
                 'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
                 'st_mtime_ns', 'st_ctime_ns', 'st_flags')}
-            if prepared is not None:
-                require(metadata == prepared, 'Delete operand metadata changed')
+            if prepared is not None and metadata != prepared:
+                mismatch = {'stage': stage, 'path': str(target), 'preparation_id': setup_id,
+                            'row_id': row_id, 'operation': {name: row[name] for name in
+                                ('case_id', 'output', 'cache', 'phase', 'pair_id', 'method', 'warmup')},
+                            'expected': dict(prepared), 'observed': dict(metadata),
+                            'changed_fields': sorted(name for name in metadata if metadata[name] != prepared[name])}
+                error = RuntimeError('Delete operand metadata changed at ' + stage)
+                error.operand_metadata_mismatch = mismatch
+                error.add_note('Operand metadata comparison: ' + json.dumps(mismatch, sort_keys=True))
+                raise error
             if contents:
                 require(content_manifest(target) == expected['tiny_4kib'], 'Delete operand differs from CLI fixture')
             return metadata
@@ -391,17 +399,20 @@ def native_delete(args):
                             verify_clone(source, target, expected['tiny_4kib'])
                             sources()
                             prepared = operand()
+                            setup['operand_metadata'] = dict(prepared)
+                            setup['operand_metadata_stage'] = 'before_content_validation'
                             setup['validated'] = True
                             record('preparation', setup, setup_id)
                             argv = ['/bin/rm', '-f', str(target)] if method == 'native' else [
                                 str(binary), *(['--json'] if form == 'json' else []), 'delete', str(target)]
-                            row = key | {'pair_id': pair_id, 'warmup': phase == 'timing' and pair_id == 0,
+                            row = key | {'pair_id': pair_id, 'preparation_id': setup_id,
+                                         'warmup': phase == 'timing' and pair_id == 0,
                                          'method': method, 'argv': argv, 'ok': False, 'validated': False}
                             row_id = record('rows', row)
                             report['active_operation'] = row
                             checkpoint()
                             sources()
-                            operand(prepared)
+                            operand(prepared, stage='before_conditioning')
                             conditioning = native_suite.cache_prepare(cache, 120)
                             row['cache_receipt'] = conditioning
                             if cache == 'cold':
@@ -413,7 +424,7 @@ def native_delete(args):
                                     row['unavailable'] = report['cold_cache_unavailable']
                                     record('rows', row, row_id)
                                     sources()
-                                    operand(prepared)
+                                    operand(prepared, stage='denial_closeout')
                                     require(native_delete_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
                                     remove_fixture(target)
                                     record('unavailable', key | {'reason': report['cold_cache_unavailable']})
@@ -421,7 +432,7 @@ def native_delete(args):
                                     checkpoint()
                                     denied = True
                                     break
-                            operand(prepared, contents=False, mounts=False)
+                            operand(prepared, contents=False, mounts=False, stage='after_conditioning')
                             receipt = native_metrics.collect(argv, timeout_s=120, env=environment, phase=phase)
                             row.update(receipt)
                             record('rows', row, row_id)
@@ -479,8 +490,14 @@ def native_delete(args):
             report['command_receipt'] = error.receipt
         if base is not None and not cleaned:
             report['retained_fixture'] = str(base)
+        mismatch = getattr(error, 'operand_metadata_mismatch', None)
+        if mismatch is not None:
+            report['operand_metadata_mismatch'] = mismatch
+            row['operand_metadata_mismatch'] = mismatch
         if not journal_failed:
             try:
+                if mismatch is not None:
+                    record('rows', row, row_id)
                 checkpoint()
                 journal.finish(report)
             except BaseException as secondary:

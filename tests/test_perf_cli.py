@@ -123,6 +123,8 @@ class NativeDelete(unittest.TestCase):
             self.assertEqual((state['timing_pairs'], state['resource_pairs']), (31, 12))
             self.assertEqual(len(rows), 176)
             self.assertEqual(len(comparisons), 4)
+            self.assertEqual({row['preparation_id'] for row in rows}, set(range(176)))
+            self.assertEqual(json.loads(self.output.with_name(self.output.name + '.manifest').read_text())['event_count'], 1060)
             for form in ('plain', 'json'):
                 for phase, count in (('timing', 31), ('resources', 12)):
                     for method in ('native', 'candidate'):
@@ -182,6 +184,162 @@ class NativeDelete(unittest.TestCase):
                 self.collect.assert_not_called()
                 self.assertTrue((self.base / 'target').exists())
                 self.retained()
+
+    def test_prepared_diagnostic_snapshot_precedes_content_validation(self):
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                  'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self.configure(stack, Path(directory))
+            original = cli.content_manifest
+            snapshots = []
+            target_reads = []
+            def content(path):
+                if path == self.base / 'target':
+                    target_reads.append(True)
+                    if len(target_reads) == 1:
+                        info = path.lstat()
+                        snapshots.append({name: getattr(info, name, None) for name in fields})
+                        result = original(path)
+                        path.chmod(0o600)
+                        return result
+                return original(path)
+            stack.enter_context(mock.patch.object(cli, 'content_manifest', side_effect=content))
+            with self.assertRaisesRegex(RuntimeError, 'at before_conditioning') as caught:
+                cli.native_delete(self.args)
+            state, rows, _ = self.retained()
+            journal = cli.native_report.ReportJournal.open_existing(self.output)
+            try:
+                preparations = list(journal.iter_latest('preparation'))
+            finally:
+                journal.close()
+            mismatch = caught.exception.operand_metadata_mismatch
+            self.assertEqual(mismatch['expected'], snapshots[0])
+            self.assertEqual(preparations[0]['operand_metadata'], snapshots[0])
+            self.assertEqual(preparations[0]['operand_metadata_stage'], 'before_content_validation')
+            self.assertTrue(preparations[0]['validated'])
+            self.assertEqual(rows[0]['preparation_id'], mismatch['preparation_id'])
+            self.assertEqual((mismatch['preparation_id'], mismatch['row_id']), (0, 0))
+            self.assertEqual(mismatch['operation'], {key: rows[0][key] for key in
+                             ('case_id', 'output', 'cache', 'phase', 'pair_id', 'method', 'warmup')})
+            self.assertEqual(mismatch['path'], str(self.base / 'target'))
+            self.assertEqual(mismatch['stage'], 'before_conditioning')
+            self.assertEqual(state['operand_metadata_mismatch'], rows[0]['operand_metadata_mismatch'])
+            self.assertEqual(mismatch['changed_fields'], sorted(name for name in fields
+                             if mismatch['expected'][name] != mismatch['observed'][name]))
+            self.assertIn('st_mode', mismatch['changed_fields'])
+            self.condition.assert_not_called()
+            self.collect.assert_not_called()
+            self.assertTrue((self.base / 'target').exists())
+
+    def test_every_prepared_metadata_field_drift_remains_fatal_without_diagnostic_restat(self):
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                  'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+        for field in fields:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                self.configure(stack, Path(directory))
+                original_append = cli.native_report.ReportJournal.append
+                original_lstat = Path.lstat
+                prepared = []
+                observed = []
+                def append(journal, kind, index, payload):
+                    if kind == 'preparation' and payload.get('validated'):
+                        prepared.append(copy.deepcopy(payload['operand_metadata']))
+                    return original_append(journal, kind, index, payload)
+                def lstat(path, *args, **kwargs):
+                    info = original_lstat(path, *args, **kwargs)
+                    if prepared and path == self.base / 'target':
+                        value = {name: getattr(info, name, None) for name in fields}
+                        value[field] = (value[field] or 0) + (0o040 if field == 'st_mode' else 1)
+                        if observed:
+                            raise AssertionError('Diagnostic unexpectedly restatted operand')
+                        observed.append(value)
+                        return SimpleNamespace(**value)
+                    return info
+                stack.enter_context(mock.patch.object(cli.native_report.ReportJournal, 'append', new=append))
+                stack.enter_context(mock.patch.object(Path, 'lstat', new=lstat))
+                with self.assertRaises(RuntimeError) as caught:
+                    cli.native_delete(self.args)
+                self.condition.assert_not_called()
+                self.collect.assert_not_called()
+                self.assertTrue(self.base.is_dir())
+                self.assertEqual(len(observed), 1)
+                if field == 'st_nlink':
+                    self.assertIn('independent regular file', str(caught.exception))
+                else:
+                    mismatch = caught.exception.operand_metadata_mismatch
+                    self.assertEqual(mismatch['expected'], prepared[0])
+                    self.assertEqual(mismatch['observed'], observed[0])
+                    self.assertEqual(mismatch['changed_fields'], [field])
+                    self.assertEqual(mismatch['stage'], 'before_conditioning')
+                    state, rows, _ = self.retained()
+                    self.assertEqual(state['operand_metadata_mismatch'], mismatch)
+                    self.assertEqual(rows[0]['operand_metadata_mismatch'], mismatch)
+
+    def test_conditioning_and_denial_mismatches_record_the_actual_guard_stage(self):
+        for denied in (False, True):
+            with self.subTest(denied=denied), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                self.configure(stack, Path(directory), cache=['cold'])
+                original = self.condition.side_effect
+                def condition(mode, timeout):
+                    result = original(mode, timeout)
+                    (self.base / 'target').chmod(0o600)
+                    if denied:
+                        result['exit_code'] = 1
+                    return result
+                self.condition.side_effect = condition
+                with self.assertRaises(RuntimeError) as caught:
+                    cli.native_delete(self.args)
+                mismatch = caught.exception.operand_metadata_mismatch
+                self.assertEqual(mismatch['stage'], 'denial_closeout' if denied else 'after_conditioning')
+                self.assertIn('st_mode', mismatch['changed_fields'])
+                self.assertEqual(self.condition.call_count, 1)
+                self.collect.assert_not_called()
+                state, rows, _ = self.retained()
+                self.assertEqual(state['operand_metadata_mismatch'], mismatch)
+                self.assertEqual(rows[0]['operand_metadata_mismatch'], mismatch)
+                self.assertTrue((self.base / 'target').exists())
+
+    def test_diagnostic_journal_failures_preserve_primary_comparison_and_secondary_error(self):
+        for failure in ('append', 'checkpoint', 'finish'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                self.configure(stack, Path(directory))
+                original_append = cli.native_report.ReportJournal.append
+                original_checkpoint = cli.native_report.ReportJournal.checkpoint
+                original_finish = cli.native_report.ReportJournal.finish
+                prepared = []
+                def append(journal, kind, index, payload):
+                    if kind == 'preparation' and payload.get('validated'):
+                        prepared.append(copy.deepcopy(payload['operand_metadata']))
+                        (self.base / 'target').chmod(0o600)
+                    if failure == 'append' and payload.get('operand_metadata_mismatch'):
+                        raise OSError('diagnostic append failed')
+                    return original_append(journal, kind, index, payload)
+                def checkpoint(journal, state):
+                    if failure == 'checkpoint' and state.get('operand_metadata_mismatch'):
+                        raise OSError('diagnostic checkpoint failed')
+                    return original_checkpoint(journal, state)
+                def finish(journal, state):
+                    if failure == 'finish' and state.get('operand_metadata_mismatch'):
+                        raise OSError('diagnostic finish failed')
+                    return original_finish(journal, state)
+                stack.enter_context(mock.patch.object(cli.native_report.ReportJournal, 'append', new=append))
+                stack.enter_context(mock.patch.object(cli.native_report.ReportJournal, 'checkpoint', new=checkpoint))
+                stack.enter_context(mock.patch.object(cli.native_report.ReportJournal, 'finish', new=finish))
+                with self.assertRaisesRegex(RuntimeError, 'at before_conditioning') as caught:
+                    cli.native_delete(self.args)
+                error = caught.exception
+                mismatch = error.operand_metadata_mismatch
+                self.assertEqual(mismatch['expected'], prepared[0])
+                self.assertEqual(mismatch['stage'], 'before_conditioning')
+                self.assertIn('st_mode', mismatch['changed_fields'])
+                self.assertEqual(json.loads(error.__notes__[0].split(': ', 1)[1]), mismatch)
+                self.assertTrue(any('diagnostic ' + failure + ' failed' in note for note in error.__notes__[1:]))
+                self.condition.assert_not_called()
+                self.collect.assert_not_called()
+                self.assertTrue((self.base / 'target').exists())
+                self.assertTrue(self.output.with_name(self.output.name + '.journal').exists())
+                self.assertTrue(self.output.with_name(self.output.name + '.manifest').exists())
+                self.assertFalse(self.output.exists())
 
     def test_pair_closure_rejects_short_duplicate_invalid_and_extra_ids(self):
         for phase, count in (('timing', 31), ('resources', 10)):
