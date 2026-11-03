@@ -23,7 +23,7 @@ macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource
 
 RSS means `/usr/bin/time -lp reported maximum RSS`: the maximum individual child-process peak, excluding whole-system, aggregate descendant, kernel and server memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
 
-The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`). Its five native C/header hashes match current source. This is native-content equivalence, not a new build of the newer main or managed Python lifecycle. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
+The measured executable is `fb743b75ea6053a0f3060e97e54ca95ab15f21d9fc6186c644eb56b8c960c7d1`, built from commit `0a1c708f5461f92bf085d5a9a8a072b7b8ce86ee` (tree `0364901cbbbab92b8a9741cba41f7c60bd0bb8f3`), before the current native changes. The move file is an explicitly derived direct-control subset of an interleaved collection; it is not a canonical-harness rerun.
 
 ### Measured commands and inputs
 
@@ -54,6 +54,8 @@ The build-cache input begins with 200,000 generated files and 10,000,000,000 log
 The dataset input begins with 2,000 generated files and 50,000,000,000 logical bytes. Metadata enrichment produces 2,002 regular-file names, 23 directories including root and 50,016,777,216 logical bytes, including hardlink aliases. All 40 operands were prepared and validated outside command timing. Whole-tree allocation and generation time were not recorded.
 
 The clone configurations are the same workload. Two workers are explicit; the four-worker row records `--jobs 4`, matching the default setting. Both preserve the observed RSS increase. No worker default was changed. Older raw result files remain available.
+
+The clone rows compare StallionFS with the recorded `ditto` command; they do not establish a mandatory-clone performance win. macOS `cp -cRp` requests cloning but permits fallback to `copyfile`; it is not equivalent to a clone command that must fail when cloning is unavailable. Keep command policy separate from observed sharing.
 
 ### Linux/OpenZFS descriptive references
 
@@ -92,17 +94,30 @@ npm cache containing the locked fixture dependencies:
 ```
 
 The output directory must be new. Three outer cycles each collect all 13 existing
-native file-operation fixtures (including installed dependencies), the three
+native file-operation fixtures (including installed dependencies), the existing
+ordinary-copy comparison on `tiny_4kib` against `cp -Rp`, the existing CLI tiny-delete
+comparison against `rm -f`, the three
 native command scan layouts, the 20,000-file scanner API comparison with memory,
 and folder-workspace lifecycle comparisons at concurrency one and four. Each
 stage uses ten measured rounds by default (`--samples`, minimum ten). Native
 stages use one internal repetition per outer cycle; the older fileops campaigns
 are not run again. This includes the existing 50 GB dataset and its copies.
 
-`--cache warm cold` is the default for native command stages. The API scanner and
-workspace stages remain warm. A denied purge is retained and never retried by
-later stages: warm work continues, or subsequent native stages are recorded as
-unavailable when only cold was requested. Nothing is installed or downloaded.
+`--cache warm cold` is the default for native command stages. The API scanner
+always has a warm stage and adds a separate purge-conditioned stage when cold
+was requested: 21 planned stages for warm selection, 24 with cold. Workspace
+stages remain warm. A denied purge is retained and never retried by later stages:
+warm work continues only after confirmed source/runtime validation and cleanup;
+later cold API stages, and native stages requested only cold, are unavailable.
+Nothing is installed or downloaded.
+
+The existing CLI tiny-clone case is collected by `cli.py --native-clone` against
+`/bin/cp -cRp`, using the original 4 KiB/0640 source and fresh absent output.
+Source and parent must have observed absent extended ACLs and common ownership;
+no flags, ACLs or ownership are initialized. Both plain and JSON calls receive
+fresh native references, 31 timing pairs and separate RSS pairs. Native cp can
+fall back to copying, so results do not prove clone syscalls or physical sharing.
+This does not qualify the case or substitute for the enriched native-file case.
 
 `campaign.json` checkpoints stage arguments, exit status, log/report references
 and source/runtime fingerprints. Native status is read from the small manifest,
@@ -117,19 +132,44 @@ Release acceptance requires three consecutive complete suites with every require
 comparison correct and lower wall time plus lower CPU or lower peak RSS, beyond
 precision and observed variation. `all_metrics_won` remains a placeholder, not
 an implemented release decision. Finder, mounted FSKit resources,
-workspace peak memory/full metadata equivalence, external-drive repeats,
+workspace cold coverage/peak memory/full metadata equivalence, external-drive repeats,
 replacement/exchange moves, mount listing, image/recovery workflows and
-CLI JSON/startup-only cases remain outside this campaign, as does mounted-image
+Other CLI JSON/startup-only cases remain outside this campaign, as does mounted-image
 steady-state I/O. Child reports retain their
 measurement limits and failures. Review local paths before publishing reports.
 
 API scanner attempts check source contents and metadata before and after each
-call. A small three-layout collection with separate memory children passed these
-checks; the complete campaign remains unqualified. Use `native_suite.py --runs 1`
+call. Cold attempts purge after the source precheck and immediately before the
+API call or fresh memory child launch. Complete OS/device-cache eviction is not
+established. Resource RSS includes child startup, imports and extension hashing
+before its fixture scan; it is not standalone API memory. Footprint is optional
+and reported as medians only; paired resource comparisons use RSS.
+Cold tools retain entry and target metadata plus content hashes when readable.
+Permission-denied content reads are reported with an unavailable hash; matching
+metadata establishes observed identity stability, not unchanged executable bytes.
+Missing tools, metadata failures and changed identity, hash or readability stop collection.
+The complete campaign remains unqualified. Use `native_suite.py --runs 1`
 for a single native diagnostic run. It omits the campaign's API and workspace
 stages and does not establish a complete acceptance suite.
 
 ## CLI startup and structured output
+
+The full campaign collects only `cli/delete/tiny_4kib` from this CLI matrix.
+Each plain/JSON and cache group uses fresh paired `rm -f` references: 31 timing
+pairs plus warmup 0, and `--samples` resource pairs (minimum ten). Candidate JSON
+output is checked independently. Direct CPU covers command/reaped-child work;
+resource comparisons use RSS only, with footprint unavailable. Full source and
+candidate-based mount checks precede conditioning and follow measurement. Between
+conditioning and either method, only root/operand metadata is checked, without
+candidate execution or fixture file-content reads; fully cold metadata is not
+established. This requires stable owned trees. The original
+4 KiB/0640 fixture and every created root are validated; this case is separate
+from the enriched native-delete workload. Failed validation or uncertain work
+retains the owned fixture. A report-write failure after verified cleanup fails
+the command and retains available journal evidence, without claiming fixture retention.
+
+Use `cli.py --native-delete --candidate ... --scratch ... --output ...` for that
+collection. It does not use an older StallionFS release as a native reference.
 
 The baseline path must contain a separately installed release:
 
@@ -147,13 +187,13 @@ Apple references are plain `cp -cRp`, `mv -n` and `rm -f`; JSON comparisons are 
 /tmp/stallionfs-perf-env/bin/python tests/perf/fileops.py --memory --binary /tmp/stallionfs-perf-env/bin/stallionfs --scratch /tmp/stallionfs-perf --output /tmp/stallionfs-perf/fileops.json
 ```
 
-Requires 2 GiB free. Clone, delete and move each cover a 4 KiB file, a 64 MiB file, 2,000 flat files and 10,000 nested files. References are `cp -cRp`, `rm -rf` and `mv -n`. Both copies use copy-on-write; moves use an absent exact destination. Overwrite and cross-volume behavior are outside this comparison.
+Requires 2 GiB free. Clone, delete and move each cover a 4 KiB file, a 64 MiB file, 2,000 flat files and 10,000 nested files. References are `cp -cRp`, `rm -rf` and `mv -n`. The `cp -cRp` reference permits fallback to `copyfile`; these checks do not establish that it shared data. Moves use an absent exact destination. Overwrite and cross-volume behavior are outside this comparison.
 
 Limit a run with `--fixtures flat_2000 nested_10000 --operations clone`. Unselected fixtures are never generated; JSON records selected cases and setup, validation and cleanup durations separately from command timing.
 
 Fresh-process timings use 31 measured pairs for 4 KiB, seven otherwise, plus one warmup, with shuffled order. CPU uses `cpu_children_s`; `cpu_self_s` and aggregate `cpu_s` remain diagnostics. `--memory` adds three separate pairs using `time -lp`: child peak RSS and physical footprint, excluding the runner. Wrapped times are separate; memory counters do not measure unique filesystem-cache or APFS storage use.
 
-Validation checks content, modes, symlinks, independent clone inodes, preserved move inodes and completed deletion. Deletion operates on a copy-on-write copy of the retained fixture. Verification reads precede timing; fixtures may exceed RAM. No durability flush is requested. `--timeout` adjusts the 600-second operation/setup-copy limit.
+Validation checks content, modes, symlinks, independent clone inodes, preserved move inodes and completed deletion. Deletion operates on a separate `cp -cRp` copy of the retained fixture. Verification reads precede timing; fixtures may exceed RAM. No durability flush is requested. `--timeout` adjusts the 600-second operation/setup-copy limit.
 
 ## Large file trees
 
@@ -289,8 +329,11 @@ Both npm version inspection and installation use the disposable project prefix a
 
 On macOS, the native suite observes regular-file data-stream clone attributes through the
 already-open validation descriptors. Destination attributes are compared with
-the post-copy source. StallionFS and `cp -cRp` require positive sharing evidence
-for every data-bearing regular-file stream; ordinary `cp`, `ditto` and `rsync`
+the post-copy source. The harness requires positive sharing evidence from StallionFS and `cp -cRp`
+for every data-bearing regular-file stream. This is a validation requirement,
+not a no-fallback command contract: macOS `cp -cRp` may use `copyfile`. Positive
+sharing applies to the measured streams and does not make its command policy
+equivalent to mandatory cloning. Ordinary `cp`, `ditto` and `rsync`
 record sharing separately from copy correctness. Unsupported attributes and
 zero identifiers remain unknown. Empty and observed holes-only streams are not
 positive evidence; a tree with no qualifying streams remains unknown.

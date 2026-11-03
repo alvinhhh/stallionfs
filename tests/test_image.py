@@ -260,12 +260,72 @@ def _owned_command(argv, *, cwd, timeout, stem):
         raise
 
 
+def run_creation_success_alteration(method='creation_success_alteration'):
+    """Use the existing command lifecycle for this opt-in diagnostic."""
+    assert method in ('creation_success_alteration', 'creation_corrective')
+    previous = _install_command_handlers()
+    outcome = None
+    candidate = False
+
+    def clean():
+        state = _command_state
+        if (outcome is None or outcome.testsRun != 1 or not outcome.wasSuccessful() or outcome.skipped or
+                state['active'] is not None or state['failure'] is not None or
+                state['first_signal'] is not None or state['signal_count']):
+            return False
+        receipts = list(ImageCore.base.glob('*.command.json'))
+        if len(receipts) != 4:
+            return False
+        for path in receipts:
+            record = json.loads(path.read_text())
+            if (record['phase'] != 'done' or record['returncode'] != 0 or record['timeout'] or
+                    record['cap_reached'] or record['cleanup_errors'] or record['cleanup_uncertain'] or
+                    record['first_failure'] is not None or record['primary_exception'] is not None or
+                    record['first_signal'] is not None or record['signal_count']):
+                return False
+            for stream in ('stdout', 'stderr'):
+                captured = Path(record[stream + '_path'])
+                if (captured.is_symlink() or not captured.is_file() or
+                        captured.stat().st_size != record[stream + '_retained_bytes'] or
+                        record[stream + '_discarded_bytes'] or captured.stat().st_size >= _COMMAND_STREAM_CAP):
+                    return False
+        return True
+
+    try:
+        suite = unittest.TestSuite([ImageCore(method)])
+        outcome = unittest.TextTestRunner(verbosity=2).run(suite)
+        candidate = clean()
+        _exclusive(ImageCore.base / 'creation-finalization.json', json.dumps({
+            'diagnostic_completion_candidate': candidate,
+            'requires_actual_terminal_exit_zero': True,
+            'preservation_verdict': 'Separate creation_three_complete semantic receipt; unittest success is not preservation'
+        }, indent=2) + '\n')
+    except BaseException as error:
+        _latch_command('creation_finalization', repr(error))
+        print(f'Creation diagnostic finalization failed: {error!r}', file=sys.stderr)
+    finally:
+        try:
+            _restore_command_handlers(previous)
+        except BaseException as error:
+            _latch_command('restore_handlers', repr(error))
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return 0 if (candidate and clean() and
+                     all(signal.getsignal(number) is handler for number, handler in previous.items()) and
+                     not (set(signal.sigpending()) & set(previous))) else 1
+    except BaseException as error:
+        _latch_command('creation_final_guard', repr(error))
+        return 1
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'Offline image core requires macOS APFS')
 class ImageCore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base = Path(tempfile.mkdtemp(prefix='stallionfs-image-tests-')).resolve()
         cls.failed = False
+        cls.retain_requested = False
         cls.executables = {}
         cls.source = Path(__file__).resolve().parents[1]
         cls.common = [*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-O2', '-g',
@@ -317,12 +377,12 @@ class ImageCore(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if cls.failed:
+        if cls.failed or cls.retain_requested:
             print(f'Failed image fixtures and receipts retained: {cls.base}', file=sys.stderr)
         else:
             shutil.rmtree(cls.base)
 
-    def scenario(self, name, executable='normal', *, argument=None, timeout=90):
+    def scenario(self, name, executable='normal', *, argument=None, timeout=90, completion='PASS'):
         receipt = self.base / f'{executable}-{name}.json'
         try:
             result = _owned_command([str(self.executables[executable]), name if argument is None else str(argument)], cwd=self.base,
@@ -330,7 +390,7 @@ class ImageCore(unittest.TestCase):
             _exclusive(receipt, json.dumps({'scenario': name, 'returncode': result.returncode,
                                           'stdout': result.stdout, 'stderr': result.stderr}, indent=2))
             self.assertEqual(result.returncode, 0, f'{name}: {result.stderr}\n{result.stdout}\nRetained: {self.base}')
-            self.assertIn(f'PASS {name}', result.stdout)
+            self.assertIn(f'{completion} {name}', result.stdout)
             print(result.stdout, end='', flush=True)
         except subprocess.TimeoutExpired as error:
             type(self).failed = True
@@ -402,8 +462,26 @@ class ImageCore(unittest.TestCase):
     def test_creation_locks_fences_identity_and_retained_failures(self):
         self.scenario('creation')
 
+    def creation_success_alteration(self):
+        # Explicit invocation only; normal discovery and its case count are unchanged.
+        type(self).retain_requested = True
+        self.scenario('creation-success-alteration', timeout=15, completion='COMPLETE')
+
+    def creation_corrective(self):
+        type(self).retain_requested = True
+        self.scenario('creation-corrective', timeout=15, completion='COMPLETE')
+
+    def test_creation_readback_retry_and_unknown_outcome_cleanup(self):
+        self.scenario('creation-readback')
+
     def test_exact_io_errors_poisoning_and_no_implicit_recovery(self):
         self.scenario('io')
+
+    def test_append_readback_retry_and_rejection_preserve_committed_state(self):
+        self.scenario('append-readback')
+
+    def test_anchor_readback_retry_and_uncertain_outcome_after_final_fence(self):
+        self.scenario('anchor-readback')
 
     def test_process_cuts_and_separate_discard_unflushed_write_model(self):
         self.scenario('cuts')

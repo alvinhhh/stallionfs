@@ -26,6 +26,11 @@ native-time-v1 io_output_blocks=2
 def process(*, code=0, effects=None):
     child = mock.Mock(pid=54321, returncode=code)
     child.communicate.side_effect = effects or [(b'bytes\xff', REPORT)]
+    def wait(timeout=None):
+        if child.returncode is None:
+            raise subprocess.TimeoutExpired('command', timeout)
+        return child.returncode
+    child.wait.side_effect = wait
     return child
 
 
@@ -546,6 +551,73 @@ class NativeStatistics(unittest.TestCase):
         b[0]['phase'] = 'unknown'
         with self.assertRaises(ValueError): metrics.compare_paired(a, b, 'cpu_s')
         with self.assertRaises(ValueError): metrics.collect(['/bin/true'], timeout_s=1, phase='unknown')
+
+
+
+class CleanupOwnership(unittest.TestCase):
+    @contextmanager
+    def idle(self):
+        with mock.patch.object(metrics.signal, 'getitimer', return_value=(0, 0)), \
+                mock.patch.object(metrics.signal, 'sigpending', return_value=set()), \
+                mock.patch.object(metrics.signal, 'getsignal', return_value=signal.SIG_DFL), \
+                mock.patch.object(metrics.os, 'killpg') as kill:
+            yield kill
+
+    def test_stale_none_after_kernel_reap_never_authorizes_group_signal(self):
+        child = process(code=None)
+        child.wait.side_effect = None
+        child.wait.return_value = 0  # The kernel wait finished before Python stored returncode.
+        receipt = {'completion_uncertain': True}
+        with self.idle() as kill:
+            metrics._stop_group(child, receipt, 0.1)
+        kill.assert_not_called()
+        self.assertTrue(receipt['group_signalling_forbidden'])
+        self.assertEqual(receipt['group_signal_skipped_reason'], 'leader_already_reaped')
+
+    def test_interrupted_reconciliation_forbids_a_later_destructive_fallback(self):
+        child = process(code=None)
+        child.wait.side_effect = KeyboardInterrupt()
+        receipt = {'completion_uncertain': True}
+        with self.idle() as kill:
+            metrics._stop_group(child, receipt, 0.1)
+            metrics._stop_group(child, receipt, 0.1)
+        kill.assert_not_called()
+        child.wait.assert_called_once_with(timeout=0)
+        self.assertEqual(receipt['group_signal_skipped_reason'], 'prior_reap_uncertainty')
+
+    def test_active_alarm_cannot_authorize_reconciliation_or_signalling(self):
+        child = process(code=None)
+        with self.idle() as kill, mock.patch.object(metrics.signal, 'getitimer', return_value=(0.1, 0)):
+            metrics._stop_group(child, {}, 0.1)
+        kill.assert_not_called()
+        child.wait.assert_not_called()
+
+    def test_only_owned_unreaped_leader_can_receive_term_and_reap_ends_authority(self):
+        child = process(code=None)
+        def finish(**kwargs):
+            child.returncode = 0
+            return b'kept', b'output'
+        child.communicate.side_effect = finish
+        receipt = {'completion_uncertain': True}
+        with self.idle() as kill:
+            self.assertEqual(metrics._stop_group(child, receipt, 0.1), (b'kept', b'output'))
+            metrics._stop_group(child, receipt, 0.1)
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM)])
+        self.assertIsNone(receipt['group_alive_after_cleanup'])
+
+    def test_second_interrupt_keeps_primary_failure_and_no_later_signal(self):
+        child = process(code=None)
+        child.communicate.side_effect = KeyboardInterrupt()
+        original = PermissionError('original capture failure')
+        receipt = {}
+        with self.idle() as kill:
+            with self.assertRaises(metrics.ChildCompletionUnknown) as caught:
+                with metrics._retain_on_failure(receipt, lambda: child, None, 0.1):
+                    raise original
+            metrics._stop_group(child, receipt, 0.1)
+        self.assertIs(caught.exception.__cause__, original)
+        self.assertIn('KeyboardInterrupt', receipt['termination_error'])
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM)])
 
 
 if __name__ == '__main__': unittest.main()
