@@ -88,8 +88,8 @@ struct Fixture {
 #else
     let modes = [0,1,2]
 #endif
+    let fs = StallionExtension().fileSystem
     for mode in modes {
-        let fs = StallionExtension().fileSystem
         let resource = FSPathURLResource(url:fixture.url,writable:mode != 2)
         let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:mode == 1 ? ["--rdonly"] : []) { done(($0,$1)) } }
         need(loaded.0 != nil && loaded.1 == nil,"public factory readonly load")
@@ -103,14 +103,28 @@ struct Fixture {
         let _: Bool = wait { done in volume.unmount { done(true) } }
         let deactivated: Error? = wait { volume.deactivate(options:[],replyHandler:$0) };need(deactivated == nil,"public factory readonly deactivation")
         let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(unloaded == nil,"public factory readonly unload")
+        let again: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:mode == 1 ? ["--rdonly"] : []) { done(($0,$1)) } }
+        need(again.1 == nil && again.0 !== volume,"same public factory and resource reopen with new ownership")
+        let fresh = again.0 as! StallionVolume
+        let freshRO: Bool = wait { done in fresh.enqueue { done(fresh.coreReadOnlyForTesting()) } }
+        need(freshRO && fresh.requestedMountOptions.contains(.readOnly),"reopened factory retains readonly selection")
+        let freshClose: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(freshClose == nil,"fresh readonly ownership consumed")
         let after = try Data(contentsOf:image);need(after==before,"public factory denied mutation preserves image")
     }
     let revoked = FSPathURLResource(url:fixture.url,writable:true);revoked.revoke()
-    let fs = StallionExtension().fileSystem
     let denied: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:revoked,arguments:[]) { done(($0,$1)) } }
     need(denied.0 == nil && code(denied.1)==Int(EACCES),"public factory revoked resource denied")
     let after = try Data(contentsOf:image);need(after==before,"revoked load preserves image")
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+    let configurationResource = FSPathURLResource(url:fixture.url,writable:true)
+    fs.setLoadConfigurationHookForTesting { configurationResource.revoke() }
+    let failedConfiguration: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:configurationResource,arguments:[]) { done(($0,$1)) } }
+    fs.setLoadConfigurationHookForTesting(nil)
+    need(failedConfiguration.0 == nil && code(failedConfiguration.1)==Int(EACCES),"failed writable configuration consumes fresh handle")
+    let healthy = FSPathURLResource(url:fixture.url,writable:true)
+    let recovered: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:healthy,arguments:[]) { done(($0,$1)) } }
+    need(recovered.1 == nil && recovered.0 != nil,"same factory recovers after configuration failure")
+    let recoveredClose: Error? = wait { fs.unloadResource(resource:healthy,replyHandler:$0) };need(recoveredClose == nil,"recovered fresh handle closes")
     try accessPolicyChecks(parent,factory:true)
 #endif
 }
@@ -244,7 +258,7 @@ struct Fixture {
     let trace: [StallionVolume.Record]=wait { done in v.enqueue { done(v.capturedRecords()) } }
     need(trace.isEmpty,"nonfixture policy leaves optional trace empty")
     close(fs,v,active.0,found.0,expectedError:Int(EACCES))
-    let reopened = makeFileSystem()
+    let reopened = fs
     let probe: (FSProbeResult?,Error?) = wait { done in reopened.probeResource(resource:resource) { done(($0,$1)) } }
     need(probe.1 == nil && probe.0?.containerID?.uuid==f.identity,"persistent container identity after commit")
     let again = load(reopened,["--rdonly"]);need(again.1 == nil,"read-only reopen after mutation")
