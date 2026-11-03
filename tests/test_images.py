@@ -12,9 +12,9 @@ from unittest.mock import patch
 
 from stallionfs import images
 if __package__:
-    from .image_failure_diagnostics import failure_scope
+    from .image_failure_diagnostics import failure_scope, observe_detach
 else:
-    from image_failure_diagnostics import failure_scope
+    from image_failure_diagnostics import failure_scope, observe_detach
 from stallionfs.core import StallionError
 
 
@@ -37,7 +37,9 @@ class Images(unittest.TestCase):
         for image in self.base.glob('*.sparseimage'):
             state = images.mounted(image)
             if state:
-                images.detach(image, state['mountpoint'] or self.base / 'unused')
+                mountpoint = state['mountpoint'] or self.base / 'unused'
+                with failure_scope(self.base, image, mountpoint=mountpoint, stage='cleanup'), observe_detach():
+                    images.detach(image, mountpoint)
         shutil.rmtree(self.base)
 
     def test_clone_ownership_busy_detach_and_recovery(self):
@@ -73,7 +75,9 @@ class Images(unittest.TestCase):
                     images.detach(first, first_mount)
             self.assertEqual(busy.read(), b'changed')
             self.assertIsNotNone(images.mounted(first))
-        images.detach(first, first_mount)
+        self.assertTrue(busy.closed)
+        with failure_scope(self.base, first, mountpoint=first_mount, stage='body'), observe_detach():
+            images.detach(first, first_mount)
         self.assertIsNone(images.mounted(first))
         repo = images.attach(first, first_mount)
         self.assertEqual((repo / 'file').read_bytes(), b'changed')

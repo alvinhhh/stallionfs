@@ -6,7 +6,13 @@ import SFSImage
 @main
 #endif
 struct StallionExtension: UnaryFileSystemExtension {
-    var fileSystem: StallionFileSystem { StallionFileSystem() }
+    var fileSystem: StallionFileSystem {
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+        StallionFileSystem(accessPolicy: .contextualWrites)
+#else
+        StallionFileSystem()
+#endif
+    }
 }
 // A load keeps the exact core-open access selected before its handle exists.
 // Only this file can construct a production admission after that open succeeds.
@@ -30,8 +36,8 @@ struct ImageAdmission {
 #endif
 }
 final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchecked Sendable {
-    // Candidate opt-in: compile contextual handlers plus STALLION_CONTEXT_WRITES
-    // and construct with .contextualWrites. The public entry point stays RO.
+    // The public entry point enables contextual writes only with both build flags.
+    // Direct construction defaults to read-only.
     // Writable acquisition uses delivered caller context; data I/O additionally
     // requires the canonical item's retained write mode from a successful open.
     // Kernel cache/descriptor ordering still requires mounted qualification.

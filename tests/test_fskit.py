@@ -175,22 +175,31 @@ class FSKitInterfaces(unittest.TestCase):
                 self.assertFalse(any(word in symbols.stdout.lower() for word in forbidden))
             # Genuine core and no diagnostic flag: exercise retained-open
             # admission without claiming installed descriptor/cache routing.
-            for variant in ('legacy', 'context'):
+            for variant, handlers, writes in (('neither', False, False), ('handlers', True, False),
+                                              ('writes', False, True), ('both', True, True)):
                 directory = self.base / (variant + '-admission')
                 directory.mkdir(mode=0o700)
                 images = directory / 'images'
                 images.mkdir(mode=0o700)
-                defines = ['-D', 'STALLION_CONTEXT_WRITES', '-D', 'STALLION_ADAPTER_CHECK']
-                if variant == 'context':
+                defines = ['-D', 'STALLION_ADAPTER_CHECK']
+                if writes:
+                    defines += ['-D', 'STALLION_CONTEXT_WRITES']
+                if handlers:
                     defines += ['-D', 'STALLION_CONTEXT_HANDLERS']
                 executable = directory / 'admission-check'
                 self.command(variant + '-admission-build', [self.tools['swiftc'], *defines,
                              '-swift-version', '6', '-strict-concurrency=complete', '-target', target,
                              '-sdk', self.sdk, '-I', filesystem / 'fskit', '-g', '-Onone', '-parse-as-library',
                              '-module-cache-path', directory / 'cache', *sources,
-                             tests / 'fskit_write_driver.swift', normal, hooks, '-o', executable], 180, swift=variant)
+                             tests / 'fskit_write_driver.swift', normal, hooks, '-o', executable], 180,
+                             swift='context' if handlers else 'legacy')
                 child = self.command(variant + '-admission-run', [executable, '--access-policy', images], 180)
                 self.assertEqual(child.stdout, 'PASS immutable read-only selection, contextual open grants and retained-write delivery\n')
+                self.assertEqual(child.stderr, '')
+                factory_images = directory / 'factory-images'
+                factory_images.mkdir(mode=0o700)
+                child = self.command(variant + '-factory-run', [executable, '--factory-policy', factory_images], 180)
+                self.assertEqual(child.stdout, 'PASS public factory access selection, refusal and persistence\n')
                 self.assertEqual(child.stderr, '')
             module = self.base / 'context-admission-module'
             self.command('context-admission-module-build', [self.tools['swiftc'],

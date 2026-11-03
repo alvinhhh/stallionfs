@@ -1022,7 +1022,7 @@ class DiagnosticTests(unittest.TestCase):
         first = fixture.base / 'first.sparseimage'
         first_mount = fixture.base / 'first'
         native = [dict(path=str(first_mount), device='/dev/disk998', readonly=False, ignore_ownership=False)]
-        attached, scopes = {}, []
+        attached, scopes, observations = {}, [], []
         primary = image_cases.StallionError('unexpected recovery failure')
         def clone(source, destination):
             if source in attached:
@@ -1049,7 +1049,8 @@ class DiagnosticTests(unittest.TestCase):
                 raise image_cases.StallionError('wrong mountpoint')
             scope = diagnostics._scope.get()
             scopes.append(scope)
-            error = image_cases.StallionError('intentional busy') if scope else primary
+            observations.append(diagnostics._detach_observation.get() is not None)
+            error = image_cases.StallionError('intentional busy') if scope['expected'] else primary
             self.reporter.report(self.args, error, scope)
             raise error
         with patch.object(image_cases.images, 'clone', side_effect=clone), \
@@ -1061,10 +1062,42 @@ class DiagnosticTests(unittest.TestCase):
             image_cases.Images.test_clone_ownership_busy_detach_and_recovery(fixture)
         self.assertIs(caught.exception, primary)
         self.assertEqual(scopes, [dict(base=fixture.base, image=first, workspace=None,
-            mountpoint=first_mount, stage='body', expected=True), None])
+            mountpoint=first_mount, stage='body', expected=True),
+            dict(base=fixture.base, image=first, workspace=None,
+                 mountpoint=first_mount, stage='body', expected=False)])
         self.assertEqual(self.reporter.attempts, 1)
         self.assertEqual(self.events()[0]['message'], 'unexpected recovery failure')
+        self.assertEqual(observations, [False, True])
+        self.assertIsNone(diagnostics._detach_observation.get())
         self.assertIsNone(diagnostics._scope.get())
+
+    def test_image_cleanup_observes_detach_and_retains_fixture_on_failure(self):
+        fixture = image_cases.Images()
+        fixture.base = self.base / 'cleanup-case'
+        fixture.base.mkdir(mode=0o700)
+        image = fixture.base / 'copy.sparseimage'
+        image.write_bytes(b'synthetic backing')
+        primary = image_cases.StallionError('cleanup busy')
+        for mounted_point in (str(fixture.base / 'volume'), None):
+            with self.subTest(mountpoint=mounted_point):
+                point = mounted_point or fixture.base / 'unused'
+                def detach(actual_image, actual_point):
+                    self.assertEqual((actual_image, actual_point), (image, point))
+                    self.assertEqual(diagnostics._scope.get(), dict(base=fixture.base,
+                        image=image, workspace=None, mountpoint=Path(point),
+                        stage='cleanup', expected=False))
+                    self.assertIsNotNone(diagnostics._detach_observation.get())
+                    raise primary
+                with patch.object(image_cases.images, 'mounted', return_value=dict(mountpoint=mounted_point)), \
+                        patch.object(image_cases.images, 'detach', side_effect=detach), \
+                        patch.object(image_cases.shutil, 'rmtree') as remove:
+                    with self.assertRaises(type(primary)) as caught:
+                        fixture.tearDown()
+                    self.assertIs(caught.exception, primary)
+                    remove.assert_not_called()
+                self.assertTrue(image.exists())
+                self.assertIsNone(diagnostics._scope.get())
+                self.assertIsNone(diagnostics._detach_observation.get())
 
     def test_eject_query_follows_both_existing_attempts_and_keeps_original_exception(self):
         first, final = space.images._error('first busy'), space.images._error('final busy')

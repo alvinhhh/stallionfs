@@ -323,7 +323,9 @@ def run_creation_success_alteration(method='creation_success_alteration'):
 class ImageCore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        print('ImageCore setup: start', file=sys.stderr, flush=True)
         cls.base = Path(tempfile.mkdtemp(prefix='stallionfs-image-tests-')).resolve()
+        print('ImageCore setup: directory-ready', file=sys.stderr, flush=True)
         cls.failed = False
         cls.retain_requested = False
         cls.executables = {}
@@ -333,6 +335,7 @@ class ImageCore(unittest.TestCase):
                       '-I', str(cls.source / 'filesystem'), *shlex.split(os.environ.get('CFLAGS', ''))]
         try:
             cls.compile('normal')
+            print('ImageCore setup: complete', file=sys.stderr, flush=True)
         except BaseException as error:
             _latch_command('compile', repr(error))
             print(f'Image compilation evidence retained: {cls.base}', file=sys.stderr)
@@ -342,6 +345,7 @@ class ImageCore(unittest.TestCase):
     def compile(cls, name, *defines):
         if name in cls.executables:
             return cls.executables[name]
+        print('ImageCore compile: preparation-start', file=sys.stderr, flush=True)
         obj, exe = cls.base / f'{name}.o', cls.base / name
         replacements = ('pread', 'pwrite', 'fcntl', 'fsync', 'flock', 'close',
                         'openat', 'fstat', 'fstatat', 'fstatfs', 'mkdirat', 'unlinkat',
@@ -360,18 +364,28 @@ class ImageCore(unittest.TestCase):
              '-include', str(shim), '-c', str(cls.source / 'filesystem/image.c'), '-o', str(obj)],
             [*cls.common, *defines, str(cls.source / 'tests/image_driver.c'), str(obj), '-o', str(exe)],
         ]
+        print('ImageCore compile: preparation-complete', file=sys.stderr, flush=True)
         for index, command in enumerate(commands):
+            stage = 'core' if index == 0 else 'driver-link'
+            print(f'ImageCore {stage}: command-start', file=sys.stderr, flush=True)
             result = _owned_command(command, cwd=None, timeout=60, stem=cls.base / f'command-{name}-compile-{index}')
+            print(f'ImageCore {stage}: command-return', file=sys.stderr, flush=True)
             _exclusive(cls.base / f'{name}-compile-{index}.txt', result.stdout + result.stderr)
+            print(f'ImageCore {stage}: receipt-written', file=sys.stderr, flush=True)
             if result.returncode:
                 raise AssertionError(f'Image compilation failed; retained {cls.base}\n{result.stderr}')
+            print(f'ImageCore {stage}: command-success', file=sys.stderr, flush=True)
             if index == 0:
+                print('ImageCore symbols: command-start', file=sys.stderr, flush=True)
                 symbols = _owned_command(['/usr/bin/nm', '-u', str(obj)], cwd=None, timeout=60,
                                          stem=cls.base / f'command-{name}-symbols')
+                print('ImageCore symbols: command-return', file=sys.stderr, flush=True)
                 _exclusive(cls.base / f'{name}-symbols.txt', symbols.stdout + symbols.stderr)
+                print('ImageCore symbols: receipt-written', file=sys.stderr, flush=True)
                 if symbols.returncode or not {'_sfs_test_memcpy', '_sfs_test_clock_gettime'} <= set(symbols.stdout.split()):
                     _latch_command('symbols', name)
                     raise AssertionError(f'Image copy/clock hook absent; retained {cls.base}')
+                print('ImageCore symbols: command-success', file=sys.stderr, flush=True)
         cls.executables[name] = exe
         return exe
 
