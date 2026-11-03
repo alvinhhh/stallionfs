@@ -86,7 +86,7 @@ jobs:
           sys.path.insert(0, str(checkout / 'tests'))
           from image_failure_diagnostics import install
           diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
-          faulthandler.dump_traceback_later(300)
+          faulthandler.dump_traceback_later(300, repeat=True)
           suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
           try:
               result = unittest.TextTestRunner(verbosity=2, resultclass=ContextualResult).run(suite)
