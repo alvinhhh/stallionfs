@@ -79,7 +79,11 @@ class Lifecycle:
 
     def _payload(self, path, meta):
         if meta.get('backend') == 'native-image':
-            target = core.native_target(meta)
+            if meta.get('ownership') == 'store-created':
+                from ._native import installed_target
+                target = installed_target(self, path, meta, confirmed=False)
+            else:
+                target = core.native_target(meta)
             return Path(target['directory']) / target['component']
         return path / ('workspace.sparseimage' if meta.get('backend') == 'image' else 'repo')
 
@@ -89,8 +93,12 @@ class Lifecycle:
     def _open(self, workspace, path, meta, *, enrolled=None):
         state_path = self._state(workspace)
         previous = core.read_json(state_path) if state_path.exists() else {}
+        if meta.get('backend') == 'native-image':
+            enrolled = False
+        elif enrolled is None:
+            enrolled = previous.get('enrolled') is True
         state = {'id': workspace, 'generation': uuid.uuid4().hex, 'status': 'open',
-                 'enrolled': previous.get('enrolled') is True if enrolled is None else enrolled,
+                 'enrolled': enrolled,
                  'object': identity(path), 'payload': identity(self._payload(path, meta))}
         replace_json(state_path, state)
         protection = self.root / 'protected' / f'{workspace}.json'
@@ -174,6 +182,8 @@ class Lifecycle:
         with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
             if meta.get('backend') == 'native-image':
+                if meta.get('ownership') == 'store-created':
+                    raise core.StallionError('Owned native snapshots and rollback are not implemented')
                 name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
                 response = {'id': name, 'name': name, 'workspace': workspace, 'backend': 'native-image',
                             'native_image_result': None}
@@ -199,6 +209,8 @@ class Lifecycle:
     def snapshots(self, workspace):
         _, meta = self.object('workspaces', workspace)
         if meta.get('backend') == 'native-image':
+            if meta.get('ownership') == 'store-created':
+                raise core.StallionError('Owned native snapshots and rollback are not implemented')
             with self._workspace_lock(workspace):
                 _, meta = self.object('workspaces', workspace)
                 return core.native_operation(core.native_target(meta), 'snapshots')['snapshots']
@@ -228,6 +240,17 @@ class Lifecycle:
         if not os.path.lexists(journal):
             return
         registration = self.root / 'workspaces' / workspace / 'meta.json'
+        record = core.read_json(journal)
+        if record.get('operation') in ('native-create', 'native-mount', 'native-unmount'):
+            if registration.exists():
+                metadata = core.read_json(registration)
+                if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
+                    from ._native import check_pending
+                    check_pending(workspace, record)
+                    return  # Explicit mount/unmount observes recovery; never replay here.
+            if record.get('operation') == 'native-create':
+                raise core.StallionError(f'Native candidate intent retained without reconciliation: {journal}')
+            raise core.StallionError('Native operation intent has no installed owned workspace')
         if registration.exists() and core.read_json(registration).get('backend') == 'native-image':
             raise core.StallionError('Unexpected exchange journal for a native image registration; retained unchanged')
         record = core.read_json(journal)
@@ -256,6 +279,8 @@ class Lifecycle:
         with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
             if meta.get('backend') == 'native-image':
+                if meta.get('ownership') == 'store-created':
+                    raise core.StallionError('Owned native snapshots and rollback are not implemented')
                 snapshot = self._native_name(snapshot)
                 recovery = 'recovery-' + uuid.uuid4().hex
                 response = {'workspace': workspace, 'snapshot': snapshot, 'recovery': recovery,
@@ -333,6 +358,7 @@ class Lifecycle:
         if auto_retire and not self.cleanup_config()['enabled']:
             raise core.StallionError('Enable cleanup before using --auto-retire')
         generation = None
+        native_access = None
         try:
             with self._lease(workspace) as lease_fd:
                 with core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
@@ -352,13 +378,23 @@ class Lifecycle:
                         state['auto_retire'] = {'generation': state['generation']}
                         replace_json(self._state(workspace), state)
                         generation = state['generation']
-                    repo = self._mount(path, meta)['path']
+                    access = self._mount(path, meta)
+                    if meta.get('backend') == 'native-image':
+                        native_access = access
+                    repo = access['path']
                 options = {}
                 if auto_retire:
                     options = {'pass_fds': (lease_fd,), 'env': {
                         **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
                         'STALLIONFS_LEASE_GENERATION': generation}}
                 result = subprocess.run(command, cwd=repo, **options)
+        except BaseException as error:
+            if native_access is not None:
+                try:
+                    error.native_image_result = native_access
+                except (AttributeError, MemoryError):
+                    pass
+            raise
         finally:
             # Closing our descriptor must not unlock the shared lease held by descendants.
             if generation is not None:

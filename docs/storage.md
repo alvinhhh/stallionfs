@@ -86,3 +86,52 @@ proof that an earlier fence completed. Malformed pairs refuse normal admission.
 Physical power-loss recovery, native lifecycle cleanup, installed mounting and
 performance acceptance require separate qualification.
 
+
+## Installed owned native workspaces
+
+Native creation keeps the prepared folder input and verified image candidate
+under the existing typed creation intent. Installation holds the same creation
+locks and backing guard while moving only the owned resource directory to
+`workspaces/<id>`. It verifies the moved destination with the same guard token.
+After consumption, exact inode, UUID and initial committed anchor must match the
+FULL-verified import before `native-install.json` records completed ownership.
+`native-create.json` remains immutable origin evidence; current installed
+location and later anchors are separate. The resource directory must retain its
+original inode through the rename; recovery also binds the saved intent object
+and installation metadata to that immutable origin.
+
+A rename followed by a proof/close error retains `installed-unconfirmed` plus
+the intent. Before any first mount, explicit recovery may use a fresh guard with
+the original anchor and lineage to complete installation without repeating import
+or rename. It preserves the previous result. Once mounting has been attempted,
+that first-install recovery route is closed. Installed ownership blocks external
+registration of the backing inode independently of the creation journal.
+
+Mount/unmount intents and helper output remain in each workspace's
+`native-operations` directory; the active typed record is also in the existing
+journal directory. The lease spans helper launch, stop/reap and observation.
+Interruption while a directly owned helper is being launched is recorded until
+its handle is retained, then handled under the same lease. A helper that cannot
+be reaped leaves a pending hold and stays supervised; no later managed mutator
+is admitted. Persisted helper dispositions must contain typed terminal/reaped
+evidence; missing or inconsistent fields retain the hold. Prior attempts are
+referenced by retained receipt path, and repeated supervision failures keep
+counts plus first/last detail rather than an unbounded nested history.
+These records describe observed operations, not a live-session
+registry or authenticated history of adapter writeback.
+
+The resource-directory descriptor is outside the mount. It checks host/backing
+identity while a new mounted-root descriptor supplies `fstatfs` evidence after
+mounting. The descriptor observation and native mount table must agree on exact
+root, type, owner, flags and filesystem ID. Informational source text is not
+interpreted as backing identity. Mounted observation descriptors close before
+ordinary unmount. Namespace absence followed by a fresh guard/consumed close
+permits a normal later mount, but grants neither prior-close success nor deletion
+authority. Owned workspaces stay unenrolled and without `closed_at`; native
+snapshot/rollback/retirement/purge support is a later step.
+
+First-mount attempt and successful first-use acceptance are separate durable
+facts. Until the initial Git branch/commit and write/fsync/remove probe succeed,
+a mount after recovery must repeat those acceptance checks. Successful acceptance
+is persisted before a usable repository path is returned. Later ordinary branch
+and content changes do not reapply original import expectations.

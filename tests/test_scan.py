@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 
-from stallionfs._scan import mounts, scan
+from stallionfs._scan import mount_for_descriptor, mounts, scan
 
 
 def reference(root):
@@ -43,6 +43,24 @@ class Scan(unittest.TestCase):
             self.assertIsInstance(record['ignore_ownership'], bool)
             self.assertIsInstance(record['owner'], int)
             self.assertGreaterEqual(record['owner'], 0)
+            self.assertIsInstance(record['flags'], int)
+            self.assertIsInstance(record['fsid'], tuple)
+            self.assertEqual(len(record['fsid']), 2)
+            self.assertTrue(all(isinstance(value, int) for value in record['fsid']))
+
+    def test_descriptor_mount_observation_borrows_live_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                actual = mount_for_descriptor(descriptor)
+                os.fstat(descriptor)  # The provider must not consume its caller's descriptor.
+                expected = [row for row in mounts() if row['path'] == actual['path']]
+                self.assertEqual(expected, [actual])
+                # APFS firmlinks need not be lexical descendants of f_mntonname.
+            finally:
+                os.close(descriptor)
+            with self.assertRaises(OSError):
+                mount_for_descriptor(descriptor)
 
     def test_bulk_matches_reference_and_parallel_calls(self):
         with tempfile.TemporaryDirectory() as directory:

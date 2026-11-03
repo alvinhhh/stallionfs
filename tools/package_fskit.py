@@ -6,6 +6,8 @@ from pathlib import Path
 import plistlib
 import re
 import stat
+import subprocess
+import tempfile
 
 
 def read_executable(path):
@@ -34,11 +36,67 @@ def write_new(path, data, mode):
         raise OSError('Package copy mismatch')
 
 
+PROFILE_SYMBOLS = {'_stallionfs_factory_read_only_v1': 'read-only',
+                   '_stallionfs_factory_contextual_writes_v1': 'contextual-writes'}
+PROFILE_OUTPUT_LIMIT = 1024 * 1024
+
+
+def _tool_output(argv, directory):
+    # Keep tool output off pipes and bound the accepted complete response.
+    with tempfile.TemporaryFile(dir=directory) as output:
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                stderr=output, timeout=30, check=False)
+        output.seek(0)
+        data = output.read(PROFILE_OUTPUT_LIMIT + 1)
+    if result.returncode != 0 or len(data) > PROFILE_OUTPUT_LIMIT:
+        raise ValueError('Compiled factory inspection failed or exceeded its output limit')
+    try:
+        return data.decode('utf-8', errors='strict')
+    except UnicodeError as error:
+        raise ValueError('Invalid compiled factory inspection output') from error
+
+
+def compiled_factory_profile(extension, requested=None):
+    """Inspect the exact bytes copied to the package, without executing them.
+
+    Signing may change executable bytes later. This pre-sign digest identifies
+    build input only; the eventual bundle signature seals code and declaration.
+    """
+    with tempfile.TemporaryDirectory(prefix='stallionfs-package-') as temporary:
+        directory = Path(temporary)
+        executable = directory / 'extension'
+        write_new(executable, extension, 0o700)
+        architectures = _tool_output(['/usr/bin/lipo', '-archs', str(executable)], directory).split()
+        if (not architectures or len(architectures) != len(set(architectures))
+                or any(arch not in ('arm64', 'arm64e', 'x86_64') for arch in architectures)):
+            raise ValueError('Missing or unsupported executable architecture inventory')
+        policies = []
+        for architecture in architectures:
+            symbols = _tool_output(['/usr/bin/nm', '-arch', architecture, '-g', '-U', '-j',
+                                    str(executable)], directory).splitlines()
+            markers = [symbol for symbol in symbols if symbol in PROFILE_SYMBOLS]
+            if len(markers) != 1:
+                raise ValueError('Missing, stripped or contradictory compiled factory profile')
+            policies.append(PROFILE_SYMBOLS[markers[0]])
+        if len(set(policies)) != 1:
+            raise ValueError('Executable architectures disagree on factory policy')
+        policy = policies[0]
+        if requested is not None and requested != policy:
+            raise ValueError('Requested access policy differs from compiled factory')
+        if read_executable(executable) != extension:
+            raise ValueError('Executable changed during compiled factory inspection')
+    return {'schema': 1, 'policy': policy, 'architectures': architectures,
+            'pre_sign_sha256': hashlib.sha256(extension).hexdigest()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', required=True, type=Path)
     parser.add_argument('--extension', required=True, type=Path)
     parser.add_argument('--out', required=True, type=Path, help='Fresh .app path; never an installed app')
+    parser.add_argument('--profile', choices=('production', 'private-sfsro27'), default='production')
+    parser.add_argument('--access-policy', choices=('read-only', 'contextual-writes'),
+                        help='Optional assertion; policy is derived from the compiled factory')
     parser.add_argument('--bundle-version', required=True, help='Explicit development bundle version')
     args = parser.parse_args()
     if not re.fullmatch(r'[1-9][0-9]*(?:\.[0-9]+){0,2}', args.bundle_version):
@@ -50,12 +108,19 @@ def main():
         parser.error('--out must not already exist')
     templates = Path(__file__).resolve().parents[1] / 'filesystem/fskit'
     host, extension = read_executable(args.host), read_executable(args.extension)
+    factory = compiled_factory_profile(extension, args.access_policy)
     plists = []
     for name in ('Host.Info.plist', 'Module.Info.plist'):
         value = plistlib.loads((templates / name).read_bytes())
         if value.get('CFBundleVersion') != '__BUNDLE_VERSION__':
             raise ValueError('Unexpected bundle version template')
         value['CFBundleVersion'] = args.bundle_version
+        if name == 'Host.Info.plist':
+            value['StallionFSControllerProtocol'] = 1
+        else:
+            value['EXAppExtensionAttributes']['FSShortName'] = 'stallionfs' if args.profile == 'production' else 'sfsro27'
+            value['StallionFSAccessPolicy'] = factory['policy']
+            value['StallionFSCompiledFactory'] = factory
         plists.append(plistlib.dumps(value, sort_keys=True))
     os.umask(0o077)
     output.mkdir(mode=0o700)

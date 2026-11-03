@@ -59,6 +59,21 @@ def owned_native_target(path, metadata):
             target['file'] != [info.st_dev, info.st_ino]):
         raise StallionError('Native candidate backing identity changed')
     proof = read_json(path / 'native-create.json')
+    validate_native_creation_proof(metadata, proof)
+    # Reuse the unchanged external target validator only for its identity schema.
+    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
+                'file': target['file'], 'uuid': target['uuid']}
+    native_target({'ownership': 'external-reference', 'native_image': resolved})
+    return resolved
+
+
+def validate_native_creation_proof(metadata, proof):
+    """Validate immutable import lineage without treating its old path as current."""
+    target = metadata.get('native_image')
+    if (metadata.get('ownership') != 'store-created' or metadata.get('backend') != 'native-image'
+            or metadata.get('state') != 'candidate' or not isinstance(target, dict)
+            or target.get('component') != 'image.sfs' or set(target) != {'component', 'parent', 'object', 'file', 'uuid', 'anchor'}):
+        raise StallionError('Invalid native creation lineage')
     identifier(metadata.get('id'), 32)
     identifier(metadata.get('seed'), 64)
     identifier(metadata.get('transaction'), 32)
@@ -92,11 +107,10 @@ def owned_native_target(path, metadata):
             result.get('identity', {}).get('uuid') != target['uuid'] or result.get('anchor') != target['anchor'] or
             any(result.get(key, {}).get('status') != 0 for key in ('close', 'reopen', 'reopen_close'))):
         raise StallionError('Native candidate lacks matching completed creation proof')
-    # Reuse the unchanged external target validator only for its identity schema.
-    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
-                'file': target['file'], 'uuid': target['uuid']}
-    native_target({'ownership': 'external-reference', 'native_image': resolved})
-    return resolved
+    native_target({'ownership': 'external-reference', 'native_image': {
+        'directory': '/creation-proof', 'component': target['component'],
+        'parent': target['object'], 'file': target['file'], 'uuid': target['uuid']}})
+    return target
 
 
 def native_retention_reason(path):
@@ -379,7 +393,11 @@ class Store(Lifecycle):
         if metadata.get('backend') == 'native-image':
             if kind != 'workspaces':
                 raise StallionError('Native image registrations are not seeds or trash')
-            native_target(metadata)
+            if metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                installed_target(self, path, metadata, confirmed=False)
+            else:
+                native_target(metadata)
             return path, metadata
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(metadata.get("commit", ""))):
             raise StallionError(f"Invalid commit in metadata: {path}")
@@ -405,7 +423,11 @@ class Store(Lifecycle):
             metadata = read_json(registration / 'meta.json')
             if metadata.get('backend') != 'native-image':
                 continue
-            target = native_target(metadata)
+            if metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                target = installed_target(self, registration, metadata, confirmed=False)
+            else:
+                target = native_target(metadata)
             references.append(tuple(target['file']))
             try:
                 parent = Path(target['directory']).lstat()
@@ -432,6 +454,13 @@ class Store(Lifecycle):
 
     def _refuse_owned_native_reference(self, target):
         expected = target['file']
+        for workspace in (self.root / 'workspaces').iterdir():
+            metadata = read_json(workspace / 'meta.json')
+            if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                owned = installed_target(self, workspace, metadata, confirmed=False)
+                if owned['file'] == expected:
+                    raise StallionError('An installed owned native image cannot be registered as external')
         for stage in (self.root / 'staging').iterdir():
             private_directory(stage)
             if os.path.lexists(stage / 'owned'):
@@ -510,8 +539,8 @@ class Store(Lifecycle):
                 raise error from closing_error
             raise
 
-    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None):
-        """Produce a retained verified image; public workspace creation is unchanged."""
+    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None, install_profile=None, native_host=None):
+        """Produce a retained verified image; optionally continue into guarded installation."""
         import uuid
         from . import _image
         from .lifecycle import identity, replace_json
@@ -565,6 +594,9 @@ class Store(Lifecycle):
                 if read_json(journal).get('transaction') != transaction:
                     raise StallionError('Native candidate intent ownership changed')
                 with self._workspace_lock(workspace, reconcile=False, native_result=native_result):
+                    if install_profile is not None:
+                        from ._native import preflight_create
+                        preflight_create(self, response, intent, stage, journal, install_profile, native_host)
                     repo = host / 'repo'
                     clone_tree(base / 'repo', repo, jobs=jobs)
                     branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
@@ -645,6 +677,9 @@ class Store(Lifecycle):
                         response['host_cleanup_error'] = str(error)
                     else:
                         response['host_cleanup_complete'] = True
+                    if install_profile is not None:
+                        from ._native import install_candidate
+                        return install_candidate(self, response, intent, metadata, install_profile, native_host)
                     # The intent remains an observational hold, never an exchange journal.
                     return response
 
@@ -728,7 +763,32 @@ class Store(Lifecycle):
                     path.rename(stage / "expired")
             return {"deleted" if yes else "would_delete": seed}
 
-    def create(self, seed, *, name="", jobs=4):
+    def create(self, seed, *, name="", jobs=4, backend=None, capacity_gib=None,
+               native_profile='production', native_host=None):
+        if backend == 'native-image':
+            result = self._build_owned_native_candidate(seed, name=name, jobs=jobs,
+                native_capacity_gib=capacity_gib, install_profile=native_profile, native_host=native_host)
+            workspace = result['workspace']
+            try:
+                mounted_result = [result]
+                with self._workspace_lock(workspace, native_result=mounted_result):
+                    path, metadata = self.object('workspaces', workspace)
+                    from ._native import mount_locked
+                    mounted = mount_locked(self, path, metadata)
+                    mounted_result[0] = {**mounted, 'installation': result}
+                    return mounted_result[0]
+            except BaseException as error:
+                try:
+                    receipt = getattr(error, 'native_candidate_result', None)
+                    if isinstance(receipt, dict):
+                        receipt['installation'] = result
+                    else:
+                        error.native_candidate_result = result
+                except (AttributeError, MemoryError):
+                    pass
+                raise
+        if backend is not None or capacity_gib is not None or native_host is not None or native_profile != 'production':
+            raise StallionError('Native capacity/profile/host options require --backend native-image')
         import uuid
         identifier(seed, 64)
         if type(jobs) is not int or not 1 <= jobs <= 4:
@@ -759,7 +819,10 @@ class Store(Lifecycle):
 
     def _mount(self, path, metadata):
         if metadata.get('backend') == 'native-image':
-            raise StallionError('Mounted native image sessions are not supported by this command')
+            if metadata.get('ownership') != 'store-created':
+                raise StallionError('Mounting external native registrations is not supported')
+            from ._native import mount_locked
+            return mount_locked(self, path, metadata)
         repo = path / "repo"
         if metadata.get("backend") == "image":
             from . import images
@@ -781,17 +844,26 @@ class Store(Lifecycle):
 
     def mount(self, workspace):
         identifier(workspace, 32)
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, metadata = self.object("workspaces", workspace)
             self._open(workspace, path, metadata)
-            return self._mount(path, metadata)
+            result = self._mount(path, metadata)
+            if metadata.get('backend') == 'native-image':
+                native_result[0] = result
+            return result
 
     def unmount(self, workspace):
         identifier(workspace, 32)
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, metadata = self.object("workspaces", workspace)
             if metadata.get('backend') == 'native-image':
-                raise StallionError('Mounted native image sessions are not supported by this command')
+                if metadata.get('ownership') != 'store-created':
+                    raise StallionError('Unmounting external native registrations is not supported')
+                from ._native import unmount_locked
+                native_result[0] = unmount_locked(self, path, metadata)
+                return native_result[0]
             if metadata.get("backend") != "image":
                 raise StallionError("This workspace is an ordinary folder")
             self._open(workspace, path, metadata)
@@ -810,8 +882,11 @@ class Store(Lifecycle):
                 if meta.get("backend") == "image":
                     target = path / ("workspace.sparseimage" if kind == "seeds" else "volume/repo")
                 elif meta.get('backend') == 'native-image':
-                    native = native_target(meta)
-                    target = Path(native['directory']) / native['component']
+                    if meta.get('ownership') == 'store-created':
+                        target = path / 'volume/repo'
+                    else:
+                        native = native_target(meta)
+                        target = Path(native['directory']) / native['component']
                 values.append({**meta, "path": str(target)})
             except FileNotFoundError:
                 continue  # An object can be moved by another process while listing.
