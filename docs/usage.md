@@ -195,6 +195,60 @@ sfs purge trash WORKSPACE_ID
 ```
 
 `purge` is deliberate permanent deletion. Inspect the data first. Interrupted deletion retains its remainder in staging and reports that path, keeping usable snapshot listings clear of partial entries. Pending rollback journals and mounted images prevent purging. Keep any previous rollback repository you need by copying `recovery/RECOVERY_ID/repo` to a new path before purging its slot; image recovery remains a closed `workspace.sparseimage` backing file.
+## Owned native workspaces
+
+Native workspaces require a qualified, signed StallionFS package enabled in
+File System Extensions settings. The production filesystem type is `stallionfs`.
+The current controller requires macOS 27 and a writable package; packaging,
+discovery and offline tests alone do not qualify an installed release. See
+[FSKit packaging](fskit-package.md) for the remaining distribution and mounted
+validation requirements.
+
+Prepare an ordinary folder seed, then create an independent native image:
+
+```sh
+seed=$(sfs prepare /path/to/project --key dependencies-v1 -- npm ci)
+sfs --json create "$seed" --backend native-image --capacity-gib 8 --name parser
+sfs run WORKSPACE_ID -- python3 -c 'from pathlib import Path; Path("result").write_text("saved")'
+sfs unmount WORKSPACE_ID
+sfs mount WORKSPACE_ID
+```
+
+Successful creation prints the mounted `volume/repo` path, containing the
+prepared commit, dependencies and a new workspace branch. Each image has a fresh
+UUID. Creation verifies the imported image, installs only its owned resource
+directory, completes its ownership proof, then mounts and checks the writable
+repository path. Capacity is required in GiB; APFS-image seeds are not accepted.
+Ordinary folder creation remains the default.
+
+`run` holds the managed-use lease while the command executes. Stop shells,
+editors and other users before `unmount`; unmount never forces a busy volume.
+After successful ordinary unmount, the controller requires namespace absence
+and a fresh exact-image guard with successful consumed close. Later mounts allow
+legitimate content and Git changes; they do not reset the original branch or
+require the creation anchor to remain current.
+
+On failure, use `--json` and retain the reported workspace, journal and operation
+files. A completed install survives mount failure. If the target is absent,
+`mount ID` can try a new operation after the previous helper is reaped. If a
+matching mount exists but completion is unresolved, explicitly `unmount ID`
+before mounting again. An unresolved executing helper blocks new managed
+mutators; keep its controller supervising it. Timeout/interruption never means
+that the OS rolled the operation back. Installation recovery before first mount
+uses a new guard of the retained image; it does not repeat import or rename.
+
+The controller uses ordinary macOS type dispatch and current mount observations.
+These do not authenticate an exact live adapter session or prove a previous
+adapter close succeeded. A fresh guard validates only its own current admission
+and consumed close. Owned snapshots, rollback, cleanup enrollment, retirement,
+removal and purge remain unsupported. An unmounted owned image stays protected
+and receives no cleanup closure credit.
+
+`--native-host PATH` selects the containing app's `Contents/MacOS/StallionFS`
+discovery executable. `--native-profile private-sfsro27` is reserved for explicit
+private qualification with that short type; it is not the production default.
+Neither option installs, registers, enables or signs an extension.
+
 ## Closed native images
 
 Register an existing native image without moving or copying its backing file:
@@ -215,8 +269,8 @@ most 32 snapshots; full catalogs fail without evicting an existing root.
 These commands operate on closed images. The managed lease and ordinary core
 exclusive inode lock reject cooperating active users, including the current
 FSKit loader while it retains its core handle. They do not detect arbitrary
-noncooperating writers or qualify mounted kernel caching. Native mount/run,
-cleanup enrollment, retirement and removal are unsupported by these commands.
+noncooperating writers or qualify mounted kernel caching. Mount/run for external registrations, cleanup enrollment, retirement and
+removal are unsupported by these commands.
 Registering an external file grants no authority to delete it.
 
 The immediate parent must be private, owned and local writable APFS. Registration

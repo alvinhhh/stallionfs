@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import re
 import shutil
 import signal
@@ -102,6 +103,24 @@ class FSKitInterfaces(unittest.TestCase):
                    for line in child.stderr.splitlines()):
                 raise AssertionError(f'Unexpected Swift warning in {label}; retained {cls.base}')
         return child
+
+    def test_readonly_host_discovery_completion_and_metadata(self):
+        cls = type(self)
+        cls.failed = True
+        directory = self.base / 'host-discovery'
+        directory.mkdir(mode=0o700)
+        executable = directory / 'host-check'
+        self.command('host-discovery-build', [self.tools['swiftc'], '-D', 'STALLION_HOST_CHECK',
+                     '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors',
+                     '-target', 'arm64-apple-macos27.0', '-sdk', self.sdk, '-Onone', '-parse-as-library',
+                     '-module-cache-path', directory / 'cache',
+                     self.source / 'filesystem/fskit/Host.swift',
+                     self.source / 'tests/fskit_host_driver.swift', '-o', executable], 90, swift='current')
+        child = self.command('host-discovery-run', [executable], 10)
+        self.assertEqual(child.stdout,
+                         'PASS: discovery single completion, independent deadline, malformed metadata and bounded JSON\n')
+        self.assertEqual(child.stderr, '')
+        cls.failed = False
 
     def test_admission_ownership_and_legacy_callbacks(self):
         cls = type(self)
@@ -244,6 +263,21 @@ class FSKitInterfaces(unittest.TestCase):
                 child = self.command(variant + '-admission-run', [executable, '--access-policy', images], 180)
                 self.assertEqual(child.stdout, 'PASS immutable read-only selection, contextual open grants and retained-write delivery\n')
                 self.assertEqual(child.stderr, '')
+                # Inspect the actual four compiled factory configurations through
+                # the same bounded artifact boundary used by packaging.
+                import importlib.util
+                package_spec = importlib.util.spec_from_file_location(
+                    'package_fskit', self.source / 'tools/package_fskit.py')
+                package = importlib.util.module_from_spec(package_spec)
+                package_spec.loader.exec_module(package)
+                compiled = package.read_executable(executable)
+                expected_policy = 'contextual-writes' if handlers and writes else 'read-only'
+                profile = package.compiled_factory_profile(compiled, expected_policy)
+                self.assertEqual(profile['policy'], expected_policy)
+                self.assertEqual(profile['pre_sign_sha256'], hashlib.sha256(compiled).hexdigest())
+                with self.assertRaises(ValueError):
+                    package.compiled_factory_profile(compiled,
+                        'read-only' if handlers and writes else 'contextual-writes')
                 factory_images = directory / 'factory-images'
                 factory_images.mkdir(mode=0o700)
                 child = self.command(variant + '-factory-run', [executable, '--factory-policy', factory_images], 180)
@@ -266,6 +300,46 @@ class FSKitInterfaces(unittest.TestCase):
                                  ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
                                   'fixturewritablemetadata', 'fixtureidentity', 'privatetestidentity',
                                   'fortesting', 'reclaimfortesting', 'createabortfortesting')))
+            # Assemble the ordinary both-flags extension, not a test driver.
+            # This verifies unsigned package wiring; it does not activate FSKit.
+            host = self.base / 'production-package-host'
+            self.command('production-package-host-build', [self.tools['swiftc'],
+                         '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors',
+                         '-target', target, '-sdk', self.sdk, '-Onone', '-parse-as-library',
+                         '-module-cache-path', self.base / 'production-package-host-cache',
+                         filesystem / 'fskit/Host.swift', '-o', host], 90, swift='current')
+            app = self.base / 'ProductionPackage.app'
+            child = self.command('production-package-assemble', [sys.executable, '-I', '-B',
+                         self.source / 'tools/package_fskit.py', '--host', host, '--extension', module,
+                         '--out', app, '--bundle-version', '9', '--profile', 'production',
+                         '--access-policy', 'contextual-writes'], 90)
+            self.assertEqual(child.stdout, 'Unsigned package: ' + str(app) + '\n')
+            self.assertEqual(child.stderr, '')
+            contents = app / 'Contents'
+            extension_contents = contents / 'Extensions/StallionFS.appex/Contents'
+            self.assertEqual((contents / 'MacOS/StallionFS').read_bytes(), host.read_bytes())
+            self.assertEqual((extension_contents / 'MacOS/StallionFS').read_bytes(), module.read_bytes())
+            host_info = plistlib.loads((contents / 'Info.plist').read_bytes())
+            module_info = plistlib.loads((extension_contents / 'Info.plist').read_bytes())
+            self.assertEqual(host_info['CFBundleIdentifier'], 'com.alvinhhh.stallionfs')
+            self.assertEqual(host_info['CFBundlePackageType'], 'APPL')
+            self.assertEqual(host_info['StallionFSControllerProtocol'], 1)
+            self.assertEqual(module_info['CFBundleIdentifier'], 'com.alvinhhh.stallionfs.module')
+            self.assertEqual(module_info['CFBundlePackageType'], 'XPC!')
+            for info in (host_info, module_info):
+                self.assertEqual(info['CFBundleVersion'], '9')
+                self.assertEqual(info['CFBundleExecutable'], 'StallionFS')
+                self.assertEqual(info['LSMinimumSystemVersion'], '27.0')
+            self.assertEqual(module_info['StallionFSAccessPolicy'], 'contextual-writes')
+            self.assertEqual(module_info['StallionFSCompiledFactory'], {
+                'schema': 1, 'policy': 'contextual-writes', 'architectures': ['arm64'],
+                'pre_sign_sha256': hashlib.sha256(module.read_bytes()).hexdigest()})
+            attributes = module_info['EXAppExtensionAttributes']
+            self.assertEqual(attributes['EXExtensionPointIdentifier'], 'com.apple.fskit.fsmodule')
+            self.assertEqual(attributes['FSShortName'], 'stallionfs')
+            self.assertTrue(attributes['FSSupportsPathURLs'])
+            self.assertTrue(attributes['FSRequiresSecurityScopedPathURLResources'])
+            self.assertFalse(attributes['FSSupportsBlockResources'])
             unhooked = self.base / 'context-xattr-unhooked'
             unhooked.mkdir(mode=0o700)
             unhooked_images = unhooked / 'images'

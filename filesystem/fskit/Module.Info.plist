@@ -27,7 +27,7 @@
 		<key>FSRequiresSecurityScopedPathURLResources</key>
 		<true/>
 		<key>FSShortName</key>
-		<string>sfsro27</string>
+		<string>stallionfs</string>
 		<key>FSSupportsBlockResources</key>
 		<false/>
 		<key>FSSupportsPathURLs</key>

@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from . import __version__
@@ -49,6 +50,10 @@ def main(argv=None):
     create = commands.add_parser("create", help="Clone a prepared seed")
     create.add_argument("seed")
     create.add_argument("--name", default="")
+    create.add_argument('--backend', choices=('native-image',), help='Use an owned native image with a mounted repository')
+    create.add_argument('--capacity-gib', type=int, help='Required capacity for native images')
+    create.add_argument('--native-profile', choices=('production', 'private-sfsro27'), default='production')
+    create.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     create.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Folder clone workers; use 1 for lower CPU use")
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
@@ -157,7 +162,11 @@ def main(argv=None):
             result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup, image_size=args.image_size)
             text = result["id"]
         elif args.action == "create":
-            result = store.create(args.seed, name=args.name, jobs=args.jobs)
+            options = {}
+            if args.backend is not None or args.capacity_gib is not None or args.native_host is not None or args.native_profile != 'production':
+                options = dict(backend=args.backend, capacity_gib=args.capacity_gib,
+                               native_profile=args.native_profile, native_host=args.native_host)
+            result = store.create(args.seed, name=args.name, jobs=args.jobs, **options)
             text = result["path"]
         elif args.action in ("mount", "unmount"):
             result = getattr(store, args.action)(args.id)
@@ -214,7 +223,7 @@ def main(argv=None):
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
         return result["returncode"] if args.action == "run" else 0
-    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError) as exc:
+    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError, subprocess.TimeoutExpired) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)
         notes = list(getattr(exc, "__notes__", ()))
