@@ -50,12 +50,20 @@ class NativeImageCLI(unittest.TestCase):
         bridge = cls.artifacts / 'diagnostic-bridge.o'
         cls.owned('diagnostic-bridge', [*flags, '-Dclock_gettime=sfs_bridge_test_clock',
                     '-DPyLong_FromLongLong=sfs_bridge_test_signed', '-DPyLong_FromUnsignedLongLong=sfs_bridge_test_unsigned',
+                    '-DPyUnicode_FromStringAndSize=sfs_bridge_test_text',
                     '-Dsfs_image_snapshot=sfs_bridge_test_snapshot', '-Dsfs_image_prepare_restore=sfs_bridge_test_restore',
                     '-include', tests / 'native_image_bridge_hooks.h', '-c', source / 'stallionfs/_image.c', '-o', bridge])
+        importer = cls.artifacts / 'diagnostic-importer.o'
+        cls.owned('diagnostic-importer', [*flags, '-Dsfs_image_verify=sfs_bridge_test_import_verify',
+                    '-Dsfs_image_open_readonly=sfs_bridge_test_import_open', '-Dsfs_image_close=sfs_bridge_test_import_close',
+                    '-Dsfs_image_write=sfs_bridge_test_import_write', '-Dmalloc=sfs_bridge_test_import_malloc',
+                    '-Dpwrite=sfs_bridge_test_import_pwrite',
+                    '-include', tests / 'native_image_bridge_hooks.h',
+                    '-c', source / 'stallionfs/_native_import.c', '-o', importer])
         hooks = cls.artifacts / 'diagnostic-hooks.o'
         cls.owned('diagnostic-hooks', [*flags, '-c', tests / 'native_image_bridge_hooks.c', '-o', hooks])
         cls.diagnostic = cls.artifacts / ('_image' + sysconfig.get_config_var('EXT_SUFFIX'))
-        cls.owned('diagnostic-link', [clang, '-isysroot', sdk, '-bundle', '-undefined', 'dynamic_lookup', bridge, normal, hooks, '-o', cls.diagnostic])
+        cls.owned('diagnostic-link', [clang, '-isysroot', sdk, '-bundle', '-undefined', 'dynamic_lookup', bridge, importer, normal, hooks, '-o', cls.diagnostic])
         cls.failed = False
 
     @classmethod
@@ -137,6 +145,196 @@ class NativeImageCLI(unittest.TestCase):
         symbols = self.owned('production-symbols', ['/usr/bin/nm', _image.__file__]).stdout.lower()
         self.assertFalse(any(word in symbols for word in ('sfs_diag_', 'sfs_bridge_test_', 'sfs_image_diagnostic_')))
 
+    def test_scoped_backing_guard_retains_exact_inode_and_consumes_after_exceptions(self):
+        from stallionfs import _image
+        import errno
+        import threading
+        directory = self.seed()
+        def target(parent, component='image.sfs', identity=None):
+            info = parent.stat()
+            value = dict(directory=str(parent), component=component,
+                         parent=[info.st_dev, info.st_ino], file=None)
+            if identity is None:
+                inspected = _image.inspect(value)
+                self.assertTrue(inspected['ok'], inspected)
+                identity = inspected['identity']
+            return value | identity
+        original = target(directory)
+        tokens = []
+        def blocked(value):
+            with self.assertRaises(OSError) as caught:
+                _image.with_backing_guard(value, lambda token: self.fail('competing scope entered'))
+            self.assertEqual(caught.exception.errno, errno.EBUSY)
+        moved = self.base / 'moved'
+        moved.mkdir(mode=0o700)
+        destination = target(moved, identity={k: original[k] for k in ('file', 'uuid')})
+        alias = self.base / 'alias'
+        alias.symlink_to(directory, target_is_directory=True)
+        aliased = original | dict(directory=str(alias / '..' / directory.name))
+        def action(token):
+            tokens.append(token)
+            with self.assertRaises(TypeError):
+                type(token)()
+            token.verify(original)
+            blocked(original)
+            blocked(aliased)
+            # A failed independently opened handle must not release this flock.
+            blocked(original)
+            errors = []
+            def foreign_thread():
+                try:
+                    token.verify(original)
+                except RuntimeError as error:
+                    errors.append(error)
+            thread = threading.Thread(target=foreign_thread)
+            thread.start(); thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            (directory / 'image.sfs').rename(moved / 'image.sfs')
+            token.verify(destination)
+            for wrong in (destination | dict(file=[0, 0]), destination | dict(uuid='00' * 16)):
+                with self.assertRaises(OSError):
+                    token.verify(wrong)
+            blocked(destination)
+            return 'host action complete'
+        self.assertEqual(_image.with_backing_guard(original, action), 'host action complete')
+        self.assertEqual(tokens[0].close_result['status'], 0)
+        with self.assertRaises(RuntimeError):
+            tokens[0].verify(destination)
+        self.assertEqual(_image.with_backing_guard(destination, lambda token: 42), 42)
+        for primary in (RuntimeError('action failure'), KeyboardInterrupt('cancel action')):
+            def fail(token):
+                tokens.append(token)
+                raise primary
+            with self.assertRaises(type(primary)) as caught:
+                _image.with_backing_guard(destination, fail)
+            self.assertIs(caught.exception, primary)
+            self.assertIs(primary.native_backing_guard, tokens[-1])
+            self.assertEqual(tokens[-1].close_result['status'], 0)
+            self.assertEqual(_image.with_backing_guard(destination, lambda token: 7), 7)
+        class RejectDisposition(RuntimeError):
+            def __setattr__(self, name, value):
+                if name == 'native_backing_guard':
+                    raise MemoryError('cannot attach disposition')
+                super().__setattr__(name, value)
+        primary = RejectDisposition('preserved original')
+        def fail_attachment(token):
+            raise primary
+        with self.assertRaises(RejectDisposition) as caught:
+            _image.with_backing_guard(destination, fail_attachment)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(primary.__context__.native_backing_guard.close_result['status'], 0)
+        for replacement in (destination | dict(file=[0, 0]), destination | dict(uuid='00' * 16)):
+            with self.assertRaises(OSError):
+                _image.with_backing_guard(replacement, lambda token: self.fail('replaced identity entered'))
+        replacement_dir = self.seed('replacement')
+        (moved / 'image.sfs').rename(moved / 'saved.sfs')
+        (replacement_dir / 'image.sfs').rename(moved / 'image.sfs')
+        with self.assertRaises(OSError):
+            _image.with_backing_guard(destination, lambda token: self.fail('replacement inode entered'))
+        (moved / 'image.sfs').rename(replacement_dir / 'image.sfs')
+        (moved / 'saved.sfs').rename(moved / 'image.sfs')
+        symlink = moved / 'link.sfs'
+        symlink.symlink_to('image.sfs')
+        with self.assertRaises(OSError):
+            _image.with_backing_guard(destination | dict(component='link.sfs'),
+                                      lambda token: self.fail('symlink backing entered'))
+        hardlink = moved / 'alias.sfs'
+        os.link(moved / 'image.sfs', hardlink)
+        with self.assertRaises(OSError):
+            _image.with_backing_guard(destination, lambda token: self.fail('hardlink entered'))
+        hardlink.unlink()
+        def unlink(token):
+            tokens.append(token)
+            (moved / 'image.sfs').unlink()
+            # Deliberate unlink is followed only by terminal consuming close.
+        _image.with_backing_guard(destination, unlink)
+        self.assertEqual(tokens[-1].close_result['status'], 0)
+
+    def test_scoped_backing_guard_preserves_consumed_close_error_and_primary(self):
+        directory = self.seed()
+        script = textwrap.dedent('''            import ctypes,importlib.util,json,sys
+            from pathlib import Path
+            module_path,directory=sys.argv[1:]
+            spec=importlib.util.spec_from_file_location('stallionfs._image',module_path)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            control=ctypes.CDLL(module_path).sfs_bridge_test_configure
+            control.argtypes=[ctypes.c_int]*4;control.restype=None
+            info=Path(directory).stat()
+            target=dict(directory=directory,component='image.sfs',parent=[info.st_dev,info.st_ino],file=None)
+            target.update(module.inspect(target)['identity'])
+            for primary in (None,KeyboardInterrupt('original cancellation')):
+                tokens=[]
+                def action(token):
+                    tokens.append(token)
+                    control(0,0,128,0)
+                    if primary is not None:raise primary
+                    return 'mutation completed'
+                try:
+                    module.with_backing_guard(target,action)
+                    raise AssertionError('close failure returned success')
+                except BaseException as error:
+                    if primary is not None:assert error is primary
+                    else:assert isinstance(error,OSError)
+                    assert error.native_backing_guard is tokens[0]
+                    assert tokens[0].close_result['status'] != 0
+                control(0,0,0,0)
+                assert module.with_backing_guard(target,lambda token:'released')=='released'
+                try:tokens[0].verify(target)
+                except RuntimeError:pass
+                else:raise AssertionError('consumed token reused')
+            print('PASS consuming guard close dispositions')
+        ''')
+        child = self.owned('guard-consumed-close', [sys.executable, '-I', '-B', '-c',
+                                                   script, self.diagnostic, directory])
+        self.assertEqual(child.stdout, 'PASS consuming guard close dispositions\n')
+        self.assertEqual(child.stderr, '')
+
+    def test_scoped_backing_guard_excludes_prestarted_process(self):
+        from stallionfs import _image
+        import selectors
+        directory = self.seed()
+        info = directory.stat()
+        target = dict(directory=str(directory), component='image.sfs',
+                      parent=[info.st_dev, info.st_ino], file=None)
+        target.update(_image.inspect(target)['identity'])
+        script = """import json,sys
+from stallionfs import _image
+print('ready',flush=True)
+for line in sys.stdin:
+    try:
+        value=_image.with_backing_guard(json.loads(line),lambda token: 'entered')
+        print(value,flush=True)
+    except OSError as error:
+        print(error.errno,flush=True)
+"""
+        # Start before acquisition; the child never inherits an active core lock.
+        child = subprocess.Popen([sys.executable, '-I', '-B', '-c', script],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True)
+        def response():
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(10), 'competitor response timed out')
+            return child.stdout.readline().strip()
+        def attempt():
+            child.stdin.write(json.dumps(target) + '\n'); child.stdin.flush()
+            return response()
+        try:
+            self.assertEqual(response(), 'ready')
+            def action(token):
+                self.assertEqual(attempt(), str(__import__('errno').EBUSY))
+                self.assertEqual(attempt(), str(__import__('errno').EBUSY))
+                token.verify(target)
+            _image.with_backing_guard(target, action)
+            self.assertEqual(attempt(), 'entered')
+            child.stdin.close(); child.stdin = None
+            stdout, stderr = child.communicate(timeout=10)
+            self.assertEqual((child.returncode, stdout, stderr), (0, '', ''))
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate(timeout=10)
+
     def test_duplicate_registrations_share_inode_lock_and_native_data_is_not_cleanup_owned(self):
         from stallionfs.core import Store
         directory = self.seed()
@@ -192,6 +390,135 @@ class NativeImageCLI(unittest.TestCase):
         self.assertEqual(self.command('snapshots', workspace), before)
         self.command('snapshot', workspace, '--name', 'overflow', status=1)
         self.assertEqual(self.command('snapshots', workspace), before)
+
+    def test_native_import_large_resource_fork(self):
+        from stallionfs import _image
+        script = textwrap.dedent('''
+            import ctypes, hashlib, importlib.util, json, os, sys
+            from pathlib import Path
+            module_path, base = sys.argv[1:]
+            spec = importlib.util.spec_from_file_location('stallionfs._image', module_path)
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            base = Path(base); base.mkdir(mode=0o700)
+            source = base / 'input' / 'repo'; source.parent.mkdir(mode=0o700); source.mkdir(mode=0o700)
+            destination = base / 'owned'; destination.mkdir(mode=0o700)
+            path = source / 'file'; path.write_bytes(b'file')
+            value = b'v' * (16 * 1024 * 1024) + b'!'
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+            status = libc.setxattr(os.fsencode(path), b'com.apple.ResourceFork', value, len(value), 0, 1)
+            assert status == 0, ctypes.get_errno()
+            def pair(path):
+                st = path.stat(); return [st.st_dev, st.st_ino]
+            result = module.create_from_tree({'directory': str(source), 'root': pair(source)},
+                {'directory': str(destination), 'parent': pair(destination), 'component': 'image.sfs',
+                 'before_create': lambda: None}, 1 << 28)
+            assert result['candidate_complete'], result
+            assert result['resources']['xattr_memory_high_water'] == len(value), result
+            assert result['resources']['scratch_bytes'] > len(value), result
+            print(json.dumps({'directory': str(destination), 'size': len(value), 'sha256': hashlib.sha256(value).hexdigest(), 'result': result}))
+        ''')
+        child = self.owned('large-resource-fork', [sys.executable, '-I', '-c', script,
+            _image.__file__, self.base / 'large'], 60)
+        expected = json.loads(child.stdout)
+        actual = self.owned('large-resource-check', [self.fixture, 'describe', expected['directory'], 'repo/file'], 30)
+        observed = json.loads(actual.stdout)['xattrs'][b'com.apple.ResourceFork'.hex()]
+        self.assertEqual(observed, {key: expected[key] for key in ('size', 'sha256')})
+
+    def test_native_import_diagnostic_failure_receipts(self):
+        script = textwrap.dedent('''
+            import ctypes, importlib.util, json, os, sys
+            from pathlib import Path
+            module_path, base, case, kind, ordinal, flags = sys.argv[1:]
+            spec = importlib.util.spec_from_file_location('stallionfs._image', module_path)
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            control = ctypes.CDLL(module_path).sfs_bridge_test_configure
+            control.argtypes = [ctypes.c_int] * 4; control.restype = None
+            base = Path(base); base.mkdir(mode=0o700)
+            source = base / 'input' / 'repo'; source.parent.mkdir(mode=0o700); source.mkdir(mode=0o700)
+            destination = base / 'owned'; destination.mkdir(mode=0o700)
+            (source / 'file').write_bytes(b'imported bytes')
+            (source / 'second').write_bytes(b'second file')
+            os.environ['SFS_TEST_MUTATE_PATH'] = str(source / ('added' if case == 'directory-change' else 'file'))
+            if case == 'source-allocation':
+                libc = ctypes.CDLL(None, use_errno=True)
+                libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+                assert libc.setxattr(os.fsencode(source / 'file'), b'org.example.value', b'value', 5, 0, 1) == 0
+            def pair(path):
+                st = path.stat(); return [st.st_dev, st.st_ino]
+            def before():
+                if case == 'precreate-signal': raise KeyboardInterrupt('precreate interrupted')
+            control(int(kind), int(ordinal), int(flags), 0)
+            exception = None
+            try:
+                result = module.create_from_tree({'directory': str(source), 'root': pair(source)},
+                    {'directory': str(destination), 'parent': pair(destination), 'component': 'image.sfs',
+                     'before_create': before}, 1 << 26)
+            except (MemoryError, KeyboardInterrupt) as error:
+                exception = type(error).__name__
+                result = json.loads(bytes(error.native_image_carrier['data']).split(b'\\0', 1)[0])
+            print(json.dumps({'result': result, 'exception': exception,
+                              'exists': (destination / 'image.sfs').exists()}))
+        ''')
+        cases = [('precreate-signal', 0, 0, 0), ('create-allocation', 7, 1, 0),
+                 ('create-write', 1, 1, 0), ('create-fence', 4, 1, 0),
+                 ('commit-first-fence', 4, 4, 0), ('commit-final-fence', 4, 5, 0),
+                 ('verify-budget', 0, 0, 256), ('close', 0, 0, 1024),
+                 ('reopen-read', 0, 0, 512), ('reopen-close', 0, 0, 2048),
+                 ('response-allocation', 0, 0, 4096), ('creation-signal', 0, 0, 2),
+                 ('import-signal', 0, 0, 8192), ('read-change', 0, 0, 16384),
+                 ('directory-change', 0, 0, 32768), ('source-allocation', 0, 0, 65536), ('scratch-full', 0, 0, 131072)]
+        for case, kind, ordinal, flags in cases:
+            with self.subTest(case=case):
+                child = self.owned('import-' + case, [sys.executable, '-I', '-c', script,
+                    self.diagnostic, self.base / case, case, kind, ordinal, flags], 30)
+                observed = json.loads(child.stdout); result = observed['result']
+                if case == 'response-allocation':
+                    self.assertEqual(observed['exception'], 'MemoryError')
+                    self.assertTrue(result['candidate_complete'])
+                    self.assertTrue(result['verified'])
+                    self.assertEqual(result['reopen_close']['status'], 0)
+                else:
+                    self.assertFalse(result['candidate_complete'], observed)
+                if case in ('precreate-signal', 'source-allocation', 'scratch-full'):
+                    if case == 'precreate-signal': self.assertEqual(observed['exception'], 'KeyboardInterrupt')
+                    self.assertFalse(observed['exists'])
+                    self.assertFalse(result['creation_attempted'])
+                else:
+                    self.assertTrue(observed['exists'], observed)
+                    self.assertTrue(result['creation_attempted'])
+                if case == 'create-allocation':
+                    self.assertIsNone(result['identity'])
+                    self.assertIsNotNone(result['observed_file'])
+                if case.startswith('commit-'):
+                    self.assertFalse(result['import_committed'])
+                    self.assertIsNotNone(result['commit'])
+                    if case == 'commit-final-fence':
+                        self.assertEqual(result['commit']['status'], 8)  # SFS_OUTCOME_UNKNOWN
+                        self.assertIsNone(result['abort'])
+                    else:
+                        self.assertTrue(result['commit']['poisoned'])
+                        self.assertFalse(result['commit']['transaction_active'])
+                        self.assertIsNone(result['abort'])
+                if case in ('verify-budget', 'close', 'reopen-read', 'reopen-close'):
+                    self.assertTrue(result['import_committed'])
+                    self.assertIsNotNone(result['anchor'])
+                if case == 'verify-budget':
+                    self.assertNotEqual(result['verify']['incomplete_reason'], 0)
+                    self.assertFalse(result['verified'])
+                if case == 'close':
+                    self.assertNotEqual(result['close']['status'], 0)
+                    self.assertIsNone(result['reopen'])
+                if case == 'reopen-read': self.assertNotEqual(result['reopen']['status'], 0)
+                if case == 'reopen-close': self.assertNotEqual(result['reopen_close']['status'], 0)
+                if case in ('creation-signal', 'import-signal'): self.assertEqual(observed['exception'], 'KeyboardInterrupt')
+                if case in ('import-signal', 'read-change'):
+                    self.assertFalse(result['import_committed'])
+                    self.assertEqual(result['abort']['status'], 0)
+                    self.assertFalse(result['abort']['transaction_active'])
+                if case in ('read-change', 'directory-change'):
+                    self.assertEqual(result['reason'], 'source-changed')
+                if case == 'directory-change': self.assertTrue(result['import_committed'])
 
     def test_diagnostic_receipts_signals_deadline_and_transient_output_allocation(self):
         script = textwrap.dedent('''

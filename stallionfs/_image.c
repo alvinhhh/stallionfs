@@ -6,12 +6,15 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include "image.h"
+#include "_native_import.h"
+#include <math.h>
 
 /* Ordinary core only. Each call owns one handle until its consumed close;
  * Python holds the managed lease and validates the canonical parent's ACL. */
@@ -373,7 +376,300 @@ static PyObject *restore_image(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args,"OOO:restore",&target,&name,&recovery)) return NULL;
     return invoke(target,name,recovery,RESTORE);
 }
+
+/* Private synchronous exclusion scope. Callbacks must not fork, exec, transfer
+ * ownership or retain a verifier for later use. flock is cooperative exclusion;
+ * inherited descriptors can prolong it after an unsupported fork. */
+typedef struct {
+    PyObject_HEAD
+    pid_t owner;
+    unsigned long thread;
+    int active, consumed, parent_close_errno;
+    sfs_result opened, closed;
+} backing_verifier;
+
+static int verifier_owner(backing_verifier *self) {
+    if (self->owner != getpid() || self->thread != PyThread_get_thread_ident()) {
+        PyErr_SetString(PyExc_RuntimeError,"Backing guard belongs to another process or thread"); return -1;
+    }
+    return 0;
+}
+static PyObject *verifier_close_result(backing_verifier *self, void *closure) {
+    (void)closure;
+    if (verifier_owner(self)) return NULL;
+    if (!self->consumed && !self->parent_close_errno) Py_RETURN_NONE;
+    PyObject *value = self->consumed ? receipt(&self->closed) : PyDict_New();
+    if (value && (PUT_B(value,"core_consumed",self->consumed) ||
+                  PUT_I(value,"parent_close_errno",self->parent_close_errno) ||
+                  (!self->consumed && set_owned(value,"core_receipt",Py_NewRef(Py_None))))) {
+        Py_DECREF(value); return NULL;
+    }
+    return value;
+}
+static int guard_target(PyObject *target, PyObject **directory, PyObject **component, uint64_t parent[2], uint64_t file[2]) {
+    if (!PyDict_Check(target)) { PyErr_SetString(PyExc_TypeError,"Image target must be a dictionary"); return -1; }
+    if (pair_value(target,"parent",parent,0) < 0 || pair_value(target,"file",file,0) < 0) return -1;
+    *directory = path_bytes(PyDict_GetItemString(target,"directory"));
+    *component = path_bytes(PyDict_GetItemString(target,"component"));
+    if (!*directory || !*component) return -1;
+    const char *name = PyBytes_AS_STRING(*component);
+    if (strchr(name,'/') || !strcmp(name,".") || !strcmp(name,"..")) {
+        PyErr_SetString(PyExc_ValueError,"Expected one backing filename component"); return -1;
+    }
+    return 0;
+}
+static int guard_location(const char *directory, const char *name, int parent_fd,
+                          const uint64_t parent[2], const sfs_result *opened) {
+    struct stat ps, named;
+    if (same_parent(directory,parent_fd,parent) || fstat(parent_fd,&ps) ||
+        fstatat(parent_fd,name,&named,AT_SYMLINK_NOFOLLOW)) return -1;
+    if (ps.st_uid != geteuid() || (ps.st_mode & 0777) != 0700 ||
+        !S_ISREG(named.st_mode) || named.st_uid != geteuid() || named.st_nlink != 1 ||
+        (named.st_mode & 0077) || (named.st_mode & 0600) != 0600 ||
+        (uint64_t)named.st_dev != opened->device || (uint64_t)named.st_ino != opened->inode) {
+        errno = ESTALE; return -1;
+    }
+    return same_parent(directory,parent_fd,parent);
+}
+static PyObject *verifier_verify(backing_verifier *self, PyObject *target) {
+    if (verifier_owner(self)) return NULL;
+    if (!self->active) { PyErr_SetString(PyExc_RuntimeError,"Backing guard is no longer active"); return NULL; }
+    PyObject *directory = NULL, *component = NULL, *result = NULL;
+    uint64_t parent[2], file[2]; int fd = -1;
+    if (guard_target(target,&directory,&component,parent,file)) goto done;
+    int matches = identity_matches(&self->opened,file,PyDict_GetItemString(target,"uuid"));
+    if (matches < 0) goto done;
+    if (!matches) { errno = ESTALE; PyErr_SetFromErrno(PyExc_OSError); goto done; }
+    fd = open(PyBytes_AS_STRING(directory),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0 || guard_location(PyBytes_AS_STRING(directory),PyBytes_AS_STRING(component),fd,parent,&self->opened)) {
+        PyErr_SetFromErrno(PyExc_OSError); goto done;
+    }
+    result = Py_NewRef(Py_None);
+done:
+    if (fd >= 0 && close(fd) && !PyErr_Occurred()) { Py_CLEAR(result); PyErr_SetFromErrno(PyExc_OSError); }
+    Py_XDECREF(directory); Py_XDECREF(component);
+    return result;
+}
+static PyMethodDef verifier_methods[] = {
+    {"verify",(PyCFunction)verifier_verify,METH_O,"Verify a location names the guarded inode; does not grant deletion authority."},
+    {NULL,NULL,0,NULL}
+};
+static PyGetSetDef verifier_properties[] = {
+    {"close_result",(getter)verifier_close_result,NULL,"Consumed close disposition, available after the callback.",NULL},
+    {NULL,NULL,NULL,NULL,NULL}
+};
+static PyObject *verifier_new(PyTypeObject *type, PyObject *args, PyObject *keywords) {
+    (void)type; (void)args; (void)keywords;
+    PyErr_SetString(PyExc_TypeError,"Backing verifiers are created only inside a guarded callback"); return NULL;
+}
+static PyTypeObject verifier_type = {
+    PyVarObject_HEAD_INIT(NULL,0)
+    .tp_name = "stallionfs._image._BackingVerifier",
+    .tp_basicsize = sizeof(backing_verifier),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = verifier_methods,
+    .tp_getset = verifier_properties,
+    .tp_new = verifier_new,
+};
+static PyObject *with_backing_guard(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *target, *callback, *directory = NULL, *component = NULL, *value = NULL;
+    PyObject *error_type = NULL, *error_value = NULL, *error_trace = NULL, *fallback = NULL;
+    uint64_t parent[2], file[2]; int fd = -1;
+    sfs_image *handle = NULL;
+    backing_verifier *token = NULL;
+    if (!PyArg_ParseTuple(args,"OO:with_backing_guard",&target,&callback)) return NULL;
+    if (!PyCallable_Check(callback)) { PyErr_SetString(PyExc_TypeError,"Expected a synchronous callback"); return NULL; }
+    if (guard_target(target,&directory,&component,parent,file)) goto done;
+    token = PyObject_New(backing_verifier,&verifier_type);
+    if (!token) goto done;
+    token->owner = getpid(); token->thread = PyThread_get_thread_ident();
+    token->active = token->consumed = token->parent_close_errno = 0;
+    memset(&token->opened,0,sizeof(token->opened)); memset(&token->closed,0,sizeof(token->closed));
+    fallback = PyObject_CallFunction(PyExc_RuntimeError,"s","Backing guard consumed-close disposition");
+    if (!fallback || PyObject_SetAttrString(fallback,"native_backing_guard",(PyObject *)token)) goto done;
+    if (PyErr_CheckSignals() < 0) goto done;
+    fd = open(PyBytes_AS_STRING(directory),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0 || same_parent(PyBytes_AS_STRING(directory),fd,parent)) { PyErr_SetFromErrno(PyExc_OSError); goto done; }
+    enum sfs_status status = sfs_image_open_readonly(PyBytes_AS_STRING(directory),PyBytes_AS_STRING(component),&handle,&token->opened);
+    if (status != SFS_OK) { errno = error_code(status,&token->opened); PyErr_SetFromErrno(PyExc_OSError); goto done; }
+    int matches = identity_matches(&token->opened,file,PyDict_GetItemString(target,"uuid"));
+    if (matches < 0) goto done;
+    if (!matches) { errno = ESTALE; PyErr_SetFromErrno(PyExc_OSError); goto done; }
+    if (guard_location(PyBytes_AS_STRING(directory),PyBytes_AS_STRING(component),fd,parent,&token->opened)) {
+        PyErr_SetFromErrno(PyExc_OSError); goto done;
+    }
+    if (PyErr_CheckSignals() < 0) goto done;
+    token->active = 1;
+    value = PyObject_CallOneArg(callback,(PyObject *)token);
+done:
+    if (token) token->active = 0;
+    /* A foreign fork cannot consume the parent's logical scope. Do not touch
+     * the inherited core; the unsupported child's descriptors live until exit. */
+    if (token && token->owner != getpid()) {
+        Py_CLEAR(value); PyErr_Clear();
+        PyErr_SetString(PyExc_RuntimeError,"Forking while a backing guard is active is unsupported");
+        handle = NULL; fd = -1;
+    }
+    PyErr_Fetch(&error_type,&error_value,&error_trace);
+    if (handle) {
+        (void)sfs_image_close(handle,&token->closed); handle = NULL; token->consumed = 1;
+    }
+    if (fd >= 0) { if (close(fd) && token) token->parent_close_errno = errno; fd = -1; }
+    if (!error_type && token && (token->closed.status != SFS_OK || token->parent_close_errno)) {
+        errno = token->closed.status != SFS_OK ? error_code(token->closed.status,&token->closed) : token->parent_close_errno;
+        PyErr_SetFromErrno(PyExc_OSError);
+        PyErr_Fetch(&error_type,&error_value,&error_trace);
+    }
+    if (!error_type && PyErr_CheckSignals() < 0) PyErr_Fetch(&error_type,&error_value,&error_trace);
+    if (error_type) {
+        PyErr_NormalizeException(&error_type,&error_value,&error_trace);
+        if (token && error_value && PyObject_SetAttrString(error_value,"native_backing_guard",(PyObject *)token)) {
+            PyErr_Clear();
+            if (fallback && PyExceptionInstance_Check(error_value)) {
+                PyException_SetContext(fallback,PyException_GetContext(error_value));
+                PyException_SetContext(error_value,Py_NewRef(fallback));
+            }
+        }
+        Py_CLEAR(value); PyErr_Restore(error_type,error_value,error_trace);
+    }
+    Py_XDECREF(fallback); Py_XDECREF(token); Py_XDECREF(directory); Py_XDECREF(component);
+    return value;
+}
+
+typedef struct { cancellation cancel; PyObject *before_create; } import_context;
+static int import_cancelled(void *opaque) { return cancelled(&((import_context *)opaque)->cancel); }
+static int import_before_create(void *opaque) {
+    import_context *context = opaque;
+    if (import_cancelled(opaque)) return -1;
+    PyObject *value = PyObject_CallNoArgs(context->before_create);
+    if (value) { Py_DECREF(value); return 0; }
+    PyErr_Fetch(&context->cancel.signal_type,&context->cancel.signal_value,&context->cancel.signal_traceback);
+    PyErr_NormalizeException(&context->cancel.signal_type,&context->cancel.signal_value,&context->cancel.signal_traceback);
+    return -1;
+}
+static void import_json(fixed_json *json, const sfs_import_report *r) {
+    const char *outcome = r->candidate_complete ? "candidate-created" :
+        r->creation_attempted ? "retained-incomplete" : "not-created";
+    const char *disposition = !r->creation_attempted ? "not_attempted" : r->created ? "known_created" : r->existing ? "known_existing" : "unknown";
+    const sfs_result *failed = &r->original;
+    const sfs_result *operations[] = {&r->creation,&r->commit,&r->verify,&r->close,&r->reopen,&r->reopen_close};
+    for (size_t i=0;i<sizeof(operations)/sizeof(*operations);i++) if (operations[i]->status != SFS_OK) { failed=operations[i]; break; }
+    int code=r->local_error ? r->local_error : r->cleanup_error ? r->cleanup_error : error_code(failed->status,failed);
+    if (!r->candidate_complete && !code) code=EIO;
+    append_json(json,"{\"ok\":%s,\"candidate_complete\":%s,\"creation_attempted\":%s,\"creation_disposition\":\"%s\","
+        "\"import_committed\":%s,\"verified\":%s,\"outcome\":\"%s\",\"reason\":\"%s\",\"error_code\":%d,"
+        "\"local_error\":%d,\"descriptor_close_error\":%d,\"failed_record\":%" PRIu64 ",\"observed_file\":",
+        r->candidate_complete ? "true" : "false",r->candidate_complete ? "true" : "false",
+        r->creation_attempted ? "true" : "false",disposition,r->import_committed ? "true" : "false",r->verified ? "true" : "false",
+        outcome,r->reason ? r->reason : "none",code,r->local_error,r->cleanup_error,r->failed_record);
+    if (r->observed) append_json(json,"[%" PRIu64 ",%" PRIu64 "]",r->observed_identity[0],r->observed_identity[1]);
+    else append_json(json,"null");
+    append_json(json,",\"identity\":");
+    if (r->created) { char uuid[33]; raw_hex(r->creation.uuid,16,uuid);
+        append_json(json,"{\"file\":[%" PRIu64 ",%" PRIu64 "],\"uuid\":\"%s\"}",r->creation.device,r->creation.inode,uuid);
+    } else append_json(json,"null");
+    append_json(json,",\"anchor\":");
+    if (r->import_committed) { char digest[65]; raw_hex(r->commit.root_digest,32,digest);
+        append_json(json,"{\"generation\":%" PRIu64 ",\"root_digest\":\"%s\",\"committed_end\":%" PRIu64 "}",r->commit.generation,digest,r->commit.committed_end);
+    } else append_json(json,"null");
+    append_json(json,",\"resources\":{\"entries\":%" PRIu64 ",\"scratch_bytes\":%" PRIu64 ",\"xattr_memory_high_water\":%" PRIu64
+        ",\"policy\":\"finite-traversal-v2\",\"budget\":{\"raw_cells\":%" PRIu64 ",\"metadata_read_bytes\":%" PRIu64
+        ",\"metadata_hash_bytes\":%" PRIu64 ",\"checks\":%" PRIu64 ",\"auxiliary_bytes\":%" PRIu64 ",\"auxiliary_io_bytes\":%" PRIu64 "}},",
+        r->entries,r->scratch_bytes,r->xattr_memory_high_water,r->budget.raw_cells,r->budget.metadata_read_bytes,r->budget.metadata_hash_bytes,
+        r->budget.checks,r->budget.auxiliary_bytes,r->budget.auxiliary_io_bytes);
+    append_json(json,"\"budget_explicit\":%s,\"budget_saturated\":%s,\"parent_steps\":%" PRIu64 ",",r->budget_explicit ? "true" : "false",r->budget_saturated ? "true" : "false",r->parent_steps);
+    append_json(json,"\"creation\":"); append_receipt(json,r->creation_attempted ? &r->creation : NULL);
+    append_json(json,",\"original\":"); append_receipt(json,&r->original);
+    append_json(json,",\"commit\":"); append_receipt(json,r->commit.generation ? &r->commit : NULL);
+    append_json(json,",\"abort\":"); append_receipt(json,r->abort_attempted ? &r->abort : NULL);
+    append_json(json,",\"verify\":"); append_receipt(json,r->verify.generation ? &r->verify : NULL);
+    append_json(json,",\"close\":"); append_receipt(json,r->close_attempted ? &r->close : NULL);
+    append_json(json,",\"reopen\":"); append_receipt(json,r->reopen_attempted ? &r->reopen : NULL);
+    append_json(json,",\"reopen_close\":"); append_receipt(json,r->reopen_close_attempted ? &r->reopen_close : NULL);
+    append_json(json,",\"failure_path_error\":%d,\"xattr_names_scratch_high_water\":%" PRIu64 "}",r->failure_path_error,r->xattr_names_scratch_high_water);
+}
+static PyObject *create_from_tree(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *source,*destination,*capacity,*budget_arg=Py_None,*source_path=NULL,*destination_path=NULL;
+    PyObject *carrier=NULL,*buffer=NULL,*fallback=NULL,*json_module=NULL,*loads=NULL,*result=NULL;
+    sfs_import_options options={0}; sfs_import_report report={0}; import_context context={0}; sfs_verify_budget supplied={0};
+    if (!PyArg_ParseTuple(args,"OOO|O:create_from_tree",&source,&destination,&capacity,&budget_arg)) return NULL;
+    if (!PyDict_Check(source) || !PyDict_Check(destination) || !PyLong_CheckExact(capacity)) {
+        PyErr_SetString(PyExc_TypeError,"Source and destination must be dictionaries; capacity must be an integer"); return NULL;
+    }
+    if (PyDict_GetItemString(destination,"file") || PyDict_GetItemString(destination,"uuid")) {
+        PyErr_SetString(PyExc_ValueError,"Native creation cannot adopt an existing backing identity"); return NULL;
+    }
+    PyObject *component=PyDict_GetItemString(destination,"component");
+    context.before_create=PyDict_GetItemString(destination,"before_create");
+    if (!component || !PyUnicode_Check(component) || PyUnicode_CompareWithASCIIString(component,"image.sfs") ||
+        !context.before_create || !PyCallable_Check(context.before_create)) {
+        PyErr_SetString(PyExc_ValueError,"Native creation requires image.sfs and a durable precreate callback"); return NULL;
+    }
+    context.before_create=Py_NewRef(context.before_create);
+    if (pair_value(source,"root",options.source_identity,0)<0 || pair_value(destination,"parent",options.destination_identity,0)<0) goto finish;
+    options.capacity=PyLong_AsUnsignedLongLong(capacity); if (PyErr_Occurred()) goto finish;
+    if (budget_arg != Py_None) {
+        const char *names[] = {"raw_cells","metadata_read_bytes","metadata_hash_bytes","checks","auxiliary_bytes","auxiliary_io_bytes"};
+        uint64_t *values[] = {&supplied.raw_cells,&supplied.metadata_read_bytes,&supplied.metadata_hash_bytes,
+            &supplied.checks,&supplied.auxiliary_bytes,&supplied.auxiliary_io_bytes};
+        if (!PyDict_Check(budget_arg) || PyDict_Size(budget_arg)!=6) {
+            PyErr_SetString(PyExc_ValueError,"Verification budget requires all six positive uint64 dimensions"); goto finish;
+        }
+        for (unsigned i=0;i<6;i++) {
+            PyObject *value=PyDict_GetItemString(budget_arg,names[i]);
+            if (!value || !PyLong_CheckExact(value)) { PyErr_SetString(PyExc_ValueError,"Verification budget dimensions must be exact integers"); goto finish; }
+            *values[i]=PyLong_AsUnsignedLongLong(value);
+            if (PyErr_Occurred()) goto finish;
+            if (!*values[i]) { PyErr_SetString(PyExc_ValueError,"Verification budget dimensions must be positive"); goto finish; }
+        }
+        options.verification_budget=&supplied;
+    }
+    source_path=path_bytes(PyDict_GetItemString(source,"directory"));
+    destination_path=path_bytes(PyDict_GetItemString(destination,"directory"));
+    if (!source_path || !destination_path) goto finish;
+    carrier=PyDict_New(); buffer=PyByteArray_FromStringAndSize(NULL,16384);
+    fallback=PyObject_CallFunction(PyExc_MemoryError,"s","Native candidate response unavailable; inspect retained intent and receipt before retrying");
+    json_module=PyImport_ImportModule("json"); if (json_module) loads=PyObject_GetAttrString(json_module,"loads");
+    if (!carrier || !buffer || !fallback || !loads) goto finish;
+    memset(PyByteArray_AS_STRING(buffer),0,16384); memcpy(PyByteArray_AS_STRING(buffer),"{}",2);
+    if (PyDict_SetItemString(carrier,"data",buffer) || PyDict_SetItemString(carrier,"snapshot",Py_None) ||
+        PyDict_SetItemString(carrier,"recovery",Py_None) || PyObject_SetAttrString(fallback,"native_image_carrier",carrier)) goto finish;
+    context.cancel.carrier=carrier; context.cancel.fallback=fallback; context.cancel.deadline=INFINITY;
+    options.source=PyBytes_AS_STRING(source_path); options.destination=PyBytes_AS_STRING(destination_path);
+    options.cancelled=import_cancelled; options.before_create=import_before_create; options.context=&context;
+    sfs_native_import(&options,&report);
+    fixed_json json={.bytes=PyByteArray_AS_STRING(buffer),.capacity=16384}; import_json(&json,&report);
+    if (json.failed) { PyErr_SetString(PyExc_RuntimeError,"Native creation receipt exceeded its fixed carrier"); goto retained_error; }
+    if (context.cancel.signal_type) {
+        if (context.cancel.signal_value && PyObject_SetAttrString(context.cancel.signal_value,"native_image_carrier",carrier)<0) {
+            PyErr_Clear(); PyException_SetContext(context.cancel.signal_value,Py_NewRef(fallback));
+        }
+        PyErr_Restore(context.cancel.signal_type,context.cancel.signal_value,context.cancel.signal_traceback);
+        context.cancel.signal_type=context.cancel.signal_value=context.cancel.signal_traceback=NULL; goto finish;
+    }
+    PyObject *text=PyUnicode_FromStringAndSize(json.bytes,(Py_ssize_t)json.used);
+    if (text) { result=PyObject_CallOneArg(loads,text); Py_DECREF(text); }
+    if (result) {
+        PyObject *path=report.failure_path ? PyUnicode_DecodeFSDefaultAndSize(report.failure_path,(Py_ssize_t)report.failure_path_length) : Py_NewRef(Py_None);
+        if (path && !PyDict_SetItemString(result,"failure_path",path) && !PyDict_SetItemString(carrier,"failure_path",path)) {
+            Py_DECREF(path); goto finish;
+        }
+        Py_XDECREF(path); Py_CLEAR(result);
+    }
+retained_error:
+    PyErr_Clear(); PyErr_SetObject(PyExc_MemoryError,fallback);
+finish:
+    Py_XDECREF(source_path); Py_XDECREF(destination_path); Py_XDECREF(carrier); Py_XDECREF(buffer);
+    Py_XDECREF(context.before_create);
+    free(report.failure_path);
+    Py_XDECREF(fallback); Py_XDECREF(json_module); Py_XDECREF(loads);
+    return result;
+}
 static PyMethodDef methods[] = {
+    {"create_from_tree",create_from_tree,METH_VARARGS,"Produce a retained native candidate from a private prepared tree."},
+    {"with_backing_guard",with_backing_guard,METH_VARARGS,"Run synchronous nonforking work while holding a readonly backing lock."},
     {"inspect",inspect_image,METH_O,"Check a closed native image and report its opened identity."},
     {"snapshot",snapshot_image,METH_VARARGS,"Commit a named snapshot of a closed native image."},
     {"snapshots",list_images,METH_O,"List committed snapshot names under one core handle."},
@@ -381,4 +677,7 @@ static PyMethodDef methods[] = {
     {NULL,NULL,0,NULL}
 };
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT,"_image",NULL,-1,methods,NULL,NULL,NULL,NULL};
-PyMODINIT_FUNC PyInit__image(void) { return PyModule_Create(&module); }
+PyMODINIT_FUNC PyInit__image(void) {
+    if (PyType_Ready(&verifier_type) < 0) return NULL;
+    return PyModule_Create(&module);
+}
