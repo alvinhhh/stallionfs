@@ -240,9 +240,66 @@ uses a new guard of the retained image; it does not repeat import or rename.
 The controller uses ordinary macOS type dispatch and current mount observations.
 These do not authenticate an exact live adapter session or prove a previous
 adapter close succeeded. A fresh guard validates only its own current admission
-and consumed close. Owned snapshots, rollback, cleanup enrollment, retirement,
-removal and purge remain unsupported. An unmounted owned image stays protected
-and receives no cleanup closure credit.
+and consumed close. Ordinary unmount alone grants no stale-cleanup credit.
+
+Owned native snapshots and rollback require an already unmounted workspace,
+including all nested mountpoints. Use `sfs unmount ID` first, then `sfs snapshot
+ID --name NAME`, `sfs snapshots ID` or `sfs rollback ID NAME`. Rollback saves the
+previous current state under the returned recovery name in the same commit.
+The catalog holds 32 entries without eviction. At 32 entries, both snapshot and
+rollback are refused: rollback also needs one free entry for recovery. Catalog
+entry deletion is not supported. A failed or interrupted mutation retains its
+receipt; `snapshots ID` makes a fresh current observation without replaying it.
+
+Cleanup remains disabled by default and needs explicit per-workspace enrollment.
+For an enrolled owned native workspace, `close ID --quiescent` normally unmounts
+and records a fresh current image baseline. Cleanup can also observe an enrolled,
+already-unmounted workspace left open by a crash; its seven-day idle period
+starts at that new observation, never at an inferred crash time. Preview does
+not create an idle baseline. Mount/run, catalog mutation and restore clear it.
+The final retirement guard must still match that exact anchor and lifecycle.
+
+Native retirement moves the same owned directory into protected trash and uses
+one of the store's 32 retention slots. Explicit `remove ID` requires the same
+enrollment and seven-day stale baseline. `restore ID` resolves an interrupted
+move without replay, or returns protected trash to its workspace location. It
+works at full retention, frees the existing protection slot, and leaves the
+workspace unmounted; use `mount ID` afterward. Original creation, installation
+and successful first-use evidence remain unchanged. Native `run --auto-retire`
+is not supported.
+
+To permanently delete one owned native workspace already in protected trash:
+
+```sh
+sfs purge trash WORKSPACE_ID
+sfs purge trash WORKSPACE_ID --yes
+```
+
+The first command previews without changing pending move or purge records.
+`--yes` permanently removes the current filesystem **and every snapshot and
+recovery entry inside that image**. This unlinks the image; it does not securely
+erase storage media. It cannot purge an external registration, a mounted
+resource, a workspace in managed use, or an unconfirmed installation.
+
+Deletion checks an exact manifest of private owned entries before touching data.
+Unexpected files, links, nonempty unmounted volume directories, or changed
+identities stop it. The manifest is limited to 16,384 entries and the durable
+intent to 8 MiB. Every metadata input, including whitespace, is bounded to
+8 MiB before decoding; oversized input leaves existing recovery records unchanged.
+Exceeding a limit refuses deletion. Purge works when all
+32 retention slots are occupied and never runs automatically.
+
+An interrupted purge reports whether the image name is already absent. Run the
+same `purge trash WORKSPACE_ID --yes` command to finish only its recorded remaining
+entries. A failed close after unlink cannot restore the image. The reserved
+staging container and top-level journal retain partial work; do not edit or move
+them. Conflicting or unbound replacement entries remain untouched. A compact
+completion receipt makes repeating a completed purge harmless and rejects reused
+names. If a crash occurred before relocation authorization and left an unbound
+or missing staging container, the same explicit command verifies the unchanged
+original, durably archives the old attempt and starts a fresh attempt. Any unknown
+orphan container remains untouched and retained. Permanent deletion is separate
+from recoverable `remove` and `restore`.
 
 `--native-host PATH` selects the containing app's `Contents/MacOS/StallionFS`
 discovery executable. `--native-profile private-sfsro27` is reserved for explicit

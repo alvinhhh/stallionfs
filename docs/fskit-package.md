@@ -10,10 +10,11 @@ The read-only recipe below does not qualify writable workspace creation.
 
 First complete the offline recipe in that document in a Bash session. Keep its
 successful output directory, three fixture files, source hashes and compiler
-logs. The production `readonly-extension` binary is compiled against that
-fixture's generated `FixtureIdentity.swift`: its UUID, generation, digest and
-topology remain mandatory. Do not substitute another fixture or an older
-extension binary. The image and its identity stay outside the app bundle.
+logs. Current production extensions accept supported validated format-0.6 images.
+Generated `FixtureIdentity.swift` belongs to the offline helper and historical
+fixture-restricted builds; it is not a restriction on the current public factory.
+Keep fixture images and identity files outside the app bundle, and do not
+substitute an older extension binary for the current reviewed source.
 
 From the same repository root and Bash session, choose an explicit development
 bundle version. The value below is an example for a disposable package, not a
@@ -82,6 +83,29 @@ A writable production extension must be compiled with both
 one flag leaves the public factory read-only. Caller context, admitted resource
 write access and retained item-open mode remain independent runtime checks.
 Do not use diagnostic write flags or fixture identity hooks in the product.
+
+Using the same selected SDK/tool arrays and ordinary `image.o` from the offline
+recipe, build the current public writable factory and normal Host explicitly:
+
+```bash
+"${swift[@]}" -warnings-as-errors -D STALLION_CONTEXT_HANDLERS \
+    -D STALLION_CONTEXT_WRITES -parse-as-library -application-extension \
+    -Xlinker -e -Xlinker _NSExtensionMain \
+    filesystem/fskit/Extension.swift filesystem/fskit/Volume.swift \
+    "$experiment_out/image.o" -o "$experiment_out/writable-extension"
+"${swift[@]}" -warnings-as-errors -parse-as-library \
+    filesystem/fskit/Host.swift -o "$experiment_out/writable-host"
+python3 -I -B tools/package_fskit.py \
+    --host "$experiment_out/writable-host" \
+    --extension "$experiment_out/writable-extension" \
+    --out "$experiment_out/WritableStallionFS.app" \
+    --bundle-version "$package_version" --profile production \
+    --access-policy contextual-writes
+```
+
+These outputs must be fresh private preparation paths. This builds and assembles
+an unsigned candidate only. Shared-release directory permissions, distribution
+signing, installer/CLI delivery and installed qualification remain separate.
 
 For a qualified writable build, package with `--profile production
 --access-policy contextual-writes`. The optional access-policy argument is a
