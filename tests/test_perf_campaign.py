@@ -41,7 +41,8 @@ class CampaignTests(unittest.TestCase):
         output = Path(argv[argv.index('--output') + 1])
         state = {'status': 'complete', 'passed': True, 'cleanup_passed': True}
         if Path(argv[2]).name == 'cli.py':
-            state.update(case_id='cli/delete/tiny_4kib', source_checks_passed=True)
+            state.update(case_id='cli/clone/tiny_4kib' if '--native-clone' in argv else 'cli/delete/tiny_4kib',
+                         source_checks_passed=True)
         if Path(argv[2]).name in ('native_suite.py', 'cli.py'):
             writer = campaign.native_report.ReportJournal(output)
             try:
@@ -69,18 +70,21 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result['status'], 'complete')
         self.assertTrue(result['collection_passed'])
         self.assertFalse(result['all_metrics_won'])
-        expected = ['native-files', 'native-copy', 'native-cli-delete', 'native-scan', 'scan-api', 'workspaces']
+        expected = ['native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone', 'native-scan', 'scan-api', 'workspaces']
         self.assertEqual([row['stage'] for row in result['stages']], expected * 3)
-        self.assertEqual([row['cycle'] for row in result['stages']], [1] * 6 + [2] * 6 + [3] * 6)
-        self.assertEqual(len(self.calls), 18)
+        self.assertEqual([row['cycle'] for row in result['stages']], [1] * 7 + [2] * 7 + [3] * 7)
+        self.assertEqual(len(self.calls), 21)
         for argv, options in self.calls:
             self.assertEqual(argv[:2], [sys.executable, '-B'])
             self.assertEqual(argv[argv.index('--samples') + 1], '10')
             self.assertEqual(options['cwd'], self.output)
             self.assertFalse(options['check'])
             self.assertNotIn('shell', options)
-        files, copy, cli, scan, api, workspace = [argv for argv, _ in self.calls[:6]]
+        files, copy, cli, clone, scan, api, workspace = [argv for argv, _ in self.calls[:7]]
         self.assertIn('--native-delete', cli)
+        self.assertIn('--native-clone', clone)
+        self.assertNotIn('--baseline', clone)
+        self.assertEqual(clone[clone.index('--cache') + 1:clone.index('--candidate')], ['warm'])
         self.assertNotIn('--baseline', cli)
         self.assertEqual(cli[cli.index('--cache') + 1:cli.index('--candidate')], ['warm'])
         self.assertEqual(files[files.index('--fixtures') + 1:files.index('--node')], list(campaign.FILES))
@@ -88,7 +92,7 @@ class CampaignTests(unittest.TestCase):
                          ['clone', 'move', 'delete'])
         self.assertEqual(len(campaign.FILES), 13)
         self.assertEqual(len(set(campaign.FILES)), 13)
-        for argv, _ in self.calls[1::6]:
+        for argv, _ in self.calls[1::7]:
             self.assertEqual(Path(argv[2]).name, 'native_suite.py')
             self.assertEqual(argv[argv.index('--operations') + 1:],
                              ['copy', '--copy-tools', 'cp', '--fixtures', 'tiny_4kib'])
@@ -111,9 +115,9 @@ class CampaignTests(unittest.TestCase):
         self.args += ['--cache', 'warm', 'cold']
         self.assertEqual(self.run_mocked(), 0)
         report = self.report()
-        expected = ['native-files', 'native-copy', 'native-cli-delete', 'native-scan', 'scan-api', 'scan-api-cold', 'workspaces']
+        expected = ['native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone', 'native-scan', 'scan-api', 'scan-api-cold', 'workspaces']
         self.assertEqual([row['stage'] for row in report['stages']], expected * 3)
-        self.assertEqual(len(self.calls), 21)
+        self.assertEqual(len(self.calls), 24)
         for row in report['stages']:
             if row['stage'] in ('scan-api', 'scan-api-cold'):
                 mode = 'cold' if row['stage'] == 'scan-api-cold' else 'warm'
@@ -167,7 +171,7 @@ class CampaignTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 1)
         self.assertEqual(self.run_mocked(failed_first), 1)
         report = self.report()
-        self.assertEqual(len(self.calls), 18)
+        self.assertEqual(len(self.calls), 21)
         self.assertEqual(report['status'], 'complete')
         self.assertFalse(report['collection_passed'])
         self.assertEqual(report['stages'][0]['status'], 'complete_with_failures')
@@ -197,14 +201,16 @@ class CampaignTests(unittest.TestCase):
 
     def test_denied_purge_is_not_retried_in_later_native_stages(self):
         for cache, denied_stage, expected_calls, expected_skips in (
-                (['warm', 'cold'], 'native-files', 18, 3),
-                (['cold'], 'native-files', 7, 14),
-                (['warm', 'cold'], 'native-copy', 18, 3),
-                (['cold'], 'native-copy', 8, 13),
-                (['warm', 'cold'], 'native-cli-delete', 18, 3),
-                (['cold'], 'native-cli-delete', 9, 12),
-                (['warm', 'cold'], 'scan-api-cold', 19, 2),
-                (['cold'], 'scan-api-cold', 11, 10)):
+                (['warm', 'cold'], 'native-files', 21, 3),
+                (['cold'], 'native-files', 7, 17),
+                (['warm', 'cold'], 'native-copy', 21, 3),
+                (['cold'], 'native-copy', 8, 16),
+                (['warm', 'cold'], 'native-cli-delete', 21, 3),
+                (['cold'], 'native-cli-delete', 9, 15),
+                (['warm', 'cold'], 'native-cli-clone', 21, 3),
+                (['cold'], 'native-cli-clone', 10, 14),
+                (['warm', 'cold'], 'scan-api-cold', 22, 2),
+                (['cold'], 'scan-api-cold', 12, 12)):
             with self.subTest(cache=cache, denied_stage=denied_stage):
                 self.calls = []
                 self.output = self.root / ('reports-' + '-'.join(cache) + '-' + denied_stage)
@@ -221,8 +227,8 @@ class CampaignTests(unittest.TestCase):
                     try:
                         state = {'status': 'complete', 'passed': False, 'cleanup_passed': True,
                                  'cold_cache_unavailable': 'purge denied'}
-                        if denied_stage == 'native-cli-delete':
-                            state.update(self.cold_denial(), cache=cache, case_id='cli/delete/tiny_4kib',
+                        if denied_stage in campaign.CLI_CASES:
+                            state.update(self.cold_denial(), cache=cache, case_id=campaign.CLI_CASES[denied_stage],
                                          source_checks_passed=True)
                         writer.finish(state)
                     finally:
@@ -233,7 +239,7 @@ class CampaignTests(unittest.TestCase):
                     self.assertEqual(campaign.main([*self.args, '--cache', *cache]), 1)
                 report = self.report()
                 self.assertEqual(len(self.calls), expected_calls)
-                self.assertEqual(len(report['stages']), 21)
+                self.assertEqual(len(report['stages']), 24)
                 self.assertTrue(report['cold_cache_unavailable'])
                 self.assertFalse(report['collection_passed'])
                 denied_index = next(index for index, (argv, _) in enumerate(self.calls)
@@ -249,16 +255,19 @@ class CampaignTests(unittest.TestCase):
                 self.assertTrue(all(row['argv'] is None and row['planned_argv'] for row in skipped))
 
     def test_cli_denial_requires_exact_case_source_runtime_and_tool_closeout(self):
-        state = {**self.cold_denial(), 'cache': ['cold'], 'case_id': 'cli/delete/tiny_4kib',
-                 'source_checks_passed': True}
         evidence = {'final_report_exists': True}
-        self.assertTrue(campaign.safe_to_continue('native-cli-delete', 1, state, evidence))
-        for change in ({'case_id': 'fileops/delete/tiny_4kib'}, {'source_checks_passed': False},
-                       {'denial_runtime_verified': False}, {'cold_tool_identity_verified': False},
-                       {'cold_cache_receipt': {}}, {'cold_cache_unavailable': None},
-                       {'cache': ['warm']}, {'cleanup_passed': False}, {'retained_fixture': '/keep'}):
-            with self.subTest(change=change):
-                self.assertFalse(campaign.safe_to_continue('native-cli-delete', 1, {**state, **change}, evidence))
+        for stage, case in campaign.CLI_CASES.items():
+            state = {**self.cold_denial(), 'cache': ['cold'], 'case_id': case,
+                     'source_checks_passed': True}
+            self.assertTrue(campaign.safe_to_continue(stage, 1, state, evidence))
+            for change in ({'case_id': 'fileops/clone/tiny_4kib'}, {'source_checks_passed': False},
+                           {'denial_runtime_verified': False}, {'cold_tool_identity_verified': False},
+                           {'cold_cache_receipt': {}}, {'cold_cache_unavailable': None},
+                           {'cache': ['warm']}, {'cleanup_passed': False}, {'retained_fixture': '/keep'}):
+                with self.subTest(stage=stage, change=change):
+                    self.assertFalse(campaign.safe_to_continue(stage, 1, {**state, **change}, evidence))
+            self.assertFalse(campaign.safe_to_continue(stage, 1,
+                {**state, 'cold_cache_receipt': {'mode': 'cold', 'exit_code': -9}}, evidence))
 
     def test_incomplete_uncertain_and_non_native_failures_cannot_continue(self):
         evidence = {'final_report_exists': True}

@@ -105,11 +105,19 @@ are not run again. This includes the existing 50 GB dataset and its copies.
 
 `--cache warm cold` is the default for native command stages. The API scanner
 always has a warm stage and adds a separate purge-conditioned stage when cold
-was requested: 18 planned stages for warm selection, 21 with cold. Workspace
+was requested: 21 planned stages for warm selection, 24 with cold. Workspace
 stages remain warm. A denied purge is retained and never retried by later stages:
 warm work continues only after confirmed source/runtime validation and cleanup;
 later cold API stages, and native stages requested only cold, are unavailable.
 Nothing is installed or downloaded.
+
+The existing CLI tiny-clone case is collected by `cli.py --native-clone` against
+`/bin/cp -cRp`, using the original 4 KiB/0640 source and fresh absent output.
+Source and parent must have observed absent extended ACLs and common ownership;
+no flags, ACLs or ownership are initialized. Both plain and JSON calls receive
+fresh native references, 31 timing pairs and separate RSS pairs. Native cp can
+fall back to copying, so results do not prove clone syscalls or physical sharing.
+This does not qualify the case or substitute for the enriched native-file case.
 
 `campaign.json` checkpoints stage arguments, exit status, log/report references
 and source/runtime fingerprints. Native status is read from the small manifest,

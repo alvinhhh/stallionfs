@@ -70,6 +70,10 @@ def fingerprints(args):
     return result
 
 
+CLI_CASES = {'native-cli-delete': 'cli/delete/tiny_4kib',
+             'native-cli-clone': 'cli/clone/tiny_4kib'}
+
+
 def stages(args, cycle):
     common = ['--scratch', str(args.scratch), '--samples', str(args.samples)]
     runtime = ['--node', str(args.node), '--npm', str(args.npm), '--npm-cache', str(args.npm_cache)]
@@ -80,6 +84,8 @@ def stages(args, cycle):
         ('native-copy', 'native_suite.py', [*native, '--operations', 'copy',
          '--copy-tools', 'cp', '--fixtures', 'tiny_4kib']),
         ('native-cli-delete', 'cli.py', ['--native-delete', '--cache', *args.cache,
+         '--candidate', str(args.binary)]),
+        ('native-cli-clone', 'cli.py', ['--native-clone', '--cache', *args.cache,
          '--candidate', str(args.binary)]),
         ('native-scan', 'native_suite.py', [*native, '--operations', 'scan', '--fixtures', *SCANS]),
         ('scan-api', 'scan.py', ['--files', '20000', '--memory', '--cache', 'warm']),
@@ -145,7 +151,7 @@ def safe_to_continue(name, code, state, evidence):
                    and state.get('cold_tool_identity_verified') is True
                    and isinstance(sources, dict) and bool(sources)
                    and all(isinstance(row, dict) and row.get('unchanged') is True for row in sources.values()))
-    cli_denied = (name == 'native-cli-delete' and isinstance(state.get('cache'), list)
+    cli_denied = (name in CLI_CASES and isinstance(state.get('cache'), list)
                   and 'cold' in state['cache'] and bool(state.get('cold_cache_unavailable'))
                   and isinstance(receipt, dict) and receipt.get('mode') == 'cold'
                   and type(receipt.get('exit_code')) is int and receipt['exit_code'] > 0
@@ -156,12 +162,12 @@ def safe_to_continue(name, code, state, evidence):
                 and type(state.get('passed')) is bool and evidence['final_report_exists']
                 and (name not in ('scan-api', 'scan-api-cold') or
                      state.get('cache') == ('cold' if name == 'scan-api-cold' else 'warm'))
-                and (name != 'native-cli-delete' or (state.get('case_id') == 'cli/delete/tiny_4kib'
+                and (name not in CLI_CASES or (state.get('case_id') == CLI_CASES[name]
                      and state.get('source_checks_passed') is True))
                 and not any(state.get(key) for key in
                             ('retained_fixture', 'completion_uncertain', 'error', 'cleanup_error')))
     return terminal and ((code == 0 and state['passed']) or
-                         (((name.startswith('native-') and name != 'native-cli-delete') or cold_denied or cli_denied)
+                         (((name.startswith('native-') and name not in CLI_CASES) or cold_denied or cli_denied)
                           and code == 1 and not state['passed']))
 
 
@@ -209,7 +215,7 @@ def collect(args):
                         argv = None
                     else:
                         start = argv.index('--cache') + 1
-                        end = argv.index('--candidate') if name == 'native-cli-delete' else argv.index('--operations')
+                        end = argv.index('--candidate') if name in CLI_CASES else argv.index('--operations')
                         remaining = [cache for cache in argv[start:end] if cache != 'cold']
                         argv = [*argv[:start], *remaining, *argv[end:]] if remaining else None
                 row = {'cycle': cycle, 'stage': name, 'argv': argv, 'output': str(output),

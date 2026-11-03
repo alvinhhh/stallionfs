@@ -193,16 +193,16 @@ class BenchmarkCLI(unittest.TestCase):
         changes = ('none', 'missing', 'duplicate', 'reordered', 'failed', 'cleanup-failed')
         for cache, target, change in ((cache, target, change)
                                      for cache in (['warm'], ['cold'], ['warm', 'cold'])
-                                     for target in ('native-copy', 'native-cli-delete', 'scan-api-cold' if 'cold' in cache else 'scan-api')
+                                     for target in ('native-copy', 'native-cli-delete', 'native-cli-clone', 'scan-api-cold' if 'cold' in cache else 'scan-api')
                                      for change in changes):
             with self.subTest(cache=cache, target=target, change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                planned = ['native-files', 'native-copy', 'native-cli-delete', 'native-scan', 'scan-api',
+                planned = ['native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone', 'native-scan', 'scan-api',
                            *(['scan-api-cold'] if 'cold' in cache else []), 'workspaces']
                 stages = [{'cycle': cycle, 'stage': stage,
                            'outcome': {'passed': True, 'cleanup_passed': True}}
                           for cycle in range(1, 4) for stage in planned]
-                self.assertEqual(len(stages), 21 if 'cold' in cache else 18)
+                self.assertEqual(len(stages), 24 if 'cold' in cache else 21)
                 index = next(index for index, row in enumerate(stages)
                              if row['cycle'] == 2 and row['stage'] == target)
                 if change == 'missing':
@@ -392,26 +392,31 @@ class BenchmarkDeadline(unittest.TestCase):
 
     def test_list_marks_catalog_only_entries_without_starting_collectors(self):
         catalog = benchmark._catalog()
-        self.assertTrue(all(case['catalog_only'] for case in catalog['cases'] if case['id'].startswith('cli/') and case['id'] != 'cli/delete/tiny_4kib'))
+        collected_cli = {'cli/delete/tiny_4kib', 'cli/clone/tiny_4kib'}
+        self.assertTrue(all(case['catalog_only'] for case in catalog['cases'] if case['id'].startswith('cli/') and case['id'] not in collected_cli))
         self.assertFalse(any(case['catalog_only'] for case in catalog['cases'] if case['id'].startswith('fileops/')))
         self.assertFalse(next(case['catalog_only'] for case in catalog['cases'] if case['id'] == 'cli/delete/tiny_4kib'))
+        self.assertFalse(next(case['catalog_only'] for case in catalog['cases'] if case['id'] == 'cli/clone/tiny_4kib'))
 
-    def test_only_existing_cli_delete_gets_native_coverage(self):
+    def test_only_existing_cli_delete_and_clone_get_native_coverage(self):
+        selected = {'cli/delete/tiny_4kib': ('native-cli-delete', '/bin/rm -f'),
+                    'cli/clone/tiny_4kib': ('native-cli-clone', '/bin/cp -cRp')}
         for cache, collected in ((['warm'], True), (['cold'], True), (['warm', 'cold'], True), (['warm', 'cold'], False)):
             coverage = benchmark._coverage(cache, collected=collected)
             self.assertEqual(len(coverage), 37)
-            row = next(row for row in coverage if row['id'] == 'cli/delete/tiny_4kib')
-            self.assertEqual(row['collector'], 'native-cli-delete')
-            self.assertFalse(row['catalog_only'])
-            self.assertFalse(row['qualified'])
-            self.assertEqual(len(row['required_cells']), 8)
-            for cell in row['required_cells']:
-                self.assertEqual(cell['reference'], '/bin/rm -f')
-                self.assertEqual(cell['status'], 'collected_unverified'
-                                 if collected and cell['cache'] in cache else 'unavailable')
-                self.assertFalse(cell['win'])
+            for case, (collector, reference) in selected.items():
+                row = next(row for row in coverage if row['id'] == case)
+                self.assertEqual(row['collector'], collector)
+                self.assertFalse(row['catalog_only'])
+                self.assertFalse(row['qualified'])
+                self.assertEqual(len(row['required_cells']), 8)
+                for cell in row['required_cells']:
+                    self.assertEqual(cell['reference'], reference)
+                    self.assertEqual(cell['status'], 'collected_unverified'
+                                     if collected and cell['cache'] in cache else 'unavailable')
+                    self.assertFalse(cell['win'])
             for other in coverage:
-                if other['id'].startswith('cli/') and other['id'] != row['id']:
+                if other['id'].startswith('cli/') and other['id'] not in selected:
                     self.assertIsNone(other['collector'])
                     self.assertTrue(all(cell['status'] == 'unavailable' for cell in other['required_cells']))
 
