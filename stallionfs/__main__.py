@@ -99,7 +99,7 @@ def main(argv=None):
     purge = commands.add_parser("purge", help="Preview or permanently delete retained data")
     purge.add_argument("kind", choices=("snapshots", "recovery", "trash"))
     purge.add_argument("id")
-    purge.add_argument("--yes", action="store_true")
+    purge.add_argument("--yes", action="store_true", help="Permanently delete selected data, including all snapshots inside a native image")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
     from . import benchmark
     benchmark.parser(commands)

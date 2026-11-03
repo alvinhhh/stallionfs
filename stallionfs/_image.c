@@ -471,16 +471,61 @@ static PyTypeObject verifier_type = {
     .tp_getset = verifier_properties,
     .tp_new = verifier_new,
 };
+static int expected_anchor_value(PyObject *value, sfs_result *anchor) {
+    if (!PyDict_CheckExact(value) || PyDict_Size(value) != 3) {
+        PyErr_SetString(PyExc_ValueError,"Expected exactly generation, root_digest and committed_end"); return -1;
+    }
+    const char *keys[] = {"generation","committed_end"};
+    uint64_t *fields[] = {&anchor->generation,&anchor->committed_end};
+    for (size_t i = 0; i < 2; ++i) {
+        PyObject *number = PyDict_GetItemString(value,keys[i]);
+        if (!number || !PyLong_CheckExact(number)) {
+            PyErr_SetString(PyExc_TypeError,"Expected anchor values must be unsigned integers"); return -1;
+        }
+        unsigned long long parsed = PyLong_AsUnsignedLongLong(number);
+        if (PyErr_Occurred()) return -1;
+        *fields[i] = (uint64_t)parsed;
+    }
+    PyObject *digest = PyDict_GetItemString(value,"root_digest");
+    if (!digest || !PyUnicode_CheckExact(digest)) {
+        PyErr_SetString(PyExc_TypeError,"Expected anchor digest must be lowercase hexadecimal text"); return -1;
+    }
+    Py_ssize_t length = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(digest,&length);
+    if (!text) return -1;
+    if (length != 64) {
+        PyErr_SetString(PyExc_ValueError,"Expected anchor digest must contain 64 lowercase hexadecimal characters"); return -1;
+    }
+    for (size_t i = 0; i < 32; ++i) {
+        unsigned byte = 0;
+        for (size_t j = 0; j < 2; ++j) {
+            char c = text[i*2+j];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                PyErr_SetString(PyExc_ValueError,"Expected anchor digest must be lowercase hexadecimal"); return -1;
+            }
+            byte = byte*16 + (unsigned)(c <= '9' ? c-'0' : c-'a'+10);
+        }
+        anchor->root_digest[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
 static PyObject *with_backing_guard(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *target, *callback, *directory = NULL, *component = NULL, *value = NULL;
+    PyObject *target, *callback, *expected = Py_None, *directory = NULL, *component = NULL, *value = NULL;
+    PyObject *stale_error = NULL; sfs_result expected_anchor = {0};
     PyObject *error_type = NULL, *error_value = NULL, *error_trace = NULL, *fallback = NULL;
     uint64_t parent[2], file[2]; int fd = -1;
     sfs_image *handle = NULL;
     backing_verifier *token = NULL;
-    if (!PyArg_ParseTuple(args,"OO:with_backing_guard",&target,&callback)) return NULL;
+    if (!PyArg_ParseTuple(args,"OO|O:with_backing_guard",&target,&callback,&expected)) return NULL;
+    if (expected != Py_None && expected_anchor_value(expected,&expected_anchor)) return NULL;
     if (!PyCallable_Check(callback)) { PyErr_SetString(PyExc_TypeError,"Expected a synchronous callback"); return NULL; }
     if (guard_target(target,&directory,&component,parent,file)) goto done;
+    if (expected != Py_None) {
+        stale_error = PyObject_CallFunction(PyExc_OSError,"is",ESTALE,"Native backing anchor changed");
+        if (!stale_error || PyObject_SetAttrString(stale_error,"native_anchor_mismatch",Py_True)) goto done;
+    }
     token = PyObject_New(backing_verifier,&verifier_type);
     if (!token) goto done;
     token->owner = getpid(); token->thread = PyThread_get_thread_ident();
@@ -498,6 +543,12 @@ static PyObject *with_backing_guard(PyObject *self, PyObject *args) {
     if (!matches) { errno = ESTALE; PyErr_SetFromErrno(PyExc_OSError); goto done; }
     if (guard_location(PyBytes_AS_STRING(directory),PyBytes_AS_STRING(component),fd,parent,&token->opened)) {
         PyErr_SetFromErrno(PyExc_OSError); goto done;
+    }
+    if (expected != Py_None &&
+        (token->opened.generation != expected_anchor.generation ||
+         token->opened.committed_end != expected_anchor.committed_end ||
+         memcmp(token->opened.root_digest,expected_anchor.root_digest,32))) {
+        PyErr_SetObject(PyExc_OSError,stale_error); goto done;
     }
     if (PyErr_CheckSignals() < 0) goto done;
     token->active = 1;
@@ -533,7 +584,7 @@ done:
         }
         Py_CLEAR(value); PyErr_Restore(error_type,error_value,error_trace);
     }
-    Py_XDECREF(fallback); Py_XDECREF(token); Py_XDECREF(directory); Py_XDECREF(component);
+    Py_XDECREF(stale_error); Py_XDECREF(fallback); Py_XDECREF(token); Py_XDECREF(directory); Py_XDECREF(component);
     return value;
 }
 

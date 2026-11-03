@@ -62,7 +62,7 @@ def _consumed(receipt, target, anchor=None):
             and (anchor is None or all(receipt.get(k) == v for k, v in anchor.items())))
 
 
-def guarded(target, callback=None, *, anchor=None):
+def guarded(target, callback=None, *, anchor=None, expected_anchor=None):
     """One synchronous guard invocation. A fresh receipt never repairs an old one."""
     tokens = []
     def held(token):
@@ -71,13 +71,28 @@ def guarded(target, callback=None, *, anchor=None):
         if callback is not None:
             return callback(token)
     try:
-        _image.with_backing_guard(target, held)
+        if expected_anchor is None:
+            _image.with_backing_guard(target, held)
+        else:
+            _image.with_backing_guard(target, held, expected_anchor)
     except BaseException as error:
-        if tokens:
-            try:
+        # Extraction is diagnostic only. Allocation failure or an exception
+        # subclass refusing attribute access must not replace the primary error.
+        try:
+            if not tokens:
+                carrier = error
+                seen = set()
+                while carrier is not None and id(carrier) not in seen:
+                    seen.add(id(carrier))
+                    token = getattr(carrier, 'native_backing_guard', None)
+                    if token is not None:
+                        tokens.append(token)
+                        break
+                    carrier = carrier.__context__
+            if tokens:
                 error.native_current_guard = tokens[0].close_result
-            except (AttributeError, MemoryError):
-                pass
+        except BaseException:
+            pass  # The original exception still owns its native guard carrier.
         raise
     receipt = tokens[0].close_result
     if not _consumed(receipt, target, anchor):
@@ -322,11 +337,11 @@ def observe(path, profile):
     return row
 
 
-def installed_target(store, path, metadata, *, confirmed=True):
+def installed_target(store, path, metadata, *, confirmed=True, _location=None):
     from .core import private_directory, read_json, validate_native_creation_proof, native_target
     from .lifecycle import identity
     path = Path(path)
-    if (path.parent != store.root / 'workspaces' or path.name != metadata.get('id')
+    if (path.parent not in (store.root / 'workspaces', store.root / 'trash') or path.name != metadata.get('id')
             or metadata.get('backend') != 'native-image' or metadata.get('ownership') != 'store-created'
             or metadata.get('state') not in ('installed', 'installed-unconfirmed')):
         raise failure('Invalid installed native workspace', {'workspace': metadata.get('id')})
@@ -337,13 +352,15 @@ def installed_target(store, path, metadata, *, confirmed=True):
     created = validate_native_creation_proof(origin, read_json(path / 'native-create.json'))
     target = metadata.get('native_image')
     if (not isinstance(target, dict) or set(target) != {'component', 'parent', 'object', 'file', 'uuid'}
-            or target['component'] != 'image.sfs' or target['parent'] != identity(path.parent)
+            or target['component'] != 'image.sfs' or target['parent'] != identity(store.root / 'workspaces')
             or target['object'] != identity(path) or target['object'] != created['object']
             or target['file'] != created['file']
             or target['uuid'] != created['uuid'] or metadata.get('transaction') != origin.get('transaction')
             or any(metadata.get(key) != origin.get(key) for key in
                    ('id', 'seed', 'commit', 'branch', 'name', 'created', 'capacity_gib'))):
         raise failure('Installed native lineage or location changed', {'workspace': path.name})
+    from ._native_recovery import location
+    location(store, path, metadata, override=_location)
     backing = (path / 'image.sfs').lstat()
     if (not stat.S_ISREG(backing.st_mode) or backing.st_nlink != 1 or backing.st_uid != os.getuid()
             or _same(backing) != target['file']):
@@ -475,7 +492,7 @@ def recover_install(store, path, metadata):
 
 
 class Operation:
-    def __init__(self, store, path, action, target):
+    def __init__(self, store, path, action, target, *, details=None, operation_id=None):
         from .core import read_json, sync_directory
         self.path = Path(path)
         self.journal = store.root / 'journals' / (path.name + '.json')
@@ -488,11 +505,13 @@ class Operation:
         parent.mkdir(mode=0o700, exist_ok=True)
         from .core import private_directory
         private_directory(parent)
-        self.directory = parent / uuid.uuid4().hex
+        self.directory = parent / (operation_id or uuid.uuid4().hex)
         self.directory.mkdir(mode=0o700)
         self.record = {'operation': action, 'workspace': path.name, 'id': self.directory.name,
                        'target': target, 'outcome': 'prepared', 'child_pending': False,
                        'helpers': [], 'previous_unresolved': self.previous_reference(previous)}
+        if details is not None:
+            self.record.update(details)
         self.persist()
         sync_directory(parent)
 
@@ -527,6 +546,10 @@ class Operation:
 
 def check_pending(workspace, record):
     """Require affirmative terminal evidence before replacing a native intent."""
+    from ._native_recovery import ACTIONS, validate_intent
+    if isinstance(record, dict) and record.get('operation') in ACTIONS:
+        validate_intent(workspace, record)
+        return
     def malformed():
         raise failure('Malformed or unresolved native helper intent; retained unchanged', {'intent': record})
     if (not isinstance(record, dict) or record.get('workspace') != workspace
@@ -766,6 +789,10 @@ def mount_locked(store, path, metadata):
     metadata = read_json(path / 'meta.json')
     profile = metadata['controller_profile']
     volume = path / 'volume'
+    from ._native_recovery import CATALOG, catalog_locked
+    journal = store.root / 'journals' / (path.name + '.json')
+    if journal.exists() and read_json(journal).get('operation') in CATALOG:
+        catalog_locked(store, path, metadata, 'snapshots')
     state_path = path / 'native-mount.json'
     proof = read_json(path / 'native-install.json')
     first_use = proof.get('first_use')
@@ -857,7 +884,7 @@ def unmount_locked(store, path, metadata):
             operation.record['observed_mount'] = None
             _persist(path / 'native-mount.json', {'state': 'absent', 'target': target,
                 'operation': operation.record['id'], 'current_guard': receipt})
-            store._open(path.name, path, metadata, enrolled=False)
+            store._open(path.name, path, metadata)
             operation.finish()
             return {'unmounted': path.name, 'already_absent': row is None, 'native_operation': operation.record}
         except BaseException as error:
