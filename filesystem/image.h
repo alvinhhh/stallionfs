@@ -237,6 +237,17 @@ enum sfs_status sfs_image_set_metadata(sfs_image *, sfs_inode,
 enum sfs_status sfs_image_stat_metadata(sfs_image *, sfs_view, sfs_inode,
                                       sfs_metadata_entry *out, sfs_result *);
 
+/* Checked committed logical mapping query, including allocated zero blocks.
+ * The view binds the successful admission's generation and root digest. Seek
+ * inclusively at a logical 4096-byte block index; no physical address escapes.
+ * Positive budgets bound metadata reads/hashes/checks and allow cancellation.
+ * Other budget dimensions are unused. No transaction overlay or atime update.
+ * Errors preserve both outputs. End sets found=0 and preserves out_block. */
+enum sfs_status sfs_image_next_mapped_block(sfs_image *, sfs_view,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    sfs_inode, uint64_t at_or_after_block, const sfs_verify_budget *,
+    uint64_t *out_block, int *found, sfs_result *);
+
 /* Formats 0.5/0.6: opaque non-NUL names, 1..255 bytes; owners are never followed.
  * Set atomically replaces the complete binary value (NULL permits length zero).
  * The caller keeps input stable through the call, without output overlap.

@@ -1387,6 +1387,34 @@ enum sfs_status sfs_image_pin_stat_transaction(sfs_image *h, sfs_pin token, sfs_
     if (!e) e = pin_stat_value(&n, out);
     return touched_result(&r, e, result_out);
 }
+enum sfs_status sfs_image_next_mapped_block(sfs_image *h, sfs_view view,
+    uint64_t generation, const uint8_t digest[32], sfs_inode id,
+    uint64_t at_or_after, const sfs_verify_budget *budget,
+    uint64_t *out_block, int *found, sfs_result *result_out) {
+    enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e;
+    if (!out_block || !found || !digest || !generation || !valid_budget(budget) ||
+        at_or_after > SFS_FILE_MAX / CELL + 1)
+        return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (generation != h->current.generation || memcmp(digest, h->current.root.digest, 32))
+        return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    sfs_verify_budget remaining = *budget;
+    reader r = current_reader(h, 0); r.budget = &remaining;
+    namespace ns; node n; cursor c; uint8_t row[MAX_ROW]; int present = 0;
+    e = charge(&r, SFS_INCOMPLETE_CHECKS, 1);
+    if (!e) e = selected_namespace(&r, view, &ns);
+    if (!e) e = node_get(&r, &ns, id, 1, &n);
+    if (!e && n.e.kind != SFS_FILE) e = SFS_INVALID;
+    key seek = number_key(at_or_after);
+    if (!e) e = cursor_start(&c, &r, n.extent, MAP_EXTENT, UINT64_MAX, n.e.size, &seek);
+    if (!e) e = cursor_next(&c, row, &present);
+    if (!e && stable(h)) e = io_failure(&r, SFS_PHASE_IDENTITY);
+    if (!e) { if (present) *out_block = get64(row); *found = present; }
+    touched_result(&r, e, result_out);
+    if (e == SFS_INCOMPLETE && result_out) result_out->incomplete_reason = r.incomplete;
+    return e;
+}
+
 enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, const void *name, size_t length, sfs_entry *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!out || !valid_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);

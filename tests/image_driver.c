@@ -1,5 +1,6 @@
 /* Test-only syscall substitutions apply to image.c, never to this driver. */
 #include "image.h"
+#include "../stallionfs/_native_import.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <assert.h>
 #include <dirent.h>
@@ -5526,6 +5527,74 @@ static void snapshot_catalog(void) {
     }
 }
 
+
+static void importer_budget_arithmetic(void) {
+    const uint64_t counts[] = {262143, 262144, 262145, 1048576, UINT64_MAX};
+    for (unsigned i=0;i<sizeof(counts)/sizeof(*counts);i++) {
+        int saturated=0;
+        sfs_verify_budget b=sfs_import_default_budget(UINT64_MAX,counts[i],counts[i],&saturated);
+        assert(b.raw_cells && b.metadata_read_bytes && b.metadata_hash_bytes && b.checks && b.auxiliary_bytes && b.auxiliary_io_bytes);
+        assert(saturated); /* finite allowance, never an arithmetic refusal */
+        saturated=0;
+        b=sfs_import_default_budget(UINT64_C(1)<<30,counts[i],counts[i],&saturated);
+        assert(b.raw_cells && b.metadata_read_bytes && b.metadata_hash_bytes && b.checks && b.auxiliary_bytes && b.auxiliary_io_bytes);
+        if (i<4) assert(!saturated);
+    }
+}
+static void mapped_blocks(void) {
+    importer_budget_arithmetic();
+    sfs_image *h; sfs_result r; hardlink_create(&h,UINT64_C(16)*1024*1024);
+    sfs_metadata_initial m=metadata_input(SFS_FILE); sfs_inode a,b,hole;
+    OK(sfs_image_begin(h,&r));
+    OK(sfs_image_add_metadata(h,1,"a",1,SFS_FILE,&m,&a,&r));
+    OK(sfs_image_add_metadata(h,1,"b",1,SFS_FILE,&m,&b,&r));
+    OK(sfs_image_add_metadata(h,1,"hole",4,SFS_FILE,&m,&hole,&r));
+    unsigned char zero[CELL]={0};
+    OK(sfs_image_resize(h,a,3*CELL,&r)); OK(sfs_image_resize(h,b,3*CELL,&r)); OK(sfs_image_resize(h,hole,3*CELL,&r));
+    OK(sfs_image_write(h,a,0,zero,sizeof(zero),&r)); OK(sfs_image_write(h,b,2*CELL,zero,sizeof(zero),&r));
+    OK(sfs_image_commit(h,&r));
+    sfs_view view; OK(sfs_image_begin(h,&r)); OK(sfs_image_snapshot(h,"before",6,&view,&r)); OK(sfs_image_commit(h,&r));
+    sfs_result binding=r;
+    size_t length; unsigned char *image=bytes("image",&length),*ns=namespace_at(image,image,length);
+    unsigned char *arow=leaf_row(image,ns+64,a,length,496),*brow=leaf_row(image,ns+64,b,length,496);
+    unsigned char *aext=record(image,arow+32,length),*bext=record(image,brow+32,length);
+    assert(!get16(aext+68) && !get16(bext+68) && get16(aext+70)==1 && get16(bext+70)==1);
+    assert(get64(aext+640)==0 && get64(bext+640)==2); /* Independent codec evidence. */
+    reset("",0); unsigned queries_started=clock_calls;
+    for (unsigned v=0;v<2;v++) {
+        uint64_t block=99; int found=99;
+        OK(sfs_image_next_mapped_block(h,v ? view : 0,binding.generation,binding.root_digest,a,0,&generous,&block,&found,&r));
+        assert(found==1 && block==0 && r.coverage==SFS_COVERAGE_TOUCHED);
+        OK(sfs_image_next_mapped_block(h,v ? view : 0,binding.generation,binding.root_digest,a,1,&generous,&block,&found,&r));
+        assert(found==0 && block==0);
+        OK(sfs_image_next_mapped_block(h,v ? view : 0,binding.generation,binding.root_digest,b,0,&generous,&block,&found,&r));
+        assert(found==1 && block==2);
+        block=99; OK(sfs_image_next_mapped_block(h,v ? view : 0,binding.generation,binding.root_digest,hole,0,&generous,&block,&found,&r));
+        assert(found==0 && block==99);
+    }
+    image_unwritten(); unchanged("image",image,length); free(image);
+    uint64_t block=99; int found=99;
+    assert(sfs_image_next_mapped_block(h,0,binding.generation+1,binding.root_digest,a,0,&generous,&block,&found,&r)==SFS_STATE);
+    assert(block==99 && found==99);
+    assert(sfs_image_next_mapped_block(h,32,binding.generation,binding.root_digest,a,0,&generous,&block,&found,&r)==SFS_NOT_FOUND);
+    assert(sfs_image_next_mapped_block(h,0,binding.generation,binding.root_digest,1,0,&generous,&block,&found,&r)==SFS_INVALID);
+    assert(block==99 && found==99);
+    for (unsigned stop=0;stop<4;stop++) {
+        sfs_image_clear_read_cache(h); sfs_verify_budget budget=generous; unsigned polls=0;
+        if (stop==0) budget.metadata_read_bytes=1;
+        else if (stop==1) budget.metadata_hash_bytes=1;
+        else if (stop==2) budget.checks=1;
+        else { budget.cancelled=cancel_now; budget.context=&polls; }
+        assert(sfs_image_next_mapped_block(h,0,binding.generation,binding.root_digest,a,0,&budget,&block,&found,&r)==SFS_INCOMPLETE);
+        assert(block==99 && found==99 && !r.poisoned && r.incomplete_reason!=SFS_INCOMPLETE_NONE);
+    }
+    assert(clock_calls==queries_started); /* Success, end, invalid, stale and budget/cancel paths. */
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_write(h,a,CELL,zero,sizeof(zero),&r));
+    unsigned query_clock_calls=clock_calls;
+    OK(sfs_image_next_mapped_block(h,0,binding.generation,binding.root_digest,a,1,&generous,&block,&found,&r));
+    assert(found==0 && block==99 && r.transaction_active && clock_calls==query_clock_calls); OK(sfs_image_abort(h,&r));
+    close_image(h); retain(3900);
+}
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -5544,6 +5613,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"restore-admission")) restore_admission();
     else if(!strcmp(argv[1],"restore-faults")) restore_faults();
     else if(!strcmp(argv[1],"snapshot-catalog")) snapshot_catalog();
+    else if(!strcmp(argv[1],"mapped-blocks")) mapped_blocks();
 #ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
     else if(!strcmp(argv[1],"diagnostic-receipts")) diagnostic_receipts();
 #endif
@@ -5568,7 +5638,7 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
+    if(strcmp(argv[1],"mapped-blocks")&&strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("%s %s\n", (!strcmp(argv[1],"creation-success-alteration") || !strcmp(argv[1],"creation-corrective")) ? "COMPLETE" : "PASS", argv[1]); return 0;
 }
