@@ -306,7 +306,7 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
 @contextmanager
 def observe_detach():
     """Observe only the first detach command in this explicit test operation."""
-    observation = dict(started=False, operation_id=None)
+    observation = dict(started=False, operation_id=None, pre_observation='unavailable')
     token = _detach_observation.set(observation)
     try:
         yield
@@ -356,7 +356,14 @@ def artifact_available(directory):
             return False
         for line in lines:
             value = json.loads(line)
-            if not isinstance(value, dict) or value.get('kind') not in _fields or set(value) - {'kind'} != _fields[value['kind']] | _metadata:
+            if not isinstance(value, dict) or value.get('kind') not in _fields:
+                return False
+            required = _fields[value['kind']] | _metadata
+            optional = {'pre_observation'} if value['kind'] in ('observation', 'failure') else set()
+            if not required <= set(value) - {'kind'} <= required | optional:
+                return False
+            if ('pre_observation' in value and
+                    value['pre_observation'] not in ('attempted', 'unavailable', 'not-selected')):
                 return False
             if (type(value['operation_id']) is not int or value['operation_id'] < 0 or
                     value['phase'] not in ('before', 'after', 'standalone') or
@@ -790,6 +797,9 @@ class Diagnostics:
             if observation is not None:
                 observation['operation_id'] = operation_id
                 observation['deadline'] = deadline
+                if before:
+                    # Admission is not proof that mapping/capture completed.
+                    observation['pre_observation'] = 'attempted'
             self.operation_id, self.phase = operation_id, phase
             if before:
                 saved_remaining = self.remaining
@@ -806,6 +816,8 @@ class Diagnostics:
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
                        failed_device=args[2] if args[1] == 'detach' and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
+                       pre_observation=(observation.get('pre_observation', 'unavailable')
+                                        if observation is not None else 'not-selected'),
                        observation='immediately before detach command' if before else 'post-failure observation')
             if scope is None:
                 self._emit(deadline, 'unavailable', reason='no explicit owned fixture context')
