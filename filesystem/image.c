@@ -324,9 +324,9 @@ static enum sfs_status aux_finish(reader *r, enum sfs_status first) {
     if (!first && error) { r->error = error; r->phase = SFS_PHASE_VERIFY_AUX; return SFS_IO; }
     return first;
 }
-static enum sfs_status aux_bytes(reader *r, uint64_t at, uint8_t **out) {
+static enum sfs_status aux_bytes(reader *r, uint64_t at, aux_entry **out) {
     auxiliary *a = r->aux; uint64_t block = at / CELL;
-    for (unsigned i = 0; i < a->count; ++i) if (a->entries[i].valid && a->entries[i].block == block) { a->entries[i].stamp = ++a->clock; *out = a->entries[i].bytes + at % CELL; return SFS_OK; }
+    for (unsigned i = 0; i < a->count; ++i) if (a->entries[i].valid && a->entries[i].block == block) { a->entries[i].stamp = ++a->clock; *out = &a->entries[i]; return SFS_OK; }
     unsigned slot = a->count;
     if (slot == CACHE_COUNT) { slot = 0; for (unsigned i = 1; i < a->count; ++i) if (a->entries[i].stamp < a->entries[slot].stamp) slot = i; }
     else { a->entries[slot].bytes = calloc(1, CELL); if (!a->entries[slot].bytes) return SFS_NOMEM; a->count++; }
@@ -340,13 +340,14 @@ static enum sfs_status aux_bytes(reader *r, uint64_t at, uint8_t **out) {
     size_t n = a->length - offset < CELL ? (size_t)(a->length - offset) : CELL;
     e = charge(r, SFS_INCOMPLETE_AUX_IO, n); if (e) return e;
     memset(v->bytes, 0, CELL); if (read_exact(a->fd, v->bytes, n, offset)) return io_failure(r, SFS_PHASE_VERIFY_AUX);
-    v->block = block; v->stamp = ++a->clock; v->valid = 1; *out = v->bytes + at % CELL; return SFS_OK;
+    v->block = block; v->stamp = ++a->clock; v->valid = 1; *out = v; return SFS_OK;
 }
 static enum sfs_status memo(reader *r, const reference *ref, uint8_t entry[128], int writing) {
     if (!r->aux) { if (!writing) memset(entry, 0, 128); return SFS_OK; }
-    uint64_t at = (ref->offset / CELL) * 128; uint8_t *p; enum sfs_status e = aux_bytes(r, at, &p); if (e) return e;
+    uint64_t at = (ref->offset / CELL) * 128; aux_entry *selected; enum sfs_status e = aux_bytes(r, at, &selected); if (e) return e;
+    uint8_t *p = selected->bytes + at % CELL;
     if (!writing) { memcpy(entry, p, 128); if (get32(entry + 4) && (get32(entry + 4) != ref->type || memcmp(entry + 8, ref->digest, 32))) return SFS_CORRUPT; if (!zero(entry + 64, 64)) return SFS_CORRUPT; }
-    else { memcpy(p, entry, 128); for (unsigned i = 0; i < r->aux->count; ++i) if (r->aux->entries[i].valid && r->aux->entries[i].block == at / CELL) { r->aux->entries[i].dirty = 1; break; } }
+    else { memcpy(p, entry, 128); selected->dirty = 1; }
     return SFS_OK;
 }
 static enum sfs_status metadata(reader *r, const reference *ref, unsigned type, uint64_t before, const uint8_t **out) {
@@ -788,11 +789,19 @@ static enum sfs_status append_prepared(sfs_image *h, unsigned type, const uint8_
     if (!*remaining || !reserve_cells(h, 1)) return SFS_LIMIT;
     uint64_t at; if (!aligned(h->eof < DATA_START ? DATA_START : h->eof, &at)) return SFS_LIMIT;
     if (stable(h)) return SFS_IO;
-    reference ref = { .type = type, .offset = at, .length = CELL }; if (prepared) { if (prepared->type != type || prepared->offset != at || prepared->length != CELL) return SFS_CORRUPT; ref = *prepared; } else hash_cell(b, type, h->current.uuid, ref.digest, h->current.minor);
+    const anchor domain = h->current;
+    reference ref = { .type = type, .offset = at, .length = CELL }; if (prepared) { if (prepared->type != type || prepared->offset != at || prepared->length != CELL) return SFS_CORRUPT; ref = *prepared; } else hash_cell(b, type, domain.uuid, ref.digest, domain.minor);
+    const reference expected = ref;
     uint8_t padding[CELL] = {0}; uint64_t gap = h->eof < DATA_START ? DATA_START : h->eof;
     while (gap < at) { size_t n = at - gap < CELL ? (size_t)(at - gap) : CELL; if (write_exact(h->fd, padding, n, gap)) goto failed; gap += n; }
     if (write_exact(h->fd, b, CELL, at)) goto failed;
-    h->eof = at + CELL; (*remaining)--; *out = ref; return SFS_OK;
+    h->eof = at + CELL;
+    /* Accept the sealed reference only after descriptor bytes match it. */
+    uint8_t observed[CELL], digest[32];
+    if (read_exact(h->fd, observed, CELL, at)) goto failed;
+    hash_cell(observed, expected.type, domain.uuid, digest, domain.minor);
+    if (memcmp(digest, expected.digest, sizeof(digest))) return SFS_CORRUPT;
+    (*remaining)--; *out = expected; return SFS_OK;
 failed: { int error = errno; struct stat st; if (!fstat(h->fd, &st) && st.st_size >= 0) h->eof = (uint64_t)st.st_size; errno = error; return SFS_IO; }
 }
 static enum sfs_status append_cell(sfs_image *h, unsigned type, const uint8_t b[CELL], reference *out, uint64_t *remaining) { return append_prepared(h, type, b, out, remaining, NULL); }
@@ -1135,6 +1144,12 @@ static enum sfs_status create_image(const char *directory, const char *name, uin
     phase = SFS_PHASE_COMMIT_BARRIER; if (fullsync(h->fd)) goto io_failed;
     phase = SFS_PHASE_PARENT_BARRIER; if (fsync(parent)) goto io_failed;
     phase = SFS_PHASE_FINAL_BARRIER; if (fullsync(h->fd)) goto io_failed;
+    uint8_t observed[CELL];
+    for (unsigned slot = 0; slot < 2; slot++) {
+        phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0;
+        if (read_exact(h->fd, observed, CELL, slot * CELL)) goto io_failed;
+        if (memcmp(observed, b, CELL)) { code = SFS_CORRUPT; goto failed; }
+    }
     phase = SFS_PHASE_IDENTITY; struct stat ps, named;
     if (fstat(parent, &ps)) goto io_failed;
     if (!same_identity(&ps, &h->parent_identity)) { errno = ESTALE; goto io_failed; }
@@ -2410,17 +2425,22 @@ enum sfs_status sfs_image_commit(sfs_image *h, sfs_result *out) {
     anchor next = h->current; next.generation++; uint8_t b[CELL]; envelope(b, ROOT, next.uuid, h->current.minor); encode_ref(b + 64, &h->staged.ns.ref); encode_ref(b + 120, &h->staged.catalog);
     uint64_t remaining = 1; e = append_cell(h, ROOT, b, &next.root, &remaining); if (e) return mutation_failure(h, e, SFS_PHASE_RECORDS, e == SFS_IO ? errno : 0, 1, out); next.end = h->eof;
     /* Finalize every reachable byte and the slot before the first fence. */
-    encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
+    encode_slot(b, &next); unsigned slot = (unsigned)(next.generation % 2); int published = 0, error; enum sfs_phase phase = SFS_PHASE_RECORD_BARRIER;
     h->fence_attempted |= 1;
     if (fullsync(h->fd)) goto failed;
     h->fence_succeeded |= 1;
     phase = slot ? SFS_PHASE_SLOT1 : SFS_PHASE_SLOT0; published = 1; if (write_exact(h->fd, b, CELL, slot * ALIGNMENT)) goto failed;
     phase = SFS_PHASE_COMMIT_BARRIER; h->fence_attempted |= 2; if (fullsync(h->fd)) goto failed;
     h->fence_succeeded |= 2;
+    /* Verify the intended slot before promoting or acknowledging it. */
+    uint8_t observed[CELL];
+    if (read_exact(h->fd, observed, CELL, slot * ALIGNMENT)) goto failed;
+    if (memcmp(observed, b, CELL)) { error = 0; goto failed_with_error; }
     pins_promote(h);
     h->live = h->staged; memset(&h->staged, 0, sizeof(h->staged)); h->transaction = 0; h->current = next; h->slots[slot] = next; h->slot_observed[slot] = 1; h->slot_status[slot] = SFS_OK;
     result(h, SFS_OK, SFS_PHASE_NONE, 0, out); if (out) out->coverage = SFS_COVERAGE_ROOT_ONLY; return SFS_OK;
-failed: { int error = errno; discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out); }
+failed: error = errno;
+failed_with_error: discard(h); h->poisoned = 1; h->phase = phase; return result(h, published ? SFS_OUTCOME_UNKNOWN : SFS_IO, phase, error, out);
 }
 static enum sfs_status cookie_cursor(reader *r, const namespace *ns, uint64_t parent, const sfs_cookie *cookie, cursor *c) {
     const uint8_t *b = cookie->bytes; key prefix = name_key(parent, NULL, 0);

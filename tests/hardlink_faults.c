@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     assert(argc==2);
     unsigned sequence=0;
     int operations=1;
-    if (__builtin_available(macOS 13.0, *)) operations=2;
+    if (__builtin_available(macOS 13.0, *)) operations=3;
     for(copying=0;copying<operations;copying++) for(int symlink=0;symlink<2;symlink++) for(int append=0;append<2;append++)
     for(unsigned workers=1;workers<=4;workers+=3) for(mode=0;mode<11;mode++) {
         char source[PATH_MAX],target[PATH_MAX],a[PATH_MAX],b[PATH_MAX],first[PATH_MAX],second[PATH_MAX],error_path[PATH_MAX];
@@ -129,7 +129,8 @@ int main(int argc, char **argv) {
         assert(fchflags(fd,flags)==0); struct stat original,after; assert(fstat(fd,&original)==0); assert(close(fd)==0);
         source_identity=original;
         int descriptors=descriptor_count(); clears=restores=links=metadata_calls=copied_inodes=0; caller=pthread_self();
-        int result=(copying?stallion_copy:stallion_clone)(source,target,workers,cancel_after_metadata,NULL,error_path,sizeof(error_path)); int error=errno;
+        int result=copying==2 ? stallion_copy_with_strategy(source,target,STALLION_COPY_AUTO,workers,cancel_after_metadata,NULL,error_path,sizeof(error_path)) :
+            (copying?stallion_copy:stallion_clone)(source,target,workers,cancel_after_metadata,NULL,error_path,sizeof(error_path)); int error=errno;
         assert(descriptor_count()==descriptors);
         assert(lstat(first,&after)==0 && after.st_ino==original.st_ino && after.st_flags==flags && after.st_nlink==2);
         if(mode==0 || mode==7) { assert(result==0 && clears==1 && restores==1 && links==1); }

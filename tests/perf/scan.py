@@ -17,11 +17,18 @@ import fileops as f
 import native_correctness
 import native_fixtures
 import native_metrics
+import native_suite
 from native_fixtures import scan_fixture as fixture
 from stallionfs import __version__, _scan
 
 
 METHODS = {'posix': 1, 'bulk_serial': 1, 'bulk': 4}
+
+
+class ColdCacheUnavailable(RuntimeError):
+    """A completed purge failed; validate retained sources before cleanup."""
+
+
 CHILD = '''
 import hashlib, json, pathlib, sys
 from stallionfs import _scan
@@ -41,6 +48,8 @@ def memory_sample(path, method, expected, native_hash, metrics, record=None):
         record.update(row)
     if row.get('completion_uncertain') or row['exit_code'] != 0:
         raise f.ChildCompletionUnknown('Memory child completion uncertain; preserve fixture')
+    f.require(type(row.get('rss_bytes')) is int and row['rss_bytes'] > 0,
+              'Memory child peak RSS is unavailable or invalid')
     f.require(completed is not None and not completed.stderr, 'Memory child output unavailable or invalid')
     observed = json.loads(completed.stdout)
     f.require(observed == {'counts': expected, 'native_binary_sha256': native_hash},
@@ -57,25 +66,38 @@ def comparisons(rows, phase):
             for method, values in methods.items() if method != 'posix'}
 
 
+def runtime_provenance():
+    """Hash installed resources without requiring repository C source files."""
+    native_binary = Path(_scan.__file__).resolve()
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        import stallionfs
+        package = Path(stallionfs.__file__).resolve().parent
+        f.require(native_binary.parent == package, 'Use the extension from this installed package')
+        return f.fingerprint_sources(), native_binary, 'Installed package; memory children verify the same binary hash'
+    package = Path(__file__).resolve().parents[2] / 'stallionfs'
+    f.require(native_binary.parent != package.resolve(),
+              'Use an installed runtime outside the source checkout')
+    sources = [package / name for name in ('__init__.py', '_scan.c', '_walk.c', '_tree.h')]
+    sources += [Path(__file__), Path(f.__file__), Path(native_fixtures.__file__),
+                Path(native_metrics.__file__), Path(native_correctness.__file__),
+                Path(native_suite.__file__)]
+    return ({path.name: f.digest(path) for path in sources}, native_binary,
+            'Installed runtime outside source checkout; memory children verify the same binary hash')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scratch', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--files', type=int, default=20000)
     parser.add_argument('--samples', type=int, default=11)
+    parser.add_argument('--cache', choices=('warm', 'cold'), default='warm')
     parser.add_argument('--memory', action='store_true', help='Separate Python-process peak-memory samples per method/layout; uses --samples')
     args = parser.parse_args()
     if not 1 <= args.files <= 1000000 or not 10 <= args.samples <= 100:
         parser.error('Use 1–1,000,000 files and 10–100 samples')
     rng = random.Random(20261006)
-    package = Path(__file__).resolve().parents[2] / 'stallionfs'
-    sources = [package / name for name in ('__init__.py', '_scan.c', '_walk.c', '_tree.h')]
-    sources += [Path(__file__), Path(f.__file__), Path(native_fixtures.__file__),
-                Path(native_metrics.__file__), Path(native_correctness.__file__)]
-    hashes = {path.name: f.digest(path) for path in sources}
-    native_binary = Path(_scan.__file__)
-    f.require(native_binary.resolve().parent != package.resolve(),
-              'Use an installed runtime outside the source checkout')
+    hashes, native_binary, native_origin = runtime_provenance()
     scratch = args.scratch.resolve(strict=True)
     f.require(scratch.is_dir(), '--scratch must be an existing directory')
     volume = f.scratch_volume(_scan.mounts(), scratch)
@@ -89,26 +111,61 @@ def main():
               'implementation_sha256': hashes,
               'native_binary_sha256': f.digest(native_binary),
               'native_module': native_binary.name,
-              'native_origin': 'Installed runtime outside source checkout; memory children verify the same binary hash',
+              'native_origin': native_origin,
               'python_binary_sha256': f.digest(Path(sys.executable)),
               'python': platform.python_version(), 'samples': args.samples, 'warmup_rounds': 2,
-              'timing': 'Python API wall and process CPU time; native implementations; warm OS cache; no process startup',
+              'cache': args.cache, 'cold_cache_unavailable': None,
+              'timing': 'Python API wall and process CPU time; no process startup; '
+                        + ('validated source reads precede timing; residency is not guaranteed'
+                           if args.cache == 'warm' else 'purge-conditioned after source precheck; complete OS/device-cache eviction is not established'),
               'source_validation': 'Populated ACL, xattr/resource fork, sparse and hardlink coverage; full source snapshots before and after each attempt, outside API timing and child memory. Read-induced access times are excluded. Prechecks read all file contents; cache residency is not guaranteed.',
               'jobs': METHODS, 'status': 'running', 'passed': False,
               'layouts': 'Flat and 100-files-per-folder nested layouts; deep40 distributes files evenly along a 40-directory single-child chain, with special entries and empty directory at its deepest leaf',
               'volume': {key: volume.get(key) for key in ('filesystem', 'readonly', 'ignore_ownership')},
               'memory_samples_per_method': args.samples if args.memory else 0,
-              'memory_method': 'Separate fresh Python-process peak RSS/physical footprint from time -lp. Includes interpreter, import and child count/hash checks; excludes parent runner. Same startup for every method. Wrapper times are diagnostics, not API timing results or standalone C-engine memory.',
+              'memory_method': 'Separate fresh Python-process peak RSS from time -lp, with optional footprint medians. Includes interpreter startup, imports and extension hash/count checks; excludes parent runner. Only RSS has paired resource comparisons. Cold conditioning precedes child launch; imports and extension hashing precede its fixture scan, so API cache residency is not guaranteed. Wrapper times are diagnostics, not API timing results or standalone C-engine memory.',
               'workloads': {}}
+    if args.cache == 'cold':
+        result['cold_tools'] = f.cold_tool_provenance()
+        result['cold_tool_identity_verified'] = False
+        result['cold_tool_content_verified'] = False
+        result['cold_tool_limits'] = 'Matching metadata establishes observed identity stability only. Unavailable content hashes do not establish unchanged executable bytes.'
     if args.memory:
         result['time_sha256'] = f.digest(Path('/usr/bin/time'))
     root = Path(tempfile.mkdtemp(prefix='stallionfs-scan-', dir=scratch))
     identity = root.lstat()
     cleanup_safe, checkpoint_identity = False, None
+    prepared_sources = {}
 
     def checkpoint():
         nonlocal checkpoint_identity
         checkpoint_identity = f.write_json(partial, result, checkpoint_identity)
+
+    def validate_runtime():
+        f.require(runtime_provenance()[0] == hashes and
+                  f.digest(native_binary) == result['native_binary_sha256'] and
+                  f.digest(Path(sys.executable)) == result['python_binary_sha256'] and
+                  (not args.memory or f.digest(Path('/usr/bin/time')) == result['time_sha256']),
+                  'Source, interpreter or native binary changed during measurement')
+        if args.cache == 'cold':
+            observed = f.cold_tool_provenance()
+            f.require(observed == result['cold_tools'],
+                      'Cold tool identity, content hash or readability changed during measurement')
+            return all(row['content_hash_status'] == 'available' and row['sha256'] is not None
+                       for row in observed.values())
+        return False
+
+    def condition(row):
+        receipt = native_suite.cache_prepare(args.cache, 600)
+        row['cache_receipt'] = receipt
+        if args.cache == 'cold':
+            f.require(type(receipt.get('exit_code')) is int and receipt['exit_code'] >= 0,
+                      'Purge completion did not establish a normal exit')
+            if receipt['exit_code']:
+                result['cold_cache_unavailable'] = 'cache purge unavailable; no further purge retries'
+                result['cold_cache_receipt'] = receipt
+                row['unavailable'] = result['cold_cache_unavailable']
+                raise ColdCacheUnavailable(result['cold_cache_unavailable'])
 
     try:
         try:
@@ -138,18 +195,20 @@ def main():
                 metadata['coverage'] = native_fixtures.verify_metadata_coverage(expected_source, metadata['seed'])
                 f.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
                 metadata['status'] = 'prepared'
+                prepared_sources[path] = expected_source
                 checkpoint()
                 for index in range(args.samples + 2):
                     order = list(METHODS)
                     rng.shuffle(order)
                     for method in order:
                         row = dict(method=method, round=index, pair_id=index, order=order,
-                                   phase='timing', warmup=index < 2, ok=False, validated=False)
+                                   phase='timing', cache=args.cache, warmup=index < 2, ok=False, validated=False)
                         details['sample_rows'].append(row)
                         checkpoint()
                         before = native_correctness.snapshot(path, allow_special=True)
                         row['source_precheck'] = native_correctness.verify_source(expected_source, before)
                         f.require(row['source_precheck']['unchanged'], 'Scan source changed before timing attempt')
+                        condition(row)
                         cpu_start = time.process_time()
                         start = time.perf_counter()
                         observed = _scan.scan(path, bulk=method != 'posix', jobs=METHODS[method])
@@ -178,12 +237,13 @@ def main():
                         rng.shuffle(order)
                         for method in order:
                             row = dict(method=method, round=index, pair_id=index, order=order, warmup=False,
-                                       phase='resources', ok=False, validated=False)
+                                       phase='resources', cache=args.cache, ok=False, validated=False)
                             details['memory_rows'].append(row)
                             checkpoint()
                             before = native_correctness.snapshot(path, allow_special=True)
                             row['source_precheck'] = native_correctness.verify_source(expected_source, before)
                             f.require(row['source_precheck']['unchanged'], 'Scan source changed before memory attempt')
+                            condition(row)
                             row.update(memory_sample(path, method, expected, result['native_binary_sha256'], root / 'memory.txt', row))
                             row['ok'] = True
                             row['source_verification'] = native_correctness.verify_source(
@@ -197,11 +257,15 @@ def main():
                                  for key in ('rss_bytes', 'footprint_bytes')} for method in METHODS}
                     details['memory_comparisons'] = comparisons(details['memory_rows'], 'resources')
                 print(layout, json.dumps(medians), flush=True)
-            f.require({path.name: f.digest(path) for path in sources} == hashes and
-                      f.digest(native_binary) == result['native_binary_sha256'] and
-                      f.digest(Path(sys.executable)) == result['python_binary_sha256'] and
-                      (not args.memory or f.digest(Path('/usr/bin/time')) == result['time_sha256']),
-                      'Source, interpreter or native binary changed during measurement')
+            tool_content_verified = validate_runtime()
+            cleanup_safe = True
+        except ColdCacheUnavailable:
+            verification = result['denial_source_verification'] = {}
+            for path, expected_source in prepared_sources.items():
+                verification[path.name] = native_correctness.verify_source(
+                    expected_source, native_correctness.snapshot(path, allow_special=True))
+                f.require(verification[path.name]['unchanged'], 'Scan source changed after denied purge')
+            tool_content_verified = validate_runtime()
             cleanup_safe = True
         finally:
             if cleanup_safe:
@@ -213,9 +277,14 @@ def main():
                           'Fixture contains a mounted filesystem; preserve it')
                 f.remove_fixture(root)
                 result['cleanup_passed'] = True
+                if args.cache == 'cold':
+                    result['cold_tool_identity_verified'] = True
+                    result['cold_tool_content_verified'] = tool_content_verified
+                if result['cold_cache_unavailable']:
+                    result['denial_runtime_verified'] = True
             else:
                 result['retained_fixture'] = str(root)
-        result.update(status='complete', passed=True)
+        result.update(status='complete', passed=result['cold_cache_unavailable'] is None)
         f.write_new_json(output, result)
     except BaseException as exc:
         result.update(status='failed', passed=False, error=f'{type(exc).__name__}: {exc}')
@@ -230,7 +299,8 @@ def main():
     current = partial.lstat()
     if (current.st_dev, current.st_ino) == checkpoint_identity:
         partial.unlink()
+    return 0 if result['passed'] else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

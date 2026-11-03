@@ -3,6 +3,8 @@
 STALLIONFS_TEST_IMAGES=1 additionally enables actual cross-volume qualification.
 """
 import errno
+import fcntl
+from functools import partial
 import importlib.util
 import json
 import os
@@ -11,6 +13,7 @@ import platform
 import pwd
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -19,24 +22,29 @@ import unittest
 from unittest import mock
 
 
+UF_TRACKED = getattr(stat, 'UF_TRACKED', 0x00000040)
 MACOS_13 = sys.platform == 'darwin' and int(platform.mac_ver()[0].split('.')[0]) >= 13
 
 
 @unittest.skipUnless(MACOS_13, 'Ordinary copy requires macOS 13 or newer')
 class OrdinaryCopy(unittest.TestCase):
+    copy_strategy = None
+
     @classmethod
     def setUpClass(cls):
         from stallionfs import _scan, copy
         if __package__:
-            from .test_fileops import descriptors
+            from .test_fileops import compile_native_faults, descriptors
         else:
-            from test_fileops import descriptors
+            from test_fileops import compile_native_faults, descriptors
         perf = str(Path(__file__).parent / 'perf')
         sys.path.insert(0, perf)
         cls.addClassCleanup(sys.path.remove, perf)
         import native_correctness
         import native_fixtures
-        cls.copy = staticmethod(copy)
+        cls.public_copy = staticmethod(copy)
+        cls.copy = staticmethod(copy if cls.copy_strategy is None else partial(copy, strategy=cls.copy_strategy))
+        cls.compile_native_faults = staticmethod(compile_native_faults)
         cls.native = _scan
         cls.descriptors = staticmethod(descriptors)
         cls.checks = native_correctness
@@ -77,6 +85,33 @@ class OrdinaryCopy(unittest.TestCase):
         self.assertFalse(source_inodes & {tuple(row['device_inode']) for row in observed['entries'].values()})
         return observed
 
+    def eligible_child(self, source):
+        child = source / 'eligible-auto'
+        with child.open('xb') as stream:
+            stream.write(b'x')
+            stream.seek(8 * 1024 * 1024 - 1)
+            stream.write(b'y')
+            stream.flush()
+            fcntl.fcntl(stream.fileno(), 99, struct.pack('=IIqq', 0, 0, 1024 * 1024, 6 * 1024 * 1024))
+            os.fsync(stream.fileno())
+        self.fixtures.enrich_metadata(child, receipt={})
+        subprocess.run(['/bin/chmod', '-N', str(child)], check=True, capture_output=True, timeout=15)
+        child.chmod(0o640)
+        os.chflags(child, 0)
+        entry = self.checks.snapshot(child)['entries']['']
+        self.assertEqual(entry['uid'], os.geteuid())
+        self.assertEqual(entry['mode'], 0o640)
+        self.assertEqual(entry['flags'], 0)
+        self.assertIsNone(entry['acl']['unavailable'])
+        acl_text = bytes.fromhex(entry['acl'].get('text_hex') or '')
+        self.assertTrue(all(line.startswith(b'!#') for line in acl_text.splitlines()), acl_text)
+        self.assertTrue(all(entry['xattrs'].get(name.hex()) == value.hex()
+                            for name, value in self.fixtures.METADATA_XATTRS.items()))
+        self.assertLess(entry['allocated_bytes'], entry['size'])
+        self.assertTrue(any(start <= 1024 * 1024 and end >= 7 * 1024 * 1024
+                            for start, end in entry['holes']['ranges']))
+        return child
+
     def test_root_file_preserves_enriched_metadata_and_source(self):
         source = self.base / 'source'
         source.write_bytes(bytes(range(256)) * 16)
@@ -88,7 +123,7 @@ class OrdinaryCopy(unittest.TestCase):
         self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
         self.assertEqual(before['entries']['']['mode'], 0o750)
         self.assertEqual(before['entries']['']['flags'], stat.UF_NODUMP)
-        self.assertIs(self.copy, self.native.copy)
+        self.assertIs(self.public_copy, self.native.copy)
         destination = self.base / 'destination'
         self.assertIsNone(self.copy(source, destination))
         self.assert_preserved(before, destination)
@@ -96,12 +131,75 @@ class OrdinaryCopy(unittest.TestCase):
         destination.write_bytes(b'changed')
         self.assertEqual(source.read_bytes(), bytes(range(256)) * 16)
 
+    def test_tracked_files_preserve_flags_for_each_mode_and_entrypoint(self):
+        for flags in (0, UF_TRACKED):
+            for mode in (0o600, 0o640, 0o644):
+                source = self.base / f'source-{flags}-{mode:o}'
+                source.mkdir(mode=0o750)
+                file = source / 'data'
+                file.write_bytes(bytes(range(256)) * 16)
+                file.chmod(mode)
+                os.chflags(file, flags)
+                os.utime(file, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
+                for kind, operand in (('file', file), ('tree', source)):
+                    with self.subTest(flags=flags, mode=oct(mode), kind=kind):
+                        before = self.checks.snapshot(operand)
+                        destination = self.base / f'copy-{flags}-{mode:o}-{kind}'
+                        self.copy(operand, destination, jobs=1)
+                        self.assert_preserved(before, destination)
+                        self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(operand))['unchanged'])
+
+    def test_tracked_tree_preserves_metadata_hardlinks_and_blocking_flags(self):
+        source = self.base / 'source'
+        source.mkdir(mode=0o750)
+        nested = source / 'nested'
+        nested.mkdir()
+        file = nested / 'data'
+        file.write_bytes(bytes(range(256)) * 16)
+        os.link(file, nested / 'alias')
+        outside = self.base / 'outside'
+        outside.write_bytes(b'outside remains unchanged')
+        link = nested / 'link'
+        link.symlink_to(outside)
+        receipt = self.fixtures.enrich_metadata(source, receipt={})
+        for path in (source, nested, file, link):
+            try:
+                os.chflags(path, path.lstat().st_flags | UF_TRACKED, follow_symlinks=False)
+            except OSError as error:
+                self.skipTest(f'Tracked {"symlink" if path == link else "file/directory"} fixture unavailable: {error}')
+        protected = []
+        try:
+            for name, flag in (('immutable', stat.UF_IMMUTABLE), ('append', stat.UF_APPEND)):
+                path = nested / name
+                path.write_bytes(b'protected content')
+                os.chflags(path, UF_TRACKED | flag)
+                protected.append(path)
+            before = self.checks.snapshot(source)
+            outside_before = self.checks.snapshot(outside)
+            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+            for jobs in (1, 2, 4):
+                with self.subTest(jobs=jobs):
+                    destination = self.base / f'copy-{jobs}'
+                    self.copy(source, destination, jobs=jobs)
+                    protected.extend(destination / 'nested' / path.name for path in protected[:2])
+                    self.assert_preserved(before, destination)
+                    self.assertEqual((destination / 'nested/data').stat().st_ino,
+                                     (destination / 'nested/alias').stat().st_ino)
+                    self.assertEqual((destination / 'nested/data').stat().st_nlink, 2)
+                    self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
+            self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+        finally:
+            for path in protected:
+                if path.exists():
+                    os.chflags(path, path.stat().st_flags & ~(stat.UF_IMMUTABLE | stat.UF_APPEND))
+
     def test_privileged_mode_bits_when_fixture_supported(self):
         source = self.base / 'source'
         source.write_bytes(b'original')
+        os.chown(source, -1, os.getegid())
+        self.assertEqual(source.stat().st_gid, os.getegid())
         source.chmod(0o6750)
-        if stat.S_IMODE(source.stat().st_mode) != 0o6750:
-            self.skipTest('Fixture filesystem or sandbox strips setuid/setgid bits')
+        self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o6750)
         before = self.checks.snapshot(source)
         destination = self.base / 'destination'
         self.copy(source, destination)
@@ -178,6 +276,9 @@ class OrdinaryCopy(unittest.TestCase):
         (source / 'outside').symlink_to(outside, target_is_directory=True)
         (source / 'space \n café 🐎').write_bytes(b'names are bytes')
         receipt = self.fixtures.enrich_metadata(source, receipt={})
+        eligible = self.eligible_child(source)
+        os.link(eligible, source / 'b/eligible-alias')
+        os.link(eligible, self.base / 'external-eligible')
         (source / 'a').chmod(0o500)
         source.chmod(0o550)
         os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
@@ -194,6 +295,16 @@ class OrdinaryCopy(unittest.TestCase):
                 for name in ('file', 'link'):
                     self.assertEqual((destination / 'a' / name).lstat().st_nlink, 3)
                     self.assertEqual((source / 'a' / name).lstat().st_nlink, 4)
+                self.assertEqual((destination / 'eligible-auto').stat().st_ino,
+                                 (destination / 'b/eligible-alias').stat().st_ino)
+                self.assertEqual((destination / 'eligible-auto').stat().st_nlink, 2)
+                self.assertEqual(eligible.stat().st_nlink, 3)
+                with (destination / 'b/eligible-alias').open('r+b') as stream:
+                    stream.write(b'z')
+                with (destination / 'eligible-auto').open('rb') as stream:
+                    self.assertEqual(stream.read(1), b'z')
+                with eligible.open('rb') as stream:
+                    self.assertEqual(stream.read(1), b'x')
                 (destination / 'b/file').write_bytes(b'changed')
                 self.assertEqual((destination / 'c/file').read_bytes(), b'changed')
                 self.assertEqual((source / 'a/file').read_bytes(), b'original')
@@ -276,6 +387,14 @@ class OrdinaryCopy(unittest.TestCase):
             with self.subTest(jobs=jobs), self.assertRaises((ValueError, OverflowError)):
                 self.copy(source, destination, jobs=jobs)
             self.assertFalse(os.path.lexists(destination))
+        for strategy in ('', 'clone', 'AUTO', 'materialised', 'auto\x00'):
+            with self.subTest(strategy=strategy), self.assertRaises(ValueError):
+                self.public_copy(source, destination, strategy=strategy)
+            self.assertFalse(os.path.lexists(destination))
+        for strategy in (None, 1, b'auto'):
+            with self.subTest(strategy=strategy), self.assertRaises(TypeError):
+                self.public_copy(source, destination, strategy=strategy)
+            self.assertFalse(os.path.lexists(destination))
         with self.assertRaises(FileNotFoundError):
             self.copy(self.base / 'missing', destination)
         with self.assertRaises(FileNotFoundError):
@@ -317,24 +436,44 @@ class OrdinaryCopy(unittest.TestCase):
         for name, command in (('native', [str(launcher)]), ('python', [sys.executable, '-I', '-m', 'stallionfs'])):
             with self.subTest(cli=name):
                 source = '--source café 🐎 "\\\t\n\x01'
-                destination = '--' + name + '-copy "\\\t\n\x02'
                 path = self.base / source
                 path.write_bytes(b'original')
                 store = self.base / (name + '-unused-store')
                 def cli(*arguments):
                     return subprocess.run([*command, '--root', str(store), '--json', *arguments], cwd=self.base,
                                           env=environment, capture_output=True, text=True, timeout=15)
-                result = cli('copy', '--jobs=2', '--', source, destination)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), {'source': source, 'destination': destination})
-                self.assertEqual((self.base / destination).read_bytes(), b'original')
+                forms = [()] if self.copy_strategy is None else [
+                    ('--strategy=' + self.copy_strategy,), ('--strategy', self.copy_strategy)]
+                for index, options in enumerate(forms):
+                    destination = '--' + name + f'-copy-{index} "\\\t\n\x02'
+                    with self.subTest(options=options):
+                        result = cli('copy', *options, '--jobs=2', '--', source, destination)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        expected = {'source': source, 'destination': destination}
+                        if self.copy_strategy == 'auto':
+                            expected['strategy'] = 'auto'
+                        self.assertEqual(json.loads(result.stdout), expected)
+                        self.assertEqual((self.base / destination).read_bytes(), b'original')
+                options = forms[0]
                 for jobs in ('0', '5', '-1', '4294967297'):
-                    result = cli('copy', '--jobs=' + jobs, '--', source, '--invalid')
+                    result = cli('copy', *options, '--jobs=' + jobs, '--', source, '--invalid')
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertEqual(result.stdout, '')
                     self.assertFalse((self.base / '--invalid').exists())
+                for arguments in (('--strategy=clone', '--', source, '--invalid'),
+                                  ('--strategy', 'AUTO', '--', source, '--invalid'),
+                                  ('--strategy=', '--', source, '--invalid'), ('--strategy',)):
+                    with self.subTest(arguments=arguments):
+                        result = cli('copy', *arguments)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertEqual(result.stdout, '')
+                        self.assertFalse(os.path.lexists(self.base / '--invalid'))
+                result = cli('clone', '--strategy=auto', '--', source, '--invalid')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertFalse(os.path.lexists(self.base / '--invalid'))
                 for operands in ((source, destination), ('missing', 'never-created')):
-                    result = cli('copy', '--', *operands)
+                    result = cli('copy', *options, '--', *operands)
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertEqual(result.stdout, '')
                     self.assertIsInstance(json.loads(result.stderr)['error'], str)
@@ -375,9 +514,11 @@ class OrdinaryCopy(unittest.TestCase):
         source = self.base / 'source'
         source.mkdir(mode=0o700)
         receipt = self.fixtures.enrich_metadata(source, receipt={})
+        self.eligible_child(source)
         before = self.checks.snapshot(source)
         self.assertEqual({row['gid'] for row in before['entries'].values()}, {group})
         self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        fault_executable = self.compile_native_faults(self.base) if self.copy_strategy == 'auto' else None
         victim = self.base / 'victim'
         victim.mkdir(mode=0o700)
         point = victim / 'mounted'
@@ -405,6 +546,11 @@ class OrdinaryCopy(unittest.TestCase):
             self.assert_preserved(before, repo / 'copied')
             self.copy(repo / 'copied', self.base / 'returned', jobs=1)
             self.assert_preserved(before, self.base / 'returned')
+            if fault_executable is not None:
+                verified = repo / 'fault-verified-copy'
+                subprocess.run([str(fault_executable), str(self.base), '--auto-cross-volume',
+                                str(source), str(verified)], check=True, timeout=30)
+                self.assert_preserved(before, verified)
             for operation in (self.native.clone, self.native.move):
                 with self.subTest(operation=operation.__name__), self.assertRaises(OSError) as raised:
                     operation(source, repo / 'refused')
@@ -423,6 +569,14 @@ class OrdinaryCopy(unittest.TestCase):
                     images.detach(image, point)
                 if images.mounted(image) is not None:
                     raise RuntimeError(f'Retaining attached image {image}')
+
+
+class MaterializedCopy(OrdinaryCopy):
+    copy_strategy = 'materialized'
+
+
+class AutoCopy(OrdinaryCopy):
+    copy_strategy = 'auto'
 
 
 class CopyFixtureSafety(unittest.TestCase):
@@ -505,10 +659,11 @@ if sys.platform == 'darwin' and not MACOS_13:
                 source = Path(directory) / 'source'
                 destination = Path(directory) / 'destination'
                 source.write_bytes(b'original')
-                with self.assertRaises(OSError) as raised:
-                    copy(source, destination)
-                self.assertEqual(raised.exception.errno, errno.ENOTSUP)
-                self.assertFalse(destination.exists())
+                for options in ({}, {'strategy': 'materialized'}, {'strategy': 'auto'}):
+                    with self.subTest(options=options), self.assertRaises(OSError) as raised:
+                        copy(source, destination, **options)
+                    self.assertEqual(raised.exception.errno, errno.ENOTSUP)
+                    self.assertFalse(destination.exists())
                 self.assertEqual(source.read_bytes(), b'original')
 
 

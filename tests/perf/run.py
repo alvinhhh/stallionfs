@@ -32,7 +32,10 @@ def runtime_fingerprints():
     checkout = Path(__file__).resolve().parents[2]
     paths = {name: Path(module.__file__).resolve() for name, module in
              (("__init__.py", stallionfs), ("core.py", core), ("images.py", images))}
-    f.require(all(not path.is_relative_to(checkout) for path in paths.values()),
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        paths['_benchmark_budget.py'] = Path(core.__file__).with_name('_benchmark_budget.py').resolve()
+    f.require(Path(f.__file__).with_name("manifest.json").is_file() or
+              all(not path.is_relative_to(checkout) for path in paths.values()),
               "Use an installed runtime outside the source checkout")
     return {name: f.digest(path) for name, path in paths.items()}
 
@@ -121,6 +124,12 @@ def main():
     fingerprint_paths["tests/perf/run.py"] = Path(__file__).resolve()
     fingerprint_paths["tests/perf/fileops.py"] = Path(f.__file__).resolve()
     fingerprint_paths["tests/perf/native_metrics.py"] = Path(native_metrics.__file__).resolve()
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        package = Path(stallionfs.__file__).resolve().parent
+        fingerprint_paths = {name: package / name for name in ('core.py', 'images.py', '__init__.py', '_benchmark_budget.py')}
+        fingerprint_paths.update({'tests/perf/' + name: Path(__file__).with_name(name)
+                                  for name in ('run.py', 'fileops.py', 'native_metrics.py')})
+        fingerprint_paths['installed-build-manifest'] = Path(f.__file__).with_name('manifest.json')
     fingerprints = {name: hashlib.sha256(path.read_bytes()).hexdigest()
                     for name, path in fingerprint_paths.items()}
     native_binary = Path(_scan.__file__)

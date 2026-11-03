@@ -88,6 +88,17 @@ def run(args, cwd=None, *, capture=True):
     # Inherited Git routing variables must never redirect an operation elsewhere.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
+        from ._benchmark_budget import command
+        result = command(args, cwd=cwd, environment=env, persist_success=False)
+        if result.returncode:
+            raise StallionError(f'{args[0]} failed ({result.returncode}): '
+                                + result.stderr.decode(errors='replace').strip())
+        if not capture:
+            sys.stderr.write(result.stdout.decode(errors='replace'))
+            sys.stderr.write(result.stderr.decode(errors='replace'))
+            return None
+        return result.stdout.decode(errors='replace').strip()
     result = subprocess.run(
         [str(a) for a in args], cwd=cwd, env=env, text=True,
         stdout=subprocess.PIPE if capture else sys.stderr,

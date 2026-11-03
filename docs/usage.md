@@ -4,6 +4,7 @@
 
 ```sh
 sfs copy source destination
+sfs copy source destination --strategy auto
 sfs clone source destination
 sfs clone source destination --jobs 1
 sfs move source destination
@@ -15,7 +16,9 @@ sfs delete --missing-ok file
 sfs volumes
 ```
 
-`copy` copies file data and metadata to an exact new path, using ordinary data copying without requesting APFS cloning. It requires macOS 13 or later. Regular files, directories and symlinks are supported; symlink targets are not followed. Internal regular-file and symlink hardlinks share new destination inodes, independent of the source. Existing destinations, special files, nested source volumes and destinations inside the source are rejected.
+`copy` copies file data and metadata to an exact new path. The default, `--strategy materialized`, copies file data without requesting APFS cloning. It requires macOS 13 or later. Regular files, directories and symlinks are supported; symlink targets are not followed. Internal regular-file and symlink hardlinks share new destination inodes, independent of the source. Existing destinations, special files, nested source volumes and destinations inside the source are rejected.
+
+`--strategy auto` attempts data-fork cloning for eligible regular files inside the new private destination tree, then verifies ordinary-copy metadata. When only the group differs, it verifies every other field before applying metadata and checking the complete result again. Eligible files must belong to the current user, have owner read/write permission, no setuid/setgid bits, zero file flags and an empty extended ACL. Single-file operands, symlinks and other regular files use materialized copying. Only unsupported-clone and cross-volume errors permit fallback, and only when the destination entry is still absent. Other errors, including failures after a successful clone, retain any partial output and fail. Both strategies use the same copy preservation requirements. Cloned data may share physical blocks; resource forks are always verified and are copied again only when metadata application is required.
 
 Copying can cross volumes when the destination supports the required mode, ownership, modification time, flags, ACLs, extended attributes (including resource forks) and sparse hole ranges. Unsupported or unpreserved properties fail explicitly. Access, change and birth times and allocated-block counts are not equality requirements. The operation checks source stability but does not provide an atomic snapshot; keep both trees stable during copying.
 
@@ -25,7 +28,7 @@ On failure, any partial output remains at the exact destination you requested, e
 
 Directory copying uses up to four workers. Files are pinned before cloning, links are copied without following their targets, and nested volumes and special files are rejected. Keep the source and destination trees stable during the operation; a recursive copy is not an atomic snapshot of concurrent changes. An error may leave a partial new destination. All workers stop before the command returns.
 
-Copies and directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last.
+Copies and directory clones require a destination parent owned by the current user or root. Non-sticky parents writable by other users, and ACLs granting other users permission to change directory entries or permissions, are rejected. The new directory stays private while its children are copied; its final metadata is applied last. Destination name and descriptor checks rely on both trees remaining stable; they cannot prove which inode was cloned if the same user replaces a leaf before its first post-clone lookup.
 
 Ordinary copies of a single file or symlink also reject destination parents that grant inheritable file access to other users, before creating any output.
 
@@ -37,12 +40,15 @@ Ordinary copies of a single file or symlink also reject destination parents that
 
 File operations, scans and volume listings run in the native executable, including with `--json`. `volumes` lists cached mount records; it does not inspect partition maps, repair disks or change volume settings.
 
+Successful `copy --strategy auto` JSON includes `"strategy": "auto"` alongside `source` and `destination`. Default and explicit materialized-copy JSON contain only `source` and `destination`. `--strategy=auto` and `--strategy=materialized` are also accepted; `clone` does not accept a strategy option.
+
 The same operations are available to Python applications:
 
 ```python
 from stallionfs import clone, copy, delete, mounts, move, scan
 
 copy("source", "destination", jobs=4)
+copy("another-source", "another-destination", jobs=4, strategy="auto")
 move("destination", "renamed")
 delete("renamed", recursive=True, jobs=1)
 print(mounts())

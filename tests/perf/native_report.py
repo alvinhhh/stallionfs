@@ -7,7 +7,10 @@ from pathlib import Path
 import stat
 import tempfile
 
-import fileops
+if __package__:
+    from . import fileops
+else:
+    import fileops
 
 KINDS = ('rows', 'preparation', 'metadata_preparation', 'comparisons', 'unavailable')
 ENCODER = json.JSONEncoder(ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(',', ':'))

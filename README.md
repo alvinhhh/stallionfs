@@ -30,6 +30,14 @@ sfs delete --recursive old-project
 sfs volumes
 ```
 
+Run a quick comparison in disposable storage:
+
+```sh
+sfs benchmark --samples 10 --scratch /path/to/scratch --output benchmark.json
+```
+
+`--list` lists existing cases. `--full` collects the existing campaign and reports required coverage gaps; it needs explicit Node, npm and offline-cache inputs.
+
 Destinations are exact paths. Copies, clones and moves refuse to overwrite existing files; `move --replace` and `move --exchange` are explicit alternatives. Use `--jobs 1` with copying, cloning, deletion or scanning for lower CPU use. See [file operations](docs/usage.md#file-operations) for options and supported filesystems.
 
 Prepare a clean checkout, then start working in a copy:
@@ -79,7 +87,7 @@ source .venv/bin/activate
 
 ## Performance
 
-macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median elapsed times include command startup; each row has ten timing pairs and ten separate resource pairs. Measured native code matches the current native sources; build provenance and exact commands are linked below.
+macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median elapsed times include command startup; each row has ten timing pairs and ten separate resource pairs. These results describe the pinned measured executable; build provenance and exact commands are linked below.
 
 | Operation | Native reference | Native | stallionfs |
 | --- | --- | ---: | ---: |

@@ -1,5 +1,7 @@
-"""Compare two installed CLIs, including startup, on small private fixtures."""
+"""Compare installed CLI cases, including startup, on private fixtures."""
 import argparse
+import base64
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,8 +14,15 @@ import shutil
 import stat
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
+
+import fileops as f
+import native_correctness
+import native_metrics
+import native_report
+import native_suite
 
 from fileops import (REPO, ChildCompletionUnknown, command, cpu_usage, digest, fingerprint_sources, manifest,
                      no_mounts_below, remove_fixture, require, scratch_volume,
@@ -208,13 +217,859 @@ def paired_plain_effects(rows):
     }
 
 
+
+CLI_DELETE_FIXTURE_POLICY = 'cli-delete-uf-tracked-v1'
+# Darwin sys/stat.h defines this flag even when Python's stat module omits it.
+DARWIN_UF_TRACKED = 0x00000040
+_DARWIN_FCHFLAGS = None
+
+
+def _fchflags(descriptor, flags):
+    """Call Darwin's descriptor flag setter with its public C signature."""
+    global _DARWIN_FCHFLAGS
+    require(sys.platform == 'darwin', 'Tracked CLI fixtures require Darwin fchflags')
+    if _DARWIN_FCHFLAGS is None:
+        library = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        setter = library.fchflags
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint32]
+        setter.restype = ctypes.c_int
+        _DARWIN_FCHFLAGS = setter
+    result = _DARWIN_FCHFLAGS(descriptor, flags)
+    if result == -1:
+        code = ctypes.get_errno()
+        raise OSError(code, 'fchflags failed: ' + os.strerror(code))
+    require(result == 0, 'Unexpected fchflags return value')
+
+
+def initialize_tracked_delete_operand(target, root_identity, source_identity, evidence):
+    """Initialize only a fresh owned independent operand before its prepared snapshot."""
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+              'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+    stable = fields[:8]
+    def metadata(info):
+        return {name: getattr(info, name, None) for name in fields}
+    descriptor = None
+    evidence.update(policy=CLI_DELETE_FIXTURE_POLICY, status='running', descriptor_closed=False)
+    try:
+        require(target.is_absolute() and target.name == 'target', 'Invalid tracked delete operand')
+        root = target.parent.lstat()
+        require(stat.S_ISDIR(root.st_mode) and stat.S_IMODE(root.st_mode) == 0o700
+                and root.st_uid == os.getuid() and (root.st_dev, root.st_ino) == root_identity,
+                'Tracked operand root changed')
+        initial = metadata(target.lstat())
+        evidence['initial_metadata'] = dict(initial)
+
+        def valid(value):
+            require(stat.S_ISREG(value['st_mode']) and stat.S_IMODE(value['st_mode']) == 0o640
+                    and value['st_size'] == 4096 and value['st_nlink'] == 1
+                    and value['st_uid'] == os.getuid() and value['st_dev'] == root_identity[0]
+                    and (value['st_dev'], value['st_ino']) != source_identity,
+                    'Tracked operand must be an owned independent regular file')
+            require(value['st_flags'] in (0, DARWIN_UF_TRACKED), 'Unexpected initial tracked operand flags')
+
+        valid(initial)
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        opened = metadata(os.fstat(descriptor))
+        valid(opened)
+        require(all(opened[name] == initial[name] for name in stable),
+                'Tracked operand identity or metadata changed while opening')
+        _fchflags(descriptor, DARWIN_UF_TRACKED)
+        final = metadata(os.fstat(descriptor))
+        evidence['final_metadata'] = dict(final)
+        require(final['st_flags'] == DARWIN_UF_TRACKED
+                and all(final[name] == initial[name] for name in stable),
+                'Tracked operand initialization changed protected metadata or flags')
+        require(metadata(target.lstat()) == final, 'Tracked operand path changed during initialization')
+    except BaseException as error:
+        evidence.update(status='failed', error=f'{type(error).__name__}: {error}')
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+                evidence['descriptor_closed'] = True
+            except BaseException as close_error:
+                evidence['close_error'] = f'{type(close_error).__name__}: {close_error}'
+                error.add_note('Tracked operand close failed: ' + evidence['close_error'])
+        raise
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        evidence.update(status='failed', close_error=f'{type(error).__name__}: {error}')
+        raise
+    evidence.update(status='complete', descriptor_closed=True)
+    return final
+
+
+def native_delete_pins(runtime, cache):
+    sources = source_hashes()
+    sources.update({Path(module.__file__).name: digest(Path(module.__file__))
+                    for module in (f, native_metrics, native_report, native_suite)})
+    result = {'runtime': runtime_hashes(runtime), 'source': sources,
+              'python': digest(Path(sys.executable).resolve()),
+              'tools': {name: digest(Path(name)) for name in ('/bin/rm', '/bin/cp', '/usr/bin/time')}}
+    if 'cold' in cache:
+        result['cold_tools'] = f.cold_tool_provenance()
+    return result
+
+
+def native_delete_comparison(rows, phase, samples):
+    require(all(row.get('fixture_policy') == CLI_DELETE_FIXTURE_POLICY for row in rows),
+            'CLI delete fixture policies differ or are untagged')
+    require(all(row['method'] in ('native', 'candidate') for row in rows), 'Unexpected CLI delete method')
+    expected = set(range(1, 32 if phase == 'timing' else samples + 1))
+    methods = {}
+    for method in ('native', 'candidate'):
+        warmups = [row for row in rows if row['method'] == method and row['warmup']]
+        require((len(warmups) == 1 and warmups[0]['pair_id'] == 0) if phase == 'timing' else not warmups,
+                'Incorrect planned CLI delete warmup')
+        selected = [row for row in rows if row['method'] == method and not row['warmup']]
+        ids = [row['pair_id'] for row in selected]
+        require(all(type(value) is int for value in ids) and len(ids) == len(expected)
+                and set(ids) == expected, 'Incomplete or duplicate planned CLI delete pairs')
+        require(all(row['phase'] == phase and row.get('ok') is True and row.get('validated') is True
+                    and not row.get('completion_uncertain') for row in selected + warmups),
+                'Invalid planned CLI delete measurement')
+        methods[method] = selected
+    return {metric: native_metrics.compare_paired(methods['native'], methods['candidate'], metric)
+            for metric in (('wall_s', 'cpu_s') if phase == 'timing' else ('rss_bytes',))}
+
+
+def native_delete(args):
+    """Collect only the existing CLI tiny-delete case against fresh rm calls."""
+    require(platform.system() == 'Darwin', 'This comparison requires macOS')
+    scratch = args.scratch.expanduser().resolve(strict=True)
+    output = args.output.expanduser().absolute()
+    require(scratch.is_dir() and output.parent.is_dir(), 'Scratch and output parent must exist')
+    require(shutil.disk_usage(scratch).free >= 256 * 1024**2, 'At least 256 MiB free is required')
+    runtime = installed(args.candidate.expanduser().resolve(strict=True))
+    binary = runtime['binary']
+    pins = native_delete_pins(runtime, args.cache)
+    inventory = json.loads(command([binary, '--json', 'volumes']).stdout)
+    volume = scratch_volume(inventory, scratch)
+    report = {'schema': 1, 'case_id': 'cli/delete/tiny_4kib', 'fixture_policy': CLI_DELETE_FIXTURE_POLICY,
+              'status': 'running', 'passed': False,
+              'qualified': False, 'all_metrics_won': False, 'cleanup_passed': False,
+              'timing_pairs': 31, 'timing_warmup_id': 0, 'resource_pairs': args.samples,
+              'cache': args.cache, 'pins': pins, 'volume': volume, 'cold_cache_unavailable': None,
+              'cache_condition': 'Full source and candidate-based mount checks precede conditioning. After conditioning, identical root/operand metadata checks precede both methods without candidate execution or fixture file-content reads. Fully cold metadata residency is not established.',
+              'limits': ['Only the original 4 KiB/0640 CLI fixture is scored; this is not the enriched native-delete case.',
+                         'Each fresh owned operand is initialized once to UF_TRACKED=64 before its prepared snapshot and outside measurement; deletion cost is not equivalent to historical untracked or untagged fixtures.',
+                         'Timing includes command startup; CPU is completed-command/reaped-child CPU from native_metrics, not legacy harness-plus-child cpu_s.',
+                         'RSS is the measured individual-process peak, not simultaneous process-tree or whole-system memory. Footprint is unavailable.',
+                         'JSON candidate calls are independently paired with fresh plain-output rm calls.',
+                         'Purge conditioning does not establish complete OS/device-cache eviction.',
+                         'After conditioning only root/operand metadata is checked; mount checks use the candidate before conditioning and after measurement. Stable owned trees are required; cache residency is not guaranteed.',
+                         'Unreadable cold-tool contents remain unverified; matching metadata establishes observed identity stability only.',
+                         'Stable owned fixtures only; concurrent hostile path replacement is not contained.',
+                         'No release qualification or tiny-command saving target is established by collection.']}
+    journal = native_report.ReportJournal(output)
+    journal_failed = False
+    counters = dict.fromkeys(('rows', 'preparation', 'comparisons', 'unavailable'), 0)
+    base = None
+    cleaned = False
+
+    def checkpoint():
+        nonlocal journal_failed
+        try:
+            journal.checkpoint(report)
+        except BaseException:
+            journal_failed = True
+            raise
+
+    def record(kind, value, index=None):
+        nonlocal journal_failed
+        if index is None:
+            index = counters[kind]
+            counters[kind] += 1
+        try:
+            journal.append(kind, index, value)
+        except BaseException:
+            journal_failed = True
+            raise
+        return index
+
+    try:
+        checkpoint()
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-cli-delete-', dir=scratch))
+        base.chmod(0o700)
+        identity = base.lstat()
+        report['fixture_root'] = str(base)
+        checkpoint()
+        roots, _ = make_fixtures(base)
+        require(roots == {'tiny_4kib': base / 'tiny', 'empty': base / 'empty', 'nested_1000': base / 'nested'},
+                'CLI fixture roots differ from the existing case')
+        tiny = roots['tiny_4kib'].lstat()
+        require(stat.S_ISREG(tiny.st_mode) and stat.S_IMODE(tiny.st_mode) == 0o640
+                and roots['tiny_4kib'].read_bytes() == bytes(range(256)) * 16,
+                'CLI tiny fixture bytes or mode differ')
+        expected = {name: content_manifest(path) for name, path in roots.items()}
+        identities = {name: (path.lstat().st_dev, path.lstat().st_ino) for name, path in roots.items()}
+        report['fixtures'] = {name: {'manifest_sha256': hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest(),
+                                     'root_identity': identities[name]} for name, value in expected.items()}
+        source = roots['tiny_4kib']
+        target = base / 'target'
+        unused_store = base / 'unused-store'
+        environment = dict(os.environ, STALLIONFS_HOME=str(unused_store), PYTHONDONTWRITEBYTECODE='1')
+        environment.pop('PYTHONPATH', None)
+        environment.pop('PYTHONHOME', None)
+
+        def owned(*, mounts=True):
+            current = base.lstat()
+            require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700
+                    and current.st_uid == os.getuid()
+                    and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino),
+                    'Private fixture root changed; preserve it')
+            if mounts:
+                no_mounts_below(binary, base)
+
+        def sources():
+            owned()
+            require(not os.path.lexists(unused_store), 'Command created an unnecessary store')
+            require((base / 'outside-sentinel').read_bytes() == b'keep outside linked trees\n', 'Sentinel changed')
+            for name, path in roots.items():
+                info = path.lstat()
+                require((info.st_dev, info.st_ino) == identities[name]
+                        and content_manifest(path) == expected[name], 'CLI source fixture changed: ' + name)
+
+        def operand(prepared=None, *, contents=True, mounts=True, stage=None):
+            owned(mounts=mounts)
+            require(target.is_absolute() and target.parent == base and target.name == 'target', 'Invalid delete operand')
+            info = target.lstat()
+            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1,
+                    'Delete operand must be an independent regular file')
+            require((info.st_dev, info.st_ino) != identities['tiny_4kib'], 'Delete operand aliases protected source')
+            metadata = {name: getattr(info, name, None) for name in (
+                'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+                'st_mtime_ns', 'st_ctime_ns', 'st_flags')}
+            if prepared is not None and metadata != prepared:
+                mismatch = {'stage': stage, 'path': str(target), 'preparation_id': setup_id,
+                            'row_id': row_id, 'operation': {name: row[name] for name in
+                                ('case_id', 'output', 'cache', 'phase', 'pair_id', 'method', 'warmup')},
+                            'expected': dict(prepared), 'observed': dict(metadata),
+                            'changed_fields': sorted(name for name in metadata if metadata[name] != prepared[name])}
+                error = RuntimeError('Delete operand metadata changed at ' + stage)
+                error.operand_metadata_mismatch = mismatch
+                error.add_note('Operand metadata comparison: ' + json.dumps(mismatch, sort_keys=True))
+                raise error
+            if contents:
+                require(content_manifest(target) == expected['tiny_4kib'], 'Delete operand differs from CLI fixture')
+            return metadata
+
+        rng = random.Random(SEED)
+        for form in ('plain', 'json'):
+            for cache in args.cache:
+                for phase in ('timing', 'resources'):
+                    key = {'case_id': report['case_id'], 'fixture_policy': CLI_DELETE_FIXTURE_POLICY,
+                           'output': form, 'cache': cache, 'phase': phase,
+                           'reference': '/bin/rm -f', 'reference_output': 'plain', 'paired': True}
+                    if cache == 'cold' and report['cold_cache_unavailable']:
+                        record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                        checkpoint()
+                        continue
+                    rows = []
+                    denied = False
+                    rounds = range(32) if phase == 'timing' else range(1, args.samples + 1)
+                    for pair_id in rounds:
+                        order = ['native', 'candidate']
+                        rng.shuffle(order)
+                        for method in order:
+                            sources()
+                            require(not os.path.lexists(target), 'Stale delete operand')
+                            setup = key | {'pair_id': pair_id, 'method': method,
+                                           'argv': ['/bin/cp', '-cRp', str(source), str(target)], 'validated': False}
+                            setup_id = record('preparation', setup)
+                            report['active_operation'] = setup
+                            checkpoint()
+                            completed = command(setup['argv'], check=False, timeout=120, environment=environment)
+                            setup.update(exit_code=completed.returncode,
+                                stdout_b64=base64.b64encode(completed.stdout).decode(),
+                                stderr_b64=base64.b64encode(completed.stderr).decode())
+                            record('preparation', setup, setup_id)
+                            require(completed.returncode == 0, 'CLI operand setup failed; preserve fixture')
+                            verify_clone(source, target, expected['tiny_4kib'])
+                            sources()
+                            setup['tracked_initialization'] = {}
+                            try:
+                                initialized = initialize_tracked_delete_operand(target,
+                                    (identity.st_dev, identity.st_ino), identities['tiny_4kib'],
+                                    setup['tracked_initialization'])
+                                prepared = operand()
+                                setup['operand_metadata'] = dict(prepared)
+                                setup['operand_metadata_stage'] = 'before_content_validation'
+                                require(prepared == initialized,
+                                        'Tracked operand changed before prepared snapshot')
+                            except BaseException as error:
+                                try:
+                                    record('preparation', setup, setup_id)
+                                except BaseException as journal_error:
+                                    error.add_note('Tracked preparation reporting failed: ' + repr(journal_error))
+                                raise
+                            setup['validated'] = True
+                            record('preparation', setup, setup_id)
+                            argv = ['/bin/rm', '-f', str(target)] if method == 'native' else [
+                                str(binary), *(['--json'] if form == 'json' else []), 'delete', str(target)]
+                            row = key | {'pair_id': pair_id, 'preparation_id': setup_id,
+                                         'warmup': phase == 'timing' and pair_id == 0,
+                                         'method': method, 'argv': argv, 'ok': False, 'validated': False}
+                            row_id = record('rows', row)
+                            report['active_operation'] = row
+                            checkpoint()
+                            sources()
+                            operand(prepared, stage='before_conditioning')
+                            conditioning = native_suite.cache_prepare(cache, 120)
+                            row['cache_receipt'] = conditioning
+                            if cache == 'cold':
+                                code = conditioning.get('exit_code')
+                                require(type(code) is int and code >= 0, 'Purge did not establish normal completion')
+                                if code:
+                                    report['cold_cache_unavailable'] = 'cache purge unavailable; no further purge retries'
+                                    report['cold_cache_receipt'] = conditioning
+                                    row['unavailable'] = report['cold_cache_unavailable']
+                                    record('rows', row, row_id)
+                                    sources()
+                                    operand(prepared, stage='denial_closeout')
+                                    require(native_delete_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+                                    remove_fixture(target)
+                                    record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                                    report.pop('active_operation', None)
+                                    checkpoint()
+                                    denied = True
+                                    break
+                            operand(prepared, contents=False, mounts=False, stage='after_conditioning')
+                            receipt = native_metrics.collect(argv, timeout_s=120, env=environment, phase=phase)
+                            row.update(receipt)
+                            record('rows', row, row_id)
+                            checkpoint()
+                            require(not row.get('completion_uncertain') and row.get('ok') is True
+                                    and row.get('exit_code') == 0, 'CLI measurement failed or uncertain')
+                            stderr = base64.b64decode(row['stderr_b64'], validate=True)
+                            require(not (native_metrics.time_diagnostics(stderr) if phase == 'resources' else stderr),
+                                    'Delete command emitted diagnostics')
+                            stdout = base64.b64decode(row['stdout_b64'], validate=True)
+                            if method == 'candidate' and form == 'json':
+                                require(json.loads(stdout) == {'path': str(target)}, 'CLI delete JSON contract differs')
+                            else:
+                                require(stdout == b'', 'Delete command output differs')
+                            require(not os.path.lexists(target), 'Delete did not complete before returning')
+                            sources()
+                            if phase == 'resources':
+                                require(type(row.get('rss_bytes')) is int and row['rss_bytes'] > 0, 'Peak RSS unavailable')
+                            row['validated'] = True
+                            record('rows', row, row_id)
+                            rows.append(row)
+                            report.pop('active_operation', None)
+                            checkpoint()
+                        if denied:
+                            break
+                    if not denied:
+                        record('comparisons', key | {'metrics': native_delete_comparison(rows, phase, args.samples),
+                                                     'footprint': 'unavailable'})
+                        checkpoint()
+        sources()
+        report['source_checks_passed'] = True
+        require(not os.path.lexists(target), 'Unconsumed delete operand remains')
+        require(native_delete_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+        checkpoint()
+        try:
+            journal.verify()
+        except BaseException:
+            journal_failed = True
+            raise
+        owned()
+        remove_fixture(base)
+        cleaned = True
+        report.update(status='complete', passed=report['cold_cache_unavailable'] is None, cleanup_passed=True)
+        if 'cold' in args.cache:
+            report['cold_tool_identity_verified'] = True
+            report['cold_tool_content_verified'] = all(row['content_hash_status'] == 'available'
+                and row['sha256'] is not None for row in pins['cold_tools'].values())
+        if report['cold_cache_unavailable']:
+            report['denial_runtime_verified'] = True
+        checkpoint()
+        journal.finish(report)
+    except BaseException as error:
+        report.update(status='failed', passed=False, error=f'{type(error).__name__}: {error}')
+        if hasattr(error, 'receipt'):
+            report['command_receipt'] = error.receipt
+        if base is not None and not cleaned:
+            report['retained_fixture'] = str(base)
+        mismatch = getattr(error, 'operand_metadata_mismatch', None)
+        if mismatch is not None:
+            report['operand_metadata_mismatch'] = mismatch
+            row['operand_metadata_mismatch'] = mismatch
+        if not journal_failed:
+            try:
+                if mismatch is not None:
+                    record('rows', row, row_id)
+                checkpoint()
+                journal.finish(report)
+            except BaseException as secondary:
+                error.add_note('Report closeout also failed: ' + str(secondary))
+        raise
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            journal.close()
+        except BaseException as secondary:
+            if primary is None:
+                raise
+            primary.add_note('Journal close also failed: ' + str(secondary))
+    return 0 if report['passed'] else 1
+
+
+CLI_CLONE_FIXTURE_POLICY = 'cli-clone-acl-absent-v1'
+_CLONE_FIELDS = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size',
+                 'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+# Parent link accounting can change with child entries; full precommand snapshots still include it.
+_CLONE_PARENT_SECURITY = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_flags')
+
+
+def _clone_metadata(info):
+    return {name: getattr(info, name, None) for name in _CLONE_FIELDS}
+
+
+def _clone_parent_compare(expected, observed, fields, *, stage, path, diagnostic=None, message, error=None):
+    if all(observed[name] == expected[name] for name in fields):
+        return
+    mismatch = {'expected': dict(expected), 'observed': dict(observed),
+                'compared_fields': list(fields),
+                'differing_fields': [name for name in fields if observed[name] != expected[name]],
+                'stage': stage, 'path': str(path),
+                'preparation_id': None, 'row_id': None, **(diagnostic or {})}
+    # Freeze the compared values before any failure-report I/O can fail or mutate a payload.
+    snapshot = json.dumps(mismatch, sort_keys=True)
+    if error is None:
+        error = RuntimeError(message)
+    error.clone_parent_metadata_mismatch_json = snapshot
+    error.add_note('Clone parent metadata comparison: ' + snapshot)
+    raise error
+
+
+def _clone_absent_acl(path):
+    observed = native_correctness._acl(path)
+    require(observed == {'text_hex': None, 'unavailable': None},
+            'CLI clone requires an observed absent extended ACL: ' + str(path))
+    return observed
+
+
+def clone_admission(source, parent, source_identity, parent_identity, *, diagnostic=None):
+    """Observe the generated fixture; never initialize flags, ownership or ACLs."""
+    before = {'source': _clone_metadata(source.lstat()), 'parent': _clone_metadata(parent.lstat())}
+    leaf, directory = before['source'], before['parent']
+    require(stat.S_ISREG(leaf['st_mode']) and stat.S_IMODE(leaf['st_mode']) == 0o640
+            and leaf['st_size'] == 4096 and leaf['st_nlink'] == 1
+            and leaf['st_uid'] == os.geteuid()
+            and (leaf['st_dev'], leaf['st_ino']) == source_identity,
+            'CLI clone source admission differs')
+    require(stat.S_ISDIR(directory['st_mode']) and stat.S_IMODE(directory['st_mode']) == 0o700
+            and directory['st_uid'] == os.geteuid()
+            and (directory['st_dev'], directory['st_ino']) == parent_identity
+            and leaf['st_dev'] == directory['st_dev'] and leaf['st_gid'] == directory['st_gid'],
+            'CLI clone parent ownership or group admission differs')
+    before['acl'] = {'source': _clone_absent_acl(source), 'parent': _clone_absent_acl(parent)}
+    require(_clone_metadata(source.lstat()) == leaf,
+            'CLI clone admission changed during ACL observation')
+    _clone_parent_compare(directory, _clone_metadata(parent.lstat()), _CLONE_FIELDS,
+                          stage='admission_after_acl', path=parent, diagnostic=diagnostic,
+                          message='CLI clone admission changed during ACL observation')
+    return before
+
+
+def verify_clone_output(source, destination, expected, prepared, *, diagnostic=None):
+    """Validate the real output, then mutate only its checked independent descriptor."""
+    parent = destination.parent
+    def closure(stage):
+        require(_clone_metadata(source.lstat()) == prepared['source'], 'CLI clone source metadata changed')
+        current = _clone_metadata(parent.lstat())
+        _clone_parent_compare(prepared['parent'], current, _CLONE_PARENT_SECURITY,
+                              stage=stage + '_before_acl', path=parent, diagnostic=diagnostic,
+                              message='CLI clone parent identity or security metadata changed')
+        _clone_absent_acl(source)
+        _clone_absent_acl(parent)
+        after_parent = _clone_metadata(parent.lstat())
+        require(_clone_metadata(source.lstat()) == prepared['source'],
+                'CLI clone metadata changed during output observation')
+        _clone_parent_compare(prepared['parent'], after_parent, _CLONE_PARENT_SECURITY,
+                              stage=stage + '_after_acl', path=parent, diagnostic=diagnostic,
+                              message='CLI clone metadata changed during output observation')
+
+    verify_clone(source, destination, expected)
+    closure('output')
+    info = _clone_metadata(destination.lstat())
+    original = prepared['source']
+    require(stat.S_ISREG(info['st_mode']) and info['st_nlink'] == 1
+            and (info['st_dev'], info['st_ino']) != (original['st_dev'], original['st_ino'])
+            and info['st_dev'] == original['st_dev']
+            and all(info[name] == original[name] for name in
+                    ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_mtime_ns', 'st_flags')),
+            'CLI clone output metadata or independence differs')
+    _clone_absent_acl(destination)
+    require(_clone_metadata(destination.lstat()) == info, 'CLI clone output changed during ACL observation')
+    payload = bytes(range(256)) * 16
+    descriptor = os.open(destination, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        require(_clone_metadata(os.fstat(descriptor)) == info and _clone_metadata(destination.lstat()) == info,
+                'CLI clone output descriptor differs from public path')
+        require(os.pread(descriptor, 4097, 0) == payload and os.pread(descriptor, 1, 4096) == b'',
+                'CLI clone output bytes or EOF differ')
+        require(os.pwrite(descriptor, b'changed', 0) == 7, 'CLI clone independence mutation was short')
+        require(os.pread(descriptor, 4097, 0) == b'changed' + payload[7:] and
+                os.pread(descriptor, 1, 4096) == b'', 'CLI clone independence mutation differs')
+        changed = _clone_metadata(os.fstat(descriptor))
+        require(all(changed[name] == info[name] for name in
+                    ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid', 'st_size', 'st_flags'))
+                and _clone_metadata(destination.lstat()) == changed, 'CLI clone mutated output identity changed')
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except BaseException as secondary:
+            error.add_note('Clone output close also failed: ' + repr(secondary))
+        raise
+    os.close(descriptor)
+    require(_clone_metadata(destination.lstat()) == changed, 'CLI clone output changed after close')
+    _clone_absent_acl(destination)
+    require(_clone_metadata(destination.lstat()) == changed, 'CLI clone output changed during final ACL observation')
+    require(source.read_bytes() == payload, 'CLI clone mutation changed protected source bytes or EOF')
+    closure('mutation')
+    return {'output_metadata': info, 'mutation_metadata': changed, 'bytes_and_eof': True,
+            'independent_descriptor': True, 'mutation_isolated': True, 'descriptor_closed': True,
+            'acl_absence': True}
+
+
+def native_clone_pins(runtime, cache):
+    pins = native_delete_pins(runtime, cache)
+    pins['source'][Path(native_correctness.__file__).name] = digest(Path(native_correctness.__file__))
+    return pins
+
+
+def native_clone_comparison(rows, phase, samples):
+    require(all(row.get('fixture_policy') == CLI_CLONE_FIXTURE_POLICY for row in rows),
+            'CLI clone fixture policies differ or are untagged')
+    require(all(row['method'] in ('native', 'candidate') for row in rows), 'Unexpected CLI clone method')
+    expected = set(range(1, 32 if phase == 'timing' else samples + 1))
+    methods = {}
+    for method in ('native', 'candidate'):
+        warmups = [row for row in rows if row['method'] == method and row['warmup']]
+        require((len(warmups) == 1 and warmups[0]['pair_id'] == 0) if phase == 'timing' else not warmups,
+                'Incorrect planned CLI clone warmup')
+        selected = [row for row in rows if row['method'] == method and not row['warmup']]
+        ids = [row['pair_id'] for row in selected]
+        require(all(type(value) is int for value in ids) and len(ids) == len(expected)
+                and set(ids) == expected, 'Incomplete or duplicate planned CLI clone pairs')
+        require(all(row['phase'] == phase and row.get('ok') is True and row.get('validated') is True
+                    and not row.get('completion_uncertain') for row in selected + warmups),
+                'Invalid planned CLI clone measurement')
+        methods[method] = selected
+    return {metric: native_metrics.compare_paired(methods['native'], methods['candidate'], metric)
+            for metric in (('wall_s', 'cpu_s') if phase == 'timing' else ('rss_bytes',))}
+
+def native_clone(args):
+    """Collect only the existing CLI tiny-clone case against fresh cp calls."""
+    require(platform.system() == 'Darwin', 'This comparison requires macOS')
+    scratch = args.scratch.expanduser().resolve(strict=True)
+    output = args.output.expanduser().absolute()
+    require(scratch.is_dir() and output.parent.is_dir(), 'Scratch and output parent must exist')
+    require(shutil.disk_usage(scratch).free >= 256 * 1024**2, 'At least 256 MiB free is required')
+    runtime = installed(args.candidate.expanduser().resolve(strict=True))
+    binary = runtime['binary']
+    pins = native_clone_pins(runtime, args.cache)
+    inventory = json.loads(command([binary, '--json', 'volumes']).stdout)
+    volume = scratch_volume(inventory, scratch)
+    report = {'schema': 1, 'case_id': 'cli/clone/tiny_4kib', 'fixture_policy': CLI_CLONE_FIXTURE_POLICY,
+              'status': 'running', 'passed': False,
+              'qualified': False, 'all_metrics_won': False, 'cleanup_passed': False,
+              'timing_pairs': 31, 'timing_warmup_id': 0, 'resource_pairs': args.samples,
+              'cache': args.cache, 'pins': pins, 'volume': volume, 'cold_cache_unavailable': None,
+              'cache_condition': 'Full source and candidate-based mount checks precede conditioning. After conditioning, identical root/operand metadata checks precede both methods without candidate execution or fixture file-content reads. Fully cold metadata residency is not established.',
+              'limits': ['Only the original 4 KiB/0640 CLI clone fixture is scored; no enriched native-files alias.',
+                         'Source flags/ownership/ACLs are observed without modification; destination is absent until the measured command. Source and parent ACL absence is admitted before conditioning.',
+                         'Timing includes command startup; CPU is completed-command/reaped-child CPU from native_metrics, not legacy harness-plus-child cpu_s.',
+                         'RSS is the measured individual-process peak, not simultaneous process-tree or whole-system memory. Footprint is unavailable.',
+                         'JSON candidate calls are independently paired with fresh plain-output cp -cRp calls. cp may fall back; command success and independence do not prove clone syscalls or physical block sharing.',
+                         'Purge conditioning does not establish complete OS/device-cache eviction.',
+                         'After conditioning only root/operand metadata is checked; mount checks use the candidate before conditioning and after measurement. Stable owned trees are required; cache residency is not guaranteed.',
+                         'Unreadable cold-tool contents remain unverified; matching metadata establishes observed identity stability only.',
+                         'Stable owned fixtures only; concurrent hostile path replacement is not contained.',
+                         'No release qualification or tiny-command saving target is established by collection.']}
+    journal = native_report.ReportJournal(output)
+    journal_failed = False
+    counters = dict.fromkeys(('rows', 'preparation', 'comparisons', 'unavailable'), 0)
+    base = None
+    cleaned = False
+
+    def checkpoint():
+        nonlocal journal_failed
+        try:
+            journal.checkpoint(report)
+        except BaseException:
+            journal_failed = True
+            raise
+
+    def record(kind, value, index=None):
+        nonlocal journal_failed
+        if index is None:
+            index = counters[kind]
+            counters[kind] += 1
+        try:
+            journal.append(kind, index, value)
+        except BaseException:
+            journal_failed = True
+            raise
+        return index
+
+    try:
+        checkpoint()
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-cli-clone-', dir=scratch))
+        base.chmod(0o700)
+        identity = base.lstat()
+        report['fixture_root'] = str(base)
+        checkpoint()
+        roots, _ = make_fixtures(base)
+        require(roots == {'tiny_4kib': base / 'tiny', 'empty': base / 'empty', 'nested_1000': base / 'nested'},
+                'CLI fixture roots differ from the existing case')
+        tiny = roots['tiny_4kib'].lstat()
+        require(stat.S_ISREG(tiny.st_mode) and stat.S_IMODE(tiny.st_mode) == 0o640
+                and roots['tiny_4kib'].read_bytes() == bytes(range(256)) * 16,
+                'CLI tiny fixture bytes or mode differ')
+        expected = {name: content_manifest(path) for name, path in roots.items()}
+        identities = {name: (path.lstat().st_dev, path.lstat().st_ino) for name, path in roots.items()}
+        report['fixtures'] = {name: {'manifest_sha256': hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest(),
+                                     'root_identity': identities[name]} for name, value in expected.items()}
+        source = roots['tiny_4kib']
+        source_baseline = _clone_metadata(source.lstat())
+        parent_metadata = _clone_metadata(base.lstat())
+        target = base / 'destination'
+        unused_store = base / 'unused-store'
+        environment = dict(os.environ, STALLIONFS_HOME=str(unused_store), PYTHONDONTWRITEBYTECODE='1')
+        environment.pop('PYTHONPATH', None)
+        environment.pop('PYTHONHOME', None)
+
+        setup_id = row_id = None
+        row = None
+
+        def diagnostic():
+            return {'preparation_id': setup_id, 'row_id': row_id}
+
+        def owned(*, mounts=True, stage='source_closure'):
+            current = base.lstat()
+            try:
+                require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700
+                        and current.st_uid == os.getuid()
+                        and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino),
+                        'Private fixture root changed; preserve it')
+            except RuntimeError as error:
+                _clone_parent_compare(parent_metadata, _clone_metadata(current), _CLONE_PARENT_SECURITY,
+                                      stage=stage + '_security', path=base, diagnostic=diagnostic(),
+                                      message=str(error), error=error)
+                raise
+            current_metadata = _clone_metadata(current)
+            _clone_parent_compare(parent_metadata, current_metadata, _CLONE_PARENT_SECURITY,
+                                  stage=stage + '_security', path=base, diagnostic=diagnostic(),
+                                  message='CLI clone parent security metadata changed')
+            if mounts:
+                no_mounts_below(binary, base)
+
+        def sources():
+            owned()
+            require(not os.path.lexists(unused_store), 'Command created an unnecessary store')
+            require((base / 'outside-sentinel').read_bytes() == b'keep outside linked trees\n', 'Sentinel changed')
+            for name, path in roots.items():
+                info = path.lstat()
+                require((info.st_dev, info.st_ino) == identities[name]
+                        and content_manifest(path) == expected[name], 'CLI source fixture changed: ' + name)
+
+            require(_clone_metadata(source.lstat()) == source_baseline, 'CLI clone protected source metadata changed')
+            allowed = {'tiny', 'empty', 'nested', 'outside-sentinel'}
+            if os.path.lexists(target):
+                allowed.add(target.name)
+            require({path.name for path in base.iterdir()} == allowed, 'Unexpected CLI clone fixture entry')
+
+        def guard(prepared, *, mounts=True, stage):
+            owned(mounts=mounts, stage=stage)
+            require(not os.path.lexists(target), 'CLI clone destination must remain absent')
+            require(_clone_metadata(source.lstat()) == prepared['source'], 'CLI clone source metadata changed')
+            _clone_parent_compare(prepared['parent'], _clone_metadata(base.lstat()), _CLONE_FIELDS,
+                                  stage=stage, path=base, diagnostic=diagnostic(),
+                                  message='CLI clone parent metadata changed')
+
+        rng = random.Random(SEED)
+        for form in ('plain', 'json'):
+            for cache in args.cache:
+                for phase in ('timing', 'resources'):
+                    key = {'case_id': report['case_id'], 'fixture_policy': CLI_CLONE_FIXTURE_POLICY,
+                           'output': form, 'cache': cache, 'phase': phase,
+                           'reference': '/bin/cp -cRp', 'reference_output': 'plain', 'paired': True}
+                    if cache == 'cold' and report['cold_cache_unavailable']:
+                        record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                        checkpoint()
+                        continue
+                    rows = []
+                    denied = False
+                    rounds = range(32) if phase == 'timing' else range(1, args.samples + 1)
+                    for pair_id in rounds:
+                        order = ['native', 'candidate']
+                        rng.shuffle(order)
+                        for method in order:
+                            setup_id = row_id = None
+                            row = None
+                            sources()
+                            require(not os.path.lexists(target), 'Stale CLI clone destination')
+                            setup = key | {'pair_id': pair_id, 'method': method,
+                                           'kind': 'read_only_clone_admission', 'validated': False}
+                            setup_id = record('preparation', setup)
+                            report['active_operation'] = setup
+                            checkpoint()
+                            prepared = clone_admission(source, base, identities['tiny_4kib'],
+                                                       (identity.st_dev, identity.st_ino), diagnostic=diagnostic())
+                            require(prepared['source'] == source_baseline, 'CLI clone source snapshot cannot be rebased')
+                            setup['operand_metadata'] = prepared
+                            setup['operand_metadata_stage'] = 'before_conditioning'
+                            setup['validated'] = True
+                            record('preparation', setup, setup_id)
+                            argv = ['/bin/cp', '-cRp', str(source), str(target)] if method == 'native' else [
+                                str(binary), *(['--json'] if form == 'json' else []), 'clone', str(source), str(target)]
+                            row = key | {'pair_id': pair_id, 'preparation_id': setup_id,
+                                         'warmup': phase == 'timing' and pair_id == 0,
+                                         'method': method, 'argv': argv, 'ok': False, 'validated': False}
+                            row_id = record('rows', row)
+                            report['active_operation'] = row
+                            checkpoint()
+                            sources()
+                            guard(prepared, stage='before_conditioning')
+                            conditioning = native_suite.cache_prepare(cache, 120)
+                            row['cache_receipt'] = conditioning
+                            if cache == 'cold':
+                                code = conditioning.get('exit_code')
+                                require(type(code) is int and code >= 0, 'Purge did not establish normal completion')
+                                if code:
+                                    report['cold_cache_unavailable'] = 'cache purge unavailable; no further purge retries'
+                                    report['cold_cache_receipt'] = conditioning
+                                    row['unavailable'] = report['cold_cache_unavailable']
+                                    record('rows', row, row_id)
+                                    sources()
+                                    guard(prepared, stage='denial_closeout')
+                                    require(native_clone_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+                                    require(not os.path.lexists(target), 'Denied clone destination must stay absent')
+                                    record('unavailable', key | {'reason': report['cold_cache_unavailable']})
+                                    report.pop('active_operation', None)
+                                    checkpoint()
+                                    denied = True
+                                    break
+                            guard(prepared, mounts=False, stage='after_conditioning')
+                            receipt = native_metrics.collect(argv, timeout_s=120, env=environment, phase=phase)
+                            row.update(receipt)
+                            record('rows', row, row_id)
+                            checkpoint()
+                            require(not row.get('completion_uncertain') and row.get('ok') is True
+                                    and row.get('exit_code') == 0, 'CLI measurement failed or uncertain')
+                            stderr = base64.b64decode(row['stderr_b64'], validate=True)
+                            require(not (native_metrics.time_diagnostics(stderr) if phase == 'resources' else stderr),
+                                    'Clone command emitted diagnostics')
+                            stdout = base64.b64decode(row['stdout_b64'], validate=True)
+                            if method == 'candidate' and form == 'json':
+                                require(json.loads(stdout) == {'source': str(source), 'destination': str(target)}, 'CLI clone JSON contract differs')
+                            else:
+                                require(stdout == b'', 'Clone command output differs')
+                            row['output_verification'] = verify_clone_output(
+                                source, target, expected['tiny_4kib'], prepared, diagnostic=diagnostic())
+                            sources()
+                            remove_fixture(target)
+                            require(not os.path.lexists(target), 'CLI clone output cleanup did not finish')
+                            if phase == 'resources':
+                                require(type(row.get('rss_bytes')) is int and row['rss_bytes'] > 0, 'Peak RSS unavailable')
+                            row['validated'] = True
+                            record('rows', row, row_id)
+                            rows.append(row)
+                            report.pop('active_operation', None)
+                            checkpoint()
+                        if denied:
+                            break
+                    if not denied:
+                        record('comparisons', key | {'metrics': native_clone_comparison(rows, phase, args.samples),
+                                                     'footprint': 'unavailable'})
+                        checkpoint()
+        sources()
+        report['source_checks_passed'] = True
+        require(not os.path.lexists(target), 'Unconsumed CLI clone output remains')
+        require(native_clone_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+        checkpoint()
+        try:
+            journal.verify()
+        except BaseException:
+            journal_failed = True
+            raise
+        owned()
+        remove_fixture(base)
+        cleaned = True
+        report.update(status='complete', passed=report['cold_cache_unavailable'] is None, cleanup_passed=True)
+        if 'cold' in args.cache:
+            report['cold_tool_identity_verified'] = True
+            report['cold_tool_content_verified'] = all(row['content_hash_status'] == 'available'
+                and row['sha256'] is not None for row in pins['cold_tools'].values())
+        if report['cold_cache_unavailable']:
+            report['denial_runtime_verified'] = True
+        checkpoint()
+        journal.finish(report)
+    except BaseException as error:
+        report.update(status='failed', passed=False, error=f'{type(error).__name__}: {error}')
+        if hasattr(error, 'receipt'):
+            report['command_receipt'] = error.receipt
+        if base is not None and not cleaned:
+            report['retained_fixture'] = str(base)
+        mismatch_json = getattr(error, 'clone_parent_metadata_mismatch_json', None)
+        if mismatch_json is not None:
+            report['clone_parent_metadata_mismatch'] = json.loads(mismatch_json)
+            if row is not None:
+                row['clone_parent_metadata_mismatch'] = json.loads(mismatch_json)
+        if not journal_failed:
+            try:
+                if mismatch_json is not None and row is not None:
+                    record('rows', row, row_id)
+                checkpoint()
+                journal.finish(report)
+            except BaseException as secondary:
+                error.add_note('Report closeout also failed: ' + str(secondary))
+        raise
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            journal.close()
+        except BaseException as secondary:
+            if primary is None:
+                raise
+            primary.add_note('Journal close also failed: ' + str(secondary))
+    return 0 if report['passed'] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, required=True, help="Older installed CLI in a virtual environment")
-    parser.add_argument("--candidate", type=Path, required=True, help="New installed CLI in a separate virtual environment")
+    parser.add_argument("--baseline", type=Path, help="Older installed CLI for legacy two-release comparisons")
+    parser.add_argument("--candidate", type=Path, required=True, help="Installed candidate CLI")
     parser.add_argument("--scratch", type=Path, required=True, help="Existing writable APFS directory")
-    parser.add_argument("--output", type=Path, required=True, help="New sanitized JSON result path")
+    parser.add_argument("--output", type=Path, required=True, help="New report path")
+    native_route = parser.add_mutually_exclusive_group()
+    native_route.add_argument('--native-delete', action='store_true', help='Collect the existing tiny-delete case against rm')
+    native_route.add_argument('--native-clone', action='store_true', help='Collect the existing tiny-clone case against cp -cRp')
+    parser.add_argument('--samples', type=int, help='Native CLI resource pairs, 10–100; timing always uses 31 pairs')
+    parser.add_argument('--cache', nargs='+', choices=('warm', 'cold'), help='Native CLI cache modes')
     args = parser.parse_args()
+    if args.native_delete or args.native_clone:
+        if args.baseline is not None:
+            parser.error('Native CLI comparisons use the candidate and native command; do not supply --baseline')
+        args.samples = args.samples if args.samples is not None else 10
+        args.cache = args.cache if args.cache is not None else ['warm']
+        if not 10 <= args.samples <= 100 or len(args.cache) != len(set(args.cache)):
+            parser.error('Use 10–100 resource pairs and distinct cache modes')
+        deadline = 'STALLIONFS_BENCHMARK_DEADLINE'
+        supplied_deadline = deadline in os.environ
+        if not supplied_deadline:
+            os.environ[deadline] = str(time.monotonic() + 600)
+        try:
+            return native_clone(args) if args.native_clone else native_delete(args)
+        finally:
+            if not supplied_deadline:
+                os.environ.pop(deadline, None)
+    if args.baseline is None or args.samples is not None or args.cache is not None:
+        parser.error('Legacy comparisons require --baseline; --samples and --cache apply only to --native-delete or --native-clone')
     require(platform.system() == "Darwin", "This comparison requires macOS")
     scratch = args.scratch.expanduser().resolve(strict=True)
     output_arg = args.output.expanduser().absolute()
@@ -376,4 +1231,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

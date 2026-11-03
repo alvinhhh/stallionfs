@@ -108,6 +108,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) goto helper;
     }
     unsigned workers = 4;
+    enum stallion_copy_strategy strategy = STALLION_COPY_MATERIALIZED;
     int recursive = 0, missing_ok = 0, move_flags = RENAME_EXCL, end_options = 0;
     char *paths[2] = {0};
     int count = 0;
@@ -119,6 +120,12 @@ int main(int argc, char **argv) {
             if (!strcmp(arg, "--jobs")) { if (++i >= argc) goto usage; value = argv[i]; }
             if (value[0] < '1' || value[0] > '4' || value[1]) goto usage;
             workers = (unsigned)(value[0] - '0');
+        } else if (!end_options && copying && (!strcmp(arg, "--strategy") || !strncmp(arg, "--strategy=", 11))) {
+            const char *value = arg + 11;
+            if (!strcmp(arg, "--strategy")) { if (++i >= argc) goto usage; value = argv[i]; }
+            if (!strcmp(value, "materialized")) strategy = STALLION_COPY_MATERIALIZED;
+            else if (!strcmp(value, "auto")) strategy = STALLION_COPY_AUTO;
+            else goto usage;
         } else if (!end_options && deleting && (!strcmp(arg, "--recursive") || !strcmp(arg, "-r"))) recursive = 1;
         else if (!end_options && deleting && !strcmp(arg, "--missing-ok")) missing_ok = 1;
         else if (!end_options && moving && !strcmp(arg, "--replace")) {
@@ -164,7 +171,7 @@ int main(int argc, char **argv) {
         int result;
         if (scanning) result = stallion_scan(paths[0], 1, workers, &stats, cancelled, NULL, error_path, sizeof(error_path));
         else if (moving) result = renamex_np(paths[0], paths[1], (unsigned)move_flags);
-        else if (copying) result = stallion_copy(paths[0], paths[1], workers, cancelled, NULL, error_path, sizeof(error_path));
+        else if (copying) result = stallion_copy_with_strategy(paths[0], paths[1], strategy, workers, cancelled, NULL, error_path, sizeof(error_path));
         else if (cloning) result = stallion_clone(paths[0], paths[1], workers, cancelled, NULL, error_path, sizeof(error_path));
         else result = stallion_delete(paths[0], recursive, missing_ok, workers, cancelled, NULL, error_path, sizeof(error_path));
         if (result) return report_error(json, error_path[0] ? error_path : paths[0], errno);
@@ -178,6 +185,7 @@ int main(int argc, char **argv) {
         } else if (json) {
             fputs(deleting ? "{\"path\":" : "{\"source\":", stdout); json_string(stdout, paths[0]);
             if (!deleting) { fputs(",\"destination\":", stdout); json_string(stdout, paths[1]); }
+            if (copying && strategy == STALLION_COPY_AUTO) fputs(",\"strategy\":\"auto\"", stdout);
             fputs("}\n", stdout);
         } else return 0;
     }

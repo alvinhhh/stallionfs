@@ -217,45 +217,90 @@ def _bytes(value):
 
 
 def _stop_group(process, receipt, grace_s):
-    """Bound termination and collection. Never infer all descendants exited."""
+    """One reaper; never signal a numeric group after uncertain or completed reaping."""
     receipt.setdefault('termination', [])
 
-    def reaped_group_unknown():
-        receipt.update(completion_uncertain=True, group_signal_skipped_reason='leader_already_reaped',
-                       group_ownership_after_cleanup='unknown_after_reap', group_alive_after_cleanup=None)
+    def partial():
+        return (base64.b64decode(receipt.get('partial_stdout_b64', '')),
+                base64.b64decode(receipt.get('partial_stderr_b64', '')))
 
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        if process.returncode is not None:
-            # Reaping releases the PID; its numeric group no longer proves ownership.
-            reaped_group_unknown()
-            receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'leader already reaped'})
-        else:
+    def skip(reason, *, drain=False):
+        receipt.update(completion_uncertain=True, group_signalling_forbidden=True,
+                       group_signal_skipped_reason=reason,
+                       group_ownership_after_cleanup='unknown_after_reap', group_alive_after_cleanup=None)
+        if drain:
             try:
-                os.killpg(process.pid, sig)
-                receipt['termination'].append({'signal': sig.name, 'sent': True})
-            except ProcessLookupError:
-                receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'group absent'})
-            except OSError as error:
-                receipt['termination'].append({'signal': sig.name, 'sent': False, 'error': str(error)})
+                return process.communicate(timeout=grace_s)
+            except subprocess.TimeoutExpired as error:
+                receipt['partial_stdout_b64'] = base64.b64encode(_bytes(error.output)).decode('ascii')
+                receipt['partial_stderr_b64'] = base64.b64encode(_bytes(error.stderr)).decode('ascii')
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError as error:
+                    receipt['stream_close_error'] = str(error)
+        return partial()
+
+    def unreaped():
+        # Popen can be interrupted between kernel waitpid and returncode assignment.
+        # Only this capture owner may wait on its Popen; no watchdog reaps it.
+        receipt['group_signalling_forbidden'] = True
+        if process.returncode is not None:
+            receipt['reap_state'] = 'reaped'
+            return False
+        if (any(signal.getitimer(signal.ITIMER_REAL))
+                or signal.getsignal(signal.SIGALRM) != signal.SIG_DFL
+                or signal.SIGALRM in signal.sigpending()
+                or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
+            return False
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            receipt['group_signalling_forbidden'] = False
+            receipt['reap_state'] = 'unreaped'
+            return True
+        except BaseException as error:
+            receipt['reap_reconciliation_error'] = f'{type(error).__name__}: {error}'
+        else:
+            receipt['reap_state'] = 'reaped'
+        return False
+
+    if receipt.get('group_signalling_forbidden'):
+        return skip('prior_reap_uncertainty')
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not unreaped():
+            reaped = receipt.get('reap_state') == 'reaped'
+            if reaped:
+                receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'leader already reaped'})
+            return skip('leader_already_reaped' if reaped else 'reap_ownership_uncertain', drain=reaped)
+        receipt['group_signalling_forbidden'] = True
+        try:
+            os.killpg(process.pid, sig)
+            receipt['termination'].append({'signal': sig.name, 'sent': True})
+        except ProcessLookupError:
+            receipt['termination'].append({'signal': sig.name, 'sent': False, 'reason': 'group absent'})
+        except OSError as error:
+            receipt['termination'].append({'signal': sig.name, 'sent': False, 'error': str(error)})
+        # A second interruption during communicate must not authorize a later signal.
+        receipt['group_signalling_forbidden'] = True
         try:
             output = process.communicate(timeout=grace_s)
-            if process.returncode is not None:
-                reaped_group_unknown()
-                return output
-            try: os.killpg(process.pid, 0)
-            except ProcessLookupError: return output
-            except OSError as error: receipt['group_probe_error'] = str(error)
-            if sig == signal.SIGKILL: return output
+            receipt.update(group_signal_skipped_reason='leader_already_reaped',
+                           group_ownership_after_cleanup='unknown_after_reap', group_alive_after_cleanup=None)
+            return output
         except subprocess.TimeoutExpired as error:
             receipt['partial_stdout_b64'] = base64.b64encode(_bytes(error.output)).decode('ascii')
             receipt['partial_stderr_b64'] = base64.b64encode(_bytes(error.stderr)).decode('ascii')
-    # Do not perform an unbounded final communicate or unlink any fixture.
+            # The next iteration must reconcile its sole wait again before SIGKILL.
     for stream in (process.stdout, process.stderr):
-        if stream is not None: stream.close()
-    try: process.wait(timeout=grace_s)
-    except subprocess.TimeoutExpired: receipt['leader_reap_timed_out'] = True
-    return (base64.b64decode(receipt.get('partial_stdout_b64', '')),
-            base64.b64decode(receipt.get('partial_stderr_b64', '')))
+        if stream is not None:
+            stream.close()
+    try:
+        process.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        receipt['leader_reap_timed_out'] = True
+    return partial()
 
 
 def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, phase='resources'):
@@ -271,6 +316,9 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
     be safely interrupted before Popen returns its handle; startup counts toward
     the timing deadline, but this is not a hard bound on a stalled spawn.
     """
+    if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
+        from stallionfs._benchmark_budget import remaining
+        timeout_s = remaining(timeout_s)
     arguments = [os.fspath(value) for value in argv]
     if not arguments or not all(isinstance(value, str) and '\0' not in value for value in arguments):
         raise ValueError('argv must contain non-NUL strings')

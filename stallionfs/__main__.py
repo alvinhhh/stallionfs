@@ -23,6 +23,9 @@ def main(argv=None):
         command.add_argument("source")
         command.add_argument("destination")
         command.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Directory workers; use 1 for lower CPU use")
+        if action == "copy":
+            command.add_argument("--strategy", choices=("materialized", "auto"), default="materialized",
+                                 help="Data transport; materialized by default")
     delete = commands.add_parser("delete", help="Permanently delete a file or directory without following links")
     delete.add_argument("path")
     delete.add_argument("-r", "--recursive", action="store_true")
@@ -93,6 +96,8 @@ def main(argv=None):
     purge.add_argument("id")
     purge.add_argument("--yes", action="store_true")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
+    from . import benchmark
+    benchmark.parser(commands)
     raw = list(sys.argv[1:] if argv is None else argv)
     setup = []
     command_index = 0
@@ -111,6 +116,8 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'benchmark':
+        return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
     try:
         store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)
@@ -134,11 +141,15 @@ def main(argv=None):
                 result, text = {"path": path}, ""
             else:
                 source, destination = args.source, args.destination
-                if args.action in {"clone", "copy"}:
-                    getattr(_scan, args.action)(source, destination, jobs=args.jobs)
+                if args.action == "copy":
+                    _scan.copy(source, destination, jobs=args.jobs, strategy=args.strategy)
+                elif args.action == "clone":
+                    _scan.clone(source, destination, jobs=args.jobs)
                 else:
                     _scan.move(source, destination, replace=args.replace, exchange=args.exchange)
                 result, text = {"source": source, "destination": destination}, ""
+                if args.action == "copy" and args.strategy == "auto":
+                    result["strategy"] = "auto"
         elif args.action == 'register-native-image':
             result = store.register_native_image(args.path, name=args.name)
             text = result['id']
