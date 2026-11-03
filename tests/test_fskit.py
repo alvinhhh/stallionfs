@@ -1,5 +1,5 @@
 """Direct FSKit callback checks; no installed extension or kernel-routing claim."""
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
@@ -309,10 +309,11 @@ class FSKitInterfaces(unittest.TestCase):
                          '-module-cache-path', self.base / 'production-package-host-cache',
                          filesystem / 'fskit/Host.swift', '-o', host], 90, swift='current')
             app = self.base / 'ProductionPackage.app'
+            candidate_manifest = self.base / 'production-package-candidate.json'
             child = self.command('production-package-assemble', [sys.executable, '-I', '-B',
                          self.source / 'tools/package_fskit.py', '--host', host, '--extension', module,
                          '--out', app, '--bundle-version', '9', '--profile', 'production',
-                         '--access-policy', 'contextual-writes'], 90)
+                         '--access-policy', 'contextual-writes', '--manifest-out', candidate_manifest], 90)
             self.assertEqual(child.stdout, 'Unsigned package: ' + str(app) + '\n')
             self.assertEqual(child.stderr, '')
             contents = app / 'Contents'
@@ -340,6 +341,79 @@ class FSKitInterfaces(unittest.TestCase):
             self.assertTrue(attributes['FSSupportsPathURLs'])
             self.assertTrue(attributes['FSRequiresSecurityScopedPathURLResources'])
             self.assertFalse(attributes['FSSupportsBlockResources'])
+            receipt = json.loads(candidate_manifest.read_bytes())
+            self.assertEqual(receipt['kind'], 'fskit-unsigned-assembly-candidate')
+            self.assertEqual(receipt['assembly'], 'no-signing-performed')
+            self.assertEqual(receipt['package_profile'], 'production')
+            self.assertEqual(receipt['bundle_version'], '9')
+            self.assertEqual(receipt['filesystem_short_name'], 'stallionfs')
+            self.assertEqual(receipt['controller_protocol'], 1)
+            self.assertEqual(receipt['factory_policy'], 'contextual-writes')
+            self.assertEqual(receipt['architectures'], ['arm64'])
+            self.assertEqual(candidate_manifest.parent, app.parent)
+            self.assertEqual(candidate_manifest.stat().st_mode & 0o777, 0o600)
+            for directory in [app] + [path for path in app.rglob('*') if path.is_dir()]:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+            rows = {row['path']: row['sha256'] for row in receipt['pre_sign_package_files']}
+            expected_paths = {'Contents/Info.plist', 'Contents/MacOS/StallionFS',
+                'Contents/Extensions/StallionFS.appex/Contents/Info.plist',
+                'Contents/Extensions/StallionFS.appex/Contents/MacOS/StallionFS'}
+            self.assertEqual(set(rows), expected_paths)
+            self.assertEqual(len(receipt['pre_sign_package_files']), 4)
+            for path, digest in rows.items():
+                self.assertEqual(digest, hashlib.sha256((app / path).read_bytes()).hexdigest())
+            for name, executable, info, packaged_path in (
+                    ('host', host, host_info, 'Contents/MacOS/StallionFS'),
+                    ('module', module, module_info,
+                     'Contents/Extensions/StallionFS.appex/Contents/MacOS/StallionFS')):
+                inventory = self.command('production-package-' + name + '-architectures',
+                    ['/usr/bin/lipo', '-archs', executable], 30).stdout.split()
+                self.assertEqual(inventory, ['arm64'])
+                observed = self.command('production-package-' + name + '-deployment',
+                    ['/usr/bin/otool', '-arch', 'arm64', '-l', executable], 30).stdout
+                # Independent field extraction from actual tool text, including the SDK.
+                self.assertEqual(re.findall(r'^\s*platform\s+(\S+)\s*$', observed, re.MULTILINE), ['1'])
+                minima = re.findall(r'^\s*minos\s+(\S+)\s*$', observed, re.MULTILINE)
+                sdks = re.findall(r'^\s*sdk\s+(\S+)\s*$', observed, re.MULTILINE)
+                self.assertEqual(minima, ['27.0'])
+                self.assertEqual(len(sdks), 1)
+                self.assertEqual(receipt[name]['slices'], [{'architecture': 'arm64',
+                    'platform': 'macos', 'minimum_os': minima[0], 'sdk': sdks[0]}])
+                self.assertEqual(receipt[name]['declared_minimum_os'], info['LSMinimumSystemVersion'])
+                self.assertEqual(receipt[name]['bundle_id'], info['CFBundleIdentifier'])
+                self.assertEqual(receipt[name]['pre_sign_input_sha256'], rows[packaged_path])
+                self.assertEqual(receipt[name]['pre_sign_input_sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
+            # Reuse these ordinary build bytes with isolated template dictionaries.
+            # No production template or public command-line option is changed.
+            template_bytes = [plistlib.dumps(value) for value in package._load_templates()]
+            for floors, compatible in ((('28.0', '28.0'), True),
+                                      (('26.0', '26.0'), False),
+                                      (('27.0', '26.0'), False)):
+                suffix = '-'.join(floors)
+                template_values = [plistlib.loads(data) for data in template_bytes]
+                for value, floor in zip(template_values, floors):
+                    value['LSMinimumSystemVersion'] = floor
+                variant_app = self.base / ('Template-' + suffix + '.app')
+                variant_manifest = self.base / ('template-' + suffix + '.json')
+                argv = ['package_fskit.py', '--host', str(host), '--extension', str(module),
+                        '--out', str(variant_app), '--bundle-version', '9',
+                        '--manifest-out', str(variant_manifest)]
+                output = io.StringIO()
+                with mock.patch.object(package, '_load_templates', return_value=template_values), \
+                        mock.patch.object(sys, 'argv', argv), redirect_stdout(output):
+                    if compatible:
+                        package.main()
+                    else:
+                        with self.assertRaises(ValueError): package.main()
+                if compatible:
+                    self.assertEqual(output.getvalue(), 'Unsigned package: ' + str(variant_app) + '\n')
+                    variant = json.loads(variant_manifest.read_bytes())
+                    self.assertEqual(variant['host']['declared_minimum_os'], '28.0')
+                    self.assertEqual(variant['module']['slices'][0]['minimum_os'], '27.0')
+                else:
+                    self.assertFalse(variant_app.exists())
+                    self.assertFalse(variant_manifest.exists())
+                    self.assertEqual(output.getvalue(), '')
             unhooked = self.base / 'context-xattr-unhooked'
             unhooked.mkdir(mode=0o700)
             unhooked_images = unhooked / 'images'
