@@ -1524,12 +1524,16 @@ class Workspaces(unittest.TestCase):
         from stallionfs import _native
         from stallionfs.core import read_json
         repository = Path(__file__).resolve().parents[1]
-        compiler = capture._owned_command(['/usr/bin/xcrun', '--find', 'clang'], cwd=self.base,
+        compiler = capture._owned_command(['/usr/bin/xcrun', '--sdk', 'macosx', '--find', 'clang'], cwd=self.base,
             timeout=15, stem=self.base / 'recovery-find-clang')
         self.assertEqual(compiler.returncode, 0, compiler.stderr)
+        sdk = capture._owned_command(['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'], cwd=self.base,
+            timeout=15, stem=self.base / 'recovery-find-sdk')
+        self.assertEqual(sdk.returncode, 0, sdk.stderr)
         checker = self.base / 'recovery-fixture'
         compiled = capture._owned_command([compiler.stdout.strip(), '-std=c11', '-Wall', '-Wextra',
-            '-Wno-deprecated-declarations', '-O1', '-I', str(repository / 'filesystem'),
+            '-Wno-deprecated-declarations', '-O1', '-isysroot', sdk.stdout.strip(),
+            '-I', str(repository / 'filesystem'),
             str(repository / 'tests/native_image_fixture.c'), str(repository / 'filesystem/image.c'),
             '-o', str(checker)], cwd=self.base, timeout=90, stem=self.base / 'recovery-fixture-build')
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
@@ -2965,6 +2969,8 @@ os.chflags('file',0x8001)
             self.store.gc(older_than=float("nan"), yes=True)
         insecure = self.base / "insecure"
         insecure.mkdir(mode=0o755)
+        insecure.chmod(0o755)
+        self.assertEqual(insecure.stat().st_mode & 0o777, 0o755)
         with self.assertRaisesRegex(StallionError, "0700"):
             Store(insecure)
         alias = self.base / "alias"

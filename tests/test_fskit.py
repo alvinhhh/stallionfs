@@ -399,12 +399,16 @@ class FSKitInterfaces(unittest.TestCase):
                         '--out', str(variant_app), '--bundle-version', '9',
                         '--manifest-out', str(variant_manifest)]
                 output = io.StringIO()
-                with mock.patch.object(package, '_load_templates', return_value=template_values), \
-                        mock.patch.object(sys, 'argv', argv), redirect_stdout(output):
-                    if compatible:
-                        package.main()
-                    else:
-                        with self.assertRaises(ValueError): package.main()
+                previous_umask = os.umask(0o077)
+                try:
+                    with mock.patch.object(package, '_load_templates', return_value=template_values), \
+                            mock.patch.object(sys, 'argv', argv), redirect_stdout(output):
+                        if compatible:
+                            package.main()
+                        else:
+                            with self.assertRaises(ValueError): package.main()
+                finally:
+                    os.umask(previous_umask)
                 if compatible:
                     self.assertEqual(output.getvalue(), 'Unsigned package: ' + str(variant_app) + '\n')
                     variant = json.loads(variant_manifest.read_bytes())
