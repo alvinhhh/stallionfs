@@ -315,7 +315,7 @@ os.chflags('file',0x8001)
     def test_native_preflight_refusals_mutation_and_capacity_retain_output(self):
         from stallionfs import _image
         cases = ('special', 'external-hardlink', 'absolute-link', 'escaping-link', 'loop-link',
-                 'acl', 'link-acl', 'flags', 'source-change', 'capacity')
+                 'acl', 'flags', 'source-change', 'capacity')
         for index, case in enumerate(cases):
             with self.subTest(case=case):
                 stage = self.base / f'refusal-{index}'
@@ -329,26 +329,7 @@ os.chflags('file',0x8001)
                 elif case == 'absolute-link': (source / 'link').symlink_to(str(path))
                 elif case == 'escaping-link': (source / 'link').symlink_to('../outside')
                 elif case == 'loop-link': (source / 'link').symlink_to('link')
-                elif case in ('acl', 'link-acl'):
-                    run(['/bin/chmod', '+a', 'everyone allow read', path])
-                    if case == 'link-acl':
-                        import ctypes
-                        link = source / 'link'; link.symlink_to('file')
-                        libc = ctypes.CDLL(None, use_errno=True)
-                        libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
-                        libc.acl_get_file.restype = ctypes.c_void_p
-                        libc.acl_set_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
-                        libc.acl_free.argtypes = [ctypes.c_void_p]
-                        acl = libc.acl_get_file(os.fsencode(path), 0x100)
-                        self.assertTrue(acl)
-                        try:
-                            status = libc.acl_set_link_np(os.fsencode(link), 0x100, acl)
-                            error = ctypes.get_errno()
-                            if status and error == errno.ENOTSUP:
-                                self.skipTest('Host cannot create a nonempty symlink ACL')
-                            self.assertEqual(status, 0, os.strerror(error))
-                        finally: self.assertEqual(libc.acl_free(acl), 0)
-                        run(['/bin/chmod', '-N', path])
+                elif case == 'acl': run(['/bin/chmod', '+a', 'everyone allow read', path])
                 elif case == 'flags': os.chflags(path, 2)
                 def pair(item):
                     info = item.stat()
@@ -375,9 +356,90 @@ os.chflags('file',0x8001)
                     self.assertFalse((destination / 'image.sfs').exists())
                 reasons = {'special': 'unsupported-kind', 'external-hardlink': 'external-hardlink',
                            'absolute-link': 'unsafe-path', 'escaping-link': 'unsafe-path', 'loop-link': 'unsafe-path',
-                           'acl': 'unsupported-acl', 'link-acl': 'unsupported-acl', 'flags': 'unsupported-metadata', 'source-change': 'source-changed',
+                           'acl': 'unsupported-acl', 'flags': 'unsupported-metadata', 'source-change': 'source-changed',
                            'capacity': 'capacity'}
                 self.assertEqual(result['reason'], reasons[case], result)
+
+    def test_native_symlink_acl_host_capability(self):
+        import ctypes
+        from stallionfs import _image
+        source = self.base / 'acl-stage' / 'input' / 'repo'
+        source.parent.mkdir(mode=0o700, parents=True); source.mkdir(mode=0o700)
+        stage = source.parent.parent; stage.chmod(0o700)
+        destination = stage / 'owned'; destination.mkdir(mode=0o700)
+        target = source / 'file'; target.write_bytes(b'link target')
+        link = source / 'link'; link.symlink_to('file')
+        run(['/bin/chmod', '+a', 'everyone allow read', target])
+        libc = ctypes.CDLL(None, use_errno=True)
+        for name in ('acl_get_file', 'acl_get_link_np'):
+            function = getattr(libc, name)
+            function.argtypes = [ctypes.c_char_p, ctypes.c_int]
+            function.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_set_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+        libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        def has_entry(function, argument):
+            ctypes.set_errno(0)
+            acl = function(argument, 0x100)
+            if not acl:
+                self.assertEqual(ctypes.get_errno(), errno.ENOENT)
+                return False
+            try:
+                entry = ctypes.c_void_p()
+                ctypes.set_errno(0)
+                status = libc.acl_get_entry(acl, 0, ctypes.byref(entry))
+                if status == 0: return True
+                self.assertEqual(status, -1)
+                self.assertEqual(ctypes.get_errno(), errno.EINVAL)
+                return False
+            finally:
+                self.assertEqual(libc.acl_free(acl), 0)
+        descriptor = os.open(link, os.O_RDONLY | os.O_CLOEXEC | os.O_SYMLINK)
+        try:
+            self.assertEqual(os.fstat(descriptor).st_ino, link.lstat().st_ino)
+            self.assertTrue(has_entry(libc.acl_get_file, os.fsencode(target)))
+            self.assertFalse(has_entry(libc.acl_get_link_np, os.fsencode(link)))
+            self.assertFalse(has_entry(libc.acl_get_fd_np, descriptor))
+            acl = libc.acl_get_file(os.fsencode(target), 0x100)
+            self.assertTrue(acl)
+            try:
+                ctypes.set_errno(0)
+                status = libc.acl_set_link_np(os.fsencode(link), 0x100, acl)
+                error = ctypes.get_errno()
+            finally:
+                self.assertEqual(libc.acl_free(acl), 0)
+            if status != 0:
+                self.assertEqual(status, -1)
+                self.assertEqual(error, errno.ENOTSUP)
+                self.assertFalse(has_entry(libc.acl_get_link_np, os.fsencode(link)))
+                self.assertFalse(has_entry(libc.acl_get_fd_np, descriptor))
+                self.assertTrue(has_entry(libc.acl_get_file, os.fsencode(target)))
+                print(json.dumps({'capability': 'nonempty-symlink-acl', 'supported': False,
+                                  'errno': error, 'path_and_held_empty_acl': 'verified',
+                                  'importer_link_acl_refusal': 'NOT EXECUTED: host rejected ACL creation'}), file=sys.stderr)
+                return
+            run(['/bin/chmod', '-N', target])
+            self.assertFalse(has_entry(libc.acl_get_file, os.fsencode(target)))
+            self.assertTrue(has_entry(libc.acl_get_link_np, os.fsencode(link)))
+            self.assertTrue(has_entry(libc.acl_get_fd_np, descriptor))
+            def pair(path):
+                info = path.stat(); return [info.st_dev, info.st_ino]
+            attempted = []
+            result = _image.create_from_tree({'directory': str(source), 'root': pair(source)},
+                {'directory': str(destination), 'parent': pair(destination), 'component': 'image.sfs',
+                 'before_create': lambda: attempted.append(True)}, 1 << 26)
+            self.assertFalse(result['candidate_complete'])
+            self.assertEqual(result['reason'], 'unsupported-acl')
+            self.assertEqual(result['failure_path'], 'link')
+            self.assertFalse(result['creation_attempted'])
+            self.assertFalse(attempted)
+            self.assertFalse((destination / 'image.sfs').exists())
+            print(json.dumps({'capability': 'nonempty-symlink-acl', 'supported': True,
+                              'importer_link_acl_refusal': 'verified'}), file=sys.stderr)
+        finally:
+            os.close(descriptor)
 
     def test_native_creator_owns_callback_across_path_conversion(self):
         import gc
@@ -740,6 +802,64 @@ os.chflags('file',0x8001)
         with self.assertRaises(StallionError):
             self.store.gc(older_than=0, yes=True)
         self.assertEqual((victim / "precious").read_text(), "keep")
+
+    def test_gc_excludes_native_registration_through_quarantined_destruction(self):
+        from contextlib import contextmanager
+        from stallionfs import core, _image
+        seed = self.prepare()['id']
+        workspace = self.store.create(seed)
+        self.store.move(workspace['id'])
+        stage = self.base / 'image-stage'; stage.mkdir(mode=0o700)
+        source = stage / 'input' / 'repo'; source.parent.mkdir(mode=0o700); source.mkdir(mode=0o700)
+        (source / 'file').write_bytes(b'image payload')
+        destination = stage / 'owned'; destination.mkdir(mode=0o700)
+        def pair(path):
+            info = path.stat(); return [info.st_dev, info.st_ino]
+        result = _image.create_from_tree({'directory': str(source), 'root': pair(source)},
+            {'directory': str(destination), 'parent': pair(destination), 'component': 'image.sfs',
+             'before_create': lambda: None}, 1 << 26)
+        self.assertTrue(result['candidate_complete'])
+        directory = self.store.root / 'trash' / workspace['id'] / 'repo' / 'private'
+        directory.mkdir(mode=0o700)
+        (destination / 'image.sfs').rename(directory / 'backing.bin')
+        quarantined, excluded, resume = threading.Event(), threading.Event(), threading.Event()
+        backing, registration_thread = [], []
+        original_remove, original_lock = core.remove_tree, core.lock
+        def reclaim(path, *, jobs=4):
+            backing.append(path / 'repo/private/backing.bin')
+            self.assertEqual(pair(backing[0]), result['identity']['file'])
+            quarantined.set()
+            self.assertTrue(resume.wait(5))
+            original_remove(path, jobs=jobs)
+        @contextmanager
+        def observe_lock(path, **options):
+            if registration_thread == [threading.get_ident()] and path == self.store.root / '.lock':
+                self.assertFalse(options.get('shared', False))
+                with self.assertRaises(BlockingIOError):
+                    with original_lock(path, blocking=False):
+                        self.fail('Registration acquired exclusive store lock during destruction')
+                excluded.set()
+            with original_lock(path, **options):
+                yield
+        def register():
+            registration_thread.append(threading.get_ident())
+            return self.store.register_native_image(backing[0])
+        with patch('stallionfs.core.remove_tree', reclaim), patch('stallionfs.core.lock', observe_lock):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                collected = pool.submit(self.store.gc, older_than=0, yes=True)
+                try:
+                    self.assertTrue(quarantined.wait(5))
+                    registered = pool.submit(register)
+                    self.assertTrue(excluded.wait(5))
+                    self.assertEqual(list((self.store.root / 'workspaces').iterdir()), [])
+                finally:
+                    resume.set()
+                self.assertEqual(collected.result(timeout=10), [workspace['id']])
+                with self.assertRaises((FileNotFoundError, StallionError)):
+                    registered.result(timeout=10)
+        self.assertFalse(backing[0].exists())
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(list((self.store.root / 'staging').iterdir()), [])
 
     def test_parallel_gc_preserves_symlink_targets_and_reports_errors(self):
         seed = self.prepare()["id"]

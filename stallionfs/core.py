@@ -848,7 +848,9 @@ class Store(Lifecycle):
 
         def collect(entry):
             identifier(entry.name, 32)
-            with lock(self.root / ".lock"), self._workspace_lock(entry.name):
+            # Shared collection freezes native-reference publication while
+            # independent workspace leases permit concurrent reclamation.
+            with lock(self.root / ".lock", shared=True), self._workspace_lock(entry.name):
                 if os.path.lexists(self.root / "protected" / f"{entry.name}.json"):
                     return None
                 if not entry.exists() and not entry.is_symlink():
