@@ -1,8 +1,11 @@
 """Installed benchmark selection, ownership, evidence and exit boundaries."""
 from contextlib import redirect_stdout
+import errno
+import fcntl
 import io
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -159,7 +162,7 @@ class BenchmarkCLI(unittest.TestCase):
             run = Path(data['run_directory'])
             self.assertEqual(code, 1)
             self.assertTrue(run.is_dir())
-            self.assertEqual(run.parent, Path(parent))
+            self.assertEqual(run.parent, Path(parent).resolve())
             self.assertEqual(run.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads((run / 'summary.json').read_text())['status'], 'failed')
 
@@ -258,6 +261,371 @@ class BenchmarkCLI(unittest.TestCase):
                     'fixture/package.json', 'fixture/package-lock.json', 'fixture/check.cjs'}
         self.assertEqual(set(manifest['resources']), expected)
         self.assertFalse(any('test_' in name or 'results/' in name for name in expected))
+
+
+class BenchmarkDirectoryProtection(unittest.TestCase):
+    def test_unsafe_scratch_and_ancestor_are_rejected_before_collection(self):
+        for mode, nested in ((0o777, False), (0o770, False), (0o777, True)):
+            with self.subTest(mode=oct(mode), nested=nested), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                scratch = base / 'scratch'
+                scratch.mkdir(mode=0o700)
+                scratch.chmod(mode)
+                if nested:
+                    scratch = scratch / 'private'
+                    scratch.mkdir(mode=0o700)
+                with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', scratch, [], [])), \
+                        mock.patch.object(benchmark, '_collect') as collect, \
+                        mock.patch.object(tempfile, 'mkdtemp', side_effect=AssertionError('created')), \
+                        redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(benchmark.run(arguments()), 1)
+                collect.assert_not_called()
+                self.assertIsNone(json.loads(output.getvalue())['run_directory'])
+
+    def test_sticky_scratch_accepts_a_private_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            scratch = base / 'scratch'
+            scratch.mkdir(mode=0o700)
+            scratch.chmod(0o1777)
+            with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', scratch, [], [])), \
+                    mock.patch.object(benchmark, '_collect', return_value={'status': 'complete', 'exit_code': 0}), \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(benchmark.run(arguments()), 0)
+            root = Path(json.loads(output.getvalue())['run_directory'])
+            self.assertEqual(root.parent, scratch)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertTrue((root/'summary.json').is_file())
+
+    def test_existing_collector_control_entries_are_never_overwritten(self):
+        from stallionfs import _benchmark_budget as budget
+        for name in ('collector-receipt.json', 'collector.log', 'receipts'):
+            for link in (False, True):
+                with self.subTest(name=name, link=link), tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary).resolve()
+                    root = base/'run'; root.mkdir(mode=0o700)
+                    sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+                    entry = root/name
+                    if link:
+                        entry.symlink_to(sentinel)
+                    else:
+                        entry.write_bytes(b'existing control')
+                    with mock.patch.object(budget, 'command') as command, self.assertRaises(OSError):
+                        benchmark._collect(arguments(), base, base/'sfs', root, [], [])
+                    command.assert_not_called()
+                    self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+                    self.assertEqual(entry.is_symlink(), link)
+                    self.assertEqual(entry.read_bytes(), b'outside sentinel' if link else b'existing control')
+
+    def test_replaced_run_keeps_all_closeout_in_original_directory(self):
+        from stallionfs import _benchmark_budget as budget
+        for full in (False, True):
+            for failure in (False, True):
+                with self.subTest(full=full, failure=failure), tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary).resolve()
+                    sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+                    retained = base/'retained'
+                    primary = OSError('collector failed first')
+                    def command(argv, **kwargs):
+                        root = kwargs['cwd']
+                        self.assertEqual((root/'collector-receipt.json').read_bytes(), b'')
+                        kwargs['output'].write(b'collector progress')
+                        kwargs['receipt'].update(exit_code=1 if failure else 0)
+                        root.rename(retained)
+                        root.mkdir(mode=0o700)
+                        for name in ('collector-receipt.json', 'collector.log', 'summary.json', 'native.json'):
+                            (root/name).symlink_to(sentinel)
+                        if failure:
+                            raise primary
+                    with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', base, [], [])), \
+                            mock.patch.object(budget, 'command', side_effect=command), \
+                            mock.patch.object(benchmark, '_read_native', side_effect=AssertionError('read replacement')), \
+                            redirect_stdout(io.StringIO()) as output:
+                        code = benchmark.run(arguments(full=full, node=base/'node', npm=base/'npm', npm_cache=base))
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(code, 1)
+                    self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+                    self.assertEqual((retained/'collector.log').read_bytes(), b'collector progress')
+                    self.assertEqual(json.loads((retained/'collector-receipt.json').read_text())['exit_code'], 1 if failure else 0)
+                    self.assertEqual(json.loads((retained/'summary.json').read_text())['status'], 'failed')
+                    replacement = Path(result['run_directory'])
+                    self.assertTrue((replacement/'collector-receipt.json').is_symlink())
+                    self.assertTrue((replacement/'summary.json').is_symlink())
+                    if failure:
+                        self.assertEqual(result['error'], str(primary))
+                        self.assertTrue(any('entry changed' in note for note in primary.__notes__))
+                    else:
+                        self.assertIn('entry changed', result['error'])
+
+    def test_replaced_receipt_never_redirects_held_write(self):
+        from stallionfs import _benchmark_budget as budget
+        for failure in (False, True):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                root = base/'run'; root.mkdir(mode=0o700)
+                sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+                primary = OSError('collector failed first')
+                def command(argv, **kwargs):
+                    receipt = root/'collector-receipt.json'
+                    receipt.rename(root/'held-receipt.json')
+                    receipt.symlink_to(sentinel)
+                    kwargs['receipt'].update(exit_code=1 if failure else 0)
+                    if failure:
+                        raise primary
+                with mock.patch.object(budget, 'command', side_effect=command), \
+                        mock.patch.object(benchmark, '_read_native', return_value=({'status': 'complete', 'passed': True, 'cleanup_passed': True}, [])), \
+                        self.assertRaises((OSError, RuntimeError)) as caught:
+                    benchmark._collect(arguments(), base, base/'sfs', root, [], [])
+                if failure:
+                    self.assertIs(caught.exception, primary)
+                    self.assertTrue(any('entry changed' in note for note in primary.__notes__))
+                self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+                self.assertTrue((root/'collector-receipt.json').is_symlink())
+                self.assertEqual(json.loads((root/'held-receipt.json').read_text())['exit_code'], 1 if failure else 0)
+
+    def test_failed_collector_retains_reserved_receipt(self):
+        from stallionfs import _benchmark_budget as budget
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            primary = OSError('collector failed first')
+            def command(argv, **kwargs):
+                kwargs['receipt'].update(exit_code=9)
+                raise primary
+            with mock.patch.object(budget, 'command', side_effect=command), self.assertRaises(OSError) as caught:
+                benchmark._collect(arguments(), root, root/'sfs', root, [], [])
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(json.loads((root/'collector-receipt.json').read_text())['exit_code'], 9)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS ACLs required')
+    def test_nonowner_acl_and_inherited_private_access_are_rejected(self):
+        cases = (('add_file,add_subdirectory,delete_child', False),
+                 ('delete', False), ('list,search,directory_inherit', True))
+        for permissions, inherited in cases:
+            with self.subTest(permissions=permissions), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                scratch = base/'scratch'; scratch.mkdir(mode=0o700)
+                subprocess.run(['/bin/chmod', '+a', 'group:everyone allow ' + permissions, str(scratch)], check=True)
+                try:
+                    with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', scratch, [], [])), \
+                            mock.patch.object(benchmark, '_collect') as collect, redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(benchmark.run(arguments()), 1)
+                    collect.assert_not_called()
+                    result = json.loads(output.getvalue())
+                    if inherited:
+                        root = Path(result['run_directory'])
+                        self.assertTrue(root.is_dir())
+                        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+                        self.assertEqual(list(root.iterdir()), [])
+                    else:
+                        self.assertIsNone(result['run_directory'])
+                        self.assertEqual(list(scratch.iterdir()), [])
+                finally:
+                    subprocess.run(['/bin/chmod', '-RN', str(scratch)], check=True)
+
+    def test_native_directory_check_borrows_descriptor_and_rejects_wrong_kind(self):
+        from stallionfs import _scan
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                before = os.fstat(fd)
+                _scan._protected_directory_fd(fd, True)
+                _scan._protected_directory_fd(fd, False)
+                self.assertEqual(os.fstat(fd).st_ino, before.st_ino)
+                root.chmod(0o777)
+                for private in (False, True):
+                    with self.assertRaises(OSError):
+                        _scan._protected_directory_fd(fd, private)
+                    self.assertEqual(os.fstat(fd).st_ino, before.st_ino)
+            finally:
+                root.chmod(0o700)
+                os.close(fd)
+            with self.assertRaises(OSError):
+                _scan._protected_directory_fd(-1, True)
+            file = root/'file'; file.write_bytes(b'keep')
+            with file.open('rb') as stream:
+                with self.assertRaises(OSError):
+                    _scan._protected_directory_fd(stream.fileno(), False)
+                self.assertEqual(stream.read(), b'keep')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS system temporary directory required')
+    def test_root_owned_system_sticky_tmp_traversal_is_supported(self):
+        scratch = Path('/tmp').resolve(strict=True)
+        self.assertEqual(scratch.stat().st_uid, 0)
+        self.assertTrue(scratch.stat().st_mode & 0o1000)
+        with benchmark._PinnedDirectory(scratch) as parent:
+            with tempfile.TemporaryDirectory(prefix='sfs-sticky-test-', dir=parent.path) as temporary:
+                with benchmark._PinnedDirectory(temporary, private=True) as directory:
+                    directory.check()
+                    self.assertEqual(directory.path.parent, scratch)
+
+    def test_final_directory_close_failure_precedes_terminal_result(self):
+        for outcome in ('complete', 'failed', 'cancelled'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+                state = {}
+                primary = RuntimeError('collector primary failure')
+                close = os.close
+                opened = os.open
+                terminal = io.StringIO()
+                def collect(args, resources, binary, root, fixtures, operations, directory):
+                    state['root'] = root
+                    state['owned'] = list(directory.descriptors)
+                    state['fault_fd'] = directory.fd
+                    state['armed'] = True
+                    if outcome == 'failed':
+                        raise primary
+                    if outcome == 'cancelled':
+                        raise KeyboardInterrupt()
+                    return {'status': 'complete', 'collection_complete': True, 'qualified': False, 'exit_code': 0}
+                def close_fd(fd):
+                    if state.get('armed') and fd in state['owned']:
+                        self.assertEqual(terminal.getvalue(), '')
+                        state.setdefault('close_attempts', []).append(fd)
+                        if fd == state['fault_fd']:
+                            # Model close returning EINTR after releasing the descriptor.
+                            close(fd)
+                            source = opened(sentinel, os.O_RDONLY)
+                            try:
+                                # Request the released slot without overwriting any
+                                # descriptor that might have been allocated meanwhile.
+                                state['reused'] = (source if source == fd else
+                                                   fcntl.fcntl(source, fcntl.F_DUPFD_CLOEXEC, fd))
+                            finally:
+                                if source != fd:
+                                    close(source)
+                            raise InterruptedError(errno.EINTR, 'injected final directory close')
+                    return close(fd)
+                try:
+                    with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', base, [], [])), \
+                            mock.patch.object(benchmark, '_collect', side_effect=collect), \
+                            mock.patch.object(os, 'close', side_effect=close_fd), redirect_stdout(terminal):
+                        code = benchmark.run(arguments())
+                    result = json.loads(terminal.getvalue())
+                    expected_status = 'interrupted' if outcome == 'cancelled' else 'failed'
+                    self.assertEqual(result['status'], expected_status)
+                    self.assertEqual(code, 130 if outcome == 'cancelled' else 1)
+                    self.assertEqual(result['exit_code'], code)
+                    self.assertEqual(state['close_attempts'], list(reversed(state['owned'])))
+                    self.assertEqual(state['reused'], state['fault_fd'])
+                    self.assertEqual(os.read(state['reused'], 100), b'outside sentinel')
+                    self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+                    self.assertEqual(len(result['closeout_errors']), 1)
+                    self.assertIn('injected final directory close', result['closeout_errors'][0])
+                    if outcome == 'failed':
+                        self.assertEqual(result['error'], str(primary))
+                    if outcome == 'cancelled':
+                        self.assertNotIn('error', result)
+                    summary = json.loads((state['root']/'summary.json').read_text())
+                    self.assertEqual(summary['status'], result['status'])
+                    self.assertEqual(summary['exit_code'], code)
+                    self.assertEqual(summary['closeout_errors'], result['closeout_errors'])
+                    self.assertEqual(summary['summary_finalization'], 'provisional; check terminal outcome and process exit')
+                finally:
+                    if 'reused' in state:
+                        close(state['reused'])
+
+    def test_success_is_emitted_after_all_owned_directory_closes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+            state = {}
+            close = os.close
+            terminal = io.StringIO()
+            def collect(args, resources, binary, root, fixtures, operations, directory):
+                state.update(root=root, owned=list(directory.descriptors), armed=True)
+                return {'status': 'complete', 'collection_complete': True, 'qualified': False, 'exit_code': 0}
+            def close_fd(fd):
+                if state.get('armed') and fd in state['owned']:
+                    self.assertEqual(terminal.getvalue(), '')
+                    state.setdefault('closed', []).append(fd)
+                return close(fd)
+            with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', base, [], [])), \
+                    mock.patch.object(benchmark, '_collect', side_effect=collect), \
+                    mock.patch.object(os, 'close', side_effect=close_fd), redirect_stdout(terminal):
+                self.assertEqual(benchmark.run(arguments()), 0)
+            result = json.loads(terminal.getvalue())
+            self.assertEqual(result['status'], 'complete')
+            self.assertNotIn('closeout_errors', result)
+            self.assertEqual(state['closed'], list(reversed(state['owned'])))
+            self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+            summary = json.loads((state['root']/'summary.json').read_text())
+            self.assertEqual(summary['summary_finalization'], 'provisional; check terminal outcome and process exit')
+
+    def test_summary_close_failure_marks_terminal_failure_and_saved_summary_provisional(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            sentinel = base/'outside'; sentinel.write_bytes(b'outside sentinel')
+            create = benchmark._PinnedDirectory.create
+            state = {'attempts': 0}
+            class SummaryStream:
+                def __init__(self, stream):
+                    self.stream = stream
+                def write(self, value):
+                    return self.stream.write(value)
+                def flush(self):
+                    return self.stream.flush()
+                def close(self):
+                    state['attempts'] += 1
+                    self.stream.close()
+                    raise OSError(errno.EIO, 'injected summary close')
+            def create_summary(directory, name, mode):
+                stream = create(directory, name, mode)
+                return SummaryStream(stream) if name == 'summary.json' else stream
+            with mock.patch.object(benchmark, '_preflight', return_value=(base, base/'sfs', base, [], [])), \
+                    mock.patch.object(benchmark, '_collect', return_value={'status': 'complete', 'exit_code': 0}), \
+                    mock.patch.object(benchmark._PinnedDirectory, 'create', create_summary), \
+                    redirect_stdout(io.StringIO()) as terminal:
+                self.assertEqual(benchmark.run(arguments()), 1)
+            result = json.loads(terminal.getvalue())
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('injected summary close', result['error'])
+            self.assertEqual(state['attempts'], 1)
+            self.assertEqual(sentinel.read_bytes(), b'outside sentinel')
+            summary = json.loads((Path(result['run_directory'])/'summary.json').read_text())
+            self.assertEqual(summary['status'], 'complete')
+            self.assertEqual(summary['summary_finalization'], 'provisional; check terminal outcome and process exit')
+
+    def test_multiple_directory_close_errors_are_reported_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            directory = benchmark._PinnedDirectory(base, private=True)
+            owned = list(directory.descriptors)
+            close = os.close
+            attempts = []
+            def close_fd(fd):
+                attempts.append(fd)
+                close(fd)
+                raise OSError(errno.EIO, 'injected close ' + str(fd))
+            with mock.patch.object(os, 'close', side_effect=close_fd), self.assertRaises(OSError) as caught:
+                directory.__exit__(None, None, None)
+            self.assertEqual(attempts, list(reversed(owned)))
+            self.assertEqual(len(getattr(caught.exception, '__notes__', ())), len(owned) - 1)
+            with mock.patch.object(os, 'close', side_effect=AssertionError('retried close')):
+                directory.__exit__(None, None, None)
+
+    def test_rejected_ancestor_closes_only_owned_descriptors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            scratch = root/'scratch'; scratch.mkdir(mode=0o700); scratch.chmod(0o777)
+            borrowed = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            opened = []
+            original = os.open
+            def open_fd(*args, **kwargs):
+                fd = original(*args, **kwargs)
+                opened.append(fd)
+                return fd
+            try:
+                with mock.patch.object(os, 'open', side_effect=open_fd), self.assertRaises(OSError):
+                    benchmark._PinnedDirectory(scratch)
+                self.assertTrue(opened)
+                for fd in opened:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+                self.assertTrue(os.fstat(borrowed))
+            finally:
+                os.close(borrowed)
 
 
 class BenchmarkDeadline(unittest.TestCase):

@@ -222,7 +222,16 @@ static PyObject *private_directory(PyObject *self, PyObject *argument) {
     return value;
 }
 
+static PyObject *protected_directory_fd(PyObject *self, PyObject *args) {
+    (void)self;
+    int fd, private;
+    if (!PyArg_ParseTuple(args, "ip", &fd, &private)) return NULL;
+    if (stallion_protected_directory_fd(fd, private)) return PyErr_SetFromErrno(PyExc_OSError);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef methods[] = {
+    {"_protected_directory_fd", protected_directory_fd, METH_VARARGS, "Validate pinned directory ownership, mode and ACLs without changing them."},
     {"_private_directory", private_directory, METH_O, "Validate private directory ownership, mode and ACLs without changing them."},
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},
     {"copy", (PyCFunction)(void(*)(void))copy_path, METH_VARARGS | METH_KEYWORDS, "Copy to an exact new path with materialized (default) or auto strategy."},

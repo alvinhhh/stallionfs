@@ -24,6 +24,8 @@ typedef int (*stallion_cancel_fn)(void *context);
  * principals. No permissions are changed. Return 0, or -1 with errno.
  */
 int stallion_private_directory(const char *path);
+/* Validate a pinned private directory or protected parent, including ACLs. */
+int stallion_protected_directory_fd(int fd, int private);
 
 struct stallion_scan_stats {
     uint64_t files, directories, symlinks, other, logical_bytes, skipped_mounts;

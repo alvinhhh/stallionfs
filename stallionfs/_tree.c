@@ -1077,7 +1077,7 @@ static int outside_source(int parent, const struct stat *source) {
     return error ? -1 : 0;
 }
 
-static int check_acl(int fd, uid_t owner, int private, int leaf_copy) {
+static int check_acl(int fd, uid_t owner, int private, int leaf_copy, int namespace) {
     acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
     /* Darwin reports ENOENT when a pinned directory has no extended ACL. */
     if (!acl) { if (errno == ENOENT) { errno = 0; return 0; } if (!errno) errno = EIO; return -1; }
@@ -1086,6 +1086,7 @@ static int check_acl(int fd, uid_t owner, int private, int leaf_copy) {
     acl_entry_t entry;
     acl_permset_mask_t known, mutations = ACL_ADD_FILE | ACL_ADD_SUBDIRECTORY | ACL_DELETE_CHILD |
         ACL_WRITE_ATTRIBUTES | ACL_WRITE_SECURITY | ACL_CHANGE_OWNER;
+    if (namespace) mutations |= ACL_DELETE;
     if (acl_valid(acl)) error = errno ? errno : EIO;
     if (!error && acl_maximal_permset_mask_np(&known)) error = errno ? errno : EIO;
     for (int index = ACL_FIRST_ENTRY; !error; index = ACL_NEXT_ENTRY) {
@@ -1133,7 +1134,21 @@ static int protected_parent(int fd, dev_t device, enum operation operation, int 
     if ((st.st_uid != geteuid() && st.st_uid != 0) || (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) {
         errno = EPERM; return -1;
     }
-    return check_acl(fd, geteuid(), 0, leaf_copy);
+    return check_acl(fd, geteuid(), 0, leaf_copy, 0);
+}
+
+int stallion_protected_directory_fd(int fd, int private) {
+    struct stat st;
+    if (fstat(fd, &st)) return -1;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    if (!private) {
+        if ((st.st_uid != geteuid() && st.st_uid != 0) ||
+            (!(st.st_mode & S_ISVTX) && (st.st_mode & 0022))) { errno = EPERM; return -1; }
+        /* An ACL on this ancestor must not permit its own removal either. */
+        return check_acl(fd, geteuid(), 0, 0, 1);
+    }
+    if (st.st_uid != getuid() || (st.st_mode & 0077)) { errno = EPERM; return -1; }
+    return check_acl(fd, getuid(), 1, 0, 0);
 }
 
 int stallion_private_directory(const char *path) {
@@ -1147,11 +1162,7 @@ int stallion_private_directory(const char *path) {
     free(owned);
     errno = open_error;
     if (fd < 0) return -1;
-    struct stat st;
-    int error = 0;
-    if (fstat(fd, &st)) error = errno;
-    else if (st.st_uid != getuid() || (st.st_mode & 0077)) error = EPERM;
-    else if (check_acl(fd, getuid(), 1, 0)) error = errno;
+    int error = stallion_protected_directory_fd(fd, 1) ? errno : 0;
     if (close(fd) && !error) error = errno;
     errno = error;
     return error ? -1 : 0;

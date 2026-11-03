@@ -1,5 +1,6 @@
 """Installed entry point for disposable native comparisons."""
 import argparse
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import os
@@ -95,6 +96,73 @@ def _environment():
             and not key.startswith('STALLIONFS_BENCHMARK_') and not key.lower().startswith('npm_config_')}
 
 
+class _PinnedDirectory:
+    """Retain a private directory and its protected pathname ancestors."""
+
+    def __init__(self, path, *, private=False):
+        from ._scan import _protected_directory_fd
+        self.path = Path(path).resolve(strict=True)
+        self.private = private
+        self.descriptors = []
+        self.links = []
+        self.validate = _protected_directory_fd
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            self.descriptors.append(os.open('/', flags))
+            for name in self.path.parts[1:]:
+                parent = self.descriptors[-1]
+                self.validate(parent, False)
+                child = os.open(name, flags, dir_fd=parent)
+                self.descriptors.append(child)
+                self.links.append((parent, name, child))
+            self.fd = self.descriptors[-1]
+            self.check()
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def check(self):
+        for parent, name, child in self.links:
+            self.validate(parent, False)
+            self.check_entry(parent, name, child)
+        self.validate(self.fd, self.private)
+
+    @staticmethod
+    def check_entry(parent, name, fd):
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError('Benchmark directory or evidence entry changed: ' + name)
+
+    def create(self, name, mode):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=self.fd)
+        try:
+            return os.fdopen(fd, mode)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, primary, traceback):
+        failure = None
+        while self.descriptors:
+            fd = self.descriptors.pop()
+            try:
+                os.close(fd)
+            except OSError as error:
+                if primary is not None:
+                    primary.add_note('Benchmark directory close also failed: ' + str(error))
+                elif failure is None:
+                    failure = error
+                else:
+                    failure.add_note('Benchmark directory close also failed: ' + str(error))
+        if failure is not None:
+            raise failure
+
+
 def _preflight(args):
     if sys.platform != 'darwin':
         raise RuntimeError('Installed comparisons currently require macOS/APFS')
@@ -154,7 +222,8 @@ def _preflight(args):
     parent = args.scratch or Path(tempfile.gettempdir())
     if parent.is_symlink() or not parent.is_dir():
         raise ValueError('Scratch must be an existing directory, not a symlink')
-    parent = parent.resolve(strict=True)
+    with _PinnedDirectory(parent) as directory:
+        parent = directory.path
     if args.full and shutil.which('git') is None:
         raise RuntimeError('Missing prerequisite: Git')
     if args.output:
@@ -228,11 +297,49 @@ def _read_native(output):
         journal.close()
 
 
-def _collect(args, resources, binary, root, fixtures, operations):
+def _collect(args, resources, binary, root, fixtures, operations, directory=None):
+    guard = _PinnedDirectory(root, private=True) if directory is None else nullcontext(directory)
+    with guard as directory:
+        directory.check()
+        root = directory.path
+        receipt = {'log': str(root / 'collector.log')}
+        evidence = directory.create('collector-receipt.json', 'w')
+        log = None
+        primary = None
+        try:
+            log = directory.create('collector.log', 'wb')
+            return _collect_pinned(args, resources, binary, directory, fixtures, operations, log, receipt)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            def save_receipt():
+                json.dump(receipt, evidence, indent=2)
+                evidence.write('\n')
+                evidence.flush()
+                directory.check_entry(directory.fd, 'collector-receipt.json', evidence.fileno())
+            def check_log():
+                if log is not None:
+                    directory.check_entry(directory.fd, 'collector.log', log.fileno())
+            for closeout in (check_log, log.close if log is not None else lambda: None,
+                             save_receipt, evidence.close, directory.check):
+                try:
+                    closeout()
+                except BaseException as secondary:
+                    if primary is None:
+                        primary = secondary
+                    else:
+                        primary.add_note('Collector evidence closeout also failed: ' + str(secondary))
+            if primary is not None and sys.exc_info()[1] is None:
+                raise primary
+
+
+def _collect_pinned(args, resources, binary, directory, fixtures, operations, log, receipt):
     from ._benchmark_budget import command
+    root = directory.path
     environment = _environment()
     receipts = root / 'receipts'
-    receipts.mkdir(mode=0o700)
+    os.mkdir('receipts', mode=0o700, dir_fd=directory.fd)
     environment.update(STALLIONFS_BENCHMARK_DEADLINE=str(time.monotonic() + (86400 if args.full else 600)),
                        STALLIONFS_BENCHMARK_RECEIPTS=str(receipts),
                        STALLIONFS_BENCHMARK_BINARY=str(binary.resolve()),
@@ -250,27 +357,10 @@ def _collect(args, resources, binary, root, fixtures, operations):
                 '--runs', '1', '--cache', 'warm', '--jobs', str(args.jobs),
                 '--fixtures', *fixtures, '--operations', *operations, '--copy-tools',
                 *(['cp-clone', 'cp', 'ditto', 'rsync'] if 'clone' in operations else ['cp'])]
-    receipt = {'log': str(root / 'collector.log')}
-    log = (root / 'collector.log').open('xb')
-    primary = None
-    try:
-        command(argv, timeout=(86410 if args.full else 610), environment=environment,
-                cwd=root, output=log, persist_success=False, receipt=receipt)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        for closeout in (log.close, lambda: (root / 'collector-receipt.json').write_text(
-                json.dumps(receipt, indent=2) + '\n')):
-            try:
-                closeout()
-            except BaseException as secondary:
-                if primary is None:
-                    primary = secondary
-                else:
-                    primary.add_note('Collector evidence closeout also failed: ' + str(secondary))
-        if primary is not None and sys.exc_info()[1] is None:
-            raise primary
+    directory.check()
+    command(argv, timeout=(86410 if args.full else 610), environment=environment,
+            cwd=root, output=log, persist_success=False, receipt=receipt)
+    directory.check()
     if receipt.get('completion_uncertain'):
         raise RuntimeError('Collector completion uncertain; all run files retained')
     if receipt.get('exit_code') != 0:
@@ -300,6 +390,11 @@ def _collect(args, resources, binary, root, fixtures, operations):
 
 
 def run(args):
+    with ExitStack() as directories:
+        return _run(args, directories)
+
+
+def _run(args, directories):
     # This branch must remain ahead of path resolution, Store and native imports.
     if args.list:
         value = _catalog()
@@ -307,11 +402,15 @@ def run(args):
             case['id'] + (' (catalog only)' if case['catalog_only'] else '') for case in value['cases']))
         return 0
     root = None
+    directory = None
     try:
         resources, binary, parent, fixtures, operations = _preflight(args)
-        root = Path(tempfile.mkdtemp(prefix='sfs-benchmark-', dir=parent))
-        os.chmod(root, 0o700)
-        result = _collect(args, resources, binary, root, fixtures, operations)
+        with _PinnedDirectory(parent) as scratch:
+            root = Path(tempfile.mkdtemp(prefix='sfs-benchmark-', dir=scratch.path))
+            scratch.check()
+            directory = directories.enter_context(_PinnedDirectory(root, private=True))
+        result = _collect(args, resources, binary, root, fixtures, operations, directory)
+        directory.check()
     except KeyboardInterrupt:
         result = {'status': 'interrupted', 'collection_complete': False, 'qualified': False, 'exit_code': 130}
     except (OSError, ValueError, RuntimeError) as error:
@@ -335,17 +434,55 @@ def run(args):
     result['limits'] = ['Not release qualification', 'RSS is the maximum individual child peak, not whole-system memory',
                         'cp -c permits fallback; sharing observations do not change that contract',
                         'Completion uncertainty retains storage; descendant containment is not established']
-    if root is not None:
-        # The owned copy survives an explicit-output collision or write failure.
-        targets = ([args.output.absolute()] if args.output else []) + [root / 'summary.json']
-        for output in targets:
+    def closeout_error(message, error):
+        result.setdefault('closeout_errors', []).append(message + str(error))
+        result['closeout_errors'].extend(getattr(error, '__notes__', ()))
+        if result['exit_code'] == 0:
+            result.update(status='failed', error=message + str(error), exit_code=1)
+
+    # Reserve summary files while the original directory is still held. Finalize
+    # directory descriptors before serializing results or printing terminal output.
+    summaries = []
+    try:
+        if directory is not None:
+            targets = ([args.output.absolute()] if args.output else []) + [root / 'summary.json']
+            for output in targets:
+                try:
+                    if output == root / 'summary.json':
+                        stream = directory.create('summary.json', 'w')
+                    else:
+                        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        stream = os.fdopen(fd, 'w')
+                    summaries.append(stream)
+                except OSError as error:
+                    closeout_error('Cannot reserve summary: ', error)
+        try:
+            directories.close()
+        except OSError as error:
+            closeout_error('Cannot close run directory: ', error)
+        while summaries:
+            stream = summaries.pop(0)
             try:
-                fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(fd, 'w') as stream:
-                    json.dump(result, stream, indent=2)
-                    stream.write('\n')
+                # A saved file precedes its own close and any later summary close.
+                json.dump({**result, 'summary_finalization': 'provisional; check terminal outcome and process exit'},
+                          stream, indent=2)
+                stream.write('\n')
+                stream.flush()
             except OSError as error:
-                result.update(status='failed', error='Cannot write summary: ' + str(error), exit_code=1)
+                closeout_error('Cannot write summary: ', error)
+            finally:
+                try:
+                    stream.close()
+                except OSError as error:
+                    closeout_error('Cannot close summary: ', error)
+    finally:
+        # Only streams that have not yet had a close attempt remain here.
+        while summaries:
+            stream = summaries.pop(0)
+            try:
+                stream.close()
+            except OSError as error:
+                closeout_error('Cannot close summary: ', error)
     if args.json:
         print(json.dumps(result))
     else:
