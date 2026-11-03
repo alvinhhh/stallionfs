@@ -80,7 +80,45 @@ struct Fixture {
         need(sfs_image_close(h, &r) == SFS_OK, "reopen close"); return bytes
     }
 }
-func accessPolicyChecks(_ parent: URL) throws {
+@MainActor func factoryPolicyChecks(_ parent: URL) throws {
+    let fixture = try Fixture(parent,"factory-readonly")
+    let image = fixture.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+    let modes = [1,2]
+#else
+    let modes = [0,1,2]
+#endif
+    for mode in modes {
+        let fs = StallionExtension().fileSystem
+        let resource = FSPathURLResource(url:fixture.url,writable:mode != 2)
+        let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:mode == 1 ? ["--rdonly"] : []) { done(($0,$1)) } }
+        need(loaded.0 != nil && loaded.1 == nil,"public factory readonly load")
+        let volume = loaded.0 as! StallionVolume
+        let coreRO: Bool = wait { done in volume.enqueue { done(volume.coreReadOnlyForTesting()) } }
+        need(coreRO && volume.requestedMountOptions.contains(.readOnly),"public factory readonly core and mount request")
+        let active: (FSItem?,Error?) = wait { done in volume.activate { done(($0,$1)) } };need(active.1 == nil,"public factory readonly activation")
+        let mounted: Error? = wait { volume.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"public factory readonly mount")
+        let written: Error? = wait { done in volume.write(contents:Data([1]),to:active.0!,at:0) { done($1) } }
+        need(code(written)==Int(EROFS),"public factory readonly mutation denied")
+        let _: Bool = wait { done in volume.unmount { done(true) } }
+        let deactivated: Error? = wait { volume.deactivate(options:[],replyHandler:$0) };need(deactivated == nil,"public factory readonly deactivation")
+        let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(unloaded == nil,"public factory readonly unload")
+        let after = try Data(contentsOf:image);need(after==before,"public factory denied mutation preserves image")
+    }
+    let revoked = FSPathURLResource(url:fixture.url,writable:true);revoked.revoke()
+    let fs = StallionExtension().fileSystem
+    let denied: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:revoked,arguments:[]) { done(($0,$1)) } }
+    need(denied.0 == nil && code(denied.1)==Int(EACCES),"public factory revoked resource denied")
+    let after = try Data(contentsOf:image);need(after==before,"revoked load preserves image")
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+    try accessPolicyChecks(parent,factory:true)
+#endif
+}
+
+@MainActor func accessPolicyChecks(_ parent: URL, factory: Bool = false) throws {
+    func makeFileSystem() -> StallionFileSystem {
+        factory ? StallionExtension().fileSystem : StallionFileSystem(accessPolicy:.contextualWrites)
+    }
     let f = try Fixture(parent,"access-policy"), resource = FSPathURLResource(url: f.url,writable: true)
     let image = f.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
     func load(_ fs: StallionFileSystem, _ args: [String] = []) -> (FSVolume?,Error?) {
@@ -102,7 +140,7 @@ func accessPolicyChecks(_ parent: URL) throws {
     // SDK FSTaskOptions.init is unavailable. Exercise its exact shared decoder;
     // installed task delivery is a separate qualification requirement.
     for mode in 0..<3 {
-        let fs = mode == 0 ? StallionFileSystem() : StallionFileSystem(accessPolicy:.contextualWrites)
+        let fs = mode == 0 ? StallionFileSystem() : makeFileSystem()
 #if STALLION_WRITE_DIAGNOSTIC
         if mode == 2 { fs.diagnosticUUID = f.identity }
 #endif
@@ -130,18 +168,18 @@ func accessPolicyChecks(_ parent: URL) throws {
         let after = try Data(contentsOf:image)
         need(after==before,"readonly load unchanged through unload")
     }
-    let force = load(StallionFileSystem(accessPolicy:.contextualWrites),["--rdonly","-f"])
+    let force = load(makeFileSystem(),["--rdonly","-f"])
     need(force.0 == nil && code(force.1)==Int(ENOTSUP),"force remains refused before any open")
     let revoked = FSPathURLResource(url:f.url,writable:true);revoked.revoke()
-    let revokedReply: (FSVolume?,Error?)=wait { done in StallionFileSystem(accessPolicy:.contextualWrites).loadResource(resource:revoked,arguments:["--rdonly"]) { done(($0,$1)) } }
+    let revokedReply: (FSVolume?,Error?)=wait { done in makeFileSystem().loadResource(resource:revoked,arguments:["--rdonly"]) { done(($0,$1)) } }
     need(revokedReply.0 == nil && code(revokedReply.1)==Int(EACCES),"revoked resource refuses even explicit readonly")
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
-    let roResource=FSPathURLResource(url:f.url,writable:false), roFS=StallionFileSystem(accessPolicy:.contextualWrites)
+    let roResource=FSPathURLResource(url:f.url,writable:false), roFS=makeFileSystem()
     let roReply: (FSVolume?,Error?)=wait { done in roFS.loadResource(resource:roResource,arguments:[]) { done(($0,$1)) } }
     need(roReply.1 == nil && (roReply.0 as! StallionVolume).requestedMountOptions.contains(.readOnly),"nonwritable production resource falls back to readonly")
     let roUnload: Error?=wait { roFS.unloadResource(resource:roResource,replyHandler:$0) };need(roUnload == nil,"nonwritable resource unload")
 #endif
-    let fs = StallionFileSystem(accessPolicy:.contextualWrites), reply = load(fs)
+    let fs = makeFileSystem(), reply = load(fs)
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
     need(reply.1 == nil && reply.0 != nil,"explicit contextual mutation admission")
     let v = reply.0 as! StallionVolume
@@ -206,15 +244,21 @@ func accessPolicyChecks(_ parent: URL) throws {
     let trace: [StallionVolume.Record]=wait { done in v.enqueue { done(v.capturedRecords()) } }
     need(trace.isEmpty,"nonfixture policy leaves optional trace empty")
     close(fs,v,active.0,found.0,expectedError:Int(EACCES))
-    let reopened = StallionFileSystem(accessPolicy:.contextualWrites)
+    let reopened = makeFileSystem()
     let probe: (FSProbeResult?,Error?) = wait { done in reopened.probeResource(resource:resource) { done(($0,$1)) } }
     need(probe.1 == nil && probe.0?.containerID?.uuid==f.identity,"persistent container identity after commit")
     let again = load(reopened,["--rdonly"]);need(again.1 == nil,"read-only reopen after mutation")
     let rv = again.0 as! StallionVolume
     need(rv.volumeID.uuid==f.identity && anchorMatches(rv.anchor,durable),"reopened committed identity and generation")
-    close(reopened,rv)
+    let reopenedRoot: (FSItem?,Error?) = wait { done in rv.activate { done(($0,$1)) } }
+    need(reopenedRoot.1 == nil,"reopened activation")
+    let reopenedMount: Error? = wait { rv.mount(arguments:[],replyHandler:$0) };need(reopenedMount == nil,"reopened mount")
+    let persisted: (FSItem?,FSFileName?,Error?) = wait { done in rv.lookupItem(named:FSFileName(string:"created-no-grant"),inDirectory:reopenedRoot.0!) { done(($0,$1,$2)) } }
+    need(persisted.0 != nil && persisted.2 == nil,"created entry persists through unload and reopen")
+    close(reopened,rv,reopenedRoot.0,persisted.0)
+    need(f.contents()==Data("changed!".utf8),"retained write persists through unload and reopen")
     let deniedFixture=try Fixture(parent,"access-policy-denied",mode:0o400)
-    let deniedFS=StallionFileSystem(accessPolicy:.contextualWrites), deniedResource=FSPathURLResource(url:deniedFixture.url,writable:true)
+    let deniedFS=makeFileSystem(), deniedResource=FSPathURLResource(url:deniedFixture.url,writable:true)
     let deniedLoad: (FSVolume?,Error?)=wait { done in deniedFS.loadResource(resource:deniedResource,arguments:[]) { done(($0,$1)) } }
     need(deniedLoad.1 == nil,"readonly inode in writable volume admitted")
     let deniedVolume=deniedLoad.0 as! StallionVolume
@@ -232,7 +276,7 @@ func accessPolicyChecks(_ parent: URL) throws {
     let deniedUnload: Error?=wait { deniedFS.unloadResource(resource:deniedResource,replyHandler:$0) };need(deniedUnload == nil,"denied-open model consumed")
     need(deniedFixture.contents()==Data("original".utf8),"denied opens preserve file bytes")
     let partial=try Fixture(parent,"access-policy-partial",mode:0o200)
-    let partialFS=StallionFileSystem(accessPolicy:.contextualWrites), partialResource=FSPathURLResource(url:partial.url,writable:true)
+    let partialFS=makeFileSystem(), partialResource=FSPathURLResource(url:partial.url,writable:true)
     let partialLoad: (FSVolume?,Error?)=wait { done in partialFS.loadResource(resource:partialResource,arguments:[]) { done(($0,$1)) } };need(partialLoad.1 == nil,"partly authorized fixture load")
     let partialVolume=partialLoad.0 as! StallionVolume
     let partialRoot: (FSItem?,Error?)=wait { done in partialVolume.activate { done(($0,$1)) } }
@@ -250,7 +294,7 @@ func accessPolicyChecks(_ parent: URL) throws {
     need(partial.contents()==Data("original".utf8),"partly authorized open preserves bytes")
     let other = try Fixture(parent,"access-policy-other")
     need(other.identity != f.identity,"independent image has its own stored identity")
-    let otherFS=StallionFileSystem(accessPolicy:.contextualWrites), otherResource=FSPathURLResource(url:other.url,writable:true)
+    let otherFS=makeFileSystem(), otherResource=FSPathURLResource(url:other.url,writable:true)
     let otherReply: (FSVolume?,Error?)=wait { done in otherFS.loadResource(resource:otherResource,arguments:[]) { done(($0,$1)) } }
     need(otherReply.1 == nil && (otherReply.0 as! StallionVolume).volumeID.uuid==other.identity,"second image needs no fixture-specific rebuild")
     let otherVolume=otherReply.0 as! StallionVolume
@@ -3300,6 +3344,11 @@ func contextualXattrQueue(_ parent: URL) throws {
 #endif
 @main struct Driver {
     static func main() throws {
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--factory-policy" {
+            try factoryPolicyChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
+            print("PASS public factory access selection, refusal and persistence")
+            return
+        }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--access-policy" {
             try accessPolicyChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
             print("PASS immutable read-only selection, contextual open grants and retained-write delivery")
