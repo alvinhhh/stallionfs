@@ -106,6 +106,100 @@ class NativeReferenceTests(unittest.TestCase):
                 self.store.register_native_image(self.image)
         self.assertEqual(self.image.read_bytes(), b'owned external fixture')
 
+    def test_native_holds_precede_gc_move_forget_and_purge(self):
+        shapes = ('native-create', 'repo/owned/image.sfs', 'repo/owned/native-create.json', 'reference')
+        for index, shape in enumerate(shapes):
+            for collection, width in (('trash', 32), ('workspaces', 32), ('seeds', 64), ('recovery', 32)):
+                with self.subTest(shape=shape, collection=collection):
+                    value = f'{index + 100:0{width}x}'
+                    path = self.store.root / collection / value
+                    path.mkdir(mode=0o700)
+                    (path / 'repo').mkdir(mode=0o700)
+                    write_json(path / 'meta.json', {'id': value, 'commit': 'a' * 40})
+                    payload = path / (shape if shape != 'reference' else 'repo/private/arbitrary-name.bin')
+                    payload.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    payload.write_bytes(b'malformed or partial native material')
+                    registration = None
+                    if shape == 'reference':
+                        original = self.image
+                        self.image = payload
+                        try:
+                            registration = self.store.register_native_image(payload)['id']
+                        finally:
+                            self.image = original
+                    before = (path.stat().st_ino, payload.stat().st_ino, payload.read_bytes())
+                    for apply in (False, True):
+                        with self.assertRaises(StallionError):
+                            if collection == 'trash':
+                                self.store.gc(older_than=0, yes=apply, jobs=1)
+                            elif collection == 'workspaces':
+                                self.store.move(value)
+                            elif collection == 'seeds':
+                                self.store.forget(value, yes=apply)
+                            else:
+                                self.store.purge('recovery', value, yes=apply)
+                        self.assertEqual((path.stat().st_ino, payload.stat().st_ino, payload.read_bytes()), before)
+                    # Remove only this test registration to keep later cases independent.
+                    if registration is not None:
+                        core.remove_tree(self.store.root / 'workspaces' / registration)
+                    core.remove_tree(path)
+
+    def test_changed_external_reference_blocks_generic_collection(self):
+        path = self.store.root / 'trash' / ('c1' * 16)
+        path.mkdir(mode=0o700)
+        (path / 'repo').mkdir(mode=0o700)
+        write_json(path / 'meta.json', {'id': path.name, 'commit': 'a' * 40})
+        original_inode = path.stat().st_ino
+        self.image.rename(self.parent / 'held-original')
+        self.image.write_bytes(b'replacement')
+        for apply in (False, True):
+            with self.assertRaisesRegex(StallionError, 'Changed native reference'):
+                self.store.gc(older_than=0, yes=apply, jobs=1)
+            self.assertEqual(path.stat().st_ino, original_inode)
+        self.assertEqual((self.parent / 'held-original').read_bytes(), b'owned external fixture')
+
+    def test_native_marked_nested_staging_is_never_generically_removed(self):
+        for shape in ('native-create', 'native-create.json', 'owned/image.sfs', 'expired/owned/image.sfs'):
+            with self.subTest(shape=shape):
+                retained = None
+                with self.assertRaises(StallionError):
+                    with self.store.staging() as stage:
+                        retained = stage
+                        target = stage / shape
+                        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        target.write_bytes(b'')
+                self.assertTrue(retained.exists())
+                self.assertTrue((retained / shape).exists())
+
+    def test_direct_purge_refuses_native_metadata_and_partial_owned_payload(self):
+        for index, shape in enumerate(('meta.json', 'owned/image.sfs', 'native-create')):
+            value = f'{index + 1:032x}'
+            path = self.store.root / 'recovery' / value
+            path.mkdir(mode=0o700)
+            if shape == 'meta.json':
+                write_json(path / shape, {'backend': 'native-image', 'ownership': 'external-reference'})
+            else:
+                target = path / shape
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                target.write_bytes(b'partial')
+            with self.assertRaisesRegex(StallionError, 'native'):
+                self.store.purge('recovery', value, yes=True)
+            self.assertTrue(path.exists())
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+
+    def test_unknown_native_intent_blocks_reference_publication(self):
+        value = 'ab' * 16
+        journal = self.store.root / 'journals' / (value + '.json')
+        write_json(journal, {'operation': 'native-create', 'workspace': value,
+                            'creation_attempted': True, 'native_image': {'file': None}})
+        original = journal.read_bytes()
+        with self.assertRaisesRegex(StallionError, 'uncertain native creation'):
+            self.store.register_native_image(self.image)
+        with self.assertRaisesRegex(StallionError, 'without reconciliation'):
+            self.store._reconcile(value)
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+
     def test_fallback_receipts_and_captured_signal_are_reported_by_cli(self):
         from contextlib import redirect_stderr, redirect_stdout
         from io import StringIO

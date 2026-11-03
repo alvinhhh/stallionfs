@@ -75,8 +75,8 @@ class BenchmarkResources(build_py):
 setup(
     ext_modules=[Extension("stallionfs._scan", ["stallionfs/_scan.c", "stallionfs/_tree.c", "stallionfs/_walk.c"],
                            depends=[HEADER], extra_compile_args=FLAGS),
-                 Extension("stallionfs._image", ["stallionfs/_image.c", "filesystem/image.c"],
-                           include_dirs=["filesystem"], depends=["filesystem/image.h"], extra_compile_args=FLAGS)],
+                 Extension("stallionfs._image", ["stallionfs/_image.c", "stallionfs/_native_import.c", "filesystem/image.c"],
+                           include_dirs=["filesystem"], depends=["filesystem/image.h", "stallionfs/_native_import.h"], extra_compile_args=FLAGS)],
     scripts=["stallionfs/_main.c"],
     cmdclass={"build_scripts": NativeScripts, "build_py": BenchmarkResources},
 )

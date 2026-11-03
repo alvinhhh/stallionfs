@@ -231,6 +231,8 @@ class Lifecycle:
         if registration.exists() and core.read_json(registration).get('backend') == 'native-image':
             raise core.StallionError('Unexpected exchange journal for a native image registration; retained unchanged')
         record = core.read_json(journal)
+        if record.get('operation') == 'native-create':
+            raise core.StallionError(f'Native candidate intent retained without reconciliation: {journal}')
         core.identifier(record.get('recovery'), 32)
         if record.get('workspace') != workspace or record.get('backend') not in ('folder', 'image'):
             raise core.StallionError('Uncertain rollback journal; retained without changes')
@@ -409,6 +411,7 @@ class Lifecycle:
         path, meta = self.object('workspaces', workspace)
         if meta.get('backend') == 'native-image':
             return None  # Registration never authorizes retirement of external data.
+        self._guard_native_tree(path)
         state = core.read_json(self._state(workspace))
         if not self._valid_state(workspace, path, meta, state, now):
             return None
@@ -514,8 +517,9 @@ class Lifecycle:
         path = self.root / kind / value
         # Purge is explicit permanent deletion, never called by automatic maintenance.
         workspace_lock = self._workspace_lock(value) if kind == 'trash' else contextlib.nullcontext()
-        with workspace_lock, core.lock(self.root / 'locks' / 'retention'):
+        with core.lock(self.root / '.lock'), workspace_lock, core.lock(self.root / 'locks' / 'retention'):
             core.private_directory(path)
+            self._guard_native_tree(path)
             if next((self.root / 'journals').iterdir(), None) is not None:
                 raise core.StallionError('Resolve pending rollback before purging retained data')
             self._no_mounts(path)

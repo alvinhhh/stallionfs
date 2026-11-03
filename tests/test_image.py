@@ -523,6 +523,9 @@ class ImageCore(unittest.TestCase):
     def test_streamed_partial_ranges_forced_seal_truncate_and_regrow(self):
         self.scenario('ranges')
 
+    def test_committed_mapped_positions_views_budgets_and_output_atomicity(self):
+        self.scenario('mapped-blocks')
+
     def test_full_budgets_cancellation_auxiliary_errors_and_cleanup(self):
         self.scenario('budgets')
 
