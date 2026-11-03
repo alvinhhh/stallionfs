@@ -209,6 +209,123 @@ func resourceUnloadChecks(_ url: URL) {
     hooksReset()
     let _: Bool = wait { done in volume.unmount { done(true) } }
     need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "terminal unmount replies without touching consumed handle")
+    resourceReloadChecks(owner, path: path, retired: volume, oldRoot: root.0!)
+}
+
+func resourceReloadChecks(_ owner: StallionFileSystem, path: FSPathURLResource, retired: StallionVolume, oldRoot: FSItem) {
+    func load(_ resource: FSResource) -> (FSVolume?, Error?) {
+        wait { done in owner.loadResource(resource: resource, force: false) { done(($0, $1)) } }
+    }
+    func drained() {
+        let empty: Bool = wait { owner.drainResourceWorkForTesting($0) }
+        need(empty, "resource callback tickets released")
+    }
+    func locked() {
+        var handle: OpaquePointer?, result = sfs_result()
+        need(sfs_image_open_readonly(path.url.path, "image.sfs", &handle, &result) == SFS_BUSY && handle == nil,
+             "new admission retains independent core lock")
+    }
+    let before = try! Data(contentsOf: path.url.appendingPathComponent("image.sfs"))
+    let same = load(path)
+    need(same.1 == nil && same.0 !== retired, "same resource object receives fresh volume")
+    let second = same.0 as! StallionVolume
+    let rejected = load(path)
+    need(rejected.0 == nil && code(rejected.1) == Int(EINVAL), "live admission refuses another load")
+    locked()
+    hooksReset()
+    let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.fileID]
+    let oldAttributes: (FSItem.Attributes?, Error?) = wait { done in retired.getAttributes(request, of: oldRoot) { done(($0, $1)) } }
+    let oldSync: Error? = wait { retired.synchronize(flags: .wait, replyHandler: $0) }
+    let _: Bool = wait { done in retired.unmount { done(true) } }
+    let oldReclaim: Error? = wait { retired.reclaimItem(oldRoot, replyHandler: $0) }
+    need(oldAttributes.0 == nil && code(oldAttributes.1) == Int(ENXIO) && code(oldSync) == Int(ENXIO) && code(oldReclaim) == Int(ENXIO),
+         "retired volume and items remain terminal during fresh admission")
+    need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "retired callbacks never touch new handle")
+    locked()
+
+    // Hold A after target capture but before queue insertion. FIFO work alone
+    // cannot exercise this scheduling window.
+    let captured = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), delayed = DispatchSemaphore(value: 0)
+    owner.setUnloadAdmissionHookForTesting {
+        captured.signal(); need(release.wait(timeout: .now() + 10) == .success, "release captured old admission")
+    }
+    let resourceURL = path.url
+    DispatchQueue.global().async {
+        let delayedResource = FSPathURLResource(url: resourceURL, writable: false)
+        owner.unloadResource(resource: delayedResource) { error in
+            need(code(error) == Int(EIO), "captured old unload preserves its consuming error"); delayed.signal()
+        }
+    }
+    need(captured.wait(timeout: .now() + 10) == .success, "old unload captured before enqueue")
+    owner.setUnloadAdmissionHookForTesting(nil)
+    hooksReset(); hooksFailClose()
+    let replacement = FSPathURLResource(url: path.url, writable: false)
+    let next: (FSVolume?, Error?) = wait { done in
+        owner.unloadResource(resource: path) { error in
+            need(code(error) == Int(EIO), "consuming error published before reentrant reload")
+            owner.loadResource(resource: replacement, force: false) { done(($0, $1)) }
+        }
+    }
+    need(next.1 == nil && next.0 !== second && next.0 !== retired, "distinct resource and same owner reload reentrantly")
+    let closeCount = hooksCloses()
+    release.signal()
+    need(delayed.wait(timeout: .now() + 10) == .success, "delayed old unload replies once")
+    drained()
+    need(hooksCloses() == closeCount, "delayed captured unload does not close new admission")
+    locked()
+    let closed: Error? = wait { owner.unloadResource(resource: replacement, replyHandler: $0) }
+    let lastClose = hooksCloses()
+    let duplicate: Error? = wait { owner.unloadResource(resource: replacement, replyHandler: $0) }
+    need(closed == nil && duplicate == nil && hooksCloses() == lastClose, "new consuming outcome is independent and duplicate does not reclose")
+    drained()
+
+    // A failed fresh reservation must not resurrect the old context or prevent
+    // a later normal load, including from inside the failure reply.
+    let revoked = FSPathURLResource(url: path.url, writable: false); revoked.revoke()
+    let recovered: (FSVolume?, Error?) = wait { done in
+        owner.loadResource(resource: revoked, force: false) { volume, error in
+            need(volume == nil && code(error) == Int(EACCES), "failed open reports original error")
+            owner.loadResource(resource: path, force: false) { done(($0, $1)) }
+        }
+    }
+    need(recovered.1 == nil && recovered.0 !== next.0, "failed reservation clears before reply")
+    let recoveredClose: Error? = wait { owner.unloadResource(resource: path, replyHandler: $0) }; need(recoveredClose == nil, "recovered reservation closes")
+    drained()
+
+    let invalidType = load(FSGenericURLResource(url: path.url))
+    let force: (FSVolume?, Error?) = wait { done in owner.loadResource(resource: path, force: true) { done(($0, $1)) } }
+    let excessive: (FSVolume?, Error?) = wait { done in owner.loadResource(resource: path, arguments: Array(repeating: "x", count: 65)) { done(($0, $1)) } }
+    need(invalidType.0 == nil && code(invalidType.1) == Int(EINVAL) && force.0 == nil && code(force.1) == Int(ENOTSUP) &&
+         excessive.0 == nil && code(excessive.1) == Int(E2BIG), "pre-admission refusals leave ownership idle")
+
+    let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0), configured = DispatchSemaphore(value: 0)
+    owner.setLoadConfigurationHookForTesting {
+        entered.signal(); need(resume.wait(timeout: .now() + 10) == .success, "release opening resource")
+    }
+    owner.loadResource(resource: path, force: false) { volume, error in
+        need(volume != nil && error == nil, "opening reservation survives refused peers"); configured.signal()
+    }
+    need(entered.wait(timeout: .now() + 10) == .success, "configuration boundary held")
+    owner.setLoadConfigurationHookForTesting(nil)
+    let opening = load(path)
+    let earlyUnload: Error? = wait { owner.unloadResource(resource: path, replyHandler: $0) }
+    need(opening.0 == nil && code(opening.1) == Int(EINVAL) && code(earlyUnload) == Int(EINVAL), "opening context refuses overlapping lifecycle")
+    let probes = DispatchGroup()
+    let unsupported = FSGenericURLResource(url: path.url)
+    for _ in 1..<ReadOnlyLimits.callbacks {
+        probes.enter(); owner.probeResource(resource: unsupported) { result, error in
+            need(result != nil && error == nil, "bounded queued probe replies once"); probes.leave()
+        }
+    }
+    let saturated = load(path)
+    need(saturated.0 == nil && code(saturated.1) == Int(EAGAIN), "callback budget rejection leaves existing reservation intact")
+    resume.signal()
+    need(configured.wait(timeout: .now() + 10) == .success && probes.wait(timeout: .now() + 10) == .success, "bounded resource work drains")
+    drained()
+    let finalClose: Error? = wait { owner.unloadResource(resource: path, replyHandler: $0) }; need(finalClose == nil, "final admission consumes")
+    drained()
+    let after = try! Data(contentsOf: path.url.appendingPathComponent("image.sfs"))
+    need(after == before, "resource ownership regressions never mutate the image")
 }
 
 func generalNamespaceChecks(_ parent: URL) throws {

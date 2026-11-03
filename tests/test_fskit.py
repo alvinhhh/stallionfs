@@ -1,6 +1,8 @@
 """Direct FSKit callback checks; no installed extension or kernel-routing claim."""
 from contextlib import redirect_stderr
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import platform
@@ -101,6 +103,51 @@ class FSKitInterfaces(unittest.TestCase):
                 raise AssertionError(f'Unexpected Swift warning in {label}; retained {cls.base}')
         return child
 
+    def test_admission_ownership_and_legacy_callbacks(self):
+        cls = type(self)
+        cls.failed = True
+        try:
+            filesystem = self.source / 'filesystem'
+            tests = self.source / 'tests'
+            directory = self.base / 'resource-admission'
+            directory.mkdir(mode=0o700)
+            target = 'arm64-apple-macos27.0'
+            cflags = [self.tools['clang'], '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g',
+                      '-target', target, '-isysroot', self.sdk, '-I', filesystem]
+            normal = directory / 'normal-image.o'
+            hooked = directory / 'hooked-image.o'
+            hooks = directory / 'hooks.o'
+            producer = directory / 'fixture-producer'
+            self.command('resource-normal-core', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
+            self.command('resource-fixture-build', [*cflags, tests / 'fskit_fixture.c', normal, '-o', producer], 90)
+            fixture = directory / 'fixture'
+            self.command('resource-fixture-run', [producer, fixture], 90)
+            manifest = json.loads((fixture / 'manifest.json').read_text())
+            self.assertTrue(manifest['full_verified'])
+            self.assertTrue(manifest['consumed_close'])
+            before = hashlib.sha256((fixture / 'image.sfs').read_bytes()).digest()
+            replacements = ('pread', 'pwrite', 'ftruncate', 'fsync', 'close')
+            self.command('resource-hooked-core', [*cflags, *(f'-D{name}=sfs_hooks_{name}' for name in replacements),
+                         '-c', filesystem / 'image.c', '-o', hooked], 90)
+            self.command('resource-hooks', [*cflags, '-c', tests / 'fskit_image_hooks.c', '-o', hooks], 90)
+            executable = directory / 'adapter-check'
+            self.command('resource-adapter-build', [self.tools['swiftc'], '-D', 'STALLION_ADAPTER_CHECK',
+                         '-swift-version', '6', '-strict-concurrency=complete', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-g', '-Onone', '-parse-as-library',
+                         '-module-cache-path', directory / 'cache', filesystem / 'fskit/Extension.swift',
+                         filesystem / 'fskit/Volume.swift', fixture / 'FixtureIdentity.swift',
+                         tests / 'fskit_adapter_driver.swift', hooked, hooks, '-o', executable], 180, swift='legacy')
+            child = self.command('resource-adapter-run', [executable, fixture], 180)
+            self.assertEqual(child.stdout,
+                             'PASS: real-core namespace, aliases, pagination, resource limits, reclaim, lifecycle ordering, read-only refusal and consumed close\n'
+                             'UNTESTED: kernel access routing, packer/buffer delivery, kernel reclaim counts, acquired security scope and signed lifecycle\n')
+            self.assertEqual(child.stderr, '')
+            self.assertEqual(hashlib.sha256((fixture / 'image.sfs').read_bytes()).digest(), before)
+            cls.failed = False
+        except BaseException as error:
+            capture._latch_command('fskit_resource_admission', repr(error))
+            raise
+
     def test_contextual_and_legacy_callbacks_and_production_builds(self):
         cls = type(self)
         try:
@@ -120,6 +167,7 @@ class FSKitInterfaces(unittest.TestCase):
             sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
             forbidden = ('sfs_diag_', 'sfs_image_diagnostic_', 'enablewritediagnostic', 'diagnosticwrite',
                          'sfs_test_', 'fixtureidentity', 'reclaimfortesting', 'ownsfortesting',
+                         'unloadadmissionhook', 'loadconfigurationhook', 'drainresourceworkfortesting',
                          'diagnostictracestoragefortesting', 'diagnosticreadfortesting',
                          'diagnosticclosemodesfortesting', 'diagnosticmutationfortesting', 'diagnosticsetattributes', 'performwrite', 'setwritableattributes', 'enableadmittedwrites',
                          'writecountfortesting', 'setattributesvaluefortesting', 'refusedmutationfortesting',

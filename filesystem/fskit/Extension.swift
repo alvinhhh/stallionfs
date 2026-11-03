@@ -48,11 +48,34 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         super.init()
     }
     private let queue = DispatchQueue(label: "sfs.volume")
-    private var resource: FSPathURLResource?
-    private var volume: StallionVolume?
-    private var unloadedURL: URL?
-    private var disposition: Error?
+    private final class ResourceAdmission: @unchecked Sendable {
+        let resource: FSPathURLResource
+        let url: URL
+        // Only the serial queue reads or changes ownership and its outcome.
+        var volume: StallionVolume?
+        var consumed = false
+        var disposition: Error?
+        init(_ resource: FSPathURLResource) { self.resource = resource; url = resource.url }
+    }
+    private enum Routing { case idle, opening(ResourceAdmission), live(ResourceAdmission) }
+    // The lock protects routing identities, never core work or framework replies.
+    private let routingLock = NSLock()
+    private var routing = Routing.idle
+    private var completed: ResourceAdmission?
     private let callbacks = CallbackBudget()
+#if STALLION_ADAPTER_CHECK
+    private var unloadAdmissionHook: (() -> Void)?
+    private var loadConfigurationHook: (() -> Void)?
+    func setLoadConfigurationHookForTesting(_ hook: (() -> Void)?) {
+        routingLock.lock(); loadConfigurationHook = hook; routingLock.unlock()
+    }
+    func setUnloadAdmissionHookForTesting(_ hook: (() -> Void)?) {
+        routingLock.lock(); unloadAdmissionHook = hook; routingLock.unlock()
+    }
+    func drainResourceWorkForTesting(_ reply: @escaping (Bool) -> Void) {
+        queue.async(execute: DispatchWorkItem { reply(self.callbacks.isEmpty) })
+    }
+#endif
 #if STALLION_WRITE_DIAGNOSTIC
     // Explicit, single-image binding supplied by the disposable-image harness.
     // The default extension initializer supplies no binding and stays read-only.
@@ -137,9 +160,21 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
     }
     private func loadResource(resource: FSResource, force: Bool, readOnly: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
         guard boundedResource(resource) else { replyHandler(nil, POSIXError(.ENAMETOOLONG)); return }
-        enqueue(rejected: { replyHandler(nil, $0) }) {
-        guard self.resource == nil && self.unloadedURL == nil, let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
+        guard let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
         guard !force else { replyHandler(nil, POSIXError(.ENOTSUP)); return }
+        guard callbacks.acquire(4096) else { replyHandler(nil, POSIXError(.EAGAIN)); return }
+        routingLock.lock()
+        guard case .idle = routing else {
+            routingLock.unlock(); callbacks.release(4096); replyHandler(nil, POSIXError(.EINVAL)); return
+        }
+        let context = ResourceAdmission(path)
+        routing = .opening(context)
+#if STALLION_ADAPTER_CHECK
+        let configurationHook = loadConfigurationHook
+#endif
+        routingLock.unlock()
+        queue.async(execute: DispatchWorkItem {
+        defer { self.callbacks.release(4096) }
         do {
             // --rdonly wins before open, even over a private fixture binding.
             let expected: UUID?
@@ -162,6 +197,9 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
             } else { access = .readOnly }
             let (opened, scoped) = try self.open(path, access: access, expectedUUID: expected)
             let loaded = StallionVolume(admission: opened, resource: path, scope: scoped, queue: self.queue)
+#if STALLION_ADAPTER_CHECK
+            configurationHook?()
+#endif
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             if access != .readOnly {
                 do { try loaded.enableAdmittedWrites() }
@@ -175,21 +213,58 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
                 }
             }
 #endif
-            self.resource = path; self.volume = loaded; self.containerStatus = .ready; replyHandler(loaded, nil)
-        } catch { replyHandler(nil, error) }
-    } }
+            context.volume = loaded
+            self.finishOpening(context, live: true)
+            self.containerStatus = .ready; replyHandler(loaded, nil)
+        } catch {
+            self.finishOpening(context, live: false)
+            replyHandler(nil, error)
+        }
+    }) }
+    private func finishOpening(_ context: ResourceAdmission, live: Bool) {
+        routingLock.lock()
+        guard case .opening(let current) = routing, current === context else {
+            routingLock.unlock(); preconditionFailure("Resource admission reservation changed")
+        }
+        routing = live ? .live(context) : .idle
+        routingLock.unlock()
+    }
     func unloadResource(resource: FSResource, options: FSTaskOptions, replyHandler: @escaping (Error?) -> Void) {
         unloadResource(resource: resource, replyHandler: replyHandler)
     }
     func unloadResource(resource: FSResource, replyHandler: @escaping (Error?) -> Void) {
         guard boundedResource(resource) else { replyHandler(POSIXError(.ENAMETOOLONG)); return }
-        enqueue(rejected: { replyHandler($0) }) {
         guard let path = resource as? FSPathURLResource else { replyHandler(POSIXError(.EINVAL)); return }
-        if self.unloadedURL == path.url { replyHandler(self.disposition); return }
-        guard path.url == self.resource?.url, let volume = self.volume else { replyHandler(POSIXError(.EINVAL)); return }
+        guard callbacks.acquire(4096) else { replyHandler(POSIXError(.EAGAIN)); return }
+        routingLock.lock()
+        let selected: ResourceAdmission?
+        switch routing {
+        case .live(let current): selected = current.url == path.url ? current : nil
+        case .idle: selected = completed?.url == path.url ? completed : nil
+        case .opening: selected = nil
+        }
+#if STALLION_ADAPTER_CHECK
+        let hook = unloadAdmissionHook
+#endif
+        routingLock.unlock()
+        guard let context = selected else {
+            callbacks.release(4096); replyHandler(POSIXError(.EINVAL)); return
+        }
+#if STALLION_ADAPTER_CHECK
+        hook?()
+#endif
+        queue.async(execute: DispatchWorkItem {
+        defer { self.callbacks.release(4096) }
+        if context.consumed { replyHandler(context.disposition); return }
+        guard let volume = context.volume else { preconditionFailure("Live resource has no volume") }
         let unloaded = volume.unload()
         guard unloaded.consumed else { replyHandler(unloaded.error); return }
-        self.disposition = unloaded.error; self.unloadedURL = path.url; self.volume = nil; self.resource = nil
-        replyHandler(self.disposition)
-    } }
+        context.disposition = unloaded.error; context.consumed = true; context.volume = nil
+        self.routingLock.lock()
+        if case .live(let current) = self.routing, current === context {
+            self.routing = .idle; self.completed = context
+        }
+        self.routingLock.unlock()
+        replyHandler(context.disposition)
+    }) }
 }
