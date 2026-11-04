@@ -192,7 +192,6 @@ jobs:
       group: hosted-docs-clone-screen
       cancel-in-progress: false
     env:
-      SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
       PYTHONDONTWRITEBYTECODE: '1'
       MAKEFLAGS: -j1
       CMAKE_BUILD_PARALLEL_LEVEL: '1'
@@ -206,6 +205,8 @@ jobs:
         with:
           python-version: '3.13'
       - name: Build and install public source wheel
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
           umask 077
           mkdir "$SCREEN_ROOT"
@@ -214,6 +215,8 @@ jobs:
           "$SCREEN_ROOT/venv/bin/python" -m pip wheel --no-deps --wheel-dir "$SCREEN_ROOT/wheels" "$GITHUB_WORKSPACE"
           "$SCREEN_ROOT/venv/bin/python" -m pip install --force-reinstall --no-deps "$SCREEN_ROOT/wheels/"*.whl
       - name: Record source and hosted environment
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
           cd "$RUNNER_TEMP"
           "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
@@ -245,6 +248,8 @@ jobs:
           (root / 'evidence/environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
           PY
       - name: Collect fixed document clone comparison
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
           cd "$RUNNER_TEMP"
           "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
@@ -275,6 +280,8 @@ jobs:
           raise SystemExit(outcome['returncode'])
           PY
       - name: Show correctness and existing case gate
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         if: always()
         run: |
           cd "$RUNNER_TEMP"
@@ -315,6 +322,8 @@ jobs:
           raise SystemExit(0 if result['accepted'] else 1)
           PY
       - name: Preserve synthetic screen evidence
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         if: always()
         uses: actions/upload-artifact@v4
         with:
