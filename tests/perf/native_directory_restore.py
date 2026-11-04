@@ -293,6 +293,7 @@ class Session:
         self.cancelled = cancelled if cancelled is not None else lambda: False
         self.expected = expected; self.source = {}; self.destination = {}; self.owned = []
         self.changed_flags = {}; self.changed_modes = {}; self.failure = None; self.bindings = []
+        self.operation = 'not_started'; self.operation_phase = 'preflight'
         self.summary = {'status': 'not_started', 'mutation_attempts': 0, 'alias_replacements': 0,
                         'acl_repairs': 0, 'tracking_repairs': 0, 'directory_times': 0,
                         'recovery': 'not_needed'}
@@ -369,16 +370,19 @@ class Session:
             self.note_admission('entry_identity')
             after = self.ops.fstat(fd)
             need(signature(after) == signature(info), 'identity_changed')
-            records[name] = {'fd': fd, 'info': after, 'parent': parent_fd, 'leaf': leaf}
+            entry_id = f'e{sorted(snapshot["entries"]).index(name) + 1:04}'
+            records[name] = {'fd': fd, 'info': after, 'parent': parent_fd, 'leaf': leaf, 'entry_id': entry_id}
         self.note_admission('source_closure')
         self.check(records, source=records is self.source)
 
     def check(self, records, *, source=False):
         for name, record in records.items():
             info = self.ops.fstat(record['fd'])
+            self.note_difference(record, record['info'], info, 'source_held' if source else 'destination_held')
             need(signature(info) == signature(record['info']), 'source_changed' if source else 'identity_changed')
             if name:
                 named = self.ops.named(record['parent'], record['leaf'])
+                self.note_difference(record, info, named, 'source_named' if source else 'destination_named')
                 need(signature(named) == signature(info), 'source_changed' if source else 'identity_changed')
         for fd, before in self.pins:
             now = self.ops.fstat(fd)
@@ -399,24 +403,49 @@ class Session:
             if not stat.S_ISDIR(record['info'].st_mode):
                 need(record['info'].st_nlink == counts[identity(record['info'])], 'destination_external_alias')
 
-    def refresh(self, records, allowed):
+    def note_difference(self, record, before, after, check, allowed=(), parent_nlink=None):
+        # Only project a failed comparison already required by the guards.
+        fields = [('identity', identity(before), identity(after)),
+            ('generation', getattr(before, 'st_gen', None), getattr(after, 'st_gen', None)),
+            ('birthtime', getattr(before, 'st_birthtime', None), getattr(after, 'st_birthtime', None))]
+        for field in ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink', 'st_flags', 'st_mtime_ns', 'st_ctime_ns'):
+            if field not in allowed or field == 'st_nlink' and parent_nlink is not None:
+                expected = before.st_nlink + parent_nlink if field == 'st_nlink' and parent_nlink is not None else getattr(before, field)
+                fields.append((field.removeprefix('st_'), expected, getattr(after, field)))
+        for field, expected, actual in fields:
+            if expected != actual:
+                self.summary.setdefault('failure_context', {'operation': self.operation,
+                    'phase': self.operation_phase, 'check': check, 'entry_id': record.get('entry_id'), 'field': field})
+                break
+
+    def refresh(self, records, allowed, *, parent_nlink=None):
         for record in records:
             before, after = record['info'], self.ops.fstat(record['fd'])
+            permitted = allowed(record) if callable(allowed) else allowed
+            delta = parent_nlink[1] if parent_nlink is not None and record is parent_nlink[0] else None
+            self.note_difference(record, before, after, 'refresh', permitted, delta)
             need(identity(after) == identity(before), 'identity_changed')
             need(getattr(after, 'st_gen', None) == getattr(before, 'st_gen', None)
                  and getattr(after, 'st_birthtime', None) == getattr(before, 'st_birthtime', None), 'identity_changed')
-            permitted = allowed(record) if callable(allowed) else allowed
             for key in ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink', 'st_flags', 'st_mtime_ns', 'st_ctime_ns'):
-                need(key in permitted or getattr(before, key) == getattr(after, key), 'identity_changed')
+                if key == 'st_nlink' and delta is not None:
+                    need(after.st_nlink == before.st_nlink + delta, 'identity_changed')
+                else:
+                    need(key in permitted or getattr(before, key) == getattr(after, key), 'identity_changed')
             record['info'] = after
 
-    def mutate(self, call, records, allowed):
-        self.preflight(); self.summary['mutation_attempts'] += 1; call()
-        self.refresh(records, allowed)
+    def mutate(self, call, records, allowed, *, operation='metadata_setter', parent_nlink=None):
+        self.operation = operation; self.operation_phase = 'preflight'
+        self.preflight(); self.summary['mutation_attempts'] += 1
+        self.operation_phase = 'native_call'; call()
+        self.operation_phase = 'refresh'
+        self.refresh(records, allowed, parent_nlink=parent_nlink)
+        self.operation_phase = 'postflight'
         self.preflight()
 
     def restore(self, destination_snapshot, output='output'):
         self.summary['status'] = 'incomplete'
+        self.operation = 'destination_capture'; self.operation_phase = 'preflight'
         try:
             derived = plan(self.expected, destination_snapshot, os.geteuid())
             need('/' not in output and output not in ('', '.', '..'))
@@ -445,7 +474,8 @@ class Session:
                     # The removed held inode is no longer a named destination member.
                     del self.destination[name]
                 self.mutate(remove, old_class + [parent], lambda record:
-                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'})
+                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'},
+                    operation='alias_unlink', parent_nlink=(parent, -1))
                 remaining = sum(identity(record['info']) == identity(victim['info'])
                                 for record in self.destination.values())
                 need(self.ops.fstat(victim['fd']).st_nlink == remaining, 'destination_external_alias')
@@ -456,13 +486,18 @@ class Session:
                     need(error.errno == errno.ENOENT, 'identity_changed')
                 else:
                     raise RestoreError('identity_changed')
+                self.operation = 'alias_link'; self.operation_phase = 'preflight'
                 self.preflight()
                 self.summary['mutation_attempts'] += 1
+                self.operation_phase = 'native_call'
                 self.ops.link(first['parent'], first['leaf'], victim['parent'], victim['leaf'])
+                self.operation_phase = 'refresh'
                 self.refresh(same + [parent], lambda record:
-                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'})
-                replacement = dict(first, parent=victim['parent'], leaf=victim['leaf'])
+                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'},
+                    parent_nlink=(parent, 1))
+                replacement = dict(first, parent=victim['parent'], leaf=victim['leaf'], entry_id=victim['entry_id'])
                 self.destination[name] = replacement
+                self.operation_phase = 'postflight'
                 self.preflight(); self.summary['alias_replacements'] += 1
             for name in derived['flags']:
                 record = self.destination[name]; original = record['info'].st_flags
@@ -503,6 +538,8 @@ class Session:
             self.summary['status'] = 'restored_pending_final_verifiers'
         except BaseException as error:
             self.failure = error
+            self.summary.setdefault('failure_context', {'operation': self.operation,
+                'phase': self.operation_phase, 'check': 'unclassified', 'entry_id': None, 'field': None})
             self.summary['error'] = str(error) if isinstance(error, RestoreError) else 'restoration_operation_failed'
             self.summary['status'] = 'incomplete'
             self.recover()
