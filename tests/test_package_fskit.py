@@ -1,11 +1,14 @@
 """Package profile refusal cases; actual compiler matrix is in test_fskit."""
 import hashlib
+import base64
+import zipfile
 import importlib.util
 from contextlib import redirect_stdout
 import io
 import json
 import os
 import plistlib
+import stat
 import sys
 from types import SimpleNamespace
 import tempfile
@@ -224,6 +227,15 @@ class PackageCompatibilityTests(unittest.TestCase):
         self.assemble()
         self.assertEqual(self.manifest.read_bytes(), first)
 
+    def test_runtime_inputs_require_an_external_manifest_before_inspection(self):
+        argv = ['package_fskit.py', '--host', str(self.host), '--extension', str(self.extension),
+                '--out', str(self.app), '--bundle-version', '9', '--runtime-inputs', str(self.base / 'inputs.json')]
+        with patch.object(sys, 'argv', argv), patch.object(package, 'inspect_package_artifacts') as inspect, \
+                patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit):
+            package.main()
+        inspect.assert_not_called()
+        self.assertFalse(self.app.exists())
+
     def test_existing_paths_symlinks_and_invalid_locations_refuse(self):
         original = self.manifest
         existing = self.base / 'existing.json'
@@ -330,3 +342,240 @@ class PackageCompatibilityTests(unittest.TestCase):
         finally:
             os.close(descriptor)
             os.close(parent)
+
+
+SOURCE = Path(__file__).resolve().parents[1]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def put(path, data=b'fixture', mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(mode)
+    return path
+
+
+def pinned(path):
+    return {'path': str(path), 'sha256': digest(path.read_bytes())}
+
+
+def json_file(path, value):
+    return put(path, (json.dumps(value, sort_keys=True, indent=2) + '\n').encode())
+
+
+class RuntimeAssembly(unittest.TestCase):
+    def setUp(self):
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        self.temporary = tempfile.TemporaryDirectory(prefix='package-runtime-', dir=SOURCE.parent)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+
+    def inputs(self):
+        python = self.root / 'python'
+        put(python / 'bin/python3.13', b'inert interpreter', 0o755)
+        put(python / 'lib/python3.13/encodings/__init__.py', b'# inert stdlib\n')
+        (python / 'lib/python3.13/lib-dynload').mkdir()
+        metadata = {'python_version': '3.13.18', 'python_tag': 'cp313', 'target_triple': 'aarch64-apple-darwin',
+                    'python_config_vars': {'SOABI': 'cpython-313-darwin', 'EXT_SUFFIX': '.cpython-313-darwin.so',
+                                           'Py_GIL_DISABLED': '0', 'Py_DEBUG': '0'}}
+        license_path = put(self.root / 'metadata/licenses/LICENSE', b'Python license fixture')
+        records = {'licenses': [{'path': 'licenses/LICENSE', 'sha256': digest(license_path.read_bytes()),
+                                  'size': license_path.stat().st_size}]}
+        descriptor = {'python_exe': 'bin/python3.13', 'python_root': str(python),
+                      'license_root': str(license_path.parent)}
+        for name, data in {'python_archive': b'archive fixture', 'full_archive': b'full fixture',
+                           'python_inventory': json.dumps(package._runtime_inventory(python)).encode(),
+                           'metadata': json.dumps(metadata).encode(), 'static_receipt': b'{}',
+                           'license_records': json.dumps(records).encode()}.items():
+            path = put(self.root / (name + '.input'), data)
+            descriptor['metadata_file' if name == 'metadata' else name] = str(path)
+            descriptor[name + '_sha256'] = digest(data)
+        python_descriptor = json_file(self.root / 'python.json', descriptor)
+        git = self.root / 'git'
+        put(git / 'bin/git', b'inert git', 0o755)
+        (git / 'libexec/git-core').mkdir(parents=True)
+        (git / 'share/git-core/templates').mkdir(parents=True)
+        (git / 'libexec/git-core/git').symlink_to('../../bin/git')
+        inventory = json_file(self.root / 'git-tree.json', package._runtime_inventory(git))
+        qualification = json_file(self.root / 'git-qualification.json', {
+            'schema': 1, 'inventory_sha256': digest(inventory.read_bytes()),
+            'static_closure_accepted': True, 'local_correctness_passed': True, 'synthetic_fixture': True})
+        sources = {path.relative_to(SOURCE).as_posix(): path.read_bytes()
+                   for path in (SOURCE / 'stallionfs').iterdir() if path.is_file() and path.suffix in ('.py', '.c', '.h')}
+        sources.update({name: (SOURCE / name).read_bytes() for name in ('setup.py', 'pyproject.toml')})
+        build_sources = {name: digest(data) for name, data in sources.items()}
+        files = {name: data for name, data in sources.items() if name.startswith('stallionfs/') and name.endswith('.py')}
+        resources = {}
+        for name in ('fileops.py', 'native_suite.py', 'native_metrics.py', 'native_correctness.py',
+                     'native_fixtures.py', 'native_report.py', 'campaign.py', 'scan.py', 'run.py', 'cli.py',
+                     'fixture/package.json', 'fixture/package-lock.json', 'fixture/check.cjs'):
+            data = (SOURCE / 'tests/perf' / name).read_bytes()
+            files['stallionfs/_benchmark_runtime/' + name] = data
+            resources[name] = digest(data)
+        files.update({'stallionfs/_benchmark_runtime/manifest.json': json.dumps({
+            'kind': 'build-source provenance', 'build_source_sha256': build_sources, 'resources': resources}).encode(),
+            'stallionfs/_scan.cpython-313-darwin.so': b'inert scan',
+            'stallionfs/_image.cpython-313-darwin.so': b'inert image',
+            'stallionfs-0.6.3.data/scripts/sfs': b'inert native launcher',
+            'stallionfs-0.6.3.data/scripts/stallionfs': b'inert native launcher',
+            'stallionfs-0.6.3.dist-info/METADATA': b'Name: stallionfs\nVersion: 0.6.3\n',
+            'stallionfs-0.6.3.dist-info/WHEEL': b'Tag: cp313-cp313-macosx_15_0_arm64\n',
+            'stallionfs-0.6.3.dist-info/entry_points.txt': b'stallionfs-python = stallionfs.__main__:main\n'})
+        record = 'stallionfs-0.6.3.dist-info/RECORD'
+        files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+                                  + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
+        wheel = self.root / 'fixture.whl'
+        with zipfile.ZipFile(wheel, 'w') as archive:
+            for name, data in files.items(): archive.writestr(name, data)
+        wheel.chmod(0o644)
+        license = put(self.root / 'COPYING', b'Git license fixture')
+        source = put(self.root / 'git-source.tar.xz', b'Git corresponding source fixture')
+        config = put(self.root / 'config.mak', b'Git build recipe fixture')
+        value = {'schema': 1, 'python_descriptor': pinned(python_descriptor),
+                 'git': {'root': str(git), 'inventory': pinned(inventory), 'qualification': pinned(qualification)},
+                 'wheel': pinned(wheel), 'licenses': [dict(pinned(license), destination='Git/COPYING')],
+                 'sources': [dict(pinned(source), destination='Git/source.tar.xz'), dict(pinned(config), destination='Git/config.mak')]}
+        self.descriptor = json_file(self.root / 'runtime-inputs.json', value)
+        self.value = value
+        self.app = self.root / 'Assembled With Spaces.app'
+        self.manifest = self.root / 'candidate.json'
+        self.host = put(self.root / 'host', mode=0o755)
+        self.extension = put(self.root / 'extension', mode=0o755)
+
+    def inspect(self, argv, directory):
+        if argv[0] == '/usr/bin/lipo': return 'arm64'
+        if argv[0] == '/usr/bin/nm':
+            return {'wheel-2': '_PyInit__scan', 'wheel-3': '_PyInit__image'}.get(Path(argv[-1]).name,
+                    '_stallionfs_factory_contextual_writes_v1') + '\n'
+        self.assertEqual(argv[0], '/usr/bin/otool')
+        return APPLE_BUILD_VERSION
+
+    def assemble(self):
+        argv = ['package_fskit.py', '--host', str(self.host), '--extension', str(self.extension),
+                '--out', str(self.app), '--bundle-version', '9', '--manifest-out', str(self.manifest),
+                '--runtime-inputs', str(self.descriptor)]
+        self.stdout = io.StringIO()
+        with patch.object(sys, 'argv', argv), patch.object(package, '_tool_output', side_effect=self.inspect), redirect_stdout(self.stdout):
+            package.main()
+
+    def test_complete_synthetic_mapping_modes_and_source_sidecar_under_both_umasks(self):
+        self.inputs()
+        for mask in (0o022, 0o077):
+            self.app = self.root / (str(mask) + '.app')
+            self.manifest = self.root / (str(mask) + '.json')
+            previous = os.umask(mask)
+            try: self.assemble()
+            finally: os.umask(previous)
+            value = json.loads(self.manifest.read_bytes())['runtime']
+            self.assertFalse(value['complete_candidate'])
+            self.assertFalse(value['distribution_signing_performed'])
+            self.assertEqual(value['inventory'], package._runtime_inventory(self.app))
+            self.assertEqual(self.app.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(self.manifest.stat().st_mode & 0o777, 0o600)
+            self.assertTrue((self.app / 'Contents/Resources/Runtime/CLI/bin/stallionfs-python').stat().st_mode & 0o111)
+            sidecar = self.root / value['source_sidecar']['path']
+            self.assertEqual(value['source_sidecar']['inventory'], package._runtime_inventory(sidecar))
+            self.assertTrue((self.app / 'Contents/Resources/Licenses/Git/COPYING').is_file())
+
+    def test_missing_substituted_qualification_license_and_wheel_inputs_refuse_before_output(self):
+        self.inputs()
+        original = self.descriptor.read_bytes()
+        for mutation in ('schema', 'qualification', 'license', 'source', 'wheel-pin'):
+            value = json.loads(original)
+            if mutation == 'schema': value['schema'] = 2
+            elif mutation == 'qualification':
+                value['git']['qualification'] = pinned(json_file(self.root / 'unqualified.json', {'schema': 1}))
+            elif mutation == 'license': value['licenses'] = []
+            elif mutation == 'source': value['sources'] = []
+            else: value['wheel']['sha256'] = '0' * 64
+            json_file(self.descriptor, value)
+            with self.subTest(mutation=mutation), self.assertRaises((ValueError, KeyError)):
+                self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())
+
+    def test_source_mutation_and_unlisted_output_are_detected_and_retained(self):
+        self.inputs()
+        original = package._runtime_write_at
+        def substitute(root, name, data, mode=0o644):
+            result = original(root, name, data, mode)
+            if name == 'Contents/Resources/Runtime/runtime.json':
+                original(root, 'unexpected', b'unlisted')
+            return result
+        with patch.object(package, '_runtime_write_at', side_effect=substitute), self.assertRaisesRegex(ValueError, 'mapping changed'):
+            self.assemble()
+        self.assertTrue((self.app / 'unexpected').is_file())
+        self.assertEqual(self.stdout.getvalue(), '')
+        self.assertEqual(self.manifest.read_bytes(), b'')
+        with self.assertRaises(SystemExit): self.assemble()
+
+    def test_runtime_input_change_during_copy_is_refused(self):
+        self.inputs()
+        original = package._runtime_write_at
+        def change_input(root, name, data, mode=0o644):
+            result = original(root, name, data, mode)
+            if name == 'Contents/Resources/Runtime/CPython/bin/python3.13':
+                (self.root / 'python/bin/python3.13').write_bytes(b'changed input')
+            return result
+        with patch.object(package, '_runtime_write_at', side_effect=change_input), self.assertRaisesRegex(ValueError, 'changed after copy'):
+            self.assemble()
+        self.assertTrue(self.app.is_dir())
+        self.assertEqual(self.manifest.read_bytes(), b'')
+        self.assertEqual(self.stdout.getvalue(), '')
+
+    def test_wheel_traversal_collision_symlink_and_record_corruption_refuse(self):
+        self.inputs()
+        metadata = json.loads((self.root / 'metadata.input').read_bytes())
+        for names in (('../outside',), ('same', 'SAME'), ('link',)):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, 'w') as archive:
+                for name in names:
+                    item = zipfile.ZipInfo(name)
+                    if name == 'link': item.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(item, b'fixture')
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                package._runtime_wheel_members(stream.getvalue(), metadata)
+        stream = io.BytesIO()
+        with zipfile.ZipFile(self.root / 'fixture.whl') as original, zipfile.ZipFile(stream, 'w') as changed:
+            for item in original.infolist():
+                data = original.read(item)
+                changed.writestr(item, data + b'changed' if item.filename == 'stallionfs/core.py' else data)
+        with self.assertRaisesRegex(ValueError, 'RECORD'):
+            package._runtime_wheel_members(stream.getvalue(), metadata)
+
+    def test_required_python_members_and_exact_current_benchmark_resources_are_mandatory(self):
+        self.inputs()
+        with zipfile.ZipFile(self.root / 'fixture.whl') as archive:
+            original = {item.filename: archive.read(item) for item in archive.infolist()}
+        for mutation in ('bootstrap', 'main', 'resource-map', 'resource-file', 'stale-resource', 'foreign-package'):
+            files = dict(original)
+            if mutation == 'bootstrap': files.pop('stallionfs/_bundle.py')
+            elif mutation == 'main': files.pop('stallionfs/__main__.py')
+            elif mutation == 'resource-file': files.pop('stallionfs/_benchmark_runtime/cli.py')
+            elif mutation == 'foreign-package': files['stallionfs/injected.py'] = b'raise AssertionError("unlisted")'
+            else:
+                name = 'stallionfs/_benchmark_runtime/manifest.json'
+                manifest = json.loads(files[name])
+                if mutation == 'resource-map': manifest['resources'].pop('cli.py')
+                else:
+                    files['stallionfs/_benchmark_runtime/cli.py'] = b'stale resource with valid self-hash'
+                    manifest['resources']['cli.py'] = digest(files['stallionfs/_benchmark_runtime/cli.py'])
+                files[name] = json.dumps(manifest).encode()
+            record = 'stallionfs-0.6.3.dist-info/RECORD'
+            files.pop(record)
+            files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+                                      + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
+            wheel = self.root / (mutation + '.whl')
+            with zipfile.ZipFile(wheel, 'w') as archive:
+                for name, data in files.items(): archive.writestr(name, data)
+            value = dict(self.value, wheel=pinned(wheel))
+            json_file(self.descriptor, value)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())

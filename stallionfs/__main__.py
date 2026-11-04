@@ -39,6 +39,8 @@ def main(argv=None):
     move_mode.add_argument("--replace", action="store_true", help="Replace the destination atomically")
     move_mode.add_argument("--exchange", action="store_true", help="Swap two existing paths atomically")
     commands.add_parser("volumes", help="List mounted filesystems")
+    command_setup = commands.add_parser('command', help='Manage this user\'s sfs command link')
+    command_setup.add_argument('operation', choices=('status', 'install', 'remove'))
     prepare = commands.add_parser("prepare", help="Prepare a clean commit once")
     prepare.add_argument("source")
     prepare.add_argument("--ref", default="HEAD")
@@ -121,6 +123,19 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'command':
+        if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
+            parser.error('--root applies to workspace commands')
+        try:
+            from ._command import run, describe
+            result = run(args.operation)
+            print(json.dumps(result, sort_keys=True) if args.json else describe(result))
+            return 0
+        except (OSError, ValueError, ImportError, KeyError, TypeError, KeyboardInterrupt, MemoryError) as error:
+            interrupted = isinstance(error, KeyboardInterrupt)
+            message = 'interrupted; inspect command status' if interrupted else str(error)
+            print(json.dumps({'error': message}) if args.json else 'stallionfs: ' + message, file=sys.stderr)
+            return 130 if interrupted else 1
     if args.action == 'benchmark':
         return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
