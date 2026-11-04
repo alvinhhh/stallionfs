@@ -8,7 +8,7 @@ on:
       mode:
         description: Hosted document clone action
         type: choice
-        options: [compare, system-trace]
+        options: [compare, thread-cpu]
         default: compare
 permissions:
   contents: read
@@ -213,15 +213,19 @@ jobs:
       - name: Build and install public source wheel
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+          PHASE_MODE: ${{ inputs.mode }}
         run: |
           umask 077
+          if [ "$PHASE_MODE" = 'thread-cpu' ]; then
+            export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1"
+          fi
           mkdir "$SCREEN_ROOT"
           mkdir -p "$SCREEN_ROOT/evidence/receipts" "$SCREEN_ROOT/wheels" "$SCREEN_ROOT/scratch"
           python -m venv "$SCREEN_ROOT/venv"
           "$SCREEN_ROOT/venv/bin/python" -m pip wheel --no-deps --wheel-dir "$SCREEN_ROOT/wheels" "$GITHUB_WORKSPACE"
           "$SCREEN_ROOT/venv/bin/python" -m pip install --force-reinstall --no-deps "$SCREEN_ROOT/wheels/"*.whl
       - name: Record source and hosted environment
-        if: inputs.mode != 'system-trace'
+        if: inputs.mode != 'thread-cpu'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -255,7 +259,7 @@ jobs:
           (root / 'evidence/environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
           PY
       - name: Collect fixed document clone comparison
-        if: inputs.mode != 'system-trace'
+        if: inputs.mode != 'thread-cpu'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -287,8 +291,8 @@ jobs:
               (evidence / 'collector-outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
           raise SystemExit(outcome['returncode'])
           PY
-      - name: Probe System Trace capability
-        if: inputs.mode == 'system-trace'
+      - name: Collect thread CPU phases
+        if: inputs.mode == 'thread-cpu'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -298,33 +302,36 @@ jobs:
           from pathlib import Path
           from stallionfs._benchmark_budget import command
           root = Path(os.environ['SCREEN_ROOT'])
-          control = root / 'scratch/trace-control'
+          control = root / 'scratch/phase-control'
           control.mkdir(mode=0o700)
           receipts = control / 'receipts'
           receipts.mkdir(mode=0o700)
-          output = root / 'evidence/system-trace-status.json'
+          output = root / 'evidence/thread-cpu-status.json'
           os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
-          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 210)
-          argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/system_trace_probe.py'),
-              '--binary', str(root / 'venv/bin/stallionfs'), '--scratch', str(root / 'scratch'),
-              '--output', str(output), '--revision', os.environ['GITHUB_SHA']]
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 160)
           code = 1
           try:
-              code = command(argv, cwd=control, timeout=200, umask=0o077, output_limit=65536).returncode
+              wheels = list((root / 'wheels').glob('*.whl'))
+              if len(wheels) != 1:
+                  raise RuntimeError('Wheel identity unavailable')
+              argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_phase_probe.py'),
+                  '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]), '--scratch', str(root / 'scratch'),
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA']]
+              code = command(argv, cwd=control, timeout=150, umask=0o077, output_limit=65536).returncode
           except BaseException:
               pass
           if not output.exists():
               with output.open('x') as artifact:
-                  json.dump({'schema': 1, 'scope': 'hosted-source-build capability diagnostic',
-                      'status': 'incomplete', 'capability': 'unavailable', 'target_completion': 'unknown',
-                      'correctness': None, 'schema_metadata_status': 'unavailable', 'cpu_attribution': 'unavailable',
-                      'benchmark_verdict': 'not_applicable', 'error': 'outer_capture_incomplete'}, artifact)
+                  json.dump({'schema': 1, 'scope': 'hosted diagnostic source build', 'status': 'incomplete',
+                      'target_completion': 'unknown', 'correctness': None, 'counter_status': 'unavailable',
+                      'clone_attempts': None, 'cleanup': 'retained_ephemeral', 'benchmark_verdict': 'not_applicable',
+                      'error': 'outer_capture_incomplete'}, artifact)
           raise SystemExit(code)
           PY
       - name: Show correctness and existing case gate
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always() && inputs.mode != 'system-trace'
+        if: always() && inputs.mode != 'thread-cpu'
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
@@ -366,7 +373,7 @@ jobs:
       - name: Preserve synthetic screen evidence
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always() && inputs.mode != 'system-trace'
+        if: always() && inputs.mode != 'thread-cpu'
         uses: actions/upload-artifact@v4
         with:
           name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
@@ -380,11 +387,11 @@ jobs:
             ${{ env.SCREEN_ROOT }}/evidence/receipts/*.json
           if-no-files-found: error
           retention-days: 3
-      - name: Preserve System Trace capability status
-        if: always() && inputs.mode == 'system-trace'
+      - name: Preserve thread CPU phase status
+        if: always() && inputs.mode == 'thread-cpu'
         uses: actions/upload-artifact@v4
         with:
-          name: hosted-system-trace-status-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/system-trace-status.json
+          name: hosted-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/thread-cpu-status.json
           if-no-files-found: error
           retention-days: 3
