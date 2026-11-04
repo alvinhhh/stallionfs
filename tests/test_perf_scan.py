@@ -276,6 +276,12 @@ class ScannerStatistics(unittest.TestCase):
         for field in ('sha256', 'mode'):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 self.configure(stack, Path(directory))
+                def fixture(path, *args):
+                    counts = self.fixture(path, *args)
+                    (path / 'file').chmod(0o644)
+                    self.assertEqual(stat.S_IMODE((path / 'file').stat().st_mode), 0o644)
+                    return counts
+                stack.enter_context(mock.patch.object(scan, 'fixture', side_effect=fixture))
                 def mutate(path, **_):
                     if field == 'sha256':
                         (path / 'file').write_bytes(b'b')

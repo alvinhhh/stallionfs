@@ -49,6 +49,7 @@ class NativeImageCLI(unittest.TestCase):
                     '-include', tests / 'native_image_bridge_hooks.h', '-c', filesystem / 'image.c', '-o', normal])
         bridge = cls.artifacts / 'diagnostic-bridge.o'
         cls.owned('diagnostic-bridge', [*flags, '-Dclock_gettime=sfs_bridge_test_clock',
+                    '-Dclose=sfs_bridge_test_parent_close', '-Dsfs_image_open_readonly=sfs_bridge_test_guard_open',
                     '-DPyLong_FromLongLong=sfs_bridge_test_signed', '-DPyLong_FromUnsignedLongLong=sfs_bridge_test_unsigned',
                     '-DPyUnicode_FromStringAndSize=sfs_bridge_test_text',
                     '-Dsfs_image_snapshot=sfs_bridge_test_snapshot', '-Dsfs_image_prepare_restore=sfs_bridge_test_restore',
@@ -250,6 +251,154 @@ class NativeImageCLI(unittest.TestCase):
             # Deliberate unlink is followed only by terminal consuming close.
         _image.with_backing_guard(destination, unlink)
         self.assertEqual(tokens[-1].close_result['status'], 0)
+
+    def test_guard_wrapper_retains_precallback_carrier_and_primary_extraction_errors(self):
+        from stallionfs import _native
+        from unittest.mock import patch
+        receipt = {'core_consumed': True, 'status': 0, 'parent_close_errno': 0}
+        class Token:
+            fail = False
+            @property
+            def close_result(self):
+                if self.fail: raise MemoryError('receipt allocation')
+                return receipt
+        for fallback in (False, True):
+            token = Token()
+            error = OSError('pre-callback failure')
+            carrier = RuntimeError('fallback') if fallback else error
+            carrier.native_backing_guard = token
+            if fallback: error.__context__ = carrier
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+            self.assertIs(error.native_current_guard, receipt)
+            self.assertIs(carrier.native_backing_guard, token)
+            token.fail = True
+            del error.native_current_guard
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+            self.assertIs(carrier.native_backing_guard, token)
+        for denied in ('native_backing_guard', '__context__'):
+            class HostileError(Exception):
+                def __getattribute__(self, name):
+                    if name == denied: raise RuntimeError('diagnostic attribute refused')
+                    return super().__getattribute__(name)
+            error = HostileError('original')
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(HostileError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+        error = OSError('original before diagnostic allocation failure')
+        token = Token(); error.native_backing_guard = token
+        with patch('stallionfs._native._image.with_backing_guard', side_effect=error), \
+             patch('stallionfs._native.set', side_effect=MemoryError('seen allocation'), create=True):
+            with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+        self.assertIs(caught.exception, error)
+        self.assertIs(error.native_backing_guard, token)
+
+    def test_scoped_backing_guard_expected_anchor_exact_and_copied_before_open(self):
+        from stallionfs import _image
+        import errno
+        directory = self.seed()
+        info = directory.stat()
+        target = dict(directory=str(directory), component='image.sfs', parent=[info.st_dev, info.st_ino], file=None)
+        inspected = _image.inspect(target); target.update(inspected['identity'])
+        expected = {key: inspected['receipt'][key] for key in ('generation', 'root_digest', 'committed_end')}
+        tokens = []
+        def held(token):
+            tokens.append(token)
+            with self.assertRaises(OSError) as caught: _image.with_backing_guard(target, lambda _: None)
+            self.assertEqual(caught.exception.errno, errno.EBUSY)
+            return 17
+        self.assertEqual(_image.with_backing_guard(target, held), 17)
+        self.assertEqual(_image.with_backing_guard(target, held, None), 17)
+        self.assertEqual(_image.with_backing_guard(target, held, expected), 17)
+        self.assertEqual(len(tokens), 3)
+        for token in tokens:
+            self.assertTrue(token.close_result['core_consumed'])
+            with self.assertRaises(RuntimeError): token.verify(target)
+        for key in expected:
+            mismatch = dict(expected)
+            mismatch[key] = '0' * 64 if key == 'root_digest' else mismatch[key] + 1
+            with self.assertRaises(OSError) as caught:
+                _image.with_backing_guard(target, lambda _: self.fail('stale callback invoked'), mismatch)
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertTrue(caught.exception.native_anchor_mismatch)
+            receipt = caught.exception.native_backing_guard.close_result
+            self.assertTrue(receipt['core_consumed'])
+            self.assertEqual(receipt['status'], 0)
+            self.assertEqual(receipt['parent_close_errno'], 0)
+        class AnchorDict(dict): pass
+        class AnchorInteger(int): pass
+        class AnchorDigest(str): pass
+        invalid = [{}, dict(expected, extra=1), {key: value for key, value in expected.items() if key != 'generation'}]
+        invalid += [AnchorDict(expected), dict(expected, generation=AnchorInteger(expected['generation'])),
+                    dict(expected, committed_end=AnchorInteger(expected['committed_end'])),
+                    dict(expected, root_digest=AnchorDigest(expected['root_digest']))]
+        for key in ('generation', 'committed_end'):
+            invalid += [dict(expected, **{key: value}) for value in (True, False, -1, 1 << 64, 1.0, '1')]
+        invalid += [dict(expected, root_digest=value) for value in ('A' * 64, 'g' * 64, '0' * 63, b'0' * 64)]
+        for value in invalid:
+            # Invalid expected values must fail before a nonexistent resource is opened.
+            with self.assertRaises((ValueError, TypeError, OverflowError)):
+                _image.with_backing_guard(dict(target, directory='/nonexistent-native-anchor-test'),
+                                          lambda _: self.fail('invalid anchor callback invoked'), value)
+        mutable = dict(expected)
+        class Directory:
+            def __fspath__(self):
+                mutable['generation'] += 1
+                return str(directory)
+        self.assertEqual(_image.with_backing_guard(dict(target, directory=Directory()), lambda _: 19, mutable), 19)
+        self.assertTrue(_image.snapshot(target, 'advance-anchor')['ok'])
+        with self.assertRaises(OSError) as caught:
+            _image.with_backing_guard(target, lambda _: self.fail('old committed anchor accepted'), expected)
+        self.assertTrue(caught.exception.native_anchor_mismatch)
+        self.assertEqual(caught.exception.native_backing_guard.close_result['status'], 0)
+
+    def test_scoped_backing_guard_anchor_mismatch_retains_close_and_allocation_failures(self):
+        directory = self.seed()
+        script = textwrap.dedent('''            import ctypes,importlib.util,json,sys
+            from pathlib import Path
+            module_path,directory=sys.argv[1:]
+            spec=importlib.util.spec_from_file_location('stallionfs._image',module_path)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            control=ctypes.CDLL(module_path).sfs_bridge_test_configure
+            control.argtypes=[ctypes.c_int]*4;control.restype=None
+            info=Path(directory).stat()
+            target=dict(directory=directory,component='image.sfs',parent=[info.st_dev,info.st_ino],file=None)
+            observed=module.inspect(target);target.update(observed['identity'])
+            anchor={k:observed['receipt'][k] for k in ('generation','root_digest','committed_end')}
+            stale=dict(anchor,generation=anchor['generation']+1)
+            for flags in (0,1048576,262144,64,1048576|262144|64):
+                called=[];control(0,0,flags,0)
+                try:module.with_backing_guard(target,lambda token:called.append(token),stale)
+                except OSError as error:
+                    assert error.native_anchor_mismatch and not called
+                    carrier=error.native_backing_guard
+                    if flags & 64:
+                        try:carrier.close_result
+                        except MemoryError:pass
+                        else:raise AssertionError('report allocation fault not exercised')
+                    receipt=carrier.close_result
+                    assert receipt['core_consumed']
+                    assert (receipt['status'] != 0) == bool(flags & 1048576)
+                    assert (receipt['parent_close_errno'] != 0) == bool(flags & 262144)
+                else:raise AssertionError('mismatch returned success')
+                control(0,0,0,0)
+                assert module.with_backing_guard(target,lambda _:7,anchor)==7
+            control(0,0,524288,0);called=[]
+            try:module.with_backing_guard(target,lambda token:called.append(token),anchor)
+            except KeyboardInterrupt as error:
+                assert not called
+                assert error.native_backing_guard.close_result['core_consumed']
+            else:raise AssertionError('pre-callback cancellation was lost')
+            control(0,0,0,0)
+            print('PASS expected-anchor mismatch, consumed close, parent close, report allocation and cancellation')
+        ''')
+        child = self.owned('guard-expected-faults', [sys.executable, '-I', '-B', '-c', script,
+                                                    self.diagnostic, directory])
+        self.assertEqual(child.stdout, 'PASS expected-anchor mismatch, consumed close, parent close, report allocation and cancellation\n')
+        self.assertEqual(child.stderr, '')
 
     def test_scoped_backing_guard_preserves_consumed_close_error_and_primary(self):
         directory = self.seed()

@@ -2,16 +2,21 @@ import Foundation
 @preconcurrency import FSKit
 import SFSImage
 
+// Packaging reads the defined symbol from each executable architecture. Keep
+// the marker and public factory selection in this single compile-time branch.
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+@_cdecl("stallionfs_factory_contextual_writes_v1")
+public func stallionFactoryProfile() -> Int32 { 1 }
+#else
+@_cdecl("stallionfs_factory_read_only_v1")
+public func stallionFactoryProfile() -> Int32 { 0 }
+#endif
 #if !STALLION_ADAPTER_CHECK
 @main
 #endif
 struct StallionExtension: UnaryFileSystemExtension {
     var fileSystem: StallionFileSystem {
-#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
-        StallionFileSystem(accessPolicy: .contextualWrites)
-#else
-        StallionFileSystem()
-#endif
+        StallionFileSystem(accessPolicy: stallionFactoryProfile() == 1 ? .contextualWrites : .readOnly)
     }
 }
 // A load keeps the exact core-open access selected before its handle exists.

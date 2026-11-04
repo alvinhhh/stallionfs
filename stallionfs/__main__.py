@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from . import __version__
@@ -38,6 +39,8 @@ def main(argv=None):
     move_mode.add_argument("--replace", action="store_true", help="Replace the destination atomically")
     move_mode.add_argument("--exchange", action="store_true", help="Swap two existing paths atomically")
     commands.add_parser("volumes", help="List mounted filesystems")
+    command_setup = commands.add_parser('command', help='Manage this user\'s sfs command link')
+    command_setup.add_argument('operation', choices=('status', 'install', 'remove'))
     prepare = commands.add_parser("prepare", help="Prepare a clean commit once")
     prepare.add_argument("source")
     prepare.add_argument("--ref", default="HEAD")
@@ -49,6 +52,10 @@ def main(argv=None):
     create = commands.add_parser("create", help="Clone a prepared seed")
     create.add_argument("seed")
     create.add_argument("--name", default="")
+    create.add_argument('--backend', choices=('native-image',), help='Use an owned native image with a mounted repository')
+    create.add_argument('--capacity-gib', type=int, help='Required capacity for native images')
+    create.add_argument('--native-profile', choices=('production', 'private-sfsro27'), default='production')
+    create.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     create.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Folder clone workers; use 1 for lower CPU use")
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
@@ -94,7 +101,7 @@ def main(argv=None):
     purge = commands.add_parser("purge", help="Preview or permanently delete retained data")
     purge.add_argument("kind", choices=("snapshots", "recovery", "trash"))
     purge.add_argument("id")
-    purge.add_argument("--yes", action="store_true")
+    purge.add_argument("--yes", action="store_true", help="Permanently delete selected data, including all snapshots inside a native image")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
     from . import benchmark
     benchmark.parser(commands)
@@ -116,6 +123,19 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'command':
+        if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
+            parser.error('--root applies to workspace commands')
+        try:
+            from ._command import run, describe
+            result = run(args.operation)
+            print(json.dumps(result, sort_keys=True) if args.json else describe(result))
+            return 0
+        except (OSError, ValueError, ImportError, KeyError, TypeError, KeyboardInterrupt, MemoryError) as error:
+            interrupted = isinstance(error, KeyboardInterrupt)
+            message = 'interrupted; inspect command status' if interrupted else str(error)
+            print(json.dumps({'error': message}) if args.json else 'stallionfs: ' + message, file=sys.stderr)
+            return 130 if interrupted else 1
     if args.action == 'benchmark':
         return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
@@ -157,7 +177,11 @@ def main(argv=None):
             result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup, image_size=args.image_size)
             text = result["id"]
         elif args.action == "create":
-            result = store.create(args.seed, name=args.name, jobs=args.jobs)
+            options = {}
+            if args.backend is not None or args.capacity_gib is not None or args.native_host is not None or args.native_profile != 'production':
+                options = dict(backend=args.backend, capacity_gib=args.capacity_gib,
+                               native_profile=args.native_profile, native_host=args.native_host)
+            result = store.create(args.seed, name=args.name, jobs=args.jobs, **options)
             text = result["path"]
         elif args.action in ("mount", "unmount"):
             result = getattr(store, args.action)(args.id)
@@ -214,7 +238,7 @@ def main(argv=None):
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
         return result["returncode"] if args.action == "run" else 0
-    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError) as exc:
+    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError, subprocess.TimeoutExpired) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)
         notes = list(getattr(exc, "__notes__", ()))

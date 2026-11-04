@@ -173,6 +173,24 @@ static PyObject *move_path(PyObject *self, PyObject *args, PyObject *kwargs) {
     return value;
 }
 
+/* Keep pathname snapshots and descriptor observations on one native ABI. */
+static PyObject *mount_record(const struct statfs *value) {
+    PyObject *path = PyUnicode_DecodeFSDefault(value->f_mntonname);
+    PyObject *device = PyUnicode_DecodeFSDefault(value->f_mntfromname);
+    PyObject *filesystem = PyUnicode_DecodeFSDefault(value->f_fstypename);
+    if (!path || !device || !filesystem) {
+        Py_XDECREF(path); Py_XDECREF(device); Py_XDECREF(filesystem); return NULL;
+    }
+    PyObject *record = Py_BuildValue("{s:O,s:O,s:O,s:O,s:O,s:I,s:(ii),s:K}",
+        "path", path, "device", device, "filesystem", filesystem,
+        "readonly", value->f_flags & MNT_RDONLY ? Py_True : Py_False,
+        "ignore_ownership", value->f_flags & MNT_IGNORE_OWNERSHIP ? Py_True : Py_False,
+        "owner", (unsigned int)value->f_owner,
+        "fsid", value->f_fsid.val[0], value->f_fsid.val[1],
+        "flags", (unsigned long long)value->f_flags);
+    Py_DECREF(path); Py_DECREF(device); Py_DECREF(filesystem);
+    return record;
+}
 static PyObject *mount_records(PyObject *self, PyObject *unused) {
     (void)self; (void)unused;
     struct statfs *mounts = NULL;
@@ -185,26 +203,20 @@ static PyObject *mount_records(PyObject *self, PyObject *unused) {
     PyObject *result = PyList_New(count);
     if (!result) { free(mounts); return NULL; }
     for (int i = 0; i < count; i++) {
-        PyObject *path = PyUnicode_DecodeFSDefault(mounts[i].f_mntonname);
-        PyObject *device = PyUnicode_DecodeFSDefault(mounts[i].f_mntfromname);
-        PyObject *filesystem = PyUnicode_DecodeFSDefault(mounts[i].f_fstypename);
-        if (!path || !device || !filesystem) {
-            Py_XDECREF(path); Py_XDECREF(device); Py_XDECREF(filesystem);
-            Py_DECREF(result);
-            free(mounts);
-            return NULL;
-        }
-        PyObject *record = Py_BuildValue("{s:O,s:O,s:O,s:O,s:O,s:I}",
-            "path", path, "device", device, "filesystem", filesystem,
-            "readonly", mounts[i].f_flags & MNT_RDONLY ? Py_True : Py_False,
-            "ignore_ownership", mounts[i].f_flags & MNT_IGNORE_OWNERSHIP ? Py_True : Py_False,
-            "owner", (unsigned int)mounts[i].f_owner);
-        Py_DECREF(path); Py_DECREF(device); Py_DECREF(filesystem);
+        PyObject *record = mount_record(&mounts[i]);
         if (!record) { Py_DECREF(result); free(mounts); return NULL; }
         PyList_SET_ITEM(result, i, record);
     }
     free(mounts);
     return result;
+}
+static PyObject *mount_for_descriptor(PyObject *self, PyObject *argument) {
+    (void)self;
+    int descriptor = PyObject_AsFileDescriptor(argument);
+    if (descriptor < 0) return NULL;
+    struct statfs value;
+    if (fstatfs(descriptor, &value)) return PyErr_SetFromErrno(PyExc_OSError);
+    return mount_record(&value);
 }
 
 static PyObject *private_directory(PyObject *self, PyObject *argument) {
@@ -239,6 +251,7 @@ static PyMethodDef methods[] = {
     {"_clone_tree", (PyCFunction)(void(*)(void))clone_tree, METH_VARARGS | METH_KEYWORDS, "Clone a prepared directory; reject root symlinks."},
     {"delete", (PyCFunction)(void(*)(void))delete_path, METH_VARARGS | METH_KEYWORDS, "Delete a path; directories require recursive=True and mounts are refused."},
     {"move", (PyCFunction)(void(*)(void))move_path, METH_VARARGS | METH_KEYWORDS, "Rename an exact path atomically; default is no overwrite, with optional replace or exchange."},
+    {"mount_for_descriptor", mount_for_descriptor, METH_O, "Observe the filesystem of a borrowed open descriptor; never close it."},
     {"mounts", mount_records, METH_NOARGS, "Read cached mount identities and flags without walking their contents."},
     {NULL, NULL, 0, NULL}
 };
