@@ -245,14 +245,14 @@ class ImageStoreTests(unittest.TestCase):
                 fixture.call(store.snapshot, value, workspace=value, expected=True)
             git(repo, "config", "--local", "--unset", "include.path")
             fixture.call(store.unmount, value, workspace=value)
-            with observe_detach():
-                closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
+            closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertFalse(repo.exists())
             fixture.call(store.mount, value, workspace=value)
             snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertEqual((repo / "file").read_text(), "snapshot state\n")
             (repo / "file").write_text("later state\n")
-            result = fixture.call(store.rollback, value, snapshot["id"], workspace=value)
+            with observe_detach():
+                result = fixture.call(store.rollback, value, snapshot["id"], workspace=value)
             self.assertEqual((repo / "file").read_text(), "snapshot state\n")
             self.assertEqual((repo / "untracked").read_text(), "preserved\n")
             self.assertTrue((store.root / "recovery" / result["recovery"] / "workspace.sparseimage").exists())
