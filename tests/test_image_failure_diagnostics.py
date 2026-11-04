@@ -1214,7 +1214,7 @@ class DiagnosticTests(unittest.TestCase):
             self.reporter.report(self.args, OSError('resource busy'), self.scope())
         self.assertEqual(capture.call_count, 3)
         command = capture.call_args_list[-1].args[0]
-        self.assertEqual(command[-3:], ['--', str(self.image), '/dev/disk999'])
+        self.assertEqual(command[-4:], ['--', str(self.image), '/dev/disk999', '/dev/rdisk999'])
         self.assertNotIn('+f', command)
         self.assertNotIn(str(self.point), command)
         event = self.events()[-1]
@@ -1228,6 +1228,27 @@ class DiagnosticTests(unittest.TestCase):
         self.assertIn(f'D{info.st_dev:#x}', event['stdout'])
         self.assertIn(f'i{info.st_ino}', event['stdout'])
         self.assertIsNone(self.events()[1]['mountpoint'])
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+    def test_raw_device_aliases_reject_unmapped_or_malformed_inputs(self):
+        for devices in ([], ['/dev/rdisk999'], ['/dev/disk999', '/dev/disk999'],
+                        ['/dev/disk999/../disk0'], ['/dev/disk999 private'], [None],
+                        [f'/dev/disk{i}' for i in range(33)]):
+            with self.subTest(devices=devices), self.assertRaises(ValueError):
+                self.reporter._raw_devices(devices)
+
+    def test_missing_raw_node_remains_a_bounded_inconclusive_holder_query(self):
+        values = self.mapping_capture()
+        values[-1] = captured(self.holder_output(), b'lsof: /dev/rdisk999: No such file or directory\n', 1)
+        with patch.object(self.reporter, '_capture', side_effect=values) as capture:
+            self.reporter.report(self.args, OSError('resource busy'), self.scope())
+        self.assertEqual(capture.call_count, 3)
+        self.assertIn('/dev/rdisk999', capture.call_args_list[-1].args[0])
+        event = self.events()[-1]
+        self.assertEqual(event['returncode'], 1)
+        self.assertTrue(event['reaped']); self.assertFalse(event['timeout']); self.assertFalse(event['truncated'])
+        self.assertIn('path-bearing diagnostic omitted', event['stderr'])
+        self.assertNotIn('No such file', event['stderr'])
         self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
     def test_physical_and_synthesized_apfs_devices_mounted_and_unmounted(self):
@@ -1253,7 +1274,9 @@ class DiagnosticTests(unittest.TestCase):
                         patch.object(diagnostics.os, 'stat', side_effect=device_stat):
                     self.reporter.report(('/usr/bin/hdiutil', 'detach', devices[0]), OSError('busy'), self.scope())
                 self.assertEqual(capture.call_count, 4 if mounted else 3)
-                self.assertEqual(capture.call_args_list[2].args[0][-6:], ['--', str(self.image), *devices])
+                command = capture.call_args_list[2].args[0]
+                self.assertEqual(command[command.index('--'):], ['--', str(self.image), *devices,
+                    '/dev/rdisk2', '/dev/rdisk2s1', '/dev/rdisk3', '/dev/rdisk3s1'])
                 if mounted:
                     self.assertEqual(capture.call_args_list[3].args[0][-3:], ['+f', '--', str(self.point)])
                 else:
@@ -1645,12 +1668,16 @@ class DiagnosticTests(unittest.TestCase):
     def test_unrelated_inventory_and_lsof_paths_not_persisted(self):
         unrelated = dict(self.record, **{'image-path': '/other-user/private', 'system-entities': [{'dev-entry': '/dev/disk111'}]})
         values = self.mapping_capture([unrelated, self.record])
-        values[-1] = captured(b'p1\nf3\nn/other-user/secret\nn' + str(self.image).encode() + b'\n', b'warning /other-user/secret\nvisible warning', 1)
+        values[-1] = captured(b'p1\nf3\nn/other-user/secret\nn' + str(self.image).encode() +
+            b'\nn/dev/rdisk999\nn/dev/rdisk999s1\nn/dev/rdisk111\n',
+            b'warning /other-user/secret\nvisible warning', 1)
         with patch.object(self.reporter, '_capture', side_effect=values):
             self.reporter.report(self.args, OSError('busy'), self.scope())
         text = (self.reporter.directory / diagnostics.REPORT).read_text()
         self.assertNotIn('other-user', text)
         self.assertNotIn('disk111', text)
+        self.assertNotIn('rdisk999s1', text)
+        self.assertIn('n/dev/rdisk999', text)
         self.assertIn('visible warning', text)
         self.assertIn('unscoped name omitted', text)
         with patch.object(self.reporter, '_mapping', return_value=(str(self.image), ['/dev/disk999'], str(self.point), '/dev/disk999s1', (self.image.stat().st_dev, self.image.stat().st_ino))), \

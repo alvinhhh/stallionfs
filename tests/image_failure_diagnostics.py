@@ -647,6 +647,16 @@ class Diagnostics:
         return str(backing), devices, str(point), volumes[0]['dev-entry'], identity
 
     @staticmethod
+    def _raw_devices(devices):
+        # Derive only counterparts of the independently validated attachment graph.
+        # Missing nodes remain an inconclusive lsof result, not proof of no holder.
+        if (not isinstance(devices, list) or not 0 < len(devices) <= 32 or
+                not all(isinstance(device, str) and _device.fullmatch(device) for device in devices) or
+                len(set(devices)) != len(devices)):
+            raise ValueError('invalid device mapping')
+        return ['/dev/r' + device.removeprefix('/dev/') for device in devices]
+
+    @staticmethod
     def _holder_identity(lines, image, identity):
         # lsof's D is hexadecimal st_dev; i is the decimal inode number.
         # A pathname without both fields cannot establish the held backing inode.
@@ -833,7 +843,8 @@ class Diagnostics:
             # Exact backing/device queries remain useful when detached or remapped.
             # Only the caller's expected, independently observed mount can scope +f.
             point = point if matches else None
-            queries = [([], [image, *devices])]
+            raw_devices = self._raw_devices(devices)
+            queries = [([], [image, *devices, *raw_devices])]
             if point is not None:
                 queries.append((['+f'], [point]))
             for options, names in queries:
@@ -856,7 +867,7 @@ class Diagnostics:
                 for line in raw_lines:
                     if line.startswith('n'):
                         name = line[1:]
-                        allowed = name in [image, *devices, point] or (point is not None and name.startswith(point + '/') and '..' not in Path(name).parts)
+                        allowed = name in [image, *devices, *raw_devices, point] or (point is not None and name.startswith(point + '/') and '..' not in Path(name).parts)
                         # Ambiguous name/annotation text must not smuggle a second path.
                         allowed = allowed and not any(c.isspace() for c in name)
                         display_truncated |= allowed and len(line) > 512
