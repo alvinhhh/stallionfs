@@ -103,6 +103,8 @@ macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median
 
 [Detailed results](tests/perf/README.md). Scan results apply only to the recorded find/stat recipe.
 
+[Document copy (hosted M1): 43% less elapsed time, 1.9% lower peak process memory. CPU inconclusive.](tests/perf/README.md#hosted-m1-document-clone-screen)
+
 ## Contributing
 
 [Open an issue](https://github.com/alvinhhh/stallionfs/issues) for bugs or feature requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions and tests, or [SECURITY.md](SECURITY.md) to report a vulnerability.

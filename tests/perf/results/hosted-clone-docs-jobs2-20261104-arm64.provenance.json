@@ -1,0 +1,109 @@
+{
+  "archive_policy": "Complete generated benchmark evidence from the linked hosted run, retained byte-for-byte: report, sample journal, matching manifest, environment metadata, case/outcome and measurement/setup receipts.",
+  "artifact_id": 13318063300,
+  "artifact_name": "hosted-docs-clone-41823313146-1",
+  "case_status": "pass",
+  "cleanup_passed": true,
+  "correctness_passed": true,
+  "files": {
+    "complete_generated_evidence": {
+      "bytes": 5199917,
+      "name": "hosted-clone-docs-jobs2-20261104-arm64.evidence.zip",
+      "sha256": "8114c9def7bf3ad775e5f5f6f420a4259cc5e5ab36764c10d6ba40229e82a4ce"
+    },
+    "report": {
+      "bytes": 2146084,
+      "name": "hosted-clone-docs-jobs2-20261104-arm64.json.xz",
+      "sha256": "9a38c8cdb243f8550f4354896f496af86784c9aaf509165dc6ef2bc94b0b4bab",
+      "uncompressed_sha256": "093e9c70d5dc92c55aa2b1b05f89d8757a116e32ae5344b35040921439f26406"
+    }
+  },
+  "fixture": {
+    "directories": 105,
+    "logical_bytes": 116777216,
+    "regular_files": 5002,
+    "special_entries": 0,
+    "symlinks": 0
+  },
+  "host": {
+    "arch": "arm64",
+    "cache": "warm generated fixture; no purge; residency not guaranteed",
+    "cli_sha256": "166e3958b5b16ed75c8a8ca9d2c120baf24e706d4295816901e750972fa9a4d5",
+    "cpu": "Apple M1 (Virtual)",
+    "hardware_model": "VirtualMac2,1",
+    "logical_cpus": 3,
+    "os": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "ram_bytes": 7516192768,
+    "volume": {
+      "device": "/dev/disk2s5",
+      "filesystem": "apfs",
+      "path": "/System/Volumes/Data",
+      "readonly": false
+    },
+    "wheel_sha256": "5f469e1dffc7a76aed6fc2d17b39254e68e511f125b667260364f722f02cd1b6"
+  },
+  "measurement_equivalence": "Numeric sample values, row/status fields, selected comparisons and case decisions are unchanged; only explicit path-prefix redaction and export provenance are added.",
+  "redacted_report_export": {
+    "committed_bytes": 5647154,
+    "committed_prefix_sha256": "35332f2b19e60db4c1d8b5db13edec1e08707b1898b5483992f39e88c7c5f889",
+    "event_count": 85,
+    "format": "redacted-generated-native-suite-v1",
+    "limitations": "This is redacted raw measurement data, not an untouched original. Unknown strings are not automatically scrubbed; publication still requires content review.",
+    "original_manifest_sha256": "e02aee12478ee8446e5225c58e69d0fdd31384bc43d22e75dbf028cbfbe59772",
+    "policy": "Reviewed generated fixtures and pinned offline dependency fixture only; explicit path-prefix substitutions in text, keys, decoded stdout/stderr and validated clone-sharing record paths. Re-encoded sharing payloads retain original digests and lengths alongside exported digests and lengths. Validated numeric scan stdout bytes, digests and lengths are unchanged; gzip headers are regenerated without optional metadata. Numeric observations are unchanged.",
+    "redaction_manifest": [
+      {
+        "alias": "${WORKSPACE}",
+        "replacement_count": 0
+      },
+      {
+        "alias": "${RUNNER_TEMP}",
+        "replacement_count": 297
+      }
+    ]
+  },
+  "resource_pairs": 10,
+  "rss_quantization_sensitivity": {
+    "decision_with_separate_floor": "candidate_lower",
+    "paired_mean_reduction_bytes": 104857.6,
+    "paired_median_reduction_bytes": 106496.0,
+    "raw_comparison_changed": false,
+    "separate_floor_bytes": 16384,
+    "stored_measurement_precision_floor_bytes": 0,
+    "stored_required_gap_bytes": 11455.789445613174
+  },
+  "run": "https://github.com/alvinhhh/stallionfs/actions/runs/41823313146",
+  "schema": 1,
+  "scope": "One hosted public-source document clone case; not campaign or installed-release qualification.",
+  "selection": {
+    "cache": [
+      "warm"
+    ],
+    "copy_tools": [
+      "ditto"
+    ],
+    "fixtures": [
+      "docs_5k_100mb"
+    ],
+    "jobs": 2,
+    "operations": [
+      "clone"
+    ],
+    "runs": 1,
+    "samples": 10,
+    "timeout": 120.0
+  },
+  "source_commit": "c093766bcf089637c92dfae5ce1d49a0d661eefa",
+  "source_tree": "64f95eac60ba9e78ce151ed4d56d8ae346729ff0",
+  "third_metric": {
+    "decision": "inconclusive",
+    "metric": "cpu_s"
+  },
+  "timing_pairs": 10,
+  "validated_latest_rows": 40,
+  "winning_metrics": [
+    "wall_s",
+    "rss_bytes"
+  ],
+  "workflow": "https://github.com/alvinhhh/stallionfs/blob/c093766bcf089637c92dfae5ce1d49a0d661eefa/.github/workflows/checks.yml"
+}

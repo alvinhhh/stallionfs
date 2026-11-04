@@ -4,6 +4,39 @@
 
 JSON results retain samples, validation outcomes and source/runtime hashes.
 
+## Hosted M1 document clone screen
+
+November 4, 2026 (UTC): GitHub-hosted `xcode-27`, macOS 27.0.1, virtual Apple M1,
+three logical CPUs, 7 GiB RAM and writable APFS. Public-source wheel from
+[`c093766`](https://github.com/alvinhhh/stallionfs/commit/c093766bcf089637c92dfae5ce1d49a0d661eefa).
+One warm `docs_5k_100mb` clone case, `--jobs 2`, versus `ditto --rsrc --extattr --acl`:
+ten timing pairs and ten resource pairs, 40 validated rows, correctness and cleanup passed.
+
+| Metric | Native | StallionFS | Median change | Paired screen |
+| --- | ---: | ---: | ---: | --- |
+| Elapsed time | 1.008 s | 573.912 ms | −43.0% | Lower beyond noise |
+| Total CPU | 857.851 ms | 683.898 ms | −20.3% | Inconclusive |
+| Peak process RSS | 5,472 KiB | 5,368 KiB | −1.9% | Lower beyond noise |
+
+Wall time and RSS pass; CPU remains inconclusive. RSS is the reported peak of an
+individual process, not whole-system memory. Its recorded measurement precision floor is 0 B.
+A separate 16 KiB quantization-floor sensitivity still passes: paired mean and
+median reductions are 102.4 KiB and 104 KiB. The raw comparison is unchanged.
+
+Fixture: 5,002 regular files, 105 directories, 116,777,216 logical bytes, no symlinks.
+Scope is this hosted source-build case; campaign, symlink-timestamp and
+installed-release qualification remain open. Warm conditioning does not guarantee cache residency.
+
+[Redacted raw report](results/hosted-clone-docs-jobs2-20261104-arm64.json.xz) ·
+[Complete synthetic evidence](results/hosted-clone-docs-jobs2-20261104-arm64.evidence.zip) ·
+[Provenance and checksums](results/hosted-clone-docs-jobs2-20261104-arm64.provenance.json) ·
+[Hosted run](https://github.com/alvinhhh/stallionfs/actions/runs/41823313146).
+The archive retains every generated report, journal, manifest and setup receipt;
+the report export changes only explicit runner paths and retains original hashes.
+Reproduce the selection with the manual
+[`Checks` workflow](https://github.com/alvinhhh/stallionfs/blob/c093766bcf089637c92dfae5ce1d49a0d661eefa/.github/workflows/checks.yml).
+It accepts no inputs and records the checked-out public source revision.
+
 ## Current native comparisons — October 29–30, 2026 (UTC)
 
 macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource pairs per row. Values are native / StallionFS medians. Linked JSON (XZ) retains all samples, actual commands, CPU, reported RSS, p95, sample variance, precision floors, correctness and paired decisions; decompress before using a plain-JSON reader.
