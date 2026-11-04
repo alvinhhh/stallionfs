@@ -20,15 +20,23 @@ MARKER = 'directory-clone-feasibility-v1'
 MAX_SMALL_CASES = 19
 COVERAGE = ('ownership', 'metadata', 'hardlink_classes', 'symlinks', 'flags', 'setid', 'inherited_acl')
 PIN_PATHS = ('stallionfs/_tree.c', 'stallionfs/_tree.h', 'stallionfs/_benchmark_budget.py',
-             'stallionfs/_benchmark_runtime/native_metrics.py', 'tests/native_directory_clone_probe.c',
+             'tests/perf/native_metrics.py', 'tests/native_directory_clone_probe.c',
              'tests/perf/native_directory_clone_probe.py', 'tests/perf/native_phase_probe.py',
              'tests/perf/fileops.py', 'tests/perf/native_fixtures.py', 'tests/perf/native_correctness.py',
              'tests/perf/native_suite.py', 'tests/test_fileops.py', 'tests/test_copy.py')
 PIN_PATHS += ('tests/test_native_directory_clone_probe.py', '.github/workflows/checks.yml')
+SETUP_ERRORS = {'host_checks': 'host_check_failed', 'inputs': 'input_unavailable',
+                'wheel_identity': 'wheel_unavailable', 'source_pins': 'pin_unavailable',
+                'binary_pins': 'binary_pin_unavailable', 'private_fixture_setup': 'fixture_setup_failed',
+                'volume': 'volume_probe_failed', 'host_metadata': 'host_metadata_unavailable',
+                'scratch_checks': 'scratch_check_failed'}
 
 
 def pins(checkout):
-    return {path: digest(checkout / path) for path in PIN_PATHS}
+    try:
+        return {path: digest(checkout / path) for path in PIN_PATHS}
+    except OSError:
+        raise ProbeError('pin_unavailable') from None
 
 
 def protocol(raw):
@@ -156,6 +164,7 @@ def probe(binary, wheel, helper, scratch, output, revision):
     import native_fixtures
     import native_suite
     result = {'schema': 1, 'scope': 'hosted directory-clone feasibility only', 'status': 'incomplete',
+              'stage': 'host_checks',
               'target_completion': 'not_started', 'cases': [], 'docs_attempted': False, 'clone_calls': 0,
               'helper_invocations': 0,
               'cleanup': 'not_started', 'benchmark_verdict': 'not_applicable',
@@ -169,16 +178,21 @@ def probe(binary, wheel, helper, scratch, output, revision):
                 and os.environ.get('STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED') == '1'
                 and re.fullmatch('[0-9a-f]{40}', revision) is not None, 'host_invalid')
         checkout = Path(__file__).resolve().parents[2]
+        result['stage'] = 'inputs'
         binary, wheel, helper, scratch = [path.resolve(strict=True) for path in (binary, wheel, helper, scratch)]
         runner = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
         os.environ['RUNNER_TEMP'] = str(runner)
         require(scratch.is_relative_to(runner) and scratch != runner and helper.is_file()
                 and os.access(helper, os.X_OK) and binary.is_file() and os.access(binary, os.X_OK)
                 and wheel.is_file() and not os.path.lexists(output), 'input_invalid')
+        result['stage'] = 'wheel_identity'
         require(not Path(stallionfs.__file__).resolve().is_relative_to(checkout), 'wheel_invalid')
+        result['stage'] = 'source_pins'
         pinned = pins(checkout)
+        result['stage'] = 'binary_pins'
         binaries = {'helper_sha256': digest(helper), 'cli_sha256': digest(binary), 'wheel_sha256': digest(wheel)}
         result.update(revision=revision, source_sha256=pinned, **binaries)
+        result['stage'] = 'private_fixture_setup'
         private = Path(tempfile.mkdtemp(prefix='directory-feasibility-private-', dir=scratch)); identity = private.stat()
         receipts = private / 'receipts'; receipts.mkdir(mode=0o700)
         os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
@@ -203,13 +217,16 @@ def probe(binary, wheel, helper, scratch, output, revision):
             result['target_completion'] = 'complete'
             return child
 
+        result['stage'] = 'volume'
         inventory = json.loads(run([str(binary), '--json', 'volumes']).stdout)
         volume = fileops.scratch_volume(inventory, scratch)
         require(volume.get('ignore_ownership') is False, 'scratch_invalid')
         result['volume'] = {'filesystem': 'apfs', 'readonly': False, 'ignore_ownership': False}
+        result['stage'] = 'host_metadata'
         build = run(['/usr/bin/sw_vers', '-buildVersion']).stdout.decode('ascii').strip()
         require(re.fullmatch(r'\d+[A-Z]\d+[a-z]?', build) is not None, 'host_invalid')
         result['host'] = {'os': platform.mac_ver()[0], 'build': build, 'arch': os.uname().machine}
+        result['stage'] = 'scratch_checks'
         require(shutil.disk_usage(scratch).free >= fileops.HEADROOM, 'scratch_invalid')
         fileops.no_mounts_below(binary, private)
 
@@ -286,6 +303,7 @@ def probe(binary, wheel, helper, scratch, output, revision):
             check_pins()
             safe_to_clean = True
 
+        result['stage'] = 'small_recipes'
         cases = recipes()
         require(len(cases) == MAX_SMALL_CASES, 'case_plan_invalid')
         for index, (name, _) in enumerate(cases):
@@ -295,12 +313,14 @@ def probe(binary, wheel, helper, scratch, output, revision):
         require(len(result['cases']) == MAX_SMALL_CASES and all(row['passed'] for row in result['cases']), 'small_gate_failed')
         require(all(any(row['coverage'].get(field) is True for row in result['cases']) for field in COVERAGE),
                 'coverage_incomplete')
+        result['stage'] = 'document_recipe'
         base = private / 'docs'; base.mkdir(mode=0o700)
         safe_to_clean = False
         execute(base, 'docs_5k_100mb', docs=True)
         result['status'] = 'feasible_controlled_fixture_only'
+        result['stage'] = 'complete'
     except BaseException as error:
-        result['error'] = str(error) if isinstance(error, ProbeError) else 'probe_incomplete'
+        result['error'] = str(error) if isinstance(error, ProbeError) else SETUP_ERRORS.get(result['stage'], 'probe_incomplete')
     finally:
         if private is not None:
             result['cleanup'] = 'retained_ephemeral'
@@ -320,7 +340,7 @@ def probe(binary, wheel, helper, scratch, output, revision):
                     require(not private.exists(), 'cleanup_failed')
                     result['cleanup'] = 'complete'
                 except BaseException:
-                    result['status'] = 'incomplete'; result['error'] = 'cleanup_failed'
+                    result['status'] = 'incomplete'; result['stage'] = 'cleanup'; result['error'] = 'cleanup_failed'
         publish(output, result)
     return 0 if result['status'] == 'feasible_controlled_fixture_only' and result['cleanup'] == 'complete' else 1
 

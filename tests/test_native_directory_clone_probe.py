@@ -1,5 +1,6 @@
 """Pure/mock safety checks. This module never executes a clone helper."""
 from contextlib import ExitStack
+import hashlib
 import importlib.util
 import json
 import os
@@ -36,7 +37,7 @@ class DirectoryProbe(unittest.TestCase):
         self.commands = []; self.docs = mock.Mock(); self.last_snapshot_count = None
 
     def run_probe(self, *, response=None, capture=None, missing_coverage=False, changed_pin=False,
-                  source_changed=False, host=True, expected_error=None, sharing=True):
+                  source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False):
         cases = [(f'controlled-{i:02}', expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
         def prepare(base, name, *_):
             for entry in ('source', 'parent', 'outside'): (base / entry).mkdir()
@@ -53,6 +54,7 @@ class DirectoryProbe(unittest.TestCase):
         def pins(_):
             nonlocal pin_count
             pin_count += 1
+            if pin_unavailable: raise FileNotFoundError('PRIVATE missing source /private/source-path')
             return {'source': ('b' if changed_pin and any(row[0][0] == str(self.helper) for row in self.commands) else 'a') * 64}
         def command(argv, **options):
             self.commands.append((argv, options))
@@ -174,6 +176,29 @@ class DirectoryProbe(unittest.TestCase):
         _, value, _ = self.run_probe(host=False)
         self.assertEqual(value['error'], 'host_invalid'); self.assertEqual(self.commands, [])
         self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_real_source_pins_use_committed_inputs_without_generated_install_directory(self):
+        checkout = Path(__file__).parents[1]
+        observed = probe.pins(checkout)
+        self.assertEqual(set(observed), set(probe.PIN_PATHS))
+        self.assertNotIn('stallionfs/_benchmark_runtime/native_metrics.py', observed)
+        self.assertEqual(observed['tests/perf/native_metrics.py'],
+                         hashlib.sha256((checkout / 'tests/perf/native_metrics.py').read_bytes()).hexdigest())
+        self.assertTrue(all(len(value) == 64 for value in observed.values()))
+
+    def test_missing_real_pin_uses_fixed_error_without_exporting_path(self):
+        with self.assertRaises(probe.ProbeError) as caught: probe.pins(self.root)
+        self.assertEqual(str(caught.exception), 'pin_unavailable')
+
+    def test_source_pin_failure_records_stage_before_commands_or_fixture_creation(self):
+        _, value, _ = self.run_probe(pin_unavailable=True)
+        self.assertEqual((value['stage'], value['error']), ('source_pins', 'pin_unavailable'))
+        self.assertEqual(value['target_completion'], 'not_started')
+        self.assertEqual((value['helper_invocations'], value['clone_calls']), (0, 0))
+        self.assertEqual(value['cases'], []); self.assertFalse(value['docs_attempted'])
+        self.assertEqual(value['cleanup'], 'not_started'); self.assertEqual(self.commands, [])
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertNotIn('PRIVATE', json.dumps(value)); self.assertNotIn('/private/source-path', json.dumps(value))
 
     def test_protocol_rejects_duplicate_unknown_boolean_and_contradictory_fields(self):
         self.assertEqual(probe.protocol(json.dumps(native()).encode()), native())
