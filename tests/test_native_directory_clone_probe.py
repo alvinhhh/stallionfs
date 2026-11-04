@@ -1,5 +1,6 @@
 """Pure/mock safety checks. This module never executes a clone helper."""
 from contextlib import ExitStack
+from copy import deepcopy
 import hashlib
 import importlib.util
 import json
@@ -26,6 +27,104 @@ def native(calls=1, error=0):
             'clone_calls': calls, 'close_error': 0}
 
 
+def detail_entry(kind='file', *, flags=0, mtime=100, acl=None):
+    return {'kind': kind, 'flags': flags, 'mtime_ns': mtime,
+            'acl': {'text_hex': acl, 'unavailable': None}, 'device_inode': [234567891, 987654321],
+            'uid': 123456789, 'xattrs': {'PRIVATE-xattr': 'PRIVATE-value'}, 'sha256': 'deadbeef' * 8}
+
+
+def detail_snapshot(entries=None, groups=None):
+    return {'entries': entries if entries is not None else {'': detail_entry('directory'), 'PRIVATE-name': detail_entry()},
+            'hardlink_groups': groups if groups is not None else [], 'unavailable_fields': []}
+
+
+class FirstRecipeDetail(unittest.TestCase):
+    def detail(self, source, destination, *, source_ok=True, outside_ok=True, independent=True):
+        return probe.first_recipe_detail(source, destination,
+            {'source_unchanged': source_ok, 'outside_sentinel_unchanged': outside_ok}, independent)
+
+    def test_all_entries_flags_signed_deltas_acl_states_and_unchanged_entries_are_allowlisted(self):
+        secret_acl = b'!#acl 1\ngroup:PRIVATE-user:PRIVATE-id:allow:read\n'.hex()
+        source = detail_snapshot({'': detail_entry('directory'), 'PRIVATE-A': detail_entry(flags=64, mtime=100, acl=secret_acl),
+                                  'PRIVATE-B': detail_entry('symlink', flags=2, mtime=200)})
+        destination = deepcopy(source)
+        destination['entries']['PRIVATE-A'] = detail_entry(flags=0, mtime=93)
+        destination['entries']['PRIVATE-B']['mtime_ns'] = 205
+        value = self.detail(source, destination)
+        self.assertEqual(set(value), probe.DETAIL_FIELDS)
+        self.assertEqual(value['status'], 'available'); self.assertEqual(value['entry_count'], 3)
+        self.assertEqual([entry['entry_id'] for entry in value['entries']], ['e0001', 'e0002', 'e0003'])
+        unchanged, a, b = value['entries']
+        self.assertTrue(unchanged['mtime_equal']); self.assertEqual(unchanged['mtime_delta_ns'], 0)
+        self.assertEqual((a['source_flags'], a['destination_flags'], a['mtime_delta_ns']), (64, 0, -7))
+        self.assertEqual((a['source_acl'], a['destination_acl'], a['acl_equal']), ('nonempty', 'empty', False))
+        self.assertEqual((b['source_kind'], b['mtime_delta_ns']), ('symlink', 5))
+        self.assertTrue(all(set(entry) == probe.DETAIL_ENTRY_FIELDS for entry in value['entries']))
+        encoded = json.dumps(value)
+        for secret in ('PRIVATE', '234567891', '987654321', '123456789', 'deadbeef', secret_acl):
+            self.assertNotIn(secret, encoded)
+        self.assertLessEqual(len(encoded.encode()), probe.DETAIL_MAX_BYTES)
+
+    def test_normalized_topology_preserves_split_merge_and_symlink_classes_without_inode_ids(self):
+        entries = {'': detail_entry('directory'), **{f'PRIVATE-{name}': detail_entry() for name in 'ABCD'},
+                   'PRIVATE-E': detail_entry('symlink'), 'PRIVATE-F': detail_entry('symlink')}
+        source = detail_snapshot(entries, [['PRIVATE-A', 'PRIVATE-B'], ['PRIVATE-C', 'PRIVATE-D'], ['PRIVATE-E', 'PRIVATE-F']])
+        destination = detail_snapshot(deepcopy(entries), [['PRIVATE-D', 'PRIVATE-B'], ['PRIVATE-C', 'PRIVATE-A']])
+        value = self.detail(source, destination)
+        self.assertEqual(value['entry_count'], 7)
+        self.assertEqual(value['source_hardlink_groups'], [['e0002', 'e0003'], ['e0004', 'e0005'], ['e0006', 'e0007']])
+        self.assertEqual(value['destination_hardlink_groups'], [['e0002', 'e0004'], ['e0003', 'e0005']])
+        self.assertNotIn('PRIVATE', json.dumps(value))
+
+    def test_missing_and_extra_entries_have_explicit_absence_without_partial_timestamp_claims(self):
+        source = detail_snapshot()
+        destination = detail_snapshot({'': detail_entry('directory'), 'PRIVATE-extra': detail_entry('symlink')})
+        value = self.detail(source, destination)
+        self.assertEqual(value['entry_count'], 3)
+        absent = [entry for entry in value['entries'] if entry['source_kind'] is None or entry['destination_kind'] is None]
+        self.assertEqual(len(absent), 2)
+        self.assertTrue(all(entry['mtime_equal'] is None and entry['mtime_delta_ns'] is None and entry['acl_equal'] is None for entry in absent))
+
+    def test_empty_acl_state_does_not_erase_serialization_difference(self):
+        source = detail_snapshot(); destination = deepcopy(source)
+        destination['entries']['PRIVATE-name']['acl']['text_hex'] = b'!#acl 1\n\x00'.hex()
+        entry = self.detail(source, destination)['entries'][1]
+        self.assertEqual((entry['source_acl'], entry['destination_acl']), ('empty', 'empty'))
+        self.assertFalse(entry['acl_equal'])
+
+    def test_unknown_identity_or_outside_closure_suppresses_all_detail(self):
+        for options in ({'source_ok': False}, {'outside_ok': False}, {'independent': False}, {'independent': None}):
+            with self.subTest(options=options):
+                self.assertEqual(self.detail({}, {}, **options), {'schema': 1, 'status': 'unavailable', 'reason': 'identity_unverified'})
+
+    def test_invalid_metadata_and_topology_fail_closed_without_private_values(self):
+        bad = []
+        for field, value in (('flags', True), ('flags', -1), ('flags', 1 << 32), ('mtime_ns', True), ('kind', 'PRIVATE-kind')):
+            source = detail_snapshot(); source['entries']['PRIVATE-name'][field] = value; bad.append(source)
+        source = detail_snapshot(); source['entries']['PRIVATE-name']['acl']['unavailable'] = 'PRIVATE exception /private/path'; bad.append(source)
+        source = detail_snapshot(); source['entries']['PRIVATE-name']['acl']['text_hex'] = 'PRIVATE-invalid'; bad.append(source)
+        source = detail_snapshot(); source['entries']['PRIVATE-name'] = None; bad.append(source)
+        source = detail_snapshot(); source['unavailable_fields'] = None; bad.append(source)
+        for groups in ([['PRIVATE-name', 'PRIVATE-name']], [['PRIVATE-name', 'missing']], [['', 'PRIVATE-name']], [['PRIVATE-name']]):
+            bad.append(detail_snapshot(groups=groups))
+        for source in bad:
+            with self.subTest(source=source):
+                value = self.detail(source, detail_snapshot())
+                self.assertEqual(value, {'schema': 1, 'status': 'unavailable', 'reason': 'detail_schema_invalid'})
+
+    def test_entry_and_serialized_bounds_never_export_truncated_detail(self):
+        entries = {'': detail_entry('directory'), **{f'PRIVATE-{i:03}': detail_entry() for i in range(probe.DETAIL_MAX_ENTRIES - 1)}}
+        source = detail_snapshot(entries)
+        value = self.detail(source, deepcopy(source))
+        self.assertEqual(value['entry_count'], probe.DETAIL_MAX_ENTRIES)
+        self.assertLessEqual(len(json.dumps(value).encode()), probe.DETAIL_MAX_BYTES)
+        source['entries']['PRIVATE-over-limit'] = detail_entry()
+        self.assertEqual(self.detail(source, source), {'schema': 1, 'status': 'unavailable', 'reason': 'detail_bounds_exceeded'})
+        with mock.patch.object(probe, 'DETAIL_MAX_BYTES', 1):
+            self.assertEqual(self.detail(detail_snapshot(), detail_snapshot()),
+                             {'schema': 1, 'status': 'unavailable', 'reason': 'detail_bounds_exceeded'})
+
+
 class DirectoryProbe(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='directory-probe-mock-'); self.addCleanup(self.temp.cleanup)
@@ -37,17 +136,24 @@ class DirectoryProbe(unittest.TestCase):
         self.commands = []; self.docs = mock.Mock(); self.last_snapshot_count = None
 
     def run_probe(self, *, response=None, capture=None, missing_coverage=False, changed_pin=False,
-                  source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False):
-        cases = [(f'controlled-{i:02}', expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
+                  source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False,
+                  first_recipe_only=False, destination_preserved=True):
+        cases = [(probe.FIRST_RECIPE if first_recipe_only and i == 0 else f'controlled-{i:02}',
+                  expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
         def prepare(base, name, *_):
             for entry in ('source', 'parent', 'outside'): (base / entry).mkdir()
+            if first_recipe_only:
+                for directory in ('a', 'b', 'c'): (base / 'source' / directory).mkdir()
+                (base / 'source/a/file').write_bytes(b'original')
+                for directory in ('b', 'c'): os.link(base / 'source/a/file', base / 'source' / directory / 'file')
             return (base / 'source', base / 'parent', base / 'outside', dict(cases)[name], [],
                     {field: not missing_coverage for field in probe.COVERAGE})
         def docs(base, name, specification):
             self.docs(name, specification)
             path = base / name; path.mkdir(); return path
-        snapshots = mock.Mock(return_value={'entries': {}, 'unavailable_fields': []})
-        checks = {'strict_equal': True, 'sparse_preserved': True, 'independent_clone': True, 'candidate_losses': []}
+        snapshot = detail_snapshot() if first_recipe_only else {'entries': {}, 'unavailable_fields': []}
+        snapshots = mock.Mock(return_value=snapshot)
+        checks = {'strict_equal': destination_preserved, 'sparse_preserved': True, 'independent_clone': True, 'candidate_losses': []}
         product = types.ModuleType('stallionfs'); product.__file__ = '/private/tmp/installed/stallionfs/__init__.py'
         budget = types.ModuleType('stallionfs._benchmark_budget')
         pin_count = 0
@@ -67,6 +173,11 @@ class DirectoryProbe(unittest.TestCase):
                 value = response if response is not None else native()
                 if expected_error and len([row for row in self.commands if row[0][0] == str(self.helper)]) == 1:
                     value = native(0, expected_error[0])
+                if first_recipe_only:
+                    target = Path(argv[1]) / argv[5] / argv[6]; target.mkdir()
+                    for directory in ('a', 'b', 'c'): (target / directory).mkdir()
+                    (target / 'a/file').write_bytes(b'original')
+                    for directory in ('b', 'c'): os.link(target / 'a/file', target / directory / 'file')
                 raw = value if isinstance(value, bytes) else json.dumps(value).encode()
                 return subprocess.CompletedProcess(argv, 0, raw, b'')
             if argv[0] == '/usr/bin/sw_vers': return subprocess.CompletedProcess(argv, 0, b'26B118\n', b'')
@@ -97,8 +208,52 @@ class DirectoryProbe(unittest.TestCase):
             stack.enter_context(mock.patch.object(native_correctness, 'clone_sharing', return_value={'full_data_stream_sharing': sharing}))
             stack.enter_context(mock.patch.object(native_suite, 'cache_prepare', side_effect=AssertionError('No cache/timing work')))
             self.removals = stack.enter_context(mock.patch.object(probe.shutil, 'rmtree', wraps=shutil.rmtree))
-            code = probe.probe(self.binary, self.wheel, self.helper, self.scratch, output, 'a' * 40)
+            code = probe.probe(self.binary, self.wheel, self.helper, self.scratch, output, 'a' * 40,
+                               first_recipe_only=first_recipe_only)
         return code, json.loads(output.read_text()), snapshots
+
+    def test_successful_first_recipe_only_stops_after_one_invocation_without_qualifying_full_gate(self):
+        code, value, _ = self.run_probe(first_recipe_only=True)
+        self.assertEqual(code, 0); self.assertEqual(value['status'], 'first_recipe_diagnostic_complete')
+        self.assertTrue(value['first_recipe_only']); self.assertFalse(value['full_gate_qualified'])
+        self.assertEqual((value['helper_invocations'], value['clone_calls'], len(value['cases'])), (1, 1, 1))
+        self.assertEqual(value['cases'][0]['case'], probe.FIRST_RECIPE)
+        self.assertTrue(value['cases'][0]['passed'])
+        self.assertEqual(value['cases'][0]['first_recipe_detail']['status'], 'available')
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called()
+        self.assertLessEqual(len(json.dumps(value).encode()), 65536)
+
+    def test_first_recipe_failure_keeps_strict_stop_and_detail_without_later_work(self):
+        code, value, _ = self.run_probe(first_recipe_only=True, destination_preserved=False)
+        self.assertEqual(code, 1); self.assertEqual(value['error'], 'correctness_failed')
+        self.assertEqual(value['status'], 'incomplete'); self.assertFalse(value['full_gate_qualified'])
+        self.assertEqual((value['helper_invocations'], value['clone_calls'], len(value['cases'])), (1, 1, 1))
+        self.assertEqual(value['cases'][0]['first_recipe_detail']['status'], 'available')
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called(); self.removals.assert_not_called()
+
+    def test_first_recipe_unknown_capture_never_builds_detail_or_rescans(self):
+        with mock.patch.object(probe, 'first_recipe_detail', wraps=probe.first_recipe_detail) as detail:
+            _, value, snapshots = self.run_probe(first_recipe_only=True, capture='uncertain')
+        detail.assert_not_called(); self.assertEqual(snapshots.call_count, self.last_snapshot_count)
+        self.assertEqual(value['target_completion'], 'unknown'); self.assertIsNone(value['clone_calls'])
+        self.assertEqual(value['helper_invocations'], 1); self.assertFalse(value['full_gate_qualified'])
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called(); self.removals.assert_not_called()
+
+    def test_first_recipe_identity_failure_suppresses_detail_without_additional_snapshots(self):
+        _, value, snapshots = self.run_probe(first_recipe_only=True, source_changed=True)
+        self.assertEqual(value['error'], 'correctness_failed')
+        self.assertEqual(value['cases'][0]['first_recipe_detail'],
+                         {'schema': 1, 'status': 'unavailable', 'reason': 'identity_unverified'})
+        self.assertEqual(snapshots.call_count, self.last_snapshot_count + 3)
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called(); self.removals.assert_not_called()
+
+    def test_first_recipe_missing_detail_cannot_claim_diagnostic_completion(self):
+        with mock.patch.object(probe, 'first_recipe_detail', return_value={'schema': 1, 'status': 'unavailable', 'reason': 'detail_bounds_exceeded'}):
+            code, value, _ = self.run_probe(first_recipe_only=True)
+        self.assertEqual(code, 1); self.assertEqual(value['status'], 'incomplete')
+        self.assertEqual(value['error'], 'first_recipe_detail_unavailable')
+        self.assertEqual(value['helper_invocations'], 1); self.assertFalse(value['full_gate_qualified'])
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called()
 
     def test_complete_gate_permits_exactly_one_unchanged_docs_fixture_and_only_sanitized_status(self):
         code, value, _ = self.run_probe()
@@ -213,10 +368,12 @@ class DirectoryProbe(unittest.TestCase):
     def test_workflow_routes_each_mode_and_artifact_explicitly(self):
         text = (Path(__file__).parents[1] / '.github/workflows/checks.yml').read_text()
         self.assertNotIn("inputs.mode != 'thread-cpu'", text)
-        self.assertIn('options: [compare, thread-cpu, directory-feasibility]', text)
-        self.assertIn("if: inputs.mode == 'directory-feasibility'", text)
+        self.assertIn('options: [compare, thread-cpu, directory-feasibility, delete-thread-cpu]', text)
+        for mode in ('compare', 'thread-cpu', 'directory-feasibility', 'delete-thread-cpu'):
+            self.assertIn(f"if: inputs.mode == '{mode}'", text)
         directory_step = text.split('      - name: Collect hosted directory feasibility\n')[1].split('      - name: Show correctness')[0]
         self.assertNotIn('native_suite.py', directory_step); self.assertNotIn('thread-cpu', directory_step)
+        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--first-recipe-only']", directory_step)
         self.assertIn('directory-feasibility-status.json', directory_step)
         fallback = directory_step.split('          if not output.exists():\n')[1]
         self.assertIn("'docs_attempted': None", fallback)

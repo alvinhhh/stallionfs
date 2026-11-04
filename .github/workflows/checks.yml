@@ -8,7 +8,7 @@ on:
       mode:
         description: Hosted document clone action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility]
+        options: [compare, thread-cpu, directory-feasibility, delete-thread-cpu]
         default: compare
 permissions:
   contents: read
@@ -218,6 +218,8 @@ jobs:
           umask 077
           if [ "$PHASE_MODE" = 'thread-cpu' ]; then
             export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1"
+          elif [ "$PHASE_MODE" = 'delete-thread-cpu' ]; then
+            export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1 -DSTALLIONFS_DIAGNOSTIC_DELETE_CPU=1"
           elif [ "$PHASE_MODE" = 'directory-feasibility' ]; then
             export CFLAGS=''
           elif [ "$PHASE_MODE" != 'compare' ]; then
@@ -332,6 +334,69 @@ jobs:
                       'error': 'outer_capture_incomplete'}, artifact)
           raise SystemExit(code)
           PY
+      - name: Collect fixed-cache delete CPU phases
+        if: inputs.mode == 'delete-thread-cpu'
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+          STALLIONFS_DELETE_CPU_HOSTED: '1'
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, signal, sys, time
+          from pathlib import Path
+          from stallionfs._benchmark_budget import command
+          deadline = time.monotonic() + 900
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(deadline)
+          def expired(*_):
+              raise TimeoutError('Aggregate diagnostic deadline exhausted')
+          signal.signal(signal.SIGALRM, expired)
+          signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
+          root = Path(os.environ['SCREEN_ROOT'])
+          control = root / 'scratch/delete-control'; control.mkdir(mode=0o700)
+          receipts = control / 'receipts'; receipts.mkdir(mode=0o700)
+          candidate = control / 'driver-status.json'
+          output = root / 'evidence/delete-thread-cpu-status.json'
+          os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
+          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf'))
+          from native_phase_probe import clean_capture, publish, read_report
+          code, receipt = 1, {}
+          value = {'schema': 1, 'scope': 'hosted fixed-cache delete CPU only', 'status': 'incomplete',
+              'stage': 'outer_capture', 'target_completion': 'unknown', 'delete_attempts': None,
+              'counter_status': 'unavailable', 'cleanup': 'retained_ephemeral', 'correctness': None,
+              'benchmark_verdict': 'not_applicable', 'error': 'outer_capture_incomplete'}
+          try:
+              wheels = list((root / 'wheels').glob('*.whl'))
+              if len(wheels) != 1:
+                  raise RuntimeError('Wheel identity unavailable')
+              argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_delete_phase_probe.py'),
+                  '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]), '--scratch', str(root / 'scratch'),
+                  '--output', str(candidate), '--revision', os.environ['GITHUB_SHA']]
+              # The child stops work at deadline-30. Fifteen seconds then remain
+              # for its status, followed by fifteen for outer reap/publication.
+              allowed = deadline - 15 - time.monotonic()
+              if allowed <= 0:
+                  raise TimeoutError('No aggregate supervision budget')
+              child = command(argv, cwd=control, timeout=allowed, umask=0o077, receipt=receipt, output_limit=65536)
+              capture = dict(receipt)
+              capture['exit_code'] = 0
+              if (child.returncode not in (0, 1) or type(receipt.get('exit_code')) is not int
+                  or receipt['exit_code'] != child.returncode or not clean_capture(capture) or time.monotonic() >= deadline):
+                  raise RuntimeError('Outer completion unavailable')
+              observed = read_report(candidate)
+              if child.returncode == 0:
+                  if observed.get('status') != 'complete' or observed.get('cleanup') != 'complete':
+                      raise RuntimeError('Driver success status unavailable')
+              elif observed.get('status') != 'incomplete':
+                  raise RuntimeError('Failed driver cannot publish success')
+              value, code = observed, child.returncode
+          except BaseException:
+              pass
+          if time.monotonic() >= deadline:
+              raise TimeoutError('No status publication budget')
+          publish(output, value)
+          signal.setitimer(signal.ITIMER_REAL, 0)
+          raise SystemExit(code)
+          PY
       - name: Collect hosted directory feasibility
         if: inputs.mode == 'directory-feasibility'
         env:
@@ -360,7 +425,7 @@ jobs:
               argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_directory_clone_probe.py'),
                   '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]),
                   '--helper', str(root / 'directory-clone-probe'), '--scratch', str(root / 'scratch'),
-                  '--output', str(output), '--revision', os.environ['GITHUB_SHA']]
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'], '--first-recipe-only']
               code = command(argv, cwd=control, timeout=200, umask=0o077, output_limit=65536).returncode
           except BaseException:
               pass
@@ -438,6 +503,14 @@ jobs:
           name: hosted-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/thread-cpu-status.json
           if-no-files-found: error
+          retention-days: 3
+      - name: Preserve fixed-cache delete CPU status
+        if: always() && inputs.mode == 'delete-thread-cpu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-delete-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/delete-thread-cpu-status.json
+          if-no-files-found: warn
           retention-days: 3
       - name: Preserve directory feasibility status
         if: always() && inputs.mode == 'directory-feasibility'
