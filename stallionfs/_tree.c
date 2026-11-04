@@ -25,8 +25,8 @@
 #include <inttypes.h>
 
 #define CPU_WORKERS 4
-#define CPU_MARKER "stallionfs-thread-cpu-v1"
-enum cpu_phase { CPU_LEAF, CPU_DIRECTORY, CPU_PHASES };
+#define CPU_MARKER "stallionfs-thread-cpu-v2"
+enum cpu_phase { CPU_FCLONEFILEAT, CPU_DIRECTORY, CPU_PHASES };
 enum cpu_status { CPU_OK, CPU_CLOCK, CPU_RANGE, CPU_NESTED, CPU_OVERFLOW, CPU_BOUND, CPU_JOIN, CPU_OPERATION };
 struct cpu_counter { uint64_t calls, failures, ns; };
 struct cpu_slot {
@@ -140,8 +140,8 @@ static void cpu_report(struct cpu_profile *profile, unsigned requested, unsigned
     if (!status) for (unsigned i = 0; i <= started; i++) {
         struct cpu_slot *slot = &profile->slots[i];
         if (slot->status) { status = slot->status; break; }
-        uint64_t leaf = slot->phase[CPU_LEAF].ns, directory = slot->phase[CPU_DIRECTORY].ns;
-        if (UINT64_MAX - leaf < directory || leaf + directory > slot->total) { status = CPU_RANGE; break; }
+        uint64_t clone = slot->phase[CPU_FCLONEFILEAT].ns, directory = slot->phase[CPU_DIRECTORY].ns;
+        if (UINT64_MAX - clone < directory || clone + directory > slot->total) { status = CPU_RANGE; break; }
         cpu_add(&sum, &sum.total, slot->total);
         for (unsigned phase = 0; phase < CPU_PHASES; phase++) {
             cpu_add(&sum, &sum.phase[phase].calls, slot->phase[phase].calls);
@@ -156,20 +156,20 @@ static void cpu_report(struct cpu_profile *profile, unsigned requested, unsigned
     FILE *stream = fdopen(profile->fd, "w");
     int complete = 0;
     if (stream) {
-        fprintf(stream, "{\"schema\":1,\"marker\":\"" CPU_MARKER "\",\"status\":\"%s\","
+        fprintf(stream, "{\"schema\":2,\"marker\":\"" CPU_MARKER "\",\"status\":\"%s\","
                 "\"workers_requested\":%u,\"workers_started\":%u,\"main_fallback\":%s,"
                 "\"scope\":\"instrumented run_tree main and worker spans\",\"counters\":",
                 names[status], requested, started, started ? "false" : "true");
         if (status) fputs("null,\"slots\":[]}", stream);
         else {
-            fprintf(stream, "{\"total_cpu_ns\":%" PRIu64 ",\"clone_leaf\":", sum.total);
-            cpu_counter_json(stream, &sum.phase[CPU_LEAF]);
+            fprintf(stream, "{\"total_cpu_ns\":%" PRIu64 ",\"fclonefileat\":", sum.total);
+            cpu_counter_json(stream, &sum.phase[CPU_FCLONEFILEAT]);
             fputs(",\"directory_metadata\":", stream); cpu_counter_json(stream, &sum.phase[CPU_DIRECTORY]);
             fputs("},\"slots\":[", stream);
             for (unsigned i = 0; i <= started; i++) {
                 struct cpu_slot *slot = &profile->slots[i];
-                fprintf(stream, "%s{\"slot\":%u,\"total_cpu_ns\":%" PRIu64 ",\"clone_leaf\":", i ? "," : "", i, slot->total);
-                cpu_counter_json(stream, &slot->phase[CPU_LEAF]);
+                fprintf(stream, "%s{\"slot\":%u,\"total_cpu_ns\":%" PRIu64 ",\"fclonefileat\":", i ? "," : "", i, slot->total);
+                cpu_counter_json(stream, &slot->phase[CPU_FCLONEFILEAT]);
                 fputs(",\"directory_metadata\":", stream); cpu_counter_json(stream, &slot->phase[CPU_DIRECTORY]);
                 fputc('}', stream);
             }
@@ -687,7 +687,18 @@ static int clear_acl(int fd) {
 static int first_inode(enum operation operation, struct tree *tree, int input, int parent,
                         const char *name, const struct stat *identity,
                         stallion_cancel_fn cancel, void *context) {
-    if (operation == CLONING) return fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
+    if (operation == CLONING) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+        struct cpu_token token = cpu_enter(CPU_FCLONEFILEAT);
+#endif
+        int result = fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+        int error = errno;
+        cpu_leave(token, result != 0);
+        errno = error;
+#endif
+        return result;
+    }
     struct copy_progress progress = {.tree = tree, .cancel = cancel, .context = context};
     if (copy_stopped(&progress)) { errno = progress.error; return -1; }
     int output = -1, error = 0, cloned = 0;
@@ -969,19 +980,11 @@ done:
 
 static int clone_leaf(struct tree *state, struct job *job, const char *name, unsigned type,
                       ino_t expected) {
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
-    struct cpu_token token = cpu_enter(CPU_LEAF);
-#endif
     int parent = job->source, destination = job->destination;
     dev_t device = state->device;
     int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | (type == DT_LNK ? O_SYMLINK : O_NOFOLLOW);
     int fd = openat(parent, name, flags);
-    if (fd < 0) {
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
-        cpu_leave(token, 1);
-#endif
-        return -1;
-    }
+    if (fd < 0) return -1;
     struct stat identity;
     int error = 0;
     if (fstat(fd, &identity)) error = errno;
@@ -994,9 +997,6 @@ static int clone_leaf(struct tree *state, struct job *job, const char *name, uns
     else if (first_inode(state->operation, state, fd, destination, name, &identity, NULL, NULL)) error = errno;
     if (close(fd) && !error) error = errno;
     errno = error;
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
-    cpu_leave(token, error != 0);
-#endif
     return error ? -1 : 0;
 }
 
