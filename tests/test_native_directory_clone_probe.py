@@ -19,6 +19,7 @@ with mock.patch.object(sys, 'path', [str(PERF), *sys.path]):
     spec = importlib.util.spec_from_file_location('directory_probe_under_test', PERF / 'native_directory_clone_probe.py')
     probe = importlib.util.module_from_spec(spec); spec.loader.exec_module(probe)
     import fileops, native_correctness, native_fixtures, native_suite
+    import native_directory_restore as restoration_support
 
 
 def native(calls=1, error=0):
@@ -138,7 +139,8 @@ class DirectoryProbe(unittest.TestCase):
     def run_probe(self, *, response=None, capture=None, missing_coverage=False, changed_pin=False,
                   source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False,
                   first_recipe_only=False, destination_preserved=True, restore_first_recipe=False,
-                  restore_status='restored_pending_final_verifiers', restore_final_preserved=True, restore_close=True):
+                  restore_status='restored_pending_final_verifiers', restore_final_preserved=True, restore_close=True,
+                  admission_error=None, setup_capture=False):
         cases = [(probe.FIRST_RECIPE if first_recipe_only and i == 0 else f'controlled-{i:02}',
                   expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
         def prepare(base, name, *_):
@@ -158,12 +160,22 @@ class DirectoryProbe(unittest.TestCase):
         self.restorer = mock.Mock()
         self.restorer.summary = {'status': 'incomplete', 'error': 'restoration_close_failed'}
         self.restorer.close.return_value = restore_close
+        def admission_report():
+            closed = self.restorer.close.called
+            return {'status': 'complete', 'phase': 'complete', 'refusal_code': None, 'errno': None,
+                    'close': {'status': ('complete' if restore_close else 'incomplete') if closed else 'deferred',
+                              'attempts': int(closed), 'failures': int(closed and not restore_close),
+                              'errno': 5 if closed and not restore_close else None}}
+        self.restorer.admission_report.side_effect = admission_report
         def reconstruct(_):
             checks['strict_equal'] = restore_final_preserved
             return {'status': restore_status}
         self.restorer.restore.side_effect = reconstruct
         restoration_module = types.ModuleType('native_directory_restore')
         restoration_module.Session = mock.Mock(return_value=self.restorer)
+        restoration_module.Session.side_effect = admission_error
+        restoration_module.AdmissionError = restoration_support.AdmissionError
+        restoration_module.refusal_report = restoration_support.refusal_report
         product = types.ModuleType('stallionfs'); product.__file__ = '/private/tmp/installed/stallionfs/__init__.py'
         budget = types.ModuleType('stallionfs._benchmark_budget')
         pin_count = 0
@@ -191,6 +203,7 @@ class DirectoryProbe(unittest.TestCase):
                 raw = value if isinstance(value, bytes) else json.dumps(value).encode()
                 return subprocess.CompletedProcess(argv, 0, raw, b'')
             if argv[0] == '/usr/bin/sw_vers': return subprocess.CompletedProcess(argv, 0, b'26B118\n', b'')
+            if setup_capture: options['receipt']['completion_uncertain'] = True
             return subprocess.CompletedProcess(argv, 0, b'[]', b'')
         budget.command = command
         source_verifications = 0
@@ -230,6 +243,11 @@ class DirectoryProbe(unittest.TestCase):
         self.assertEqual(value['helper_invocations'], 1); self.assertEqual(value['clone_calls'], 1)
         self.assertFalse(value['cases'][0]['raw_clone']['passed']); self.assertTrue(value['cases'][0]['passed'])
         self.restorer.restore.assert_called_once(); self.restorer.close.assert_called_once()
+        self.assertEqual((value['setup_completion'], value['target_completion'], value['helper_launch']),
+                         ('complete', 'complete', 'observed'))
+        self.assertEqual(value['restoration_completion'], 'restored_pending_final_verifiers')
+        self.assertEqual((value['restoration_admission']['status'], value['restoration_admission']['phase']), ('complete', 'complete'))
+        self.assertEqual(value['restoration_admission']['close']['status'], 'complete')
         self.docs.assert_not_called()
 
     def test_restoration_failure_or_unknown_completion_never_rescans_or_starts_later_work(self):
@@ -237,6 +255,7 @@ class DirectoryProbe(unittest.TestCase):
         self.restorer.restore.assert_not_called()
         self.assertEqual(snapshots.call_count, self.last_snapshot_count)
         self.assertEqual(value['target_completion'], 'unknown'); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.assertEqual(value['helper_launch'], 'observed'); self.assertEqual(value['restoration_completion'], 'not_started')
         self.setUp()
         _, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, restore_status='incomplete')
         self.assertEqual(value['error'], 'restoration_incomplete'); self.assertEqual(value['cleanup'], 'retained_ephemeral')
@@ -251,11 +270,50 @@ class DirectoryProbe(unittest.TestCase):
                 code, value, _ = self.run_probe(first_recipe_only=True, restore_first_recipe=True, **options)
                 self.assertEqual(code, 1); self.assertEqual(value['status'], 'incomplete')
                 self.assertEqual(value['error'], error); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+                if not options.get('restore_close', True):
+                    self.assertEqual(value['restoration_admission']['status'], 'complete')
+                    self.assertEqual(value['restoration_admission']['close']['status'], 'incomplete')
 
     def test_restoration_flag_requires_first_recipe_scope_before_any_helper(self):
         code, value, _ = self.run_probe(restore_first_recipe=True)
         self.assertEqual(code, 1); self.assertEqual(value['error'], 'restoration_scope_invalid')
         self.assertEqual(value['helper_invocations'], 0); self.assertFalse(value['docs_attempted'])
+
+    def test_constructor_refusal_preserves_report_close_failure_and_no_helper_or_method_start(self):
+        report = {'status': 'refused', 'phase': 'acl', 'refusal_code': 'native_error', 'errno': 45,
+                  'close': {'status': 'incomplete', 'attempts': 3, 'failures': 1, 'errno': 9}}
+        error = restoration_support.AdmissionError(report)
+        code, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, admission_error=error)
+        self.assertEqual(code, 1); self.assertEqual(value['stage'], 'restoration_admission')
+        self.assertEqual(value['error'], 'restoration_admission_failed')
+        self.assertEqual(value['restoration_admission'], report)
+        self.assertEqual((value['setup_completion'], value['target_completion'], value['helper_launch'], value['restoration_completion']),
+                         ('complete', 'not_started', 'not_started', 'not_started'))
+        self.assertEqual(value['cases'], []); self.assertEqual(value['helper_invocations'], 0); self.assertEqual(value['clone_calls'], 0)
+        self.assertFalse(value['docs_attempted']); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.assertEqual(snapshots.call_count, 3); self.restorer.restore.assert_not_called()
+        self.removals.assert_not_called(); self.docs.assert_not_called()
+        self.assertLessEqual(len(json.dumps(value).encode()), 65536)
+
+    def test_unclassified_constructor_exception_is_redacted_with_unproved_close(self):
+        _, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True,
+            admission_error=RuntimeError('PRIVATE /private/path ACL contents'))
+        report = value['restoration_admission']
+        self.assertEqual((report['phase'], report['refusal_code'], report['errno']), ('unknown', 'admission_error', None))
+        self.assertEqual(report['close'], {'status': 'unknown', 'attempts': 0, 'failures': 0, 'errno': None})
+        self.assertEqual(value['target_completion'], 'not_started'); self.assertEqual(snapshots.call_count, 3)
+        self.assertNotIn('PRIVATE', json.dumps(value)); self.assertNotIn('/private/path', json.dumps(value))
+        self.assertNotIn('ACL contents', json.dumps(value)); self.removals.assert_not_called()
+
+    def test_uncertain_setup_capture_does_not_manufacture_helper_or_method_completion(self):
+        code, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, setup_capture=True)
+        self.assertEqual(code, 1); self.assertEqual(value['setup_completion'], 'unknown')
+        self.assertEqual(value['error'], 'setup_completion_unknown')
+        self.assertEqual((value['target_completion'], value['helper_launch'], value['restoration_completion']),
+                         ('not_started', 'not_started', 'not_started'))
+        self.assertEqual(value['cases'], []); self.assertEqual(value['helper_invocations'], 0)
+        self.assertEqual(snapshots.call_count, 0); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.restorer.restore.assert_not_called(); self.removals.assert_not_called()
 
     def test_successful_first_recipe_only_stops_after_one_invocation_without_qualifying_full_gate(self):
         code, value, _ = self.run_probe(first_recipe_only=True)

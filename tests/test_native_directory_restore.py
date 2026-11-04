@@ -328,12 +328,15 @@ class Restoration(unittest.TestCase):
         self.assertEqual(ops.fstat(session.destination['protected']['fd']).st_flags, 66)
 
     def test_descriptor_acl_admission_rejects_deny_and_inheritance_flags(self):
-        for tag, inherited in ((1, False), (2, False), (1, True)):
-            with self.subTest(tag=tag, inherited=inherited):
+        for tag, inherited, mask in ((1, False, 2), (2, False, 2), (1, True, 2), (1, False, 4)):
+            with self.subTest(tag=tag, inherited=inherited, mask=mask):
                 ops = restore.DarwinOps.__new__(restore.DarwinOps)
                 library = mock.Mock(); ops.libc = library
                 library.acl_get_fd_np.return_value = 100
-                library.acl_valid_fd_np.return_value = 0
+                library.acl_valid.return_value = 0
+                def unsupported_context_validator(*_):
+                    ctypes.set_errno(errno.ENOTSUP); return -1
+                library.acl_valid_fd_np.side_effect = unsupported_context_validator
                 library.acl_free.return_value = 0
                 ops.acl_text = lambda _: 'allow-read'
                 def flagset(_, output): output._obj.value = 300; return 0
@@ -344,15 +347,163 @@ class Restoration(unittest.TestCase):
                     ctypes.set_errno(errno.EINVAL); return -1
                 library.acl_get_entry.side_effect = entry
                 def get_tag(_, output): output._obj.value = tag; return 0
-                def permissions(_, output): output._obj.value = 2; return 0
+                def permissions(_, output): output._obj.value = mask; return 0
                 library.acl_get_tag_type.side_effect = get_tag
                 library.acl_get_permset_mask_np.side_effect = permissions
                 expected = row('file', 10, acl='allow-read')
-                if tag == 1 and not inherited:
+                if tag == 1 and not inherited and mask == 2:
                     ops.admit_acl(7, expected)
                 else:
                     with self.assertRaises(restore.RestoreError): ops.admit_acl(7, expected)
                 library.acl_set_fd_np.assert_not_called()
+                library.acl_valid.assert_called_once_with(100)
+                library.acl_valid_fd_np.assert_not_called()
+
+    def test_copy_acl_uses_object_validation_and_preserves_primary_error_through_free(self):
+        for failing in (None, 'validation', 'setter'):
+            for free_failure in (False, True):
+                with self.subTest(failing=failing, free_failure=free_failure):
+                    ops = restore.DarwinOps.__new__(restore.DarwinOps); library = mock.Mock(); ops.libc = library
+                    library.acl_get_fd_np.return_value = 100
+                    def validate(_):
+                        if failing == 'validation': ctypes.set_errno(errno.EINVAL); return -1
+                        return 0
+                    def setter(*_):
+                        if failing == 'setter': ctypes.set_errno(errno.ENOSPC); return -1
+                        return 0
+                    def free(_):
+                        ctypes.set_errno(errno.EBADF)
+                        return -1 if free_failure else 0
+                    def unsupported(*_): ctypes.set_errno(errno.ENOTSUP); return -1
+                    library.acl_valid.side_effect = validate
+                    library.acl_set_fd_np.side_effect = setter
+                    library.acl_free.side_effect = free
+                    library.acl_valid_fd_np.side_effect = unsupported
+                    expected = errno.EINVAL if failing == 'validation' else errno.ENOSPC if failing == 'setter' else errno.EBADF if free_failure else None
+                    if expected is None:
+                        ops.copy_acl(7, 9)
+                    else:
+                        with self.assertRaises(OSError) as error: ops.copy_acl(7, 9)
+                        self.assertEqual(error.exception.errno, expected)
+                    library.acl_get_fd_np.assert_called_once_with(7, 0x100)
+                    library.acl_valid.assert_called_once_with(100)
+                    library.acl_valid_fd_np.assert_not_called()
+                    library.acl_free.assert_called_once_with(100)
+                    if failing == 'validation': library.acl_set_fd_np.assert_not_called()
+                    else: library.acl_set_fd_np.assert_called_once_with(9, 100, 0x100)
+
+    def test_invalid_acl_admission_captures_only_immediate_errno_and_frees_once(self):
+        for native_errno in (None, errno.EINVAL):
+            with self.subTest(native_errno=native_errno):
+                ops = restore.DarwinOps.__new__(restore.DarwinOps); library = mock.Mock(); ops.libc = library
+                library.acl_get_fd_np.return_value = 100
+                def invalid(_):
+                    if native_errno is not None: ctypes.set_errno(native_errno)
+                    return -1
+                def free(_): ctypes.set_errno(errno.EPERM); return 0
+                library.acl_valid.side_effect = invalid; library.acl_free.side_effect = free
+                ops.acl_text = mock.Mock()
+                ctypes.set_errno(errno.ENOENT)
+                with self.assertRaises(OSError) as error: ops.admit_acl(7, row('file', 3))
+                self.assertEqual(error.exception.errno, native_errno or errno.EIO)
+                library.acl_free.assert_called_once_with(100); ops.acl_text.assert_not_called()
+                library.acl_valid_fd_np.assert_not_called()
+
+    def test_absent_acl_uses_empty_object_and_preserves_getter_or_allocator_errno(self):
+        for outcome in ('empty', 'init_failure', 'getter_failure'):
+            with self.subTest(outcome=outcome):
+                ops = restore.DarwinOps.__new__(restore.DarwinOps); library = mock.Mock(); ops.libc = library
+                def getter(*_):
+                    ctypes.set_errno(errno.EACCES if outcome == 'getter_failure' else errno.ENOENT)
+                    return None
+                def initialize(_):
+                    if outcome == 'init_failure': ctypes.set_errno(errno.ENOMEM); return None
+                    return 100
+                def flags(_, output): output._obj.value = 300; return 0
+                def end(*_): ctypes.set_errno(errno.EINVAL); return -1
+                library.acl_get_fd_np.side_effect = getter; library.acl_init.side_effect = initialize
+                library.acl_valid.return_value = 0; library.acl_get_flagset_np.side_effect = flags
+                library.acl_get_flag_np.return_value = 0; library.acl_get_entry.side_effect = end
+                library.acl_free.return_value = 0; ops.acl_text = mock.Mock(return_value='empty')
+                if outcome == 'empty':
+                    ops.admit_acl(7, row('file', 3))
+                    library.acl_valid.assert_called_once_with(100)
+                    library.acl_get_entry.assert_called_once(); library.acl_free.assert_called_once_with(100)
+                else:
+                    with self.assertRaises(OSError) as error: ops.admit_acl(7, row('file', 3))
+                    self.assertEqual(error.exception.errno, errno.ENOMEM if outcome == 'init_failure' else errno.EACCES)
+                    library.acl_valid.assert_not_called(); library.acl_free.assert_not_called()
+                if outcome == 'getter_failure': library.acl_init.assert_not_called()
+                else: library.acl_init.assert_called_once_with(0)
+                library.acl_set_fd_np.assert_not_called(); library.acl_valid_fd_np.assert_not_called()
+
+    def test_constructor_binding_failure_reports_no_descriptors_without_exception_text(self):
+        library = mock.Mock()
+        with mock.patch.object(restore.sys, 'platform', 'darwin'), mock.patch.object(restore.ctypes, 'CDLL', return_value=library) as binding:
+            restore.DarwinOps()
+        binding.assert_called_once_with(None, use_errno=True)
+        self.assertEqual(library.acl_valid.argtypes, [ctypes.c_void_p])
+        self.assertIs(library.acl_valid.restype, ctypes.c_int)
+        with mock.patch.object(restore, 'DarwinOps', side_effect=AttributeError('PRIVATE /private/path')):
+            with self.assertRaises(restore.AdmissionError) as caught:
+                restore.Session('PRIVATE-base', 'PRIVATE-source', 'PRIVATE-parent', self.source)
+        report = caught.exception.report
+        self.assertEqual((report['phase'], report['refusal_code'], report['errno']), ('ops_binding', 'api_unavailable', None))
+        self.assertEqual(report['close'], {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None})
+        self.assertNotIn('PRIVATE', str(report)); self.assertNotIn('/private/path', str(report))
+
+    def test_constructor_acl_refusal_retains_primary_errno_and_separate_one_time_close_outcome(self):
+        for late in (False, True):
+            for close_failure in (False, True):
+                with self.subTest(late=late, close_failure=close_failure):
+                    ops = FakeOps(self.source, self.destination)
+                    ops.fail = None if late else 'admit_acl'
+                    original_payload = ops.payload
+                    def payload(fd, expected):
+                        if len(ops.descriptors) > 3:
+                            ops.calls.append(('payload', fd))
+                            raise OSError(errno.ENOSPC, 'PRIVATE payload /private/path')
+                        original_payload(fd, expected)
+                    if late: ops.payload = payload
+                    original_close = ops.close; first = True
+                    def closing(fd):
+                        nonlocal first
+                        ctypes.set_errno(errno.EPERM)
+                        if close_failure and first:
+                            first = False; ops.calls.append(('close', fd))
+                            raise OSError(errno.EBADF, 'PRIVATE close /private/path')
+                        first = False; original_close(fd)
+                    ops.close = closing
+                    with self.assertRaises(restore.AdmissionError) as caught:
+                        restore.Session('private', 'source', 'parent', self.source, ops=ops)
+                    report = caught.exception.report; count = 4 if late else 3
+                    self.assertEqual((report['phase'], report['refusal_code'], report['errno']),
+                        ('payload' if late else 'acl', 'native_error', errno.ENOSPC if late else errno.EIO))
+                    self.assertEqual(report['close'], {'status': 'incomplete' if close_failure else 'complete',
+                        'attempts': count, 'failures': int(close_failure), 'errno': errno.EBADF if close_failure else None})
+                    closed = [call[1] for call in ops.calls if call[0] == 'close']
+                    self.assertEqual(set(closed), set(range(1000, ops.next_fd)))
+                    self.assertEqual(len(closed), count); self.assertEqual(len(set(closed)), count)
+                    self.assertEqual(self.mutations(ops), [])
+                    self.assertNotIn('PRIVATE', str(report)); self.assertNotIn('/private/path', str(report))
+
+    def test_successful_admission_is_complete_before_deferred_owned_descriptors_close(self):
+        session, ops = self.session(); count = len(session.owned)
+        before = session.admission_report()
+        self.assertEqual((before['status'], before['phase']), ('complete', 'complete'))
+        self.assertEqual(before['close'], {'status': 'deferred', 'attempts': 0, 'failures': 0, 'errno': None})
+        self.assertGreater(count, 3); self.assertTrue(session.close())
+        after = session.admission_report()
+        self.assertEqual((after['status'], after['phase']), ('complete', 'complete'))
+        self.assertEqual(after['close'], {'status': 'complete', 'attempts': count, 'failures': 0, 'errno': None})
+        self.assertTrue(session.close()); self.assertEqual(session.admission_report(), after)
+        self.assertEqual(self.mutations(ops), [])
+
+    def test_unrecognized_admission_error_and_phase_cannot_export_private_values(self):
+        report = restore.refusal_report(restore.RestoreError('PRIVATE /private/path ACL contents'), 'PRIVATE phase')
+        self.assertEqual((report['phase'], report['refusal_code'], report['errno']), ('unknown', 'admission_error', None))
+        self.assertEqual(report['close']['status'], 'unknown')
+        self.assertNotIn('PRIVATE', str(report)); self.assertNotIn('/private/path', str(report))
 
     def test_native_time_argv_preserves_atime_and_encodes_signed_ns_without_native_call(self):
         ops = restore.DarwinOps.__new__(restore.DarwinOps); ops.libc = mock.Mock()
