@@ -30,6 +30,9 @@ def row(kind, inode, *, flags=0, mode=0o640, acl=None, links=1):
 def snapshot(entries):
     groups = {}
     for name, entry in entries.items():
+        if entry['kind'] == 'directory':
+            entry['link_count'] = 2 + sum(bool(child) and restore.relative(child)[0] == name for child in entries)
+    for name, entry in entries.items():
         if entry['kind'] != 'directory': groups.setdefault(tuple(entry['device_inode']), []).append(name)
     return {'entries': entries, 'hardlink_groups': sorted(sorted(names) for names in groups.values() if len(names) > 1),
             'metadata_capabilities': {'platform': 'darwin'}, 'unavailable_fields': []}
@@ -132,7 +135,7 @@ class FakeOps:
         self.called('unlink', parent, name)
         p = self.descriptors[parent]['info']; restore.need(p.st_mode & 0o300 == 0o300)
         info = self.names.pop((p.st_ino, name))['info']; info.st_nlink -= 1; info.st_ctime_ns += 1
-        p.st_size -= 16; p.st_mtime_ns += 1; p.st_ctime_ns += 1
+        p.st_nlink -= 1; p.st_size -= 16; p.st_mtime_ns += 1; p.st_ctime_ns += 1
 
     def link(self, parent, name, target, alias):
         self.called('link', parent, name, target, alias)
@@ -140,7 +143,7 @@ class FakeOps:
         restore.need((p.st_ino, alias) not in self.names)
         node = self.names[(self.descriptors[parent]['info'].st_ino, name)]
         self.names[(p.st_ino, alias)] = node; node['info'].st_nlink += 1; node['info'].st_ctime_ns += 1
-        p.st_size += 16; p.st_mtime_ns += 1; p.st_ctime_ns += 1
+        p.st_nlink += 1; p.st_size += 16; p.st_mtime_ns += 1; p.st_ctime_ns += 1
 
     def copy_acl(self, source, destination):
         self.called('copy_acl', source, destination)
@@ -223,22 +226,47 @@ class Restoration(unittest.TestCase):
                 self.assertEqual(len(ids), 1)
                 self.assertEqual(session.summary['alias_replacements'], 3 if partial else 1)
 
-    def test_verified_alias_parent_size_changes_on_both_unlink_and_link_are_admitted(self):
+    def test_verified_alias_parent_size_and_exact_nlink_changes_on_unlink_and_link_are_admitted(self):
         session, ops = self.session(); changes = []
-        initial = ops.nodes[tuple(self.destination['entries']['nested']['device_inode'])]['info'].st_size
+        parent_info = ops.nodes[tuple(self.destination['entries']['nested']['device_inode'])]['info']
+        initial, links = parent_info.st_size, parent_info.st_nlink
         unlink, link = ops.unlink, ops.link
         def removing(parent, name):
-            unlink(parent, name); changes.append(ops.fstat(parent).st_size)
+            unlink(parent, name); info = ops.fstat(parent); changes.append((info.st_size, info.st_nlink))
         def linking(parent, name, target, alias):
-            link(parent, name, target, alias); changes.append(ops.fstat(target).st_size)
+            link(parent, name, target, alias); info = ops.fstat(target); changes.append((info.st_size, info.st_nlink))
         ops.unlink, ops.link = removing, linking
         result = session.restore(self.destination)
         self.assertEqual(result['status'], 'restored_pending_final_verifiers')
-        self.assertEqual(changes, [initial - 16, initial] * result['alias_replacements'])
-        self.assertGreater(result['alias_replacements'], 0)
+        self.assertEqual(changes, [(initial - 16, links - 1), (initial, links)] * result['alias_replacements'])
+        self.assertEqual(result['alias_replacements'], 2)  # regular and symlink classes
+        self.assertNotIn('failure_context', result)
+        for name, record in session.destination.items():
+            self.assertEqual(record['entry_id'], f'e{sorted(self.destination["entries"]).index(name) + 1:04}')
+
+    def test_alias_parent_nlink_requires_exact_delta_and_reports_only_opaque_failure_context(self):
+        for operation, deltas in (('unlink', (0, 1, -2)), ('link', (0, -1, 2))):
+            for delta in deltas:
+                with self.subTest(operation=operation, delta=delta):
+                    session, ops = self.session(); original = getattr(ops, operation)
+                    def mutation(*args):
+                        parent = args[0] if operation == 'unlink' else args[2]
+                        before = ops.descriptors[parent]['info'].st_nlink
+                        original(*args)
+                        ops.descriptors[parent]['info'].st_nlink = before + delta
+                    setattr(ops, operation, mutation)
+                    result = session.restore(self.destination)
+                    self.assertEqual((result['status'], result['error'], result['alias_replacements']), ('incomplete', 'identity_changed', 0))
+                    context = result['failure_context']
+                    self.assertEqual(context, {'operation': 'alias_' + operation, 'phase': 'refresh', 'check': 'refresh',
+                        'entry_id': 'e0002', 'field': 'nlink'})
+                    self.assertEqual(set(context), {'operation', 'phase', 'check', 'entry_id', 'field'})
+                    self.assertNotIn('nested', str(context)); self.assertNotIn('before', context); self.assertNotIn('after', context)
+                    if operation == 'unlink': self.assertFalse(any(call[0] == 'link' for call in ops.calls))
+                    self.assertEqual([call[0] for call in self.mutations(ops)].count(operation), 1)
 
     def test_alias_parent_size_admission_does_not_allow_unrelated_size_identity_or_other_parent_drift(self):
-        for drift in ('unrelated_size', 'victim_size', 'parent_identity', 'parent_mode', 'parent_nlink'):
+        for drift in ('unrelated_size', 'unrelated_nlink', 'victim_size', 'parent_identity', 'parent_mode', 'parent_nlink'):
             with self.subTest(drift=drift):
                 session, ops = self.session(); unlink = ops.unlink
                 def removing(parent, name):
@@ -246,6 +274,8 @@ class Restoration(unittest.TestCase):
                     unlink(parent, name)
                     if drift == 'unrelated_size':
                         ops.nodes[tuple(self.destination['entries']['protected']['device_inode'])]['info'].st_size += 1
+                    elif drift == 'unrelated_nlink':
+                        ops.nodes[tuple(self.destination['entries']['protected']['device_inode'])]['info'].st_nlink += 1
                     elif drift == 'victim_size': victim['info'].st_size += 1
                     elif drift == 'parent_identity': ops.descriptors[parent]['info'].st_ino += 1
                     elif drift == 'parent_mode': ops.descriptors[parent]['info'].st_mode ^= 0o040
@@ -256,6 +286,7 @@ class Restoration(unittest.TestCase):
                 self.assertEqual(result['error'], 'identity_changed')
                 self.assertEqual(result['alias_replacements'], 0)
                 self.assertFalse(any(call[0] == 'link' for call in ops.calls))
+                self.assertIn(result['failure_context']['field'], ('identity', 'mode', 'size', 'nlink'))
 
     def test_merged_external_foreign_setid_unknown_field_content_type_and_sparse_mismatches_refuse_before_mutation(self):
         variants = []
