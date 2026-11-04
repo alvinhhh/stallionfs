@@ -148,6 +148,7 @@ class DarwinOps:
         self.libc = ctypes.CDLL(None, use_errno=True)
         pointer, integer, size = ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t
         for name, arguments, result in (
+            ('fchflags', [integer, ctypes.c_uint32], integer),
             ('acl_get_fd_np', [integer, integer], pointer), ('acl_init', [integer], pointer),
             ('acl_free', [pointer], integer), ('acl_to_text', [pointer, ctypes.POINTER(ctypes.c_ssize_t)], pointer),
             ('acl_valid', [pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
@@ -246,6 +247,9 @@ class DarwinOps:
         finally:
             self.free(acl)
 
+    def flags(self, fd, flags):
+        self.call(self.libc.fchflags, fd, flags)
+
     def payload(self, fd, row):
         # Read every xattr on the held object, including the resource fork.
         length = self.call(self.libc.flistxattr, fd, None, 0, 0); need(length <= 65536)
@@ -279,7 +283,6 @@ class DarwinOps:
     close = staticmethod(os.close)
     fstat = staticmethod(os.fstat)
     named = staticmethod(lambda parent, name: os.stat(name, dir_fd=parent, follow_symlinks=False))
-    flags = staticmethod(lambda fd, flags: os.fchflags(fd, flags))
     mode = staticmethod(os.fchmod)
     unlink = staticmethod(lambda parent, name: os.unlink(name, dir_fd=parent))
     link = staticmethod(lambda parent, name, target, alias: os.link(name, alias, src_dir_fd=parent,

@@ -483,6 +483,84 @@ class Restoration(unittest.TestCase):
         self.assertEqual(report['close'], {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None})
         self.assertNotIn('PRIVATE', str(report)); self.assertNotIn('/private/path', str(report))
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin descriptor ABI inspection')
+    def test_actual_darwin_adapter_symbols_and_abi_exist_without_native_operations(self):
+        self.symlink_flag.stop()
+        ops = restore.DarwinOps()
+        pointer, integer, size = ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t
+        expected = (
+            ('fchflags', [integer, ctypes.c_uint32], integer),
+            ('acl_get_fd_np', [integer, integer], pointer), ('acl_init', [integer], pointer),
+            ('acl_free', [pointer], integer), ('acl_to_text', [pointer, ctypes.POINTER(ctypes.c_ssize_t)], pointer),
+            ('acl_valid', [pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
+            ('acl_get_entry', [pointer, integer, ctypes.POINTER(pointer)], integer),
+            ('acl_get_tag_type', [pointer, ctypes.POINTER(integer)], integer),
+            ('acl_get_flagset_np', [pointer, ctypes.POINTER(pointer)], integer),
+            ('acl_get_flag_np', [pointer, integer], integer),
+            ('acl_get_permset_mask_np', [pointer, ctypes.POINTER(ctypes.c_uint64)], integer),
+            ('flistxattr', [integer, pointer, size, integer], ctypes.c_ssize_t),
+            ('fgetxattr', [integer, ctypes.c_char_p, pointer, size, ctypes.c_uint32, integer], ctypes.c_ssize_t))
+        for name, arguments, result in expected:
+            with self.subTest(symbol=name):
+                function = getattr(ops.libc, name)
+                self.assertEqual(function.argtypes, arguments); self.assertIs(function.restype, result)
+        for name in ('open', 'close', 'fstat', 'stat', 'fchmod', 'unlink', 'link', 'readlink'):
+            self.assertTrue(callable(getattr(os, name)), name)
+        for name in ('O_RDONLY', 'O_DIRECTORY', 'O_SYMLINK', 'O_NOFOLLOW', 'O_CLOEXEC', 'O_NONBLOCK'):
+            self.assertIsInstance(getattr(os, name), int)
+        for function in (os.open, os.stat, os.unlink, os.link, os.readlink):
+            self.assertIn(function, os.supports_dir_fd)
+        for function in (os.stat, os.link): self.assertIn(function, os.supports_follow_symlinks)
+        with mock.patch.object(ops, 'call') as call:
+            ops.times(7, -1)
+        function, descriptor, times = call.call_args.args
+        self.assertIs(function, ops.libc.futimens); self.assertEqual(descriptor, 7)
+        self.assertIs(function.restype, integer); self.assertIs(function.argtypes[0], integer)
+        self.assertEqual(function.argtypes[1]._type_._fields_, [('seconds', ctypes.c_long), ('nanoseconds', ctypes.c_long)])
+        self.assertEqual(ctypes.sizeof(times._type_), 16)
+        self.assertEqual((times[0].nanoseconds, times[1].seconds, times[1].nanoseconds), (-2, -1, 999999999))
+
+    def test_flags_adapter_uses_libc_without_os_fchflags_and_preserves_immediate_errno(self):
+        for outcome in ('success', 'errno', 'no_errno'):
+            with self.subTest(outcome=outcome):
+                library = mock.Mock()
+                def flags(fd, mask):
+                    self.assertEqual(ctypes.get_errno(), 0)
+                    self.assertEqual((fd, mask), (7, 0x42))
+                    if outcome == 'errno': ctypes.set_errno(errno.EPERM)
+                    return 0 if outcome == 'success' else -1
+                library.fchflags.side_effect = flags
+                with mock.patch.object(restore.sys, 'platform', 'darwin'), mock.patch.object(restore.ctypes, 'CDLL', return_value=library), \
+                     mock.patch.dict(os.__dict__):
+                    os.__dict__.pop('fchflags', None)
+                    self.assertFalse(hasattr(os, 'fchflags'))
+                    ops = restore.DarwinOps(); ctypes.set_errno(errno.ENOENT)
+                    if outcome == 'success': ops.flags(7, 0x42)
+                    else:
+                        with self.assertRaises(OSError) as caught: ops.flags(7, 0x42)
+                        self.assertEqual(caught.exception.errno, errno.EPERM if outcome == 'errno' else errno.EIO)
+                    # Recovery uses this same adapter and retains newly set tracking.
+                    session = restore.Session.__new__(restore.Session); session.ops = ops; session.summary = {}
+                    session.changed_flags = {7: 2}; session.changed_modes = {}
+                    session.recovery_identity = mock.Mock(return_value=SimpleNamespace(st_flags=0x40))
+                    ctypes.set_errno(errno.ENOENT); session.recover()
+                    self.assertEqual(session.summary['recovery'], 'complete' if outcome == 'success' else 'incomplete')
+                    session.recovery_identity.assert_called_once_with(7)
+                self.assertEqual(library.fchflags.argtypes, [ctypes.c_int, ctypes.c_uint32])
+                self.assertIs(library.fchflags.restype, ctypes.c_int)
+                self.assertEqual(library.fchflags.call_args_list, [mock.call(7, 0x42), mock.call(7, 0x42)])
+
+    def test_missing_fchflags_symbol_refuses_before_acquiring_any_owned_descriptor(self):
+        library = mock.Mock(); del library.fchflags
+        with mock.patch.object(restore.sys, 'platform', 'darwin'), mock.patch.object(restore.ctypes, 'CDLL', return_value=library), \
+             mock.patch.object(restore.os, 'open') as opening:
+            with self.assertRaises(restore.AdmissionError) as caught:
+                restore.Session('PRIVATE-base', 'PRIVATE-source', 'PRIVATE-parent', self.source)
+        report = caught.exception.report
+        self.assertEqual((report['phase'], report['refusal_code'], report['errno']), ('ops_binding', 'api_unavailable', None))
+        self.assertEqual(report['close'], {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None})
+        opening.assert_not_called(); self.assertNotIn('PRIVATE', str(report))
+
     def test_constructor_acl_refusal_retains_primary_errno_and_separate_one_time_close_outcome(self):
         for late in (False, True):
             for close_failure in (False, True):
