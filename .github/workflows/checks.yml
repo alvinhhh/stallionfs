@@ -4,6 +4,12 @@ on:
     branches: [main, stable]
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Hosted document clone action
+        type: choice
+        options: [compare, system-trace]
+        default: compare
 permissions:
   contents: read
 jobs:
@@ -215,6 +221,7 @@ jobs:
           "$SCREEN_ROOT/venv/bin/python" -m pip wheel --no-deps --wheel-dir "$SCREEN_ROOT/wheels" "$GITHUB_WORKSPACE"
           "$SCREEN_ROOT/venv/bin/python" -m pip install --force-reinstall --no-deps "$SCREEN_ROOT/wheels/"*.whl
       - name: Record source and hosted environment
+        if: inputs.mode != 'system-trace'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -248,6 +255,7 @@ jobs:
           (root / 'evidence/environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
           PY
       - name: Collect fixed document clone comparison
+        if: inputs.mode != 'system-trace'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -279,10 +287,44 @@ jobs:
               (evidence / 'collector-outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
           raise SystemExit(outcome['returncode'])
           PY
+      - name: Probe System Trace capability
+        if: inputs.mode == 'system-trace'
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, sys, time
+          from pathlib import Path
+          from stallionfs._benchmark_budget import command
+          root = Path(os.environ['SCREEN_ROOT'])
+          control = root / 'scratch/trace-control'
+          control.mkdir(mode=0o700)
+          receipts = control / 'receipts'
+          receipts.mkdir(mode=0o700)
+          output = root / 'evidence/system-trace-status.json'
+          os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 210)
+          argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/system_trace_probe.py'),
+              '--binary', str(root / 'venv/bin/stallionfs'), '--scratch', str(root / 'scratch'),
+              '--output', str(output), '--revision', os.environ['GITHUB_SHA']]
+          code = 1
+          try:
+              code = command(argv, cwd=control, timeout=200, umask=0o077, output_limit=65536).returncode
+          except BaseException:
+              pass
+          if not output.exists():
+              with output.open('x') as artifact:
+                  json.dump({'schema': 1, 'scope': 'hosted-source-build capability diagnostic',
+                      'status': 'incomplete', 'capability': 'unavailable', 'target_completion': 'unknown',
+                      'correctness': None, 'schema_metadata_status': 'unavailable', 'cpu_attribution': 'unavailable',
+                      'benchmark_verdict': 'not_applicable', 'error': 'outer_capture_incomplete'}, artifact)
+          raise SystemExit(code)
+          PY
       - name: Show correctness and existing case gate
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always()
+        if: always() && inputs.mode != 'system-trace'
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
@@ -324,7 +366,7 @@ jobs:
       - name: Preserve synthetic screen evidence
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always()
+        if: always() && inputs.mode != 'system-trace'
         uses: actions/upload-artifact@v4
         with:
           name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
@@ -336,5 +378,13 @@ jobs:
             ${{ env.SCREEN_ROOT }}/evidence/native.json.journal
             ${{ env.SCREEN_ROOT }}/evidence/native.json.manifest
             ${{ env.SCREEN_ROOT }}/evidence/receipts/*.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Preserve System Trace capability status
+        if: always() && inputs.mode == 'system-trace'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-system-trace-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/system-trace-status.json
           if-no-files-found: error
           retention-days: 3
