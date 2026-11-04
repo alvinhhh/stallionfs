@@ -33,6 +33,7 @@ PIN_PATHS = ('stallionfs/_tree.c', 'stallionfs/_tree.h', 'stallionfs/_benchmark_
              'tests/perf/fileops.py', 'tests/perf/native_fixtures.py', 'tests/perf/native_correctness.py',
              'tests/perf/native_suite.py', 'tests/test_fileops.py', 'tests/test_copy.py')
 PIN_PATHS += ('tests/test_native_directory_clone_probe.py', '.github/workflows/checks.yml')
+PIN_PATHS += ('tests/perf/native_directory_restore.py', 'tests/test_native_directory_restore.py')
 SETUP_ERRORS = {'host_checks': 'host_check_failed', 'inputs': 'input_unavailable',
                 'wheel_identity': 'wheel_unavailable', 'source_pins': 'pin_unavailable',
                 'binary_pins': 'binary_pin_unavailable', 'private_fixture_setup': 'fixture_setup_failed',
@@ -247,7 +248,7 @@ def prepare(base, name, native_fixtures, correct, run):
     return source, parent, outside, expected_error, protected, coverage
 
 
-def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only=False):
+def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only=False, restore_first_recipe=False):
     from stallionfs._benchmark_budget import command
     import stallionfs
     import fileops
@@ -262,11 +263,15 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
               'concurrency_and_cancellation': 'unresolved'}
     if first_recipe_only:
         result.update(scope='hosted directory-clone first-recipe detail only', first_recipe_only=True, full_gate_qualified=False)
+    if restore_first_recipe:
+        result.update(scope='hosted first-recipe selective restoration only', restoration_only=True, full_gate_qualified=False)
     private = identity = None
     safe_to_clean = True
     protected_paths = []
+    restoration_sessions = []
     os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 180)
     try:
+        require(not restore_first_recipe or first_recipe_only, 'restoration_scope_invalid')
         require(sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true'
                 and os.environ.get('STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED') == '1'
                 and re.fullmatch('[0-9a-f]{40}', revision) is not None, 'host_invalid')
@@ -344,6 +349,16 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             source_info, parent_info, base_info = source.stat(), parent.stat(), base.stat()
             require(correct.verify_source(expected, correct.snapshot(source, allow_special=name == 'special'))['unchanged'] is True,
                     'source_precheck_failed')
+            restoration = None
+            if restore_first_recipe:
+                require(first_recipe_only and name == FIRST_RECIPE and not docs, 'restoration_scope_invalid')
+                from native_directory_restore import Session
+                try:
+                    restoration = Session(base, source.name, parent.name, expected,
+                        cancelled=lambda: time.monotonic() >= float(os.environ['STALLIONFS_BENCHMARK_DEADLINE']))
+                except BaseException:
+                    raise ProbeError('restoration_admission_failed') from None
+                restoration_sessions.append(restoration)
             protected_paths.extend(source / relative for relative in protected)
             source_inode = source_info.st_ino + (name == 'stale-source-pin')
             argv = [str(helper), str(base), str(base_info.st_dev), str(base_info.st_ino), source.name, parent.name, 'output',
@@ -382,6 +397,18 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                 require(native['native_return'] == 0 and native['clone_calls'] == 1, 'clone_failed')
                 after = correct.snapshot(destination, observe_sharing=True)
                 source_after = correct.snapshot(source, observe_sharing=True)
+                if restoration is not None:
+                    raw = verdict(expected, source_after, after, outside_before, correct.snapshot(outside), correct,
+                                  native_suite.preserved, include_detail=True)
+                    row['raw_clone'] = raw
+                    require(raw['source_unchanged'] and raw['outside_sentinel_unchanged']
+                            and raw.get('first_recipe_detail', {}).get('destination_independent') is True
+                            and raw['full_data_stream_sharing'], 'restoration_precheck_failed')
+                    row['restoration'] = restoration.restore(after)
+                    require(row['restoration']['status'] == 'restored_pending_final_verifiers', 'restoration_incomplete')
+                    # Every existing strict verifier and alias-isolation assertion still runs.
+                    after = correct.snapshot(destination, observe_sharing=True)
+                    source_after = correct.snapshot(source, observe_sharing=True)
                 row.update(verdict(expected, source_after, after, outside_before, correct.snapshot(outside), correct,
                                    native_suite.preserved, include_detail=first_recipe_only and name == FIRST_RECIPE))
                 protected_paths.extend(destination / relative for relative in protected)
@@ -410,7 +437,7 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             require(len(result['cases']) == 1 and result['helper_invocations'] == 1 and result['clone_calls'] == 1
                     and result['cases'][0].get('first_recipe_detail', {}).get('status') == 'available',
                     'first_recipe_detail_unavailable')
-            result['status'] = 'first_recipe_diagnostic_complete'
+            result['status'] = 'first_recipe_restoration_complete' if restore_first_recipe else 'first_recipe_diagnostic_complete'
         else:
             require(len(result['cases']) == MAX_SMALL_CASES and all(row['passed'] for row in result['cases']), 'small_gate_failed')
             require(all(any(row['coverage'].get(field) is True for row in result['cases']) for field in COVERAGE),
@@ -424,6 +451,12 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
     except BaseException as error:
         result['error'] = str(error) if isinstance(error, ProbeError) else SETUP_ERRORS.get(result['stage'], 'probe_incomplete')
     finally:
+        for restoration in restoration_sessions:
+            if not restoration.close():
+                safe_to_clean = False
+                result.update(status='incomplete', error='restoration_close_failed')
+                for row in result['cases']:
+                    if 'restoration' in row: row['restoration'] = dict(restoration.summary)
         if private is not None:
             result['cleanup'] = 'retained_ephemeral'
             if safe_to_clean:
@@ -444,7 +477,8 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                 except BaseException:
                     result['status'] = 'incomplete'; result['stage'] = 'cleanup'; result['error'] = 'cleanup_failed'
         publish(output, result)
-    complete = 'first_recipe_diagnostic_complete' if first_recipe_only else 'feasible_controlled_fixture_only'
+    complete = ('first_recipe_restoration_complete' if restore_first_recipe else
+                'first_recipe_diagnostic_complete' if first_recipe_only else 'feasible_controlled_fixture_only')
     return 0 if result['status'] == complete and result['cleanup'] == 'complete' else 1
 
 
@@ -454,10 +488,11 @@ def main():
     for name in ('binary', 'wheel', 'helper', 'scratch', 'output'): parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--first-recipe-only', action='store_true')
+    parser.add_argument('--restore-first-recipe', action='store_true')
     args = parser.parse_args()
     try:
         return probe(args.binary, args.wheel, args.helper, args.scratch, args.output, args.revision,
-                     first_recipe_only=args.first_recipe_only)
+                     first_recipe_only=args.first_recipe_only, restore_first_recipe=args.restore_first_recipe)
     except BaseException:
         return 1
 
