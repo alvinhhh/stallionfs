@@ -3,10 +3,12 @@ on:
   push:
     branches: [main, stable]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   test:
+    if: github.event_name != 'workflow_dispatch'
     timeout-minutes: ${{ matrix.os == 'macos-26-intel' && 30 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -178,3 +180,161 @@ jobs:
       - run: |
           cd "$RUNNER_TEMP"
           stallionfs --root "$RUNNER_TEMP/stallionfs-smoke" doctor
+
+  hosted-docs-screen:
+    name: Hosted document clone screen
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: xcode-27
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    concurrency:
+      group: hosted-docs-clone-screen
+      cancel-in-progress: false
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAKEFLAGS: -j1
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      MAX_JOBS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build and install public source wheel
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        run: |
+          umask 077
+          mkdir "$SCREEN_ROOT"
+          mkdir -p "$SCREEN_ROOT/evidence/receipts" "$SCREEN_ROOT/wheels" "$SCREEN_ROOT/scratch"
+          python -m venv "$SCREEN_ROOT/venv"
+          "$SCREEN_ROOT/venv/bin/python" -m pip wheel --no-deps --wheel-dir "$SCREEN_ROOT/wheels" "$GITHUB_WORKSPACE"
+          "$SCREEN_ROOT/venv/bin/python" -m pip install --force-reinstall --no-deps "$SCREEN_ROOT/wheels/"*.whl
+      - name: Record source and hosted environment
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import hashlib, json, os, platform, subprocess, sys
+          from pathlib import Path
+          import stallionfs
+          root = Path(os.environ['SCREEN_ROOT'])
+          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          sys.path.insert(0, str(checkout / 'tests/perf'))
+          import fileops
+          binary = root / 'venv/bin/stallionfs'
+          revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True, timeout=10).strip()
+          if revision != os.environ['GITHUB_SHA'] or Path(stallionfs.__file__).resolve().is_relative_to(checkout):
+              raise RuntimeError('Source or installed-wheel identity mismatch')
+          volume = fileops.scratch_volume(json.loads(subprocess.check_output([str(binary), '--json', 'volumes'], timeout=15)), root / 'scratch')
+          wheels = list((root / 'wheels').glob('*.whl'))
+          if len(wheels) != 1:
+              raise RuntimeError('Expected exactly one source wheel')
+          def sysctl(key):
+              return subprocess.check_output(['/usr/sbin/sysctl', '-n', key], text=True, timeout=5).strip()
+          metadata = {'scope': 'hosted-source-build-only; not installed-release proof',
+              'revision': revision, 'runner_label': 'xcode-27', 'os': platform.platform(), 'arch': platform.machine(),
+              'cpu': sysctl('machdep.cpu.brand_string'), 'hardware_model': sysctl('hw.model'),
+              'logical_cpus': int(sysctl('hw.logicalcpu')), 'ram_bytes': int(sysctl('hw.memsize')),
+              'volume': {key: volume[key] for key in ('filesystem', 'device', 'path', 'readonly')},
+              'cache': 'warm generated fixture; no purge; residency not guaranteed',
+              'wheel_sha256': hashlib.sha256(wheels[0].read_bytes()).hexdigest(),
+              'cli_sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
+          (root / 'evidence/environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          PY
+      - name: Collect fixed document clone comparison
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, sys, time
+          from pathlib import Path
+          import stallionfs
+          from stallionfs._benchmark_budget import command
+          root = Path(os.environ['SCREEN_ROOT']); evidence = root / 'evidence'
+          binary = root / 'venv/bin/stallionfs'
+          env = dict(os.environ)
+          env.update(STALLIONFS_BENCHMARK_DEADLINE=str(time.monotonic() + 600),
+              STALLIONFS_BENCHMARK_RECEIPTS=str(evidence / 'receipts'),
+              STALLIONFS_BENCHMARK_BINARY=str(binary.resolve()),
+              STALLIONFS_BENCHMARK_PACKAGE=str(Path(stallionfs.__file__).resolve().parent))
+          argv = [sys.executable, '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_suite.py'),
+              '--binary', str(binary), '--scratch', str(root / 'scratch'), '--output', str(evidence / 'native.json'),
+              '--fixtures', 'docs_5k_100mb', '--operations', 'clone', '--copy-tools', 'ditto',
+              '--jobs', '2', '--samples', '10', '--runs', '1', '--cache', 'warm', '--timeout', '120']
+          outcome = {'returncode': 1}; receipt = {}
+          try:
+              outcome['returncode'] = command(argv, cwd=root, environment=env, timeout=630,
+                  receipt=receipt, output_limit=1048576).returncode
+          except Exception as error:
+              outcome['error'] = type(error).__name__ + ': ' + str(error)
+          finally:
+              outcome['receipt'] = receipt
+              (evidence / 'collector-outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
+          raise SystemExit(outcome['returncode'])
+          PY
+      - name: Show correctness and existing case gate
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        if: always()
+        run: |
+          cd "$RUNNER_TEMP"
+          python -I -B - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          root = Path(os.environ['SCREEN_ROOT']); evidence = root / 'evidence'
+          result = {'scope': 'hosted-source-build-only; not installed-release proof', 'status': 'incomplete', 'accepted': False}
+          try:
+              sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf'))
+              from native_report import ReportJournal
+              outcome = json.loads((evidence / 'collector-outcome.json').read_text())
+              journal = ReportJournal.open_existing(evidence / 'native.json')
+              try:
+                  report = journal.state
+              finally:
+                  journal.close()
+              screens = report.get('case_performance_screens')
+              result.update(collection_status=report.get('status'), correctness=report.get('passed'),
+                  cleanup_passed=report.get('cleanup_passed'), case_performance_screens=screens)
+              expected = {'run': 0, 'fixture': 'docs_5k_100mb', 'operation': 'clone', 'reference': 'ditto', 'cache': 'warm'}
+              valid = (outcome.get('returncode') == 0 and outcome.get('receipt', {}).get('completion_uncertain') is False
+                  and report.get('status') == 'complete' and report.get('passed') is True and report.get('cleanup_passed') is True
+                  and isinstance(screens, list) and len(screens) == 1)
+              screen = screens[0] if valid else {}
+              valid = (valid and {key: screen.get(key) for key in expected} == expected
+                  and screen.get('status') == 'pass' and screen.get('correctness_qualified') is True
+                  and screen.get('any_two_metrics_won') is True)
+              if not valid:
+                  raise RuntimeError('Collector correctness, cleanup or exact case gate did not pass')
+              result.update(status='pass', accepted=True)
+          except Exception as error:
+              result['error'] = type(error).__name__ + ': ' + str(error)
+          evidence.mkdir(parents=True, exist_ok=True)
+          (evidence / 'case-status.json').write_text(json.dumps(result, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Hosted source-build-only screen; not installed-release proof.\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          raise SystemExit(0 if result['accepted'] else 1)
+          PY
+      - name: Preserve synthetic screen evidence
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SCREEN_ROOT }}/evidence/environment.json
+            ${{ env.SCREEN_ROOT }}/evidence/collector-outcome.json
+            ${{ env.SCREEN_ROOT }}/evidence/case-status.json
+            ${{ env.SCREEN_ROOT }}/evidence/native.json
+            ${{ env.SCREEN_ROOT }}/evidence/native.json.journal
+            ${{ env.SCREEN_ROOT }}/evidence/native.json.manifest
+            ${{ env.SCREEN_ROOT }}/evidence/receipts/*.json
+          if-no-files-found: error
+          retention-days: 3
