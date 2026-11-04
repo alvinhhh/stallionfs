@@ -12,14 +12,14 @@ macOS 27 arm64, warm fixtures, ten direct timing pairs and ten separate resource
 | --- | ---: | ---: | ---: | --- |
 | [4 KiB ordinary copy, `cp -Rp`](results/ordinary-copy-tiny-20261030-arm64.json.xz) | 7.156500 / 9.539208 ms | 4.207000 / 5.710000 ms | 1,081,344 / 1,671,168 B | Wall gap inconclusive; CPU/RSS higher |
 | [4 KiB move, `mv -n`](results/native-move-tiny-direct-controls-20261030-arm64.json.xz) | 3.730521 / 4.360750 ms | 1.854000 / 2.422000 ms | 1,032,192 / 1,654,784 B | Slower; CPU inconclusive; RSS higher |
-| [Flat 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 11.416478 / 0.033169 s | 11.182524 / 0.029916 s | 5,111,808 / 1,769,472 B | Wall/CPU/RSS lower |
-| [Nested 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.136531 / 0.017766 s | 11.955517 / 0.054096 s | 2,588,672 / 1,933,312 B | Wall/CPU/RSS lower |
-| [Deep40 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.614668 / 0.034431 s | 12.410770 / 0.031100 s | 3,997,696 / 1,769,472 B | Wall/CPU/RSS lower |
-| [Document clone, explicit `--jobs 2`, ditto](results/native-clone-docs-jobs2-20261029-arm64.json.xz) | 0.763839 / 0.356793 s | 0.741951 / 0.661337 s | 1,818,624 / 1,916,928 B | Wall/CPU lower; RSS higher |
-| [Document clone, default 4 workers (`--jobs 4`), ditto](results/native-clone-docs-default4-20261029-arm64.json.xz) | 0.738710 / 0.219446 s | 0.709180 / 0.778186 s | 1,818,624 / 1,998,848 B | Wall lower; CPU/RSS higher |
+| [Flat 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 11.416478 s / 33.169 ms | 11.182524 s / 29.916 ms | 5,111,808 / 1,769,472 B | Wall/CPU/RSS lower |
+| [Nested 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.136531 s / 17.766 ms | 11.955517 s / 54.096 ms | 2,588,672 / 1,933,312 B | Wall/CPU/RSS lower |
+| [Deep40 20k scan, recorded find/stat](results/native-scans-20k-20261030-arm64.json.xz) | 12.614668 s / 34.431 ms | 12.410770 s / 31.100 ms | 3,997,696 / 1,769,472 B | Wall/CPU/RSS lower |
+| [Document clone, explicit `--jobs 2`, ditto](results/native-clone-docs-jobs2-20261029-arm64.json.xz) | 763.839 / 356.793 ms | 741.951 / 661.337 ms | 1,818,624 / 1,916,928 B | Wall/CPU lower; RSS higher |
+| [Document clone, default 4 workers (`--jobs 4`), ditto](results/native-clone-docs-default4-20261029-arm64.json.xz) | 738.710 / 219.446 ms | 709.180 / 778.186 ms | 1,818,624 / 1,998,848 B | Wall lower; CPU/RSS higher |
 | [Generated repository delete, `rm -rf`](results/native-delete-repository-20261030-arm64.json.xz) | 2.491947 / 1.612499 s | 2.314500 / 4.890427 s | 1,179,648 / 1,949,696 B | Wall lower; CPU/RSS higher |
 | [Generated build-cache delete, `rm -rf`](results/native-delete-cache-20261030-arm64.json.xz) | 10.526252 / 6.966327 s | 9.562070 / 19.777616 s | 1,245,184 / 1,966,080 B | Wall lower; CPU/RSS higher |
-| [Generated dataset delete, `rm -rf`](results/native-delete-dataset-20261030-arm64.json.xz) | 0.114774 / 0.085604 s | 0.103147 / 0.221650 s | 1,097,728 / 1,916,928 B | Wall lower; CPU/RSS higher |
+| [Generated dataset delete, `rm -rf`](results/native-delete-dataset-20261030-arm64.json.xz) | 114.774 / 85.604 ms | 103.147 / 221.650 ms | 1,097,728 / 1,916,928 B | Wall lower; CPU/RSS higher |
 
 RSS means `/usr/bin/time -lp reported maximum RSS`: the maximum individual child-process peak, excluding whole-system, aggregate descendant, kernel and server memory. Earlier exec-image coverage is unproven. Direct CPU uses serialized reaped-child accounting; rounded-zero resource CPU does not establish a CPU win. Copy's higher elapsed median has an inconclusive wall gap under the paired noise screen and the 0.01 ms single-file floor.
 
@@ -63,8 +63,8 @@ Separate warm document-tree cells, ten direct and ten GNU Time resource samples 
 
 | Method | Direct wall median | Direct CPU median | Reported RSS median |
 | --- | ---: | ---: | ---: |
-| [GNU cp `--reflink=never`](results/linux-openzfs-docs-ordinary-20261030.json.xz) | 1.340353690 s | 0.864389000 s | 1,728,512 B |
-| [GNU cp `--reflink=always`](results/linux-openzfs-docs-required-reflink-20261030.json.xz) | 0.714952497 s | 0.713276500 s | 1,728,512 B |
+| [GNU cp `--reflink=never`](results/linux-openzfs-docs-ordinary-20261030.json.xz) | 1.340353690 s | 864.389000 ms | 1,728,512 B |
+| [GNU cp `--reflink=always`](results/linux-openzfs-docs-required-reflink-20261030.json.xz) | 714.952497 ms | 713.276500 ms | 1,728,512 B |
 
 Linux VM on a macOS APFS-backed disk file. GNU Time reports per-process maximum RSS, converted from KiB to bytes once, excluding ARC, kernel and guest/host caches. Required-reflink API acceptance and the first validated destination's aggregate pool-counter corroboration are distinct; full per-file physical sharing and exclusive storage savings remain unknown. These descriptive cells establish no causal filesystem/product win.
 
