@@ -204,3 +204,127 @@ inventory and command/current-image observations. Source, fake-controller and
 direct callback tests do not establish mounted persistence or distribution
 eligibility. The production signing/profile, installation, enablement and mounted
 qualification gates remain open until that intended artifact passes them.
+
+## Optional self-contained CLI runtime
+
+`--runtime-inputs /absolute/runtime-inputs.json` extends this same packager with
+the CLI and its private Python/Git dependencies. It requires `--manifest-out`
+and an existing owned `0700` output parent. The default host/module-only recipe
+below is unchanged. This option assembles an unsigned candidate; it does not
+install, register, sign or notarize an app.
+
+The schema-1 input object has exactly `schema`, `python_descriptor`, `git`,
+`wheel`, `licenses` and `sources`. A pinned file is an object with absolute
+`path` and lowercase SHA-256 `sha256` fields:
+
+```json
+{
+  "schema": 1,
+  "python_descriptor": {"path": "/inputs/python.json", "sha256": "..."},
+  "git": {
+    "root": "/inputs/private-git",
+    "inventory": {"path": "/inputs/git-tree.json", "sha256": "..."},
+    "qualification": {"path": "/inputs/git-qualification.json", "sha256": "..."}
+  },
+  "wheel": {"path": "/inputs/stallionfs.whl", "sha256": "..."},
+  "licenses": [{"path": "/inputs/COPYING", "sha256": "...", "destination": "Git/COPYING"}],
+  "sources": [
+    {"path": "/inputs/git-source.tar.xz", "sha256": "...", "destination": "Git/source.tar.xz"},
+    {"path": "/inputs/git-build-recipe", "sha256": "...", "destination": "Git/build-recipe"}
+  ]
+}
+```
+
+The abbreviated hashes above are placeholders, not usable inputs. The Python
+descriptor pins the preserved runtime root/inventory, install-only and matching
+full archives, upstream build metadata, static receipt and complete license
+records. Supported metadata is currently traditional-GIL CPython 3.13.18,
+`cpython-313-darwin`, arm64; no runtime is fetched or selected automatically.
+The wheel must have the exact cp313 arm64 tag, complete RECORD, the native
+launchers/extensions and current source/resource provenance, including
+`_bundle.py`. Build a fresh source-matched wheel after changing Python source.
+The old wheel is not a substitute. Native wheel members undergo the same
+bounded existing Apple-tool inspection contract; this option adds no compiler
+or tool-selection fallback.
+
+Tree inventories are sorted arrays of normalized relative `path`, `type`,
+`mode` (octal string), and `size`, with `sha256` for files or `link` for symlinks.
+Only ordinary owned files/directories and present confined relative symlinks
+are admitted. The Git qualification object has integer `schema:1`, the pinned
+`inventory_sha256`, `static_closure_accepted:true` and
+`local_correctness_passed:true`. These are explicit caller assertions backed by
+the retained artifact reviews/receipts; JSON supplies no signature or independent
+approval authority. The packager cannot determine license/source completeness
+from a count of files. Supply the independently reviewed complete Git source,
+build/config/patch material and any required dependency material, with exact
+notices. Missing required maps, changed pins, unsupported members and unsafe
+links or modes refuse assembly.
+
+The app preserves `Contents/Resources/Runtime/{CPython,Git,CLI}`. Native `sfs`
+and `stallionfs` stay in `CLI/bin` and keep their existing C fast paths. Their
+sibling `stallionfs-python` is a fixed `/bin/sh` helper using only quoted
+relative bundle paths, `-I -B -S` and the explicit wheel bootstrap. It preserves
+cwd, arguments and the helper identity needed by existing benchmark dispatch;
+it does not use PATH to find Python, process `.pth` files or inherit shell
+startup instructions. Unsupported direct relative/symlink helper invocations
+refuse. Source/wheel installations retain their existing entry points.
+
+Internal Git operations, including the diagnostic version call and budgeted
+path, remove inherited `GIT_*` routing before setting the private executable,
+helper/template directories and child-only private Git PATH prefix. Generic
+preparation and user workspace commands retain their existing PATH behavior.
+Caller-selected external tools/configuration remain outside the private Git
+closure; no network, credential or keychain qualification is implied.
+
+With this option only, app directories become `0755`, executable inputs/helper
+`0755` and ordinary resources `0644`; the receipt remains `0600`. Licenses are
+inside `Contents/Resources/Licenses`; a fresh sibling `APP.app.sources`
+directory holds the pinned corresponding-source/build files. Existing sidecars
+are never overwritten. The external receipt adds the exact runtime inventory,
+input hashes, source build ID and license/source mappings. Complete input and
+output checks finish before a success message. A failure retains partial
+output and may leave an empty reserved receipt; use fresh paths after review.
+
+The runtime validator checks physical same-bundle paths, ownership, modes and
+required dependencies. It does not authenticate the interpreter already loaded.
+Group-writable installation anchors, ACL policy, signed app/CLI pairing including
+mounted reuse, final nested-code layout/hardened runtime, notarized distribution,
+owned user links and installed FSKit lifecycle remain separate qualification
+gates. Do not treat a private assembly or CLI test as an installation/update
+permission or a stable mounted-filesystem result.
+
+## User command link
+
+The Control Panel offers `Install Command`, `Remove Command` and `Refresh` for
+one per-user `~/.local/bin/sfs` link. The target must be the admitted physical
+`/Applications/StallionFS.app` and its bundled native CLI. Workspace, relocated,
+translocated, symlinked and mounted-volume candidates are refused. These actions
+manage a command link; they do not install, replace or remove the app or prepare
+an FSKit module for an update.
+
+The corresponding bundled CLI actions are `sfs command status`, `sfs command
+install` and `sfs command remove`; place `--json` before `command` for structured
+output. They run before workspace Store initialization. Status creates no
+directories, lock or workspace store. Install creates missing user-owned command
+directories but never changes existing permissions. Ownership, mode and ACL
+checks must admit the held parents. A regular file, dangling foreign link or link
+to a previous/other target is a conflict, not an entry to overwrite or adopt.
+
+The panel displays an exact zsh/bash PATH line; CLI output includes it when its
+process PATH lacks the command folder. They never edit a shell profile or change
+PATH. Terminal configuration can differ from the app's environment; use the
+displayed command path or PATH line in that terminal.
+
+The Host requests helper termination after 30 seconds or oversized output. It
+keeps mutation controls disabled until the owned helper actually exits and both
+streams finish. This is not a hard stop guarantee for uninterruptible OS work.
+
+Mutation is serialized by an owned local lock and rechecks the target, parents
+and exact owned link. It does not provide atomic compare/unlink protection
+against arbitrary same-user replacement. Interrupted or uncertain operations
+retain the observed entry; refresh status before an explicit install/remove.
+Removal deletes only the exact current-user link to the admitted target. Empty
+directories and the small lock file remain. If app admission is unavailable,
+restore the app to its supported location before managing its link. No workspace
+data, mount, signing state or system registration is changed. Ordinary app
+installation, upgrade/removal and signed installed qualification remain separate.

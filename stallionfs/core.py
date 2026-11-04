@@ -201,10 +201,17 @@ def native_failure_details(error):
     return None
 
 
-def run(args, cwd=None, *, capture=True):
+def run(args, cwd=None, *, capture=True, internal_git=False):
     # Inherited Git routing variables must never redirect an operation elsewhere.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if internal_git:
+        from . import _bundle
+        try:
+            executable, env = _bundle.git_environment(env)
+        except (ValueError, OSError) as error:
+            raise StallionError('Invalid bundled Git: ' + str(error)) from error
+        args = [executable, *args[1:]]
     if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
         from ._benchmark_budget import command
         result = command(args, cwd=cwd, environment=env, persist_success=False)
@@ -232,7 +239,7 @@ def run(args, cwd=None, *, capture=True):
 def git(repo, *args):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
-                "-C", repo, *args])
+                "-C", repo, *args], internal_git=True)
 
 
 def identifier(value, length):
@@ -1037,5 +1044,5 @@ class Store(Lifecycle):
             if (source / "probe").read_bytes() != b"stallionfs\n":
                 raise StallionError("Copy-on-write isolation check failed")
         return {"backend": "apfs-clonefile", "isolation": "passed", "root": str(self.root),
-                "git": run(["git", "--version"]), "python": platform.python_version(),
+                "git": run(["git", "--version"], internal_git=True), "python": platform.python_version(),
                 "staging_entries": [p.name for p in (self.root / "staging").iterdir()]}
