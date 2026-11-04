@@ -25,8 +25,21 @@
 #include <inttypes.h>
 
 #define CPU_WORKERS 4
+#if defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+#define CPU_MARKER "stallionfs-delete-thread-cpu-v1"
+#define CPU_SCHEMA 1
+#define CPU_PROFILE_OPERATION DELETING
+#define CPU_PHASE0_NAME "entry_unlinkat"
+#define CPU_PHASE1_NAME "directory_unlinkat"
+enum cpu_phase { CPU_UNLINK_ENTRY, CPU_UNLINK_DIRECTORY, CPU_PHASES };
+#else
 #define CPU_MARKER "stallionfs-thread-cpu-v2"
+#define CPU_SCHEMA 2
+#define CPU_PROFILE_OPERATION CLONING
+#define CPU_PHASE0_NAME "fclonefileat"
+#define CPU_PHASE1_NAME "directory_metadata"
 enum cpu_phase { CPU_FCLONEFILEAT, CPU_DIRECTORY, CPU_PHASES };
+#endif
 enum cpu_status { CPU_OK, CPU_CLOCK, CPU_RANGE, CPU_NESTED, CPU_OVERFLOW, CPU_BOUND, CPU_JOIN, CPU_OPERATION };
 struct cpu_counter { uint64_t calls, failures, ns; };
 struct cpu_slot {
@@ -109,7 +122,7 @@ static struct cpu_profile cpu_open(enum operation operation, unsigned workers) {
     int saved = errno;
     struct cpu_profile profile = {.fd = -1};
     const char *path = getenv("STALLIONFS_DIAGNOSTIC_THREAD_CPU_REPORT");
-    if (operation == CLONING && path && path[0] && strlen(path) < PATH_MAX - sizeof(".pending")) {
+    if (operation == CPU_PROFILE_OPERATION && path && path[0] && strlen(path) < PATH_MAX - sizeof(".pending")) {
         char pending[PATH_MAX];
         strcpy(profile.path, path);
         snprintf(pending, sizeof(pending), "%s.pending", path);
@@ -140,7 +153,7 @@ static void cpu_report(struct cpu_profile *profile, unsigned requested, unsigned
     if (!status) for (unsigned i = 0; i <= started; i++) {
         struct cpu_slot *slot = &profile->slots[i];
         if (slot->status) { status = slot->status; break; }
-        uint64_t clone = slot->phase[CPU_FCLONEFILEAT].ns, directory = slot->phase[CPU_DIRECTORY].ns;
+        uint64_t clone = slot->phase[0].ns, directory = slot->phase[1].ns;
         if (UINT64_MAX - clone < directory || clone + directory > slot->total) { status = CPU_RANGE; break; }
         cpu_add(&sum, &sum.total, slot->total);
         for (unsigned phase = 0; phase < CPU_PHASES; phase++) {
@@ -156,21 +169,21 @@ static void cpu_report(struct cpu_profile *profile, unsigned requested, unsigned
     FILE *stream = fdopen(profile->fd, "w");
     int complete = 0;
     if (stream) {
-        fprintf(stream, "{\"schema\":2,\"marker\":\"" CPU_MARKER "\",\"status\":\"%s\","
+        fprintf(stream, "{\"schema\":%d,\"marker\":\"" CPU_MARKER "\",\"status\":\"%s\","
                 "\"workers_requested\":%u,\"workers_started\":%u,\"main_fallback\":%s,"
                 "\"scope\":\"instrumented run_tree main and worker spans\",\"counters\":",
-                names[status], requested, started, started ? "false" : "true");
+                CPU_SCHEMA, names[status], requested, started, started ? "false" : "true");
         if (status) fputs("null,\"slots\":[]}", stream);
         else {
-            fprintf(stream, "{\"total_cpu_ns\":%" PRIu64 ",\"fclonefileat\":", sum.total);
-            cpu_counter_json(stream, &sum.phase[CPU_FCLONEFILEAT]);
-            fputs(",\"directory_metadata\":", stream); cpu_counter_json(stream, &sum.phase[CPU_DIRECTORY]);
+            fprintf(stream, "{\"total_cpu_ns\":%" PRIu64 ",\"" CPU_PHASE0_NAME "\":", sum.total);
+            cpu_counter_json(stream, &sum.phase[0]);
+            fputs(",\"" CPU_PHASE1_NAME "\":", stream); cpu_counter_json(stream, &sum.phase[1]);
             fputs("},\"slots\":[", stream);
             for (unsigned i = 0; i <= started; i++) {
                 struct cpu_slot *slot = &profile->slots[i];
-                fprintf(stream, "%s{\"slot\":%u,\"total_cpu_ns\":%" PRIu64 ",\"fclonefileat\":", i ? "," : "", i, slot->total);
-                cpu_counter_json(stream, &slot->phase[CPU_FCLONEFILEAT]);
-                fputs(",\"directory_metadata\":", stream); cpu_counter_json(stream, &slot->phase[CPU_DIRECTORY]);
+                fprintf(stream, "%s{\"slot\":%u,\"total_cpu_ns\":%" PRIu64 ",\"" CPU_PHASE0_NAME "\":", i ? "," : "", i, slot->total);
+                cpu_counter_json(stream, &slot->phase[0]);
+                fputs(",\"" CPU_PHASE1_NAME "\":", stream); cpu_counter_json(stream, &slot->phase[1]);
                 fputc('}', stream);
             }
             fputs("]}", stream);
@@ -688,11 +701,13 @@ static int first_inode(enum operation operation, struct tree *tree, int input, i
                         const char *name, const struct stat *identity,
                         stallion_cancel_fn cancel, void *context) {
     if (operation == CLONING) {
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
         struct cpu_token token = cpu_enter(CPU_FCLONEFILEAT);
 #endif
         int result = fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
         int error = errno;
         cpu_leave(token, result != 0);
         errno = error;
@@ -792,7 +807,8 @@ done:
 }
 static int directory_metadata(struct tree *state, struct job *job, int input, int output,
                                stallion_cancel_fn cancel, void *context) {
-#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
     if (state->operation == CLONING) {
         struct cpu_token token = cpu_enter(CPU_DIRECTORY);
         int result = fcopyfile(input, output, NULL, COPYFILE_METADATA);
@@ -1020,7 +1036,20 @@ static void finish(struct tree *state, struct job *job) {
                     fail(state, errno, parent_fd, job->name);
                 else if (current.st_dev != state->device || current.st_ino != job->inode ||
                          !S_ISDIR(current.st_mode)) fail(state, ESTALE, parent_fd, job->name);
-                else if (unlinkat(parent_fd, job->name, AT_REMOVEDIR)) fail(state, errno, parent_fd, job->name);
+                else {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+                    struct cpu_token token = cpu_enter(CPU_UNLINK_DIRECTORY);
+#endif
+                    int removed = unlinkat(parent_fd, job->name, AT_REMOVEDIR);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+                    int saved = errno;
+                    cpu_leave(token, removed != 0);
+                    errno = saved;
+#endif
+                    if (removed) fail(state, errno, parent_fd, job->name);
+                }
             }
         }
         if (close(job->source)) fail(state, errno, parent_fd, job->name);
@@ -1101,7 +1130,18 @@ static void process(struct tree *state, struct job *job) {
         }
         if (type == DT_DIR) directory(state, job, name, entry->d_ino);
         else if (state->operation == DELETING) {
-            if (unlinkat(job->source, name, 0)) fail(state, errno, job->source, name);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+            struct cpu_token token = cpu_enter(CPU_UNLINK_ENTRY);
+#endif
+            int removed = unlinkat(job->source, name, 0);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+            int saved = errno;
+            cpu_leave(token, removed != 0);
+            errno = saved;
+#endif
+            if (removed) fail(state, errno, job->source, name);
         } else if (type == DT_REG || type == DT_LNK) {
             if (clone_leaf(state, job, name, type, entry->d_ino))
                 fail(state, errno, job->source, name);

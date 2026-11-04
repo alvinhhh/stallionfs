@@ -18,6 +18,14 @@ from native_phase_probe import ProbeError, clean_capture, digest, publish, requi
 
 MARKER = 'directory-clone-feasibility-v1'
 MAX_SMALL_CASES = 19
+FIRST_RECIPE = 'metadata-hardlinks-symlinks-flags'
+DETAIL_MAX_ENTRIES = 64
+DETAIL_MAX_BYTES = 32768
+DETAIL_ENTRY_FIELDS = frozenset(('entry_id', 'source_kind', 'destination_kind', 'source_flags',
+    'destination_flags', 'mtime_equal', 'mtime_delta_ns', 'source_acl', 'destination_acl', 'acl_equal'))
+DETAIL_FIELDS = frozenset(('schema', 'status', 'observation_phase', 'entry_count', 'entries',
+    'hardlink_scope', 'source_hardlink_groups', 'destination_hardlink_groups', 'source_unchanged',
+    'outside_sentinel_unchanged', 'destination_independent'))
 COVERAGE = ('ownership', 'metadata', 'hardlink_classes', 'symlinks', 'flags', 'setid', 'inherited_acl')
 PIN_PATHS = ('stallionfs/_tree.c', 'stallionfs/_tree.h', 'stallionfs/_benchmark_budget.py',
              'tests/perf/native_metrics.py', 'tests/native_directory_clone_probe.c',
@@ -62,22 +70,105 @@ def protocol(raw):
     return value
 
 
-def verdict(expected, source_after, destination, outside_before, outside_after, correct, preserved):
+def first_recipe_detail(source, destination, summary, independent):
+    """Project captured snapshots onto a bounded, path-free metadata schema."""
+    def unavailable(reason):
+        return {'schema': 1, 'status': 'unavailable', 'reason': reason}
+
+    if (type(summary) is not dict or summary.get('source_unchanged') is not True or summary.get('outside_sentinel_unchanged') is not True
+            or independent is not True):
+        return unavailable('identity_unverified')
+    try:
+        left, right = source['entries'], destination['entries']
+        require(type(left) is dict and type(right) is dict and type(source['unavailable_fields']) is list
+                and type(destination['unavailable_fields']) is list and not source['unavailable_fields']
+                and not destination['unavailable_fields'] and all(type(entry) is dict for entry in left.values())
+                and all(type(entry) is dict for entry in right.values()), 'detail_schema_invalid')
+        require(0 < len(left) <= DETAIL_MAX_ENTRIES and 0 < len(right) <= DETAIL_MAX_ENTRIES,
+                'detail_bounds_exceeded')
+        names = left.keys() | right.keys()
+        require(len(names) <= DETAIL_MAX_ENTRIES, 'detail_bounds_exceeded')
+        require(all(type(name) is str for name in names), 'detail_schema_invalid')
+        ids = {name: f'e{index:04}' for index, name in enumerate(sorted(names), 1)}
+
+        def metadata(entry):
+            if entry is None: return (None,) * 5
+            require(type(entry) is dict and type(entry['kind']) is str
+                    and entry['kind'] in ('file', 'directory', 'symlink'), 'detail_schema_invalid')
+            flags, mtime, acl = entry['flags'], entry['mtime_ns'], entry['acl']
+            require(type(flags) is int and 0 <= flags <= 0xffffffff and type(mtime) is int
+                    and -(1 << 63) <= mtime < (1 << 63), 'detail_schema_invalid')
+            require(type(acl) is dict and set(acl) == {'text_hex', 'unavailable'}
+                    and acl['unavailable'] is None, 'detail_schema_invalid')
+            encoded = acl['text_hex']
+            require(encoded is None or (type(encoded) is str and len(encoded) <= 16384
+                    and len(encoded) % 2 == 0 and re.fullmatch('[0-9a-f]*', encoded) is not None), 'detail_schema_invalid')
+            text = bytes.fromhex(encoded) if encoded is not None else b''
+            lines = [line.strip() for line in text.rstrip(b'\x00').splitlines() if line.strip()]
+            require(not lines or lines[0].startswith(b'!#acl '), 'detail_schema_invalid')
+            state = 'nonempty' if any(not line.startswith(b'!#') for line in lines) else 'empty'
+            return entry['kind'], flags, mtime, state, encoded
+
+        entries = []
+        for name, entry_id in ids.items():
+            a, b = metadata(left.get(name)), metadata(right.get(name))
+            delta = b[2] - a[2] if a[0] is not None and b[0] is not None else None
+            require(delta is None or -(1 << 63) <= delta < (1 << 63), 'detail_schema_invalid')
+            entry = {'entry_id': entry_id, 'source_kind': a[0], 'destination_kind': b[0],
+                     'source_flags': a[1], 'destination_flags': b[1],
+                     'mtime_equal': delta == 0 if delta is not None else None, 'mtime_delta_ns': delta,
+                     'source_acl': a[3], 'destination_acl': b[3],
+                     'acl_equal': a[4] == b[4] if delta is not None else None}
+            require(set(entry) == DETAIL_ENTRY_FIELDS, 'detail_schema_invalid')
+            entries.append(entry)
+
+        def groups(snapshot, observed):
+            raw = snapshot['hardlink_groups']
+            require(type(raw) is list and len(raw) <= DETAIL_MAX_ENTRIES // 2, 'detail_schema_invalid')
+            seen, normalized = set(), []
+            for group in raw:
+                require(type(group) is list and 2 <= len(group) <= DETAIL_MAX_ENTRIES
+                        and all(type(name) is str and name in observed for name in group), 'detail_schema_invalid')
+                require(len(set(group)) == len(group) and not seen.intersection(group), 'detail_schema_invalid')
+                kinds = {observed[name]['kind'] for name in group}
+                require(len(kinds) == 1 and kinds <= {'file', 'symlink'}, 'detail_schema_invalid')
+                seen.update(group); normalized.append(sorted(ids[name] for name in group))
+            return sorted(normalized)
+
+        detail = {'schema': 1, 'status': 'available', 'observation_phase': 'post_clone_pre_alias_write',
+                  'entry_count': len(entries), 'entries': entries,
+                  'hardlink_scope': 'within_fixture; omitted leaf IDs are singletons',
+                  'source_hardlink_groups': groups(source, left),
+                  'destination_hardlink_groups': groups(destination, right),
+                  'source_unchanged': True, 'outside_sentinel_unchanged': True, 'destination_independent': True}
+        require(set(detail) == DETAIL_FIELDS, 'detail_schema_invalid')
+        require(len(json.dumps(detail).encode()) <= DETAIL_MAX_BYTES, 'detail_bounds_exceeded')
+        return detail
+    except ProbeError as error:
+        return unavailable(str(error) if str(error) in ('detail_schema_invalid', 'detail_bounds_exceeded') else 'detail_schema_invalid')
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return unavailable('detail_schema_invalid')
+
+
+def verdict(expected, source_after, destination, outside_before, outside_after, correct, preserved, *, include_detail=False):
     source_ok = correct.verify_source(expected, source_after)['unchanged'] is True
     sentinel_ok = correct.verify_source(outside_before, outside_after)['unchanged'] is True
     checks = correct.verify_clone(expected, destination)
     sharing = correct.clone_sharing(source_after, destination)['full_data_stream_sharing'] is True
     fields = sorted({row['field'] for row in checks.get('candidate_losses', [])})
     require(set(fields) <= set(correct.FIELDS) | {'entry', 'hardlink_groups', 'metadata_capabilities'}, 'comparison_invalid')
-    return {'destination_preserved': preserved(checks), 'source_unchanged': source_ok,
+    result = {'destination_preserved': preserved(checks), 'source_unchanged': source_ok,
             'outside_sentinel_unchanged': sentinel_ok, 'full_data_stream_sharing': sharing,
             'difference_counts': {field: sum(row['field'] == field for row in checks['candidate_losses']) for field in fields},
             'passed': preserved(checks) and source_ok and sentinel_ok and sharing}
+    if include_detail:
+        result['first_recipe_detail'] = first_recipe_detail(expected, destination, result, checks.get('independent_clone'))
+    return result
 
 
 def recipes():
     """One attempt per recipe; existing assertions remain strict, with no jobs sweep."""
-    return [('metadata-hardlinks-symlinks-flags', None), ('setid', None),
+    return [(FIRST_RECIPE, None), ('setid', None),
             *[('inherit-' + name, None) for name in ('clean', 'parent-read', 'owner', 'foreign-read', 'foreign-xattr')],
             *[('parent-' + name, None) for name in ('shared', 'sticky', 'deny', 'current-user', 'other-principal')],
             *[('existing-' + name, (errno.EEXIST,)) for name in ('file', 'directory', 'link', 'dangling')],
@@ -156,7 +247,7 @@ def prepare(base, name, native_fixtures, correct, run):
     return source, parent, outside, expected_error, protected, coverage
 
 
-def probe(binary, wheel, helper, scratch, output, revision):
+def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only=False):
     from stallionfs._benchmark_budget import command
     import stallionfs
     import fileops
@@ -169,6 +260,8 @@ def probe(binary, wheel, helper, scratch, output, revision):
               'helper_invocations': 0,
               'cleanup': 'not_started', 'benchmark_verdict': 'not_applicable',
               'concurrency_and_cancellation': 'unresolved'}
+    if first_recipe_only:
+        result.update(scope='hosted directory-clone first-recipe detail only', first_recipe_only=True, full_gate_qualified=False)
     private = identity = None
     safe_to_clean = True
     protected_paths = []
@@ -289,7 +382,8 @@ def probe(binary, wheel, helper, scratch, output, revision):
                 require(native['native_return'] == 0 and native['clone_calls'] == 1, 'clone_failed')
                 after = correct.snapshot(destination, observe_sharing=True)
                 source_after = correct.snapshot(source, observe_sharing=True)
-                row.update(verdict(expected, source_after, after, outside_before, correct.snapshot(outside), correct, native_suite.preserved))
+                row.update(verdict(expected, source_after, after, outside_before, correct.snapshot(outside), correct,
+                                   native_suite.preserved, include_detail=first_recipe_only and name == FIRST_RECIPE))
                 protected_paths.extend(destination / relative for relative in protected)
                 if name == 'metadata-hardlinks-symlinks-flags' and row['passed']:
                     # Existing cross-directory alias isolation assertion, after the immutable snapshot comparison.
@@ -306,18 +400,26 @@ def probe(binary, wheel, helper, scratch, output, revision):
         result['stage'] = 'small_recipes'
         cases = recipes()
         require(len(cases) == MAX_SMALL_CASES, 'case_plan_invalid')
-        for index, (name, _) in enumerate(cases):
+        if first_recipe_only:
+            require(cases[0] == (FIRST_RECIPE, None), 'case_plan_invalid')
+        for index, (name, _) in enumerate(cases[:1] if first_recipe_only else cases):
             base = private / f'case-{index:02}'; base.mkdir(mode=0o700)
             safe_to_clean = False
             execute(base, name)
-        require(len(result['cases']) == MAX_SMALL_CASES and all(row['passed'] for row in result['cases']), 'small_gate_failed')
-        require(all(any(row['coverage'].get(field) is True for row in result['cases']) for field in COVERAGE),
-                'coverage_incomplete')
-        result['stage'] = 'document_recipe'
-        base = private / 'docs'; base.mkdir(mode=0o700)
-        safe_to_clean = False
-        execute(base, 'docs_5k_100mb', docs=True)
-        result['status'] = 'feasible_controlled_fixture_only'
+        if first_recipe_only:
+            require(len(result['cases']) == 1 and result['helper_invocations'] == 1 and result['clone_calls'] == 1
+                    and result['cases'][0].get('first_recipe_detail', {}).get('status') == 'available',
+                    'first_recipe_detail_unavailable')
+            result['status'] = 'first_recipe_diagnostic_complete'
+        else:
+            require(len(result['cases']) == MAX_SMALL_CASES and all(row['passed'] for row in result['cases']), 'small_gate_failed')
+            require(all(any(row['coverage'].get(field) is True for row in result['cases']) for field in COVERAGE),
+                    'coverage_incomplete')
+            result['stage'] = 'document_recipe'
+            base = private / 'docs'; base.mkdir(mode=0o700)
+            safe_to_clean = False
+            execute(base, 'docs_5k_100mb', docs=True)
+            result['status'] = 'feasible_controlled_fixture_only'
         result['stage'] = 'complete'
     except BaseException as error:
         result['error'] = str(error) if isinstance(error, ProbeError) else SETUP_ERRORS.get(result['stage'], 'probe_incomplete')
@@ -342,7 +444,8 @@ def probe(binary, wheel, helper, scratch, output, revision):
                 except BaseException:
                     result['status'] = 'incomplete'; result['stage'] = 'cleanup'; result['error'] = 'cleanup_failed'
         publish(output, result)
-    return 0 if result['status'] == 'feasible_controlled_fixture_only' and result['cleanup'] == 'complete' else 1
+    complete = 'first_recipe_diagnostic_complete' if first_recipe_only else 'feasible_controlled_fixture_only'
+    return 0 if result['status'] == complete and result['cleanup'] == 'complete' else 1
 
 
 def main():
@@ -350,9 +453,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('binary', 'wheel', 'helper', 'scratch', 'output'): parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--revision', required=True)
+    parser.add_argument('--first-recipe-only', action='store_true')
     args = parser.parse_args()
     try:
-        return probe(args.binary, args.wheel, args.helper, args.scratch, args.output, args.revision)
+        return probe(args.binary, args.wheel, args.helper, args.scratch, args.output, args.revision,
+                     first_recipe_only=args.first_recipe_only)
     except BaseException:
         return 1
 
