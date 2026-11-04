@@ -137,7 +137,8 @@ class DirectoryProbe(unittest.TestCase):
 
     def run_probe(self, *, response=None, capture=None, missing_coverage=False, changed_pin=False,
                   source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False,
-                  first_recipe_only=False, destination_preserved=True):
+                  first_recipe_only=False, destination_preserved=True, restore_first_recipe=False,
+                  restore_status='restored_pending_final_verifiers', restore_final_preserved=True, restore_close=True):
         cases = [(probe.FIRST_RECIPE if first_recipe_only and i == 0 else f'controlled-{i:02}',
                   expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
         def prepare(base, name, *_):
@@ -154,6 +155,15 @@ class DirectoryProbe(unittest.TestCase):
         snapshot = detail_snapshot() if first_recipe_only else {'entries': {}, 'unavailable_fields': []}
         snapshots = mock.Mock(return_value=snapshot)
         checks = {'strict_equal': destination_preserved, 'sparse_preserved': True, 'independent_clone': True, 'candidate_losses': []}
+        self.restorer = mock.Mock()
+        self.restorer.summary = {'status': 'incomplete', 'error': 'restoration_close_failed'}
+        self.restorer.close.return_value = restore_close
+        def reconstruct(_):
+            checks['strict_equal'] = restore_final_preserved
+            return {'status': restore_status}
+        self.restorer.restore.side_effect = reconstruct
+        restoration_module = types.ModuleType('native_directory_restore')
+        restoration_module.Session = mock.Mock(return_value=self.restorer)
         product = types.ModuleType('stallionfs'); product.__file__ = '/private/tmp/installed/stallionfs/__init__.py'
         budget = types.ModuleType('stallionfs._benchmark_budget')
         pin_count = 0
@@ -190,7 +200,8 @@ class DirectoryProbe(unittest.TestCase):
             return {'unchanged': not (source_changed and source_verifications == 2)}
         output = self.root / 'status.json'
         with ExitStack() as stack:
-            stack.enter_context(mock.patch.dict(sys.modules, {'stallionfs': product, 'stallionfs._benchmark_budget': budget}))
+            stack.enter_context(mock.patch.dict(sys.modules, {'stallionfs': product, 'stallionfs._benchmark_budget': budget,
+                                                              'native_directory_restore': restoration_module}))
             stack.enter_context(mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true' if host else 'false',
                 'STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED': '1', 'RUNNER_TEMP': str(self.root)}))
             stack.enter_context(mock.patch.object(sys, 'platform', 'darwin'))
@@ -209,8 +220,42 @@ class DirectoryProbe(unittest.TestCase):
             stack.enter_context(mock.patch.object(native_suite, 'cache_prepare', side_effect=AssertionError('No cache/timing work')))
             self.removals = stack.enter_context(mock.patch.object(probe.shutil, 'rmtree', wraps=shutil.rmtree))
             code = probe.probe(self.binary, self.wheel, self.helper, self.scratch, output, 'a' * 40,
-                               first_recipe_only=first_recipe_only)
+                               first_recipe_only=first_recipe_only, restore_first_recipe=restore_first_recipe)
         return code, json.loads(output.read_text()), snapshots
+
+    def test_restoration_keeps_raw_negative_and_runs_final_verifiers_with_exactly_one_helper_and_no_docs(self):
+        code, value, _ = self.run_probe(first_recipe_only=True, restore_first_recipe=True, destination_preserved=False)
+        self.assertEqual(code, 0); self.assertEqual(value['status'], 'first_recipe_restoration_complete')
+        self.assertFalse(value['full_gate_qualified']); self.assertFalse(value['docs_attempted'])
+        self.assertEqual(value['helper_invocations'], 1); self.assertEqual(value['clone_calls'], 1)
+        self.assertFalse(value['cases'][0]['raw_clone']['passed']); self.assertTrue(value['cases'][0]['passed'])
+        self.restorer.restore.assert_called_once(); self.restorer.close.assert_called_once()
+        self.docs.assert_not_called()
+
+    def test_restoration_failure_or_unknown_completion_never_rescans_or_starts_later_work(self):
+        _, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, capture='uncertain')
+        self.restorer.restore.assert_not_called()
+        self.assertEqual(snapshots.call_count, self.last_snapshot_count)
+        self.assertEqual(value['target_completion'], 'unknown'); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.setUp()
+        _, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, restore_status='incomplete')
+        self.assertEqual(value['error'], 'restoration_incomplete'); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.assertEqual(snapshots.call_count, self.last_snapshot_count + 3)
+        self.docs.assert_not_called()
+
+    def test_restoration_cannot_override_failed_final_verifier_or_close_failure(self):
+        for options, error in (({'restore_final_preserved': False}, 'correctness_failed'),
+                               ({'restore_close': False}, 'restoration_close_failed')):
+            with self.subTest(options=options):
+                self.setUp()
+                code, value, _ = self.run_probe(first_recipe_only=True, restore_first_recipe=True, **options)
+                self.assertEqual(code, 1); self.assertEqual(value['status'], 'incomplete')
+                self.assertEqual(value['error'], error); self.assertEqual(value['cleanup'], 'retained_ephemeral')
+
+    def test_restoration_flag_requires_first_recipe_scope_before_any_helper(self):
+        code, value, _ = self.run_probe(restore_first_recipe=True)
+        self.assertEqual(code, 1); self.assertEqual(value['error'], 'restoration_scope_invalid')
+        self.assertEqual(value['helper_invocations'], 0); self.assertFalse(value['docs_attempted'])
 
     def test_successful_first_recipe_only_stops_after_one_invocation_without_qualifying_full_gate(self):
         code, value, _ = self.run_probe(first_recipe_only=True)
@@ -373,9 +418,13 @@ class DirectoryProbe(unittest.TestCase):
             self.assertIn(f"if: inputs.mode == '{mode}'", text)
         directory_step = text.split('      - name: Collect hosted directory feasibility\n')[1].split('      - name: Show correctness')[0]
         self.assertNotIn('native_suite.py', directory_step); self.assertNotIn('thread-cpu', directory_step)
-        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--first-recipe-only']", directory_step)
+        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--first-recipe-only', '--restore-first-recipe']", directory_step)
+        self.assertEqual(text.count("'--first-recipe-only'"), 1)
+        self.assertEqual(text.count("'--restore-first-recipe'"), 1)
         self.assertIn('directory-feasibility-status.json', directory_step)
         fallback = directory_step.split('          if not output.exists():\n')[1]
+        self.assertIn("'scope': 'hosted first-recipe selective restoration only'", fallback)
+        self.assertIn("'first_recipe_only': True, 'restoration_only': True, 'full_gate_qualified': False", fallback)
         self.assertIn("'docs_attempted': None", fallback)
         self.assertIn("'helper_invocations': None", fallback)
         self.assertIn("'clone_calls': None", fallback)
