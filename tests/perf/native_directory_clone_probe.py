@@ -257,7 +257,8 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
     import native_suite
     result = {'schema': 1, 'scope': 'hosted directory-clone feasibility only', 'status': 'incomplete',
               'stage': 'host_checks',
-              'target_completion': 'not_started', 'cases': [], 'docs_attempted': False, 'clone_calls': 0,
+              'setup_completion': 'not_started', 'target_completion': 'not_started', 'helper_launch': 'not_started',
+              'restoration_completion': 'not_started', 'cases': [], 'docs_attempted': False, 'clone_calls': 0,
               'helper_invocations': 0,
               'cleanup': 'not_started', 'benchmark_verdict': 'not_applicable',
               'concurrency_and_cancellation': 'unresolved'}
@@ -299,20 +300,24 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             require(pins(checkout) == pinned and all(digest(path) == binaries[key] for path, key in
                     ((helper, 'helper_sha256'), (binary, 'cli_sha256'), (wheel, 'wheel_sha256'))), 'source_changed')
 
-        def run(argv, timeout=10):
+        def run(argv, timeout=10, *, target=False):
             nonlocal safe_to_clean
             receipt = {}
             safe_to_clean = False
+            completion = 'target_completion' if target else 'setup_completion'
+            result[completion] = 'unknown'
+            if target: result['helper_launch'] = 'unknown'
             try:
                 child = command(argv, timeout=timeout, umask=0o077, receipt=receipt, output_limit=65536)
             except BaseException:
-                result['target_completion'] = 'unknown'
-                raise ProbeError('target_completion_unknown') from None
+                raise ProbeError(completion + '_unknown') from None
+            finally:
+                if target and type(receipt.get('pid')) is int and receipt['pid'] > 0:
+                    result['helper_launch'] = 'observed'
             if not clean_capture(receipt):
-                result['target_completion'] = 'unknown'
-                raise ProbeError('target_completion_unknown')
+                raise ProbeError(completion + '_unknown')
             # Transport is complete; case correctness and cleanup remain unproven.
-            result['target_completion'] = 'complete'
+            result[completion] = 'complete'
             return child
 
         result['stage'] = 'volume'
@@ -352,13 +357,20 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             restoration = None
             if restore_first_recipe:
                 require(first_recipe_only and name == FIRST_RECIPE and not docs, 'restoration_scope_invalid')
-                from native_directory_restore import Session
+                result['stage'] = 'restoration_admission'
+                import native_directory_restore as restore
                 try:
-                    restoration = Session(base, source.name, parent.name, expected,
+                    restoration = restore.Session(base, source.name, parent.name, expected,
                         cancelled=lambda: time.monotonic() >= float(os.environ['STALLIONFS_BENCHMARK_DEADLINE']))
-                except BaseException:
+                except restore.AdmissionError as error:
+                    result['restoration_admission'] = error.report
                     raise ProbeError('restoration_admission_failed') from None
+                except BaseException as error:
+                    result['restoration_admission'] = restore.refusal_report(error)
+                    raise ProbeError('restoration_admission_failed') from None
+                result['restoration_admission'] = restoration.admission_report()
                 restoration_sessions.append(restoration)
+                result['stage'] = 'small_recipes'
             protected_paths.extend(source / relative for relative in protected)
             source_inode = source_info.st_ino + (name == 'stale-source-pin')
             argv = [str(helper), str(base), str(base_info.st_dev), str(base_info.st_ino), source.name, parent.name, 'output',
@@ -371,7 +383,7 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             row['clone_calls'] = None
             result['helper_invocations'] += 1
             if docs: result['docs_attempted'] = True
-            child = run(argv, timeout=60 if docs else 10)
+            child = run(argv, timeout=60 if docs else 10, target=True)
             try:
                 native = protocol(child.stdout)
                 require(not child.stderr, 'protocol_invalid')
@@ -404,7 +416,9 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                     require(raw['source_unchanged'] and raw['outside_sentinel_unchanged']
                             and raw.get('first_recipe_detail', {}).get('destination_independent') is True
                             and raw['full_data_stream_sharing'], 'restoration_precheck_failed')
+                    result['restoration_completion'] = 'incomplete'
                     row['restoration'] = restoration.restore(after)
+                    result['restoration_completion'] = row['restoration']['status']
                     require(row['restoration']['status'] == 'restored_pending_final_verifiers', 'restoration_incomplete')
                     # Every existing strict verifier and alias-isolation assertion still runs.
                     after = correct.snapshot(destination, observe_sharing=True)
@@ -452,7 +466,9 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
         result['error'] = str(error) if isinstance(error, ProbeError) else SETUP_ERRORS.get(result['stage'], 'probe_incomplete')
     finally:
         for restoration in restoration_sessions:
-            if not restoration.close():
+            closed = restoration.close()
+            result['restoration_admission'] = restoration.admission_report()
+            if not closed:
                 safe_to_clean = False
                 result.update(status='incomplete', error='restoration_close_failed')
                 for row in result['cases']:

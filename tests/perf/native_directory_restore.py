@@ -26,6 +26,32 @@ class RestoreError(Exception):
     """Only fixed codes may leave this module; never paths or native messages."""
 
 
+ADMISSION_PHASES = frozenset(('ops_binding', 'roots', 'schema', 'entry_identity',
+    'acl', 'payload', 'symlink', 'source_closure', 'complete', 'unknown'))
+REFUSAL_CODES = frozenset(('restoration_refused', 'platform_unavailable', 'acl_unavailable',
+    'acl_changed', 'payload_changed', 'identity_changed', 'source_changed', 'native_error',
+    'api_unavailable', 'admission_error'))
+
+
+def error_number(error):
+    value = error.errno if isinstance(error, OSError) else None
+    return value if type(value) is int and 0 < value <= 65535 else None
+
+
+class AdmissionError(RestoreError):
+    def __init__(self, report):
+        super().__init__('restoration_admission_failed')
+        self.report = dict(report, close=dict(report['close']))
+
+
+def refusal_report(error, phase='unknown', close=None):
+    code = (str(error) if isinstance(error, RestoreError) else 'native_error' if isinstance(error, OSError)
+            else 'api_unavailable' if isinstance(error, AttributeError) else 'admission_error')
+    return {'status': 'refused', 'phase': phase if phase in ADMISSION_PHASES else 'unknown',
+        'refusal_code': code if code in REFUSAL_CODES else 'admission_error', 'errno': error_number(error),
+        'close': dict(close) if close is not None else {'status': 'unknown', 'attempts': 0, 'failures': 0, 'errno': None}}
+
+
 def need(condition, code='restoration_refused'):
     if not condition:
         raise RestoreError(code)
@@ -124,7 +150,7 @@ class DarwinOps:
         for name, arguments, result in (
             ('acl_get_fd_np', [integer, integer], pointer), ('acl_init', [integer], pointer),
             ('acl_free', [pointer], integer), ('acl_to_text', [pointer, ctypes.POINTER(ctypes.c_ssize_t)], pointer),
-            ('acl_valid_fd_np', [integer, integer, pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
+            ('acl_valid', [pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
             ('acl_get_entry', [pointer, integer, ctypes.POINTER(pointer)], integer),
             ('acl_get_tag_type', [pointer, ctypes.POINTER(integer)], integer),
             ('acl_get_flagset_np', [pointer, ctypes.POINTER(pointer)], integer),
@@ -141,32 +167,53 @@ class DarwinOps:
             raise OSError(ctypes.get_errno() or errno.EIO, 'descriptor operation failed')
         return value
 
+    def call(self, function, *arguments):
+        ctypes.set_errno(0)
+        return self.checked(function(*arguments))
+
+    def free(self, pointer):
+        primary = sys.exc_info()[1]
+        try:
+            self.call(self.libc.acl_free, pointer)
+        except BaseException:
+            # Preserve the original failure and its captured errno.
+            if primary is None:
+                raise
+
     def acl(self, fd):
         ctypes.set_errno(0)
         acl = self.libc.acl_get_fd_np(fd, 0x100)
-        if not acl and ctypes.get_errno() == errno.ENOENT:
+        failure = ctypes.get_errno()
+        if not acl and failure == errno.ENOENT:
+            ctypes.set_errno(0)
             acl = self.libc.acl_init(0)
-        need(bool(acl), 'acl_unavailable')
+            failure = ctypes.get_errno()
+        if not acl:
+            raise OSError(failure or errno.EIO, 'ACL unavailable')
         return acl
 
     def acl_text(self, acl):
         length = ctypes.c_ssize_t()
+        ctypes.set_errno(0)
         text = self.libc.acl_to_text(acl, ctypes.byref(length))
-        need(bool(text) and 0 <= length.value <= 16384, 'acl_unavailable')
+        failure = ctypes.get_errno()
+        if not text:
+            raise OSError(failure or errno.EIO, 'ACL serialization unavailable')
         try:
+            need(0 <= length.value <= 16384, 'acl_unavailable')
             return ctypes.string_at(text, length.value).hex()
         finally:
-            self.checked(self.libc.acl_free(text))
+            self.free(text)
 
     def admit_acl(self, fd, row):
         acl = self.acl(fd)
         try:
-            self.checked(self.libc.acl_valid_fd_np(fd, 0x100, acl))
+            self.call(self.libc.acl_valid, acl)
             text = self.acl_text(acl)
             global_flags = ctypes.c_void_p()
-            self.checked(self.libc.acl_get_flagset_np(acl, ctypes.byref(global_flags)))
+            self.call(self.libc.acl_get_flagset_np, acl, ctypes.byref(global_flags))
             for bit in (1, 1 << 17):
-                need(self.checked(self.libc.acl_get_flag_np(global_flags, bit)) == 0)
+                need(self.call(self.libc.acl_get_flag_np, global_flags, bit) == 0)
             # No-ACL and a validated empty representation are equivalent only for
             # this admission read; final copy equality keeps its original rules.
             if row['acl']['text_hex'] is not None:
@@ -180,36 +227,36 @@ class DarwinOps:
                     break
                 count += 1; need(count <= 128)
                 tag = ctypes.c_int(); flags = ctypes.c_void_p(); permissions = ctypes.c_uint64()
-                self.checked(self.libc.acl_get_tag_type(entry, ctypes.byref(tag)))
-                self.checked(self.libc.acl_get_flagset_np(entry, ctypes.byref(flags)))
-                self.checked(self.libc.acl_get_permset_mask_np(entry, ctypes.byref(permissions)))
+                self.call(self.libc.acl_get_tag_type, entry, ctypes.byref(tag))
+                self.call(self.libc.acl_get_flagset_np, entry, ctypes.byref(flags))
+                self.call(self.libc.acl_get_permset_mask_np, entry, ctypes.byref(permissions))
                 need(tag.value == 1 and not permissions.value & ~(2 | 128 | 512 | 2048 | (1 << 20)))
                 for bit in (16, 32, 64, 128, 256):
-                    value = self.checked(self.libc.acl_get_flag_np(flags, bit)); need(value == 0)
+                    value = self.call(self.libc.acl_get_flag_np, flags, bit); need(value == 0)
                 index = -1
             need(row['acl']['text_hex'] is not None or count == 0, 'acl_changed')
         finally:
-            self.checked(self.libc.acl_free(acl))
+            self.free(acl)
 
     def copy_acl(self, source, destination):
         acl = self.acl(source)
         try:
-            self.checked(self.libc.acl_valid_fd_np(destination, 0x100, acl))
-            self.checked(self.libc.acl_set_fd_np(destination, acl, 0x100))
+            self.call(self.libc.acl_valid, acl)
+            self.call(self.libc.acl_set_fd_np, destination, acl, 0x100)
         finally:
-            self.checked(self.libc.acl_free(acl))
+            self.free(acl)
 
     def payload(self, fd, row):
         # Read every xattr on the held object, including the resource fork.
-        length = self.checked(self.libc.flistxattr(fd, None, 0, 0)); need(length <= 65536)
+        length = self.call(self.libc.flistxattr, fd, None, 0, 0); need(length <= 65536)
         names = ctypes.create_string_buffer(max(length, 1))
-        need(self.checked(self.libc.flistxattr(fd, names, length, 0)) == length)
+        need(self.call(self.libc.flistxattr, fd, names, length, 0) == length)
         need(not length or names.raw[length - 1] == 0)
         attributes = {}
         for name in filter(None, names.raw[:length].split(b'\x00')):
-            length = self.checked(self.libc.fgetxattr(fd, name, None, 0, 0, 0)); need(length <= 1048576)
+            length = self.call(self.libc.fgetxattr, fd, name, None, 0, 0, 0); need(length <= 1048576)
             value = ctypes.create_string_buffer(max(length, 1))
-            need(self.checked(self.libc.fgetxattr(fd, name, value, length, 0, 0)) == length)
+            need(self.call(self.libc.fgetxattr, fd, name, value, length, 0, 0) == length)
             need(name.hex() not in attributes)
             attributes[name.hex()] = value.raw[:length].hex()
         need(attributes == row['xattrs'], 'payload_changed')
@@ -226,7 +273,7 @@ class DarwinOps:
         times = (Timespec * 2)(Timespec(0, -2), Timespec(*divmod(mtime, 1000000000)))  # Darwin UTIME_OMIT
         function = self.libc.futimens
         function.argtypes = [ctypes.c_int, ctypes.POINTER(Timespec)]; function.restype = ctypes.c_int
-        self.checked(function(fd, times))
+        self.call(function, fd, times)
 
     open = staticmethod(os.open)
     close = staticmethod(os.close)
@@ -243,14 +290,18 @@ class DarwinOps:
 class Session:
     """Bounded owned FD inventory, retained across the existing native helper."""
     def __init__(self, base, source, parent, expected, *, ops=None, cancelled=None):
-        self.ops = ops if ops is not None else DarwinOps()
         self.cancelled = cancelled if cancelled is not None else lambda: False
         self.expected = expected; self.source = {}; self.destination = {}; self.owned = []
         self.changed_flags = {}; self.changed_modes = {}; self.failure = None; self.bindings = []
         self.summary = {'status': 'not_started', 'mutation_attempts': 0, 'alias_replacements': 0,
                         'acl_repairs': 0, 'tracking_repairs': 0, 'directory_times': 0,
                         'recovery': 'not_needed'}
+        self.close_outcome = {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None}
+        self.admission = {'status': 'refused', 'phase': 'ops_binding', 'refusal_code': None, 'errno': None,
+                          'close': self.close_outcome}
         try:
+            self.ops = ops if ops is not None else DarwinOps()
+            self.admission['phase'] = 'roots'
             self.root = self.take(self.ops.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC))
             info = self.ops.fstat(self.root)
             need(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
@@ -261,13 +312,27 @@ class Session:
             self.pins = [(fd, self.ops.fstat(fd)) for fd in (self.root, self.source_root, self.parent)]
             self.bindings = [(self.root, source, self.source_root), (self.root, parent, self.parent)]
             self.capture(self.source_root, expected, self.source)
-        except BaseException:
-            self.close(); raise
+            self.admission.update(status='complete', phase='complete')
+        except BaseException as error:
+            # Capture the primary errno before close can change thread errno.
+            report = refusal_report(error, self.admission['phase'], self.close_outcome)
+            self.close()
+            report['close'] = dict(self.close_outcome)
+            raise AdmissionError(report) from None
+
+    def admission_report(self):
+        # Admission is constructor-only; close covers this session's retained FDs.
+        return dict(self.admission, close=dict(self.close_outcome))
+
+    def note_admission(self, phase):
+        if self.admission['status'] != 'complete':
+            self.admission['phase'] = phase
 
     def take(self, fd):
-        self.owned.append(fd); return fd
+        self.owned.append(fd); self.close_outcome['status'] = 'deferred'; return fd
 
     def capture(self, root, snapshot, records):
+        self.note_admission('schema')
         need(snapshot.get('unavailable_fields') == [] and 0 < len(snapshot['entries']) <= MAX_ENTRIES)
         total = 0
         for row in snapshot['entries'].values():
@@ -280,12 +345,14 @@ class Session:
                 total += row['size']
         need(total <= 32 * 1024 * 1024)
         for name in sorted(snapshot['entries'], key=lambda name: (name.count('/') + bool(name), name)):
+            self.note_admission('entry_identity')
             parent, leaf = relative(name); row = snapshot['entries'][name]
             parent_fd = records[parent]['fd'] if name else root
             flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
             flags |= os.O_SYMLINK if row['kind'] == 'symlink' else os.O_NOFOLLOW
             if row['kind'] == 'directory': flags |= os.O_DIRECTORY
             fd = self.take(self.ops.open(leaf, flags, dir_fd=parent_fd)) if name else root
+            self.note_admission('entry_identity')
             info = self.ops.fstat(fd)
             need((info.st_dev, info.st_ino) == tuple(row['device_inode']) and stat.S_IMODE(info.st_mode) == row['mode']
                  and info.st_uid == row['uid'] and info.st_gid == row['gid'] and info.st_nlink == row['link_count']
@@ -293,11 +360,17 @@ class Session:
                  and info.st_ctime_ns == row['ctime_ns'], 'identity_changed')
             need((stat.S_ISDIR(info.st_mode) if row['kind'] == 'directory' else
                   stat.S_ISREG(info.st_mode) if row['kind'] == 'file' else stat.S_ISLNK(info.st_mode)), 'identity_changed')
-            self.ops.admit_acl(fd, row); self.ops.payload(fd, row)
+            self.note_admission('acl')
+            self.ops.admit_acl(fd, row)
+            self.note_admission('payload')
+            self.ops.payload(fd, row)
+            self.note_admission('symlink')
             if row['kind'] == 'symlink': need(self.ops.readlink(parent_fd, leaf) == row['symlink_bytes'])
+            self.note_admission('entry_identity')
             after = self.ops.fstat(fd)
             need(signature(after) == signature(info), 'identity_changed')
             records[name] = {'fd': fd, 'info': after, 'parent': parent_fd, 'leaf': leaf}
+        self.note_admission('source_closure')
         self.check(records, source=records is self.source)
 
     def check(self, records, *, source=False):
@@ -471,12 +544,17 @@ class Session:
         return now
 
     def close(self):
-        error = False
         while self.owned:
+            self.close_outcome['attempts'] += 1
             try:
                 self.ops.close(self.owned.pop())
-            except BaseException:
-                error = True
-        if error:
+            except BaseException as error:
+                self.close_outcome['failures'] += 1
+                if self.close_outcome['errno'] is None:
+                    self.close_outcome['errno'] = error_number(error)
+        self.close_outcome['status'] = ('incomplete' if self.close_outcome['failures'] else
+                                       'complete' if self.close_outcome['attempts'] else 'not_needed')
+        self.summary['close'] = dict(self.close_outcome)
+        if self.close_outcome['failures']:
             self.summary.update(status='incomplete', error='restoration_close_failed')
-        return not error
+        return self.close_outcome['failures'] == 0
