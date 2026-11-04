@@ -128,10 +128,13 @@ or uncertain completion stops the driver. Existing evidence is never resumed or
 replaced.
 
 Exit zero means the selected collection completed its correctness checks.
-Release acceptance requires three consecutive complete suites with every required
-comparison correct and lower wall time plus lower CPU or lower peak RSS, beyond
-precision and observed variation. `all_metrics_won` remains a placeholder, not
-an implemented release decision. Finder, mounted FSKit resources,
+Each `case_performance_screens` result requires complete validated pairs and confirmed
+cleanup, with any two of direct elapsed time, direct total CPU and resource-pass peak
+RSS lower beyond precision and observed variation. The third metric remains visible,
+including losses or inconclusive results; missing evidence makes the screen incomplete.
+This is a case screen, not release acceptance. Release acceptance still requires three
+consecutive complete suites covering every required comparison and correctness/recovery
+check. `all_metrics_won` remains an unchanged placeholder. Finder, mounted FSKit resources,
 workspace cold coverage/peak memory/full metadata equivalence, external-drive repeats,
 replacement/exchange moves, mount listing, image/recovery workflows and
 Other CLI JSON/startup-only cases remain outside this campaign, as does mounted-image

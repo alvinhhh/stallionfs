@@ -184,6 +184,134 @@ def parse_time(stderr):
     return result
 
 
+def case_performance_screens(expected_cases, comparisons, rows, *, requested_pairs,
+                             correctness_passed, cleanup_passed):
+    """Reduce completed evidence; a case screen is never release acceptance.
+
+    Count direct wall and total CPU once each, and resource-pass peak RSS once.
+    Existing paired decisions supply the noise screen; raw observations stay intact.
+    """
+    if type(requested_pairs) is not int or requested_pairs < 10:
+        raise ValueError('At least ten requested pairs are required')
+    fields = ('run', 'fixture', 'operation', 'reference', 'cache')
+    selected = {'timing': ('wall_s', 'cpu_s'), 'resources': ('rss_bytes',)}
+    favorable = {'wall_s': 'candidate_faster', 'cpu_s': 'candidate_lower', 'rss_bytes': 'candidate_lower'}
+
+    def key(item):
+        binding = tuple(item.get(field) for field in fields)
+        if (type(binding[0]) is not int or binding[0] < 0
+                or any(not isinstance(value, str) or not value for value in binding[1:])):
+            return None
+        return binding
+
+    def finite(value):
+        return (not isinstance(value, bool) and isinstance(value, (int, float))
+                and math.isfinite(value))
+
+    def available(value, *, positive=False):
+        return finite(value) and (value > 0 if positive else value >= 0)
+
+    def paired_evidence(value):
+        savings = ('paired_mean_savings', 'paired_median_savings')
+        noise = ('paired_sample_variance', 'native_stddev', 'candidate_stddev', 'paired_stddev',
+                 'paired_standard_error', 'variance_threshold', 'required_gap')
+        if (not all(finite(value.get(name)) for name in savings)
+                or not all(available(value.get(name)) for name in noise)):
+            return False
+        gap = value['required_gap']
+        if (gap < value['variance_threshold'] or value['variance_threshold'] < max(
+                value['native_stddev'], value['candidate_stddev'], value['paired_stddev'],
+                3 * value['paired_standard_error'])):
+            return False
+        direction = (1 if value.get('decision') in ('candidate_faster', 'candidate_lower') else
+                     -1 if value.get('decision') in ('candidate_slower', 'candidate_higher') else 0)
+        return not direction or all(direction * value[name] > gap for name in savings)
+
+    cases = {}
+    for item in expected_cases:
+        binding = key(item)
+        if binding is None or binding in cases or binding[3] == 'stallionfs':
+            raise ValueError('Missing or duplicate requested case')
+        cases[binding] = {'case': dict(zip(fields, binding)), 'summaries': {},
+                          'pairs': {}, 'reasons': []}
+    unexpected = False
+    for item in comparisons:
+        case = cases.get(key(item))
+        if case is None:
+            unexpected = True
+            continue
+        phase = item.get('phase')
+        if phase not in selected or phase in case['summaries']:
+            case['reasons'].append('duplicate or unknown comparison phase')
+            continue
+        case['summaries'][phase] = item
+    for row in rows:
+        case = cases.get(key(row))
+        if case is None:
+            unexpected = True
+            continue
+        phase, method, pair = row.get('phase'), row.get('method'), row.get('pair_id')
+        if (phase not in selected or method not in (row['reference'], 'stallionfs')
+                or type(pair) is not int or not 0 <= pair < requested_pairs
+                or type(row.get('sample')) is not int or row['sample'] != pair):
+            case['reasons'].append('invalid row binding')
+            continue
+        seen = case['pairs'].setdefault((phase, method), set())
+        if pair in seen:
+            case['reasons'].append('duplicate pair observation')
+        seen.add(pair)
+        if (row.get('ok') is not True or row.get('validated') is not True
+                or row.get('completion_uncertain') is not False):
+            case['reasons'].append('failed, uncertain or unvalidated observation')
+        for metric in selected[phase]:
+            value = row.get(metric)
+            if not available(value, positive=metric == 'rss_bytes'):
+                case['reasons'].append('missing or invalid ' + metric)
+    result = []
+    for case in cases.values():
+        reasons = case['reasons']
+        if unexpected:
+            reasons.append('unexpected case evidence')
+        if correctness_passed is not True:
+            reasons.append('collection correctness not confirmed')
+        if cleanup_passed is not True:
+            reasons.append('cleanup not confirmed')
+        metrics = {}
+        for phase, names in selected.items():
+            comparison = case['summaries'].get(phase, {})
+            if comparison.get('complete') is not True or comparison.get('expected_pairs') != requested_pairs:
+                reasons.append('incomplete ' + phase + ' comparison')
+            for method in (case['case']['reference'], 'stallionfs'):
+                if case['pairs'].get((phase, method), set()) != set(range(requested_pairs)):
+                    reasons.append('incomplete ' + phase + ' pairs')
+            for metric in names:
+                measured = comparison.get('metrics')
+                value = measured.get(metric) if isinstance(measured, dict) else None
+                metrics[metric] = {'phase': phase, 'comparison': value}
+                valid_decisions = {'inconclusive', 'below_resolution'} | (
+                    {'candidate_faster', 'candidate_slower'} if metric == 'wall_s' else
+                    {'candidate_lower', 'candidate_higher'})
+                if (not isinstance(value, dict) or value.get('phase') != phase
+                        or value.get('metric') != metric or value.get('complete_pairs') != requested_pairs
+                        or value.get('excluded_pairs') != [] or value.get('decision') not in valid_decisions
+                        or not paired_evidence(value)
+                        or any(not isinstance(value.get(side), dict)
+                               or value[side].get('n') != requested_pairs
+                               or not all(available(value[side].get(name))
+                                          for name in ('mean', 'median', 'minimum', 'maximum', 'p95', 'sample_variance'))
+                               for side in ('native', 'candidate'))):
+                    reasons.append('incomplete ' + metric + ' evidence')
+        wins = [metric for metric, value in metrics.items()
+                if isinstance(value['comparison'], dict) and value['comparison'].get('decision') == favorable[metric]]
+        complete = not reasons
+        result.append(case['case'] | {
+            'scope': 'case screen only; not campaign or release acceptance',
+            'status': 'incomplete' if not complete else 'pass' if len(wins) >= 2 else 'not_passed',
+            'correctness_qualified': complete, 'any_two_metrics_won': complete and len(wins) >= 2,
+            'winning_metrics': wins, 'metrics': metrics, 'reasons': sorted(set(reasons))})
+    return result
+
+
 def parse_gnu_time(stderr):
     """Parse the fixed GNU time format; RSS is KiB, block I/O stays counts."""
     text = stderr.decode('utf-8', errors='replace') if isinstance(stderr, bytes) else stderr

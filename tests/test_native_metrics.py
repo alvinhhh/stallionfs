@@ -554,6 +554,141 @@ class NativeStatistics(unittest.TestCase):
 
 
 
+class NativeCasePolicy(unittest.TestCase):
+    case = dict(run=0, fixture='docs_5k_100mb', operation='clone', reference='ditto', cache='warm')
+
+    def evidence(self, winners=(), *, count=10, neutral=()):
+        observations, comparisons = [], []
+        for phase, names in (('timing', ('wall_s', 'cpu_s')), ('resources', ('rss_bytes',))):
+            phase_rows = []
+            for method in ('ditto', 'stallionfs'):
+                for pair in range(count):
+                    row = self.case | dict(phase=phase, method=method, sample=pair, pair_id=pair,
+                                           ok=True, validated=True, completion_uncertain=False)
+                    row.update({name: 100 if method == 'ditto' or name in neutral else
+                                50 if name in winners else 150 for name in names})
+                    phase_rows.append(row)
+            observations.extend(phase_rows)
+            comparisons.append(self.case | dict(phase=phase, complete=True, expected_pairs=count,
+                metrics={name: metrics.compare_paired(
+                    [row for row in phase_rows if row['method'] == 'ditto'],
+                    [row for row in phase_rows if row['method'] == 'stallionfs'], name) for name in names}))
+        return comparisons, observations
+
+    def screen(self, comparisons, observations, *, expected=None, **kwargs):
+        return metrics.case_performance_screens(
+            [self.case] if expected is None else expected, comparisons, observations,
+            **(dict(requested_pairs=10, correctness_passed=True, cleanup_passed=True) | kwargs))
+
+    def test_each_two_win_combination_preserves_the_losing_third(self):
+        for winners in (('wall_s', 'cpu_s'), ('wall_s', 'rss_bytes'), ('cpu_s', 'rss_bytes')):
+            with self.subTest(winners=winners):
+                comparisons, observations = self.evidence(winners)
+                result = self.screen(comparisons, observations)[0]
+                self.assertEqual(result['status'], 'pass')
+                self.assertTrue(result['any_two_metrics_won'])
+                self.assertEqual(set(result['winning_metrics']), set(winners))
+                third = ({'wall_s', 'cpu_s', 'rss_bytes'} - set(winners)).pop()
+                self.assertIn(result['metrics'][third]['comparison']['decision'],
+                              ('candidate_slower', 'candidate_higher'))
+
+    def test_valid_inconclusive_third_is_allowed_but_one_or_zero_wins_is_not(self):
+        comparisons, observations = self.evidence(('wall_s', 'cpu_s'), neutral=('rss_bytes',))
+        result = self.screen(comparisons, observations)[0]
+        self.assertEqual(result['status'], 'pass')
+        self.assertEqual(result['metrics']['rss_bytes']['comparison']['decision'], 'inconclusive')
+        for winners in ((), ('wall_s',), ('cpu_s',), ('rss_bytes',)):
+            comparisons, observations = self.evidence(winners)
+            result = self.screen(comparisons, observations)[0]
+            self.assertEqual(result['status'], 'not_passed')
+            self.assertFalse(result['any_two_metrics_won'])
+
+    def test_missing_invalid_failed_uncertain_or_excluded_evidence_is_incomplete(self):
+        changes = ({'ok': False}, {'validated': False}, {'completion_uncertain': True},
+                   {'rss_bytes': None}, {'rss_bytes': 0}, {'rss_bytes': float('nan')})
+        for change in changes:
+            with self.subTest(change=change):
+                comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+                observations[-1].update(change)
+                self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+        for damage in ('missing_phase', 'missing_metric', 'excluded', 'summary_missing',
+                       'summary_count', 'invalid_metrics', 'wrong_decision'):
+            with self.subTest(damage=damage):
+                comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+                if damage == 'missing_phase': comparisons.pop()
+                elif damage == 'missing_metric': comparisons[-1]['metrics'].pop('rss_bytes')
+                elif damage == 'excluded': comparisons[-1]['metrics']['rss_bytes']['excluded_pairs'] = [{'pair_id': 9}]
+                elif damage == 'summary_missing': comparisons[-1]['metrics']['rss_bytes']['candidate'].pop('median')
+                elif damage == 'invalid_metrics': comparisons[-1]['metrics'] = None
+                elif damage == 'wrong_decision': comparisons[-1]['metrics']['rss_bytes']['decision'] = 'candidate_faster'
+                else: comparisons[-1]['metrics']['rss_bytes']['complete_pairs'] = 9
+                self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+
+    def test_all_requested_pairs_and_terminal_correctness_and_cleanup_are_required(self):
+        comparisons, observations = self.evidence(('wall_s', 'cpu_s', 'rss_bytes'))
+        for change in ({'requested_pairs': 20}, {'correctness_passed': False},
+                       {'cleanup_passed': False}, {'cleanup_passed': None}):
+            with self.subTest(change=change):
+                self.assertEqual(self.screen(comparisons, observations, **change)[0]['status'], 'incomplete')
+        extra_case = self.case | {'fixture': 'entirely_missing'}
+        self.assertEqual(self.screen(comparisons, observations, expected=[self.case, extra_case])[1]['status'], 'incomplete')
+        for comparison in comparisons:
+            comparison['expected_pairs'] = 20
+            for value in comparison['metrics'].values():
+                value['complete_pairs'] = value['native']['n'] = value['candidate']['n'] = 20
+        self.assertEqual(self.screen(comparisons, observations, requested_pairs=20)[0]['status'], 'incomplete')
+
+    def test_saved_paired_noise_evidence_and_decisions_must_be_complete_and_consistent(self):
+        signed = ('paired_mean_savings', 'paired_median_savings')
+        nonnegative = ('paired_sample_variance', 'native_stddev', 'candidate_stddev', 'paired_stddev',
+                       'paired_standard_error', 'variance_threshold', 'required_gap')
+        for field in signed + nonnegative:
+            for bad in ('missing', None, True, float('nan'), float('inf')):
+                with self.subTest(field=field, bad=bad):
+                    comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+                    value = comparisons[0]['metrics']['wall_s']
+                    if bad == 'missing': value.pop(field)
+                    else: value[field] = bad
+                    self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+        for field in nonnegative:
+            with self.subTest(negative=field):
+                comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+                comparisons[0]['metrics']['wall_s'][field] = -1
+                self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+        for updates in ({'paired_mean_savings': -50, 'paired_median_savings': -50},
+                        {'required_gap': 50},
+                        {'required_gap': 0.5, 'variance_threshold': 1},
+                        {'native_stddev': 1}, {'candidate_stddev': 1},
+                        {'paired_stddev': 1}, {'paired_standard_error': 1}):
+            with self.subTest(updates=updates):
+                comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+                comparisons[0]['metrics']['wall_s'].update(updates)
+                self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+        comparisons, observations = self.evidence(('wall_s', 'cpu_s'))
+        comparisons[-1]['metrics']['rss_bytes'].update(paired_mean_savings=50, paired_median_savings=50)
+        self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+
+    def test_duplicates_mismatched_bindings_and_unrequested_rows_cannot_pass(self):
+        for damage in ('pair', 'phase', 'wrong_method', 'wrong_case', 'wrong_pair', 'missing_row'):
+            with self.subTest(damage=damage):
+                comparisons, observations = self.evidence(('wall_s', 'cpu_s', 'rss_bytes'))
+                if damage == 'pair': observations.append(observations[-1].copy())
+                elif damage == 'phase': comparisons.append(comparisons[-1].copy())
+                elif damage == 'wrong_method': observations[-1]['method'] = 'cp'
+                elif damage == 'wrong_case': observations[-1]['reference'] = 'cp'
+                elif damage == 'wrong_pair': observations[-1]['pair_id'] = 8
+                else: observations.pop()
+                self.assertEqual(self.screen(comparisons, observations)[0]['status'], 'incomplete')
+
+    def test_wrapped_wall_and_cpu_are_not_extra_winning_metrics(self):
+        comparisons, observations = self.evidence(('rss_bytes',))
+        for name in ('wall_s', 'cpu_s'):
+            comparisons[-1]['metrics'][name] = dict(decision='candidate_faster' if name == 'wall_s' else 'candidate_lower')
+        result = self.screen(comparisons, observations)[0]
+        self.assertEqual(result['status'], 'not_passed')
+        self.assertEqual(result['winning_metrics'], ['rss_bytes'])
+
+
 class CleanupOwnership(unittest.TestCase):
     @contextmanager
     def idle(self):

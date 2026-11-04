@@ -687,6 +687,18 @@ def main():
             try:
                 if not journal_failed:
                     checkpoint()
+                    if not linux:
+                        expected_cases = (
+                            dict(run=run, fixture=fixture, operation=operation, reference=reference, cache=cache)
+                            for run, fixture, operation, cache in product(range(a.runs), a.fixtures, a.operations, a.cache)
+                            for reference in (a.copy_tools if operation == 'clone' else
+                                              ['find-stat'] if operation == 'scan' else
+                                              ['cp'] if operation == 'copy' else [operation]))
+                        report['case_performance_screens'] = native_metrics.case_performance_screens(
+                            expected_cases, journal.iter_latest('comparisons'), journal.iter_latest('rows'),
+                            requested_pairs=a.samples,
+                            correctness_passed=report.get('status') == 'complete' and report.get('passed') is True,
+                            cleanup_passed=report.get('cleanup_passed') is True)
                     journal.finish(report)
                 elif base is not None:
                     print(f'Report write failed; fixture retained at {base}', file=sys.stderr)
