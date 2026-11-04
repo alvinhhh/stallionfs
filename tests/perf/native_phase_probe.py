@@ -11,10 +11,10 @@ import sys
 import tempfile
 import time
 
-MARKER = 'stallionfs-thread-cpu-v1'
+MARKER = 'stallionfs-thread-cpu-v2'
 SCOPE = 'instrumented run_tree main and worker spans'
 UINT64_MAX = (1 << 64) - 1
-PHASES = ('clone_leaf', 'directory_metadata')
+PHASES = ('fclonefileat', 'directory_metadata')
 STATUSES = ('available', 'clock_read_invalid', 'clock_range_invalid', 'nested_phase',
             'counter_overflow', 'worker_bound', 'join_failed', 'operation_failed')
 
@@ -51,7 +51,7 @@ def read_report(path):
 def validate_report(value):
     require(isinstance(value, dict) and set(value) == {'schema', 'marker', 'status', 'workers_requested',
             'workers_started', 'main_fallback', 'scope', 'counters', 'slots'}, 'counter_report_invalid')
-    require(type(value['schema']) is int and value['schema'] == 1 and value['marker'] == MARKER and value['scope'] == SCOPE
+    require(type(value['schema']) is int and value['schema'] == 2 and value['marker'] == MARKER and value['scope'] == SCOPE
             and value['status'] in STATUSES and type(value['workers_requested']) is int
             and value['workers_requested'] == 2 and type(value['workers_started']) is int
             and 0 <= value['workers_started'] <= 2 and type(value['main_fallback']) is bool
@@ -97,7 +97,8 @@ def validate_report(value):
     return {'scope': SCOPE, 'clock': 'CLOCK_THREAD_CPUTIME_ID', 'counters': aggregate, 'slots': slots,
             'limits': ['Includes counter overhead; no subtraction or speedup claim.',
                        'Excludes CLI startup, run_tree setup and worker exit announcement/teardown.',
-                       'Function phases are subsets of the thread totals; other work is unclassified.']}
+                       'Clone-call and directory phases are nonoverlapping subsets of the thread totals.',
+                       'Clone-call CPU includes the first inode of each hardlink group; alias linking, leaf descriptor validation and other work are unclassified.']}
 
 
 def publish(path, value):
@@ -129,7 +130,7 @@ def probe(binary, wheel, scratch, output, revision):
     import native_correctness as correct
     import native_fixtures
     import native_suite
-    result = {'schema': 1, 'scope': 'hosted diagnostic source build', 'status': 'incomplete',
+    result = {'schema': 2, 'scope': 'hosted diagnostic source build', 'status': 'incomplete',
               'target_completion': 'unknown', 'correctness': None, 'counter_status': 'unavailable',
               'clone_attempts': 0, 'cleanup': 'not_started', 'benchmark_verdict': 'not_applicable'}
     private = identity = None

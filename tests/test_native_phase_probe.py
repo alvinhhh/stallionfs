@@ -22,12 +22,12 @@ with mock.patch.object(sys, 'path', [str(PERF), *sys.path]):
 
 def report():
     slots = [{'slot': i, 'total_cpu_ns': 100,
-              'clone_leaf': {'calls': i, 'failures': 0, 'cpu_ns': i * 10},
+              'fclonefileat': {'calls': i, 'failures': 0, 'cpu_ns': i * 10},
               'directory_metadata': {'calls': 1, 'failures': 0, 'cpu_ns': 20}} for i in range(3)]
     counters = {'total_cpu_ns': 300}
     for phase in probe.PHASES:
         counters[phase] = {key: sum(row[phase][key] for row in slots) for key in ('calls','failures','cpu_ns')}
-    return {'schema': 1, 'marker': probe.MARKER, 'status': 'available', 'scope': probe.SCOPE,
+    return {'schema': 2, 'marker': probe.MARKER, 'status': 'available', 'scope': probe.SCOPE,
             'workers_requested': 2, 'workers_started': 2, 'main_fallback': False, 'counters': counters, 'slots': slots}
 
 
@@ -98,6 +98,7 @@ class PhaseProbe(unittest.TestCase):
     def test_complete_direct_capture_retains_main_phase_and_excludes_raw_data(self):
         code,value,snapshots = self.run_probe()
         self.assertEqual(code,0); self.assertTrue(value['correctness']['passed'])
+        self.assertEqual(value['schema'],2)
         self.assertEqual(value['counter_status'],'available'); self.assertEqual(value['clone_attempts'],1)
         self.assertEqual(snapshots.call_count,4); self.assertEqual(value['cleanup'],'complete')
         self.assertEqual(value['cpu_composition']['slots'][0]['directory_metadata']['calls'],1)
@@ -169,8 +170,9 @@ class PhaseProbe(unittest.TestCase):
         cases = []
         for location,key,value in [([], 'private_path','/Users/private'), (['slots',0], 'slot',True),
                                   (['counters'],'total_cpu_ns',True), (['counters'],'total_cpu_ns',1<<64),
-                                  (['counters','clone_leaf'],'cpu_ns',301), (['counters','clone_leaf'],'failures',1),
-                                  (['counters','directory_metadata'],'calls',0), ([], 'workers_started',1)]:
+                                  (['counters','fclonefileat'],'cpu_ns',301), (['counters','fclonefileat'],'failures',1),
+                                  (['counters','directory_metadata'],'calls',0), ([], 'workers_started',1),
+                                  ([], 'schema',1), ([], 'marker','stallionfs-thread-cpu-v1')]:
             item = report(); target = item
             for part in location: target = target[part]
             target[key] = value; cases.append(item)
@@ -179,6 +181,12 @@ class PhaseProbe(unittest.TestCase):
         for status in probe.STATUSES[1:]:
             item = report(); item.update(status=status,counters=None,slots=[])
             self.assertIsNone(probe.validate_report(item))
+
+    def test_old_inclusive_leaf_label_is_rejected(self):
+        item = report()
+        for row in [item['counters'], *item['slots']]:
+            row['clone_leaf'] = row.pop('fclonefileat')
+        with self.assertRaises(probe.ProbeError): probe.validate_report(item)
 
     def test_report_and_publication_reject_partial_duplicate_unsafe_or_replaced_files(self):
         path = self.root/'report.json'; path.write_text('{"schema":1,"schema":1}'); path.chmod(0o600)
@@ -205,17 +213,20 @@ class NativePhaseCounters(unittest.TestCase):
 #include <errno.h>
 #include <time.h>
 #include <copyfile.h>
+#include <sys/clonefile.h>
 #include <stdio.h>
 static int fake_clock(clockid_t, struct timespec *);
 static int fake_copy(int, int, copyfile_state_t, copyfile_flags_t);
+static int fake_clone(int, int, const char *, uint32_t);
 static int fake_flush(FILE *);
 #define clock_gettime fake_clock
 #define fcopyfile fake_copy
+#define fclonefileat fake_clone
 #define fflush fake_flush
 #define STALLIONFS_DIAGNOSTIC_THREAD_CPU 1
 #include "TREE_PATH"
 #undef fflush
-static int mode, ticks, sink_fail;
+static int mode, ticks, sink_fail, clone_result, clone_error, clone_calls;
 static int fake_flush(FILE *stream) { if (sink_fail) { errno = EIO; return EOF; } return fflush(stream); }
 static int fake_clock(clockid_t id, struct timespec *value) {
     assert(id == CLOCK_THREAD_CPUTIME_ID); errno = EIO;
@@ -227,25 +238,50 @@ static int fake_clock(clockid_t id, struct timespec *value) {
 static int fake_copy(int a, int b, copyfile_state_t s, copyfile_flags_t f) {
     (void)a; (void)b; (void)s; assert(f == COPYFILE_METADATA); errno = EACCES; return 0;
 }
+static int fake_clone(int input, int parent, const char *name, uint32_t flags) {
+    assert(input == 12 && parent == 34 && !strcmp(name, "leaf"));
+    assert(flags == (CLONE_NOFOLLOW | CLONE_ACL));
+    clone_calls++; errno = clone_error; return clone_result;
+}
 int main(int argc, char **argv) {
     assert(argc == 2); uint64_t value; errno = ENOSPC;
     for (mode = 1; mode <= 3; mode++) { assert(!cpu_now(&value)); assert(errno == ENOSPC); }
     mode = 0; ticks = 0;
     struct cpu_slot slot = {0}; cpu_current = &slot; cpu_start(&slot);
     struct tree tree = {.operation = CLONING}; struct job job = {0};
+    struct stat identity = {0};
     assert(!directory_metadata(&tree, &job, -1, -1, NULL, NULL)); assert(errno == EACCES);
     assert(slot.phase[CPU_DIRECTORY].calls == 1); assert(slot.phase[CPU_DIRECTORY].ns == 10);
+    clone_result = 0; clone_error = EACCES;
+    assert(!first_inode(CLONING, &tree, 12, 34, "leaf", &identity, NULL, NULL));
+    assert(errno == EACCES && clone_calls == 1 && slot.active == 0);
+    assert(slot.phase[CPU_FCLONEFILEAT].calls == 1 && slot.phase[CPU_FCLONEFILEAT].failures == 0);
+    assert(slot.phase[CPU_FCLONEFILEAT].ns == 10);
+    clone_result = -1; clone_error = ENOSPC;
+    assert(first_inode(CLONING, &tree, 12, 34, "leaf", &identity, NULL, NULL) == -1);
+    assert(errno == ENOSPC && clone_calls == 2 && slot.active == 0);
+    assert(slot.phase[CPU_FCLONEFILEAT].calls == 2 && slot.phase[CPU_FCLONEFILEAT].failures == 1);
+    assert(slot.phase[CPU_FCLONEFILEAT].ns == 20);
     job.source = -1; assert(clone_leaf(&tree, &job, "absent", DT_REG, 0) == -1); assert(errno == EBADF);
-    assert(slot.phase[CPU_LEAF].failures == 1);
+    assert(clone_calls == 2 && slot.phase[CPU_FCLONEFILEAT].calls == 2);
+    assert(slot.phase[CPU_FCLONEFILEAT].failures == 1 && slot.phase[CPU_FCLONEFILEAT].ns == 20);
+    slot = (struct cpu_slot){0}; mode = 1; clone_result = 0; clone_error = EACCES;
+    assert(!first_inode(CLONING, &tree, 12, 34, "leaf", &identity, NULL, NULL));
+    assert(errno == EACCES && slot.status == CPU_CLOCK && slot.active == 0);
+    assert(slot.phase[CPU_FCLONEFILEAT].calls == 1 && !slot.phase[CPU_FCLONEFILEAT].failures && !slot.phase[CPU_FCLONEFILEAT].ns);
+    slot = (struct cpu_slot){0}; clone_result = -1; clone_error = ENOSPC;
+    assert(first_inode(CLONING, &tree, 12, 34, "leaf", &identity, NULL, NULL) == -1);
+    assert(errno == ENOSPC && slot.status == CPU_CLOCK && slot.active == 0);
+    assert(slot.phase[CPU_FCLONEFILEAT].calls == 1 && slot.phase[CPU_FCLONEFILEAT].failures == 1 && !slot.phase[CPU_FCLONEFILEAT].ns);
     slot = (struct cpu_slot){0}; mode = 1;
     assert(!directory_metadata(&tree, &job, -1, -1, NULL, NULL)); assert(errno == EACCES && slot.status == CPU_CLOCK);
     mode = 0; slot = (struct cpu_slot){0};
-    struct cpu_token outer = cpu_enter(CPU_LEAF), inner = cpu_enter(CPU_DIRECTORY);
-    cpu_leave(inner, 0); assert(slot.active == CPU_LEAF + 1); cpu_leave(outer, 0); assert(slot.status == CPU_NESTED);
+    struct cpu_token outer = cpu_enter(CPU_FCLONEFILEAT), inner = cpu_enter(CPU_DIRECTORY);
+    cpu_leave(inner, 0); assert(slot.active == CPU_FCLONEFILEAT + 1); cpu_leave(outer, 0); assert(slot.status == CPU_NESTED);
     slot = (struct cpu_slot){0}; slot.phase[0].calls = UINT64_MAX;
-    outer = cpu_enter(CPU_LEAF); cpu_leave(outer, 0); assert(slot.status == CPU_OVERFLOW);
+    outer = cpu_enter(CPU_FCLONEFILEAT); cpu_leave(outer, 0); assert(slot.status == CPU_OVERFLOW);
     slot = (struct cpu_slot){0}; mode = 4; ticks = 0;
-    outer = cpu_enter(CPU_LEAF); cpu_leave(outer, 0); assert(slot.status == CPU_RANGE);
+    outer = cpu_enter(CPU_FCLONEFILEAT); cpu_leave(outer, 0); assert(slot.status == CPU_RANGE);
     mode = 0; ticks = 0; slot = (struct cpu_slot){0}; cpu_start(&slot);
     struct tree idle = {.mutex = PTHREAD_MUTEX_INITIALIZER, .available = PTHREAD_COND_INITIALIZER};
     struct cpu_worker_context context = {.state = &idle, .slot = &slot, .main_fallback = 1};
@@ -262,11 +298,11 @@ int main(int argc, char **argv) {
     profile = cpu_open(CLONING, 2);
     for (unsigned i = 0; i < 3; i++) profile.slots[i].total = 100;
     profile.slots[0].phase[CPU_DIRECTORY] = (struct cpu_counter){.calls = 1, .ns = 10};
-    profile.slots[1].phase[CPU_LEAF] = profile.slots[2].phase[CPU_LEAF] = (struct cpu_counter){.calls = 1, .ns = 10};
+    profile.slots[1].phase[CPU_FCLONEFILEAT] = profile.slots[2].phase[CPU_FCLONEFILEAT] = (struct cpu_counter){.calls = 1, .ns = 10};
     cpu_report(&profile, 2, 2, 0); snprintf(saved, sizeof(saved), "%s.valid", argv[1]); assert(!rename(argv[1], saved));
     profile = cpu_open(CLONING, CPU_WORKERS + 1); assert(!profile.enabled && profile.status == CPU_BOUND);
     cpu_report(&profile, CPU_WORKERS + 1, 0, 0); unlink(argv[1]);
-    struct stat identity = {0}; char error_path[PATH_MAX];
+    char error_path[PATH_MAX];
     assert(run_tree(-1, -1, -1, "absent", &identity, CLONING, STALLION_COPY_MATERIALIZED, 0, NULL, NULL, error_path, sizeof(error_path)) == -1);
     assert(cpu_current == &slot && errno == EBADF); cpu_current = NULL;
     return 0;
