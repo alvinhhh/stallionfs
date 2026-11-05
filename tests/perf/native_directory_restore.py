@@ -291,49 +291,151 @@ class DarwinOps:
 
 
 class Session:
-    """Bounded owned FD inventory, retained across the existing native helper."""
+    """Private stable-source experiment with bounded operation-local descriptors.
+
+    Inactive names are reopened and checked, not continuously pinned. Sequential
+    checks and final verifiers do not provide an atomic namespace snapshot or
+    exclude same-user replacement/restore races between lease windows.
+    """
     def __init__(self, base, source, parent, expected, *, ops=None, cancelled=None):
         self.cancelled = cancelled if cancelled is not None else lambda: False
-        self.expected = expected; self.source = {}; self.destination = {}; self.owned = []
-        self.changed_flags = {}; self.changed_modes = {}; self.failure = None; self.bindings = []
+        self.expected = expected; self.source = {}; self.destination = {}
+        self.owned = []; self.uncertain = []; self.bindings = []; self.pins = []
+        self.sources = []; self.targets = []; self.source_classes = {}; self.destination_classes = {}
+        self.changed_flags = {}; self.changed_modes = {}; self.failure = None
         self.operation = 'not_started'; self.operation_phase = 'preflight'
+        self.counts = dict(open_attempts=0, opened=0, close_attempts=0, closed=0,
+                           fstat=0, named=0, peak=0, live=0, uncertain=0)
         self.summary = {'status': 'not_started', 'mutation_attempts': 0, 'alias_replacements': 0,
                         'acl_repairs': 0, 'tracking_repairs': 0, 'directory_times': 0,
-                        'recovery': 'not_needed'}
+                        'recovery': 'not_needed', 'lease_counts': self.counts}
         self.close_outcome = {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None}
         self.admission = {'status': 'refused', 'phase': 'ops_binding', 'refusal_code': None, 'errno': None,
                           'close': self.close_outcome}
         try:
             self.ops = ops if ops is not None else DarwinOps()
-            self.admission['phase'] = 'roots'
-            self.root = self.take(self.ops.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC))
-            info = self.ops.fstat(self.root)
+            self.note_admission('roots')
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            self.root = self.open(base, flags)
+            info = self.fstat(self.root)
             need(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
-            self.source_root = self.take(self.ops.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                                       dir_fd=self.root))
-            self.parent = self.take(self.ops.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                                 dir_fd=self.root))
-            self.pins = [(fd, self.ops.fstat(fd)) for fd in (self.root, self.source_root, self.parent)]
+            self.source_root = self.open(source, flags, dir_fd=self.root)
+            self.parent = self.open(parent, flags, dir_fd=self.root)
+            self.pins = [(fd, self.fstat(fd)) for fd in (self.root, self.source_root, self.parent)]
             self.bindings = [(self.root, source, self.source_root), (self.root, parent, self.parent)]
             self.capture(self.source_root, expected, self.source)
+            self.source_classes = self.classes(self.source)
             self.admission.update(status='complete', phase='complete')
         except BaseException as error:
-            # Capture the primary errno before close can change thread errno.
             report = refusal_report(error, self.admission['phase'], self.close_outcome)
-            self.close()
-            report['close'] = dict(self.close_outcome)
+            self.close(); report['close'] = dict(self.close_outcome)
             raise AdmissionError(report) from None
 
     def admission_report(self):
-        # Admission is constructor-only; close covers this session's retained FDs.
         return dict(self.admission, close=dict(self.close_outcome))
 
     def note_admission(self, phase):
-        if self.admission['status'] != 'complete':
-            self.admission['phase'] = phase
+        if self.admission['status'] != 'complete': self.admission['phase'] = phase
 
-    def take(self, fd):
-        self.owned.append(fd); self.close_outcome['status'] = 'deferred'; return fd
+    def open(self, name, flags, *, dir_fd=None):
+        need(not self.uncertain, 'restoration_close_failed')
+        need(not self.cancelled(), 'restoration_cancelled')
+        self.counts['open_attempts'] += 1
+        fd = self.ops.open(name, flags, dir_fd=dir_fd) if dir_fd is not None else self.ops.open(name, flags)
+        need(fd not in self.owned, 'identity_changed')
+        self.owned.append(fd); self.counts['opened'] += 1
+        self.counts['live'] = len(self.owned)
+        self.counts['peak'] = max(self.counts['peak'], len(self.owned))
+        self.close_outcome['status'] = 'deferred'
+        return fd
+
+    def fstat(self, fd):
+        self.counts['fstat'] += 1
+        return self.ops.fstat(fd)
+
+    def named(self, parent, name):
+        self.counts['named'] += 1
+        return self.ops.named(parent, name)
+
+    def release(self, descriptors):
+        primary = sys.exc_info()[1]
+        failed = False
+        for fd in reversed(descriptors):
+            need(fd in self.owned, 'identity_changed')
+            self.owned.remove(fd)
+            self.counts['close_attempts'] += 1; self.close_outcome['attempts'] += 1
+            try:
+                self.ops.close(fd); self.counts['closed'] += 1
+            except BaseException as error:
+                failed = True; self.uncertain.append(fd)
+                self.close_outcome['failures'] += 1
+                if self.close_outcome['errno'] is None: self.close_outcome['errno'] = error_number(error)
+            self.counts['live'] = len(self.owned); self.counts['uncertain'] = len(self.uncertain)
+        if failed:
+            self.close_outcome['status'] = 'incomplete'
+            if primary is None: raise RestoreError('restoration_close_failed')
+
+    @staticmethod
+    def classes(records):
+        result = {}
+        for name, record in records.items():
+            if not stat.S_ISDIR(record['info'].st_mode): result.setdefault(identity(record['info']), set()).add(name)
+        return result
+
+    def note_difference(self, record, before, after, check, allowed=(), parent_nlink=None):
+        fields = [('identity', identity(before), identity(after)),
+            ('generation', getattr(before, 'st_gen', None), getattr(after, 'st_gen', None)),
+            ('birthtime', getattr(before, 'st_birthtime', None), getattr(after, 'st_birthtime', None))]
+        for field in ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink', 'st_flags', 'st_mtime_ns', 'st_ctime_ns'):
+            if field not in allowed or field == 'st_nlink' and parent_nlink is not None:
+                value = before.st_nlink + parent_nlink if field == 'st_nlink' and parent_nlink is not None else getattr(before, field)
+                fields.append((field.removeprefix('st_'), value, getattr(after, field)))
+        for field, expected, actual in fields:
+            if expected != actual:
+                self.summary.setdefault('failure_context', {'operation': self.operation,
+                    'phase': self.operation_phase, 'check': check, 'entry_id': record.get('entry_id'), 'field': field})
+                break
+
+    def compare(self, record, info, check, *, source=False):
+        self.note_difference(record, record['info'], info, check)
+        need(signature(info) == signature(record['info']), 'source_changed' if source else 'identity_changed')
+
+    def anchors(self, *, recovery=False):
+        need(stat.S_IMODE(self.fstat(self.root).st_mode) == 0o700, 'identity_changed')
+        for fd, before in self.pins:
+            now = self.fstat(fd)
+            need(identity(now) == identity(before) and now.st_mode == before.st_mode and
+                 now.st_uid == before.st_uid and now.st_gid == before.st_gid and now.st_flags == before.st_flags,
+                 'identity_changed')
+        for parent, name, fd in self.bindings:
+            need(identity(self.named(parent, name)) == identity(self.fstat(fd)), 'identity_changed')
+        if not recovery and '' in self.source:
+            self.compare(self.source[''], self.fstat(self.source_root), 'source_held', source=True)
+
+    def chain(self, records, root, name):
+        """Borrow the anchor; only nonroot components belong to this chain."""
+        frames = []; current = root; prefix = ''
+        try:
+            if '' in records: self.compare(records[''], self.fstat(root), 'ancestor', source=records is self.source)
+            for component in name.split('/') if name else ():
+                parent = current; prefix = component if not prefix else prefix + '/' + component
+                record = records[prefix]
+                current = self.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                frame = {'fd': current, 'parent': parent, 'leaf': component, 'record': record}
+                frames.append(frame)
+                self.compare(record, self.fstat(current), 'ancestor', source=records is self.source)
+                self.compare(record, self.named(parent, component), 'ancestor_named', source=records is self.source)
+            return current, frames
+        except BaseException:
+            self.release([frame['fd'] for frame in frames]); raise
+
+    def row_matches(self, info, row):
+        need((info.st_dev, info.st_ino) == tuple(row['device_inode']) and stat.S_IMODE(info.st_mode) == row['mode']
+             and info.st_uid == row['uid'] and info.st_gid == row['gid'] and info.st_nlink == row['link_count']
+             and info.st_flags == row['flags'] and info.st_mtime_ns == row['mtime_ns']
+             and info.st_ctime_ns == row['ctime_ns'], 'identity_changed')
+        need((stat.S_ISDIR(info.st_mode) if row['kind'] == 'directory' else
+              stat.S_ISREG(info.st_mode) if row['kind'] == 'file' else stat.S_ISLNK(info.st_mode)), 'identity_changed')
 
     def capture(self, root, snapshot, records):
         self.note_admission('schema')
@@ -345,256 +447,284 @@ class Session:
             need(type(row['mode']) is int and not row['mode'] & (stat.S_ISUID | stat.S_ISGID))
             need(type(row['flags']) is int and row['flags'] >= 0 and not row['flags'] & ~ALLOWED_FLAGS)
             if row['kind'] == 'file':
-                need(type(row.get('size')) is int and 0 <= row['size'] <= 32 * 1024 * 1024)
-                total += row['size']
+                need(type(row.get('size')) is int and 0 <= row['size'] <= 32 * 1024 * 1024); total += row['size']
         need(total <= 32 * 1024 * 1024)
-        for name in sorted(snapshot['entries'], key=lambda name: (name.count('/') + bool(name), name)):
-            self.note_admission('entry_identity')
-            parent, leaf = relative(name); row = snapshot['entries'][name]
-            parent_fd = records[parent]['fd'] if name else root
-            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-            flags |= os.O_SYMLINK if row['kind'] == 'symlink' else os.O_NOFOLLOW
-            if row['kind'] == 'directory': flags |= os.O_DIRECTORY
-            fd = self.take(self.ops.open(leaf, flags, dir_fd=parent_fd)) if name else root
-            self.note_admission('entry_identity')
-            info = self.ops.fstat(fd)
-            need((info.st_dev, info.st_ino) == tuple(row['device_inode']) and stat.S_IMODE(info.st_mode) == row['mode']
-                 and info.st_uid == row['uid'] and info.st_gid == row['gid'] and info.st_nlink == row['link_count']
-                 and info.st_flags == row['flags'] and info.st_mtime_ns == row['mtime_ns']
-                 and info.st_ctime_ns == row['ctime_ns'], 'identity_changed')
-            need((stat.S_ISDIR(info.st_mode) if row['kind'] == 'directory' else
-                  stat.S_ISREG(info.st_mode) if row['kind'] == 'file' else stat.S_ISLNK(info.st_mode)), 'identity_changed')
-            self.note_admission('acl')
-            self.ops.admit_acl(fd, row)
-            self.note_admission('payload')
-            self.ops.payload(fd, row)
-            self.note_admission('symlink')
-            if row['kind'] == 'symlink': need(self.ops.readlink(parent_fd, leaf) == row['symlink_bytes'])
-            self.note_admission('entry_identity')
-            after = self.ops.fstat(fd)
-            need(signature(after) == signature(info), 'identity_changed')
-            entry_id = f'e{sorted(snapshot["entries"]).index(name) + 1:04}'
-            records[name] = {'fd': fd, 'info': after, 'parent': parent_fd, 'leaf': leaf, 'entry_id': entry_id}
-        self.note_admission('source_closure')
-        self.check(records, source=records is self.source)
+        ids = {name: f'e{index + 1:04}' for index, name in enumerate(sorted(snapshot['entries']))}
+        for name in sorted(snapshot['entries'], key=lambda item: (item.count('/') + bool(item), item)):
+            self.note_admission('entry_identity'); parent_name, leaf = relative(name); row = snapshot['entries'][name]
+            parent, frames = self.chain(records, root, parent_name) if name else (root, [])
+            fd = None
+            try:
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+                flags |= os.O_SYMLINK if row['kind'] == 'symlink' else os.O_NOFOLLOW
+                if row['kind'] == 'directory': flags |= os.O_DIRECTORY
+                fd = self.open(leaf, flags, dir_fd=parent) if name else root
+                info = self.fstat(fd); self.row_matches(info, row)
+                self.note_admission('acl'); self.ops.admit_acl(fd, row)
+                self.note_admission('payload'); self.ops.payload(fd, row)
+                self.note_admission('symlink')
+                if row['kind'] == 'symlink': need(self.ops.readlink(parent, leaf) == row['symlink_bytes'])
+                self.note_admission('entry_identity'); after = self.fstat(fd)
+                need(signature(after) == signature(info), 'identity_changed')
+                if name: need(signature(self.named(parent, leaf)) == signature(after), 'identity_changed')
+                records[name] = {'info': after, 'parent_name': parent_name, 'leaf': leaf, 'name': name, 'entry_id': ids[name]}
+            finally:
+                self.release(([frame['fd'] for frame in frames] + [fd]) if name and fd is not None else [frame['fd'] for frame in frames])
+        self.note_admission('source_closure'); self.verify_tree(records, root)
 
-    def check(self, records, *, source=False):
-        for name, record in records.items():
-            info = self.ops.fstat(record['fd'])
-            self.note_difference(record, record['info'], info, 'source_held' if source else 'destination_held')
-            need(signature(info) == signature(record['info']), 'source_changed' if source else 'identity_changed')
-            if name:
-                named = self.ops.named(record['parent'], record['leaf'])
-                self.note_difference(record, info, named, 'source_named' if source else 'destination_named')
-                need(signature(named) == signature(info), 'source_changed' if source else 'identity_changed')
-        for fd, before in self.pins:
-            now = self.ops.fstat(fd)
-            need(identity(now) == identity(before) and now.st_mode == before.st_mode
-                 and now.st_uid == before.st_uid and now.st_gid == before.st_gid
-                 and now.st_flags == before.st_flags, 'identity_changed')
-        for parent, name, fd in self.bindings:
-            need(identity(self.ops.named(parent, name)) == identity(self.ops.fstat(fd)), 'identity_changed')
+    def lease(self, records, root, name, *, keep_chain=True):
+        record = records[name]; parent, frames = self.chain(records, root, record['parent_name']) if name else (root, [])
+        fd = None
+        try:
+            mode = record['info'].st_mode
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | (os.O_SYMLINK if stat.S_ISLNK(mode) else os.O_NOFOLLOW)
+            if stat.S_ISDIR(mode): flags |= os.O_DIRECTORY
+            fd = self.open(record['leaf'], flags, dir_fd=parent) if name else root
+            self.compare(record, self.fstat(fd), 'source_held' if records is self.source else 'destination_held', source=records is self.source)
+            if name: self.compare(record, self.named(parent, record['leaf']), 'source_named' if records is self.source else 'destination_named', source=records is self.source)
+            result = {'record': record, 'fd': fd, 'parent': parent, 'frames': frames, 'named': True, 'owns': bool(name)}
+            if not keep_chain:
+                self.release([frame['fd'] for frame in frames]); result.update(frames=[], parent=None)
+            return result
+        except BaseException:
+            pending = [frame['fd'] for frame in frames if frame['fd'] in self.owned]
+            if name and fd is not None and fd in self.owned: pending.append(fd)
+            self.release(pending); raise
 
-    def preflight(self):
+    def release_lease(self, lease):
+        pending = [frame['fd'] for frame in lease['frames']]
+        if lease['owns']: pending.append(lease['fd'])
+        lease.update(frames=[], parent=None, owns=False)
+        self.release(pending)
+
+    def verify_tree(self, records, root):
+        # Bounded complete inventory checkpoints, never called inside mutate().
+        self.anchors()
+        for name in records:
+            lease = self.lease(records, root, name)
+            self.release_lease(lease)
+
+    def class_names(self, lease):
+        return self.destination_classes.get(identity(lease['record']['info']), set())
+
+    def check_lease(self, lease, *, source=False):
+        record = lease['record']; info = self.fstat(lease['fd'])
+        self.compare(record, info, 'source_held' if source else 'destination_held', source=source)
+        if lease['named'] and record['name']:
+            self.compare(record, self.named(lease['parent'], record['leaf']), 'source_named' if source else 'destination_named', source=source)
+        for frame in lease['frames']:
+            self.compare(frame['record'], self.fstat(frame['fd']), 'ancestor', source=source)
+            self.compare(frame['record'], self.named(frame['parent'], frame['leaf']), 'ancestor_named', source=source)
+        if not source and not stat.S_ISDIR(info.st_mode):
+            need(info.st_nlink == len(self.class_names(lease)), 'destination_external_alias')
+
+    def preflight(self, *, rebind=True):
+        need(not self.uncertain, 'restoration_close_failed')
+        need(not self.cancelled(), 'restoration_cancelled'); self.anchors()
+        if rebind and self.sources:
+            canonical = self.sources[-1]
+            if len(self.sources) > 1 or canonical['parent'] is None:
+                self.release([frame['fd'] for frame in canonical['frames']]); canonical.update(frames=[], parent=None)
+                active_names = {lease['record']['name'] for lease in self.targets if lease['named']}
+                names = set().union(*(self.class_names(lease) for lease in self.targets))
+                for name in sorted(names - active_names):
+                    record = self.destination[name]
+                    parent, frames = self.chain(self.destination, self.destination_root, record['parent_name'])
+                    try: self.compare(record, self.named(parent, record['leaf']), 'destination_named')
+                    finally: self.release([frame['fd'] for frame in frames])
+                for lease in self.sources:
+                    record = lease['record']
+                    parent, frames = self.chain(self.source, self.source_root, record['parent_name']) if record['name'] else (self.source_root, [])
+                    lease.update(parent=parent, frames=frames)
+                    try: self.check_lease(lease, source=True)
+                    finally:
+                        if lease is not canonical:
+                            self.release([frame['fd'] for frame in frames]); lease.update(frames=[], parent=None)
+        for lease in self.sources:
+            if lease['parent'] is None:
+                self.compare(lease['record'], self.fstat(lease['fd']), 'source_held', source=True)
+            else: self.check_lease(lease, source=True)
+        for lease in self.targets: self.check_lease(lease)
         need(not self.cancelled(), 'restoration_cancelled')
-        self.check(self.source, source=True); self.check(self.destination)
-        counts = {}
-        for record in self.destination.values():
-            if not stat.S_ISDIR(record['info'].st_mode):
-                key = identity(record['info']); counts[key] = counts.get(key, 0) + 1
-        for record in self.destination.values():
-            if not stat.S_ISDIR(record['info'].st_mode):
-                need(record['info'].st_nlink == counts[identity(record['info'])], 'destination_external_alias')
 
-    def note_difference(self, record, before, after, check, allowed=(), parent_nlink=None):
-        # Only project a failed comparison already required by the guards.
-        fields = [('identity', identity(before), identity(after)),
-            ('generation', getattr(before, 'st_gen', None), getattr(after, 'st_gen', None)),
-            ('birthtime', getattr(before, 'st_birthtime', None), getattr(after, 'st_birthtime', None))]
+    def refresh(self, lease, allowed=(), *, parent_delta=None):
+        record = lease['record']; before = record['info']; after = self.fstat(lease['fd'])
+        self.note_difference(record, before, after, 'refresh', allowed, parent_delta)
+        need(identity(before) == identity(after) and getattr(before, 'st_gen', None) == getattr(after, 'st_gen', None)
+             and getattr(before, 'st_birthtime', None) == getattr(after, 'st_birthtime', None), 'identity_changed')
         for field in ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink', 'st_flags', 'st_mtime_ns', 'st_ctime_ns'):
-            if field not in allowed or field == 'st_nlink' and parent_nlink is not None:
-                expected = before.st_nlink + parent_nlink if field == 'st_nlink' and parent_nlink is not None else getattr(before, field)
-                fields.append((field.removeprefix('st_'), expected, getattr(after, field)))
-        for field, expected, actual in fields:
-            if expected != actual:
-                self.summary.setdefault('failure_context', {'operation': self.operation,
-                    'phase': self.operation_phase, 'check': check, 'entry_id': record.get('entry_id'), 'field': field})
-                break
+            if field == 'st_nlink' and parent_delta is not None:
+                need(after.st_nlink == before.st_nlink + parent_delta, 'identity_changed')
+            else: need(field in allowed or getattr(before, field) == getattr(after, field), 'identity_changed')
+        # Only destination state advances, and only following this known own call.
+        for name in self.destination_classes.get(identity(before), ()):
+            self.destination[name]['info'] = after
+        record['info'] = after
 
-    def refresh(self, records, allowed, *, parent_nlink=None):
-        for record in records:
-            before, after = record['info'], self.ops.fstat(record['fd'])
-            permitted = allowed(record) if callable(allowed) else allowed
-            delta = parent_nlink[1] if parent_nlink is not None and record is parent_nlink[0] else None
-            self.note_difference(record, before, after, 'refresh', permitted, delta)
-            need(identity(after) == identity(before), 'identity_changed')
-            need(getattr(after, 'st_gen', None) == getattr(before, 'st_gen', None)
-                 and getattr(after, 'st_birthtime', None) == getattr(before, 'st_birthtime', None), 'identity_changed')
-            for key in ('st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink', 'st_flags', 'st_mtime_ns', 'st_ctime_ns'):
-                if key == 'st_nlink' and delta is not None:
-                    need(after.st_nlink == before.st_nlink + delta, 'identity_changed')
-                else:
-                    need(key in permitted or getattr(before, key) == getattr(after, key), 'identity_changed')
-            record['info'] = after
-
-    def mutate(self, call, records, allowed, *, operation='metadata_setter', parent_nlink=None):
-        self.operation = operation; self.operation_phase = 'preflight'
-        self.preflight(); self.summary['mutation_attempts'] += 1
-        self.operation_phase = 'native_call'; call()
+    def mutate(self, operation, call, changed):
+        self.operation = operation; self.operation_phase = 'preflight'; self.preflight()
+        self.summary['mutation_attempts'] += 1; self.operation_phase = 'native_call'; call()
         self.operation_phase = 'refresh'
-        self.refresh(records, allowed, parent_nlink=parent_nlink)
-        self.operation_phase = 'postflight'
-        self.preflight()
+        for lease, allowed, delta in changed: self.refresh(lease, allowed, parent_delta=delta)
+        self.operation_phase = 'postflight'; self.preflight(rebind=False)
+
+    def begin_class(self, names, canonical):
+        self.sources = []
+        for name in [*sorted(set(names) - {canonical}), canonical]:
+            self.sources.append(self.lease(self.source, self.source_root, name, keep_chain=False))
+        self.targets = [self.lease(self.destination, self.destination_root, canonical)]
+
+    def end_class(self):
+        need(not self.changed_flags and not self.changed_modes, 'restoration_refused')
+        leases, self.targets, self.sources = [*self.targets, *self.sources], [], []
+        for lease in reversed(leases): self.release_lease(lease)
+
+    def parent_lease(self, target):
+        record = self.destination[target['record']['parent_name']]
+        return {'record': record, 'fd': target['parent'], 'parent': None, 'frames': target['frames'], 'named': False, 'owns': False}
+
+    def alias(self, canonical, name):
+        first = self.targets[0]
+        victim = self.lease(self.destination, self.destination_root, name); self.targets.append(victim)
+        parent = self.parent_lease(victim); original = stat.S_IMODE(parent['record']['info'].st_mode)
+        if original & 0o300 != 0o300:
+            self.changed_modes[parent['fd']] = (parent, original)
+            self.mutate('parent_mode', lambda: self.ops.mode(parent['fd'], original | 0o300),
+                        [(parent, {'st_mode', 'st_ctime_ns'}, None)])
+        old_key = identity(victim['record']['info'])
+        def remove():
+            self.ops.unlink(victim['parent'], victim['record']['leaf'])
+            self.destination_classes[old_key].remove(name)
+            del self.destination[name]; victim['named'] = False
+        self.mutate('alias_unlink', remove, [(victim, {'st_nlink', 'st_ctime_ns'}, -1),
+                    (parent, {'st_size', 'st_mtime_ns', 'st_ctime_ns'}, -1)])
+        try: self.named(victim['parent'], victim['record']['leaf'])
+        except OSError as error: need(error.errno == errno.ENOENT, 'identity_changed')
+        else: raise RestoreError('identity_changed')
+        def link():
+            self.ops.link(first['parent'], first['record']['leaf'], victim['parent'], victim['record']['leaf'])
+            replacement = dict(first['record'], name=name, parent_name=victim['record']['parent_name'],
+                               leaf=victim['record']['leaf'], entry_id=victim['record']['entry_id'])
+            self.destination[name] = replacement
+            self.destination_classes.setdefault(identity(first['record']['info']), set()).add(name)
+        self.mutate('alias_link', link, [(first, {'st_nlink', 'st_ctime_ns'}, 1),
+                    (parent, {'st_size', 'st_mtime_ns', 'st_ctime_ns'}, 1)])
+        replacement = self.destination[name]
+        self.compare(replacement, self.named(victim['parent'], replacement['leaf']), 'destination_named')
+        self.preflight(rebind=False); self.summary['alias_replacements'] += 1
+        if parent['fd'] in self.changed_modes:
+            self.mutate('parent_mode_restore', lambda: self.ops.mode(parent['fd'], original),
+                        [(parent, {'st_mode', 'st_ctime_ns'}, None)])
+            del self.changed_modes[parent['fd']]
+        self.targets.pop(); self.release_lease(victim)
+
+    def metadata(self, name):
+        target = self.targets[0]; source = self.sources[-1]; expected = self.expected['entries'][name]
+        original = target['record']['info'].st_flags
+        if original & BLOCKING:
+            need(not stat.S_ISDIR(target['record']['info'].st_mode) and len(self.class_names(target)) == 1)
+            self.changed_flags[target['fd']] = (target, original)
+            self.mutate('flags_unblock', lambda: self.ops.flags(target['fd'], original & ~BLOCKING),
+                        [(target, {'st_flags', 'st_ctime_ns'}, None)])
+        if target['record']['info'].st_flags != expected['flags'] & ~BLOCKING:
+            self.mutate('tracking', lambda: self.ops.flags(target['fd'], expected['flags'] & ~BLOCKING),
+                        [(target, {'st_flags', 'st_ctime_ns'}, None)])
+            self.summary['tracking_repairs'] += 1
+        if name in self.derived['acl']:
+            self.mutate('acl', lambda: self.ops.copy_acl(source['fd'], target['fd']), [(target, {'st_ctime_ns'}, None)])
+            self.summary['acl_repairs'] += 1
+        if stat.S_ISDIR(target['record']['info'].st_mode):
+            if stat.S_IMODE(target['record']['info'].st_mode) != expected['mode']:
+                self.mutate('directory_mode', lambda: self.ops.mode(target['fd'], expected['mode']),
+                            [(target, {'st_mode', 'st_ctime_ns'}, None)])
+            if target['record']['info'].st_mtime_ns != expected['mtime_ns']:
+                def times():
+                    before = self.fstat(target['fd']).st_atime_ns
+                    self.ops.times(target['fd'], expected['mtime_ns'])
+                    need(self.fstat(target['fd']).st_atime_ns == before, 'atime_changed')
+                self.mutate('directory_time', times, [(target, {'st_mtime_ns', 'st_ctime_ns'}, None)])
+                self.summary['directory_times'] += 1
+        if target['record']['info'].st_flags != expected['flags']:
+            self.mutate('flags_restore', lambda: self.ops.flags(target['fd'], expected['flags']),
+                        [(target, {'st_flags', 'st_ctime_ns'}, None)])
+        self.changed_flags.pop(target['fd'], None)
 
     def restore(self, destination_snapshot, output='output'):
-        self.summary['status'] = 'incomplete'
-        self.operation = 'destination_capture'; self.operation_phase = 'preflight'
+        self.summary['status'] = 'incomplete'; self.operation = 'destination_capture'; self.operation_phase = 'preflight'
         try:
-            derived = plan(self.expected, destination_snapshot, os.geteuid())
+            self.derived = plan(self.expected, destination_snapshot, os.geteuid())
             need('/' not in output and output not in ('', '.', '..'))
-            destination = self.take(self.ops.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                                 dir_fd=self.parent))
-            self.bindings.append((self.parent, output, destination))
-            self.capture(destination, destination_snapshot, self.destination)
-            self.preflight()
-            # Every setter/alias has a qualified selector before the first change.
-            needed_parents = {relative(alias)[0] for _, alias in derived['aliases']}
-            for name in needed_parents:
-                record = self.destination[name]; original = stat.S_IMODE(record['info'].st_mode)
-                if original & 0o300 != 0o300:
-                    self.changed_modes[record['fd']] = original
-                    self.mutate(lambda r=record, mode=original: self.ops.mode(r['fd'], mode | 0o300),
-                                [record], {'st_mode', 'st_ctime_ns'})
-            for canonical, name in derived['aliases']:
-                first, victim = self.destination[canonical], self.destination[name]
-                parent = self.destination[relative(name)[0]]
-                # The plan admits blockers only on singleton metadata targets.
-                need(not victim['info'].st_flags & BLOCKING and not first['info'].st_flags & BLOCKING)
-                same = [r for r in self.destination.values() if identity(r['info']) == identity(first['info'])]
-                old_class = [r for r in self.destination.values() if identity(r['info']) == identity(victim['info'])]
-                def remove():
-                    self.ops.unlink(victim['parent'], victim['leaf'])
-                    # The removed held inode is no longer a named destination member.
-                    del self.destination[name]
-                self.mutate(remove, old_class + [parent], lambda record:
-                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'},
-                    operation='alias_unlink', parent_nlink=(parent, -1))
-                remaining = sum(identity(record['info']) == identity(victim['info'])
-                                for record in self.destination.values())
-                need(self.ops.fstat(victim['fd']).st_nlink == remaining, 'destination_external_alias')
-                self.preflight()
-                try:
-                    self.ops.named(victim['parent'], victim['leaf'])
-                except OSError as error:
-                    need(error.errno == errno.ENOENT, 'identity_changed')
-                else:
-                    raise RestoreError('identity_changed')
-                self.operation = 'alias_link'; self.operation_phase = 'preflight'
-                self.preflight()
-                self.summary['mutation_attempts'] += 1
-                self.operation_phase = 'native_call'
-                self.ops.link(first['parent'], first['leaf'], victim['parent'], victim['leaf'])
-                self.operation_phase = 'refresh'
-                self.refresh(same + [parent], lambda record:
-                    {'st_size', 'st_mtime_ns', 'st_ctime_ns'} if record is parent else {'st_nlink', 'st_ctime_ns'},
-                    parent_nlink=(parent, 1))
-                replacement = dict(first, parent=victim['parent'], leaf=victim['leaf'], entry_id=victim['entry_id'])
-                self.destination[name] = replacement
-                self.operation_phase = 'postflight'
-                self.preflight(); self.summary['alias_replacements'] += 1
-            for name in derived['flags']:
-                record = self.destination[name]; original = record['info'].st_flags
-                self.changed_flags[record['fd']] = original
-                if original & BLOCKING:
-                    self.mutate(lambda r=record: self.ops.flags(r['fd'], original & ~BLOCKING),
-                                [record], {'st_flags', 'st_ctime_ns'})
-                expected = self.expected['entries'][name]['flags']
-                related = [r for r in self.destination.values() if identity(r['info']) == identity(record['info'])]
-                self.mutate(lambda r=record, flags=expected: self.ops.flags(r['fd'], flags & ~BLOCKING),
-                            related, {'st_flags', 'st_ctime_ns'})
-                self.summary['tracking_repairs'] += 1
-            for name in derived['acl']:
-                record = self.destination[name]
-                self.mutate(lambda: self.ops.copy_acl(self.source[name]['fd'], record['fd']),
-                            [r for r in self.destination.values() if identity(r['info']) == identity(record['info'])], {'st_ctime_ns'})
-                self.summary['acl_repairs'] += 1
-            for name in derived['directories']:
-                record = self.destination[name]; mode = self.expected['entries'][name]['mode']
-                if stat.S_IMODE(record['info'].st_mode) != mode:
-                    self.mutate(lambda r=record, mode=mode: self.ops.mode(r['fd'], mode), [record], {'st_mode', 'st_ctime_ns'})
-                mtime = self.expected['entries'][name]['mtime_ns']
-                if record['info'].st_mtime_ns != mtime:
-                    def set_time(r=record, value=mtime):
-                        before_atime = self.ops.fstat(r['fd']).st_atime_ns
-                        self.ops.times(r['fd'], value)
-                        need(self.ops.fstat(r['fd']).st_atime_ns == before_atime, 'atime_changed')
-                    self.mutate(set_time, [record], {'st_mtime_ns', 'st_ctime_ns'})
-                    self.summary['directory_times'] += 1
-            # Restore exact blocking state only after all forward metadata work.
-            for name in derived['objects']:
-                record = self.destination[name]; flags = self.expected['entries'][name]['flags']
-                if record['info'].st_flags != flags:
-                    self.mutate(lambda r=record, flags=flags: self.ops.flags(r['fd'], flags),
-                                [r for r in self.destination.values() if identity(r['info']) == identity(record['info'])],
-                                {'st_flags', 'st_ctime_ns'})
-            self.preflight()
+            self.destination_root = self.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent)
+            self.bindings.append((self.parent, output, self.destination_root))
+            self.capture(self.destination_root, destination_snapshot, self.destination)
+            self.destination_classes = self.classes(self.destination)
+            self.verify_tree(self.source, self.source_root)
+            groups = {min(names): names for names in self.source_classes.values()}
+            for canonical, names in sorted(groups.items()):
+                aliases = [name for first, name in self.derived['aliases'] if first == canonical]
+                if not aliases: continue
+                self.begin_class(names, canonical)
+                for name in aliases: self.alias(canonical, name)
+                self.end_class()
+            # Complete each admitted inode before releasing its recovery handles.
+            for canonical, names in sorted(groups.items()):
+                if canonical not in self.derived['flags'] and canonical not in self.derived['acl']:
+                    continue
+                self.begin_class(names, canonical); self.metadata(canonical); self.end_class()
+            for name in self.derived['directories']:
+                self.begin_class({name}, name); self.metadata(name); self.end_class()
+            self.verify_tree(self.source, self.source_root)
+            self.verify_tree(self.destination, self.destination_root)
             self.summary['status'] = 'restored_pending_final_verifiers'
         except BaseException as error:
             self.failure = error
-            self.summary.setdefault('failure_context', {'operation': self.operation,
-                'phase': self.operation_phase, 'check': 'unclassified', 'entry_id': None, 'field': None})
+            self.summary.setdefault('failure_context', {'operation': self.operation, 'phase': self.operation_phase,
+                                                       'check': 'unclassified', 'entry_id': None, 'field': None})
             self.summary['error'] = str(error) if isinstance(error, RestoreError) else 'restoration_operation_failed'
-            self.summary['status'] = 'incomplete'
-            self.recover()
+            self.summary['status'] = 'incomplete'; self.recover()
+        finally:
+            # Error recovery never opens a fresh pathname or retries an alias edit.
+            for lease in [*self.targets, *self.sources]:
+                try: self.release_lease(lease)
+                except BaseException:
+                    self.summary['status'] = 'incomplete'
+                    self.summary.setdefault('error', 'restoration_close_failed')
+            self.targets = []; self.sources = []
         return dict(self.summary)
 
-    def recover(self):
-        # Stop forward repairs. Recovery can affect ONLY the still-held admitted
-        # inodes, regardless of whether names moved; never a pathname fallback.
-        self.summary['recovery'] = 'complete'
-        for fd, original in reversed(list(self.changed_flags.items())):
-            try:
-                now = self.recovery_identity(fd)
-                # Preserve newly enabled tracking; clearing it can strand a
-                # document ID. Recovery restores only the original blockers.
-                self.ops.flags(fd, (now.st_flags & ~BLOCKING) | (original & BLOCKING))
-            except BaseException:
-                self.summary['recovery'] = 'incomplete'
-        for fd, mode in reversed(list(self.changed_modes.items())):
-            try:
-                self.recovery_identity(fd)
-                self.ops.mode(fd, mode)
-            except BaseException:
-                self.summary['recovery'] = 'incomplete'
-
-    def recovery_identity(self, fd):
-        record = next(r for r in self.destination.values() if r['fd'] == fd)
-        now = self.ops.fstat(fd)
+    def recovery_identity(self, lease):
+        self.anchors(recovery=True)
+        record = lease['record']; now = self.fstat(lease['fd'])
         need(identity(now) == identity(record['info']) and now.st_uid == os.geteuid()
              and now.st_gid == record['info'].st_gid and not now.st_flags & ~ALLOWED_FLAGS)
-        need(stat.S_IMODE(self.ops.fstat(self.root).st_mode) == 0o700)
-        for parent, name, opened in self.bindings:
-            need(identity(self.ops.named(parent, name)) == identity(self.ops.fstat(opened)))
-        accounted = 0
-        for name, other in self.destination.items():
-            if identity(other['info']) == identity(now):
-                if name: need(identity(self.ops.named(other['parent'], other['leaf'])) == identity(now))
-                accounted += 1
-        if not stat.S_ISDIR(now.st_mode): need(now.st_nlink == accounted)
+        for frame in lease['frames']:
+            info = self.fstat(frame['fd'])
+            need(identity(info) == identity(frame['record']['info']), 'identity_changed')
+            need(identity(self.named(frame['parent'], frame['leaf'])) == identity(info), 'identity_changed')
+        if lease['named'] and record['name']:
+            need(identity(self.named(lease['parent'], record['leaf'])) == identity(now), 'identity_changed')
+        if not stat.S_ISDIR(now.st_mode): need(now.st_nlink == len(self.class_names(lease)), 'destination_external_alias')
         return now
 
-    def close(self):
-        while self.owned:
-            self.close_outcome['attempts'] += 1
+    def recover(self):
+        self.summary['recovery'] = 'complete'
+        for lease, original in reversed(list(self.changed_flags.values())):
             try:
-                self.ops.close(self.owned.pop())
-            except BaseException as error:
-                self.close_outcome['failures'] += 1
-                if self.close_outcome['errno'] is None:
-                    self.close_outcome['errno'] = error_number(error)
-        self.close_outcome['status'] = ('incomplete' if self.close_outcome['failures'] else
-                                       'complete' if self.close_outcome['attempts'] else 'not_needed')
+                now = self.recovery_identity(lease)
+                self.ops.flags(lease['fd'], (now.st_flags & ~BLOCKING) | (original & BLOCKING))
+            except BaseException: self.summary['recovery'] = 'incomplete'
+        for lease, original in reversed(list(self.changed_modes.values())):
+            try:
+                self.recovery_identity(lease); self.ops.mode(lease['fd'], original)
+            except BaseException: self.summary['recovery'] = 'incomplete'
+        self.changed_flags.clear(); self.changed_modes.clear()
+
+    def close(self):
+        try: self.release(list(self.owned))
+        except BaseException: pass
+        self.close_outcome['status'] = ('incomplete' if self.uncertain else 'complete' if self.close_outcome['attempts'] else 'not_needed')
         self.summary['close'] = dict(self.close_outcome)
-        if self.close_outcome['failures']:
-            self.summary.update(status='incomplete', error='restoration_close_failed')
-        return self.close_outcome['failures'] == 0
+        if self.uncertain:
+            self.summary['status'] = 'incomplete'
+            self.summary.setdefault('error', 'restoration_close_failed')
+        return not self.uncertain
