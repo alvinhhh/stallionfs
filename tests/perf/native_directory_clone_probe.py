@@ -36,6 +36,7 @@ PIN_PATHS += ('tests/test_native_directory_clone_probe.py', '.github/workflows/c
 PIN_PATHS += ('tests/perf/native_directory_restore.py', 'tests/test_native_directory_restore.py')
 PIN_PATHS += ('tests/test_native_directory_restore_fd_observer.py',)
 PIN_PATHS += ('tests/test_native_directory_restore_policy.py',)
+PIN_PATHS += ('tests/test_native_directory_type_preflight.py',)
 SETUP_ERRORS = {'host_checks': 'host_check_failed', 'inputs': 'input_unavailable',
                 'wheel_identity': 'wheel_unavailable', 'source_pins': 'pin_unavailable',
                 'binary_pins': 'binary_pin_unavailable', 'private_fixture_setup': 'fixture_setup_failed',
