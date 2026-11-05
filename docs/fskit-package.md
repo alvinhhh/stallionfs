@@ -328,3 +328,30 @@ directories and the small lock file remain. If app admission is unavailable,
 restore the app to its supported location before managing its link. No workspace
 data, mount, signing state or system registration is changed. Ordinary app
 installation, upgrade/removal and signed installed qualification remain separate.
+
+## Hosted unsigned components
+
+The manual **Checks** workflow mode `unsigned-app-artifact` builds from the
+selected commit on a verified macOS 27 ARM64 host with selected Xcode 27.1 and
+SDK 27.0. It compiles the ordinary host, the production extension with
+`STALLION_CONTEXT_HANDLERS` and `STALLION_CONTEXT_WRITES`, a matching CPython 3.13
+ARM64 wheel, and `tools/mount_witness.c`. The mount witness is compiled without
+being run. This finite job does not sign for distribution, install, register,
+or mount anything. Linker-added ad-hoc signatures may be present.
+
+The artifact contains only the four unsigned app files, wheel, mount witness,
+repository `LICENSE`, and public `provenance.json` in `StallionFS-unsigned-arm64.tar.gz`. The manifest
+records the source commit/tree, source and component hashes, actual tools and
+SDK, command results, production symbol checks, existing packager candidate
+receipt, and wheel RECORD/source/native-member validation. The archive is
+reopened and its exact inventory and file hashes verified before upload.
+Failed builds do not upload a component archive. Retention is three days;
+download and verify the archive into durable storage before expiry.
+
+These are assembly inputs, not a self-contained release: the shell app lacks
+the private Python and Git runtimes required by the bundled-runtime recipe.
+No private runtime descriptors, licenses/source sidecars, installation receipts,
+fixture identities, keys, profiles, or account identifiers are workflow inputs.
+Bundle version 146 identifies this component build; the product version is
+unchanged. A later private assembly must use the matching wheel and preserve
+its source and build provenance.

@@ -561,6 +561,57 @@ def _runtime_expected_resources(setup_bytes):
             **{'fixture/' + name: 'tests/perf/fixture/' + name for name in values['BENCHMARK_FIXTURES']}}
 
 
+def _runtime_source_wheel(data, metadata, pins):
+    files, scripts, extensions, tag = _runtime_wheel_members(data, metadata)
+    provenance = json.loads(files['stallionfs/_benchmark_runtime/manifest.json'])
+    _runtime_require(provenance.get('kind') == 'build-source provenance'
+                     and isinstance(provenance.get('build_source_sha256'), dict), 'Wheel source provenance is missing')
+    source = Path(__file__).resolve().parents[1]
+    build_sources = provenance['build_source_sha256']
+    source_names = {'setup.py', 'pyproject.toml', *(path.relative_to(source).as_posix()
+                    for path in (source / 'stallionfs').iterdir()
+                    if path.is_file() and path.suffix in ('.py', '.c', '.h'))}
+    _runtime_require(set(build_sources) == source_names, 'Wheel lacks the current bundled source')
+    for name, digest in build_sources.items():
+        _runtime_relative(name)
+        _runtime_require(isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest), 'Invalid wheel source digest')
+        data = _runtime_pinned({'path': str(source / name), 'sha256': digest}, pins)
+        if name.startswith('stallionfs/') and name.endswith('.py'):
+            _runtime_require(name in files, 'Wheel package source is missing: ' + name)
+        if name in files:
+            _runtime_require(files[name] == data, 'Wheel source differs: ' + name)
+    resources = _runtime_expected_resources(_runtime_read(source / 'setup.py', build_sources['setup.py']))
+    _runtime_require(isinstance(provenance.get('resources'), dict) and set(provenance['resources']) == set(resources),
+                     'Wheel benchmark resource set differs')
+    resource_members = {'stallionfs/_benchmark_runtime/' + name for name in resources}
+    resource_members.add('stallionfs/_benchmark_runtime/manifest.json')
+    allowed_package = {name for name in build_sources if name.startswith('stallionfs/')} | set(extensions) | resource_members
+    _runtime_require({name for name in files if name.startswith('stallionfs/')} <= allowed_package,
+                     'Wheel contains unlisted package members')
+    for name, input_name in resources.items():
+        member = 'stallionfs/_benchmark_runtime/' + name
+        _runtime_require(member in files, 'Wheel benchmark resource is missing: ' + name)
+        data = _runtime_pinned({'path': str(source / input_name), 'sha256': provenance['resources'][name]}, pins)
+        _runtime_require(files[member] == data, 'Wheel benchmark resource differs: ' + name)
+    return files, scripts, extensions, tag, build_sources
+
+
+def _inspect_runtime_wheel(files, scripts, extensions, directory):
+    observations = []
+    for index, name in enumerate([scripts + 'sfs', scripts + 'stallionfs', *extensions]):
+        executable = directory / ('wheel-' + str(index))
+        write_new(executable, files[name], 0o700)
+        _runtime_require(_architectures(executable, directory) == ['arm64'], 'Wheel must be arm64')
+        target = _deployment_target(_tool_output(['/usr/bin/otool', '-arch', 'arm64', '-l', str(executable)], directory), 'arm64')
+        _runtime_require(_version(target['minimum_os']) <= _version('27.0'), 'Wheel exceeds the app minimum')
+        if name in extensions:
+            symbols = _tool_output(['/usr/bin/nm', '-arch', 'arm64', '-g', '-U', '-j', str(executable)], directory)
+            _runtime_require('_PyInit_' + Path(name).name.split('.')[0] in symbols.splitlines(), 'Wheel initializer differs')
+        _runtime_require(read_executable(executable) == files[name], 'Wheel changed during inspection')
+        observations.append({'member': name, 'sha256': _runtime_sha(files[name]), 'target': target})
+    return observations
+
+
 def _prepare_runtime(path, output):
     pins = {}
     parent = _runtime_directory(output.parent)
@@ -605,37 +656,8 @@ def _prepare_runtime(path, output):
     _runtime_require(_runtime_inventory(git['root']) == git_rows, 'Private Git inventory differs')
     _runtime_require({'bin/git', 'libexec/git-core', 'share/git-core/templates'}
                      <= {row['path'] for row in git_rows}, 'Private Git support is incomplete')
-    files, scripts, extensions, tag = _runtime_wheel_members(_runtime_pinned(value['wheel'], pins), metadata)
-    provenance = json.loads(files['stallionfs/_benchmark_runtime/manifest.json'])
-    _runtime_require(provenance.get('kind') == 'build-source provenance'
-                     and isinstance(provenance.get('build_source_sha256'), dict), 'Wheel source provenance is missing')
-    source = Path(__file__).resolve().parents[1]
-    build_sources = provenance['build_source_sha256']
-    source_names = {'setup.py', 'pyproject.toml', *(path.relative_to(source).as_posix()
-                    for path in (source / 'stallionfs').iterdir()
-                    if path.is_file() and path.suffix in ('.py', '.c', '.h'))}
-    _runtime_require(set(build_sources) == source_names, 'Wheel lacks the current bundled source')
-    for name, digest in build_sources.items():
-        _runtime_relative(name)
-        _runtime_require(isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest), 'Invalid wheel source digest')
-        data = _runtime_pinned({'path': str(source / name), 'sha256': digest}, pins)
-        if name.startswith('stallionfs/') and name.endswith('.py'):
-            _runtime_require(name in files, 'Wheel package source is missing: ' + name)
-        if name in files:
-            _runtime_require(files[name] == data, 'Wheel source differs: ' + name)
-    resources = _runtime_expected_resources(_runtime_read(source / 'setup.py', build_sources['setup.py']))
-    _runtime_require(isinstance(provenance.get('resources'), dict) and set(provenance['resources']) == set(resources),
-                     'Wheel benchmark resource set differs')
-    resource_members = {'stallionfs/_benchmark_runtime/' + name for name in resources}
-    resource_members.add('stallionfs/_benchmark_runtime/manifest.json')
-    allowed_package = {name for name in build_sources if name.startswith('stallionfs/')} | set(extensions) | resource_members
-    _runtime_require({name for name in files if name.startswith('stallionfs/')} <= allowed_package,
-                     'Wheel contains unlisted package members')
-    for name, input_name in resources.items():
-        member = 'stallionfs/_benchmark_runtime/' + name
-        _runtime_require(member in files, 'Wheel benchmark resource is missing: ' + name)
-        data = _runtime_pinned({'path': str(source / input_name), 'sha256': provenance['resources'][name]}, pins)
-        _runtime_require(files[member] == data, 'Wheel benchmark resource differs: ' + name)
+    files, scripts, extensions, tag, build_sources = _runtime_source_wheel(
+        _runtime_pinned(value['wheel'], pins), metadata, pins)
     licenses = []
     python_licenses = json.loads(checked['license_records'])['licenses']
     _runtime_require(isinstance(python_licenses, list) and python_licenses, 'Python license records are required')
@@ -667,18 +689,7 @@ def _prepare_runtime(path, output):
     # Retain the existing inspection-tool contract; no supplied executable is launched.
     with tempfile.TemporaryDirectory(prefix='stallionfs-wheel-', dir=output.parent) as temporary:
         directory = Path(temporary)
-        observations = []
-        for index, name in enumerate([scripts + 'sfs', scripts + 'stallionfs', *extensions]):
-            executable = directory / ('wheel-' + str(index))
-            write_new(executable, files[name], 0o700)
-            _runtime_require(_architectures(executable, directory) == ['arm64'], 'Wheel must be arm64')
-            target = _deployment_target(_tool_output(['/usr/bin/otool', '-arch', 'arm64', '-l', str(executable)], directory), 'arm64')
-            _runtime_require(_version(target['minimum_os']) <= _version('27.0'), 'Wheel exceeds the app minimum')
-            if name in extensions:
-                symbols = _tool_output(['/usr/bin/nm', '-arch', 'arm64', '-g', '-U', '-j', str(executable)], directory)
-                _runtime_require('_PyInit_' + Path(name).name.split('.')[0] in symbols.splitlines(), 'Wheel initializer differs')
-            _runtime_require(read_executable(executable) == files[name], 'Wheel changed during inspection')
-            observations.append({'member': name, 'sha256': _runtime_sha(files[name]), 'target': target})
+        observations = _inspect_runtime_wheel(files, scripts, extensions, directory)
     return {'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
             'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources,
             'sidecar': sidecar, 'wheel_tag': tag, 'wheel_observations': observations,
