@@ -37,8 +37,8 @@ class WorkspaceCLI(unittest.TestCase):
         self.retired = self.root / 'trash' / self.ident / 'repo'
         self.cli = workspace.FolderCLI('/installed/stallionfs', self.root, self.seed)
 
-    def record(self, path, **changes):
-        return dict(id=self.ident, seed=self.seed, path=str(path)) | changes
+    def record(self, workspace_path, **changes):
+        return dict(id=self.ident, seed=self.seed, path=str(workspace_path)) | changes
 
     def test_candidate_pins_installed_cli_helper_and_workspace_entry_points(self):
         prefix = self.root.parent / 'environment'
