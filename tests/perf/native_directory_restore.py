@@ -356,12 +356,47 @@ class DarwinOps:
     readlink = staticmethod(lambda parent, name: os.fsencode(os.readlink(name, dir_fd=parent)).hex())
 
 
-class Session:
-    """Private stable-source experiment with bounded operation-local descriptors.
+class _ReadParent:
+    """Own one parent chain during a capture or inventory pass."""
+    def __init__(self, session, records, root):
+        self.session = session; self.records = records; self.root = root
+        self.name = None; self.parent = None; self.frames = []
 
-    Inactive names are reopened and checked, not continuously pinned. Sequential
-    checks and final verifiers do not provide an atomic namespace snapshot or
-    exclude same-user replacement/restore races between lease windows.
+    def get(self, name):
+        session = self.session
+        need(not session.uncertain, 'restoration_close_failed')
+        need(not session.cancelled(), 'restoration_cancelled')
+        if name != self.name:
+            self.close()
+            need(not session.uncertain, 'restoration_close_failed')
+            need(not session.cancelled(), 'restoration_cancelled')
+            self.parent, self.frames = session.chain(self.records, self.root, name)
+            self.name = name
+        else:
+            source = self.records is session.source
+            if '' in self.records:
+                session.compare(self.records[''], session.fstat(self.root), 'ancestor', source=source)
+            for frame in self.frames:
+                need(not session.uncertain, 'restoration_close_failed')
+                need(not session.cancelled(), 'restoration_cancelled')
+                session.compare(frame['record'], session.fstat(frame['fd']), 'ancestor', source=source)
+                session.compare(frame['record'], session.named(frame['parent'], frame['leaf']),
+                                'ancestor_named', source=source)
+        return self.parent
+
+    def close(self):
+        frames, self.frames = self.frames, []
+        self.name = None; self.parent = None
+        self.session.release([frame['fd'] for frame in frames])
+
+
+class Session:
+    """Private stable-source experiment with bounded descriptors.
+
+    Inactive leaves are reopened and checked, not continuously pinned. Read passes
+    retain only adjacent parent chains and check them before reuse. Sequential checks
+    and final verifiers do not provide an atomic namespace snapshot or exclude
+    same-user replacement/restore races between lease windows.
     """
     def __init__(self, base, source, parent, expected, *, ops=None, cancelled=None, profile='small', budget=None):
         self.cancelled = cancelled if cancelled is not None else lambda: False
@@ -511,6 +546,7 @@ class Session:
               stat.S_ISREG(info.st_mode) if row['kind'] == 'file' else stat.S_ISLNK(info.st_mode)), 'identity_changed')
 
     def capture(self, root, snapshot, records):
+        need(not self.uncertain, 'restoration_close_failed')
         self.note_admission('schema')
         maximum, logical, file_size = profile_limits(self.profile)
         need(snapshot.get('unavailable_fields') == [] and 0 < len(snapshot['entries']) <= maximum)
@@ -528,30 +564,40 @@ class Session:
                 need(type(row.get('size')) is int and 0 <= row['size'] <= file_size); total += row['size']
         need(total <= logical)
         ids = {name: f'e{index + 1:04}' for index, name in enumerate(sorted(snapshot['entries']))}
-        for name in sorted(snapshot['entries'], key=lambda item: (item.count('/') + bool(item), item)):
-            self.note_admission('entry_identity'); parent_name, leaf = relative(name); row = snapshot['entries'][name]
-            parent, frames = self.chain(records, root, parent_name) if name else (root, [])
-            fd = None
-            try:
-                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-                flags |= os.O_SYMLINK if row['kind'] == 'symlink' else os.O_NOFOLLOW
-                if row['kind'] == 'directory': flags |= os.O_DIRECTORY
-                fd = self.open(leaf, flags, dir_fd=parent) if name else root
-                info = self.fstat(fd); self.row_matches(info, row)
-                self.note_admission('acl'); self.ops.admit_acl(fd, row)
-                self.note_admission('payload'); self.ops.payload(fd, row)
-                self.note_admission('symlink')
-                if row['kind'] == 'symlink': need(self.ops.readlink(parent, leaf) == row['symlink_bytes'])
-                self.note_admission('entry_identity'); after = self.fstat(fd)
-                need(signature(after) == signature(info), 'identity_changed')
-                if name: need(signature(self.named(parent, leaf)) == signature(after), 'identity_changed')
-                records[name] = {'info': after, 'parent_name': parent_name, 'leaf': leaf, 'name': name, 'entry_id': ids[name]}
-            finally:
-                self.release(([frame['fd'] for frame in frames] + [fd]) if name and fd is not None else [frame['fd'] for frame in frames])
+        parents = _ReadParent(self, records, root)
+        try:
+            for name in sorted(snapshot['entries'], key=lambda item: (item.count('/') + bool(item), item)):
+                self.note_admission('entry_identity'); parent_name, leaf = relative(name); row = snapshot['entries'][name]
+                parent = parents.get(parent_name) if name else root
+                fd = None
+                try:
+                    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+                    flags |= os.O_SYMLINK if row['kind'] == 'symlink' else os.O_NOFOLLOW
+                    if row['kind'] == 'directory': flags |= os.O_DIRECTORY
+                    fd = self.open(leaf, flags, dir_fd=parent) if name else root
+                    info = self.fstat(fd); self.row_matches(info, row)
+                    self.note_admission('acl'); self.ops.admit_acl(fd, row)
+                    self.note_admission('payload'); self.ops.payload(fd, row)
+                    self.note_admission('symlink')
+                    if row['kind'] == 'symlink': need(self.ops.readlink(parent, leaf) == row['symlink_bytes'])
+                    self.note_admission('entry_identity'); after = self.fstat(fd)
+                    need(signature(after) == signature(info), 'identity_changed')
+                    if name: need(signature(self.named(parent, leaf)) == signature(after), 'identity_changed')
+                    records[name] = {'info': after, 'parent_name': parent_name, 'leaf': leaf, 'name': name, 'entry_id': ids[name]}
+                finally:
+                    if name and fd is not None: self.release([fd])
+        finally:
+            parents.close()
+        need(not self.uncertain, 'restoration_close_failed')
         self.note_admission('source_closure'); self.verify_tree(records, root)
 
-    def lease(self, records, root, name, *, keep_chain=True):
-        record = records[name]; parent, frames = self.chain(records, root, record['parent_name']) if name else (root, [])
+    def lease(self, records, root, name, *, keep_chain=True, _read_parent=None):
+        record = records[name]
+        if name and _read_parent is not None:
+            # Read-pass ancestors remain exclusively owned by the pass.
+            parent, frames = _read_parent.get(record['parent_name']), []
+        else:
+            parent, frames = self.chain(records, root, record['parent_name']) if name else (root, [])
         fd = None
         try:
             mode = record['info'].st_mode
@@ -577,10 +623,17 @@ class Session:
 
     def verify_tree(self, records, root):
         # Bounded complete inventory checkpoints, never called inside mutate().
+        need(not self.uncertain, 'restoration_close_failed')
         self.anchors()
-        for name in records:
-            lease = self.lease(records, root, name)
-            self.release_lease(lease)
+        parents = _ReadParent(self, records, root)
+        try:
+            for name in records:
+                lease = self.lease(records, root, name, _read_parent=parents)
+                self.release_lease(lease)
+        finally:
+            parents.close()
+
+        need(not self.uncertain, 'restoration_close_failed')
 
     def class_names(self, lease):
         return self.destination_classes.get(identity(lease['record']['info']), set())
