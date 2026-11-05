@@ -30,7 +30,13 @@ class Images(unittest.TestCase):
         subprocess.run(['/usr/bin/xattr', '-w', 'com.stallionfs.test', 'attribute', str(self.source / 'file')], check=True)
         (self.source / 'link').symlink_to('file')
         self.seed = self.base / 'seed.sparseimage'
-        images.build(self.source, self.seed, 1)
+        original_detach = images.detach
+        def observed_detach(image, point):
+            with failure_scope(self.base, image, mountpoint=point, stage='setup'), observe_detach():
+                return original_detach(image, point)
+        with failure_scope(self.base, self.seed, stage='setup'), \
+                patch.object(images, 'detach', side_effect=observed_detach):
+            images.build(self.source, self.seed, 1)
 
     def tearDown(self):
         # Failed busy/unknown attachments retain their disposable files for inspection.
