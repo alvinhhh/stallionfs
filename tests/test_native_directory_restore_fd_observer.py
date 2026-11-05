@@ -351,3 +351,206 @@ class DescriptorOwnership(unittest.TestCase):
         self.assertEqual(observer.cleared_node['info'].st_flags, 64 | observer.cleared_blocking_bits)
         self.finish(session, observer)
         self.assert_source_unchanged(observer, original)
+
+    def read_pass(self, session, *, capture):
+        if capture:
+            session.capture(session.source_root, session.expected, session.source)
+        else:
+            session.verify_tree(session.source, session.source_root)
+
+    def after_first_sibling(self, observer, callback):
+        close = observer.close; fired = []
+        def after_close(fd):
+            inode = observer.inner.descriptors[fd]['info'].st_ino
+            close(fd)
+            if inode == 3 and not fired:
+                fired.append(True); callback()
+        return mock.patch.object(observer, 'close', side_effect=after_close)
+
+    def test_read_pass_reuses_only_adjacent_parent_and_closes_leaf_before_next_entry(self):
+        for capture in (False, True):
+            with self.subTest(capture=capture):
+                session, observer, _, _, original = self.session(reuse=True)
+                baseline = deepcopy(session.source); opened = []; closure_live = []
+                open_call = observer.open; verify = session.verify_tree
+                observer.phase = 'read_pass'
+                def track_open(name, flags, *, dir_fd=None):
+                    parent_token = observer.live.get(dir_fd)
+                    start = len(observer.events)
+                    fd = open_call(name, flags, dir_fd=dir_fd)
+                    opened.append((observer.phase, name, dir_fd, parent_token,
+                                   observer.live[fd], start, set(observer.confirmed_closed)))
+                    return fd
+                def closure(records, root):
+                    closure_live.append(set(observer.live.values()))
+                    observer.phase = 'closure'
+                    return verify(records, root)
+                with mock.patch.object(observer, 'open', side_effect=track_open):
+                    if capture:
+                        with mock.patch.object(session, 'verify_tree', side_effect=closure):
+                            self.read_pass(session, capture=True)
+                    else:
+                        self.read_pass(session, capture=False)
+                phases = ('read_pass', 'closure') if capture else ('read_pass',)
+                parent_tokens = []
+                for phase in phases:
+                    leaves = [event for event in opened if event[0] == phase and event[1] in ('file', 'link')]
+                    first, sibling = leaves[:2]
+                    self.assertEqual((first[1], sibling[1]), ('file', 'link'))
+                    self.assertEqual(first[3], sibling[3])
+                    self.assertIn(first[4], sibling[6])
+                    self.assertNotIn(first[3], sibling[6])
+                    guards = observer.events[first[5] + 1:sibling[5]]
+                    self.assertIn(('fstat', session.source_root), guards)
+                    self.assertIn(('fstat', sibling[2]), guards)
+                    self.assertIn(('named', session.source_root, 'a'), guards)
+                    # The next sibling group must acquire a different allocation.
+                    self.assertNotEqual(sibling[3], leaves[2][3])
+                    self.assertIn(sibling[3], leaves[2][6])
+                    parent_tokens.append(first[3])
+                if capture:
+                    anchors = {token for _, token in observer.anchors.values()}
+                    self.assertEqual(closure_live, [anchors])
+                    self.assertNotEqual(*parent_tokens)
+                self.assertEqual(session.source, baseline)
+                self.assert_source_unchanged(observer, original)
+                self.assertEqual(set(observer.live.values()), {token for _, token in observer.anchors.values()})
+                self.finish(session, observer)
+
+    def test_read_parent_rechecks_original_full_held_signature_and_named_identity(self):
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_size', 'st_nlink',
+                  'st_flags', 'st_mtime_ns', 'st_ctime_ns', 'st_birthtime', 'st_gen')
+        for capture in (False, True):
+            for change in (*fields, 'held_type', 'root_mode', 'named_directory', 'named_symlink'):
+                with self.subTest(capture=capture, change=change):
+                    session, observer, _, _, _ = self.session(reuse=True)
+                    baseline = deepcopy(session.source); changed_at = []
+                    def drift():
+                        info = observer.inner.nodes[(7, 2)]['info']
+                        if change == 'root_mode':
+                            observer.inner.nodes[(7, 1)]['info'].st_mode ^= 0o100
+                        elif change == 'held_type':
+                            info.st_mode = stat.S_IFLNK | stat.S_IMODE(info.st_mode)
+                        elif change.startswith('named_'):
+                            kind = change.removeprefix('named_')
+                            observer.inner.names[(1, 'a')] = observer.inner.node(model.row(kind, 79))
+                        else:
+                            setattr(info, change, getattr(info, change, 0) + 1)
+                        changed_at.append(len(observer.events))
+                    with self.after_first_sibling(observer, drift):
+                        with self.assertRaisesRegex(restore.RestoreError, '^source_changed$'):
+                            self.read_pass(session, capture=capture)
+                    self.assertTrue(changed_at)
+                    self.assertFalse(any(event[0] == 'open_attempt' for event in observer.events[changed_at[0]:]))
+                    self.assertEqual(session.source, baseline)
+                    self.assertEqual(set(observer.live.values()), {token for _, token in observer.anchors.values()})
+                    self.finish(session, observer)
+
+        for change in ('healthy', 'outer_held', 'outer_named', 'inner_held', 'inner_named'):
+            with self.subTest(depth=2, change=change):
+                session, observer, _, _, _ = self.session(reuse=True)
+                baseline = deepcopy(session.source)
+                parents = restore._ReadParent(session, session.source, session.source_root)
+                try:
+                    parents.get('metadata-fixture/subdir')
+                    self.assertEqual(len(parents.frames), 2)
+                    outer, inner = parents.frames
+                    tokens = {observer.live[frame['fd']] for frame in parents.frames}
+                    if change.endswith('_held'):
+                        inode = 9 if change.startswith('outer_') else 11
+                        observer.inner.nodes[(7, inode)]['info'].st_ctime_ns += 1
+                    elif change.endswith('_named'):
+                        binding = (1, 'metadata-fixture') if change.startswith('outer_') else (9, 'subdir')
+                        observer.inner.names[binding] = observer.inner.nodes[(7, 2)]
+                    start = len(observer.events); serial = observer.serial
+                    if change == 'healthy':
+                        self.assertEqual(parents.get('metadata-fixture/subdir'), inner['fd'])
+                        self.assertEqual(observer.events[start:], [
+                            ('fstat', session.source_root), ('fstat', outer['fd']),
+                            ('named', session.source_root, 'metadata-fixture'),
+                            ('fstat', inner['fd']), ('named', outer['fd'], 'subdir')])
+                    else:
+                        with self.assertRaisesRegex(restore.RestoreError, '^source_changed$'):
+                            parents.get('metadata-fixture/subdir')
+                    self.assertEqual(observer.serial, serial)
+                    self.assertFalse(any(event[0] == 'open_attempt' for event in observer.events[start:]))
+                    self.assertEqual(session.source, baseline)
+                finally:
+                    parents.close()
+                self.assertTrue(tokens <= observer.confirmed_closed)
+                self.assertEqual(set(observer.live.values()), {token for _, token in observer.anchors.values()})
+                self.finish(session, observer)
+
+    def test_read_parent_cancellation_between_siblings_only_drains_owned_handles(self):
+        for capture in (False, True):
+            with self.subTest(capture=capture):
+                session, observer, _, _, original = self.session(reuse=True)
+                with self.after_first_sibling(observer, observer.cancel):
+                    with self.assertRaisesRegex(restore.RestoreError, '^restoration_cancelled$'):
+                        self.read_pass(session, capture=capture)
+                self.assertTrue(observer.cancelled)
+                self.assertTrue(all(event[0] == 'close' for event in observer.events[observer.cancel_event:]))
+                self.assert_source_unchanged(observer, original)
+                self.finish(session, observer)
+
+    def test_read_parent_partial_acquisition_closes_leaf_or_new_ancestor_once(self):
+        for capture in (False, True):
+            for failure in ('leaf', 'ancestor'):
+                with self.subTest(capture=capture, failure=failure):
+                    session, observer, _, _, original = self.session(reuse=True)
+                    open_call = observer.open; subdirs = []
+                    def fail_stat(name, flags, *, dir_fd=None):
+                        fd = open_call(name, flags, dir_fd=dir_fd)
+                        if name == 'subdir': subdirs.append(fd)
+                        if ((failure == 'leaf' and name == 'link') or
+                            (failure == 'ancestor' and name == 'subdir' and len(subdirs) == 2)):
+                            observer.fail_provisional_stat = True
+                        return fd
+                    with mock.patch.object(observer, 'open', side_effect=fail_stat):
+                        with self.assertRaises(OSError): self.read_pass(session, capture=capture)
+                    self.assertIsNotNone(observer.provisional_failure)
+                    _, token, _ = observer.provisional_failure
+                    self.assertIn(token, observer.confirmed_closed)
+                    self.assertEqual(set(observer.live.values()), {token for _, token in observer.anchors.values()})
+                    self.assert_source_unchanged(observer, original)
+                    self.finish(session, observer)
+
+    def test_read_parent_uncertain_close_detaches_owner_and_only_drains_remaining_handles(self):
+        for capture in (False, True):
+            for position in ('leaf', 'parent_switch', 'pass_exit'):
+                for error_mode in ('before', 'after'):
+                    with self.subTest(capture=capture, position=position, error_mode=error_mode):
+                        session, observer, _, _, original = self.session(reuse=True)
+                        close = observer.close; matches = []
+                        inode, occurrence = {'leaf': (3, 1), 'parent_switch': (2, 2), 'pass_exit': (11, 2)}[position]
+                        def fail_close(fd):
+                            if observer.inner.descriptors[fd]['info'].st_ino == inode:
+                                matches.append(fd)
+                                if len(matches) == occurrence: observer.close_error_mode = error_mode
+                            close(fd)
+                        with mock.patch.object(observer, 'close', side_effect=fail_close):
+                            # release() preserves an active primary exception; the
+                            # read pass must still refuse reuse or success afterward.
+                            try: raise RuntimeError('handled caller error')
+                            except RuntimeError:
+                                with self.assertRaisesRegex(restore.RestoreError, '^restoration_close_failed$'):
+                                    self.read_pass(session, capture=capture)
+                        self.assertEqual(len(observer.uncertain), 1)
+                        after_error = observer.events[observer.first_uncertain_event:]
+                        self.assertTrue(all(event[0] == 'close' for event in after_error))
+                        self.assertEqual(observer.close_error_fd in observer.inner.descriptors, error_mode == 'before')
+                        self.assert_source_unchanged(observer, original)
+                        self.finish(session, observer, uncertain=True)
+
+    def test_read_parent_is_drained_before_mutation_classes(self):
+        session, observer, _, destination, original = self.session(reuse=True)
+        begin = session.begin_class; checked = []
+        def begin_without_read_handles(names, canonical):
+            self.assertEqual(set(observer.live.values()), {token for _, token in observer.anchors.values()})
+            checked.append(canonical)
+            return begin(names, canonical)
+        with mock.patch.object(session, 'begin_class', side_effect=begin_without_read_handles):
+            self.assertEqual(session.restore(destination)['status'], 'restored_pending_final_verifiers')
+        self.assertTrue(checked)
+        self.assert_source_unchanged(observer, original)
+        self.finish(session, observer)
