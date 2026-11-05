@@ -94,7 +94,8 @@ class FakeOps:
 
     def open(self, name, flags, *, dir_fd=None):
         self.called('open', name, flags)
-        node = self.root if dir_fd is None else self.names[(self.descriptors[dir_fd]['info'].st_ino, name)]
+        node = (self.root if dir_fd is None else self.descriptors[dir_fd] if name == '.' else
+                self.names[(self.descriptors[dir_fd]['info'].st_ino, name)])
         fd = self.next_fd; self.next_fd += 1; self.descriptors[fd] = node
         return fd
 
@@ -307,7 +308,7 @@ class Restoration(unittest.TestCase):
         variant(lambda a, b: b['entries']['protected'].update(device_inode=b['entries']['nested/a-file']['device_inode']))
         variant(lambda a, b: b['entries']['protected'].update(link_count=2))
         variant(lambda a, b: a['entries']['protected'].update(uid=os.geteuid() + 1))
-        variant(lambda a, b: a['entries']['protected'].update(mode=0o4640))
+        variant(lambda a, b: a['entries']['protected'].update(mode=0o4640, gid=os.getegid() + 1))
         variant(lambda a, b: b['entries']['protected'].update(future_metadata='PRIVATE'))
         variant(lambda a, b: b['entries']['protected'].update(sha256='changed'))
         variant(lambda a, b: b['entries']['protected'].update(kind='symlink'))
@@ -504,6 +505,8 @@ class Restoration(unittest.TestCase):
             ('fchflags', [integer, ctypes.c_uint32], integer),
             ('acl_get_fd_np', [integer, integer], pointer), ('acl_init', [integer], pointer),
             ('acl_free', [pointer], integer), ('acl_to_text', [pointer, ctypes.POINTER(ctypes.c_ssize_t)], pointer),
+            ('acl_size', [pointer], ctypes.c_ssize_t),
+            ('acl_copy_ext', [pointer, pointer, ctypes.c_ssize_t], ctypes.c_ssize_t),
             ('acl_valid', [pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
             ('acl_get_entry', [pointer, integer, ctypes.POINTER(pointer)], integer),
             ('acl_get_tag_type', [pointer, ctypes.POINTER(integer)], integer),
@@ -622,6 +625,47 @@ class Restoration(unittest.TestCase):
         self.assertEqual(after['close'], {'status': 'complete', 'attempts': before['close']['attempts'] + count, 'failures': 0, 'errno': None})
         self.assertTrue(session.close()); self.assertEqual(session.admission_report(), after)
         self.assertEqual(self.mutations(ops), [])
+
+    def test_fixture_acl_fingerprint_uses_complete_bounded_binary_and_preserves_primary_errno(self):
+        library = mock.Mock(); library.acl_get_fd_np.return_value = 100; library.acl_valid.return_value = 0
+        library.acl_free.return_value = 0; raw = b'\x00\xff\x80whole-object'
+        library.acl_size.return_value = len(raw)
+        def copy(buffer, acl, length):
+            self.assertEqual((acl, length), (100, len(raw)))
+            ctypes.memmove(buffer, raw, length); return length
+        library.acl_copy_ext.side_effect = copy
+        with mock.patch.object(restore.sys, 'platform', 'darwin'), mock.patch.object(restore.ctypes, 'CDLL', return_value=library):
+            ops = restore.DarwinOps()
+        self.assertEqual(library.acl_size.argtypes, [ctypes.c_void_p]); self.assertIs(library.acl_size.restype, ctypes.c_ssize_t)
+        self.assertEqual(library.acl_copy_ext.argtypes, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t])
+        self.assertIs(library.acl_copy_ext.restype, ctypes.c_ssize_t)
+        self.assertEqual(ops.acl_fingerprint(7), raw)
+        library.acl_to_text.assert_not_called(); library.acl_set_fd_np.assert_not_called()
+        library.acl_free.assert_called_once_with(100)
+        for length in (0, 16385):
+            library.reset_mock(); library.acl_size.return_value = length
+            with self.assertRaises(restore.RestoreError): ops.acl_fingerprint(7)
+            library.acl_copy_ext.assert_not_called(); library.acl_free.assert_called_once_with(100)
+        library.reset_mock()
+        def size_error(_): ctypes.set_errno(errno.EACCES); return -1
+        def free_error(_): ctypes.set_errno(errno.EIO); return -1
+        library.acl_size.side_effect = size_error; library.acl_free.side_effect = free_error
+        with self.assertRaises(OSError) as failed: ops.acl_fingerprint(7)
+        self.assertEqual(failed.exception.errno, errno.EACCES); library.acl_free.assert_called_once_with(100)
+
+    def test_empty_fixture_acl_setter_requires_exact_readback_and_frees_once(self):
+        for readback in (b'empty', b'changed'):
+            with self.subTest(readback=readback):
+                ops = restore.DarwinOps.__new__(restore.DarwinOps); ops.libc = library = mock.Mock()
+                library.acl_init.return_value = 100; library.acl_valid.return_value = 0
+                library.acl_size.return_value = 5; library.acl_set_fd_np.return_value = 0; library.acl_free.return_value = 0
+                def copy(buffer, *_): ctypes.memmove(buffer, b'empty', 5); return 5
+                library.acl_copy_ext.side_effect = copy; ops.acl_fingerprint = mock.Mock(return_value=readback)
+                if readback == b'empty': ops.clear_fixture_acl(7)
+                else:
+                    with self.assertRaises(restore.RestoreError): ops.clear_fixture_acl(7)
+                library.acl_set_fd_np.assert_called_once_with(7, 100, 0x100)
+                library.acl_free.assert_called_once_with(100); ops.acl_fingerprint.assert_called_once_with(7)
 
     def test_unrecognized_admission_error_and_phase_cannot_export_private_values(self):
         report = restore.refusal_report(restore.RestoreError('PRIVATE /private/path ACL contents'), 'PRIVATE phase')

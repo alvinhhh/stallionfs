@@ -425,14 +425,15 @@ jobs:
               argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_directory_clone_probe.py'),
                   '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]),
                   '--helper', str(root / 'directory-clone-probe'), '--scratch', str(root / 'scratch'),
-                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'], '--first-recipe-only', '--restore-first-recipe']
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'], '--restore-small-recipes-only']
               code = command(argv, cwd=control, timeout=200, umask=0o077, output_limit=65536).returncode
           except BaseException:
               pass
           if not output.exists():
               with output.open('x') as artifact:
-                  json.dump({'schema': 1, 'scope': 'hosted first-recipe selective restoration only', 'status': 'incomplete',
-                      'first_recipe_only': True, 'restoration_only': True, 'full_gate_qualified': False,
+                  json.dump({'schema': 1, 'scope': 'hosted nineteen-recipe selective restoration only', 'status': 'incomplete',
+                      'first_recipe_only': False, 'small_recipes_only': True, 'restoration_only': True,
+                      'small_gate_qualified': False, 'full_gate_qualified': False,
                       'target_completion': 'unknown', 'cases': [], 'docs_attempted': None, 'helper_invocations': None, 'clone_calls': None,
                       'cleanup': 'retained_ephemeral', 'benchmark_verdict': 'not_applicable',
                       'concurrency_and_cancellation': 'unresolved', 'error': 'outer_capture_incomplete'}, artifact)
