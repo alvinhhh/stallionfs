@@ -30,13 +30,17 @@ static int pinned(int fd, uintmax_t device, uintmax_t inode, struct stat *value)
     return 0;
 }
 
-/* Current private small recipes only; document admission is not increased. */
+/* Default admission remains small; fixed document admission is explicit. */
 enum { PROBE_ENTRY_LIMIT = 18, PROBE_DEPTH_LIMIT = 2 };
+struct probe_profile { unsigned entries; int docs; };
+static const struct probe_profile small_profile = { PROBE_ENTRY_LIMIT, 0 };
+static const struct probe_profile docs_profile = { 5107, 1 };
+struct probe_counts { unsigned entries, files, directories; uintmax_t logical; };
 
 /* Consumes owned_fd even on failure; ancestors remain borrowed and held. */
 static int source_types(int owned_fd, int named_parent, const char *name,
                         const struct stat *expected, dev_t device, unsigned depth,
-                        unsigned *visited, int *close_error) {
+                        struct probe_counts *counts, const struct probe_profile *profile, int *close_error) {
     DIR *entries = fdopendir(owned_fd);
     if (!entries) {
         int error = errno ? errno : EIO;
@@ -56,7 +60,7 @@ static int source_types(int owned_fd, int named_parent, const char *name,
         const char *child_name = entry->d_name;
         if (!strcmp(child_name, ".") || !strcmp(child_name, "..")) continue;
         if (!component(child_name)) { error = EINVAL; break; }
-        if (++*visited > PROBE_ENTRY_LIMIT) { error = E2BIG; break; }
+        if (++counts->entries > profile->entries) { error = E2BIG; break; }
         /* Stat every name: d_type may be unknown, stale or unsupported. */
         if (fstatat(fd, child_name, &named, AT_SYMLINK_NOFOLLOW)) { error = errno ? errno : EIO; break; }
         if (named.st_dev != device) { error = EXDEV; break; }
@@ -64,11 +68,17 @@ static int source_types(int owned_fd, int named_parent, const char *name,
         if (!S_ISDIR(named.st_mode) && !S_ISREG(named.st_mode) && !S_ISLNK(named.st_mode)) {
             error = ENOTSUP; break;
         }
+        if (profile->docs && S_ISREG(named.st_mode)) {
+            if (named.st_size < 0 || named.st_size > 8388608 || named.st_nlink > 2) { error = E2BIG; break; }
+            counts->files++; counts->logical += (uintmax_t)named.st_size;
+            if (counts->logical > 116777216) { error = E2BIG; break; }
+        }
         if (S_ISDIR(named.st_mode)) {
+            counts->directories++;
             if (depth >= PROBE_DEPTH_LIMIT) { error = ELOOP; break; }
             int child = openat(fd, child_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (child < 0) { error = errno ? errno : EIO; break; }
-            if (source_types(child, fd, child_name, &named, device, depth + 1, visited, close_error))
+            if (source_types(child, fd, child_name, &named, device, depth + 1, counts, profile, close_error))
                 error = errno ? errno : EIO;
         }
     }
@@ -89,15 +99,17 @@ static int source_types(int owned_fd, int named_parent, const char *name,
 }
 
 /* Shared with the fake-C behavior tests; main retains the earlier refusals. */
-static int probe_clone_admitted(int root, int source, int parent,
+static int probe_clone_profile(int root, int source, int parent,
                                const char *source_name, const char *parent_name, const char *destination,
                                const struct stat *source_info, const struct stat *parent_info,
-                               int *calls, int *close_error) {
+                               int *calls, int *close_error, const struct probe_profile *profile) {
     if (no_mounts(source)) return -1;
     int copy = fcntl(source, F_DUPFD_CLOEXEC, 0);
     if (copy < 0) return -1;
-    unsigned visited = 1;
-    if (source_types(copy, root, source_name, source_info, source_info->st_dev, 0, &visited, close_error)) return -1;
+    struct probe_counts counts = { .entries = 1, .directories = 1 };
+    if (source_types(copy, root, source_name, source_info, source_info->st_dev, 0, &counts, profile, close_error)) return -1;
+    if (profile->docs && (counts.entries != 5107 || counts.files != 5002 || counts.directories != 105
+                          || counts.logical != 116777216)) { errno = EINVAL; return -1; }
     if (no_mounts(source)) return -1;
     struct stat named;
     if (fstatat(root, source_name, &named, AT_SYMLINK_NOFOLLOW)) return -1;
@@ -110,11 +122,20 @@ static int probe_clone_admitted(int root, int source, int parent,
     return fclonefileat(source, parent, destination, CLONE_NOFOLLOW | CLONE_ACL);
 }
 
+static int probe_clone_admitted(int root, int source, int parent,
+                               const char *source_name, const char *parent_name, const char *destination,
+                               const struct stat *source_info, const struct stat *parent_info,
+                               int *calls, int *close_error) {
+    return probe_clone_profile(root, source, parent, source_name, parent_name, destination,
+                               source_info, parent_info, calls, close_error, &small_profile);
+}
+
 int main(int argc, char **argv) {
     const char *hosted = getenv("STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED");
     const char *actions = getenv("GITHUB_ACTIONS"), *temporary = getenv("RUNNER_TEMP");
     uintmax_t values[6];
-    if (argc != 11 || !hosted || strcmp(hosted, "1") || !actions || strcmp(actions, "true") ||
+    int docs = argc == 12 && !strcmp(argv[11], "--docs-profile");
+    if ((argc != 11 && !docs) || !hosted || strcmp(hosted, "1") || !actions || strcmp(actions, "true") ||
         !temporary || temporary[0] != '/' || strlen(temporary) >= PATH_MAX || strlen(argv[1]) >= PATH_MAX ||
         strncmp(argv[1], temporary, strlen(temporary)) || argv[1][strlen(temporary)] != '/' ||
         !component(argv[4]) || !component(argv[5]) || !component(argv[6])) return 2;
@@ -145,8 +166,10 @@ int main(int argc, char **argv) {
     if (!error && fstatat(root, argv[5], &named, AT_SYMLINK_NOFOLLOW)) error = errno;
     if (!error && !same_object(&named, &parent_info)) error = ESTALE;
     if (!error) {
-        result = probe_clone_admitted(root, source, parent, argv[4], argv[5], argv[6],
-                                      &source_info, &parent_info, &calls, &close_error);
+        result = (docs ? probe_clone_profile(root, source, parent, argv[4], argv[5], argv[6],
+                                           &source_info, &parent_info, &calls, &close_error, &docs_profile)
+                       : probe_clone_admitted(root, source, parent, argv[4], argv[5], argv[6],
+                                              &source_info, &parent_info, &calls, &close_error));
         error = result ? errno : 0;
     }
     if (parent >= 0 && close(parent) && !close_error) close_error = errno;

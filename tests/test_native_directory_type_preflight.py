@@ -13,8 +13,8 @@ HEADER = r'''
 #include <stdarg.h>
 #include <stdint.h>
 
-#define NODE_LIMIT 32
-#define FD_LIMIT 128
+#define NODE_LIMIT 5120
+#define FD_LIMIT 256
 struct fake_node { int parent; char name[16]; struct stat info; };
 struct fake_fd { int node, alive, stream, position, closes; };
 static struct fake_node nodes[NODE_LIMIT];
@@ -223,12 +223,15 @@ HARNESS = r'''
 #include HELPER_PATH
 #undef main
 
-static void exercise(int expected, int expected_calls, int expected_close_error) {
+static void exercise_profile(int expected, int expected_calls, int expected_close_error,
+                             const struct probe_profile *profile) {
     struct stat source = nodes[0].info;
     int calls = 0, close_error = 0;
     errno = 0;
-    int result = probe_clone_admitted(10, 11, 12, "source", "parent", "output",
-                                     &source, &parent_info, &calls, &close_error);
+    int result = (profile ? probe_clone_profile(10, 11, 12, "source", "parent", "output",
+                                               &source, &parent_info, &calls, &close_error, profile)
+                          : probe_clone_admitted(10, 11, 12, "source", "parent", "output",
+                                                 &source, &parent_info, &calls, &close_error));
     int error = result ? errno : 0;
     assert(error == expected && result == (expected ? -1 : 0));
     assert(calls == expected_calls && clone_calls == expected_calls);
@@ -240,6 +243,22 @@ static void exercise(int expected, int expected_calls, int expected_close_error)
         if (!first_uncertain) assert(!handles[fd].alive);
     }
     if (!first_uncertain) assert(live == 3);
+}
+
+static void exercise(int expected, int calls, int close_error) {
+    exercise_profile(expected, calls, close_error, NULL);
+}
+
+static void docs_tree(void) {
+    int directories[100], a = add_node(0, S_IFDIR), b = add_node(0, S_IFDIR);
+    for (int i = 0; i < 100; i++) directories[i] = add_node(i % 2 ? a : b, S_IFDIR);
+    int metadata = add_node(0, S_IFDIR), nested = add_node(metadata, S_IFDIR);
+    for (int i = 0; i < 5000; i++) nodes[add_node(directories[i % 100], S_IFREG)].info.st_size = 20000;
+    int first = add_node(metadata, S_IFREG), alias = add_node(nested, S_IFREG);
+    nodes[first].info.st_size = nodes[alias].info.st_size = 8388608;
+    nodes[first].info.st_nlink = nodes[alias].info.st_nlink = 2;
+    nodes[alias].info.st_ino = nodes[first].info.st_ino;
+    assert(node_count == 5107);
 }
 
 int main(int argc, char **argv) {
@@ -271,6 +290,17 @@ int main(int argc, char **argv) {
             if (failure == OTHER_DEVICE) nodes[1].info.st_dev++;
             exercise(errors[i], 0, 0);
         }
+    } else if (group == 6) {
+        reset_fake(); docs_tree(); exercise_profile(0, 1, 0, &docs_profile);
+        reset_fake(); docs_tree(); exercise(E2BIG, 0, 0);  /* Default is still eighteen. */
+        reset_fake(); docs_tree(); nodes[node_count - 1].info.st_size++;
+        exercise_profile(E2BIG, 0, 0, &docs_profile);
+        reset_fake(); docs_tree(); nodes[node_count - 1].info.st_size--;
+        exercise_profile(EINVAL, 0, 0, &docs_profile);
+        reset_fake(); docs_tree(); nodes[node_count - 1].info.st_nlink = 3;
+        exercise_profile(E2BIG, 0, 0, &docs_profile);
+        reset_fake(); docs_tree(); failure = CLOSE_AFTER_ERROR;
+        exercise_profile(EBUSY, 0, EBUSY, &docs_profile);
     } else {
         assert(group == 5);
         reset_fake(); failure = READ_ERROR; exercise(EIO, 0, 0);
@@ -332,6 +362,9 @@ class DirectoryTypePreflight(unittest.TestCase):
 
     def test_enumeration_and_close_faults_preserve_primary_errno_and_one_close_ownership(self):
         self.exercise(5)
+
+    def test_explicit_fixed_docs_profile_preserves_default_limits_and_refuses_wrong_size_or_close(self):
+        self.exercise(6)
 
 
 if __name__ == '__main__': unittest.main()
