@@ -5,6 +5,9 @@
 #endif
 /* Keep root admission identical to the existing implementation. */
 #include "../stallionfs/_tree.c"
+#ifdef STALLIONFS_DIRECTORY_PREFLIGHT_TEST_HEADER
+#include STALLIONFS_DIRECTORY_PREFLIGHT_TEST_HEADER
+#endif
 
 static int component(const char *value) {
     return value && *value && strcmp(value, ".") && strcmp(value, "..") &&
@@ -25,6 +28,86 @@ static int pinned(int fd, uintmax_t device, uintmax_t inode, struct stat *value)
         errno = ESTALE; return -1;
     }
     return 0;
+}
+
+/* Current private small recipes only; document admission is not increased. */
+enum { PROBE_ENTRY_LIMIT = 18, PROBE_DEPTH_LIMIT = 2 };
+
+/* Consumes owned_fd even on failure; ancestors remain borrowed and held. */
+static int source_types(int owned_fd, int named_parent, const char *name,
+                        const struct stat *expected, dev_t device, unsigned depth,
+                        unsigned *visited, int *close_error) {
+    DIR *entries = fdopendir(owned_fd);
+    if (!entries) {
+        int error = errno ? errno : EIO;
+        if (close(owned_fd) && !*close_error) *close_error = errno ? errno : EIO;
+        errno = error;
+        return -1;
+    }
+    int fd = dirfd(entries), error = 0;
+    struct stat held, named;
+    if (fd < 0 || fstat(fd, &held)) error = errno ? errno : EIO;
+    else if (held.st_dev != device) error = EXDEV;
+    else if (!S_ISDIR(held.st_mode) || !same_object(&held, expected)) error = ESTALE;
+    while (!error) {
+        errno = 0;
+        struct dirent *entry = readdir(entries);
+        if (!entry) { if (errno) error = errno; break; }
+        const char *child_name = entry->d_name;
+        if (!strcmp(child_name, ".") || !strcmp(child_name, "..")) continue;
+        if (!component(child_name)) { error = EINVAL; break; }
+        if (++*visited > PROBE_ENTRY_LIMIT) { error = E2BIG; break; }
+        /* Stat every name: d_type may be unknown, stale or unsupported. */
+        if (fstatat(fd, child_name, &named, AT_SYMLINK_NOFOLLOW)) { error = errno ? errno : EIO; break; }
+        if (named.st_dev != device) { error = EXDEV; break; }
+        if (entry->d_ino && named.st_ino != entry->d_ino) { error = ESTALE; break; }
+        if (!S_ISDIR(named.st_mode) && !S_ISREG(named.st_mode) && !S_ISLNK(named.st_mode)) {
+            error = ENOTSUP; break;
+        }
+        if (S_ISDIR(named.st_mode)) {
+            if (depth >= PROBE_DEPTH_LIMIT) { error = ELOOP; break; }
+            int child = openat(fd, child_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child < 0) { error = errno ? errno : EIO; break; }
+            if (source_types(child, fd, child_name, &named, device, depth + 1, visited, close_error))
+                error = errno ? errno : EIO;
+        }
+    }
+    if (!error) {
+        if (fstat(fd, &held)) error = errno ? errno : EIO;
+        else if (held.st_dev != device) error = EXDEV;
+        else if (!same_object(&held, expected)) error = ESTALE;
+        else if (fstatat(named_parent, name, &named, AT_SYMLINK_NOFOLLOW)) error = errno ? errno : EIO;
+        else if (!same_object(&held, &named)) error = ESTALE;
+    }
+    if (closedir(entries)) {
+        int failed_close = errno ? errno : EIO;
+        if (!*close_error) *close_error = failed_close;
+        if (!error) error = failed_close;
+    }
+    errno = error;
+    return error ? -1 : 0;
+}
+
+/* Shared with the fake-C behavior tests; main retains the earlier refusals. */
+static int probe_clone_admitted(int root, int source, int parent,
+                               const char *source_name, const char *parent_name, const char *destination,
+                               const struct stat *source_info, const struct stat *parent_info,
+                               int *calls, int *close_error) {
+    if (no_mounts(source)) return -1;
+    int copy = fcntl(source, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) return -1;
+    unsigned visited = 1;
+    if (source_types(copy, root, source_name, source_info, source_info->st_dev, 0, &visited, close_error)) return -1;
+    if (no_mounts(source)) return -1;
+    struct stat named;
+    if (fstatat(root, source_name, &named, AT_SYMLINK_NOFOLLOW)) return -1;
+    if (!same_object(&named, source_info)) { errno = ESTALE; return -1; }
+    if (fstatat(root, parent_name, &named, AT_SYMLINK_NOFOLLOW)) return -1;
+    if (!same_object(&named, parent_info)) { errno = ESTALE; return -1; }
+    if (!fstatat(parent, destination, &named, AT_SYMLINK_NOFOLLOW)) { errno = EEXIST; return -1; }
+    if (errno != ENOENT) return -1;
+    *calls = 1;
+    return fclonefileat(source, parent, destination, CLONE_NOFOLLOW | CLONE_ACL);
 }
 
 int main(int argc, char **argv) {
@@ -62,8 +145,8 @@ int main(int argc, char **argv) {
     if (!error && fstatat(root, argv[5], &named, AT_SYMLINK_NOFOLLOW)) error = errno;
     if (!error && !same_object(&named, &parent_info)) error = ESTALE;
     if (!error) {
-        calls = 1;
-        result = fclonefileat(source, parent, argv[6], CLONE_NOFOLLOW | CLONE_ACL);
+        result = probe_clone_admitted(root, source, parent, argv[4], argv[5], argv[6],
+                                      &source_info, &parent_info, &calls, &close_error);
         error = result ? errno : 0;
     }
     if (parent >= 0 && close(parent) && !close_error) close_error = errno;

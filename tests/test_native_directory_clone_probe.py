@@ -343,9 +343,9 @@ class DirectoryProbe(unittest.TestCase):
         self.assertTrue(all(not row['raw_clone']['passed'] for row in restored))
         self.assertEqual(self.cleanup_decisions, [True])
         self.assertEqual(value['cases'][0]['first_recipe_detail']['entry_count'], 18)
-        self.assertEqual(len(value['source_sha256']), 19)
+        self.assertEqual(len(value['source_sha256']), 20)
         # This is the actual full driver result shape, including both first18
-        # projections, all19 rows, 8 complete summaries/close records and19 pins.
+        # projections, all19 rows, 8 complete summaries/close records and20 pins.
         self.assertLessEqual(len(json.dumps(value, indent=2).encode()), 65536)
 
     def test_nineteen_unknown_parent_deny_target_closes_but_never_clears_or_continues(self):
@@ -598,7 +598,8 @@ class DirectoryProbe(unittest.TestCase):
         self.assertEqual(set(observed), set(probe.PIN_PATHS))
         self.assertIn('tests/test_native_directory_restore_fd_observer.py', observed)
         self.assertIn('tests/test_native_directory_restore_policy.py', observed)
-        self.assertEqual(len(observed), 19)
+        self.assertIn('tests/test_native_directory_type_preflight.py', observed)
+        self.assertEqual(len(observed), 20)
         self.assertNotIn('stallionfs/_benchmark_runtime/native_metrics.py', observed)
         self.assertEqual(observed['tests/perf/native_metrics.py'],
                          hashlib.sha256((checkout / 'tests/perf/native_metrics.py').read_bytes()).hexdigest())
