@@ -73,13 +73,17 @@ class Lifecycle:
             if native_result is not None and native_result[0] is not None:
                 try:
                     error.native_image_result = native_result[0]
-                except (AttributeError, MemoryError):
+                except BaseException:
                     pass  # Preserve the original cleanup error; delivery may remain impossible.
             raise
 
     def _payload(self, path, meta):
         if meta.get('backend') == 'native-image':
-            target = core.native_target(meta)
+            if meta.get('ownership') == 'store-created':
+                from ._native import installed_target
+                target = installed_target(self, path, meta, confirmed=False)
+            else:
+                target = core.native_target(meta)
             return Path(target['directory']) / target['component']
         return path / ('workspace.sparseimage' if meta.get('backend') == 'image' else 'repo')
 
@@ -89,12 +93,19 @@ class Lifecycle:
     def _open(self, workspace, path, meta, *, enrolled=None):
         state_path = self._state(workspace)
         previous = core.read_json(state_path) if state_path.exists() else {}
+        if meta.get('backend') == 'native-image' and meta.get('ownership') != 'store-created':
+            enrolled = False
+        elif enrolled is None:
+            enrolled = previous.get('enrolled') is True
         state = {'id': workspace, 'generation': uuid.uuid4().hex, 'status': 'open',
-                 'enrolled': previous.get('enrolled') is True if enrolled is None else enrolled,
+                 'enrolled': enrolled,
                  'object': identity(path), 'payload': identity(self._payload(path, meta))}
         replace_json(state_path, state)
+        if meta.get('backend') == 'native-image':
+            core.sync_directory(state_path.parent)
         protection = self.root / 'protected' / f'{workspace}.json'
-        if path.parent == self.root / 'workspaces' and os.path.lexists(protection):
+        if (meta.get('backend') != 'native-image' and path.parent == self.root / 'workspaces'
+                and os.path.lexists(protection)):
             try:
                 retired = core.read_json(protection)
                 if (retired.get('id') == workspace and retired.get('object') == identity(path) and
@@ -174,6 +185,11 @@ class Lifecycle:
         with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
             if meta.get('backend') == 'native-image':
+                if meta.get('ownership') == 'store-created':
+                    from ._native_recovery import catalog_locked
+                    name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
+                    native_result[0] = catalog_locked(self, path, meta, 'snapshot', name)
+                    return native_result[0]
                 name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
                 response = {'id': name, 'name': name, 'workspace': workspace, 'backend': 'native-image',
                             'native_image_result': None}
@@ -200,7 +216,10 @@ class Lifecycle:
         _, meta = self.object('workspaces', workspace)
         if meta.get('backend') == 'native-image':
             with self._workspace_lock(workspace):
-                _, meta = self.object('workspaces', workspace)
+                path, meta = self.object('workspaces', workspace)
+                if meta.get('ownership') == 'store-created':
+                    from ._native_recovery import catalog_locked
+                    return catalog_locked(self, path, meta, 'snapshots')
                 return core.native_operation(core.native_target(meta), 'snapshots')['snapshots']
         core.identifier(workspace, 32)
         result = []
@@ -228,6 +247,21 @@ class Lifecycle:
         if not os.path.lexists(journal):
             return
         registration = self.root / 'workspaces' / workspace / 'meta.json'
+        record = core.read_json(journal)
+        from ._native_recovery import ACTIONS, validate_intent
+        if record.get('operation') in ACTIONS:
+            validate_intent(workspace, record)
+            return  # Explicit current admission; never replay catalog or move mutations.
+        if record.get('operation') in ('native-create', 'native-mount', 'native-unmount'):
+            if registration.exists():
+                metadata = core.read_json(registration)
+                if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
+                    from ._native import check_pending
+                    check_pending(workspace, record)
+                    return  # Explicit mount/unmount observes recovery; never replay here.
+            if record.get('operation') == 'native-create':
+                raise core.StallionError(f'Native candidate intent retained without reconciliation: {journal}')
+            raise core.StallionError('Native operation intent has no installed owned workspace')
         if registration.exists() and core.read_json(registration).get('backend') == 'native-image':
             raise core.StallionError('Unexpected exchange journal for a native image registration; retained unchanged')
         record = core.read_json(journal)
@@ -256,6 +290,10 @@ class Lifecycle:
         with self._workspace_lock(workspace, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
             if meta.get('backend') == 'native-image':
+                if meta.get('ownership') == 'store-created':
+                    from ._native_recovery import catalog_locked
+                    native_result[0] = catalog_locked(self, path, meta, 'restore', self._native_name(snapshot))
+                    return native_result[0]
                 snapshot = self._native_name(snapshot)
                 recovery = 'recovery-' + uuid.uuid4().hex
                 response = {'workspace': workspace, 'snapshot': snapshot, 'recovery': recovery,
@@ -301,7 +339,10 @@ class Lifecycle:
         with self._workspace_lock(workspace):
             path, meta = self.object('workspaces', workspace)
             if meta.get('backend') == 'native-image':
-                raise core.StallionError('External native images cannot be enrolled for cleanup')
+                if meta.get('ownership') != 'store-created':
+                    raise core.StallionError('External native images cannot be enrolled for cleanup')
+                from ._native_recovery import ready
+                ready(self, path, meta)
             return self._open(workspace, path, meta, enrolled=enabled)
 
     @staticmethod
@@ -321,6 +362,9 @@ class Lifecycle:
             raise core.StallionError('Close requires --quiescent after stopping all writers')
         with self._workspace_lock(workspace):
             path, meta = self.object('workspaces', workspace)
+            if meta.get('backend') == 'native-image' and meta.get('ownership') == 'store-created':
+                from ._native_recovery import closed_baseline
+                return closed_baseline(self, path, meta)
             state = self._open(workspace, path, meta)
             self._closed_payload(path, meta, quiescent=True)
             state.update(status='closed', closed_at=time.time(), payload=identity(self._payload(path, meta)))
@@ -333,6 +377,7 @@ class Lifecycle:
         if auto_retire and not self.cleanup_config()['enabled']:
             raise core.StallionError('Enable cleanup before using --auto-retire')
         generation = None
+        native_access = None
         try:
             with self._lease(workspace) as lease_fd:
                 with core.lock(self.root / 'locks' / f'workspace-{workspace}', blocking=False):
@@ -352,13 +397,23 @@ class Lifecycle:
                         state['auto_retire'] = {'generation': state['generation']}
                         replace_json(self._state(workspace), state)
                         generation = state['generation']
-                    repo = self._mount(path, meta)['path']
+                    access = self._mount(path, meta)
+                    if meta.get('backend') == 'native-image':
+                        native_access = access
+                    repo = access['path']
                 options = {}
                 if auto_retire:
                     options = {'pass_fds': (lease_fd,), 'env': {
                         **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
                         'STALLIONFS_LEASE_GENERATION': generation}}
                 result = subprocess.run(command, cwd=repo, **options)
+        except BaseException as error:
+            if native_access is not None:
+                try:
+                    error.native_image_result = native_access
+                except (AttributeError, MemoryError):
+                    pass
+            raise
         finally:
             # Closing our descriptor must not unlock the shared lease held by descendants.
             if generation is not None:
@@ -410,7 +465,13 @@ class Lifecycle:
     def _eligible(self, workspace, now, *, observe=False, generation=None):
         path, meta = self.object('workspaces', workspace)
         if meta.get('backend') == 'native-image':
-            return None  # Registration never authorizes retirement of external data.
+            if meta.get('ownership') != 'store-created':
+                return None  # Registration never authorizes retirement of external data.
+            from ._native_recovery import eligible
+            state = core.read_json(self._state(workspace))
+            if generation is not None and state.get('generation') != generation:
+                return None
+            return eligible(self, path, meta, state, now, observe=observe)
         self._guard_native_tree(path)
         state = core.read_json(self._state(workspace))
         if not self._valid_state(workspace, path, meta, state, now):
@@ -483,7 +544,12 @@ class Lifecycle:
                         if eligible is None:
                             continue
                         path, meta, state = eligible
-                        if apply:
+                        if apply and meta.get('backend') == 'native-image':
+                            from ._native_recovery import move_locked
+                            moved = move_locked(self, workspace, selected=eligible)
+                            if moved is None:
+                                continue
+                        elif apply:
                             with self._retention():
                                 protection = self.root / 'protected' / f'{workspace}.json'
                                 if os.path.lexists(protection):
@@ -516,29 +582,54 @@ class Lifecycle:
         core.identifier(value, 32)
         path = self.root / kind / value
         # Purge is explicit permanent deletion, never called by automatic maintenance.
-        workspace_lock = self._workspace_lock(value) if kind == 'trash' else contextlib.nullcontext()
-        with core.lock(self.root / '.lock'), workspace_lock, core.lock(self.root / 'locks' / 'retention'):
-            core.private_directory(path)
-            self._guard_native_tree(path)
-            if next((self.root / 'journals').iterdir(), None) is not None:
-                raise core.StallionError('Resolve pending rollback before purging retained data')
-            self._no_mounts(path)
-            image = path / 'workspace.sparseimage'
-            if os.path.lexists(image):
-                from . import images
-                if images.mounted(image) is not None:
-                    raise core.StallionError('Retained image is still attached')
-            if yes:
-                with self.staging() as stage:
-                    if kind == 'trash':
-                        protection = self.root / 'protected' / f'{value}.json'
-                        if os.path.lexists(protection):
-                            protection.unlink()
-                    expired = stage / 'expired'
-                    path.rename(expired)
-                    core.remove_tree(expired)
-                    stage.rmdir()
-            return {'deleted' if yes else 'would_delete': str(path)}
+        native_result = [None]
+        workspace_lock = self._workspace_lock(value, reconcile=False, native_result=native_result) if kind == 'trash' else contextlib.nullcontext()
+        from ._native_purge import MAX_INTENT_BYTES
+        bounded = core.json_read_limit(MAX_INTENT_BYTES) if kind == 'trash' else contextlib.nullcontext()
+        try:
+            with bounded, core.lock(self.root / '.lock'), workspace_lock, core.lock(self.root / 'locks' / 'retention'):
+                if kind == 'trash':
+                    journal = self.root / 'journals' / (value + '.json')
+                    pending = core.read_json(journal) if os.path.lexists(journal) else {}
+                    state_path = self._state(value)
+                    state = core.read_json(state_path) if os.path.lexists(state_path) else {}
+                    metadata = core.read_json(path / 'meta.json') if os.path.lexists(path) else {}
+                    if (metadata.get('backend') == 'native-image'
+                            or pending.get('operation') in ('native-purge', 'native-retire', 'native-return')
+                            or state.get('operation') == 'native-purge-complete'):
+                        from ._native_purge import purge_locked
+                        native_result[0] = purge_locked(self, value, yes=yes)
+                        return native_result[0]
+                    self._reconcile(value)
+                if not os.path.lexists(path):
+                    raise core.StallionError('Retained object not found: ' + value)
+                core.private_directory(path)
+                self._guard_native_tree(path)
+                if next((self.root / 'journals').iterdir(), None) is not None:
+                    raise core.StallionError('Resolve pending rollback before purging retained data')
+                self._no_mounts(path)
+                image = path / 'workspace.sparseimage'
+                if os.path.lexists(image):
+                    from . import images
+                    if images.mounted(image) is not None:
+                        raise core.StallionError('Retained image is still attached')
+                if yes:
+                    with self.staging() as stage:
+                        if kind == 'trash':
+                            protection = self.root / 'protected' / f'{value}.json'
+                            if os.path.lexists(protection):
+                                protection.unlink()
+                        expired = stage / 'expired'
+                        path.rename(expired)
+                        core.remove_tree(expired)
+                        stage.rmdir()
+                return {'deleted' if yes else 'would_delete': str(path)}
+        except BaseException as error:
+            if native_result[0] is not None:
+                try: error.native_image_result = native_result[0]
+                except BaseException: pass
+            raise
+
 
 
 # Store imports this class; defer the helper module until the class is defined.

@@ -1,6 +1,7 @@
 """Run on APFS: python3 -m unittest discover -s tests -v."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import errno
 from io import StringIO
 import json
@@ -42,6 +43,2192 @@ class Workspaces(unittest.TestCase):
 
     def prepare(self, **kwargs):
         return self.store.prepare(self.source, key="test-v1", **kwargs)
+
+    @contextmanager
+    def native_clock(self):
+        """Elapsed time advances at waits, never because a caller reads it."""
+        class Clock:
+            now = 0.0
+            def monotonic(self): return self.now
+            def advance(self, seconds):
+                if seconds < 0: raise ValueError('Negative simulated wait')
+                self.now += seconds
+            def sleep(self, seconds): self.advance(seconds)
+        clock = Clock()
+        # Do not replace the shared time module used by other code or runners.
+        with patch('stallionfs._native.time', clock):
+            yield clock
+
+    @contextmanager
+    def native_controller_fixture(self):
+        """Fake OS namespace/owned executor; never a mounted persistence proof."""
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        state = {'rows': {}, 'commands': [], 'observed_fds': set(), 'sequence': 0}
+        original_open, original_close = os.open, os.close
+        def opened(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if str(path) in state['rows']:
+                state['observed_fds'].add(fd)
+            return fd
+        def closed(fd):
+            state['observed_fds'].discard(fd)
+            return original_close(fd)
+        def rows():
+            return [dict(row) for row in state['rows'].values()]
+        def descriptor(fd):
+            self.assertIn(fd, state['observed_fds'])
+            return next(dict(row) for path, row in state['rows'].items()
+                        if Path(path).stat().st_ino == os.fstat(fd).st_ino)
+        def command(argv, record, persist, directory, **kwargs):
+            state['commands'].append(list(argv))
+            record.update(argv=list(argv), child_pending=True, outcome='running', returncode=None,
+                          pid=123, reaped=False, stdout=str(directory / 'stdout'), stderr=str(directory / 'stderr'))
+            persist()
+            self.assertFalse(state['observed_fds'], 'Controller kept a mounted observation FD open at mutation')
+            if argv[0] == '/sbin/mount':
+                self.assertEqual(argv[:3], ['/sbin/mount', '-t', 'stallionfs'])
+                path, volume = Path(argv[3]), Path(argv[4])
+                metadata = read_json(path / 'meta.json')
+                proof = read_json(path / 'native-install.json')
+                self.assertTrue(proof['complete'])
+                self.assertTrue(proof['first_mount_attempted'])
+                self.assertEqual(metadata['state'], 'installed')
+                if not (volume / 'repo').exists():
+                    clone_tree(self.store.root / 'seeds' / metadata['seed'] / 'repo', volume / 'repo')
+                    git(volume / 'repo', 'checkout', '-b', metadata['branch'])
+                state['sequence'] += 1
+                state['rows'][str(volume)] = {'path': str(volume), 'filesystem': 'stallionfs',
+                    'device': 'informational resource name', 'owner': os.getuid(),
+                    'readonly': False, 'ignore_ownership': False, 'flags': 0, 'fsid': (71, state['sequence'])}
+                result = state.get('mount_status', 0)
+            else:
+                self.assertEqual(argv[0], '/sbin/umount')
+                self.assertEqual(len(argv), 2)
+                result = state.get('unmount_status', 0)
+                if not result: state['rows'].pop(argv[1], None)
+            record.update(child_pending=False, reaped=True, returncode=result, outcome='success' if not result else 'error')
+            persist()
+            if state.get('interrupt'):
+                record['outcome'] = 'unknown'; persist()
+                raise subprocess.TimeoutExpired(argv, 30)
+            return record
+        with patch('stallionfs._native.qualify', return_value='stallionfs'), \
+             patch('stallionfs._native.execute_owned', side_effect=command), \
+             patch('stallionfs._scan.mounts', side_effect=rows), \
+             patch('stallionfs._scan.mount_for_descriptor', side_effect=descriptor, create=True), \
+             patch('stallionfs._native.os.open', side_effect=opened), \
+             patch('stallionfs._native.os.close', side_effect=closed):
+            yield state
+
+    def test_native_preflight_persists_own_transition_before_qualification(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        observed = []
+        def inspect(operation, metadata):
+            expected = {'format': 1, **operation.record}
+            self.assertEqual(read_json(operation.journal), expected)
+            self.assertEqual(read_json(operation.directory / 'record.json'), expected)
+            self.assertEqual(expected['helpers'], [])
+            self.assertIs(expected['child_pending'], False)
+            self.assertIs(expected['creation_attempted'], False)
+            observed.append(operation.directory)
+            raise OSError(errno.EIO, 'qualification stopped after checking durable preflight')
+        with patch('stallionfs._native.qualify', side_effect=inspect), \
+             patch('stallionfs._image.create_from_tree') as importer:
+            with self.assertRaises(OSError):
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            importer.assert_not_called()
+        self.assertEqual(len(observed), 1)
+        self.assertTrue((observed[0] / 'record.json').is_file())
+        original = _native._persist
+        partial = []
+        def fail_journal(path, value):
+            if Path(path).parent == self.store.root / 'journals':
+                partial.append((Path(value['stage']) / 'discovery/record.json', Path(path)))
+                raise OSError(errno.EIO, 'preflight journal persistence failed')
+            return original(path, value)
+        with patch('stallionfs._native._persist', side_effect=fail_journal), \
+             patch('stallionfs._native.qualify') as qualify, \
+             patch('stallionfs._image.create_from_tree') as importer:
+            with self.assertRaises(OSError):
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            qualify.assert_not_called()
+            importer.assert_not_called()
+        self.assertEqual(len(partial), 1)
+        retained, journal = partial[0]
+        self.assertEqual(read_json(retained)['helpers'], [])
+        self.assertIs(read_json(retained)['child_pending'], False)
+        self.assertNotIn('helpers', read_json(journal))
+        self.assertNotIn('child_pending', read_json(journal))
+
+    def test_native_owned_install_controller_paths_and_remount_records(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as os_state:
+            first = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            second = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            self.assertNotEqual(first['native_image']['uuid'], second['native_image']['uuid'])
+            self.assertEqual(Path(first['path']), self.store.root / 'workspaces' / first['id'] / 'volume/repo')
+            self.assertTrue(first['installation']['installation_confirmed'])
+            path = Path(first['path']).parent.parent
+            original_proof = (path / 'native-create.json').read_bytes()
+            self.assertFalse((self.store.root / 'journals' / (first['id'] + '.json')).exists())
+            self.assertFalse(read_json(self.store._state(first['id']))['enrolled'])
+            self.assertNotIn('closed_at', read_json(self.store._state(first['id'])))
+            self.assertEqual(self.store.run(first['id'], [sys.executable, '-c',
+                "from pathlib import Path; Path('changed').write_text('later content')"])['returncode'], 0)
+            self.store.unmount(first['id'])
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            # Offline core mutation changes the current anchor. This is not a
+            # claim that the fake mounted namespace delivered native writes.
+            _image.snapshot(target, 'fixture-current-anchor')
+            mounted = self.store.mount(first['id'])
+            self.assertEqual(Path(mounted['path'], 'changed').read_text(), 'later content')
+            self.assertEqual((path / 'native-create.json').read_bytes(), original_proof)
+            self.store.unmount(first['id'])
+            already = self.store.unmount(first['id'])
+            self.assertTrue(already['already_absent'])
+            self.assertTrue(already['native_operation']['current_guard']['core_consumed'])
+            self.assertFalse(os_state['observed_fds'])
+            alias = self.base / 'owned-alias'; alias.symlink_to(path, target_is_directory=True)
+            with self.assertRaises(StallionError): self.store.register_native_image(alias / 'image.sfs')
+            for action in (lambda: self.store.move(first['id']),
+                           lambda: self.store.run(first['id'], ['true'], auto_retire=True)):
+                with self.assertRaises(StallionError): action()
+            folder = self.store.create(seed['id']); self.store.move(folder['id'])
+            self.assertEqual(self.store.gc(older_than=0, yes=True), [folder['id']])
+
+    def test_native_install_postrename_unknown_recovers_without_replay(self):
+        from stallionfs import _native, _scan
+        from stallionfs.core import read_json, native_failure_details
+        seed = self.prepare()
+        original = _scan.move
+        moved = []
+        def uncertain(source, destination, **kwargs):
+            original(source, destination, **kwargs); moved.append(Path(destination))
+            raise OSError(errno.EIO, 'rename completed but response lost')
+        with self.native_controller_fixture(), patch('stallionfs._scan.move', side_effect=uncertain):
+            with self.assertRaises(OSError) as caught:
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        self.assertEqual(len(moved), 1)
+        path = moved[0]; backing = (path / 'image.sfs').stat().st_ino
+        intent = read_json(self.store.root / 'journals' / (path.name + '.json'))
+        self.assertEqual(intent['installation']['outcome'], 'rename-attempted')
+        self.assertFalse(intent['installation']['first_mount_attempted'])
+        self.assertEqual(read_json(path / 'meta.json')['format'], 1)
+        self.assertNotIn('format', intent['installation']['metadata'])
+        self.assertEqual(native_failure_details(caught.exception)['candidate'], str(path))
+        with self.native_controller_fixture(), patch('stallionfs._scan.move', side_effect=AssertionError('rename replay')), \
+             patch('stallionfs._image.create_from_tree', side_effect=AssertionError('import replay')):
+            result = self.store.mount(path.name)
+        self.assertEqual(result['path'], str(path / 'volume/repo'))
+        self.assertEqual((path / 'image.sfs').stat().st_ino, backing)
+        proof = read_json(path / 'native-install.json')
+        self.assertEqual(proof['previous_installation']['outcome'], 'rename-attempted')
+        self.assertTrue(proof['guard']['core_consumed'])
+
+    def test_native_mount_error_retains_object_and_explicit_unmount_recovers(self):
+        from stallionfs.core import native_failure_details, read_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            state['mount_status'] = 1
+            with self.assertRaises(StallionError) as caught:
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            details = native_failure_details(caught.exception)
+            installation = details['installation']
+            path = Path(installation['candidate']); workspace = path.name
+            self.assertTrue(installation['installation_confirmed'])
+            self.assertEqual(read_json(path / 'meta.json')['state'], 'installed')
+            before = len(state['commands'])
+            with self.assertRaises(StallionError): self.store.mount(workspace)
+            self.assertEqual(len(state['commands']), before)
+            self.store.unmount(workspace)
+            state['mount_status'] = 0
+            self.assertEqual(self.store.mount(workspace)['path'], str(path / 'volume/repo'))
+            history = [read_json(p) for p in (path / 'native-operations').glob('*/record.json')]
+            self.assertTrue(any(any(h.get('returncode') == 1 for h in r['helpers']) for r in history))
+
+    def test_native_pending_owned_child_blocks_new_mutators(self):
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import replace_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            journal = self.store.root / 'journals' / (result['id'] + '.json')
+            replace_json(journal, {'operation': 'native-mount', 'workspace': result['id'],
+                                  'child_pending': True, 'helpers': [{'child_pending': True}]})
+            before = len(state['commands'])
+            for action in (lambda: self.store.mount(result['id']), lambda: self.store.unmount(result['id']),
+                           lambda: self.store.run(result['id'], ['true'])):
+                with self.assertRaises(StallionError): action()
+            self.assertEqual(len(state['commands']), before)
+            self.assertTrue(read_json(journal)['child_pending'])
+
+    def test_native_owned_helper_timeout_and_interrupt_stop_reap_before_return(self):
+        from stallionfs import _native
+        from stallionfs.core import lock
+        for interrupt in (False, True):
+            with self.subTest(interrupt=interrupt):
+                directory = self.base / ('signal-child' if interrupt else 'timeout-child'); directory.mkdir()
+                record, observations, signals = {}, [], []
+                primary = KeyboardInterrupt('owned interruption') if interrupt else subprocess.TimeoutExpired(['helper'], 0.1)
+                class Child:
+                    pid = 41
+                    returncode = None
+                    stopped = False
+                    def poll(self): return self.returncode
+                    def wait(self, timeout=None):
+                        if self.stopped:
+                            self.returncode = -9; return -9
+                        if not interrupt and timeout is not None:
+                            clock.advance(timeout)
+                        raise primary
+                    def terminate(self): signals.append('terminate')
+                    def kill(self): signals.append('kill'); self.stopped = True
+                # Use the actual existing lease while the injected helper
+                # ignores terminate, then acknowledges only its owned kill.
+                lease = self.store.root / 'locks' / ('use-' + '0' * 32)
+                def persist():
+                    with self.assertRaises(BlockingIOError):
+                        with lock(lease, blocking=False): pass
+                    observations.append(dict(record))
+                with lock(lease), self.native_clock() as clock, \
+                     patch('stallionfs._native.subprocess.Popen', return_value=Child()):
+                    with self.assertRaises(type(primary)) as caught:
+                        _native.execute_owned(['helper'], record, persist, directory, deadline=0.1)
+                if interrupt:
+                    self.assertIs(caught.exception, primary)
+                else:
+                    # The polling timeout advances time; execute_owned must
+                    # raise its own deadline error after observing expiry.
+                    self.assertIsNot(caught.exception, primary)
+                    self.assertEqual(caught.exception.timeout, 0.1)
+                    self.assertGreaterEqual(clock.now, 0.1)
+                self.assertEqual(signals, ['terminate', 'kill'])
+                self.assertFalse(record['child_pending'])
+                self.assertEqual(record['outcome'], 'unknown')
+                self.assertEqual(record['returncode'], -9)
+                self.assertTrue(any(row.get('child_pending') is True for row in observations))
+
+    def test_native_install_current_anchor_mismatch_retains_unconfirmed(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import native_failure_details, owned_native_target, read_json
+        seed = self.prepare()
+        original = _native.install_candidate
+        def changed(store, response, intent, metadata, profile, host):
+            target = owned_native_target(Path(response['candidate']), metadata)
+            _image.snapshot(target, 'changed-before-install')
+            return original(store, response, intent, metadata, profile, host)
+        with self.native_controller_fixture() as state, patch('stallionfs._native.install_candidate', side_effect=changed):
+            with self.assertRaises(StallionError) as caught:
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            details = native_failure_details(caught.exception)
+            path = Path(details['candidate'])
+            self.assertTrue(details['installed'])
+            self.assertFalse(details['installation_confirmed'])
+            self.assertEqual(read_json(path / 'meta.json')['state'], 'installed-unconfirmed')
+            inode = (path / 'image.sfs').stat().st_ino
+            with self.assertRaises(StallionError): self.store.mount(path.name)
+            self.assertEqual((path / 'image.sfs').stat().st_ino, inode)
+            self.assertEqual(state['commands'], [])
+            self.assertTrue((self.store.root / 'journals' / (path.name + '.json')).exists())
+
+    def test_native_install_consumed_close_then_proof_error_recovers_fresh(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import read_json, native_failure_details
+        seed = self.prepare()
+        original_guard = _image.with_backing_guard
+        consumed = []
+        def guarded(target, callback):
+            tokens = []
+            def held(token):
+                tokens.append(token)
+                return callback(token)
+            try:
+                return original_guard(target, held)
+            finally:
+                if tokens: consumed.append(tokens[0].close_result)
+        with self.native_controller_fixture(), patch('stallionfs._image.with_backing_guard', side_effect=guarded), \
+             patch('stallionfs._native._complete_install', side_effect=OSError(errno.EIO, 'proof persistence')):
+            with self.assertRaises(OSError) as caught:
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        self.assertTrue(consumed[-1]['core_consumed'])
+        self.assertEqual(consumed[-1]['status'], 0)
+        path = Path(native_failure_details(caught.exception)['candidate'])
+        intent = read_json(self.store.root / 'journals' / (path.name + '.json'))
+        self.assertEqual(read_json(path / 'meta.json')['format'], 1)
+        self.assertNotIn('format', intent['installation']['metadata'])
+        before = len(consumed)
+        with self.native_controller_fixture(), patch('stallionfs._image.with_backing_guard', side_effect=guarded), \
+             patch('stallionfs._scan.move', side_effect=AssertionError('rename replay')), \
+             patch('stallionfs._image.create_from_tree', side_effect=AssertionError('import replay')):
+            self.store.mount(path.name)
+        self.assertGreater(len(consumed), before)
+        proof = read_json(path / 'native-install.json')
+        self.assertEqual(proof['previous_installation']['guard'], consumed[0])
+        self.assertTrue(proof['complete'])
+
+    def test_native_unmount_error_and_busy_guard_never_grant_closure(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            path = Path(result['path']).parent.parent
+            state['unmount_status'] = 1
+            with self.assertRaises(StallionError): self.store.unmount(path.name)
+            self.assertIn(str(path / 'volume'), state['rows'])
+            self.assertNotIn('closed_at', read_json(self.store._state(path.name)))
+            state['unmount_status'] = 0
+            with self.native_clock() as clock, \
+                 patch('stallionfs._native.guarded', side_effect=OSError(errno.EBUSY, 'held image')) as busy:
+                with self.assertRaises(OSError) as caught: self.store.unmount(path.name)
+                self.assertGreater(busy.call_count, 1)
+                self.assertGreaterEqual(clock.now, _native.OBSERVATION_WINDOW)
+                self.assertLessEqual(clock.now, _native.OBSERVATION_WINDOW + 0.05 + 1e-8)
+            self.assertEqual(caught.exception.errno, errno.EBUSY)
+            self.assertNotIn(str(path / 'volume'), state['rows'])
+            journal = self.store.root / 'journals' / (path.name + '.json')
+            self.assertEqual(read_json(journal)['outcome'], 'incomplete')
+            self.assertNotIn('closed_at', read_json(self.store._state(path.name)))
+            commands = len(state['commands'])
+            recovered = self.store.unmount(path.name)
+            self.assertTrue(recovered['already_absent'])
+            self.assertEqual(len(state['commands']), commands)
+            self.assertTrue(recovered['native_operation']['current_guard']['core_consumed'])
+
+    def test_native_discovery_qualification_complete_inventory_and_refusals(self):
+        import copy
+        import plistlib
+        from stallionfs import _native
+        app = self.base / 'StallionFS.app'
+        module = app / 'Contents/Extensions/StallionFS.appex'
+        host = app / 'Contents/MacOS/StallionFS'
+        host.parent.mkdir(parents=True)
+        (module / 'Contents').mkdir(parents=True)
+        host_info = {'CFBundleIdentifier': 'com.alvinhhh.stallionfs', 'StallionFSControllerProtocol': 1}
+        module_info = {'CFBundleIdentifier': 'com.alvinhhh.stallionfs.module', 'CFBundleVersion': '9',
+                       'LSMinimumSystemVersion': '27.0', 'StallionFSAccessPolicy': 'contextual-writes',
+                       'StallionFSCompiledFactory': {'schema': 1, 'policy': 'contextual-writes',
+                           'architectures': ['arm64'], 'pre_sign_sha256': 'a' * 64},
+                       'EXAppExtensionAttributes': {'FSShortName': 'stallionfs'}}
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(host_info))
+        (module / 'Contents/Info.plist').write_bytes(plistlib.dumps(module_info))
+        expected = {'bundle_id': 'com.alvinhhh.stallionfs.module', 'url': str(module), 'enabled': True,
+                    'short_name': 'stallionfs', 'version': '9', 'minimum_os': '27.0',
+                    'access_policy': 'contextual-writes', 'signature_status': 0,
+                    'signing_identifier': 'com.alvinhhh.stallionfs.module', 'team_identifier': 'FIXTURE'}
+        inventory = {'ok': True, 'protocol': 1, 'modules': [expected]}
+        output = self.base / 'discovery-output'
+        class Operation:
+            def __init__(self, value, status=0): self.record, self.value, self.status, self.calls = {}, value, status, []
+            def command(self, label, argv):
+                self.calls.append((label, argv))
+                output.write_text(self.value if isinstance(self.value, str) else json.dumps(self.value))
+                return {'returncode': self.status if label == 'discover' else 0, 'stdout': str(output)}
+            def persist(self): pass
+        metadata = {'controller_profile': 'production', 'native_host': str(host)}
+        with patch('stallionfs._native.platform.mac_ver', return_value=('27.0', (), '')):
+            operation = Operation(inventory)
+            self.assertEqual(_native.qualify(operation, metadata), 'stallionfs')
+            self.assertEqual(operation.calls, [
+                ('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)]),
+                ('discover', [str(host), '--discover-json'])])
+            variants = [('disabled', {'enabled': False}), ('wrong-url', {'url': '/different/module'}),
+                        ('signature', {'signature_status': -1}), ('team', {'team_identifier': None}),
+                        ('version', {'version': '8'}), ('readonly', {'access_policy': 'read-only'}),
+                        ('non-scalar', {'short_name': []}), ('wrong-type', {'short_name': 'sfsro27'})]
+            for case, change in variants:
+                with self.subTest(case=case):
+                    value = copy.deepcopy(inventory); value['modules'][0].update(change)
+                    with self.assertRaises(StallionError): _native.qualify(Operation(value), metadata)
+            collision = copy.deepcopy(inventory)
+            collision['modules'].append({**expected, 'bundle_id': 'other', 'url': '/other'})
+            for value in (collision, {'ok': True, 'protocol': 1, 'modules': []},
+                          {'ok': False, 'error': 'fetch'}, {'ok': True, 'protocol': 1, 'modules': [None]},
+                          '{', 'x' * (_native.DISCOVERY_BYTES + 1)):
+                with self.assertRaises(StallionError): _native.qualify(Operation(value), metadata)
+            with self.assertRaises(StallionError): _native.qualify(Operation(inventory, status=1), metadata)
+            for factory in (None, {}, {'schema': 1, 'policy': 'read-only',
+                            'architectures': ['arm64'], 'pre_sign_sha256': 'a' * 64}):
+                changed = dict(module_info, StallionFSCompiledFactory=factory)
+                (module / 'Contents/Info.plist').write_bytes(plistlib.dumps(changed) if factory is not None
+                    else plistlib.dumps({key: val for key, val in module_info.items() if key != 'StallionFSCompiledFactory'}))
+                operation = Operation(inventory)
+                with self.assertRaises(StallionError): _native.qualify(operation, metadata)
+                self.assertEqual(operation.calls, [])
+            changed = copy.deepcopy(module_info)
+            changed['EXAppExtensionAttributes']['FSShortName'] = 'sfsro27'
+            (module / 'Contents/Info.plist').write_bytes(plistlib.dumps(changed))
+            private_inventory = copy.deepcopy(inventory)
+            private_inventory['modules'][0]['short_name'] = 'sfsro27'
+            self.assertEqual(_native.qualify(Operation(private_inventory),
+                dict(metadata, controller_profile='private-sfsro27')), 'sfsro27')
+            with self.assertRaises(StallionError): _native.qualify(Operation(private_inventory), metadata)
+            (module / 'Contents/Info.plist').write_bytes(plistlib.dumps(module_info))
+        with patch('stallionfs._native.platform.mac_ver', return_value=('26.0', (), '')):
+            operation = Operation(inventory)
+            with self.assertRaises(StallionError): _native.qualify(operation, metadata)
+            self.assertEqual(operation.calls, [])
+
+    def test_native_helper_signal_during_launch_keeps_handle_and_reaps(self):
+        from stallionfs import _native
+        directory = self.base / 'launch-signal'; directory.mkdir()
+        record, signals, handlers = {}, [], {}
+        class Child:
+            pid = 73
+            returncode = None
+            def poll(self): return self.returncode
+            def terminate(self): signals.append('terminate'); self.returncode = -15
+            def kill(self): raise AssertionError('unnecessary kill')
+            def wait(self, timeout=None): return self.returncode
+        child = Child()
+        def set_handler(number, handler): handlers[number] = handler
+        def launch(*args, **kwargs):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return child
+        with patch('stallionfs._native.signal.getsignal', return_value=signal.SIG_DFL), \
+             patch('stallionfs._native.signal.signal', side_effect=set_handler), \
+             patch('stallionfs._native.subprocess.Popen', side_effect=launch):
+            with self.assertRaises(KeyboardInterrupt):
+                _native.execute_owned(['helper'], record, lambda: None, directory)
+        self.assertEqual(signals, ['terminate'])
+        self.assertEqual(record['pid'], child.pid)
+        self.assertEqual(record['returncode'], -15)
+        self.assertFalse(record['child_pending'])
+        self.assertEqual(record['outcome'], 'unknown')
+        self.assertTrue(all(value == signal.SIG_DFL for value in handlers.values()))
+
+    def test_native_installed_directory_and_recovery_intent_cannot_be_substituted(self):
+        import copy
+        from stallionfs import _native, _scan
+        from stallionfs.core import read_json, native_failure_details
+        from stallionfs.lifecycle import replace_json, identity
+        seed = self.prepare()
+        with self.native_controller_fixture():
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            self.store.unmount(result['id'])
+        path = Path(result['path']).parent.parent
+        metadata = read_json(path / 'meta.json')
+        retained = path.with_name(path.name + '-retained')
+        path.rename(retained)
+        path.mkdir(mode=0o700)
+        # Transplant the SAME backing inode and copied proofs into a new resource
+        # directory, then update all mutable location fields to that new inode.
+        for item in retained.iterdir(): item.rename(path / item.name)
+        metadata['native_image']['object'] = identity(path)
+        replace_json(path / 'meta.json', metadata)
+        proof = read_json(path / 'native-install.json')
+        proof['target'] = metadata['native_image']
+        replace_json(path / 'native-install.json', proof)
+        with self.assertRaises(StallionError): _native.installed_target(self.store, path, metadata)
+        original_move = _scan.move
+        def lost(source, destination, **kwargs):
+            original_move(source, destination, **kwargs)
+            raise OSError(errno.EIO, 'rename response lost')
+        with self.native_controller_fixture(), patch('stallionfs._scan.move', side_effect=lost):
+            with self.assertRaises(OSError) as caught:
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        path = Path(native_failure_details(caught.exception)['candidate'])
+        journal = self.store.root / 'journals' / (path.name + '.json')
+        original = read_json(journal)
+        for field in ('object', 'installation-metadata'):
+            intent = copy.deepcopy(original)
+            if field == 'object': intent['object'][1] += 1
+            else: intent['installation']['metadata']['native_host'] = '/substituted/host'
+            replace_json(journal, intent)
+            before = journal.read_bytes()
+            with self.native_controller_fixture() as state:
+                with self.assertRaises(StallionError): self.store.mount(path.name)
+                self.assertEqual(state['commands'], [])
+            self.assertEqual(journal.read_bytes(), before)
+        replace_json(journal, original)
+        with self.native_controller_fixture(): self.store.mount(path.name)
+
+    def test_native_malformed_helper_dispositions_retain_exact_journal(self):
+        import copy
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import replace_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            path = Path(result['path']).parent.parent
+            self.store.unmount(path.name)
+            baseline = next(read_json(p) for p in (path / 'native-operations').glob('*/record.json')
+                            if read_json(p)['operation'] == 'native-mount')
+            journal = self.store.root / 'journals' / (path.name + '.json')
+            variants = []
+            for key in ('child_pending', 'helpers'):
+                value = copy.deepcopy(baseline); value.pop(key); variants.append(value)
+            for pending in ('false', 0, 1, None):
+                value = copy.deepcopy(baseline); value['child_pending'] = pending; variants.append(value)
+                value = copy.deepcopy(baseline); value['helpers'][0]['child_pending'] = pending; variants.append(value)
+            for helper in ({}, None, {'child_pending': False}):
+                value = copy.deepcopy(baseline); value['helpers'] = [helper]; variants.append(value)
+            for outcome in ('running', 'launch-pending'):
+                value = copy.deepcopy(baseline); value['helpers'][0]['outcome'] = outcome; variants.append(value)
+            for key in ('child_pending', 'pid', 'returncode', 'reaped'):
+                value = copy.deepcopy(baseline); value['helpers'][0].pop(key); variants.append(value)
+            value = copy.deepcopy(baseline); value['workspace'] = 'f' * 32; variants.append(value)
+            value = copy.deepcopy(baseline); value['operation'] = 'native-unmount'; variants.append(value)
+            value = copy.deepcopy(baseline); value['helpers'][0].update(outcome='unknown', reaped=False); variants.append(value)
+            value = copy.deepcopy(baseline); value['target']['file'][1] += 1; variants.append(value)
+            for index, value in enumerate(variants):
+                with self.subTest(index=index):
+                    replace_json(journal, value); before = journal.read_bytes()
+                    commands = len(state['commands'])
+                    for action in (lambda: self.store.mount(path.name), lambda: self.store.unmount(path.name),
+                                   lambda: self.store.run(path.name, ['true'])):
+                        with self.assertRaises(StallionError): action()
+                        self.assertEqual(journal.read_bytes(), before)
+                    self.assertEqual(len(state['commands']), commands)
+
+    def test_native_recovered_first_use_requires_git_and_actual_write_acceptance(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        installed = []
+        original_install = _native.install_candidate
+        def stop_after_install(*args, **kwargs):
+            response = original_install(*args, **kwargs)
+            installed.append(Path(response['candidate']))
+            raise OSError(errno.EIO, 'stopped before first mount')
+        with self.native_controller_fixture(), patch('stallionfs._native.install_candidate', side_effect=stop_after_install):
+            with self.assertRaises(OSError): self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        path = installed[0]
+        self.assertEqual(read_json(path / 'native-install.json')['first_use'], {'accepted': False})
+        repo = path / 'volume/repo'
+        clone_tree(self.store.root / 'seeds' / seed['id'] / 'repo', repo)
+        git(repo, 'checkout', '-b', 'wrong-initial-branch')
+        with self.native_controller_fixture():
+            with self.assertRaises(StallionError): self.store.mount(path.name)
+            self.assertFalse(read_json(path / 'native-install.json')['first_use']['accepted'])
+            self.store.unmount(path.name)
+            metadata = read_json(path / 'meta.json')
+            git(repo, 'checkout', '-b', metadata['branch'])
+            git(repo, 'config', 'user.email', 'test@example.invalid')
+            git(repo, 'config', 'user.name', 'Test')
+            git(repo, 'commit', '--allow-empty', '-m', 'Wrong initial commit')
+            with self.assertRaises(StallionError): self.store.mount(path.name)
+            self.store.unmount(path.name)
+            git(repo, 'reset', '--hard', metadata['commit'])
+            original_open = os.open
+            for number in (errno.EROFS, errno.EACCES):
+                def deny(probe, flags, *args, **kwargs):
+                    if Path(probe).name.startswith('.stallionfs-write-'): raise OSError(number, 'write denied')
+                    return original_open(probe, flags, *args, **kwargs)
+                with patch('stallionfs._native.os.open', side_effect=deny):
+                    with self.assertRaises(OSError) as caught: self.store.mount(path.name)
+                self.assertEqual(caught.exception.errno, number)
+                self.assertFalse(read_json(path / 'native-install.json')['first_use']['accepted'])
+                journal = read_json(self.store.root / 'journals' / (path.name + '.json'))
+                self.assertFalse(journal['write_probe']['complete'])
+                self.assertEqual(journal['outcome'], 'incomplete')
+                self.store.unmount(path.name)
+            self.store.mount(path.name)
+            self.assertTrue(read_json(path / 'native-install.json')['first_use']['accepted'])
+            self.store.unmount(path.name)
+            git(repo, 'checkout', '-b', 'legitimate-later-branch')
+            git(repo, 'commit', '--allow-empty', '-m', 'Legitimate later commit')
+            self.store.mount(path.name)
+            self.assertEqual(git(repo, 'branch', '--show-current'), 'legitimate-later-branch')
+
+    def test_native_repeated_operations_and_supervision_have_bounded_receipts(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        path = self.store.root / 'workspaces' / ('e' * 32); path.mkdir(mode=0o700)
+        target = {'directory': str(path), 'component': 'image.sfs', 'parent': [1, 2], 'file': [1, 3], 'uuid': 'a' * 32}
+        previous = None
+        for number in range(100):
+            operation = _native.Operation(self.store, path, 'native-unmount', target)
+            operation.record['outcome'] = 'incomplete'; operation.persist()
+            if previous:
+                reference = operation.record['previous_unresolved']
+                self.assertEqual(reference['id'], previous.record['id'])
+                self.assertEqual(read_json(Path(reference['record']))['outcome'], 'incomplete')
+                self.assertNotIn('previous_unresolved', reference)
+            self.assertLess(len(json.dumps(operation.record)), 1600)
+            previous = operation
+        record, attempts = {}, []
+        class Child:
+            pid = 101
+            returncode = None
+            def poll(self): return self.returncode
+            def terminate(self): raise OSError(errno.EPERM, 'cannot terminate yet')
+            def kill(self):
+                attempts.append(1)
+                if len(attempts) < 100: raise OSError(errno.EPERM, 'cannot stop yet')
+                self.returncode = -9
+            def wait(self, timeout=None): return self.returncode
+        primary = KeyboardInterrupt('primary interrupted outcome')
+        child = Child()
+        directory = self.base / 'repeated-helper'; directory.mkdir()
+        def wait_once(timeout=None):
+            if child.returncode is None: raise primary
+            return child.returncode
+        child.wait = wait_once
+        def persist():
+            if record.get('stop_errors'): raise OSError(errno.EIO, 'receipt persistence failed')
+        with self.native_clock() as clock, \
+             patch('stallionfs._native.subprocess.Popen', return_value=child), \
+             patch.object(clock, 'sleep', side_effect=InterruptedError('supervision interrupted')):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                _native.execute_owned(['helper'], record, persist, directory)
+        self.assertIs(caught.exception, primary)
+        self.assertTrue(record['reaped'])
+        self.assertFalse(record['child_pending'])
+        self.assertEqual(record['outcome'], 'unknown')
+        self.assertEqual(record['stop_errors']['count'], 300)
+        self.assertEqual(record['stop_errors']['first']['phase'], 'stop-reap')
+        self.assertEqual(record['stop_errors']['last']['phase'], 'supervise')
+        self.assertLess(len(json.dumps(record)), 1600)
+
+    def test_native_helper_stream_close_preserves_primary_interruption(self):
+        from stallionfs import _native
+        directory = self.base / 'close-error-helper'; directory.mkdir()
+        record = {}
+        primary = KeyboardInterrupt('primary')
+        class Stream:
+            def close(self): raise OSError(errno.EIO, 'stream close')
+        class Child:
+            pid = 42
+            returncode = None
+            def poll(self): return self.returncode
+            def wait(self, timeout=None):
+                if self.returncode is None: raise primary
+                return self.returncode
+            def terminate(self): self.returncode = -15
+        with patch('pathlib.Path.open', return_value=Stream()), \
+             patch('stallionfs._native.subprocess.Popen', return_value=Child()):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                _native.execute_owned(['helper'], record, lambda: None, directory)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(record['stream_close_errors'], ['OSError', 'OSError'])
+        self.assertTrue(record['reaped'])
+        self.assertEqual(record['outcome'], 'unknown')
+
+    def test_native_install_target_exists_and_late_guard_receipts_fail_closed(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import native_failure_details, read_json
+        seed = self.prepare()
+        original = _native.install_candidate
+        def occupied(store, response, intent, metadata, profile, host):
+            (store.root / 'workspaces' / metadata['id']).mkdir(mode=0o700)
+            return original(store, response, intent, metadata, profile, host)
+        with self.native_controller_fixture() as state, patch('stallionfs._native.install_candidate', side_effect=occupied):
+            with self.assertRaises(StallionError): self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            self.assertEqual(state['commands'], [])
+        real_guard = _image.with_backing_guard
+        for field, value in (('parent_close_errno', errno.EIO), ('status', -errno.EIO), ('core_consumed', False)):
+            def late(target, callback):
+                class Token:
+                    def __init__(self, token): self.token = token
+                    def verify(self, target): return self.token.verify(target)
+                    @property
+                    def close_result(self): return dict(self.token.close_result, **{field: value})
+                return real_guard(target, lambda token: callback(Token(token)))
+            with self.native_controller_fixture() as state, patch('stallionfs._image.with_backing_guard', side_effect=late):
+                with self.assertRaises(StallionError) as caught:
+                    self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                details = native_failure_details(caught.exception)
+                path = Path(details['candidate'])
+                self.assertTrue(details['installed'])
+                self.assertEqual(read_json(path / 'meta.json')['state'], 'installed-unconfirmed')
+                self.assertEqual(state['commands'], [])
+
+    def test_native_install_and_first_use_durable_write_interruptions(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json, native_failure_details
+        seed = self.prepare()
+        original = _native._persist
+        phases = ('prepared-intent', 'source-metadata', 'rename-intent', 'guard-receipt',
+                  'install-proof', 'installed-metadata', 'first-mount', 'first-use', 'mount-state')
+        for phase in phases:
+            fired = []
+            def interrupt(path, value):
+                installation = value.get('installation', {})
+                matches = {
+                    'prepared-intent': installation.get('outcome') == 'prepared',
+                    'source-metadata': Path(path).name == 'meta.json' and value.get('state') == 'installed-unconfirmed',
+                    'rename-intent': installation.get('outcome') == 'rename-attempted' and installation.get('guard') is None,
+                    'guard-receipt': installation.get('guard') is not None,
+                    'install-proof': Path(path).name == 'native-install.json' and value.get('first_mount_attempted') is False,
+                    'installed-metadata': Path(path).name == 'meta.json' and value.get('state') == 'installed',
+                    'first-mount': Path(path).name == 'native-install.json' and value.get('first_mount_attempted') is True,
+                    'first-use': Path(path).name == 'native-install.json' and value.get('first_use', {}).get('accepted') is True,
+                    'mount-state': Path(path).name == 'native-mount.json' and value.get('state') == 'mounted',
+                }
+                if matches[phase] and not fired:
+                    fired.append(Path(path)); raise OSError(errno.EIO, phase)
+                return original(path, value)
+            with self.subTest(phase=phase), self.native_controller_fixture() as state, \
+                 patch('stallionfs._native._persist', side_effect=interrupt):
+                with self.assertRaises(OSError): self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                self.assertEqual(len(fired), 1)
+                self.assertLessEqual(len(state['commands']), 1)
+                if phase == 'first-use':
+                    path = fired[0].parent
+                    self.assertFalse(read_json(path / 'native-install.json')['first_use']['accepted'])
+                    self.assertFalse((path / 'native-mount.json').exists())
+                if phase == 'mount-state':
+                    self.assertTrue(read_json(fired[0].parent / 'native-install.json')['first_use']['accepted'])
+                    self.assertTrue((self.store.root / 'journals' / (fired[0].parent.name + '.json')).exists())
+
+    def test_native_mount_descriptor_disagreement_never_returns_usable_access(self):
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            def wrong(fd):
+                row = dict(next(iter(state['rows'].values())))
+                row['fsid'] = [999, 999]
+                return row
+            with patch('stallionfs._scan.mount_for_descriptor', side_effect=wrong):
+                with self.assertRaises(StallionError): self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            self.assertEqual(len(state['commands']), 1)
+            self.assertFalse(state['observed_fds'])
+            volume = Path(next(iter(state['rows'])))
+            self.assertFalse((volume.parent / 'native-mount.json').exists())
+
+    def test_cli_native_create_flags_and_timeout_receipt(self):
+        from stallionfs.__main__ import main
+        seed = '1' * 64
+        host = self.base / 'StallionFS.app/Contents/MacOS/StallionFS'
+        with patch.object(Store, 'create', return_value={'path': '/usable/repo'}) as create, \
+             patch('sys.stdout', new_callable=StringIO) as stdout:
+            status = main(['--root', str(self.store.root), 'create', seed, '--backend', 'native-image',
+                           '--capacity-gib', '2', '--native-profile', 'private-sfsro27', '--native-host', str(host)])
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), '/usable/repo\n')
+        create.assert_called_once_with(seed, name='', jobs=4, backend='native-image', capacity_gib=2,
+                                       native_profile='private-sfsro27', native_host=host)
+        error = subprocess.TimeoutExpired(['owned-helper'], 30)
+        error.native_candidate_result = {'workspace': '2' * 32, 'outcome': 'incomplete'}
+        with patch.object(Store, 'mount', side_effect=error), patch('sys.stderr', new_callable=StringIO) as stderr:
+            self.assertEqual(main(['--root', str(self.store.root), '--json', 'mount', '2' * 32]), 1)
+        self.assertEqual(json.loads(stderr.getvalue())['native_image_result']['workspace'], '2' * 32)
+
+    @contextmanager
+    def native_wall_clock(self, value=1_000_000.0):
+        from types import SimpleNamespace
+        current = [value]
+        clock = SimpleNamespace(time=lambda: current[0])
+        with patch('stallionfs.lifecycle.time', clock), patch('stallionfs._native_recovery.time', clock):
+            yield current
+
+    def native_purge_fixture(self, seed, now):
+        """Produce real native trash with an empty simulated unmounted directory."""
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        workspace = result['id']; path = Path(result['path']).parent.parent
+        self.store.unmount(workspace)
+        self.store.snapshot(workspace, name='retained-data')
+        self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+        # The namespace fixture materializes a host Git clone; real unmount hides
+        # that mounted tree. Remove only this disposable fixture's host clone.
+        remove_tree(path / 'volume/repo')
+        for archive in (path / 'native-operations').iterdir():
+            record = read_json(archive / 'record.json')
+            for index, helper in enumerate(record['helpers']):
+                for stream in ('stdout', 'stderr'):
+                    output = archive / f'{index:02}-{helper["label"]}' / stream
+                    output.write_bytes(b'fixture helper output\n'); output.chmod(0o600)
+        now[0] += STALE_SECONDS
+        self.store.move(workspace)
+        return workspace, self.store.root / 'trash' / workspace
+
+    def test_native_purge_pre_relocation_crash_retry_preserves_orphan(self):
+        from stallionfs import _native, _native_purge
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for crash in ('unbound-container', 'missing-bound-container'):
+                with self.subTest(crash=crash):
+                    workspace, path = self.native_purge_fixture(seed, now)
+                    record = self.store.purge('trash', workspace)['native_operation']
+                    journal = self.store.root / 'journals' / (workspace + '.json')
+                    orphan = self.store.root / 'staging' / record['container']
+                    orphan.mkdir(mode=0o700)
+                    if crash == 'missing-bound-container':
+                        record['container_identity'] = _native_purge.identity(orphan.stat())
+                    # Materialize only the crash-persisted state, without an exception
+                    # handler publishing an in-memory container identity afterward.
+                    _native._persist(journal, record)
+                    if crash == 'missing-bound-container': orphan.rmdir()
+                    else:
+                        (orphan / 'unknown').write_bytes(b'unknown orphan retained')
+                        orphan_identity = orphan.stat().st_ino
+                    before = journal.read_bytes()
+                    with patch('stallionfs._native_purge.restart_unrelocated', side_effect=AssertionError('preview restarted')):
+                        self.assertTrue(self.store.purge('trash', workspace)['pending'])
+                    self.assertEqual(journal.read_bytes(), before)
+                    self.assertTrue((path / 'image.sfs').exists())
+                    result = self.store.purge('trash', workspace, yes=True)
+                    self.assertTrue(result['cleanup_complete'])
+                    self.assertNotEqual(result['native_operation']['id'], record['id'])
+                    abandoned = result['native_operation']['abandoned_attempt']
+                    archive = self.store.root / 'lifecycle' / ('native-purge-abandoned-' + workspace
+                        + '-' + abandoned['id'] + '-' + abandoned['sha256'] + '.json')
+                    self.assertEqual(read_json(archive), json.loads(before))
+                    self.assertFalse(path.exists())
+                    if crash == 'unbound-container':
+                        self.assertEqual(orphan.stat().st_ino, orphan_identity)
+                        self.assertEqual((orphan / 'unknown').read_bytes(), b'unknown orphan retained')
+                        self.assertIn('native purge', _native_purge.core.native_retention_reason(orphan))
+                    else: self.assertFalse(orphan.exists())
+
+    def test_native_purge_pre_relocation_retry_publication_failures_remain_recoverable(self):
+        from stallionfs import _native, core
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for boundary in ('archive-before', 'archive-after', 'archive-fsync', 'replacement-before', 'replacement-after'):
+                with self.subTest(boundary=boundary):
+                    workspace, path = self.native_purge_fixture(seed, now)
+                    record = self.store.purge('trash', workspace)['native_operation']
+                    journal = self.store.root / 'journals' / (workspace + '.json')
+                    _native._persist(journal, record)
+                    orphan = self.store.root / 'staging' / record['container']; orphan.mkdir(mode=0o700)
+                    (orphan / 'unknown').write_bytes(b'retain')
+                    before = journal.read_bytes(); fired = []
+                    write, persist, sync = core.write_json, _native._persist, os.fsync
+                    def publishing(target, value):
+                        if Path(target).name.startswith('native-purge-abandoned-') and boundary.startswith('archive-') and boundary != 'archive-fsync':
+                            fired.append(True)
+                            if boundary == 'archive-after': write(target, value)
+                            raise OSError(errno.EIO, boundary)
+                        return write(target, value)
+                    def replacing(target, value):
+                        if Path(target) == journal and value.get('id') != record['id'] and boundary.startswith('replacement-'):
+                            fired.append(True)
+                            if boundary == 'replacement-after': persist(target, value)
+                            raise OSError(errno.EIO, boundary)
+                        return persist(target, value)
+                    def syncing(fd):
+                        if boundary == 'archive-fsync' and os.fstat(fd).st_ino == (self.store.root / 'lifecycle').stat().st_ino:
+                            fired.append(True); raise OSError(errno.EIO, boundary)
+                        return sync(fd)
+                    with patch('stallionfs.core.write_json', side_effect=publishing), \
+                         patch('stallionfs._native._persist', side_effect=replacing), \
+                         patch('stallionfs._native_purge.os.fsync', side_effect=syncing), \
+                         patch('stallionfs._native_purge.failure'):
+                        with self.assertRaises(OSError): self.store.purge('trash', workspace, yes=True)
+                    self.assertTrue(fired)
+                    self.assertTrue((path / 'image.sfs').exists())
+                    if boundary != 'replacement-after': self.assertEqual(journal.read_bytes(), before)
+                    else:
+                        replacement = read_json(journal)
+                        self.assertEqual(replacement['abandoned_attempt']['id'], record['id'])
+                        self.assertTrue(list((self.store.root / 'lifecycle').glob('native-purge-abandoned-' + workspace + '-*.json')))
+                    self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+                    self.assertEqual((orphan / 'unknown').read_bytes(), b'retain')
+
+    def test_native_purge_bounded_metadata_ingress_refuses_before_decode_or_mutation(self):
+        from stallionfs import _native, _native_purge, core
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            neighbor = self.store.root / 'journals' / ('e' * 32 + '.json')
+            record = self.store.purge('trash', workspace)['native_operation']
+            _native._persist(journal, record)
+            archive_record = next((path / 'native-operations').glob('*/record.json'))
+            original_state = self.store._state(workspace).read_bytes()
+            reference = self.store.root / 'workspaces' / ('d' * 32)
+            reference.mkdir(mode=0o700)
+            core.write_json(reference / 'meta.json', {'backend': 'fixture'})
+            cases = [('selected-journal', journal), ('completion', self.store._state(workspace)),
+                ('neighbor', neighbor), ('reference-metadata', reference / 'meta.json'),
+                ('metadata', path / 'meta.json'),
+                ('creation-proof', path / 'native-create.json'), ('installation-proof', path / 'native-install.json'),
+                ('location-proof', path / 'native-location.json'),
+                ('protection', self.store.root / 'protected' / (workspace + '.json')),
+                ('operation-proof', archive_record)]
+            limit = _native_purge.MAX_INTENT_BYTES
+            loads = json.loads
+            for label, target in cases:
+                with self.subTest(input=label):
+                    saved = target.read_bytes() if target.exists() else None
+                    payload = saved or b'{"format":1,"operation":"native-purge"}'
+                    if label == 'completion': payload = b'{"format":1,"operation":"native-purge-complete"}'
+                    target.write_bytes(payload + b' ' * (limit + 1 - len(payload))); target.chmod(0o600)
+                    before = {str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}
+                    def decoding(data, *args, **kwargs):
+                        self.assertLessEqual(len(data.encode() if isinstance(data, str) else data), limit)
+                        return loads(data, *args, **kwargs)
+                    with patch('stallionfs.core.json.loads', side_effect=decoding), \
+                         patch('stallionfs._native._persist', side_effect=AssertionError('receipt rewrite')), \
+                         patch('stallionfs.core.write_json', side_effect=AssertionError('metadata write')), \
+                         patch('stallionfs._native_purge.os.rename', side_effect=AssertionError('rename')), \
+                         patch('stallionfs._native_purge.os.unlink', side_effect=AssertionError('unlink')):
+                        with self.assertRaises(core.MetadataLimitError): self.store.purge('trash', workspace, yes=True)
+                    self.assertEqual({str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}, before)
+                    self.assertTrue((path / 'image.sfs').exists())
+                    self.assertIsNone(core._json_read_limit.get())
+                    if saved is None: target.unlink()
+                    else: target.write_bytes(saved)
+            self.assertEqual(self.store._state(workspace).read_bytes(), original_state)
+            (reference / 'meta.json').unlink(); reference.rmdir()
+            # With no pending purge, these same proof reads are delegated through
+            # installed_target/ready; they still refuse before any progress write.
+            journal.unlink()
+            for name in ('native-create.json', 'native-install.json', 'native-location.json'):
+                target = path / name; saved = target.read_bytes()
+                target.write_bytes(saved + b' ' * (limit + 1 - len(saved)))
+                with patch('stallionfs.core.json.loads', side_effect=decoding), \
+                     patch('stallionfs._native._persist', side_effect=AssertionError('receipt rewrite')):
+                    with self.assertRaises(core.MetadataLimitError): self.store.purge('trash', workspace, yes=True)
+                target.write_bytes(saved)
+            # Exact-limit valid input remains admissible; whitespace counts as input.
+            target = path / 'meta.json'; saved = target.read_bytes()
+            target.write_bytes(saved + b' ' * (limit - len(saved)))
+            self.assertTrue(self.store.purge('trash', workspace)['would_delete'])
+            target.write_bytes(saved)
+            with core.json_read_limit(64):
+                with self.assertRaises(core.MetadataLimitError):
+                    with core.json_read_limit(16): core.read_json(target)
+                self.assertEqual(core._json_read_limit.get(), 64)
+            self.assertIsNone(core._json_read_limit.get())
+            self.assertEqual(core.read_json(target)['id'], workspace)
+            self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+
+    def test_native_purge_pending_move_bounds_future_proofs_before_recovery(self):
+        from stallionfs import _native, _native_purge, core
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            persist = _native._persist
+            def interrupted(target, value):
+                if Path(target).name == 'native-location.json': raise OSError(errno.EIO, 'return location response')
+                return persist(target, value)
+            with patch('stallionfs._native._persist', side_effect=interrupted):
+                with self.assertRaises(OSError): self.store.move(workspace, restore=True)
+            path = self.store.root / 'workspaces' / workspace
+            archive = next((path / 'native-operations').glob('*/record.json'))
+            saved = archive.read_bytes()
+            archive.write_bytes(saved + b' ' * (_native_purge.MAX_INTENT_BYTES + 1 - len(saved)))
+            before = {str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}
+            with patch('stallionfs._native_recovery.recover_move', side_effect=AssertionError('recovery mutation')):
+                with self.assertRaises(core.MetadataLimitError): self.store.purge('trash', workspace, yes=True)
+            self.assertEqual({str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}, before)
+            self.assertTrue((path / 'image.sfs').exists()); self.assertIsNone(core._json_read_limit.get())
+            archive.write_bytes(saved)
+
+    def test_native_purge_preview_full_retention_success_and_completed_repeat(self):
+        from stallionfs.core import read_json, write_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            self.assertEqual(set(read_json(path / 'meta.json')['native_image']),
+                {'component', 'parent', 'object', 'file', 'uuid'})
+            other, retained = self.native_purge_fixture(seed, now)
+            for index in range(30):
+                write_json(self.store.root / 'protected' / f'{index:032x}.json', {'fixture': True})
+            self.assertEqual(len(list((self.store.root / 'protected').iterdir())), 32)
+            def records(): return {str(p.relative_to(self.store.root)): p.read_bytes() for p in self.store.root.rglob('*.json')}
+            before = records()
+            preview = self.store.purge('trash', workspace)
+            self.assertTrue(preview['would_delete']); self.assertFalse(preview['data_absent'])
+            self.assertEqual(records(), before)
+            with patch.object(self.store, '_retention', side_effect=AssertionError('purge requested a new slot')):
+                result = self.store.purge('trash', workspace, yes=True)
+            self.assertTrue(result['data_absent']); self.assertTrue(result['metadata_complete']); self.assertTrue(result['cleanup_complete'])
+            self.assertFalse(path.exists()); self.assertTrue((retained / 'image.sfs').exists())
+            receipt = read_json(self.store._state(workspace))
+            self.assertEqual(receipt['operation'], 'native-purge-complete'); self.assertNotIn('manifest', receipt)
+            self.assertEqual(receipt['guard_outcome'], 'consumed'); self.assertEqual(receipt['unlink_outcome'], 'returned')
+            self.assertFalse((self.store.root / 'staging' / receipt['container']).exists())
+            after = records()
+            self.assertTrue(self.store.purge('trash', workspace, yes=True)['already_purged'])
+            self.assertEqual(records(), after)
+            self.assertTrue(self.store.purge('trash', workspace)['would_delete']); self.assertEqual(records(), after)
+            with self.assertRaises(StallionError): self.store.purge('trash', 'f' * 32, yes=True)
+            with patch.object(self.store, '_retention', side_effect=AssertionError('restore requested a new slot')):
+                self.store.move(other, restore=True)
+            self.assertTrue((self.store.root / 'workspaces' / other / 'image.sfs').exists())
+
+    def test_native_purge_pending_move_preview_never_reconciles(self):
+        from stallionfs import _native, _native_recovery
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, trash = self.native_purge_fixture(seed, now)
+            original = _native._persist
+            def interrupted(path, value):
+                if Path(path).name == 'native-location.json': raise OSError(errno.EIO, 'return location response')
+                return original(path, value)
+            with patch('stallionfs._native._persist', side_effect=interrupted):
+                with self.assertRaises(OSError): self.store.move(workspace, restore=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            before = journal.read_bytes()
+            with patch('stallionfs._native_recovery.recover_move', side_effect=AssertionError('preview reconciled move')):
+                preview = self.store.purge('trash', workspace)
+            self.assertEqual(preview['pending'], 'native-move'); self.assertEqual(journal.read_bytes(), before)
+            with self.assertRaisesRegex(StallionError, 'not protected trash'):
+                self.store.purge('trash', workspace, yes=True)
+            self.assertTrue((self.store.root / 'workspaces' / workspace / 'image.sfs').exists())
+
+    def test_native_purge_manifest_bounds_and_unexpected_entries_refuse_before_unlink(self):
+        from stallionfs import _native_purge
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            for kind in ('extra', 'volume', 'symlink', 'hardlink', 'public-mode', 'helper-record', 'entries', 'bytes'):
+                with self.subTest(kind=kind):
+                    saved = None
+                    if kind == 'extra': (path / 'extra').write_bytes(b'retain')
+                    if kind == 'volume': (path / 'volume/file').write_bytes(b'retain')
+                    if kind == 'symlink': (path / 'extra').symlink_to(self.source)
+                    if kind == 'hardlink': os.link(path / 'image.sfs', self.base / 'backing-alias')
+                    if kind == 'public-mode': (path / 'meta.json').chmod(0o644)
+                    if kind == 'helper-record':
+                        archive = next((path / 'native-operations').glob('*/record.json'))
+                        saved = archive.read_bytes(); value = json.loads(saved); value['child_pending'] = True
+                        archive.write_text(json.dumps(value))
+                    bound = 'MAX_ENTRIES' if kind == 'entries' else 'MAX_INTENT_BYTES'
+                    with patch.object(_native_purge, bound, 1 if kind in ('entries', 'bytes') else getattr(_native_purge, bound)):
+                        with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+                    self.assertTrue((path / 'image.sfs').exists())
+                    self.assertFalse((self.store.root / 'journals' / (workspace + '.json')).exists())
+                    if kind in ('extra', 'symlink'): (path / 'extra').unlink()
+                    if kind == 'volume': (path / 'volume/file').unlink()
+                    if kind == 'hardlink': (self.base / 'backing-alias').unlink()
+                    if kind == 'public-mode': (path / 'meta.json').chmod(0o600)
+                    if saved is not None: archive.write_bytes(saved)
+            self.store.purge('trash', workspace, yes=True)
+
+    def test_native_purge_lease_mount_core_reference_and_single_guard_exclusion(self):
+        from stallionfs import _native, _image, core
+        from stallionfs.core import read_json, write_json, lock
+        seed = self.prepare()
+        with self.native_controller_fixture() as mounted, self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            with self.store._lease(workspace):
+                with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            mounted['rows'][str(path / 'volume/nested')] = {'path': str(path / 'volume/nested')}
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            mounted['rows'].clear()
+            def busy(token):
+                with self.assertRaises(OSError): self.store.purge('trash', workspace, yes=True)
+            _image.with_backing_guard(target, busy)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            record = read_json(journal)
+            self.assertFalse(record['data_absent'])
+            # A conflicting published external reference is rejected even after preparation.
+            registration = self.store.root / 'workspaces' / ('e' * 32); registration.mkdir(mode=0o700)
+            write_json(registration / 'meta.json', {'id': registration.name, 'backend': 'native-image',
+                'ownership': 'external-reference', 'native_image': target})
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            (registration / 'meta.json').unlink(); registration.rmdir()
+            unlink = os.unlink; admissions = []
+            guard = _native.guarded
+            def guarded(target, callback=None, **kwargs):
+                admissions.append(target)
+                return guard(target, callback, **kwargs)
+            def deleting(name, *args, **kwargs):
+                if name == 'image.sfs':
+                    self.assertEqual(len(admissions), 1)
+                    moved_target = dict(target, directory=str(self.store.root / 'staging' / record['container'] / 'owned'))
+                    self.assertEqual(_image.snapshot(moved_target, 'competing')['error_code'], errno.EBUSY)
+                    with self.assertRaises(BlockingIOError):
+                        with lock(self.store.root / '.lock', blocking=False): pass
+                return unlink(name, *args, **kwargs)
+            with patch('stallionfs._native.guarded', side_effect=guarded), \
+                 patch('stallionfs._native_purge.os.unlink', side_effect=deleting):
+                result = self.store.purge('trash', workspace, yes=True)
+            self.assertTrue(result['cleanup_complete']); self.assertEqual(len(admissions), 1)
+
+    def test_native_purge_journal_stage_faults_resume_only_authorized_work(self):
+        from stallionfs import _native, _native_purge
+        from stallionfs.core import read_json, native_failure_details
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for stage in _native_purge.STAGES:
+                for after in (False, True):
+                    with self.subTest(stage=stage, after=after):
+                        workspace, path = self.native_purge_fixture(seed, now)
+                        primary = OSError(errno.ENOSPC, 'stage publication')
+                        persist = _native._persist; fired = []
+                        def saving(target, record):
+                            match = record.get('workspace') == workspace and record.get('stage') == stage and not fired
+                            if match and not after: fired.append(True); raise primary
+                            result = persist(target, record)
+                            if match and after: fired.append(True); raise primary
+                            return result
+                        with patch('stallionfs._native._persist', side_effect=saving):
+                            with self.assertRaises(OSError) as caught: self.store.purge('trash', workspace, yes=True)
+                        self.assertIs(caught.exception, primary); self.assertEqual(fired, [True])
+                        held = native_failure_details(primary)
+                        self.assertEqual(held['workspace'], workspace)
+                        journal = self.store.root / 'journals' / (workspace + '.json')
+                        saved = read_json(journal) if journal.exists() else read_json(self.store._state(workspace))
+                        tombstone = self.store.root / 'staging' / saved['container']
+                        data_absent = not (path / 'image.sfs').exists() and not (tombstone / 'owned/image.sfs').exists()
+                        guard = _native.guarded
+                        with patch('stallionfs._native.guarded', side_effect=AssertionError('absent image reopened') if data_absent else guard):
+                            result = self.store.purge('trash', workspace, yes=True)
+                        self.assertTrue(result['cleanup_complete']); self.assertFalse(path.exists()); self.assertFalse(tombstone.exists())
+                        self.assertEqual(read_json(self.store._state(workspace))['first_error']['type'], 'OSError')
+
+    def test_native_purge_unlink_close_and_resource_sync_failures_keep_data_loss_facts(self):
+        from stallionfs import _native, _native_purge
+        from stallionfs.core import read_json, native_failure_details
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for phase in ('unlink-response', 'resource-sync', 'close', 'parent-close', 'lost-receipt', 'callback-and-close', 'cancel'):
+                with self.subTest(phase=phase):
+                    workspace, path = self.native_purge_fixture(seed, now)
+                    object_inode = path.stat().st_ino
+                    primary = KeyboardInterrupt('after unlink') if phase == 'cancel' else MemoryError('lost guard receipt') if phase == 'lost-receipt' else OSError(errno.EIO, phase)
+                    unlink, fsync, guard = os.unlink, os.fsync, _native.guarded
+                    removed = []; fired = []
+                    def deleting(name, *args, **kwargs):
+                        result = unlink(name, *args, **kwargs)
+                        if name == 'image.sfs':
+                            removed.append(True)
+                            if phase in ('unlink-response', 'callback-and-close', 'cancel'):
+                                fired.append(True); raise primary
+                        return result
+                    def syncing(fd):
+                        if phase == 'resource-sync' and removed and os.fstat(fd).st_ino == object_inode and not fired:
+                            fired.append(True); raise primary
+                        return fsync(fd)
+                    def guarded(target, callback=None, **kwargs):
+                        try: receipt = guard(target, callback, **kwargs)
+                        except BaseException as error:
+                            if phase == 'callback-and-close': error.native_current_guard = {'consumed': True, 'status': 8}
+                            raise
+                        if phase in ('close', 'parent-close', 'lost-receipt'):
+                            fired.append(True)
+                            if phase != 'lost-receipt': primary.native_current_guard = dict(receipt, status=8, parent_close_errno=errno.EIO)
+                            raise primary
+                        return receipt
+                    with patch('stallionfs._native_purge.os.unlink', side_effect=deleting), \
+                         patch('stallionfs._native_purge.os.fsync', side_effect=syncing), \
+                         patch('stallionfs._native.guarded', side_effect=guarded):
+                        with self.assertRaises(type(primary)) as caught: self.store.purge('trash', workspace, yes=True)
+                    self.assertIs(caught.exception, primary); self.assertEqual(removed, [True]); self.assertEqual(fired, [True])
+                    held = native_failure_details(primary); self.assertTrue(held['data_absent'])
+                    tombstone = self.store.root / 'staging' / held['container']
+                    self.assertTrue((tombstone / 'owned/meta.json').exists())
+                    with patch('stallionfs._native.guarded', side_effect=AssertionError('historical close demanded')):
+                        result = self.store.purge('trash', workspace, yes=True)
+                    self.assertTrue(result['cleanup_complete'])
+                    receipt = read_json(self.store._state(workspace))
+                    self.assertEqual(receipt['first_error']['type'], type(primary).__name__)
+                    self.assertNotEqual(receipt['guard_outcome'], 'consumed')
+
+    def test_native_purge_partial_metadata_replacement_is_never_adopted(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            persist = _native._persist; replacement = []; original = self.base / 'original-proof'
+            def saving(target, record):
+                result = persist(target, record)
+                if record.get('stage') == 'metadata-removal-authorized' and not replacement:
+                    proof = self.store.root / 'staging' / record['container'] / 'owned/meta.json'
+                    data = proof.read_bytes(); proof.rename(original); proof.write_bytes(data); proof.chmod(0o600)
+                    replacement.append(proof)
+                return result
+            with patch('stallionfs._native._persist', side_effect=saving):
+                with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            proof = replacement[0]; ident = proof.stat().st_ino
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            self.assertEqual(proof.stat().st_ino, ident); self.assertTrue(original.exists())
+            proof.unlink(); original.rename(proof)
+            with patch('stallionfs._native.guarded', side_effect=AssertionError('missing image reopened')):
+                self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+
+    def test_native_purge_syscall_response_losses_and_fences_resume_exact_names(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for phase in ('marker', 'rename', 'metadata-unlink', 'resource-rmdir', 'marker-unlink', 'container-rmdir', 'protection-unlink', 'journal-unlink'):
+                for after in (False, True):
+                    with self.subTest(phase=phase, after=after):
+                        workspace, path = self.native_purge_fixture(seed, now)
+                        primary = OSError(errno.EIO, phase + ' response lost')
+                        write, rename, unlink, rmdir = __import__('stallionfs.core', fromlist=['write_json']).write_json, os.rename, os.unlink, os.rmdir
+                        fired = []; renames = []
+                        def writing(target, record):
+                            if not after and phase == 'marker' and Path(target).name == 'native-purge.json' and not fired:
+                                fired.append(True); raise primary
+                            result = write(target, record)
+                            if phase == 'marker' and Path(target).name == 'native-purge.json' and not fired:
+                                fired.append(True); raise primary
+                            return result
+                        def renaming(source, destination, *args, **kwargs):
+                            if not after and phase == 'rename' and source == workspace and destination == 'owned' and not fired:
+                                fired.append(True); raise primary
+                            result = rename(source, destination, *args, **kwargs)
+                            if source == workspace and destination == 'owned':
+                                renames.append(True)
+                                if phase == 'rename' and not fired: fired.append(True); raise primary
+                            return result
+                        def deleting(name, *args, **kwargs):
+                            parent = os.fstat(kwargs['dir_fd']).st_ino if 'dir_fd' in kwargs else None
+                            match = ((phase == 'metadata-unlink' and name == 'meta.json')
+                                or (phase == 'marker-unlink' and name == 'native-purge.json')
+                                or (phase == 'protection-unlink' and name == workspace + '.json' and parent == (self.store.root / 'protected').stat().st_ino)
+                                or (phase == 'journal-unlink' and name == workspace + '.json' and parent == (self.store.root / 'journals').stat().st_ino))
+                            if match and not after and not fired: fired.append(True); raise primary
+                            result = unlink(name, *args, **kwargs)
+                            if match and not fired: fired.append(True); raise primary
+                            return result
+                        def removing(name, *args, **kwargs):
+                            match = ((phase == 'resource-rmdir' and name == 'owned') or
+                                (phase == 'container-rmdir' and str(name).startswith('native-purge-')))
+                            if match and not after and not fired: fired.append(True); raise primary
+                            result = rmdir(name, *args, **kwargs)
+                            if not fired and ((phase == 'resource-rmdir' and name == 'owned') or
+                                    (phase == 'container-rmdir' and str(name).startswith('native-purge-'))):
+                                fired.append(True); raise primary
+                            return result
+                        with patch('stallionfs.core.write_json', side_effect=writing), \
+                             patch('stallionfs._native_purge.os.rename', side_effect=renaming), \
+                             patch('stallionfs._native_purge.os.unlink', side_effect=deleting), \
+                             patch('stallionfs._native_purge.os.rmdir', side_effect=removing):
+                            with self.assertRaises(OSError) as caught: self.store.purge('trash', workspace, yes=True)
+                        self.assertIs(caught.exception, primary); self.assertEqual(fired, [True])
+                        journal = self.store.root / 'journals' / (workspace + '.json')
+                        record = read_json(journal) if journal.exists() else read_json(self.store._state(workspace))
+                        tombstone = self.store.root / 'staging' / record['container']
+                        before = {str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}
+                        self.store.purge('trash', workspace)
+                        self.assertEqual({str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}, before)
+                        with patch('stallionfs._native_purge.os.rename', side_effect=renaming):
+                            self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+                        self.assertEqual(renames, [True]); self.assertFalse(tombstone.exists())
+
+    def test_native_purge_completion_receipt_rejects_reused_names_and_protection(self):
+        from stallionfs.core import read_json, write_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            self.store.purge('trash', workspace, yes=True)
+            receipt = read_json(self.store._state(workspace))
+            for replacement in (self.store.root / 'trash' / workspace, self.store.root / 'workspaces' / workspace,
+                                self.store.root / 'staging' / receipt['container']):
+                replacement.mkdir(mode=0o700); marker = replacement / 'retain'; marker.write_bytes(b'untouched')
+                with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+                self.assertEqual(marker.read_bytes(), b'untouched'); marker.unlink(); replacement.rmdir()
+            protected = self.store.root / 'protected' / (workspace + '.json')
+            write_json(protected, {'id': workspace, 'replacement': True})
+            before = protected.read_bytes()
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            self.assertEqual(protected.read_bytes(), before)
+
+    def test_native_purge_marker_journal_and_reserved_names_independently_hold_staging(self):
+        from stallionfs.core import native_retention_reason, write_json
+        for variant in ('marker', 'journal', 'malformed-reserved'):
+            name = 'native-purge-' + 'a' * 32 + '-' + 'b' * 32 if variant == 'malformed-reserved' else 'build-retained-' + variant
+            container = self.store.root / 'staging' / name
+            container.mkdir(mode=0o700)
+            if variant == 'marker': write_json(container / 'native-purge.json', {'operation': 'native-purge-marker'})
+            elif variant == 'journal': write_json(self.store.root / 'journals' / ('a' * 32 + '.json'), {'operation': 'native-purge', 'container': container.name})
+            else: (container / 'native-purge.json').write_text('malformed')
+            if variant != 'journal': self.assertIsNotNone(native_retention_reason(container))
+            with patch('stallionfs.core.tempfile.mkdtemp', return_value=str(container)):
+                with self.assertRaises(StallionError):
+                    with self.store.staging(): pass
+            self.assertTrue(container.exists())
+            for entry in container.iterdir(): entry.unlink()
+            container.rmdir()
+            journal = self.store.root / 'journals' / ('a' * 32 + '.json')
+            if journal.exists(): journal.unlink()
+
+    def test_native_purge_completed_receipt_survives_outer_close(self):
+        from stallionfs import core
+        from stallionfs.core import native_failure_details
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for boundary in ('.lock', 'retention', 'workspace'):
+                workspace, path = self.native_purge_fixture(seed, now)
+                primary = OSError(errno.EIO, boundary + ' close')
+                lock = core.lock
+                @contextmanager
+                def closing(target, *args, **kwargs):
+                    with lock(target, *args, **kwargs): yield
+                    if Path(target).name == ('workspace-' + workspace if boundary == 'workspace' else boundary): raise primary
+                with patch('stallionfs.core.lock', side_effect=closing):
+                    with self.assertRaises(OSError) as caught: self.store.purge('trash', workspace, yes=True)
+                self.assertIs(caught.exception, primary)
+                self.assertTrue(native_failure_details(primary)['cleanup_complete'])
+                self.assertFalse(path.exists())
+                self.assertTrue(self.store.purge('trash', workspace, yes=True)['already_purged'])
+
+    def test_native_purge_parent_fsync_failures_hold_and_retry_recorded_directories(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for phase in ('relocation-source', 'relocation-container', 'metadata-parent', 'resource-parent', 'staging-parent', 'protection-parent', 'journal-parent'):
+                with self.subTest(phase=phase):
+                    workspace, path = self.native_purge_fixture(seed, now)
+                    object_inode = path.stat().st_ino
+                    fsync = os.fsync; fired = []
+                    journal = self.store.root / 'journals' / (workspace + '.json')
+                    protection = self.store.root / 'protected' / (workspace + '.json')
+                    primary = OSError(errno.EIO, phase)
+                    def syncing(fd):
+                        info = os.fstat(fd)
+                        if not __import__('stat').S_ISDIR(info.st_mode): return fsync(fd)
+                        record = read_json(journal) if journal.exists() else read_json(self.store._state(workspace))
+                        stage = record.get('stage')
+                        container = self.store.root / 'staging' / record.get('container', 'absent')
+                        owned = container / 'owned'
+                        match = ((phase == 'relocation-source' and stage == 'relocation-authorized' and owned.exists() and info.st_ino == path.parent.stat().st_ino)
+                            or (phase == 'relocation-container' and stage == 'relocation-authorized' and owned.exists() and info.st_ino == container.stat().st_ino)
+                            or (phase == 'metadata-parent' and stage == 'metadata-removal-authorized' and info.st_ino == object_inode)
+                            or (phase == 'resource-parent' and stage == 'resource-removal-authorized' and container.exists() and not owned.exists() and info.st_ino == container.stat().st_ino)
+                            or (phase == 'staging-parent' and stage == 'container-removal-authorized' and not container.exists() and info.st_ino == (self.store.root / 'staging').stat().st_ino)
+                            or (phase == 'protection-parent' and not protection.exists() and record.get('data_absent') and info.st_ino == protection.parent.stat().st_ino)
+                            or (phase == 'journal-parent' and not journal.exists() and record.get('operation') == 'native-purge-complete' and info.st_ino == journal.parent.stat().st_ino))
+                        if match and not fired: fired.append(True); raise primary
+                        return fsync(fd)
+                    with patch('stallionfs._native_purge.os.fsync', side_effect=syncing):
+                        with self.assertRaises(OSError) as caught: self.store.purge('trash', workspace, yes=True)
+                    self.assertIs(caught.exception, primary); self.assertEqual(fired, [True])
+                    self.assertEqual(caught.exception.errno, errno.EIO)
+                    record = read_json(journal) if journal.exists() else read_json(self.store._state(workspace))
+                    if phase not in ('protection-parent', 'journal-parent'): self.assertTrue(protection.exists())
+                    self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+                    self.assertEqual(read_json(self.store._state(workspace))['last_error'],
+                        {'type': 'OSError', 'message': str(primary)})
+
+    def test_native_purge_bound_parent_resource_and_manifest_substitutions_hold(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for changed in ('trash-parent', 'staging-parent', 'container', 'resource', 'image', 'proof'):
+                with self.subTest(changed=changed):
+                    workspace, path = self.native_purge_fixture(seed, now)
+                    persist = _native._persist; fired = []
+                    def pause(target, record):
+                        result = persist(target, record)
+                        if record.get('stage') == 'container-ready' and not fired:
+                            fired.append(True); raise OSError(errno.EIO, 'pause before admission')
+                        return result
+                    with patch('stallionfs._native._persist', side_effect=pause):
+                        with self.assertRaises(OSError): self.store.purge('trash', workspace, yes=True)
+                    journal = self.store.root / 'journals' / (workspace + '.json'); record = read_json(journal)
+                    container = self.store.root / 'staging' / record['container']
+                    target = {'trash-parent': path.parent, 'staging-parent': container.parent, 'container': container,
+                              'resource': path, 'image': path / 'image.sfs', 'proof': path / 'meta.json'}[changed]
+                    saved = self.base / ('saved-' + changed + '-' + workspace)
+                    directory = target.is_dir(); data = target.read_bytes() if changed == 'proof' else b'replacement untouched'
+                    target.rename(saved)
+                    if directory:
+                        target.mkdir(mode=0o700); marker = target / 'retain'; marker.write_bytes(data)
+                        if changed == 'resource':
+                            (target / 'meta.json').write_bytes((saved / 'meta.json').read_bytes()); (target / 'meta.json').chmod(0o600)
+                    else: target.write_bytes(data); target.chmod(0o600); marker = target
+                    identity = target.stat().st_ino
+                    with self.assertRaises((StallionError, FileNotFoundError)):
+                        self.store.purge('trash', workspace, yes=True)
+                    self.assertEqual(target.stat().st_ino, identity); self.assertEqual(marker.read_bytes(), data)
+                    if directory:
+                        for child in target.iterdir(): child.unlink()
+                        target.rmdir()
+                    else: target.unlink()
+                    saved.rename(target)
+                    self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+
+    def test_native_purge_blocks_concurrent_registrar_until_image_is_absent(self):
+        from stallionfs.core import read_json, lock
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            started = threading.Event(); attempted = []
+            unlink = os.unlink
+            def registering(backing):
+                with self.assertRaises(BlockingIOError):
+                    with lock(self.store.root / '.lock', shared=False, blocking=False):
+                        self.fail('purge released root publication lock before unlink')
+                started.set()
+                return self.store.register_native_image(backing)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                def deleting(name, *args, **kwargs):
+                    if name == 'image.sfs':
+                        record = read_json(self.store.root / 'journals' / (workspace + '.json'))
+                        backing = self.store.root / 'staging' / record['container'] / 'owned/image.sfs'
+                        attempted.append(pool.submit(registering, backing))
+                        self.assertTrue(started.wait(5)); self.assertFalse(attempted[0].done())
+                    return unlink(name, *args, **kwargs)
+                with patch('stallionfs._native_purge.os.unlink', side_effect=deleting):
+                    self.store.purge('trash', workspace, yes=True)
+                with self.assertRaises((StallionError, FileNotFoundError)): attempted[0].result(timeout=10)
+            self.assertFalse(self.store.list())
+
+    def test_native_purge_absence_without_authorization_and_conflicting_completion_hold(self):
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            persist = _native._persist; fired = []
+            def pause(target, record):
+                result = persist(target, record)
+                if record.get('stage') == 'relocated' and not fired:
+                    fired.append(True); raise OSError(errno.EIO, 'pause before unlink authorization')
+                return result
+            with patch('stallionfs._native._persist', side_effect=pause):
+                with self.assertRaises(OSError): self.store.purge('trash', workspace, yes=True)
+            journal = self.store.root / 'journals' / (workspace + '.json'); record = read_json(journal)
+            image = self.store.root / 'staging' / record['container'] / 'owned/image.sfs'
+            held = self.base / 'held-image'; image.rename(held)
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            self.assertTrue(held.exists()); held.rename(image)
+            self.store.purge('trash', workspace, yes=True)
+            complete = read_json(self.store._state(workspace))
+            # Retain a valid-shaped incompatible prior journal: completion cannot erase it.
+            record['id'] = 'd' * 32; record['container'] = 'native-purge-' + workspace + '-' + record['id']
+            _native._persist(journal, record)
+            before = journal.read_bytes()
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            self.assertEqual(journal.read_bytes(), before)
+
+    def test_native_purge_consumed_descriptor_close_error_keeps_completed_receipt(self):
+        from stallionfs.core import native_failure_details, read_json
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            root_inode = self.store.root.stat().st_ino
+            close = os.close; fired = []
+            primary = OSError(errno.EIO, 'purge directory descriptor close')
+            def closing(fd):
+                info = os.fstat(fd)
+                state = read_json(self.store._state(workspace))
+                match = info.st_ino == root_inode and state.get('cleanup_complete') is True and not fired
+                result = close(fd)
+                if match: fired.append(True); raise primary
+                return result
+            with patch('stallionfs._native_purge.os.close', side_effect=closing):
+                with self.assertRaises(OSError) as caught: self.store.purge('trash', workspace, yes=True)
+            self.assertIs(caught.exception, primary); self.assertEqual(fired, [True])
+            receipt = native_failure_details(primary)
+            self.assertTrue(receipt['cleanup_complete']); self.assertTrue(receipt['data_absent'])
+            self.assertEqual(receipt['descriptor_close_error'], 'OSError')
+            self.assertTrue(self.store.purge('trash', workspace, yes=True)['already_purged'])
+
+    def test_owned_native_catalog_real_content_round_trip_and_names(self):
+        import hashlib
+        import test_image as capture
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        repository = Path(__file__).resolve().parents[1]
+        compiler = capture._owned_command(['/usr/bin/xcrun', '--sdk', 'macosx', '--find', 'clang'], cwd=self.base,
+            timeout=15, stem=self.base / 'recovery-find-clang')
+        self.assertEqual(compiler.returncode, 0, compiler.stderr)
+        sdk = capture._owned_command(['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'], cwd=self.base,
+            timeout=15, stem=self.base / 'recovery-find-sdk')
+        self.assertEqual(sdk.returncode, 0, sdk.stderr)
+        checker = self.base / 'recovery-fixture'
+        compiled = capture._owned_command([compiler.stdout.strip(), '-std=c11', '-Wall', '-Wextra',
+            '-Wno-deprecated-declarations', '-O1', '-isysroot', sdk.stdout.strip(),
+            '-I', str(repository / 'filesystem'),
+            str(repository / 'tests/native_image_fixture.c'), str(repository / 'filesystem/image.c'),
+            '-o', str(checker)], cwd=self.base, timeout=90, stem=self.base / 'recovery-fixture-build')
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        seed = self.prepare()
+        with self.native_controller_fixture():
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.unmount(workspace)
+            original = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            self.store.snapshot(workspace, name='A')
+            changed = capture._owned_command([str(checker), 'write-path', str(path), 'repo/file', 'committed B'],
+                cwd=self.base, timeout=30, stem=self.base / 'recovery-write-B')
+            self.assertEqual(changed.returncode, 0, changed.stderr)
+            restored = self.store.rollback(workspace, 'A')
+            for label, expected in (('A', b'original\n'), ('B', b'committed B')):
+                if label == 'B': self.store.rollback(workspace, restored['recovery'])
+                observed = capture._owned_command([str(checker), 'describe', str(path), 'repo/file'],
+                    cwd=self.base, timeout=30, stem=self.base / ('recovery-read-' + label))
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                self.assertEqual(json.loads(observed.stdout)['sha256'], hashlib.sha256(expected).hexdigest())
+            current = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            self.assertEqual(current, original)
+            names = [item['name'] for item in self.store.snapshots(workspace)]
+            self.assertIn('A', names); self.assertIn(restored['recovery'], names)
+            for bad in ('', '.', '..', 'a/b', 'nul\0name', 'x' * 256):
+                with self.assertRaises(StallionError): self.store.rollback(workspace, bad)
+            with self.assertRaises(StallionError): self.store.snapshot(workspace, name='A')
+            with self.assertRaises(StallionError): self.store.rollback(workspace, 'missing')
+        self.assertEqual((self.source / 'file').read_text(), 'original\n')
+        self.assertEqual((self.store.root / 'seeds' / seed['id'] / 'repo/file').read_text(), 'original\n')
+        # Reads above use the real core, not the fake mounted directory.
+
+    def test_owned_native_catalog_limit_and_full_catalog_retirement(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.unmount(workspace)
+            for index in range(31): self.store.snapshot(workspace, name='entry-' + str(index))
+            self.assertEqual(len(self.store.snapshots(workspace)), 31)
+            self.store.snapshot(workspace, name='entry-31')
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            before = _image.inspect(target)['receipt']
+            with self.assertRaises(StallionError): self.store.snapshot(workspace, name='overflow')
+            with self.assertRaises(StallionError): self.store.rollback(workspace, 'entry-0')
+            after = _image.inspect(target)['receipt']
+            self.assertEqual([after[k] for k in ('generation', 'root_digest', 'committed_end')],
+                             [before[k] for k in ('generation', 'root_digest', 'committed_end')])
+            self.assertEqual(len(self.store.snapshots(workspace)), 32)
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+            now[0] += STALE_SECONDS
+            self.store.move(workspace)
+            restored = self.store.move(workspace, restore=True)
+            self.assertFalse(restored['mounted'])
+            self.assertEqual(len(self.store.snapshots(workspace)), 32)
+
+    def test_owned_native_catalog_unresolved_receipt_observes_without_replay(self):
+        from stallionfs import core
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture() as state:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            with self.assertRaises(StallionError): self.store.snapshot(workspace, name='mounted')
+            self.store.unmount(workspace)
+            nested = str(path / 'volume/nested')
+            state['rows'][nested] = {'path': nested}
+            with self.assertRaises(StallionError): self.store.snapshots(workspace)
+            state['rows'].pop(nested)
+            original = core.native_operation
+            calls = []
+            def lost(target, action, *names):
+                calls.append(action)
+                outcome = original(target, action, *names)
+                if action == 'snapshot':
+                    error = OSError(errno.EIO, 'committed response lost')
+                    error.native_image_result = outcome
+                    raise error
+                return outcome
+            with patch('stallionfs.core.native_operation', side_effect=lost):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='committed-once')
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            unresolved = read_json(journal)
+            self.assertEqual(unresolved['operation'], 'native-snapshot')
+            self.assertTrue(unresolved['native_image_result']['committed'])
+            self.assertEqual(unresolved['outcome'], 'incomplete')
+            with patch('stallionfs.core.native_operation', wraps=original) as current:
+                self.assertIn('committed-once', [row['name'] for row in self.store.snapshots(workspace)])
+                self.assertEqual([call.args[1] for call in current.call_args_list], ['snapshots'])
+            archived = read_json(path / 'native-operations' / unresolved['id'] / 'record.json')
+            self.assertEqual(archived['outcome'], 'incomplete')
+            self.assertFalse(journal.exists())
+            with self.store._lease(workspace):
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='managed-busy')
+            from stallionfs import _image, _native
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            def locked(token):
+                with self.assertRaises(StallionError): self.store.snapshots(workspace)
+            _image.with_backing_guard(target, locked)
+            self.assertIn('committed-once', [row['name'] for row in self.store.snapshots(workspace)])
+
+    def test_owned_native_catalog_bridge_fault_dispositions_never_replay(self):
+        from stallionfs import _image, _native
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture():
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.unmount(workspace); self.store.snapshot(workspace, name='base')
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            phases = ('before-stage', 'before-commit', 'ambiguous-commit', 'close', 'parent-close', 'report-allocation')
+            for action in ('snapshot', 'restore'):
+                real = getattr(_image, action)
+                for phase in phases:
+                    with self.subTest(action=action, phase=phase):
+                        calls = []
+                        def fault(value, *names):
+                            calls.append(names)
+                            if phase == 'before-stage': raise OSError(errno.EIO, 'bridge refused before staging')
+                            if phase == 'before-commit':
+                                outcome = dict(_image.inspect(value), operation=action, ok=False,
+                                    error_code=errno.EIO, commit_attempted=False, committed=False, outcome='not_committed')
+                            else:
+                                outcome = dict(real(value, *names), ok=False, error_code=errno.EIO)
+                                if phase == 'ambiguous-commit': outcome.update(outcome='unknown', committed=False)
+                                if phase == 'close': outcome['close_receipt'] = dict(outcome['close_receipt'], status=8)
+                                if phase == 'parent-close': outcome['guard_close_errno'] = errno.EIO
+                                if phase == 'report-allocation':
+                                    outcome['response_complete'] = False
+                                    error = MemoryError('bridge response allocation')
+                                    error.native_image_carrier = {'data': bytearray(json.dumps(outcome).encode()),
+                                        'snapshot': names[0], 'recovery': names[1] if action == 'restore' else None}
+                                    raise error
+                            return outcome
+                        # These faults test controller receipt handling at the
+                        # bridge boundary; test_cli separately injects C faults.
+                        with patch('stallionfs._image.' + action, side_effect=fault):
+                            with self.assertRaises((StallionError, OSError, MemoryError)):
+                                if action == 'snapshot': self.store.snapshot(workspace, name='fault-' + phase)
+                                else: self.store.rollback(workspace, 'base')
+                        self.assertEqual(len(calls), 1)
+                        journal = self.store.root / 'journals' / (workspace + '.json')
+                        unresolved = read_json(journal)
+                        self.assertEqual(unresolved['outcome'], 'incomplete')
+                        if phase != 'before-stage':
+                            self.assertFalse(unresolved['native_image_result']['ok'])
+                        with patch('stallionfs._image.snapshot', side_effect=AssertionError('snapshot replay')), \
+                             patch('stallionfs._image.restore', side_effect=AssertionError('restore replay')):
+                            self.assertIn('base', [row['name'] for row in self.store.snapshots(workspace)])
+                        archived = read_json(path / 'native-operations' / unresolved['id'] / 'record.json')
+                        self.assertEqual(archived['outcome'], 'incomplete')
+                        self.assertFalse(journal.exists())
+            self.assertEqual(_image.inspect(target)['identity']['file'], target['file'])
+
+    def test_owned_native_idle_baselines_require_enrollment_age_and_current_anchor(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture() as mounted, self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.assertFalse(self.store.cleanup(apply=True)['enabled'])
+            self.store.cleanup_config(enabled=True)
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            self.store.enroll(workspace)
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+            self.store.unmount(workspace)
+            self.assertTrue(read_json(self.store._state(workspace))['enrolled'])
+            self.store.cleanup(apply=False)
+            self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+            self.store.cleanup(apply=True)
+            initial = read_json(self.store._state(workspace))
+            self.assertEqual(initial['native_idle']['observed_at'], now[0])
+            self.assertNotIn('closed_at', initial)
+            now[0] += STALE_SECONDS - 1
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+            _image.snapshot(target, 'external-current-change')
+            now[0] += 1
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            changed = read_json(self.store._state(workspace))
+            self.assertNotEqual(changed['generation'], initial['generation'])
+            self.assertEqual(changed['native_idle']['observed_at'], now[0])
+            self.store.mount(workspace)
+            self.assertTrue(read_json(self.store._state(workspace))['enrolled'])
+            self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+            self.store.close(workspace, quiescent=True)
+            closed = read_json(self.store._state(workspace))
+            self.assertEqual(closed['closed_at'], now[0])
+            now[0] += STALE_SECONDS
+            self.assertEqual(self.store.cleanup(apply=False)['would_retire'], [workspace])
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [workspace])
+            self.assertFalse(mounted['rows'])
+
+    def test_owned_native_final_anchor_race_resets_only_after_clean_close(self):
+        from stallionfs import _native, _image
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+            self.store.cleanup_config(enabled=True)
+            now[0] += STALE_SECONDS
+            original = _native.guarded
+            for index, (change, fail_close) in enumerate((('anchor', False), ('generation', False),
+                                                         ('enrollment', False), ('anchor', True))):
+                if index:
+                    self.store.enroll(workspace)
+                    self.store.close(workspace, quiescent=True); now[0] += STALE_SECONDS
+                changed = []
+                def race(target, callback=None, *, anchor=None, expected_anchor=None):
+                    if expected_anchor is not None:
+                        changed.append(1)
+                        if change == 'anchor':
+                            self.assertTrue(_image.snapshot(target, 'race-' + str(fail_close))['ok'])
+                        else:
+                            changed_state = read_json(self.store._state(workspace))
+                            changed_state['generation' if change == 'generation' else 'enrolled'] = ('f' * 32 if change == 'generation' else False)
+                            _native._persist(self.store._state(workspace), changed_state)
+                    try:
+                        return original(target, callback, anchor=anchor, expected_anchor=expected_anchor)
+                    except BaseException as error:
+                        if fail_close and getattr(error, 'native_anchor_mismatch', False):
+                            error.native_current_guard = dict(error.native_current_guard, parent_close_errno=errno.EIO)
+                        raise
+                with patch('stallionfs._native.guarded', side_effect=race):
+                    observed = self.store.cleanup(apply=True)
+                self.assertEqual(changed, [1])
+                self.assertEqual(observed['retired'], [])
+                self.assertTrue(path.exists())
+                protection = self.store.root / 'protected' / (workspace + '.json')
+                journal = self.store.root / 'journals' / (workspace + '.json')
+                self.assertEqual(protection.exists(), fail_close)
+                self.assertEqual(journal.exists(), fail_close)
+                if fail_close:
+                    with patch('stallionfs._scan.move', side_effect=AssertionError('rename replay')):
+                        self.store.move(workspace, restore=True)
+                    self.assertFalse(protection.exists()); self.assertFalse(journal.exists())
+                self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+
+    def test_owned_native_move_restore_at_full_retention_preserves_origin_and_first_use(self):
+        from stallionfs.core import read_json, write_json, lock
+        from stallionfs import _image, _native
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture() as mounted, self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            git(path / 'volume/repo', 'checkout', '-b', 'legitimate-current-branch')
+            (path / 'volume/repo/later').write_text('accepted writable host fixture')
+            immutable = {name: (path / name).read_bytes() for name in ('native-create.json', 'native-install.json', 'meta.json')}
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+            now[0] += STALE_SECONDS
+            for index in range(31):
+                write_json(self.store.root / 'protected' / (f'{index:032x}' + '.json'), {'id': f'{index:032x}'})
+            original = _native.guarded
+            checks = []
+            def guarded(target, callback=None, **kwargs):
+                if callback is None: return original(target, callback, **kwargs)
+                def held(token):
+                    with self.assertRaises(BlockingIOError):
+                        with lock(self.store.root / '.lock', blocking=False): pass
+                    self.assertEqual(_image.snapshot(target, 'competing-core')['error_code'], errno.EBUSY)
+                    checks.append(1)
+                    return callback(token)
+                return original(target, held, **kwargs)
+            with patch('stallionfs._native.guarded', side_effect=guarded): self.store.move(workspace)
+            self.assertEqual(checks, [1])
+            trash = self.store.root / 'trash' / workspace
+            self.assertEqual(len(list((self.store.root / 'protected').iterdir())), 32)
+            second = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            self.store.enroll(second['id']); self.store.close(second['id'], quiescent=True)
+            now[0] += STALE_SECONDS
+            with self.assertRaises(StallionError): self.store.move(second['id'])
+            self.assertTrue((self.store.root / 'workspaces' / second['id']).exists())
+            self.assertEqual(self.store.list('trash')[0]['id'], workspace)
+            for name, content in immutable.items(): self.assertEqual((trash / name).read_bytes(), content)
+            with self.assertRaises(StallionError): self.store.register_native_image(trash / 'image.sfs')
+            self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+            with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+            with patch.object(self.store, '_retention', side_effect=AssertionError('restore requested a new slot')):
+                restored = self.store.move(workspace, restore=True)
+            self.assertFalse(restored['mounted']); self.assertFalse(mounted['rows'])
+            self.assertEqual(len(list((self.store.root / 'protected').iterdir())), 31)
+            self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+            for name, content in immutable.items(): self.assertEqual((path / name).read_bytes(), content)
+            self.store.mount(workspace)
+            self.assertEqual(git(path / 'volume/repo', 'branch', '--show-current'), 'legitimate-current-branch')
+            self.assertTrue((path / 'volume/repo/later').exists())
+
+    def test_owned_native_move_interruptions_recover_from_top_level_journal(self):
+        from stallionfs import _native, _scan, core
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        phases = ('before-protection', 'after-protection', 'rename-response', 'source-sync',
+                  'destination-sync', 'state-sync', 'location-before', 'location-after', 'close-error')
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for phase in phases:
+                with self.subTest(phase=phase):
+                    result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                    workspace = result['id']; path = Path(result['path']).parent.parent
+                    immutable = {name: (path / name).read_bytes() for name in ('native-create.json', 'native-install.json')}
+                    self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+                    now[0] += STALE_SECONDS
+                    fired = []
+                    write_json, persist, move, guard = core.write_json, _native._persist, _scan.move, _native.guarded
+                    sync = core.sync_directory
+                    def syncing(parent):
+                        failed = {'source-sync': 'workspaces', 'destination-sync': 'trash', 'state-sync': 'lifecycle'}.get(phase)
+                        if failed and Path(parent) == self.store.root / failed and not fired:
+                            fired.append(1); raise OSError(errno.EIO, phase)
+                        return sync(parent)
+                    def before_protection(target, record):
+                        if phase == 'before-protection' and Path(target).parent == self.store.root / 'protected':
+                            fired.append(1); raise OSError(errno.EIO, phase)
+                        return write_json(target, record)
+                    def moving(source, destination, **kwargs):
+                        value = move(source, destination, **kwargs)
+                        if phase == 'rename-response': fired.append(1); raise OSError(errno.EIO, phase)
+                        return value
+                    def saving(target, record):
+                        match = Path(target).name == 'native-location.json' and not fired
+                        if match and phase == 'location-before': fired.append(1); raise OSError(errno.EIO, phase)
+                        value = persist(target, record)
+                        if match and phase == 'location-after': fired.append(1); raise OSError(errno.EIO, phase)
+                        return value
+                    def guarding(target, callback=None, **kwargs):
+                        final = kwargs.get('expected_anchor') is not None
+                        if final and phase == 'after-protection': fired.append(1); raise OSError(errno.EIO, phase)
+                        value = guard(target, callback, **kwargs)
+                        if final and phase == 'close-error':
+                            fired.append(1); error = OSError(errno.EIO, phase)
+                            error.native_current_guard = dict(value, status=8); raise error
+                        return value
+                    with patch('stallionfs.core.write_json', side_effect=before_protection), \
+                         patch('stallionfs._native._persist', side_effect=saving), \
+                         patch('stallionfs._scan.move', side_effect=moving), \
+                         patch('stallionfs._native.guarded', side_effect=guarding), \
+                         patch('stallionfs.core.sync_directory', side_effect=syncing):
+                        with self.assertRaises(OSError): self.store.move(workspace)
+                    self.assertEqual(fired, [1])
+                    journal = self.store.root / 'journals' / (workspace + '.json')
+                    record = read_json(journal)
+                    self.assertEqual(record['outcome'], 'incomplete')
+                    trash = self.store.root / 'trash' / workspace
+                    self.assertNotEqual(path.exists(), trash.exists())
+                    moved_already = trash.exists()
+                    if phase in ('after-protection', 'rename-response'):
+                        actual = trash if moved_already else path
+                        entries = set((self.store.root / 'workspaces').iterdir())
+                        alias = self.base / ('collection-alias-' + workspace)
+                        alias.symlink_to(actual.parent, target_is_directory=True)
+                        for reference in (actual / 'image.sfs', alias / workspace / 'image.sfs'):
+                            with self.assertRaises(StallionError): self.store.register_native_image(reference)
+                        link = self.base / ('hardlink-' + workspace)
+                        os.link(actual / 'image.sfs', link)
+                        try:
+                            with self.assertRaises(StallionError): self.store.register_native_image(link)
+                        finally: link.unlink()
+                        self.assertEqual(set((self.store.root / 'workspaces').iterdir()), entries)
+                        self.assertEqual(read_json(journal)['id'], record['id'])
+                    with patch('stallionfs._scan.move', wraps=move) as rename, \
+                         patch('stallionfs._image.create_from_tree', side_effect=AssertionError('import replay')):
+                        self.store.move(workspace, restore=True)
+                        self.assertEqual(rename.call_count, int(moved_already))
+                    self.assertTrue(path.exists()); self.assertFalse(trash.exists()); self.assertFalse(journal.exists())
+                    for name, content in immutable.items(): self.assertEqual((path / name).read_bytes(), content)
+                    retained = read_json(path / 'native-operations' / record['id'] / 'record.json')
+                    self.assertEqual(retained['outcome'], 'incomplete')
+                    self.assertIn('resolution', retained)
+
+    def test_owned_native_recovery_fences_parents_and_state_before_releasing_hold(self):
+        from stallionfs import _native, _scan, core
+        from stallionfs.core import read_json, native_failure_details
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for failed_parent in ('trash', 'workspaces', 'lifecycle'):
+                with self.subTest(parent=failed_parent):
+                    result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                    workspace = result['id']; path = Path(result['path']).parent.parent
+                    self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+                    now[0] += STALE_SECONDS
+                    self.store.move(workspace)
+                    rename, sync, persist, unlink = _scan.move, core.sync_directory, _native._persist, Path.unlink
+                    journal = self.store.root / 'journals' / (workspace + '.json')
+                    protection = self.store.root / 'protected' / (workspace + '.json')
+                    def lost(source, destination, **kwargs):
+                        rename(source, destination, **kwargs)
+                        raise OSError(errno.EIO, 'rename completed before either parent fence')
+                    with patch('stallionfs._scan.move', side_effect=lost):
+                        with self.assertRaises(OSError): self.store.move(workspace, restore=True)
+                    original = read_json(journal)
+                    primary = OSError(errno.EIO, failed_parent + ' sync')
+                    reached = []
+                    def failing_sync(parent):
+                        if Path(parent) == self.store.root / failed_parent:
+                            reached.append(failed_parent)
+                            self.assertTrue(journal.exists()); self.assertTrue(protection.exists())
+                            raise primary
+                        return sync(parent)
+                    with patch('stallionfs.core.sync_directory', side_effect=failing_sync), \
+                         patch('stallionfs._scan.move', side_effect=AssertionError('rename replay')):
+                        with self.assertRaises(OSError) as caught: self.store.move(workspace, restore=True)
+                    self.assertIs(caught.exception, primary); self.assertEqual(reached, [failed_parent])
+                    held = read_json(journal)
+                    self.assertEqual(held['outcome'], original['outcome'])
+                    self.assertNotIn('resolution', held)
+                    self.assertEqual(native_failure_details(primary)['id'], original['id'])
+                    self.assertTrue(protection.exists()); self.assertTrue(path.exists())
+                    fences = []
+                    def syncing(parent):
+                        value = sync(parent)
+                        if Path(parent) in (self.store.root / name for name in ('trash', 'workspaces', 'lifecycle')):
+                            fences.append(Path(parent).name)
+                        return value
+                    def saving(target, record):
+                        if 'resolution' in record:
+                            self.assertEqual(fences[:3], ['trash', 'workspaces', 'lifecycle'])
+                        return persist(target, record)
+                    def removing(target, *args, **kwargs):
+                        if target in (journal, protection):
+                            self.assertEqual(fences[:3], ['trash', 'workspaces', 'lifecycle'])
+                            self.assertIn('resolution', read_json(path / 'native-operations' / original['id'] / 'record.json'))
+                        return unlink(target, *args, **kwargs)
+                    with patch('stallionfs.core.sync_directory', side_effect=syncing), \
+                         patch('stallionfs._native._persist', side_effect=saving), \
+                         patch.object(Path, 'unlink', removing), \
+                         patch('stallionfs._scan.move', side_effect=AssertionError('rename replay')):
+                        response = self.store.move(workspace, restore=True)
+                    self.assertEqual(response['native_operation']['id'], original['id'])
+                    self.assertEqual(response['native_operation']['resolution']['prior_outcome'], 'incomplete')
+                    self.assertFalse(journal.exists()); self.assertFalse(protection.exists())
+                    self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+
+    def test_owned_native_use_requires_durable_idle_invalidation(self):
+        from stallionfs import core
+        from stallionfs.core import read_json
+        seed = self.prepare()
+        with self.native_controller_fixture():
+            for action in ('mount', 'run', 'snapshot', 'rollback', 'enroll'):
+                with self.subTest(action=action):
+                    result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                    workspace = result['id']
+                    self.store.unmount(workspace); self.store.snapshot(workspace, name='before')
+                    self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+                    self.assertIn('native_idle', read_json(self.store._state(workspace)))
+                    sync = core.sync_directory
+                    primary = OSError(errno.EIO, 'native state parent sync')
+                    def failing_sync(parent):
+                        if Path(parent) == self.store.root / 'lifecycle': raise primary
+                        return sync(parent)
+                    actions = {'mount': lambda: self.store.mount(workspace),
+                        'run': lambda: self.store.run(workspace, ['unused']),
+                        'snapshot': lambda: self.store.snapshot(workspace, name='after'),
+                        'rollback': lambda: self.store.rollback(workspace, 'before'),
+                        'enroll': lambda: self.store.enroll(workspace, enabled=False)}
+                    with patch('stallionfs.core.sync_directory', side_effect=failing_sync), \
+                         patch('stallionfs.core.native_operation') as bridge, \
+                         patch('stallionfs._native.qualify') as qualifier, \
+                         patch('stallionfs._native.execute_owned') as helper, \
+                         patch('stallionfs.lifecycle.subprocess.run') as command:
+                        with self.assertRaises(OSError) as caught: actions[action]()
+                        self.assertIs(caught.exception, primary)
+                        bridge.assert_not_called(); qualifier.assert_not_called()
+                        helper.assert_not_called(); command.assert_not_called()
+                    if action in ('snapshot', 'rollback'):
+                        held = read_json(self.store.root / 'journals' / (workspace + '.json'))
+                        self.assertFalse(held['bridge_attempted']); self.assertEqual(held['outcome'], 'incomplete')
+                    # After a successful fence, helper entry sees the replacement generation.
+                    if action == 'mount':
+                        fences = []
+                        def syncing(parent):
+                            value = sync(parent)
+                            if Path(parent) == self.store.root / 'lifecycle': fences.append(True)
+                            return value
+                        def qualified(*args):
+                            self.assertEqual(fences, [True])
+                            self.assertNotIn('native_idle', read_json(self.store._state(workspace)))
+                            return 'stallionfs'
+                        with patch('stallionfs.core.sync_directory', side_effect=syncing), \
+                             patch('stallionfs._native.qualify', side_effect=qualified):
+                            self.store.mount(workspace)
+
+    def test_owned_native_completed_responses_survive_outer_close_errors(self):
+        from stallionfs import core, _scan
+        from stallionfs.core import native_failure_details, read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            for action in ('snapshot', 'rollback', 'retire', 'return'):
+                for boundary in ('workspace', 'lease', 'root', 'retention') if action in ('retire', 'return') else ('workspace', 'lease'):
+                    with self.subTest(action=action, boundary=boundary):
+                        result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                        workspace = result['id']; path = Path(result['path']).parent.parent
+                        self.store.unmount(workspace); self.store.snapshot(workspace, name='before')
+                        if action in ('retire', 'return'):
+                            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+                            now[0] += STALE_SECONDS
+                            if action == 'return': self.store.move(workspace)
+                        primary = OSError(errno.EIO, boundary + ' close')
+                        lock, lease = core.lock, self.store._lease
+                        @contextmanager
+                        def closing_lock(target, *args, **kwargs):
+                            with lock(target, *args, **kwargs): yield
+                            target_name = {'root': '.lock', 'retention': 'retention', 'workspace': 'workspace-' + workspace}.get(boundary)
+                            if Path(target).name == target_name:
+                                raise primary
+                        @contextmanager
+                        def closing_lease(value):
+                            with lease(value) as descriptor: yield descriptor
+                            if boundary == 'lease': raise primary
+                        actions = {'snapshot': lambda: self.store.snapshot(workspace, name='after'),
+                            'rollback': lambda: self.store.rollback(workspace, 'before'),
+                            'retire': lambda: self.store.move(workspace),
+                            'return': lambda: self.store.move(workspace, restore=True)}
+                        with patch('stallionfs.core.lock', side_effect=closing_lock), \
+                             patch.object(self.store, '_lease', side_effect=closing_lease), \
+                             patch('stallionfs.core.native_operation', wraps=core.native_operation) as bridge, \
+                             patch('stallionfs._scan.move', wraps=_scan.move) as rename:
+                            with self.assertRaises(OSError) as caught: actions[action]()
+                        self.assertIs(caught.exception, primary)
+                        response = native_failure_details(primary)
+                        operation = response['native_operation']
+                        self.assertEqual(operation['outcome'], 'complete')
+                        self.assertFalse((self.store.root / 'journals' / (workspace + '.json')).exists())
+                        if action in ('snapshot', 'rollback'):
+                            self.assertEqual(bridge.call_count, 1); rename.assert_not_called()
+                            self.assertTrue(response['native_image_result']['committed'])
+                        else:
+                            self.assertEqual(rename.call_count, 1); bridge.assert_not_called()
+                            self.assertEqual(response['restored' if action == 'return' else 'retired'], workspace)
+                            self.assertFalse(response['mounted'])
+                            if action == 'retire': path = self.store.root / 'trash' / workspace
+                        self.assertEqual(read_json(path / 'native-operations' / operation['id'] / 'record.json')['outcome'], 'complete')
+
+    def test_owned_native_missing_or_malformed_protection_never_allows_restore_or_delete(self):
+        from stallionfs import _scan
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+            now[0] += STALE_SECONDS
+            self.store.move(workspace)
+            trash = self.store.root / 'trash' / workspace
+            protection = self.store.root / 'protected' / (workspace + '.json')
+            saved = protection.read_bytes()
+            for damaged in (None, b'{"format": 1, "id": "wrong"}'):
+                with self.subTest(protection=damaged):
+                    if damaged is None: protection.unlink()
+                    else: protection.write_bytes(damaged)
+                    with patch('stallionfs._scan.move', wraps=_scan.move) as rename:
+                        with self.assertRaises((StallionError, FileNotFoundError)):
+                            self.store.move(workspace, restore=True)
+                        rename.assert_not_called()
+                    # Missing protection still cannot defeat native data retention.
+                    if damaged is None:
+                        with self.assertRaises(StallionError): self.store.gc(older_than=0, yes=True)
+                    else: self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+                    with self.assertRaises(StallionError): self.store.purge('trash', workspace, yes=True)
+                    self.assertTrue((trash / 'image.sfs').is_file())
+                    protection.write_bytes(saved)
+            self.store.move(workspace, restore=True)
+
+    def test_owned_native_restore_rename_response_loss_never_replays(self):
+        from stallionfs import _scan
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True); now[0] += STALE_SECONDS
+            self.store.move(workspace)
+            original = _scan.move
+            def lost(source, destination, **kwargs):
+                original(source, destination, **kwargs)
+                raise OSError(errno.EIO, 'restore rename response lost')
+            with patch('stallionfs._scan.move', side_effect=lost):
+                with self.assertRaises(OSError): self.store.move(workspace, restore=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            self.assertEqual(read_json(journal)['operation'], 'native-return')
+            with patch('stallionfs._scan.move', side_effect=AssertionError('restore rename replay')):
+                restored = self.store.move(workspace, restore=True)
+            self.assertFalse(restored['mounted']); self.assertTrue(path.exists())
+            self.assertFalse(journal.exists())
+            self.assertFalse((self.store.root / 'protected' / (workspace + '.json')).exists())
+
+    def test_owned_native_idle_invalid_busy_pending_and_reopened_state_never_retires(self):
+        import copy
+        from stallionfs import _native
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import replace_json, STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; path = Path(result['path']).parent.parent
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True)
+            self.store.cleanup_config(enabled=True); now[0] += STALE_SECONDS
+            saved = read_json(self.store._state(workspace))
+            variants = []
+            for value in (-1, True, float('inf'), now[0] + 1):
+                changed = copy.deepcopy(saved); changed['closed_at'] = value; variants.append(changed)
+            changed = copy.deepcopy(saved); changed['generation'] = 'f' * 32; variants.append(changed)
+            changed = copy.deepcopy(saved); changed['enrolled'] = False; variants.append(changed)
+            changed = copy.deepcopy(saved); changed['native_idle']['observed_at'] = now[0] + 1; variants.append(changed)
+            for changed in variants:
+                # Malformed nonfinite state is read-only JSON evidence, not a
+                # request to weaken the normal finite-state writer.
+                if changed.get('closed_at') == float('inf'):
+                    self.store._state(workspace).write_text(json.dumps(changed))
+                else: replace_json(self.store._state(workspace), changed)
+                self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+                self.assertTrue(path.exists())
+            replace_json(self.store._state(workspace), saved)
+            with patch('stallionfs._native.guarded', side_effect=OSError(errno.EBUSY, 'direct core owner')):
+                self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            with self.store._lease(workspace):
+                self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            replace_json(journal, {'operation': 'native-mount', 'workspace': workspace, 'child_pending': True})
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+            journal.unlink()
+            self.store.enroll(workspace, enabled=False)
+            self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
+
+    def test_owned_native_leases_exclude_move_restore_and_allow_independent_cleanup(self):
+        from stallionfs.lifecycle import STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspaces = []
+            for _ in range(2):
+                result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                workspaces.append(result['id'])
+                self.store.enroll(result['id']); self.store.close(result['id'], quiescent=True)
+            first, second = workspaces
+            self.store.cleanup_config(enabled=True); now[0] += STALE_SECONDS
+            with self.store._lease(first):
+                with self.assertRaises(StallionError): self.store.mount(first)
+                with self.assertRaises(StallionError): self.store.move(first)
+                observed = self.store.cleanup(apply=True)
+            self.assertEqual(observed['retired'], [second])
+            self.assertTrue((self.store.root / 'workspaces' / first).exists())
+            self.assertTrue((self.store.root / 'trash' / second).exists())
+            with self.store._lease(second):
+                with self.assertRaises(StallionError): self.store.move(second, restore=True)
+            self.store.move(second, restore=True)
+            self.assertTrue((self.store.root / 'workspaces' / second).exists())
+
+    def test_owned_native_current_location_substitution_and_existing_destination_refuse(self):
+        import copy
+        from stallionfs.core import read_json
+        from stallionfs.lifecycle import replace_json, STALE_SECONDS
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            result = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = result['id']; source = Path(result['path']).parent.parent
+            self.store.enroll(workspace); self.store.close(workspace, quiescent=True); now[0] += STALE_SECONDS
+            self.store.move(workspace)
+            trash = self.store.root / 'trash' / workspace
+            saved = read_json(trash / 'native-location.json')
+            for field in ('parent', 'object', 'file', 'uuid', 'origin_target'):
+                changed = copy.deepcopy(saved)
+                if field in ('parent', 'object', 'file'): changed[field][1] += 1
+                elif field == 'uuid': changed[field] = 'f' * 32
+                else: changed[field]['file'][1] += 1
+                replace_json(trash / 'native-location.json', changed)
+                with self.assertRaises(StallionError): self.store.move(workspace, restore=True)
+                self.assertTrue(trash.exists()); self.assertFalse(source.exists())
+            replace_json(trash / 'native-location.json', saved)
+            alias = self.base / 'owned-backing-alias'; os.link(trash / 'image.sfs', alias)
+            try:
+                with self.assertRaises(StallionError): self.store.move(workspace, restore=True)
+            finally: alias.unlink()
+            source.mkdir(mode=0o700)
+            with self.assertRaises(StallionError): self.store.move(workspace, restore=True)
+            source.rmdir()
+            displaced = trash.with_name(workspace + '-displaced'); trash.rename(displaced)
+            trash.symlink_to(displaced, target_is_directory=True)
+            try:
+                with self.assertRaises((StallionError, OSError)): self.store.move(workspace, restore=True)
+            finally:
+                trash.unlink(); displaced.rename(trash)
+            self.store.move(workspace, restore=True)
+            self.assertTrue(source.exists()); self.assertFalse(trash.exists())
 
     def test_owned_native_candidate_retained_with_fresh_identity_and_branch(self):
         from stallionfs.core import owned_native_target, read_json
@@ -782,6 +2969,8 @@ os.chflags('file',0x8001)
             self.store.gc(older_than=float("nan"), yes=True)
         insecure = self.base / "insecure"
         insecure.mkdir(mode=0o755)
+        insecure.chmod(0o755)
+        self.assertEqual(insecure.stat().st_mode & 0o777, 0o755)
         with self.assertRaisesRegex(StallionError, "0700"):
             Store(insecure)
         alias = self.base / "alias"
