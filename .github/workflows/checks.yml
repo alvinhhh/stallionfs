@@ -8,7 +8,7 @@ on:
       mode:
         description: Hosted document clone action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility, delete-thread-cpu]
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu]
         default: compare
 permissions:
   contents: read
@@ -220,7 +220,7 @@ jobs:
             export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1"
           elif [ "$PHASE_MODE" = 'delete-thread-cpu' ]; then
             export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1 -DSTALLIONFS_DIAGNOSTIC_DELETE_CPU=1"
-          elif [ "$PHASE_MODE" = 'directory-feasibility' ]; then
+          elif [ "$PHASE_MODE" = 'directory-feasibility' ] || [ "$PHASE_MODE" = 'directory-docs-feasibility' ]; then
             export CFLAGS=''
           elif [ "$PHASE_MODE" != 'compare' ]; then
             exit 2
@@ -398,10 +398,11 @@ jobs:
           raise SystemExit(code)
           PY
       - name: Collect hosted directory feasibility
-        if: inputs.mode == 'directory-feasibility'
+        if: inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
           STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED: '1'
+          DIRECTORY_DOCS_ONLY: ${{ inputs.mode == 'directory-docs-feasibility' }}
         run: |
           umask 077
           /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -pthread "$GITHUB_WORKSPACE/tests/native_directory_clone_probe.c" -o "$SCREEN_ROOT/directory-clone-probe"
@@ -416,7 +417,8 @@ jobs:
           receipts = control / 'receipts'; receipts.mkdir(mode=0o700)
           output = root / 'evidence/directory-feasibility-status.json'
           os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
-          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 210)
+          docs_only = os.environ['DIRECTORY_DOCS_ONLY'] == 'true'
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + (900 if docs_only else 210))
           code = 1
           try:
               wheels = list((root / 'wheels').glob('*.whl'))
@@ -425,18 +427,23 @@ jobs:
               argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_directory_clone_probe.py'),
                   '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]),
                   '--helper', str(root / 'directory-clone-probe'), '--scratch', str(root / 'scratch'),
-                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'], '--restore-small-recipes-only']
-              code = command(argv, cwd=control, timeout=200, umask=0o077, output_limit=65536).returncode
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'],
+                  '--restore-docs-only' if docs_only else '--restore-small-recipes-only']
+              code = command(argv, cwd=control, timeout=890 if docs_only else 200, umask=0o077, output_limit=65536).returncode
           except BaseException:
               pass
           if not output.exists():
-              with output.open('x') as artifact:
-                  json.dump({'schema': 1, 'scope': 'hosted nineteen-recipe selective restoration only', 'status': 'incomplete',
+              fallback = {'schema': 1, 'scope': 'hosted nineteen-recipe selective restoration only', 'status': 'incomplete',
                       'first_recipe_only': False, 'small_recipes_only': True, 'restoration_only': True,
                       'small_gate_qualified': False, 'full_gate_qualified': False,
                       'target_completion': 'unknown', 'cases': [], 'docs_attempted': None, 'helper_invocations': None, 'clone_calls': None,
                       'cleanup': 'retained_ephemeral', 'benchmark_verdict': 'not_applicable',
-                      'concurrency_and_cancellation': 'unresolved', 'error': 'outer_capture_incomplete'}, artifact)
+                      'concurrency_and_cancellation': 'unresolved', 'error': 'outer_capture_incomplete'}
+              if docs_only:
+                  fallback.update(scope='hosted fixed-docs selective restoration only', small_recipes_only=False,
+                      docs_only=True, docs_gate_qualified=False)
+              with output.open('x') as artifact:
+                  json.dump(fallback, artifact)
           raise SystemExit(code)
           PY
       - name: Show correctness and existing case gate
@@ -515,7 +522,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
       - name: Preserve directory feasibility status
-        if: always() && inputs.mode == 'directory-feasibility'
+        if: always() && (inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility')
         uses: actions/upload-artifact@v4
         with:
           name: hosted-directory-feasibility-${{ github.run_id }}-${{ github.run_attempt }}

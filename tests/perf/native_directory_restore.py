@@ -14,6 +14,14 @@ import sys
 import native_correctness as correct
 
 MAX_ENTRIES = 18
+
+
+def profile_limits(profile):
+    need(profile in ('small', 'docs'))
+    return ((MAX_ENTRIES, 32 * 1024 * 1024, 32 * 1024 * 1024) if profile == 'small' else
+            (correct.DOCS_ENTRIES, correct.DOCS_LOGICAL_BYTES, correct.DOCS_MAX_FILE))
+
+
 TRACKED = 0x40
 BLOCKING = stat.UF_IMMUTABLE | stat.UF_APPEND
 ALLOWED_FLAGS = TRACKED | BLOCKING
@@ -81,11 +89,13 @@ def owned_setid_leaf(snapshot, name, owner):
                 for other in snapshot['entries'].values()) == 1)
 
 
-def plan(source, destination, owner):
+def plan(source, destination, owner, *, profile='small'):
     """Compute selectors from full verified metadata, never the safe projection."""
+    maximum, logical, file_size = profile_limits(profile)
     for snapshot in (source, destination):
         need(type(snapshot) is dict and snapshot.get('unavailable_fields') == [])
-        need(type(snapshot.get('entries')) is dict and 0 < len(snapshot['entries']) <= MAX_ENTRIES)
+        need(type(snapshot.get('entries')) is dict and 0 < len(snapshot['entries']) <= maximum)
+        if profile == 'docs': correct.docs_shape(snapshot['entries'])
     left, right = source['entries'], destination['entries']
     need(left.keys() == right.keys() and '' in left and left['']['kind'] == 'directory')
     need(source.get('metadata_capabilities') == destination.get('metadata_capabilities'))
@@ -113,7 +123,7 @@ def plan(source, destination, owner):
             need(a.get(field) == b.get(field))
         if a['kind'] == 'file':
             need(all({'size', 'sha256', 'holes'} <= row.keys() and type(row['size']) is int
-                     and 0 <= row['size'] <= 32 * 1024 * 1024 and type(row['holes']) is dict
+                     and 0 <= row['size'] <= file_size and type(row['holes']) is dict
                      and 'ranges' in row['holes'] for row in (a, b)))
             need(a['holes']['ranges'] is not None and a['holes']['ranges'] == b['holes']['ranges'])
         if a['kind'] == 'symlink':
@@ -121,7 +131,7 @@ def plan(source, destination, owner):
         if a['kind'] != 'directory':
             source_classes.setdefault(tuple(a['device_inode']), []).append(name)
             destination_classes.setdefault(tuple(b['device_inode']), []).append(name)
-    need(sum(row.get('size', 0) for row in left.values() if row['kind'] == 'file') <= 32 * 1024 * 1024)
+    need(sum(row.get('size', 0) for row in left.values() if row['kind'] == 'file') <= logical)
     source_inodes = {tuple(row['device_inode']) for row in left.values()}
     need(not source_inodes.intersection(tuple(row['device_inode']) for row in right.values()))
     need(all(row['device_inode'][0] == left['']['device_inode'][0] for row in (*left.values(), *right.values())))
@@ -157,9 +167,10 @@ def plan(source, destination, owner):
 
 class DarwinOps:
     """Small descriptor-only setters; no pathname metadata fallback."""
-    def __init__(self):
+    def __init__(self, *, budget=None):
         need(sys.platform == 'darwin' and hasattr(os, 'O_SYMLINK'), 'platform_unavailable')
         self.libc = ctypes.CDLL(None, use_errno=True)
+        self.budget = budget
         pointer, integer, size = ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t
         for name, arguments, result in (
             ('fchflags', [integer, ctypes.c_uint32], integer),
@@ -295,6 +306,14 @@ class DarwinOps:
         self.call(self.libc.fchflags, fd, flags)
 
     def payload(self, fd, row):
+        budget = getattr(self, 'budget', None)
+        ticket = budget.begin() if budget is not None else None
+        try:
+            return self._payload(fd, row, budget, ticket)
+        finally:
+            if budget is not None: budget.discard(ticket)
+
+    def _payload(self, fd, row, budget, ticket):
         # Read every xattr on the held object, including the resource fork.
         length = self.call(self.libc.flistxattr, fd, None, 0, 0); need(length <= 65536)
         names = ctypes.create_string_buffer(max(length, 1))
@@ -303,6 +322,7 @@ class DarwinOps:
         attributes = {}
         for name in filter(None, names.raw[:length].split(b'\x00')):
             length = self.call(self.libc.fgetxattr, fd, name, None, 0, 0, 0); need(length <= 1048576)
+            if budget is not None: budget.reserve(ticket, 4 * (len(name) + length))
             value = ctypes.create_string_buffer(max(length, 1))
             need(self.call(self.libc.fgetxattr, fd, name, value, length, 0, 0) == length)
             need(name.hex() not in attributes)
@@ -310,10 +330,12 @@ class DarwinOps:
         need(attributes == row['xattrs'], 'payload_changed')
         if row['kind'] == 'file':
             digest = hashlib.sha256(); offset = 0
-            while data := os.pread(fd, 65536, offset):
+            while data := os.pread(fd, min(65536, row['size'] - offset + 1) if budget is not None else 65536, offset):
                 offset += len(data); need(offset <= row['size'], 'payload_changed'); digest.update(data)
             need(offset == row['size'] and digest.hexdigest() == row['sha256'], 'payload_changed')
-            need(correct._holes(fd, row['size'])['ranges'] == row['holes']['ranges'], 'payload_changed')
+            holes = (correct._holes(fd, row['size'], budget=budget, ticket=ticket) if budget is not None
+                     else correct._holes(fd, row['size']))
+            need(holes['ranges'] == row['holes']['ranges'], 'payload_changed')
 
     def times(self, fd, mtime):
         class Timespec(ctypes.Structure):
@@ -341,7 +363,7 @@ class Session:
     checks and final verifiers do not provide an atomic namespace snapshot or
     exclude same-user replacement/restore races between lease windows.
     """
-    def __init__(self, base, source, parent, expected, *, ops=None, cancelled=None):
+    def __init__(self, base, source, parent, expected, *, ops=None, cancelled=None, profile='small', budget=None):
         self.cancelled = cancelled if cancelled is not None else lambda: False
         self.expected = expected; self.source = {}; self.destination = {}
         self.owned = []; self.uncertain = []; self.bindings = []; self.pins = []
@@ -356,8 +378,15 @@ class Session:
         self.close_outcome = {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None}
         self.admission = {'status': 'refused', 'phase': 'ops_binding', 'refusal_code': None, 'errno': None,
                           'close': self.close_outcome}
+        self.profile = profile; self.budget = budget; self.buffer_ticket = None
         try:
-            self.ops = ops if ops is not None else DarwinOps()
+            profile_limits(profile)
+            need(profile != 'docs' or isinstance(budget, correct.SnapshotBudget))
+            if budget is not None:
+                self.buffer_ticket = budget.begin()
+                # ACL serialization, xattr-name parsing and two streaming chunks.
+                budget.reserve(self.buffer_ticket, 512 * 1024)
+            self.ops = ops if ops is not None else DarwinOps(budget=budget) if budget is not None else DarwinOps()
             self.note_admission('roots')
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
             self.root = self.open(base, flags)
@@ -483,7 +512,11 @@ class Session:
 
     def capture(self, root, snapshot, records):
         self.note_admission('schema')
-        need(snapshot.get('unavailable_fields') == [] and 0 < len(snapshot['entries']) <= MAX_ENTRIES)
+        maximum, logical, file_size = profile_limits(self.profile)
+        need(snapshot.get('unavailable_fields') == [] and 0 < len(snapshot['entries']) <= maximum)
+        if self.profile == 'docs': correct.docs_shape(snapshot['entries'])
+        if self.budget is not None:
+            self.budget.reserve(self.buffer_ticket, 4 * sum(len(os.fsencode(name)) for name in snapshot['entries']))
         total = 0
         for name, row in snapshot['entries'].items():
             need(type(row) is dict and COMMON_REQUIRED <= row.keys() and row.keys() <= ROW_FIELDS)
@@ -492,8 +525,8 @@ class Session:
             if row['mode'] & 0o6000: need(owned_setid_leaf(snapshot, name, os.geteuid()))
             need(type(row['flags']) is int and row['flags'] >= 0 and not row['flags'] & ~ALLOWED_FLAGS)
             if row['kind'] == 'file':
-                need(type(row.get('size')) is int and 0 <= row['size'] <= 32 * 1024 * 1024); total += row['size']
-        need(total <= 32 * 1024 * 1024)
+                need(type(row.get('size')) is int and 0 <= row['size'] <= file_size); total += row['size']
+        need(total <= logical)
         ids = {name: f'e{index + 1:04}' for index, name in enumerate(sorted(snapshot['entries']))}
         for name in sorted(snapshot['entries'], key=lambda item: (item.count('/') + bool(item), item)):
             self.note_admission('entry_identity'); parent_name, leaf = relative(name); row = snapshot['entries'][name]
@@ -707,7 +740,7 @@ class Session:
     def restore(self, destination_snapshot, output='output'):
         self.summary['status'] = 'incomplete'; self.operation = 'destination_capture'; self.operation_phase = 'preflight'
         try:
-            self.derived = plan(self.expected, destination_snapshot, os.geteuid())
+            self.derived = plan(self.expected, destination_snapshot, os.geteuid(), profile=self.profile)
             need('/' not in output and output not in ('', '.', '..'))
             self.destination_root = self.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent)
             self.bindings.append((self.parent, output, self.destination_root))
@@ -786,4 +819,6 @@ class Session:
         if self.uncertain:
             self.summary['status'] = 'incomplete'
             self.summary.setdefault('error', 'restoration_close_failed')
+        if self.buffer_ticket is not None:
+            self.budget.discard(self.buffer_ticket); self.buffer_ticket = None
         return not self.uncertain

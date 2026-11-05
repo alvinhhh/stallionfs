@@ -54,6 +54,33 @@ def fixtures():
     return source, snapshot(destination['entries'])
 
 
+def docs_model():
+    """Metadata only: the existing docs recipe's exact names, sizes and one alias."""
+    entries = {'': row('directory', 10000, mode=0o750)}
+    for index in range(5000):
+        branch = 'pages' if index % 5 == 0 else 'assets'
+        section = f'{branch}/section-{index // 100:04}'
+        for name in (branch, section):
+            if name not in entries: entries[name] = row('directory', 10000 + len(entries), mode=0o750)
+        name = f'{section}/' + (f'page-{index:06}.html' if index % 5 == 0 else f'asset-{index:06}.bin')
+        entries[name] = row('file', 20000 + index)
+        entries[name].update(size=20000, sha256='a' * 64)
+    entries['metadata-fixture'] = row('directory', 30000, mode=0o750)
+    entries['metadata-fixture/subdir'] = row('directory', 30001, mode=0o750)
+    for name in ('metadata-fixture/sparse', 'metadata-fixture/subdir/alias'):
+        entries[name] = row('file', 40000, links=2, acl=b'!#acl 1\ngroup:fixture allow read\n'.hex())
+        entries[name].update(size=8388608, sha256='b' * 64,
+                            holes={'ranges': [[1048576, 7340032]]})
+        entries[name]['xattrs'] = {b'com.apple.ResourceFork'.hex(): b'resource\x00fork\xff'.hex()}
+    source = snapshot(entries)
+    destination = deepcopy(source)
+    for index, entry in enumerate(destination['entries'].values(), 100000):
+        entry['device_inode'] = [7, index]; entry['link_count'] = 1
+        entry['acl']['text_hex'] = None
+        if entry['kind'] == 'directory': entry['mtime_ns'] += 1
+    return source, snapshot(destination['entries'])
+
+
 class FakeOps:
     """In-memory inode/name model, including detached held objects after unlink."""
     def __init__(self, source, destination):
@@ -158,6 +185,35 @@ class FakeOps:
 
 
 class Restoration(unittest.TestCase):
+    def test_docs_profile_is_explicit_and_requires_the_unchanged_full_shape(self):
+        source, target = docs_model()
+        with self.assertRaises(restore.RestoreError): restore.plan(source, target, os.geteuid())
+        selected = restore.plan(source, target, os.geteuid(), profile='docs')
+        self.assertEqual(selected['aliases'], [('metadata-fixture/sparse', 'metadata-fixture/subdir/alias')])
+        self.assertEqual(len(selected['directories']), 105)
+        self.assertEqual(selected['modes'], [])
+        for change in ('entry', 'bytes', 'file', 'depth', 'alias'):
+            with self.subTest(change=change):
+                bad = deepcopy(source)
+                files = [name for name, item in bad['entries'].items() if item['kind'] == 'file']
+                if change == 'entry': del bad['entries'][files[0]]
+                elif change == 'bytes': bad['entries'][files[0]]['size'] -= 1
+                elif change == 'file': bad['entries']['metadata-fixture/sparse']['size'] += 1
+                elif change == 'depth': bad['entries']['a/b/c/file'] = bad['entries'].pop(files[0])
+                else: bad['entries'][files[0]]['device_inode'] = [7, 40000]
+                with self.assertRaises(ValueError): restore.plan(bad, target, os.geteuid(), profile='docs')
+
+    def test_docs_session_refuses_missing_budget_before_open_and_default_still_refuses_large_source(self):
+        source, target = docs_model(); ops = FakeOps(source, target)
+        with self.assertRaises(restore.AdmissionError):
+            restore.Session('base', 'source', 'parent', source, ops=ops, profile='docs')
+        self.assertEqual(ops.calls, [])
+        with self.assertRaises(restore.AdmissionError):
+            restore.Session('base', 'source', 'parent', source, ops=ops)
+        self.assertEqual(sum(call[0] == 'open' for call in ops.calls), 3)
+        self.assertEqual(sum(call[0] == 'close' for call in ops.calls), 3)
+        self.assertFalse(ops.descriptors)
+
     def setUp(self):
         self.source, self.destination = fixtures()
         self.symlink_flag = mock.patch.object(os, 'O_SYMLINK', 0x200000, create=True)

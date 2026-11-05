@@ -46,6 +46,29 @@ class FirstRecipeDetail(unittest.TestCase):
         return probe.first_recipe_detail(source, destination,
             {'source_unchanged': source_ok, 'outside_sentinel_unchanged': outside_ok}, independent)
 
+    def test_full_sharing_summary_checks_late_pairs_without_retaining_raw_observations(self):
+        source = {'entries': {f'private-file-{index:03}': dict(kind='file', size=3, sha256='a' * 64,
+                    holes={'ranges': []}, device_inode=[7, index + 100],
+                    clone_attributes=dict(available=True, clone_id=index + 1, extended_flags=0x40))
+                    for index in range(70)}}
+        target = deepcopy(source)
+        for item in target['entries'].values(): item['device_inode'][1] += 10000
+        full = native_correctness.clone_sharing(source, target)
+        budget = native_correctness.SnapshotBudget(); ticket = budget.begin()
+        summary = native_correctness.clone_sharing(source, target, summary_only=True, budget=budget, ticket=ticket)
+        self.assertTrue(summary['full_data_stream_sharing'])
+        self.assertEqual(summary['counts']['shared'], 70)
+        self.assertEqual(summary['observations_sha256'], full['observations_sha256'])
+        self.assertNotIn('observations_gzip_b64', summary); self.assertNotIn('exceptions', summary)
+        self.assertNotIn('private-file', json.dumps(summary))
+        last = target['entries']['private-file-069']['clone_attributes']
+        for value, outcome, field in ((0, None, 'unknown'), (1000, False, 'not_shared')):
+            last['clone_id'] = value
+            result = native_correctness.clone_sharing(source, target, summary_only=True, budget=budget, ticket=ticket)
+            self.assertIs(result['full_data_stream_sharing'], outcome)
+            self.assertEqual(result['counts'][field], 1)
+        self.assertEqual(budget.live, 0); budget.discard(ticket)
+
     def test_all_entries_flags_signed_deltas_acl_states_and_unchanged_entries_are_allowlisted(self):
         secret_acl = b'!#acl 1\ngroup:PRIVATE-user:PRIVATE-id:allow:read\n'.hex()
         source = detail_snapshot({'': detail_entry('directory'), 'PRIVATE-A': detail_entry(flags=64, mtime=100, acl=secret_acl),
@@ -142,7 +165,8 @@ class DirectoryProbe(unittest.TestCase):
                   source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False,
                   first_recipe_only=False, destination_preserved=True, restore_first_recipe=False,
                   restore_status='restored_pending_final_verifiers', restore_final_preserved=True, restore_close=True,
-                  admission_error=None, setup_capture=False, restore_small_recipes_only=False, fail_case=None):
+                  admission_error=None, setup_capture=False, restore_small_recipes_only=False, fail_case=None,
+                  restore_docs_only=False, long_alias_peer=False):
         cases = [(probe.FIRST_RECIPE if first_recipe_only and i == 0 else f'controlled-{i:02}',
                   expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
         prepared_errors = dict(cases)
@@ -151,6 +175,7 @@ class DirectoryProbe(unittest.TestCase):
             prepared_errors.update({name: (errno.EPERM,) for name in
                 ('inherit-foreign-read', 'inherit-foreign-xattr', 'parent-shared', 'parent-other-principal')})
         self.prepared_cases, self.constructed_cases, self.restorers, self.cleanup_decisions = [], [], [], []
+        self.peer_read_sizes = []
         def prepare(base, name, *_):
             self.prepared_cases.append(name)
             for entry in ('source', 'parent', 'outside'): (base / entry).mkdir()
@@ -171,6 +196,22 @@ class DirectoryProbe(unittest.TestCase):
             path = base / name; path.mkdir(); return path
         snapshot = detail_snapshot() if first_recipe_only else {'entries': {}, 'unavailable_fields': []}
         snapshots = mock.Mock(return_value=snapshot)
+        if restore_docs_only:
+            from test_native_directory_restore import docs_model, row, snapshot as model_snapshot
+            full, raw_docs = docs_model()
+            restored_docs = deepcopy(full)
+            for item in restored_docs['entries'].values(): item['device_inode'][1] += 1000000
+            auxiliary = model_snapshot({'': row('directory', 5000000, mode=0o700),
+                                        'sentinel': row('file', 5000001)})
+            self.docs_budgets = []
+            def observed_docs(path, **options):
+                value = deepcopy((restored_docs if checks['strict_equal'] else raw_docs) if Path(path).name == 'output'
+                                 else full if Path(path).name == 'docs_5k_100mb' else auxiliary)
+                self.assertIs(options['docs'], Path(path).name in ('output', 'docs_5k_100mb'))
+                owner = options['budget']; self.docs_budgets.append(owner)
+                ticket = owner.begin(); owner.reserve(ticket, 512 * len(value['entries']))
+                return owner.retain(value, ticket)
+            snapshots.side_effect = observed_docs
         if restore_small_recipes_only:
             # Full first18 report shape; all other unchanged recipes have two
             # source names (the special refusal's extra name is never projected).
@@ -197,10 +238,20 @@ class DirectoryProbe(unittest.TestCase):
         self.restorer.admission_report.side_effect = admission_report
         def reconstruct(_):
             checks['strict_equal'] = restore_final_preserved
+            if restore_docs_only:
+                # Full report structure; these are model counters, not timings or observations.
+                self.restorer.summary = dict(status=restore_status, mutation_attempts=107,
+                    alias_replacements=1, acl_repairs=1, tracking_repairs=0, directory_times=105,
+                    mode_repairs=0, recovery='not_needed',
+                    lease_counts=dict({key: 326848 for key in ('open_attempts', 'opened', 'close_attempts',
+                        'closed', 'fstat', 'named')}, peak=15, live=0, uncertain=0),
+                    close=dict(status='complete', attempts=326848, failures=0, errno=None))
+                return deepcopy(self.restorer.summary)
             return {'status': restore_status}
         self.restorer.restore.side_effect = reconstruct
         restoration_module = types.ModuleType('native_directory_restore')
         restoration_module.Session = mock.Mock(return_value=self.restorer)
+        self.session_factory = restoration_module.Session
         restoration_module.Session.side_effect = admission_error
         if restore_small_recipes_only:
             def session(base, *_args, **_kwargs):
@@ -236,7 +287,7 @@ class DirectoryProbe(unittest.TestCase):
             nonlocal pin_count
             pin_count += 1
             if pin_unavailable: raise FileNotFoundError('PRIVATE missing source /private/source-path')
-            if restore_small_recipes_only: return {name: 'a' * 64 for name in probe.PIN_PATHS}
+            if restore_small_recipes_only or restore_docs_only: return {name: 'a' * 64 for name in probe.PIN_PATHS}
             return {'source': ('b' if changed_pin and any(row[0][0] == str(self.helper) for row in self.commands) else 'a') * 64}
         def command(argv, **options):
             self.commands.append((argv, options))
@@ -259,6 +310,15 @@ class DirectoryProbe(unittest.TestCase):
                     for directory in ('a', 'b', 'c'): (target / directory).mkdir()
                     (target / 'a/file').write_bytes(b'original')
                     for directory in ('b', 'c'): os.link(target / 'a/file', target / directory / 'file')
+                if restore_docs_only:
+                    self.assertEqual(argv[-1], '--docs-profile')
+                    target = Path(argv[1]) / argv[5] / argv[6]
+                    (target / 'metadata-fixture/subdir').mkdir(parents=True)
+                    (target / 'metadata-fixture/sparse').write_bytes(b'original')
+                    if long_alias_peer:
+                        (target / 'metadata-fixture/subdir/alias').write_bytes(b'changed' + b'X' * 32)
+                    else:
+                        os.link(target / 'metadata-fixture/sparse', target / 'metadata-fixture/subdir/alias')
                 raw = value if isinstance(value, bytes) else json.dumps(value).encode()
                 return subprocess.CompletedProcess(argv, 0, raw, b'')
             if argv[0] == '/usr/bin/sw_vers': return subprocess.CompletedProcess(argv, 0, b'26B118\n', b'')
@@ -266,12 +326,29 @@ class DirectoryProbe(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, b'[]', b'')
         budget.command = command
         source_verifications = 0
+        original_verify_source = native_correctness.verify_source
         def verify_source(*_):
             nonlocal source_verifications
             source_verifications += 1
-            return {'unchanged': not (source_changed and source_verifications == 2)}
+            if source_changed and source_verifications == 2: return {'unchanged': False}
+            return original_verify_source(*_) if restore_docs_only else {'unchanged': True}
         output = self.root / 'status.json'
         with ExitStack() as stack:
+            if restore_docs_only:
+                real_open = Path.open
+                test = self
+                class PeerRead:
+                    def __init__(self, stream): self.stream = stream
+                    def __enter__(self): return self
+                    def __exit__(self, *_): self.stream.close()
+                    def read(self, size=-1):
+                        test.peer_read_sizes.append(size)
+                        test.assertEqual(size, len(b'changed') + 1)
+                        return self.stream.read(size)
+                def open_path(path, mode='r', *args, **kwargs):
+                    stream = real_open(path, mode, *args, **kwargs)
+                    return PeerRead(stream) if path.name == 'alias' and mode == 'rb' else stream
+                stack.enter_context(mock.patch.object(Path, 'open', new=open_path))
             stack.enter_context(mock.patch.dict(sys.modules, {'stallionfs': product, 'stallionfs._benchmark_budget': budget,
                                                               'native_directory_restore': restoration_module}))
             stack.enter_context(mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true' if host else 'false',
@@ -283,12 +360,19 @@ class DirectoryProbe(unittest.TestCase):
             stack.enter_context(mock.patch.object(fileops, 'scratch_volume', return_value={'ignore_ownership': False}))
             self.mounts = stack.enter_context(mock.patch.object(fileops, 'no_mounts_below'))
             stack.enter_context(mock.patch.object(fileops, 'large_fixture', side_effect=docs))
-            stack.enter_context(mock.patch.object(native_fixtures, 'enrich_metadata'))
+            def enrich(_source, *, receipt):
+                receipt['hardlinks'] = ['metadata-fixture/sparse', 'metadata-fixture/subdir/alias']
+            stack.enter_context(mock.patch.object(native_fixtures, 'enrich_metadata', side_effect=enrich if restore_docs_only else None))
             stack.enter_context(mock.patch.object(native_fixtures, 'verify_metadata_coverage', return_value={'populated': True}))
             stack.enter_context(mock.patch.object(native_correctness, 'snapshot', snapshots))
-            stack.enter_context(mock.patch.object(native_correctness, 'verify_clone', return_value=checks))
+            if not restore_docs_only:
+                stack.enter_context(mock.patch.object(native_correctness, 'verify_clone', return_value=checks))
             stack.enter_context(mock.patch.object(native_correctness, 'verify_source', side_effect=verify_source))
-            stack.enter_context(mock.patch.object(native_correctness, 'clone_sharing', return_value={'full_data_stream_sharing': sharing}))
+            sharing_result = {'full_data_stream_sharing': sharing}
+            if restore_docs_only:
+                sharing_result.update(counts={'shared': 5002, 'not_shared': 0, 'unknown': 0, 'not_applicable': 0},
+                                      observations_sha256='c' * 64)
+            stack.enter_context(mock.patch.object(native_correctness, 'clone_sharing', return_value=sharing_result))
             stack.enter_context(mock.patch.object(native_suite, 'cache_prepare', side_effect=AssertionError('No cache/timing work')))
             if restore_small_recipes_only:
                 def capture_cleanup(item, guard):
@@ -306,8 +390,63 @@ class DirectoryProbe(unittest.TestCase):
             self.removals = stack.enter_context(mock.patch.object(probe.shutil, 'rmtree', wraps=shutil.rmtree))
             code = probe.probe(self.binary, self.wheel, self.helper, self.scratch, output, 'a' * 40,
                                first_recipe_only=first_recipe_only, restore_first_recipe=restore_first_recipe,
-                               restore_small_recipes_only=restore_small_recipes_only)
+                               restore_small_recipes_only=restore_small_recipes_only, restore_docs_only=restore_docs_only)
         return code, json.loads(output.read_text()), snapshots
+
+    def test_explicit_docs_only_uses_full_verifiers_one_profile_call_and_bounded_safe_summary(self):
+        code, value, snapshots = self.run_probe(restore_docs_only=True, destination_preserved=False)
+        self.assertEqual(code, 0); self.assertEqual(value['status'], 'docs_recipe_restoration_complete')
+        self.assertTrue(value['docs_gate_qualified']); self.assertFalse(value['full_gate_qualified'])
+        self.assertEqual((value['helper_invocations'], value['clone_calls'], value['restoration_sessions_started'],
+                          value['restoration_sessions_closed']), (1, 1, 1, 1))
+        self.assertEqual(self.prepared_cases, [])
+        self.assertEqual(self.session_factory.call_args.kwargs['profile'], 'docs')
+        self.assertIs(self.session_factory.call_args.kwargs['budget'], self.docs_budgets[0])
+        self.docs.assert_called_once_with('docs_5k_100mb', {'files': 5000, 'bytes': 100000000})
+        self.assertTrue(value['cases'][0]['passed']); self.assertFalse(value['cases'][0]['raw_clone']['passed'])
+        self.assertTrue(value['cases'][0]['destination_independent'])
+        self.assertTrue(value['cases'][0]['alias_isolation_tested'])
+        self.assertEqual(self.peer_read_sizes, [8])
+        self.assertNotIn('first_recipe_detail', value['cases'][0]['raw_clone'])
+        self.assertEqual(value['cleanup'], 'complete')
+        self.assertGreater(snapshots.call_count, 6)
+        self.assertTrue(all(owner.live == 0 and not owner.snapshots for owner in self.docs_budgets))
+        encoded = json.dumps(value, indent=2).encode()
+        self.assertLessEqual(len(encoded), 65536)
+        for private in (str(self.root).encode(), b'metadata-fixture', b'20000', b'com.apple.ResourceFork'):
+            self.assertNotIn(private, encoded)
+
+    def test_docs_final_verifier_or_alias_long_content_failure_retains_evidence_and_cannot_qualify(self):
+        for final_ok, long_peer in ((False, False), (True, True)):
+            with self.subTest(final_ok=final_ok, long_peer=long_peer):
+                self.setUp()
+                code, value, _ = self.run_probe(restore_docs_only=True, destination_preserved=False,
+                                               restore_final_preserved=final_ok, long_alias_peer=long_peer)
+                self.assertEqual(code, 1); self.assertFalse(value['docs_gate_qualified'])
+                self.assertEqual(value['cleanup'], 'retained_ephemeral')
+                self.assertEqual(value['restoration_sessions_closed'], 1)
+                self.assertTrue(all(owner.live == 0 for owner in self.docs_budgets))
+                self.assertEqual(value['error'], 'alias_isolation_failed' if long_peer else 'correctness_failed')
+                helper = next(argv for argv, _ in self.commands if argv[0] == str(self.helper))
+                first = Path(helper[1]) / helper[5] / 'output/metadata-fixture/sparse'
+                if not final_ok: self.assertEqual(first.read_bytes(), b'original')
+                self.assertEqual(self.peer_read_sizes, [8] if long_peer else [])
+                self.assertFalse(value['cases'][0].get('alias_isolation_tested', False))
+
+    def test_docs_unknown_helper_does_not_restore_observe_again_or_clean_and_closes_budget(self):
+        code, value, snapshots = self.run_probe(restore_docs_only=True, capture='uncertain')
+        self.assertEqual(code, 1); self.assertFalse(value['docs_gate_qualified'])
+        self.assertEqual(value['target_completion'], 'unknown')
+        self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.restorer.restore.assert_not_called()
+        self.assertEqual(snapshots.call_count, self.last_snapshot_count)
+        self.assertTrue(all(owner.live == 0 for owner in self.docs_budgets))
+
+    def test_docs_scope_is_exclusive_before_commands_or_fixture_creation(self):
+        code, value, _ = self.run_probe(restore_docs_only=True, restore_small_recipes_only=True)
+        self.assertEqual(code, 1); self.assertEqual(value['error'], 'restoration_scope_invalid')
+        self.assertEqual(self.commands, []); self.docs.assert_not_called()
+        self.assertEqual(value['helper_invocations'], 0)
 
     def test_restoration_keeps_raw_negative_and_runs_final_verifiers_with_exactly_one_helper_and_no_docs(self):
         code, value, _ = self.run_probe(first_recipe_only=True, restore_first_recipe=True, destination_preserved=False)
@@ -343,9 +482,9 @@ class DirectoryProbe(unittest.TestCase):
         self.assertTrue(all(not row['raw_clone']['passed'] for row in restored))
         self.assertEqual(self.cleanup_decisions, [True])
         self.assertEqual(value['cases'][0]['first_recipe_detail']['entry_count'], 18)
-        self.assertEqual(len(value['source_sha256']), 20)
+        self.assertEqual(len(value['source_sha256']), 21)
         # This is the actual full driver result shape, including both first18
-        # projections, all19 rows, 8 complete summaries/close records and20 pins.
+        # projections, all19 rows, 8 complete summaries/close records and21 pins.
         self.assertLessEqual(len(json.dumps(value, indent=2).encode()), 65536)
 
     def test_nineteen_unknown_parent_deny_target_closes_but_never_clears_or_continues(self):
@@ -599,7 +738,8 @@ class DirectoryProbe(unittest.TestCase):
         self.assertIn('tests/test_native_directory_restore_fd_observer.py', observed)
         self.assertIn('tests/test_native_directory_restore_policy.py', observed)
         self.assertIn('tests/test_native_directory_type_preflight.py', observed)
-        self.assertEqual(len(observed), 20)
+        self.assertIn('tests/test_native_document_reader_limits.py', observed)
+        self.assertEqual(len(observed), 21)
         self.assertNotIn('stallionfs/_benchmark_runtime/native_metrics.py', observed)
         self.assertEqual(observed['tests/perf/native_metrics.py'],
                          hashlib.sha256((checkout / 'tests/perf/native_metrics.py').read_bytes()).hexdigest())
@@ -632,12 +772,21 @@ class DirectoryProbe(unittest.TestCase):
     def test_workflow_routes_each_mode_and_artifact_explicitly(self):
         text = (Path(__file__).parents[1] / '.github/workflows/checks.yml').read_text()
         self.assertNotIn("inputs.mode != 'thread-cpu'", text)
-        self.assertIn('options: [compare, thread-cpu, directory-feasibility, delete-thread-cpu]', text)
+        self.assertIn('options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu]', text)
         for mode in ('compare', 'thread-cpu', 'directory-feasibility', 'delete-thread-cpu'):
             self.assertIn(f"if: inputs.mode == '{mode}'", text)
         directory_step = text.split('      - name: Collect hosted directory feasibility\n')[1].split('      - name: Show correctness')[0]
         self.assertNotIn('native_suite.py', directory_step); self.assertNotIn('thread-cpu', directory_step)
-        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--restore-small-recipes-only']", directory_step)
+        self.assertIn("'--restore-docs-only' if docs_only else '--restore-small-recipes-only']", directory_step)
+        self.assertIn("DIRECTORY_DOCS_ONLY: ${{ inputs.mode == 'directory-docs-feasibility' }}", directory_step)
+        self.assertIn("docs_only = os.environ['DIRECTORY_DOCS_ONLY'] == 'true'", directory_step)
+        self.assertIn('time.monotonic() + (900 if docs_only else 210)', directory_step)
+        self.assertIn('timeout=890 if docs_only else 200', directory_step)
+        driver = (Path(__file__).parent / 'perf/native_directory_clone_probe.py').read_text()
+        self.assertIn('time.monotonic() + (870 if restore_docs_only else 180)', driver)
+        self.assertIn('output_limit=65536', directory_step)
+        self.assertIn("elif [ \"$PHASE_MODE\" = 'directory-feasibility' ] || [ \"$PHASE_MODE\" = 'directory-docs-feasibility' ]; then", text)
+        self.assertIn("if: always() && (inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility')", text)
         self.assertEqual(text.count("'--restore-small-recipes-only'"), 1)
         self.assertNotIn("'--first-recipe-only'", text)
         self.assertNotIn("'--restore-first-recipe'", text)
@@ -650,6 +799,8 @@ class DirectoryProbe(unittest.TestCase):
         self.assertIn("'helper_invocations': None", fallback)
         self.assertIn("'clone_calls': None", fallback)
         self.assertNotIn("'docs_attempted': False", fallback)
+        self.assertIn("if docs_only:\n                  fallback.update(scope='hosted fixed-docs selective restoration only', small_recipes_only=False,", fallback)
+        self.assertIn('docs_only=True, docs_gate_qualified=False', fallback)
 
     def test_inherited_acl_preparation_uses_bounded_xattr_command_without_os_setxattr(self):
         base = self.scratch / 'preparation'; base.mkdir(mode=0o700)
