@@ -37,7 +37,7 @@ def report(started=4):
 
 
 class DeleteContracts(unittest.TestCase):
-    def test_workflow_routes_first_recipe_and_delete_to_their_own_drivers(self):
+    def test_workflow_routes_directory_gate_and_delete_to_their_own_drivers(self):
         workflow = (PERF.parents[1] / '.github/workflows/checks.yml').read_text()
         def arguments(step):
             block = workflow.split('- name: ' + step, 1)[1].split('      - name:', 1)[0]
@@ -48,8 +48,12 @@ class DeleteContracts(unittest.TestCase):
             return [node.value for node in ast.walk(assignment.value) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
         directory = arguments('Collect hosted directory feasibility')
         deletion = arguments('Collect fixed-cache delete CPU phases')
-        self.assertIn('--first-recipe-only', directory)
+        self.assertIn('--restore-small-recipes-only', directory)
+        self.assertNotIn('--restore-small-recipes-only', deletion)
+        self.assertNotIn('--first-recipe-only', directory)
+        self.assertNotIn('--restore-first-recipe', directory)
         self.assertNotIn('--first-recipe-only', deletion)
+        self.assertNotIn('--restore-first-recipe', deletion)
         self.assertIn('tests/perf/native_directory_clone_probe.py', directory)
         self.assertIn('tests/perf/native_delete_phase_probe.py', deletion)
         self.assertIn("if: inputs.mode == 'thread-cpu'", workflow)
