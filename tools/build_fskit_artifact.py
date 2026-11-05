@@ -99,6 +99,20 @@ def verify_archive(output, expected):
                     raise ValueError('Archive member hash differs')
 
 
+def select_wheel(directory):
+    wheels = sorted(directory.glob('*.whl'))
+    if len(wheels) != 1 or not re.fullmatch(r'stallionfs-[0-9.]+-cp313-cp313-macosx_15_0_arm64\.whl', wheels[0].name):
+        observed = {'wheel_count': len(wheels), 'wheel_names': [path.name[:160] for path in wheels[:8]],
+                    'names_truncated': len(wheels) > 8 or any(len(path.name) > 160 for path in wheels[:8])}
+        raise ValueError('Expected exactly one cp313 ARM64 wheel; ' + json.dumps(observed, sort_keys=True))
+    return wheels[0]
+
+
+def validate_wheel_targets(observations):
+    if any(package._version(row['target']['minimum_os']) > package._version('15.0') for row in observations):
+        raise ValueError('Wheel native member exceeds its macOS 15.0 platform tag')
+
+
 class Build:
     def __init__(self, source, root):
         self.source = source
@@ -177,21 +191,21 @@ class Build:
         wheel_dir = work / 'wheels'; wheel_dir.mkdir(mode=0o700)
         env = dict(os.environ, MACOSX_DEPLOYMENT_TARGET='15.0', ARCHFLAGS='-arch arm64',
                    CFLAGS='', CPPFLAGS='', CXXFLAGS='', LDFLAGS='')
-        self.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--wheel-dir', wheel_dir, source], 300, env=env)
-        wheels = list(wheel_dir.glob('*.whl'))
-        if len(wheels) != 1 or not re.fullmatch(r'stallionfs-[0-9.]+-cp313-cp313-macosx_15_0_arm64.whl', wheels[0].name):
-            raise ValueError('Expected exactly one cp313 ARM64 wheel')
+        self.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--wheel-dir', wheel_dir,
+                  '--config-settings=--build-option=--plat-name=macosx-15.0-arm64', source], 300, env=env)
+        built_wheel = select_wheel(wheel_dir)
         metadata = {'python_tag': 'cp313', 'target_triple': 'aarch64-apple-darwin',
                     'python_config_vars': {name: str(sysconfig.get_config_var(name) or 0)
                         for name in ('Py_GIL_DISABLED', 'Py_DEBUG', 'EXT_SUFFIX')}}
-        files, scripts, extensions, tag, build_sources = package._runtime_source_wheel(wheels[0].read_bytes(), metadata, {})
+        files, scripts, extensions, tag, build_sources = package._runtime_source_wheel(built_wheel.read_bytes(), metadata, {})
         observations = package._inspect_runtime_wheel(files, scripts, extensions, work)
+        validate_wheel_targets(observations)
         for index in range(4):
             symbols = self.run([selected['nm'], work / ('wheel-' + str(index))], 30).lower()
             if any(word in symbols for word in FORBIDDEN):
                 raise ValueError('Diagnostic, fixture or test symbols in wheel')
-        wheel = payload / wheels[0].name
-        shutil.copyfile(wheels[0], wheel)
+        wheel = payload / built_wheel.name
+        shutil.copyfile(built_wheel, wheel)
         self.run([*cflags, source / 'tools/mount_witness.c', '-o', payload / 'mount-witness'], 90)
         shutil.copyfile(source / 'LICENSE', payload / 'LICENSE')
         names = [*APP_FILES, wheel.name, 'mount-witness', 'LICENSE']

@@ -86,5 +86,43 @@ class ArtifactPackage(unittest.TestCase):
                 artifact.verify_archive(output, expected)
 
 
+class WheelAdmission(unittest.TestCase):
+    def test_requires_exactly_one_cp313_macos15_arm64_wheel(self):
+        expected = 'stallionfs-0.6.3-cp313-cp313-macosx_15_0_arm64.whl'
+        for names in ([], [expected, 'extra.whl'],
+                      ['stallionfs-0.6.3-cp313-cp313-macosx_15_0_universal2.whl'],
+                      ['stallionfs-0.6.3-cp312-cp312-macosx_15_0_arm64.whl'],
+                      ['stallionfs-0.6.3-cp313-cp313-macosx_27_0_arm64.whl']):
+            with self.subTest(names=names), tempfile.TemporaryDirectory(prefix='private-wheel-dir-') as directory:
+                root = Path(directory)
+                for name in names: (root / name).write_bytes(b'inert wheel')
+                with self.assertRaises(ValueError) as refused: artifact.select_wheel(root)
+                message = str(refused.exception)
+                self.assertNotIn(directory, message)
+                self.assertIn('"wheel_count": ' + str(len(names)), message)
+                for name in names: self.assertIn(name, message)
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / expected
+            wheel.write_bytes(b'inert selected wheel; full validation remains mandatory')
+            self.assertEqual(artifact.select_wheel(wheel.parent), wheel)
+
+    def test_refusal_diagnostics_bound_count_names_and_name_length(self):
+        with tempfile.TemporaryDirectory(prefix='private-wheel-dir-') as directory:
+            root = Path(directory)
+            for index in range(12): (root / (str(index) + '-' + 'x' * 180 + '.whl')).touch()
+            with self.assertRaises(ValueError) as refused: artifact.select_wheel(root)
+            message = str(refused.exception)
+            self.assertNotIn(directory, message)
+            self.assertLess(len(message), 1600)
+            self.assertIn('"wheel_count": 12', message)
+            self.assertIn('"names_truncated": true', message)
+
+    def test_explicit_platform_tag_requires_matching_native_deployment(self):
+        artifact.validate_wheel_targets([{'target': {'minimum_os': version}} for version in ('11.0', '15', '15.0.0')])
+        for version in ('15.1', '26.0', '27.0'):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'exceeds'):
+                artifact.validate_wheel_targets([{'target': {'minimum_os': '15.0'}}, {'target': {'minimum_os': version}}])
+
+
 if __name__ == '__main__':
     unittest.main()
