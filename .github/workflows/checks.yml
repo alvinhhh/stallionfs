@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Hosted document clone action
+        description: Hosted action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu]
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact]
         default: compare
 permissions:
   contents: read
@@ -189,7 +189,7 @@ jobs:
 
   hosted-docs-screen:
     name: Hosted document clone screen
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'unsigned-app-artifact'
     runs-on: xcode-27
     timeout-minutes: 20
     permissions:
@@ -527,5 +527,38 @@ jobs:
         with:
           name: hosted-directory-feasibility-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/directory-feasibility-status.json
+          if-no-files-found: error
+          retention-days: 3
+
+  unsigned-app-artifact:
+    name: Unsigned FSKit build components
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'unsigned-app-artifact'
+    runs-on: xcode-27
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAKEFLAGS: -j1
+      MAX_JOBS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check artifact boundaries and existing package validation
+        run: |
+          python -B -m unittest discover -s tests -p 'test_*package*.py' -v
+          PYTHONPATH=tests python -B -m unittest test_native_directory_clone_probe.DirectoryProbe.test_workflow_routes_each_mode_and_artifact_explicitly -v
+      - name: Build and verify unsigned components
+        run: python -B tools/build_fskit_artifact.py --out "$RUNNER_TEMP/unsigned-app-components"
+      - name: Retain verified unsigned component archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-fskit-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unsigned-app-components/StallionFS-unsigned-arm64.tar.gz
           if-no-files-found: error
           retention-days: 3

@@ -772,9 +772,16 @@ class DirectoryProbe(unittest.TestCase):
     def test_workflow_routes_each_mode_and_artifact_explicitly(self):
         text = (Path(__file__).parents[1] / '.github/workflows/checks.yml').read_text()
         self.assertNotIn("inputs.mode != 'thread-cpu'", text)
-        self.assertIn('options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu]', text)
+        self.assertIn('options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact]', text)
         for mode in ('compare', 'thread-cpu', 'directory-feasibility', 'delete-thread-cpu'):
             self.assertIn(f"if: inputs.mode == '{mode}'", text)
+        docs_job, artifact_job = text.split('  hosted-docs-screen:\n')[1].split('  unsigned-app-artifact:\n')
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.mode != 'unsigned-app-artifact'", docs_job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.mode == 'unsigned-app-artifact'", artifact_job)
+        self.assertIn('tools/build_fskit_artifact.py', artifact_job)
+        self.assertIn('unsigned-app-components/StallionFS-unsigned-arm64.tar.gz', artifact_job)
+        self.assertNotIn('PHASE_MODE', artifact_job)
+        self.assertNotIn('native_suite.py', artifact_job)
         directory_step = text.split('      - name: Collect hosted directory feasibility\n')[1].split('      - name: Show correctness')[0]
         self.assertNotIn('native_suite.py', directory_step); self.assertNotIn('thread-cpu', directory_step)
         self.assertIn("'--restore-docs-only' if docs_only else '--restore-small-recipes-only']", directory_step)
