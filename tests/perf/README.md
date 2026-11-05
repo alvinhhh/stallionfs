@@ -307,7 +307,7 @@ Use Node 24+ to fill a dedicated package cache, then compare folders:
 
 ```sh
 npm ci --prefix tests/perf/fixture --ignore-scripts --no-audit --no-fund --cache /tmp/stallionfs-perf/npm-cache
-/tmp/stallionfs-perf-env/bin/python tests/perf/run.py --methods worktree_install stallionfs_folder --scratch /tmp/stallionfs-perf --npm-cache /tmp/stallionfs-perf/npm-cache --output /tmp/stallionfs-perf/workspaces.json
+/tmp/stallionfs-perf-env/bin/python tests/perf/run.py --binary /tmp/stallionfs-perf-env/bin/stallionfs --methods worktree_install stallionfs_folder --scratch /tmp/stallionfs-perf --npm-cache /tmp/stallionfs-perf/npm-cache --output /tmp/stallionfs-perf/workspaces.json
 ```
 
 New runs require at least ten measured rounds (the default). Reports include
@@ -318,7 +318,33 @@ comparisons exclude memory and full metadata equivalence.
 The baseline includes dependency installation, not just an Apple file command. Paired intervals assume independent rounds, which host drift can violate.
 Folder comparisons use locked dependencies, generated source files and offline installation without lifecycle scripts. Validation checks content/executable modes and React rendering, excluding Git bookkeeping.
 
-`ready_s` includes creation/setup; lifecycle adds removal and completed reclamation. CPU includes coordinator/worker threads and waited children, excluding validation. Stallionfs API timing excludes CLI startup; Git/npm startup is included. Only Git registration is serialized. Installs and deletion run concurrently; removal includes a final Git prune.
+Use the Python and installed native executable from the same environment. The
+campaign passes its candidate executable to this stage. `stallionfs_folder`
+invokes `create`, `remove` and `gc --older-than 0 --yes` through that executable
+with the isolated store and JSON output. Workspace `remove` retires to trash;
+`gc` must finish deleting exactly the created IDs. CLI startup, output parsing
+and completed operations are included. Ownership, content and reclamation
+validation remain outside the timed phases. The isolated store uses its default
+disabled automatic cleanup policy.
+
+`ready_s` is batch creation/setup time at concurrency one and four, excluding
+seed preparation and subsequent validation. It is not a prompt/UI latency or
+first-use measurement. Lifecycle adds removal and completed reclamation. CPU
+includes coordinator/worker threads and waited children over the same phases.
+Only Git registration is serialized; installs and deletion run concurrently.
+Baseline removal includes a final Git prune.
+
+Use `--api-diagnostic` instead of `--binary` for the previous in-process folder
+timing, which excludes CLI startup. Reports use format 4 and label every sample's
+invocation mode; aggregation rejects missing or mixed modes. Historical API
+reports remain diagnostics and cannot establish CLI lifecycle gains. The
+existing byte-copy and image methods also remain API diagnostics.
+
+This stage reports wall and CPU totals, without workspace peak RSS, unique
+physical storage or full metadata equivalence. Seed logical bytes and image
+allocated bytes do not establish unique physical storage savings. Prepared
+reuse, offline installation and disabled package scripts remain part of this
+workload's scope.
 
 Omit `--methods` to include `prepared_byte_copy` and `stallionfs_image`, unmeasured here. Images require macOS 26+, include attach/detach, preserve ownership enforcement, disable Spotlight and default to 8 GiB (`--image-size`). Image CPU accounting excludes shared macOS helpers. Workload options: `--source-only`, `--samples`, `--concurrency`, `--source-files`.
 

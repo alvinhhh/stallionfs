@@ -43,6 +43,8 @@ class CampaignTests(unittest.TestCase):
         if Path(argv[2]).name == 'cli.py':
             state.update(case_id='cli/clone/tiny_4kib' if '--native-clone' in argv else 'cli/delete/tiny_4kib',
                          source_checks_passed=True)
+        if Path(argv[2]).name == 'run.py':
+            state.update(format=4, workspace_invocation='cli')
         if Path(argv[2]).name in ('native_suite.py', 'cli.py'):
             writer = campaign.native_report.ReportJournal(output)
             try:
@@ -107,9 +109,22 @@ class CampaignTests(unittest.TestCase):
                          ['worktree_install', 'stallionfs_folder'])
         self.assertEqual(workspace[workspace.index('--concurrency') + 1], '4')
         self.assertEqual(workspace[workspace.index('--source-files') + 1], '1000')
+        self.assertEqual(workspace[workspace.index('--binary') + 1], files[files.index('--binary') + 1])
+        self.assertNotIn('--api-diagnostic', workspace)
         for flag in ('--node', '--npm', '--npm-cache'):
             self.assertEqual(files[files.index(flag) + 1], workspace[workspace.index(flag) + 1])
         self.assertTrue(all(Path(row['log']).read_bytes() == b'stage log\n' for row in result['stages']))
+
+    def test_workspace_stage_rejects_historical_or_api_diagnostic_completion(self):
+        state = {'status': 'complete', 'passed': True, 'cleanup_passed': True,
+                 'format': 4, 'workspace_invocation': 'cli'}
+        evidence = {'final_report_exists': True}
+        self.assertTrue(campaign.safe_to_continue('workspaces', 0, state, evidence))
+        for change in ({'format': 3}, {'workspace_invocation': 'api_diagnostic'}, {'workspace_invocation': None}):
+            with self.subTest(change=change):
+                self.assertFalse(campaign.safe_to_continue('workspaces', 0, state | change, evidence))
+        legacy = {key: value for key, value in state.items() if key not in ('format', 'workspace_invocation')}
+        self.assertFalse(campaign.safe_to_continue('workspaces', 0, legacy, evidence))
 
     def test_cold_request_adds_only_existing_api_cases_in_separate_stages(self):
         self.args += ['--cache', 'warm', 'cold']
