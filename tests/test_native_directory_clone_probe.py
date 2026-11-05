@@ -1,12 +1,14 @@
 """Pure/mock safety checks. This module never executes a clone helper."""
 from contextlib import ExitStack
 from copy import deepcopy
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -140,22 +142,48 @@ class DirectoryProbe(unittest.TestCase):
                   source_changed=False, host=True, expected_error=None, sharing=True, pin_unavailable=False,
                   first_recipe_only=False, destination_preserved=True, restore_first_recipe=False,
                   restore_status='restored_pending_final_verifiers', restore_final_preserved=True, restore_close=True,
-                  admission_error=None, setup_capture=False):
+                  admission_error=None, setup_capture=False, restore_small_recipes_only=False, fail_case=None):
         cases = [(probe.FIRST_RECIPE if first_recipe_only and i == 0 else f'controlled-{i:02}',
                   expected_error if i == 0 else None) for i in range(probe.MAX_SMALL_CASES)]
+        prepared_errors = dict(cases)
+        if restore_small_recipes_only:
+            cases = probe.recipes(); prepared_errors = dict(cases)
+            prepared_errors.update({name: (errno.EPERM,) for name in
+                ('inherit-foreign-read', 'inherit-foreign-xattr', 'parent-shared', 'parent-other-principal')})
+        self.prepared_cases, self.constructed_cases, self.restorers, self.cleanup_decisions = [], [], [], []
         def prepare(base, name, *_):
+            self.prepared_cases.append(name)
             for entry in ('source', 'parent', 'outside'): (base / entry).mkdir()
-            if first_recipe_only:
+            checks['strict_equal'] = destination_preserved
+            if first_recipe_only or restore_small_recipes_only and name == probe.FIRST_RECIPE:
                 for directory in ('a', 'b', 'c'): (base / 'source' / directory).mkdir()
                 (base / 'source/a/file').write_bytes(b'original')
                 for directory in ('b', 'c'): os.link(base / 'source/a/file', base / 'source' / directory / 'file')
-            return (base / 'source', base / 'parent', base / 'outside', dict(cases)[name], [],
+            if restore_small_recipes_only and name.startswith('existing-'):
+                destination = base / 'parent/output'
+                if name == 'existing-directory': destination.mkdir()
+                elif name in ('existing-link', 'existing-dangling'): destination.symlink_to('missing')
+                else: destination.write_bytes(b'keep')
+            return (base / 'source', base / 'parent', base / 'outside', prepared_errors[name], [],
                     {field: not missing_coverage for field in probe.COVERAGE})
         def docs(base, name, specification):
             self.docs(name, specification)
             path = base / name; path.mkdir(); return path
         snapshot = detail_snapshot() if first_recipe_only else {'entries': {}, 'unavailable_fields': []}
         snapshots = mock.Mock(return_value=snapshot)
+        if restore_small_recipes_only:
+            # Full first18 report shape; all other unchanged recipes have two
+            # source names (the special refusal's extra name is never projected).
+            from test_native_directory_restore_fd_observer import first_recipe_model
+            full, _ = first_recipe_model()
+            for row in full['entries'].values():
+                if row['acl']['text_hex'] is not None:
+                    row['acl']['text_hex'] = b'!#acl 1\nuser:fixture-owner allow read\n'.hex()
+            small = detail_snapshot({'': detail_entry('directory'), 'file': detail_entry('file')})
+            def observed(path, **_):
+                case = next(part for part in Path(path).parts if part.startswith('case-'))
+                return deepcopy(full if case == 'case-00' else small)
+            snapshots.side_effect = observed
         checks = {'strict_equal': destination_preserved, 'sparse_preserved': True, 'independent_clone': True, 'candidate_losses': []}
         self.restorer = mock.Mock()
         self.restorer.summary = {'status': 'incomplete', 'error': 'restoration_close_failed'}
@@ -174,6 +202,31 @@ class DirectoryProbe(unittest.TestCase):
         restoration_module = types.ModuleType('native_directory_restore')
         restoration_module.Session = mock.Mock(return_value=self.restorer)
         restoration_module.Session.side_effect = admission_error
+        if restore_small_recipes_only:
+            def session(base, *_args, **_kwargs):
+                name = cases[int(Path(base).name.removeprefix('case-'))][0]
+                self.assertIsNone(prepared_errors[name])
+                self.assertTrue(all(item.close.called for item in self.restorers))
+                self.constructed_cases.append(name)
+                item = mock.Mock(); item.case = name; item.closed = False
+                item.summary = dict(status=restore_status, mutation_attempts=27, alias_replacements=5,
+                    acl_repairs=1, tracking_repairs=6, directory_times=6, mode_repairs=int(name == 'setid'),
+                    recovery='not_needed', lease_counts=dict(open_attempts=336, opened=336, close_attempts=336,
+                        closed=336, fstat=1557, named=862, peak=13, live=0, uncertain=0))
+                def reconstruct_case(_snapshot):
+                    checks['strict_equal'] = restore_final_preserved
+                    return deepcopy(item.summary)
+                def closing():
+                    item.closed = True; return restore_close
+                def report():
+                    return dict(status='complete', phase='complete', refusal_code=None, errno=None,
+                        close=dict(status=('complete' if restore_close else 'incomplete') if item.closed else 'deferred',
+                            attempts=336 if item.closed else 0, failures=int(item.closed and not restore_close),
+                            errno=errno.EIO if item.closed and not restore_close else None))
+                item.restore.side_effect = reconstruct_case; item.close.side_effect = closing
+                item.admission_report.side_effect = report; self.restorers.append(item)
+                return item
+            restoration_module.Session.side_effect = session
         restoration_module.AdmissionError = restoration_support.AdmissionError
         restoration_module.refusal_report = restoration_support.refusal_report
         product = types.ModuleType('stallionfs'); product.__file__ = '/private/tmp/installed/stallionfs/__init__.py'
@@ -183,6 +236,7 @@ class DirectoryProbe(unittest.TestCase):
             nonlocal pin_count
             pin_count += 1
             if pin_unavailable: raise FileNotFoundError('PRIVATE missing source /private/source-path')
+            if restore_small_recipes_only: return {name: 'a' * 64 for name in probe.PIN_PATHS}
             return {'source': ('b' if changed_pin and any(row[0][0] == str(self.helper) for row in self.commands) else 'a') * 64}
         def command(argv, **options):
             self.commands.append((argv, options))
@@ -193,9 +247,14 @@ class DirectoryProbe(unittest.TestCase):
                 if capture == 'uncertain': options['receipt']['completion_uncertain'] = True
                 if capture == 'exit': options['receipt']['exit_code'] = 1
                 value = response if response is not None else native()
+                name = cases[int(Path(argv[1]).name.removeprefix('case-'))][0] if restore_small_recipes_only else None
+                if restore_small_recipes_only:
+                    if name == fail_case: return subprocess.CompletedProcess(argv, 0, b'not JSON', b'')
+                    if prepared_errors[name] is not None: value = native(0, prepared_errors[name][0])
+                    elif name != probe.FIRST_RECIPE: (Path(argv[1]) / argv[5] / argv[6]).mkdir()
                 if expected_error and len([row for row in self.commands if row[0][0] == str(self.helper)]) == 1:
                     value = native(0, expected_error[0])
-                if first_recipe_only:
+                if first_recipe_only or restore_small_recipes_only and name == probe.FIRST_RECIPE:
                     target = Path(argv[1]) / argv[5] / argv[6]; target.mkdir()
                     for directory in ('a', 'b', 'c'): (target / directory).mkdir()
                     (target / 'a/file').write_bytes(b'original')
@@ -231,9 +290,23 @@ class DirectoryProbe(unittest.TestCase):
             stack.enter_context(mock.patch.object(native_correctness, 'verify_source', side_effect=verify_source))
             stack.enter_context(mock.patch.object(native_correctness, 'clone_sharing', return_value={'full_data_stream_sharing': sharing}))
             stack.enter_context(mock.patch.object(native_suite, 'cache_prepare', side_effect=AssertionError('No cache/timing work')))
+            if restore_small_recipes_only:
+                def capture_cleanup(item, guard):
+                    guard.update(session=item, report=dict(status='deferred', opened=2, close_attempts=0,
+                        closed=0, uncertain=0, clear_attempts=0, acl_cleared=False))
+                    return guard
+                def finish_cleanup(guard, *, clear):
+                    self.assertTrue(guard['session'].closed)
+                    self.cleanup_decisions.append(clear)
+                    guard['report'].update(status='complete' if clear else 'not_cleared', close_attempts=2,
+                        closed=2, clear_attempts=int(clear), acl_cleared=clear)
+                    return True
+                stack.enter_context(mock.patch.object(probe, 'capture_parent_cleanup', side_effect=capture_cleanup))
+                stack.enter_context(mock.patch.object(probe, 'finish_parent_cleanup', side_effect=finish_cleanup))
             self.removals = stack.enter_context(mock.patch.object(probe.shutil, 'rmtree', wraps=shutil.rmtree))
             code = probe.probe(self.binary, self.wheel, self.helper, self.scratch, output, 'a' * 40,
-                               first_recipe_only=first_recipe_only, restore_first_recipe=restore_first_recipe)
+                               first_recipe_only=first_recipe_only, restore_first_recipe=restore_first_recipe,
+                               restore_small_recipes_only=restore_small_recipes_only)
         return code, json.loads(output.read_text()), snapshots
 
     def test_restoration_keeps_raw_negative_and_runs_final_verifiers_with_exactly_one_helper_and_no_docs(self):
@@ -249,6 +322,90 @@ class DirectoryProbe(unittest.TestCase):
         self.assertEqual((value['restoration_admission']['status'], value['restoration_admission']['phase']), ('complete', 'complete'))
         self.assertEqual(value['restoration_admission']['close']['status'], 'complete')
         self.docs.assert_not_called()
+
+    def test_nineteen_restoration_uses_returned_control_errors_closes_each_positive_and_fits_status_limit(self):
+        code, value, _ = self.run_probe(restore_small_recipes_only=True, destination_preserved=False)
+        positives = [probe.FIRST_RECIPE, 'setid', 'inherit-clean', 'inherit-parent-read', 'inherit-owner',
+                     'parent-sticky', 'parent-deny', 'parent-current-user']
+        self.assertEqual((code, value['status']), (0, 'small_recipe_restoration_complete'))
+        self.assertEqual(self.prepared_cases, [name for name, _ in probe.recipes()])
+        self.assertEqual(self.constructed_cases, positives)
+        self.assertEqual(len(self.restorers), 8)
+        for item in self.restorers: item.close.assert_called_once()
+        self.assertEqual((value['positive_cases'], value['expected_refusal_cases'], value['helper_invocations']), (8, 11, 19))
+        self.assertEqual((value['restoration_sessions_started'], value['restoration_sessions_closed']), (8, 8))
+        self.assertTrue(value['small_gate_qualified']); self.assertFalse(value['full_gate_qualified'])
+        self.assertFalse(value['docs_attempted']); self.docs.assert_not_called()
+        self.assertTrue(all(row['passed'] for row in value['cases']))
+        restored = [row for row in value['cases'] if 'restoration' in row]
+        self.assertEqual(len(restored), 8)
+        self.assertTrue(all(row['restoration_admission']['close']['status'] == 'complete' for row in restored))
+        self.assertTrue(all(not row['raw_clone']['passed'] for row in restored))
+        self.assertEqual(self.cleanup_decisions, [True])
+        self.assertEqual(value['cases'][0]['first_recipe_detail']['entry_count'], 18)
+        self.assertEqual(len(value['source_sha256']), 19)
+        # This is the actual full driver result shape, including both first18
+        # projections, all19 rows, 8 complete summaries/close records and19 pins.
+        self.assertLessEqual(len(json.dumps(value, indent=2).encode()), 65536)
+
+    def test_nineteen_unknown_parent_deny_target_closes_but_never_clears_or_continues(self):
+        _, value, snapshots = self.run_probe(restore_small_recipes_only=True, fail_case='parent-deny')
+        self.assertEqual(value['target_completion'], 'unknown')
+        self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.assertFalse(value['small_gate_qualified']); self.assertEqual(self.cleanup_decisions, [False])
+        self.assertEqual(self.prepared_cases[-1], 'parent-deny')
+        self.assertNotIn('parent-current-user', self.prepared_cases)
+        self.assertEqual(snapshots.call_count, self.last_snapshot_count)
+        self.removals.assert_not_called(); self.docs.assert_not_called()
+        for item in self.restorers: item.close.assert_called_once()
+
+    def test_nineteen_close_failure_stops_before_next_case_or_helper(self):
+        _, value, _ = self.run_probe(restore_small_recipes_only=True, restore_close=False)
+        self.assertEqual(value['cleanup'], 'retained_ephemeral')
+        self.assertEqual(value['error'], 'restoration_close_failed')
+        self.assertEqual((value['helper_invocations'], self.prepared_cases), (1, [probe.FIRST_RECIPE]))
+        self.assertEqual(self.constructed_cases, [probe.FIRST_RECIPE]); self.restorers[0].close.assert_called_once()
+        self.assertFalse(value['small_gate_qualified']); self.removals.assert_not_called(); self.docs.assert_not_called()
+
+    def test_nineteen_scope_rejects_first_only_flags_before_commands_or_sessions(self):
+        _, value, snapshots = self.run_probe(restore_small_recipes_only=True, first_recipe_only=True)
+        self.assertEqual(value['error'], 'restoration_scope_invalid')
+        self.assertEqual(self.commands, []); self.assertEqual(self.constructed_cases, [])
+        self.assertEqual(snapshots.call_count, 0); self.docs.assert_not_called()
+
+    def test_real_prepare_classifies_original_eight_positives_and_eleven_controls_without_native_calls(self):
+        class Entry:
+            def __init__(self, name='case', state=None):
+                self.name = name; self.state = {} if state is None else state
+            def __truediv__(self, name): return Entry(self.name + '/' + name, self.state)
+            def __str__(self): return self.name
+            def mkdir(self, mode=0o777): self.state[self.name] = (stat.S_IFDIR | mode, 0)
+            def write_bytes(self, _): self.state[self.name] = (stat.S_IFREG | 0o644, 0)
+            def unlink(self): self.state.pop(self.name)
+            def symlink_to(self, *_args, **_kwargs): self.state[self.name] = (stat.S_IFLNK | 0o777, 0)
+            def relative_to(self, base): return self.name.removeprefix(str(base) + '/')
+            def chmod(self, mode): self.state[self.name] = (stat.S_IFMT(self.stat().st_mode) | mode, self.stat().st_flags)
+            def stat(self):
+                mode, flags = self.state[self.name]
+                return types.SimpleNamespace(st_mode=mode, st_flags=flags)
+            lstat = stat
+        def chflags(path, flags, **_): path.state[path.name] = (path.stat().st_mode, flags)
+        observed = {'hardlink_groups': [['a', 'b'], ['c', 'd'], ['e', 'f']],
+                    'entries': {name: {'flags': 64} for name in ('', 'a', 'a/file', 'a/link')}}
+        fixture = types.SimpleNamespace(enrich_metadata=mock.Mock(), verify_metadata_coverage=mock.Mock(return_value={'populated': True}))
+        correct = types.SimpleNamespace(snapshot=mock.Mock(return_value=observed))
+        returned = {}
+        with mock.patch.object(probe.os, 'chown'), mock.patch.object(probe.os, 'link'), \
+             mock.patch.object(probe.os, 'chflags', side_effect=chflags, create=True), \
+             mock.patch.object(probe.os, 'mkfifo'), mock.patch.object(probe.pwd, 'getpwuid', return_value=types.SimpleNamespace(pw_name='fixture-owner')):
+            for name, _ in probe.recipes():
+                returned[name] = probe.prepare(Entry(), name, fixture, correct, mock.Mock())[3]
+        positives = [probe.FIRST_RECIPE, 'setid', 'inherit-clean', 'inherit-parent-read', 'inherit-owner',
+                     'parent-sticky', 'parent-deny', 'parent-current-user']
+        self.assertEqual([name for name, error in returned.items() if error is None], positives)
+        self.assertEqual(len([error for error in returned.values() if error is not None]), 11)
+        for name in ('inherit-foreign-read', 'inherit-foreign-xattr', 'parent-shared', 'parent-other-principal'):
+            self.assertEqual(returned[name], (errno.EPERM,))
 
     def test_restoration_failure_or_unknown_completion_never_rescans_or_starts_later_work(self):
         _, value, snapshots = self.run_probe(first_recipe_only=True, restore_first_recipe=True, capture='uncertain')
@@ -440,7 +597,8 @@ class DirectoryProbe(unittest.TestCase):
         observed = probe.pins(checkout)
         self.assertEqual(set(observed), set(probe.PIN_PATHS))
         self.assertIn('tests/test_native_directory_restore_fd_observer.py', observed)
-        self.assertEqual(len(observed), 18)
+        self.assertIn('tests/test_native_directory_restore_policy.py', observed)
+        self.assertEqual(len(observed), 19)
         self.assertNotIn('stallionfs/_benchmark_runtime/native_metrics.py', observed)
         self.assertEqual(observed['tests/perf/native_metrics.py'],
                          hashlib.sha256((checkout / 'tests/perf/native_metrics.py').read_bytes()).hexdigest())
@@ -478,13 +636,15 @@ class DirectoryProbe(unittest.TestCase):
             self.assertIn(f"if: inputs.mode == '{mode}'", text)
         directory_step = text.split('      - name: Collect hosted directory feasibility\n')[1].split('      - name: Show correctness')[0]
         self.assertNotIn('native_suite.py', directory_step); self.assertNotIn('thread-cpu', directory_step)
-        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--first-recipe-only', '--restore-first-recipe']", directory_step)
-        self.assertEqual(text.count("'--first-recipe-only'"), 1)
-        self.assertEqual(text.count("'--restore-first-recipe'"), 1)
+        self.assertIn("'--revision', os.environ['GITHUB_SHA'], '--restore-small-recipes-only']", directory_step)
+        self.assertEqual(text.count("'--restore-small-recipes-only'"), 1)
+        self.assertNotIn("'--first-recipe-only'", text)
+        self.assertNotIn("'--restore-first-recipe'", text)
         self.assertIn('directory-feasibility-status.json', directory_step)
         fallback = directory_step.split('          if not output.exists():\n')[1]
-        self.assertIn("'scope': 'hosted first-recipe selective restoration only'", fallback)
-        self.assertIn("'first_recipe_only': True, 'restoration_only': True, 'full_gate_qualified': False", fallback)
+        self.assertIn("'scope': 'hosted nineteen-recipe selective restoration only'", fallback)
+        self.assertIn("'first_recipe_only': False, 'small_recipes_only': True, 'restoration_only': True", fallback)
+        self.assertIn("'small_gate_qualified': False, 'full_gate_qualified': False", fallback)
         self.assertIn("'docs_attempted': None", fallback)
         self.assertIn("'helper_invocations': None", fallback)
         self.assertIn("'clone_calls': None", fallback)
@@ -501,6 +661,101 @@ class DirectoryProbe(unittest.TestCase):
         self.assertIsNone(prepared[3])
         self.assertTrue(prepared[5]['inherited_acl'])
         self.assertEqual((base / 'source/file').read_bytes(), b'original')
+
+
+class FixtureParentCleanup(unittest.TestCase):
+    def model(self):
+        from test_native_directory_restore import FakeOps, fixtures
+        source, destination = fixtures(); ops = FakeOps(source, destination)
+        base = ops.open('private', 0); parent = ops.open('parent', 0, dir_fd=base)
+        session = types.SimpleNamespace(ops=ops, root=base, parent=parent)
+        acl = [b'complete private ACL including flags and qualifier']
+        ops.acl_fingerprint = mock.Mock(side_effect=lambda _fd: acl[0])
+        def clear(fd): ops.called('clear_fixture_acl', fd); acl[0] = b'empty'
+        ops.clear_fixture_acl = mock.Mock(side_effect=clear)
+        return session, ops, acl
+
+    def test_cleanup_keeps_held_base_parent_after_session_close_and_clears_once(self):
+        session, ops, _ = self.model(); guard = probe.capture_parent_cleanup(session)
+        ops.close(session.parent); ops.close(session.root)
+        self.assertTrue(probe.finish_parent_cleanup(guard, clear=True))
+        report = guard['report']
+        self.assertEqual((report['opened'], report['closed'], report['uncertain'], report['clear_attempts']), (2, 2, 0, 1))
+        self.assertEqual(report['status'], 'complete'); self.assertTrue(report['acl_cleared'])
+        ops.clear_fixture_acl.assert_called_once_with(guard['parent']); self.assertEqual(ops.descriptors, {})
+        before = list(ops.calls)
+        self.assertTrue(probe.finish_parent_cleanup(guard, clear=True)); self.assertEqual(ops.calls, before)
+
+    def test_changed_named_parent_held_owner_base_mode_or_acl_prevents_clear(self):
+        for change in ('name', 'owner', 'base_mode', 'acl'):
+            with self.subTest(change=change):
+                session, ops, acl = self.model(); guard = probe.capture_parent_cleanup(session)
+                if change == 'name':
+                    replacement = deepcopy(ops.names[(80, 'parent')]); replacement['info'].st_ino += 1
+                    ops.names[(80, 'parent')] = replacement
+                elif change == 'owner': ops.descriptors[guard['parent']]['info'].st_uid += 1
+                elif change == 'base_mode': ops.descriptors[guard['base']]['info'].st_mode ^= 0o010
+                else: acl[0] += b'changed'
+                self.assertFalse(probe.finish_parent_cleanup(guard, clear=True))
+                ops.clear_fixture_acl.assert_not_called()
+                self.assertEqual((guard['report']['status'], guard['report']['closed']), ('incomplete', 2))
+                ops.close(session.parent); ops.close(session.root)
+
+    def test_failed_or_unknown_case_only_closes_guards_without_scans_or_setters(self):
+        session, ops, _ = self.model(); guard = probe.capture_parent_cleanup(session)
+        for name in ('fstat', 'named', 'acl_fingerprint', 'clear_fixture_acl'):
+            setattr(ops, name, mock.Mock(side_effect=AssertionError('follow-up after unknown completion')))
+        self.assertTrue(probe.finish_parent_cleanup(guard, clear=False))
+        self.assertEqual((guard['report']['status'], guard['report']['clear_attempts'], guard['report']['closed']), ('not_cleared', 0, 2))
+        ops.close(session.parent); ops.close(session.root)
+
+    def test_partial_guard_capture_accounts_returned_handle_and_preserves_close_uncertainty(self):
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain):
+                session, ops, _ = self.model(); statting, closing = ops.fstat, ops.close; guard = {}; attempts = []
+                def stat(fd):
+                    if fd not in (session.root, session.parent): raise OSError(errno.EIO, 'mock provisional admission')
+                    return statting(fd)
+                def close(fd):
+                    attempts.append(fd)
+                    if uncertain and fd not in (session.root, session.parent): raise OSError(errno.EINTR, 'mock uncertain close')
+                    closing(fd)
+                ops.fstat, ops.close = stat, close
+                with self.assertRaises(OSError): probe.capture_parent_cleanup(session, guard)
+                self.assertEqual((guard['report']['opened'], guard['report']['close_attempts']), (1, 1))
+                self.assertEqual(guard['report']['uncertain'], int(uncertain))
+                self.assertEqual(attempts, [guard['base']])
+                self.assertEqual(guard['base'] in ops.descriptors, uncertain)
+                before = list(ops.calls)
+                self.assertEqual(probe.finish_parent_cleanup(guard, clear=False), not uncertain)
+                self.assertEqual(ops.calls, before); ops.clear_fixture_acl.assert_not_called()
+                closing(session.parent); closing(session.root)
+
+    def test_setter_and_close_failures_stop_with_once_only_ownership_accounting(self):
+        for failure in ('setter', 'close-before', 'close-after'):
+            with self.subTest(failure=failure):
+                session, ops, _ = self.model(); guard = probe.capture_parent_cleanup(session)
+                attempts = []; closing = ops.close
+                if failure == 'setter': ops.clear_fixture_acl.side_effect = OSError(errno.EIO, 'mock setter')
+                else:
+                    def close(fd):
+                        attempts.append(fd)
+                        if fd == guard['parent']:
+                            if failure == 'close-after': closing(fd)
+                            raise OSError(errno.EINTR, 'mock uncertain close')
+                        closing(fd)
+                    ops.close = close
+                self.assertFalse(probe.finish_parent_cleanup(guard, clear=True))
+                self.assertEqual(guard['report']['status'], 'incomplete')
+                self.assertEqual(guard['report']['close_attempts'], 2)
+                self.assertEqual(guard['report']['uncertain'], int(failure != 'setter'))
+                if failure != 'setter':
+                    self.assertEqual(attempts, [guard['parent'], guard['base']])
+                    self.assertEqual(guard['parent'] in ops.descriptors, failure == 'close-before')
+                before = list(ops.calls)
+                self.assertFalse(probe.finish_parent_cleanup(guard, clear=True)); self.assertEqual(ops.calls, before)
+                ops.clear_fixture_acl.assert_called_once()
+                closing(session.parent); closing(session.root)
 
 
 if __name__ == '__main__': unittest.main()

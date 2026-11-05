@@ -35,6 +35,7 @@ PIN_PATHS = ('stallionfs/_tree.c', 'stallionfs/_tree.h', 'stallionfs/_benchmark_
 PIN_PATHS += ('tests/test_native_directory_clone_probe.py', '.github/workflows/checks.yml')
 PIN_PATHS += ('tests/perf/native_directory_restore.py', 'tests/test_native_directory_restore.py')
 PIN_PATHS += ('tests/test_native_directory_restore_fd_observer.py',)
+PIN_PATHS += ('tests/test_native_directory_restore_policy.py',)
 SETUP_ERRORS = {'host_checks': 'host_check_failed', 'inputs': 'input_unavailable',
                 'wheel_identity': 'wheel_unavailable', 'source_pins': 'pin_unavailable',
                 'binary_pins': 'binary_pin_unavailable', 'private_fixture_setup': 'fixture_setup_failed',
@@ -249,7 +250,74 @@ def prepare(base, name, native_fixtures, correct, run):
     return source, parent, outside, expected_error, protected, coverage
 
 
-def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only=False, restore_first_recipe=False):
+def fixture_identity(info):
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_flags
+
+
+def capture_parent_cleanup(session, guard=None):
+    """Retain only the known parent-deny fixture's held cleanup ancestry."""
+    ops = session.ops
+    guard = {} if guard is None else guard
+    guard.update(ops=ops, owned=[], finished=False, report={'status': 'capturing', 'opened': 0,
+                 'close_attempts': 0, 'closed': 0, 'uncertain': 0, 'clear_attempts': 0, 'acl_cleared': False})
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        for role, anchor in (('base', session.root), ('parent', session.parent)):
+            fd = ops.open('.', flags, dir_fd=anchor)
+            guard['owned'].append(fd); guard['report']['opened'] += 1; guard[role] = fd
+            info = ops.fstat(fd); original = ops.fstat(anchor)
+            require(fixture_identity(info) == fixture_identity(original) and stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                    'cleanup_identity_failed')
+            guard[role + '_identity'] = fixture_identity(info)
+        require(guard['base_identity'][0] == guard['parent_identity'][0], 'cleanup_identity_failed')
+        require(fixture_identity(ops.named(guard['base'], 'parent')) == guard['parent_identity'],
+                'cleanup_identity_failed')
+        guard['acl'] = ops.acl_fingerprint(guard['parent'])
+        guard['report']['status'] = 'deferred'
+        return guard
+    except BaseException:
+        finish_parent_cleanup(guard, clear=False)
+        raise
+
+
+def finish_parent_cleanup(guard, *, clear):
+    """No scans or setters on failed/unknown cases; ambiguous closes are final."""
+    if guard['finished']: return guard['finished_success']
+    ops, report = guard['ops'], guard['report']; succeeded = True
+    try:
+        if clear:
+            for role in ('base', 'parent'):
+                require(fixture_identity(ops.fstat(guard[role])) == guard[role + '_identity'],
+                        'cleanup_identity_failed')
+            require(fixture_identity(ops.named(guard['base'], 'parent')) == guard['parent_identity'],
+                    'cleanup_identity_failed')
+            require(ops.acl_fingerprint(guard['parent']) == guard['acl'], 'cleanup_acl_changed')
+            report['clear_attempts'] += 1
+            ops.clear_fixture_acl(guard['parent'])
+            for role in ('base', 'parent'):
+                require(fixture_identity(ops.fstat(guard[role])) == guard[role + '_identity'],
+                        'cleanup_identity_failed')
+            require(fixture_identity(ops.named(guard['base'], 'parent')) == guard['parent_identity'],
+                    'cleanup_identity_failed')
+            report.update(status='complete', acl_cleared=True)
+        else:
+            report['status'] = 'not_cleared'
+    except BaseException:
+        succeeded = False; report['status'] = 'incomplete'
+    finally:
+        while guard['owned']:
+            fd = guard['owned'].pop(); report['close_attempts'] += 1
+            try:
+                ops.close(fd); report['closed'] += 1
+            except BaseException:
+                succeeded = False; report['uncertain'] += 1; report['status'] = 'incomplete'
+        guard.update(finished=True, finished_success=succeeded)
+    return succeeded
+
+
+def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only=False,
+          restore_first_recipe=False, restore_small_recipes_only=False):
     from stallionfs._benchmark_budget import command
     import stallionfs
     import fileops
@@ -267,13 +335,56 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
         result.update(scope='hosted directory-clone first-recipe detail only', first_recipe_only=True, full_gate_qualified=False)
     if restore_first_recipe:
         result.update(scope='hosted first-recipe selective restoration only', restoration_only=True, full_gate_qualified=False)
+    if restore_small_recipes_only:
+        result.update(scope='hosted nineteen-recipe selective restoration only', restoration_only=True,
+                      small_recipes_only=True, first_recipe_only=False, full_gate_qualified=False,
+                      small_gate_qualified=False, positive_cases=0, expected_refusal_cases=0,
+                      restoration_sessions_started=0, restoration_sessions_closed=0)
     private = identity = None
     safe_to_clean = True
     protected_paths = []
     restoration_sessions = []
+
+    def close_sessions(*, raise_on_failure=True):
+        nonlocal safe_to_clean
+        failed = False
+        while restoration_sessions:
+            item = restoration_sessions.pop(); restoration = item['session']; row = item.get('row')
+            try:
+                closed = restoration.close()
+                report = restoration.admission_report()
+            except BaseException:
+                closed = False
+                report = {'status': 'unknown', 'phase': 'unknown', 'refusal_code': None, 'errno': None,
+                          'close': {'status': 'unknown', 'attempts': 0, 'failures': 0, 'errno': None}}
+            result['restoration_admission'] = report
+            if restore_small_recipes_only and row is not None:
+                row['restoration_admission'] = report
+            if not closed:
+                failed = True; safe_to_clean = False
+                result.update(status='incomplete'); result.setdefault('error', 'restoration_close_failed')
+            elif restore_small_recipes_only:
+                result['restoration_sessions_closed'] += 1
+            if row is not None and 'restoration' in row and (restore_small_recipes_only or not closed):
+                row['restoration'] = dict(restoration.summary)
+            guard = item.get('parent_cleanup')
+            if guard is not None:
+                clear = bool(closed and row is not None and row.get('passed') is True
+                             and safe_to_clean and result['target_completion'] == 'complete')
+                guarded = finish_parent_cleanup(guard, clear=clear)
+                result['fixture_parent_cleanup'] = dict(guard['report'])
+                if row is not None: row['fixture_parent_cleanup'] = dict(guard['report'])
+                if not guarded:
+                    failed = True; safe_to_clean = False
+                    result.update(status='incomplete'); result.setdefault('error', 'cleanup_failed')
+        if failed and raise_on_failure and sys.exc_info()[1] is None:
+            raise ProbeError(result.get('error', 'restoration_close_failed'))
+
     os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 180)
     try:
         require(not restore_first_recipe or first_recipe_only, 'restoration_scope_invalid')
+        require(not restore_small_recipes_only or not (first_recipe_only or restore_first_recipe),
+                'restoration_scope_invalid')
         require(sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true'
                 and os.environ.get('STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED') == '1'
                 and re.fullmatch('[0-9a-f]{40}', revision) is not None, 'host_invalid')
@@ -356,8 +467,12 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             require(correct.verify_source(expected, correct.snapshot(source, allow_special=name == 'special'))['unchanged'] is True,
                     'source_precheck_failed')
             restoration = None
-            if restore_first_recipe:
-                require(first_recipe_only and name == FIRST_RECIPE and not docs, 'restoration_scope_invalid')
+            if restore_small_recipes_only:
+                result['positive_cases' if expected_error is None else 'expected_refusal_cases'] += 1
+            session_item = None
+            if restore_first_recipe or restore_small_recipes_only and expected_error is None:
+                require(not docs and (restore_small_recipes_only or first_recipe_only and name == FIRST_RECIPE),
+                        'restoration_scope_invalid')
                 result['stage'] = 'restoration_admission'
                 import native_directory_restore as restore
                 try:
@@ -370,7 +485,13 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                     result['restoration_admission'] = restore.refusal_report(error)
                     raise ProbeError('restoration_admission_failed') from None
                 result['restoration_admission'] = restoration.admission_report()
-                restoration_sessions.append(restoration)
+                session_item = {'session': restoration}
+                restoration_sessions.append(session_item)
+                if restore_small_recipes_only:
+                    result['restoration_sessions_started'] += 1
+                    if name == 'parent-deny':
+                        session_item['parent_cleanup'] = {}
+                        capture_parent_cleanup(restoration, session_item['parent_cleanup'])
                 result['stage'] = 'small_recipes'
             protected_paths.extend(source / relative for relative in protected)
             source_inode = source_info.st_ino + (name == 'stale-source-pin')
@@ -379,6 +500,7 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             safe_to_clean = False
             row = {'case': name, 'passed': False, 'coverage': coverage}
             result['cases'].append(row)
+            if session_item is not None: session_item['row'] = row
             known_calls = result['clone_calls']
             result['clone_calls'] = None
             row['clone_calls'] = None
@@ -425,7 +547,8 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                     after = correct.snapshot(destination, observe_sharing=True)
                     source_after = correct.snapshot(source, observe_sharing=True)
                 row.update(verdict(expected, source_after, after, outside_before, correct.snapshot(outside), correct,
-                                   native_suite.preserved, include_detail=first_recipe_only and name == FIRST_RECIPE))
+                                   native_suite.preserved,
+                                   include_detail=(first_recipe_only or restore_small_recipes_only) and name == FIRST_RECIPE))
                 protected_paths.extend(destination / relative for relative in protected)
                 if name == 'metadata-hardlinks-symlinks-flags' and row['passed']:
                     # Existing cross-directory alias isolation assertion, after the immutable snapshot comparison.
@@ -447,7 +570,10 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
         for index, (name, _) in enumerate(cases[:1] if first_recipe_only else cases):
             base = private / f'case-{index:02}'; base.mkdir(mode=0o700)
             safe_to_clean = False
-            execute(base, name)
+            try:
+                execute(base, name)
+            finally:
+                close_sessions()
         if first_recipe_only:
             require(len(result['cases']) == 1 and result['helper_invocations'] == 1 and result['clone_calls'] == 1
                     and result['cases'][0].get('first_recipe_detail', {}).get('status') == 'available',
@@ -457,23 +583,23 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
             require(len(result['cases']) == MAX_SMALL_CASES and all(row['passed'] for row in result['cases']), 'small_gate_failed')
             require(all(any(row['coverage'].get(field) is True for row in result['cases']) for field in COVERAGE),
                     'coverage_incomplete')
-            result['stage'] = 'document_recipe'
-            base = private / 'docs'; base.mkdir(mode=0o700)
-            safe_to_clean = False
-            execute(base, 'docs_5k_100mb', docs=True)
-            result['status'] = 'feasible_controlled_fixture_only'
+            if restore_small_recipes_only:
+                require(result['positive_cases'] == result['restoration_sessions_started']
+                        == result['restoration_sessions_closed'] == 8
+                        and result['expected_refusal_cases'] == 11 and result['helper_invocations'] == 19,
+                        'small_gate_failed')
+                result['status'] = 'small_recipe_restoration_complete'
+            else:
+                result['stage'] = 'document_recipe'
+                base = private / 'docs'; base.mkdir(mode=0o700)
+                safe_to_clean = False
+                execute(base, 'docs_5k_100mb', docs=True)
+                result['status'] = 'feasible_controlled_fixture_only'
         result['stage'] = 'complete'
     except BaseException as error:
         result['error'] = str(error) if isinstance(error, ProbeError) else SETUP_ERRORS.get(result['stage'], 'probe_incomplete')
     finally:
-        for restoration in restoration_sessions:
-            closed = restoration.close()
-            result['restoration_admission'] = restoration.admission_report()
-            if not closed:
-                safe_to_clean = False
-                result.update(status='incomplete', error='restoration_close_failed')
-                for row in result['cases']:
-                    if 'restoration' in row: row['restoration'] = dict(restoration.summary)
+        close_sessions(raise_on_failure=False)
         if private is not None:
             result['cleanup'] = 'retained_ephemeral'
             if safe_to_clean:
@@ -493,8 +619,11 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                     result['cleanup'] = 'complete'
                 except BaseException:
                     result['status'] = 'incomplete'; result['stage'] = 'cleanup'; result['error'] = 'cleanup_failed'
+        if restore_small_recipes_only:
+            result['small_gate_qualified'] = result['status'] == 'small_recipe_restoration_complete' and result['cleanup'] == 'complete'
         publish(output, result)
-    complete = ('first_recipe_restoration_complete' if restore_first_recipe else
+    complete = ('small_recipe_restoration_complete' if restore_small_recipes_only else
+                'first_recipe_restoration_complete' if restore_first_recipe else
                 'first_recipe_diagnostic_complete' if first_recipe_only else 'feasible_controlled_fixture_only')
     return 0 if result['status'] == complete and result['cleanup'] == 'complete' else 1
 
@@ -506,10 +635,12 @@ def main():
     parser.add_argument('--revision', required=True)
     parser.add_argument('--first-recipe-only', action='store_true')
     parser.add_argument('--restore-first-recipe', action='store_true')
+    parser.add_argument('--restore-small-recipes-only', action='store_true')
     args = parser.parse_args()
     try:
         return probe(args.binary, args.wheel, args.helper, args.scratch, args.output, args.revision,
-                     first_recipe_only=args.first_recipe_only, restore_first_recipe=args.restore_first_recipe)
+                     first_recipe_only=args.first_recipe_only, restore_first_recipe=args.restore_first_recipe,
+                     restore_small_recipes_only=args.restore_small_recipes_only)
     except BaseException:
         return 1
 

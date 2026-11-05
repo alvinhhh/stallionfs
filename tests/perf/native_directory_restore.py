@@ -1,4 +1,4 @@
-"""Confined first-recipe reconstruction experiment; never a production backend.
+"""Confined small-recipe reconstruction experiment; never a production backend.
 
 Stable source is required. Held identities detect replacement; pathname link/unlink
 cannot exclude the same user racing its own namespace. No cancellation bound or
@@ -74,6 +74,13 @@ def relative(name):
     return name.rsplit('/', 1) if '/' in name else ('', name)
 
 
+def owned_setid_leaf(snapshot, name, owner):
+    row = snapshot['entries'][name]
+    return (owner == os.geteuid() and row['kind'] == 'file' and row['uid'] == owner and row['gid'] == os.getegid()
+            and row['link_count'] == 1 and sum(other['device_inode'] == row['device_inode']
+                for other in snapshot['entries'].values()) == 1)
+
+
 def plan(source, destination, owner):
     """Compute selectors from full verified metadata, never the safe projection."""
     for snapshot in (source, destination):
@@ -89,7 +96,7 @@ def plan(source, destination, owner):
         for row in (a, b):
             need(type(row) is dict and COMMON_REQUIRED <= row.keys() and row.keys() <= ROW_FIELDS)
             need(row['kind'] in ('file', 'directory', 'symlink') and row['uid'] == owner)
-            need(type(row['mode']) is int and not row['mode'] & (stat.S_ISUID | stat.S_ISGID))
+            need(type(row['mode']) is int)
             need(type(row['mtime_ns']) is int and type(row['ctime_ns']) is int and type(row['gid']) is int)
             need(type(row['flags']) is int and row['flags'] >= 0 and not row['flags'] & ~ALLOWED_FLAGS)
             need(type(row['device_inode']) is list and len(row['device_inode']) == 2
@@ -101,7 +108,7 @@ def plan(source, destination, owner):
         need(a['kind'] != 'directory' or not a['flags'] & BLOCKING)
         need(not (a['flags'] ^ b['flags']) & ~TRACKED and not b['flags'] & TRACKED & ~a['flags'])
         for field in correct.FIELDS:
-            if field in ('acl', 'flags') or (field == 'mtime_ns' and a['kind'] == 'directory'):
+            if field in ('acl', 'flags', 'mode') or (field == 'mtime_ns' and a['kind'] == 'directory'):
                 continue
             need(a.get(field) == b.get(field))
         if a['kind'] == 'file':
@@ -118,6 +125,13 @@ def plan(source, destination, owner):
     source_inodes = {tuple(row['device_inode']) for row in left.values()}
     need(not source_inodes.intersection(tuple(row['device_inode']) for row in right.values()))
     need(all(row['device_inode'][0] == left['']['device_inode'][0] for row in (*left.values(), *right.values())))
+    modes = []
+    for name, a in left.items():
+        b = right[name]
+        if a['mode'] != b['mode'] or (a['mode'] | b['mode']) & 0o6000:
+            need(owned_setid_leaf(source, name, owner) and owned_setid_leaf(destination, name, owner))
+            need(b['mode'] in (a['mode'], a['mode'] & ~0o6000))
+            if a['mode'] != b['mode']: modes.append(name)
     for names in destination_classes.values():
         # A merged class would need a new inode; splitting is deliberately absent.
         need(len({tuple(left[name]['device_inode']) for name in names}) == 1)
@@ -136,7 +150,7 @@ def plan(source, destination, owner):
                          key=lambda name: (name.count('/') + bool(name), name), reverse=True)
     objects = sorted(canonical) + directories
     # Canonical metadata is sufficient only after the complete class plan qualifies.
-    return {'aliases': aliases, 'objects': objects, 'directories': directories,
+    return {'aliases': aliases, 'objects': objects, 'directories': directories, 'modes': modes,
             'flags': [name for name in objects if left[name]['flags'] != right[name]['flags']],
             'acl': [name for name in objects if left[name]['acl'] != right[name]['acl']]}
 
@@ -151,6 +165,8 @@ class DarwinOps:
             ('fchflags', [integer, ctypes.c_uint32], integer),
             ('acl_get_fd_np', [integer, integer], pointer), ('acl_init', [integer], pointer),
             ('acl_free', [pointer], integer), ('acl_to_text', [pointer, ctypes.POINTER(ctypes.c_ssize_t)], pointer),
+            ('acl_size', [pointer], ctypes.c_ssize_t),
+            ('acl_copy_ext', [pointer, pointer, ctypes.c_ssize_t], ctypes.c_ssize_t),
             ('acl_valid', [pointer], integer), ('acl_set_fd_np', [integer, pointer, integer], integer),
             ('acl_get_entry', [pointer, integer, ctypes.POINTER(pointer)], integer),
             ('acl_get_tag_type', [pointer, ctypes.POINTER(integer)], integer),
@@ -247,6 +263,34 @@ class DarwinOps:
         finally:
             self.free(acl)
 
+    def acl_binary(self, acl):
+        length = self.call(self.libc.acl_size, acl)
+        need(0 < length <= 16384, 'acl_unavailable')
+        data = ctypes.create_string_buffer(length)
+        need(self.call(self.libc.acl_copy_ext, data, acl, length) == length, 'acl_unavailable')
+        return data.raw
+
+    def acl_fingerprint(self, fd):
+        # Complete public serialization, kept private for one fixture's cleanup.
+        acl = self.acl(fd)
+        try:
+            self.call(self.libc.acl_valid, acl)
+            return self.acl_binary(acl)
+        finally:
+            self.free(acl)
+
+    def clear_fixture_acl(self, fd):
+        ctypes.set_errno(0)
+        acl = self.libc.acl_init(0); failure = ctypes.get_errno()
+        if not acl: raise OSError(failure or errno.EIO, 'ACL unavailable')
+        try:
+            self.call(self.libc.acl_valid, acl)
+            empty = self.acl_binary(acl)
+            self.call(self.libc.acl_set_fd_np, fd, acl, 0x100)
+            need(self.acl_fingerprint(fd) == empty, 'acl_changed')
+        finally:
+            self.free(acl)
+
     def flags(self, fd, flags):
         self.call(self.libc.fchflags, fd, flags)
 
@@ -307,7 +351,7 @@ class Session:
         self.counts = dict(open_attempts=0, opened=0, close_attempts=0, closed=0,
                            fstat=0, named=0, peak=0, live=0, uncertain=0)
         self.summary = {'status': 'not_started', 'mutation_attempts': 0, 'alias_replacements': 0,
-                        'acl_repairs': 0, 'tracking_repairs': 0, 'directory_times': 0,
+                        'acl_repairs': 0, 'tracking_repairs': 0, 'directory_times': 0, 'mode_repairs': 0,
                         'recovery': 'not_needed', 'lease_counts': self.counts}
         self.close_outcome = {'status': 'not_needed', 'attempts': 0, 'failures': 0, 'errno': None}
         self.admission = {'status': 'refused', 'phase': 'ops_binding', 'refusal_code': None, 'errno': None,
@@ -441,10 +485,11 @@ class Session:
         self.note_admission('schema')
         need(snapshot.get('unavailable_fields') == [] and 0 < len(snapshot['entries']) <= MAX_ENTRIES)
         total = 0
-        for row in snapshot['entries'].values():
+        for name, row in snapshot['entries'].items():
             need(type(row) is dict and COMMON_REQUIRED <= row.keys() and row.keys() <= ROW_FIELDS)
             need(row['kind'] in ('directory', 'file', 'symlink') and row['uid'] == os.geteuid())
-            need(type(row['mode']) is int and not row['mode'] & (stat.S_ISUID | stat.S_ISGID))
+            need(type(row['mode']) is int)
+            if row['mode'] & 0o6000: need(owned_setid_leaf(snapshot, name, os.geteuid()))
             need(type(row['flags']) is int and row['flags'] >= 0 and not row['flags'] & ~ALLOWED_FLAGS)
             if row['kind'] == 'file':
                 need(type(row.get('size')) is int and 0 <= row['size'] <= 32 * 1024 * 1024); total += row['size']
@@ -633,6 +678,16 @@ class Session:
         if name in self.derived['acl']:
             self.mutate('acl', lambda: self.ops.copy_acl(source['fd'], target['fd']), [(target, {'st_ctime_ns'}, None)])
             self.summary['acl_repairs'] += 1
+        if name in self.derived['modes']:
+            self.changed_modes[target['fd']] = (target, stat.S_IMODE(target['record']['info'].st_mode))
+            def file_mode():
+                self.ops.mode(target['fd'], expected['mode'])
+                applied = self.fstat(target['fd'])
+                need(stat.S_ISREG(applied.st_mode) and stat.S_IMODE(applied.st_mode) == expected['mode'],
+                     'identity_changed')
+            self.mutate('file_mode', file_mode, [(target, {'st_mode', 'st_ctime_ns'}, None)])
+            del self.changed_modes[target['fd']]
+            self.summary['mode_repairs'] += 1
         if stat.S_ISDIR(target['record']['info'].st_mode):
             if stat.S_IMODE(target['record']['info'].st_mode) != expected['mode']:
                 self.mutate('directory_mode', lambda: self.ops.mode(target['fd'], expected['mode']),
@@ -668,7 +723,7 @@ class Session:
                 self.end_class()
             # Complete each admitted inode before releasing its recovery handles.
             for canonical, names in sorted(groups.items()):
-                if canonical not in self.derived['flags'] and canonical not in self.derived['acl']:
+                if not any(canonical in self.derived[field] for field in ('flags', 'acl', 'modes')):
                     continue
                 self.begin_class(names, canonical); self.metadata(canonical); self.end_class()
             for name in self.derived['directories']:
@@ -707,15 +762,19 @@ class Session:
         return now
 
     def recover(self):
+        # Discharge held temporary/failed-mode and blocker obligations only;
+        # completed alias/ACL repairs are not a transactional tree rollback.
         self.summary['recovery'] = 'complete'
+        for lease, original in reversed(list(self.changed_modes.values())):
+            try:
+                self.recovery_identity(lease); self.ops.mode(lease['fd'], original)
+                restored = self.recovery_identity(lease)
+                need(stat.S_IMODE(restored.st_mode) == original, 'identity_changed')
+            except BaseException: self.summary['recovery'] = 'incomplete'
         for lease, original in reversed(list(self.changed_flags.values())):
             try:
                 now = self.recovery_identity(lease)
                 self.ops.flags(lease['fd'], (now.st_flags & ~BLOCKING) | (original & BLOCKING))
-            except BaseException: self.summary['recovery'] = 'incomplete'
-        for lease, original in reversed(list(self.changed_modes.values())):
-            try:
-                self.recovery_identity(lease); self.ops.mode(lease['fd'], original)
             except BaseException: self.summary['recovery'] = 'incomplete'
         self.changed_flags.clear(); self.changed_modes.clear()
 
