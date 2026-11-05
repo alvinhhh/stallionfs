@@ -439,6 +439,8 @@ class DirectoryProbe(unittest.TestCase):
         checkout = Path(__file__).parents[1]
         observed = probe.pins(checkout)
         self.assertEqual(set(observed), set(probe.PIN_PATHS))
+        self.assertIn('tests/test_native_directory_restore_fd_observer.py', observed)
+        self.assertEqual(len(observed), 18)
         self.assertNotIn('stallionfs/_benchmark_runtime/native_metrics.py', observed)
         self.assertEqual(observed['tests/perf/native_metrics.py'],
                          hashlib.sha256((checkout / 'tests/perf/native_metrics.py').read_bytes()).hexdigest())

@@ -186,19 +186,28 @@ class Restoration(unittest.TestCase):
         other = restore.plan(changed_source, changed_destination, os.geteuid())
         self.assertTrue(all('file' not in name and 'sym' not in name for pair in other['aliases'] for name in pair))
 
-    def test_complete_order_permissions_before_aliases_tracking_before_acl_blocking_last_and_atime_preserved(self):
+    def test_class_metadata_order_aliases_first_blockers_last_per_inode_and_directories_postorder(self):
         session, ops = self.session(); source_before = deepcopy({key: value for key, value in ops.nodes.items() if key[1] < 100})
+        protected_flags, directory_times = [], []
+        flags, times = ops.flags, ops.times
+        def flagging(fd, value):
+            if ops.descriptors[fd]['info'].st_ino == self.destination['entries']['protected']['device_inode'][1]:
+                protected_flags.append(value)
+            flags(fd, value)
+        def timing(fd, value):
+            directory_times.append(ops.descriptors[fd]['info'].st_ino)
+            times(fd, value)
+        ops.flags, ops.times = flagging, timing
         value = session.restore(self.destination)
         self.assertEqual(value['status'], 'restored_pending_final_verifiers')
         self.assertEqual((value['alias_replacements'], value['acl_repairs'], value['tracking_repairs'], value['directory_times']), (2, 1, 4, 2))
         events = self.mutations(ops); kinds = [event[0] for event in events]
         self.assertLess(kinds.index('mode'), kinds.index('unlink'))
         self.assertLess(kinds.index('flags'), kinds.index('copy_acl'))
-        self.assertEqual(events[-1][0], 'flags'); self.assertEqual(events[-1][-1], 66)
-        protected_fd = session.destination['protected']['fd']
-        self.assertEqual([event[-1] for event in events if event[:2] == ('flags', protected_fd)], [0, 64, 66])
-        times = [event[1] for event in events if event[0] == 'times']
-        self.assertEqual(times, [session.destination['nested']['fd'], session.destination['']['fd']])
+        self.assertEqual(protected_flags, [0, 64, 66])
+        self.assertLess(max(i for i, kind in enumerate(kinds) if kind in ('unlink', 'link')), kinds.index('flags'))
+        self.assertEqual(directory_times, [session.destination['nested']['info'].st_ino, session.destination['']['info'].st_ino])
+        self.assertTrue(all('fd' not in record for record in (*session.source.values(), *session.destination.values())))
         self.assertTrue(all(node['info'].st_atime_ns == 71 for node in ops.nodes.values()))
         self.assertEqual(source_before, {key: value for key, value in ops.nodes.items() if key[1] < 100})
         for first, second in (('nested/a-file', 'nested/z-file'), ('nested/a-sym', 'nested/z-sym')):
@@ -265,7 +274,7 @@ class Restoration(unittest.TestCase):
                     if operation == 'unlink': self.assertFalse(any(call[0] == 'link' for call in ops.calls))
                     self.assertEqual([call[0] for call in self.mutations(ops)].count(operation), 1)
 
-    def test_alias_parent_size_admission_does_not_allow_unrelated_size_identity_or_other_parent_drift(self):
+    def test_active_alias_drift_stops_link_and_inactive_drift_fails_final_inventory(self):
         for drift in ('unrelated_size', 'unrelated_nlink', 'victim_size', 'parent_identity', 'parent_mode', 'parent_nlink'):
             with self.subTest(drift=drift):
                 session, ops = self.session(); unlink = ops.unlink
@@ -284,8 +293,11 @@ class Restoration(unittest.TestCase):
                 result = session.restore(self.destination)
                 self.assertEqual(result['status'], 'incomplete')
                 self.assertEqual(result['error'], 'identity_changed')
-                self.assertEqual(result['alias_replacements'], 0)
-                self.assertFalse(any(call[0] == 'link' for call in ops.calls))
+                if drift not in ('unrelated_size', 'unrelated_nlink'):
+                    self.assertEqual(result['alias_replacements'], 0)
+                    self.assertFalse(any(call[0] == 'link' for call in ops.calls))
+                # Inactive unrelated names are checked on their next lease or
+                # final inventory, not continuously pinned across this edit.
                 self.assertIn(result['failure_context']['field'], ('identity', 'mode', 'size', 'nlink'))
 
     def test_merged_external_foreign_setid_unknown_field_content_type_and_sparse_mismatches_refuse_before_mutation(self):
@@ -350,13 +362,13 @@ class Restoration(unittest.TestCase):
                 # Recovery may only use already-held flags/modes, never aliases, ACLs or times.
                 self.assertTrue(all(event[0] in ('flags', 'mode') for event in events[first + 1:]))
 
-    def test_failed_acl_repair_preserves_new_tracking_during_blocker_recovery(self):
+    def test_failed_acl_repair_preserves_tracking_without_starting_later_blocker_classes(self):
         session, ops = self.session(); ops.fail = 'copy_acl'
         value = session.restore(self.destination)
         self.assertEqual(value['status'], 'incomplete')
-        self.assertTrue(session.destination['nested/a-file']['fd'] in session.changed_flags)
-        self.assertTrue(ops.fstat(session.destination['nested/a-file']['fd']).st_flags & 64)
-        self.assertEqual(ops.fstat(session.destination['protected']['fd']).st_flags, 66)
+        self.assertTrue(ops.nodes[tuple(self.destination['entries']['nested/a-file']['device_inode'])]['info'].st_flags & 64)
+        self.assertEqual(ops.nodes[tuple(self.destination['entries']['protected']['device_inode'])]['info'].st_flags, 2)
+        self.assertEqual(session.changed_flags, {})
 
     def test_descriptor_acl_admission_rejects_deny_and_inheritance_flags(self):
         for tag, inherited, mask in ((1, False, 2), (2, False, 2), (1, True, 2), (1, False, 4)):
@@ -541,11 +553,12 @@ class Restoration(unittest.TestCase):
                         self.assertEqual(caught.exception.errno, errno.EPERM if outcome == 'errno' else errno.EIO)
                     # Recovery uses this same adapter and retains newly set tracking.
                     session = restore.Session.__new__(restore.Session); session.ops = ops; session.summary = {}
-                    session.changed_flags = {7: 2}; session.changed_modes = {}
+                    lease = {'fd': 7}
+                    session.changed_flags = {7: (lease, 2)}; session.changed_modes = {}
                     session.recovery_identity = mock.Mock(return_value=SimpleNamespace(st_flags=0x40))
                     ctypes.set_errno(errno.ENOENT); session.recover()
                     self.assertEqual(session.summary['recovery'], 'complete' if outcome == 'success' else 'incomplete')
-                    session.recovery_identity.assert_called_once_with(7)
+                    session.recovery_identity.assert_called_once_with(lease)
                 self.assertEqual(library.fchflags.argtypes, [ctypes.c_int, ctypes.c_uint32])
                 self.assertIs(library.fchflags.restype, ctypes.c_int)
                 self.assertEqual(library.fchflags.call_args_list, [mock.call(7, 0x42), mock.call(7, 0x42)])
@@ -600,11 +613,13 @@ class Restoration(unittest.TestCase):
         session, ops = self.session(); count = len(session.owned)
         before = session.admission_report()
         self.assertEqual((before['status'], before['phase']), ('complete', 'complete'))
-        self.assertEqual(before['close'], {'status': 'deferred', 'attempts': 0, 'failures': 0, 'errno': None})
-        self.assertGreater(count, 3); self.assertTrue(session.close())
+        self.assertEqual(before['close']['status'], 'deferred')
+        self.assertGreater(before['close']['attempts'], 0)
+        self.assertEqual((before['close']['failures'], before['close']['errno']), (0, None))
+        self.assertEqual(count, 3); self.assertTrue(session.close())
         after = session.admission_report()
         self.assertEqual((after['status'], after['phase']), ('complete', 'complete'))
-        self.assertEqual(after['close'], {'status': 'complete', 'attempts': count, 'failures': 0, 'errno': None})
+        self.assertEqual(after['close'], {'status': 'complete', 'attempts': before['close']['attempts'] + count, 'failures': 0, 'errno': None})
         self.assertTrue(session.close()); self.assertEqual(session.admission_report(), after)
         self.assertEqual(self.mutations(ops), [])
 
@@ -623,16 +638,29 @@ class Restoration(unittest.TestCase):
         self.assertEqual(captured, [(7, [(0, -2), (-1, 999999997)])])
 
     def test_source_change_during_forward_work_stops_and_never_writes_source(self):
-        session, ops = self.session(); fired = False
-        def change(name):
-            nonlocal fired
-            if name == 'mode' and not fired:
-                fired = True; ops.nodes[(7, 5)]['info'].st_ctime_ns += 1
-        ops.after = change
-        value = session.restore(self.destination)
-        self.assertEqual(value['status'], 'incomplete'); self.assertEqual(value['error'], 'source_changed')
-        self.assertFalse(any(call[0] in ('unlink', 'link', 'copy_acl', 'times') for call in ops.calls))
-        self.assertTrue(all(ops.descriptors[event[1]]['info'].st_ino >= 100 for event in self.mutations(ops)))
+        for inode, name in ((3, 'nested/a-file'), (5, 'protected')):
+            with self.subTest(source_entry=name):
+                session, ops = self.session(); fired = False; mutation_inodes = []
+                baseline = deepcopy(session.source[name]['info'])
+                source_before = deepcopy({key: value for key, value in ops.nodes.items() if key[1] < 100})
+                def change(operation):
+                    nonlocal fired
+                    if operation in ('mode', 'flags', 'copy_acl', 'times', 'unlink', 'link'):
+                        event = ops.calls[-1]
+                        mutation_inodes.append(ops.descriptors[event[2] if operation == 'copy_acl' else event[1]]['info'].st_ino)
+                    if operation == 'mode' and not fired:
+                        fired = True; ops.nodes[(7, inode)]['info'].st_ctime_ns += 1
+                ops.after = change
+                value = session.restore(self.destination)
+                self.assertEqual((value['status'], value['error']), ('incomplete', 'source_changed'))
+                if inode == 3:
+                    self.assertFalse(any(call[0] in ('unlink', 'link', 'copy_acl', 'times') for call in ops.calls))
+                # The inactive entry is detected at its next source lease;
+                # earlier admitted classes may already have completed work.
+                self.assertEqual(session.source[name]['info'], baseline)
+                self.assertTrue(mutation_inodes); self.assertTrue(all(value >= 100 for value in mutation_inodes))
+                source_before[(7, inode)]['info'].st_ctime_ns += 1
+                self.assertEqual({key: value for key, value in ops.nodes.items() if key[1] < 100}, source_before)
 
     def test_cancellation_after_unlink_stops_before_link_without_path_recovery(self):
         session, ops = self.session()
@@ -641,6 +669,73 @@ class Restoration(unittest.TestCase):
         self.assertEqual(value['error'], 'restoration_cancelled')
         self.assertEqual(sum(call[0] == 'unlink' for call in ops.calls), 1)
         self.assertFalse(any(call[0] in ('link', 'copy_acl', 'times') for call in ops.calls))
+
+    def test_reopened_source_uses_original_full_signature_without_refreshing_baseline(self):
+        for field in ('st_size', 'st_nlink', 'st_mode', 'st_uid', 'st_gid', 'st_flags', 'st_mtime_ns', 'st_ctime_ns', 'st_gen', 'st_birthtime'):
+            with self.subTest(field=field):
+                session, ops = self.session()
+                before = deepcopy(session.source['nested/a-file']['info'])
+                source = ops.nodes[(7, 3)]['info']
+                setattr(source, field, getattr(source, field, 0) + 1)
+                value = session.restore(self.destination)
+                self.assertEqual((value['status'], value['error']), ('incomplete', 'source_changed'))
+                self.assertEqual(self.mutations(ops), [])
+                self.assertEqual(session.source['nested/a-file']['info'], before)
+
+    def test_removed_victim_remains_held_through_link_and_named_replacement_keeps_opaque_id(self):
+        session, ops = self.session(); unlink, link = ops.unlink, ops.link; victims = []
+        def removing(parent, name):
+            victim = ops.names[(ops.descriptors[parent]['info'].st_ino, name)]
+            unlink(parent, name); victims.append(victim)
+        def linking(parent, name, target, alias):
+            victim = victims[-1]
+            self.assertEqual(victim['info'].st_nlink, 0)
+            self.assertTrue(any(node is victim for node in ops.descriptors.values()))
+            self.assertNotIn((ops.descriptors[target]['info'].st_ino, alias), ops.names)
+            link(parent, name, target, alias)
+            self.assertTrue(any(node is victim for node in ops.descriptors.values()))
+        ops.unlink, ops.link = removing, linking
+        value = session.restore(self.destination)
+        self.assertEqual(value['status'], 'restored_pending_final_verifiers')
+        self.assertEqual(len(victims), 2)
+        for name in ('nested/z-file', 'nested/z-sym'):
+            self.assertEqual(session.destination[name]['entry_id'], f'e{sorted(self.destination["entries"]).index(name) + 1:04}')
+
+    def test_failed_link_recovery_uses_held_parent_without_reopen_and_reports_failed_undo(self):
+        for recovery_fails in (False, True):
+            with self.subTest(recovery_fails=recovery_fails):
+                session, ops = self.session(); mode, link = ops.mode, ops.link; failed_at = []
+                def failing_link(*args):
+                    failed_at.append(len(ops.calls)); ops.fail = 'link'; link(*args)
+                def restoring_mode(fd, value):
+                    if failed_at and recovery_fails: ops.fail = 'mode'
+                    mode(fd, value)
+                ops.mode, ops.link = restoring_mode, failing_link
+                value = session.restore(self.destination)
+                self.assertEqual(value['status'], 'incomplete')
+                self.assertEqual(value['recovery'], 'incomplete' if recovery_fails else 'complete')
+                self.assertTrue(failed_at)
+                self.assertFalse(any(call[0] == 'open' for call in ops.calls[failed_at[0]:]))
+                modes = [call for call in ops.calls[failed_at[0]:] if call[0] == 'mode']
+                self.assertEqual(len(modes), 1)
+
+    def test_primary_operation_error_survives_later_ambiguous_close_without_retry(self):
+        session, ops = self.session(); copy_acl, close = ops.copy_acl, ops.close; failed = []
+        def failed_acl(*args):
+            ops.fail = 'copy_acl'
+            try: copy_acl(*args)
+            finally: ops.fail = 'close'
+        def closing(fd):
+            if ops.fail == 'close': failed.append(fd)
+            close(fd)
+        ops.copy_acl, ops.close = failed_acl, closing
+        value = session.restore(self.destination)
+        self.assertEqual(value['error'], 'restoration_operation_failed')
+        self.assertEqual(value['status'], 'incomplete'); self.assertEqual(len(failed), 1)
+        self.assertFalse(session.close())
+        self.assertEqual(session.summary['error'], 'restoration_operation_failed')
+        self.assertEqual(sum(call == ('close', failed[0]) for call in ops.calls), 1)
+        self.assertEqual(session.admission_report()['close']['status'], 'incomplete')
 
     def test_atime_change_and_close_error_remain_incomplete(self):
         session, ops = self.session(); ops.change_atime = True
