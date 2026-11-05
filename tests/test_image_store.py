@@ -257,7 +257,8 @@ class ImageStoreTests(unittest.TestCase):
             self.assertEqual((repo / "untracked").read_text(), "preserved\n")
             self.assertTrue((store.root / "recovery" / result["recovery"] / "workspace.sparseimage").exists())
             fixture.call(store.enroll, value, workspace=value)
-            closed = fixture.call(store.close, value, quiescent=True, workspace=value)
+            with observe_detach():
+                closed = fixture.call(store.close, value, quiescent=True, workspace=value)
             closed["closed_at"] -= lifecycle.STALE_SECONDS + 10
             lifecycle.replace_json(store._state(value), closed)
             fixture.call(store.cleanup_config, enabled=True)

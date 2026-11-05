@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 import platform
 import random
+import re
 import resource
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -26,6 +28,101 @@ from stallionfs.core import Store, git, remove_tree, run
 from stallionfs import __version__, _scan
 
 METHODS = ("worktree_install", "prepared_byte_copy", "stallionfs_folder", "stallionfs_image")
+
+
+def candidate_fingerprints(binary):
+    checkout = Path(__file__).resolve().parents[2]
+    f.require(binary.is_file() and os.access(binary, os.X_OK)
+              and not binary.is_relative_to(checkout), 'Use an installed executable outside the checkout')
+    with binary.open('rb') as stream:
+        f.require(stream.read(4) in {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe',
+                                   b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'},
+                  '--binary must be the installed native executable')
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        f.require(str(binary) == os.environ.get('STALLIONFS_BENCHMARK_BINARY')
+                  and str(Path(stallionfs.__file__).resolve().parent) == os.environ.get('STALLIONFS_BENCHMARK_PACKAGE'),
+                  'Use this installed package and its native executable')
+    else:
+        f.require(binary.parent == Path(sys.executable).absolute().parent.resolve()
+                  and Path(stallionfs.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()),
+                  'Use the Python and CLI from the same installed environment')
+    helper = binary.with_name('stallionfs-python')
+    f.require(helper.is_file() and os.access(helper, os.X_OK), 'Installed Python helper is missing')
+    package = Path(stallionfs.__file__).resolve().parent
+    return {str(path): f.digest(path) for path in
+            (binary, helper, package / '__main__.py', package / 'lifecycle.py')}
+
+
+class FolderCLI:
+    """Validate the three workspace CLI results before using their identifiers."""
+    def __init__(self, binary, root, seed):
+        self.binary, self.root, self.seed = binary, Path(root).resolve(strict=True), seed
+        self.identity = self.root.lstat()
+        f.require(bool(re.fullmatch('[0-9a-f]{64}', seed)), 'Invalid prepared seed ID')
+
+    def command(self, *arguments):
+        raw = run([str(self.binary), '--root', str(self.root), '--json', *arguments])
+        f.require(isinstance(raw, str) and len(raw) <= 65536, 'Invalid workspace CLI response')
+        value = json.loads(raw)
+        f.require(isinstance(value, dict), 'Workspace CLI response must be an object')
+        return value
+
+    def path(self, value, collection, ident=None):
+        actual = value.get('id')
+        f.require(isinstance(actual, str) and bool(re.fullmatch('[0-9a-f]{32}', actual))
+                  and (ident is None or actual == ident) and value.get('seed') == self.seed,
+                  'Workspace CLI returned an unexpected identity')
+        expected = self.root / collection / actual / 'repo'
+        f.require(value.get('path') == str(expected), 'Workspace CLI returned an unexpected path')
+        return expected, actual
+
+    def verify_store(self):
+        current = self.root.lstat()
+        f.require((current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino),
+                  'Workspace store identity changed')
+
+    def verify_path(self, expected):
+        self.verify_store()
+        for path in (self.root, expected.parent.parent, expected.parent, expected):
+            info = path.lstat()
+            f.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                      and info.st_dev == self.identity.st_dev, 'Workspace CLI path is not an owned directory')
+
+    def create(self):
+        return self.path(self.command('create', self.seed), 'workspaces')
+
+    def verify_created(self, created):
+        f.require(len({ident for _, ident in created}) == len(created),
+                  'Workspace CLI reused an identity within the batch')
+        for path, _ in created: self.verify_path(path)
+
+    def remove(self, ident):
+        return self.path(self.command('remove', ident), 'trash', ident)
+
+    def reclaim(self):
+        return self.command('gc', '--older-than', '0', '--yes').get('deleted')
+
+    def verify_reclamation(self, deleted, expected):
+        self.verify_store()
+        f.require(isinstance(deleted, list) and all(isinstance(ident, str)
+                  and re.fullmatch('[0-9a-f]{32}', ident) for ident in deleted)
+                  and len(deleted) == len(set(deleted)) and set(deleted) == set(expected),
+                  'Incomplete workspace reclamation')
+        f.require(all(not os.path.lexists(self.root / collection / ident)
+                      for ident in expected for collection in ('workspaces', 'trash')),
+                  'Workspace reclamation left retained storage')
+        staging = self.root / 'staging'
+        info = staging.lstat()
+        f.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                  and info.st_dev == self.identity.st_dev, 'Workspace staging is not an owned directory')
+        f.require(next(staging.iterdir(), None) is None, 'Workspace reclamation left retained staging')
+
+
+def invocation_mode(rows):
+    modes = {row.get('invocation_mode') for row in rows}
+    f.require(len(modes) == 1 and modes <= {'cli', 'git_npm_cli', 'api_diagnostic'},
+              'Missing or mixed workspace invocation modes')
+    return modes.pop()
 
 
 def runtime_fingerprints():
@@ -59,6 +156,7 @@ def digest(root):
 
 
 def summary(rows):
+    invocation_mode(rows)
     result = {}
     for key in ("ready_s", "remove_s", "reclaim_s", "total_s",
                 "ready_cpu_s", "remove_cpu_s", "reclaim_cpu_s", "total_cpu_s"):
@@ -71,7 +169,13 @@ def summary(rows):
 
 def paired_totals(methods):
     baseline = "worktree_install"
-    result = {"baseline": baseline, "methods": {}, "unavailable": None}
+    modes = {method: invocation_mode(rows) for method, rows in methods.items()}
+    for method, mode in modes.items():
+        allowed = ({'git_npm_cli'} if method == baseline else
+                   {'cli', 'api_diagnostic'} if method == 'stallionfs_folder' else {'api_diagnostic'})
+        f.require(mode in allowed, 'Unexpected workspace invocation mode')
+    result = {"baseline": baseline, "methods": {}, "unavailable": None,
+              "invocation_modes": modes, "diagnostic_only": 'api_diagnostic' in modes.values()}
     if baseline not in methods:
         result["unavailable"] = "worktree_install was not selected"
         return result
@@ -98,6 +202,9 @@ def main():
     parser.add_argument("--image-size", type=int, default=8, metavar="GIB")
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--source-only", action="store_true")
+    invocation = parser.add_mutually_exclusive_group(required=True)
+    invocation.add_argument('--binary', type=Path, help='Installed native stallionfs executable for the folder lifecycle')
+    invocation.add_argument('--api-diagnostic', action='store_true', help='Diagnostic API timing, excluding CLI startup')
     args = parser.parse_args()
     methods = list(dict.fromkeys(args.methods))
     if (not 10 <= args.samples <= 100 or not 1 <= args.concurrency <= 32
@@ -105,6 +212,10 @@ def main():
         parser.error("Use 10–100 samples, 1–32 workers, a positive file count and a 1–65536 GiB image")
     if bool(args.node) != bool(args.npm):
         parser.error("Pass --node and --npm together")
+    binary = args.binary.expanduser().resolve(strict=True) if args.binary else None
+    candidate_pins = candidate_fingerprints(binary) if binary else None
+    modes = {method: ('git_npm_cli' if method == 'worktree_install' else
+                     'cli' if method == 'stallionfs_folder' and binary else 'api_diagnostic') for method in methods}
     node = str(args.node.resolve(strict=True)) if args.node else "node"
     npm = [node, str(args.npm.resolve(strict=True))] if args.npm else ["npm"]
     node_version = run([node, "--version"])
@@ -135,7 +246,7 @@ def main():
     native_binary = Path(_scan.__file__)
     native_fingerprint = hashlib.sha256(native_binary.read_bytes()).hexdigest()
     installed_fingerprints = runtime_fingerprints()
-    result = {"format": 3, "version": __version__, "status": "incomplete", "passed": False, "timestamp": datetime.now(timezone.utc).isoformat(),
+    result = {"format": 4, "version": __version__, "status": "incomplete", "passed": False, "timestamp": datetime.now(timezone.utc).isoformat(),
               "implementation_sha256": hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode()).hexdigest(),
               "source_sha256": fingerprints,
               "installed_python_sha256": installed_fingerprints,
@@ -149,9 +260,11 @@ def main():
               "node_command": [node], "npm_command": npm,
               "samples": args.samples, "concurrency": args.concurrency,
               "methods_selected": methods,
+              "workspace_invocation": 'cli' if binary else 'api_diagnostic',
+              "invocation_modes": modes, "candidate_runtime_sha256": candidate_pins,
               "setup": setup[:-1] + ["<isolated warm npm cache>"] if setup else [],
               "warmup_batches_per_method": 1, "source_files_generated": args.source_files,
-              "timing": "API wall time, warm filesystem cache, no cache flushing; setup downloads excluded",
+              "timing": "Warm filesystem cache, no cache flushing; prepared seed setup excluded. Per-method invocation modes distinguish CLI startup from diagnostic API calls.",
               "cpu_timing": "Process CPU including worker threads plus waited child-process CPU, summed over the same ready/remove/reclaim phases as wall time. Validation is excluded.",
               "comparison_scope": "Paired lifecycle wall and CPU totals against Git worktree plus setup. Memory and full metadata equivalence are not measured.",
               "worktree_coordination": "Only Git registration is serialized; installation and filesystem deletion run in parallel. One final Git prune is included in removal timing.",
@@ -191,6 +304,7 @@ def main():
             "cold_prepare_s": folder_prepare, "seed_regular_files": len(sizes),
             "seed_logical_bytes": sum(sizes)}
         seeds = {"stallionfs_folder": seed}
+        folder_cli = FolderCLI(binary, store.root, seed['id']) if binary and 'stallionfs_folder' in methods else None
         result["storage_note"] = "Seed content bytes include Git; shared APFS clone blocks are not inferred from logical file sizes."
         if "stallionfs_image" in methods:
             start = time.perf_counter()
@@ -208,6 +322,8 @@ def main():
         registration = threading.Lock()
 
         def create(method):
+            if method == 'stallionfs_folder' and folder_cli:
+                return folder_cli.create()
             if method in seeds:
                 value = store.create(seeds[method]["id"])
                 return Path(value["path"]), value["id"]
@@ -226,7 +342,9 @@ def main():
 
         def remove(method, item):
             path, ident = item
-            if method in seeds:
+            if method == 'stallionfs_folder' and folder_cli:
+                return folder_cli.remove(ident)
+            elif method in seeds:
                 store.move(ident)
             else:
                 shutil.rmtree(path)
@@ -239,6 +357,8 @@ def main():
             ready = time.perf_counter() - start
             ready_cpu = cpu_seconds() - cpu_start
             # Validation is outside timing and identical for all methods.
+            if method == 'stallionfs_folder' and folder_cli:
+                folder_cli.verify_created(created)
             for path, _ in created:
                 if digest(path) != expected:
                     raise RuntimeError(f"Fixture mismatch: {method}")
@@ -247,16 +367,25 @@ def main():
             cpu_start = cpu_seconds()
             start = time.perf_counter()
             with ThreadPoolExecutor(max_workers=count) as pool:
-                list(pool.map(lambda item: remove(method, item), created))
+                retired = list(pool.map(lambda item: remove(method, item), created))
             if method == "worktree_install":
                 git(source, "worktree", "prune", "--expire", "now")
             removed = time.perf_counter() - start
             removed_cpu = cpu_seconds() - cpu_start
+            if method == 'stallionfs_folder' and folder_cli:
+                for path, ident in retired:
+                    folder_cli.verify_path(path)
+                    f.require(not os.path.lexists(store.root / 'workspaces' / ident),
+                              'Workspace retirement did not complete')
             cpu_start = cpu_seconds()
             start = time.perf_counter()
-            deleted = store.gc(older_than=0, yes=True) if method in seeds else []
+            deleted = (folder_cli.reclaim()
+                       if method == 'stallionfs_folder' and folder_cli else
+                       store.gc(older_than=0, yes=True) if method in seeds else [])
             reclaimed = time.perf_counter() - start
             reclaimed_cpu = cpu_seconds() - cpu_start
+            if method == 'stallionfs_folder' and folder_cli:
+                folder_cli.verify_reclamation(deleted, [ident for _, ident in created])
             if method in seeds and set(deleted) != {ident for _, ident in created}:
                 raise RuntimeError(f"Incomplete workspace reclamation: {method}")
             if method == "worktree_install":
@@ -284,6 +413,7 @@ def main():
                     result['current'] = dict(workers=count, phase='measurement', sample=sample + 1, method=method)
                     row = batch(method, count)
                     row.update(pair_id=sample + 1, phase="timing", ok=True, validated=True,
+                               invocation_mode=modes[method],
                                precision_floor={
                                    "wall_s": 6 * time.get_clock_info("perf_counter").resolution,
                                    # Three phase deltas, each with parent and two child CPU counters.
@@ -307,6 +437,8 @@ def main():
             raise RuntimeError("Native binary changed during the benchmark; results are invalid")
         if runtime_fingerprints() != installed_fingerprints:
             raise RuntimeError("Installed Python modules changed during the benchmark; results are invalid")
+        if binary and candidate_fingerprints(binary) != candidate_pins:
+            raise RuntimeError('Workspace CLI runtime changed during the benchmark; results are invalid')
         result["correctness"] = "Every measured and warmup workspace matched full content/executable-mode digest (excluding Git metadata)" + (" and passed fixture smoke test" if setup else "")
         remove_tree(base)
         f.require(not os.path.lexists(base), "Workspace benchmark cleanup did not complete")

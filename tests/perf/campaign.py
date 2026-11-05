@@ -91,7 +91,7 @@ def stages(args, cycle):
         ('scan-api', 'scan.py', ['--files', '20000', '--memory', '--cache', 'warm']),
         *([('scan-api-cold', 'scan.py', ['--files', '20000', '--memory', '--cache', 'cold'])]
           if 'cold' in args.cache else []),
-        ('workspaces', 'run.py', ['--methods', 'worktree_install', 'stallionfs_folder',
+        ('workspaces', 'run.py', ['--binary', str(args.binary), '--methods', 'worktree_install', 'stallionfs_folder',
          '--concurrency', '4', '--source-files', '1000', *runtime]),
     )
     for name, script, options in selections:
@@ -135,7 +135,8 @@ def outcome(name, output):
     fields = ('status', 'passed', 'cleanup_passed', 'retained_fixture',
               'completion_uncertain', 'error', 'cleanup_error', 'cold_cache_unavailable',
               'cache', 'cold_cache_receipt', 'denial_source_verification', 'denial_runtime_verified',
-              'cold_tool_identity_verified', 'cold_tool_content_verified', 'case_id', 'source_checks_passed')
+              'cold_tool_identity_verified', 'cold_tool_content_verified', 'case_id', 'source_checks_passed',
+              'format', 'workspace_invocation')
     return {key: state[key] for key in fields if key in state}, evidence
 
 
@@ -164,6 +165,8 @@ def safe_to_continue(name, code, state, evidence):
                      state.get('cache') == ('cold' if name == 'scan-api-cold' else 'warm'))
                 and (name not in CLI_CASES or (state.get('case_id') == CLI_CASES[name]
                      and state.get('source_checks_passed') is True))
+                and (name != 'workspaces' or (state.get('format') == 4
+                     and state.get('workspace_invocation') == 'cli'))
                 and not any(state.get(key) for key in
                             ('retained_fixture', 'completion_uncertain', 'error', 'cleanup_error')))
     return terminal and ((code == 0 and state['passed']) or
