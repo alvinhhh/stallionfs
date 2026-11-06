@@ -942,7 +942,7 @@ func metadataAccessChecks(_ parent: URL) throws {
     for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.writeAttributes,.writeSecurity,.readAttributes]] {
         let result = access(rights); need(result.0 != nil && result.1 == nil,"real access result allows owner metadata/security without data permission")
     }
-    for rights: FSVolume.AccessMask in [[.writeAttributes,.writeData],[.writeSecurity,.readData],[.writeAttributes,.writeSecurity,.takeOwnership],FSVolume.AccessMask(rawValue:1<<30)] {
+    for rights: FSVolume.AccessMask in [[.writeAttributes,.writeData],[.writeSecurity,.readData],[.writeAttributes,.writeSecurity,.writeXattr],[.writeAttributes,.writeSecurity,.takeOwnership],FSVolume.AccessMask(rawValue:1<<30)] {
         need(code(access(rights).1) == Int(EACCES),"combined rights checked against original state; no ownership/unknown grant")
     }
     need(code(access(.writeSecurity,CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid()))).1) == Int(EACCES),"owner-scoped security access")
@@ -971,14 +971,17 @@ func metadataAccessChecks(_ parent: URL) throws {
         let a = metadataRequest(); need(code(metadataSet(m,m.root,a).1) == Int(EROFS) && a.consumedAttributes.isEmpty,"disabled setter refuses before mutation")
         m.close()
     }
-    let revoked = try CreationMount(parent,"metadata-access-revoked"), rv = revoked.volume; revoked.resource.revoke()
-    let denied: (FSCheckAccessResult?,Error?) = wait { done in rv.accessForTesting(revoked.root,access:.writeSecurity,caller:caller) { done(($0,$1)) } }
-    need(denied.0 == nil && code(denied.1) == Int(EACCES),"revoked metadata access"); revoked.close()
+    let revoked = try CreationMount(parent,"metadata-access-revoked"), rv = revoked.volume, revokedItem = revoked.create().2!; revoked.resource.revoke()
+    for rights: FSVolume.AccessMask in [[.writeSecurity],[.writeXattr,.writeAttributes,.writeSecurity]] {
+        let denied: (FSCheckAccessResult?,Error?) = wait { done in rv.accessForTesting(revokedItem,access:rights,caller:caller) { done(($0,$1)) } }
+        need(denied.0 == nil && code(denied.1) == Int(EACCES),"revoked metadata and combined xattr access")
+    }
+    revoked.close()
     // Access authorization is not an unsupported security mutation implementation.
     for name in ["com.apple.system.Security","com.apple.acl.text","com.apple.macl"] {
         let f = try Fixture(parent,"metadata-security-xattr-\(name)"), m = try Mounted(f), v = m.volume
-        let allowed: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:.writeSecurity,caller:caller) { done(($0,$1)) } }
-        need(allowed.0 != nil && allowed.1 == nil,"owner security rights before denied security mutation")
+        let allowed: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:[.writeXattr,.writeAttributes,.writeSecurity],caller:caller) { done(($0,$1)) } }
+        need(allowed.0 != nil && allowed.1 == nil,"combined owner xattr and metadata/security rights before denied security mutation")
         let before = v.anchor, result = setXattr(m,name:FSFileName(string:name),value:Data([1]),policy:.alwaysSet)
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && anchorMatches(before,v.anchor),"security access cannot enable unsupported ACL xattr mutation"); m.close()
     }
@@ -3935,11 +3938,16 @@ func contextualXattrValues(_ parent: URL) throws {
         need(coreXattr(m.coreHandle,inode:f.id,name:Data("note".utf8)) == binary,"hardlink alias xattr")
         need(coreXattr(m.coreHandle,inode:f.id,name:Data("note".utf8),view:oldView) == Data("value".utf8),"snapshot retains previous xattr")
         try! v.linkAccessForTesting(m.file,access:[.writeXattr,.readAttributes],caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())))
-        let refused: [FSVolume.AccessMask] = [[.writeXattr,.delete],[.writeXattr,.writeSecurity]]
+        let refused: [FSVolume.AccessMask] = [[.writeXattr,.delete],[.writeXattr,.writeAttributes,.writeSecurity,.delete],
+            [.writeXattr,.writeSecurity,.takeOwnership],FSVolume.AccessMask(rawValue:1<<30).union([.writeXattr,.writeSecurity])]
         for mask in refused {
             do { try v.linkAccessForTesting(m.file,access:mask,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))); need(false,"xattr granted unrelated access") }
             catch { need(code(error) == Int(EACCES),"mixed xattr mask delegates unrelated bits") }
         }
+    }
+    for rights: FSVolume.AccessMask in [[.writeXattr,.writeAttributes],[.writeXattr,.writeSecurity],[.writeXattr,.writeAttributes,.writeSecurity,.readAttributes]] {
+        let allowed: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:rights,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(allowed.0 != nil && allowed.1 == nil,"real access result allows independently eligible combined xattr and metadata/security rights")
     }
     let absent = FSFileName(string:"org.example.binary"), anchor = v.anchor, commits = v.diagnosticSnapshot().0.commits
     for policy in [FSVolume.SetXattrPolicy.mustReplace,.delete] {
@@ -3991,8 +3999,10 @@ func contextualXattrRefusals(_ parent: URL) throws {
         let m = try Mounted(f), v = m.volume, anchor = v.anchor
         let expected = [EACCES,EACCES,ENOTSUP,EACCES,ENOTSUP][index]
         need(code(setXattr(m,value:Data([1])).1) == Int(expected),"xattr mode/ACL/owner/flags refusal")
-        m.serial { do { try v.linkAccessForTesting(m.file,access:.writeXattr,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))); need(false,"access check bypassed xattr policy") }
-            catch { need(code(error) == Int(expected),"access and setter share xattr policy") } }
+        for rights: FSVolume.AccessMask in [[.writeXattr],[.writeXattr,.writeAttributes],[.writeXattr,.writeSecurity],[.writeXattr,.writeAttributes,.writeSecurity]] {
+            let denied: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:rights,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+            need(denied.0 == nil && code(denied.1) == Int(expected),"combined metadata/security rights retain xattr mode/ACL/owner/flags refusal")
+        }
         need(anchorMatches(v.anchor,anchor) && v.diagnosticSnapshot().0.commits == 0,"refused xattr unchanged")
         m.close(); need(reopenedXattr(f) == Data("value".utf8),"refused xattr persists original")
     }
@@ -4000,10 +4010,13 @@ func contextualXattrRefusals(_ parent: URL) throws {
     for name in ["com.apple.system.Security","com.apple.system.anything","com.apple.acl.text","com.apple.decmpfs","com.apple.macl","com.apple.provenance"] {
         need(code(setXattr(m,name:FSFileName(string:name),value:Data()).1) == Int(ENOTSUP),"unsupported policy metadata refused")
     }
-    for caller in [CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())),CallerIdentity(uid:-1,gid:Int(getegid())),CallerIdentity(uid:Int(geteuid()),gid:-1)] {
+    var callers = [CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())),CallerIdentity(uid:-1,gid:Int(getegid())),CallerIdentity(uid:Int(geteuid()),gid:-1)]
+    if geteuid() != 0 { callers.append(CallerIdentity(uid:0,gid:0)) }
+    for caller in callers {
         need(code(setXattr(m,value:Data(),caller:caller).1) == Int(EACCES),"foreign/unrepresentable xattr caller")
+        let denied: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:[.writeXattr,.writeAttributes,.writeSecurity],caller:caller) { done(($0,$1)) } }
+        need(denied.0 == nil && code(denied.1) == Int(EACCES),"combined xattr and metadata/security rights preserve exact owner and valid caller identity")
     }
-    if geteuid() != 0 { need(code(setXattr(m,value:Data(),caller:CallerIdentity(uid:0,gid:0)).1) == Int(EACCES),"root has no xattr owner bypass") }
     let directory = namespaceLookup(m,"dir")
     for item in [m.root,m.link,directory] { need(code(setXattr(m,value:Data(),item:item).1) == Int(ENOTSUP),"nonregular xattr target refused") }
     need(code(setXattr(m,value:Data(),item:StallionItem(f.id)).1) == Int(EINVAL),"foreign canonical item refused")
@@ -4017,7 +4030,9 @@ func contextualXattrRefusals(_ parent: URL) throws {
     need(directoryReleased == nil,"release retained xattr refusal directory")
     m.close(); need(reopenedXattr(f) == Data("value".utf8),"all refusals preserve original")
     let roFixture = try Fixture(parent,"xattr-readonly"), ro = try Mounted(roFixture,writable:false)
-    need(code(setXattr(ro,value:Data()).1) == Int(EROFS),"unbound readonly contextual setter refused"); ro.close()
+    need(code(setXattr(ro,value:Data()).1) == Int(EROFS),"unbound readonly contextual setter refused")
+    let denied: (FSCheckAccessResult?,Error?) = wait { done in ro.volume.accessForTesting(ro.file,access:[.writeXattr,.writeAttributes,.writeSecurity],caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(denied.0 == nil && code(denied.1) == Int(EACCES),"readonly resource refuses combined xattr and metadata/security access"); ro.close()
     let detachedFixture = try Fixture(parent,"xattr-detached"), detached = try Mounted(detachedFixture)
     detached.serial { try! detached.volume.diagnosticMutationForTesting { h,r in
         need(sfs_image_unlink_expected(h,1,"file",4,detachedFixture.id,&r) == SFS_OK &&
