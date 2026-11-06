@@ -735,7 +735,11 @@ func nativeSeekOracle(_ parent: URL) throws -> String {
             need(Darwin.close(fd) == 0,"APFS oracle descriptor close")
         }
     }
-    let constructors: [[String:Int64]] = [-1,0,Int64.max].map { value in ["offset":value,"accepted":FSSeekRegionResult(returnedOffset:off_t(value)) == nil ? 0 : 1] }
+    let constructors: [[String:Int64]] = [-1,0,Int64.max].map { value in
+        // The header documents nil on validation failure but imports as nonoptional.
+        let result: FSSeekRegionResult? = FSSeekRegionResult(returnedOffset:off_t(value))
+        return ["offset":value,"accepted":result == nil ? 0 : 1]
+    }
     let report: [String:Any] = ["os":ProcessInfo.processInfo.operatingSystemVersionString,"rows":rows,"constructors":constructors]
     return String(data:try JSONSerialization.data(withJSONObject:report,options:[.sortedKeys]),encoding:.utf8)!
 }

@@ -5670,9 +5670,10 @@ static void seek_regions(void) {
         else if (field==4) invalid_budget.auxiliary_bytes=0; else invalid_budget.auxiliary_io_bytes=0;
         seek_expect(h,binding,0,a,NULL,0,SFS_SEEK_DATA,SFS_INVALID,0,0,&invalid_budget);
     }
-    uint64_t sentinel=UINT64_MAX; int sentinel_found=77;
+    uint64_t sentinel=UINT64_MAX; int sentinel_found=77; unsigned invalid_clocks=clock_calls;
     assert(sfs_image_seek_region(h,0,binding.generation,binding.root_digest,a,0,SFS_SEEK_DATA,&budget,NULL,&sentinel_found,&r)==SFS_INVALID && sentinel_found==77);
     assert(sfs_image_pin_seek_region(h,pin,binding.generation,binding.root_digest,0,SFS_SEEK_DATA,&budget,&sentinel,NULL,&r)==SFS_INVALID && sentinel==UINT64_MAX);
+    assert(clock_calls==invalid_clocks);
     wrong[0]=wrong[1]=wrong[2]=pin; ++wrong[0].instance; ++wrong[1].incarnation; wrong[2].session[0]^=1;
     for (unsigned i=0;i<3;i++) seek_expect(h,binding,0,0,&wrong[i],0,SFS_SEEK_HOLE,SFS_INVALID,0,0,&budget);
     image_unwritten(); unchanged("image",before,length); free(before);
@@ -5831,7 +5832,8 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strcmp(argv[1],"mapped-blocks")&&strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
+    /* seek-regions mutates metadata fixtures; seek_expect checks each query's clock neutrality. */
+    if(strcmp(argv[1],"seek-regions")&&strcmp(argv[1],"mapped-blocks")&&strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("%s %s\n", (!strcmp(argv[1],"creation-success-alteration") || !strcmp(argv[1],"creation-corrective")) ? "COMPLETE" : "PASS", argv[1]); return 0;
 }
