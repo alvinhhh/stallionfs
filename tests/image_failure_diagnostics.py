@@ -737,7 +737,10 @@ class Diagnostics:
             dates = [datetime.fromtimestamp(second, timezone.utc).strftime('%Y-%m-%d %H:%M:%S+0000')
                      for second in (first, last)]
             predicate = (f'process == "diskarbitrationd" AND subsystem == "{DA_SUBSYSTEM}" AND '
-                         f'(eventMessage CONTAINS "{target}," OR eventMessage CONTAINS "{target} (")')
+                         f'((eventMessage CONTAINS "unable to eject {target} (status code ") OR '
+                         f'(eventMessage CONTAINS "dispatched response, id = " AND '
+                         f'eventMessage CONTAINS[c] "eject" AND eventMessage CONTAINS[c] "approval" AND '
+                         f'eventMessage CONTAINS "disk = {target}, dissented, status = "))')
             argv = ['/usr/bin/log', 'show', '--style', 'ndjson', '--start', dates[0], '--end', dates[1],
                     '--timezone', 'UTC', '--no-pager', '--no-info', '--no-debug', '--no-signpost',
                     '--no-loss', '--predicate', predicate]
