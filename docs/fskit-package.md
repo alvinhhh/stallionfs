@@ -197,6 +197,19 @@ durable and required even when the first mount follows installation recovery;
 failed checks retain the installed image and unresolved probe record. Later
 accepted writable sessions may legitimately change branch and content.
 
+Contextual removal accepts regular files, symbolic links and empty directories.
+A known nonempty directory returns `ENOTEMPTY` before a transaction begins; the
+core also rechecks the exact name/inode and directory emptiness during unlink.
+After final-name removal, core metadata remains detached: link count zero and
+no live parent/name. The retained item separately keeps its verified last-known
+parent relationship, bound to that item and pin. Removal and later held-item
+results use that informational parent ID with current post-transaction metadata
+and the full SDK-required attributes. The relationship is published only after
+a verified commit and discarded when the pin is reclaimed. It grants no
+permission to use a detached directory as a namespace parent or relink an item.
+Direct core edits without that verified callback relationship do not acquire it.
+This does not add overwrite rename, mounted snapshots or generic stale cleanup.
+
 Release qualification must bind the final signed artifact to the reviewed
 both-flags build and exercise two complete create/run/write/fsync/unmount/remount
 read cycles through the installed module. Retain package identity, public
