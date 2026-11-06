@@ -2822,13 +2822,33 @@ func directoryMetadata(_ value: sfs_metadata_entry, parent: UInt64, mode: UInt32
 func contextualDirectories(_ parent: URL) throws {
     try contextualInitialTimes(parent,kind:1)
     let m = try CreationMount(parent,"directory-reuse"), v = m.volume, required = FSCreateItemResult.requestedAttributes.wantedAttributes
+    let root = m.root as! StallionItem, rootAnchor = v.anchor
+    need(root.pin != nil,"canonical root must retain its existing pin; inode=\(root.inode)")
+    let rootPin = root.pin!
     let rights: [FSVolume.AccessMask] = [.addFile,.addSubdirectory,[.addFile,.addSubdirectory],
         [.addFile,.search],[.addSubdirectory,.search],[.addFile,.addSubdirectory,.search]]
     for access in rights {
         let result = namespaceAccess(v,m.root,access)
-        need(result.0 != nil && result.1 == nil,"actual linked root creation access without a namespace parent ID")
+        need(result.0 != nil && result.1 == nil,"actual linked root creation access; mask=\(access.rawValue) error=\(code(result.1))")
     }
-    need(m.metadata(m.root).entry.parent == 0,"root creation authority uses linked root metadata")
+    let initialRootMetadata = m.metadata(root)
+    need(initialRootMetadata.entry.inode == 1 && initialRootMetadata.entry.parent == 1 &&
+         initialRootMetadata.entry.kind == SFS_DIRECTORY && initialRootMetadata.link_count == 1,
+         "core root identity inode=\(initialRootMetadata.entry.inode) parent=\(initialRootMetadata.entry.parent) kind=\(initialRootMetadata.entry.kind.rawValue) links=\(initialRootMetadata.link_count)")
+    m.serial {
+        var pinned = sfs_pin_stat(), receipt = sfs_result()
+        let status = sfs_image_pin_stat(m.coreHandle,rootPin,&pinned,&receipt)
+        need(status == SFS_OK && receipt.status == SFS_OK,
+             "root pin stat status=\(status.rawValue) receiptStatus=\(receipt.status.rawValue)")
+        need(anchorMatches(receipt,rootAnchor),"root pin receipt must match saved anchor; generation=\(receipt.generation) expected=\(rootAnchor.generation)")
+        let metadata = pinned.metadata
+        need(pinned.linked == 1 && root.inode == 1 && root === m.root && v.ownsForTesting(root) &&
+             metadata.entry.inode == initialRootMetadata.entry.inode && metadata.entry.parent == initialRootMetadata.entry.parent &&
+             metadata.entry.kind == initialRootMetadata.entry.kind && metadata.link_count == initialRootMetadata.link_count,
+             "existing root pin identity linked=\(pinned.linked) inode=\(metadata.entry.inode) parent=\(metadata.entry.parent) kind=\(metadata.entry.kind.rawValue) links=\(metadata.link_count)")
+        need(root.pin != nil && sameBytes(root.pin!,rootPin) && anchorMatches(v.anchor,rootAnchor),
+             "root access preserves original full token and anchor; generation=\(v.anchor.generation) expected=\(rootAnchor.generation)")
+    }
     var snapshots: [FSItem.Attributes] = [], beforeCommit = true, constructors = 0
     m.serial {
         v.removeCommitReceiptForTesting = { _,_ in need(false,"directory creation entered removal receipt hook") }
