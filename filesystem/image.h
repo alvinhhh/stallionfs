@@ -248,6 +248,29 @@ enum sfs_status sfs_image_next_mapped_block(sfs_image *, sfs_view,
     sfs_inode, uint64_t at_or_after_block, const sfs_verify_budget *,
     uint64_t *out_block, int *found, sfs_result *);
 
+enum sfs_seek_region { SFS_SEEK_DATA = 1, SFS_SEEK_HOLE = 2 };
+/* Finite production limits, shared with adapter and qualification tests.
+ * Callers may supply smaller budgets or an observation-only cancellation
+ * callback; callbacks must not reenter, mutate, clear or close the handle. */
+sfs_verify_budget sfs_image_seek_budget(void);
+/* Committed regular-file layout, using whole mapped 4096-byte blocks clipped
+ * to EOF as data, including allocated zeros. No payload scan or atime update.
+ * Both routes bind the current anchor; view selects a namespace, while a full
+ * pin selects its own current committed inode (including retained detached).
+ * One copied positive budget covers admission and the entire traversal.
+ * Type validation precedes EOF handling. At/beyond EOF returns found=0, as
+ * does exhausted data; a hole search below EOF may return EOF. Failure leaves
+ * both outputs unchanged; found=0 preserves out_offset. Budget is unchanged.
+ * These queries validate touched metadata, not every raw block/subtree. */
+enum sfs_status sfs_image_seek_region(sfs_image *, sfs_view,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    sfs_inode, uint64_t offset, enum sfs_seek_region, const sfs_verify_budget *,
+    uint64_t *out_offset, int *found, sfs_result *);
+enum sfs_status sfs_image_pin_seek_region(sfs_image *, sfs_pin,
+    uint64_t expected_generation, const uint8_t expected_root_digest[32],
+    uint64_t offset, enum sfs_seek_region, const sfs_verify_budget *,
+    uint64_t *out_offset, int *found, sfs_result *);
+
 /* Formats 0.5/0.6: opaque non-NUL names, 1..255 bytes; owners are never followed.
  * Set atomically replaces the complete binary value (NULL permits length zero).
  * The caller keeps input stable through the call, without output overlap.

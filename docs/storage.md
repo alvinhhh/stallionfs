@@ -86,3 +86,120 @@ proof that an earlier fence completed. Malformed pairs refuse normal admission.
 Physical power-loss recovery, native lifecycle cleanup, installed mounting and
 performance acceptance require separate qualification.
 
+
+## Installed owned native workspaces
+
+Native creation keeps the prepared folder input and verified image candidate
+under the existing typed creation intent. Installation holds the same creation
+locks and backing guard while moving only the owned resource directory to
+`workspaces/<id>`. It verifies the moved destination with the same guard token.
+After consumption, exact inode, UUID and initial committed anchor must match the
+FULL-verified import before `native-install.json` records completed ownership.
+`native-create.json` remains immutable origin evidence; current installed
+location and later anchors are separate. The resource directory must retain its
+original inode through the rename; recovery also binds the saved intent object
+and installation metadata to that immutable origin.
+
+A rename followed by a proof/close error retains `installed-unconfirmed` plus
+the intent. Before any first mount, explicit recovery may use a fresh guard with
+the original anchor and lineage to complete installation without repeating import
+or rename. It preserves the previous result. Once mounting has been attempted,
+that first-install recovery route is closed. Installed ownership blocks external
+registration of the backing inode independently of the creation journal.
+
+Mount/unmount intents and helper output remain in each workspace's
+`native-operations` directory; the active typed record is also in the existing
+journal directory. The lease spans helper launch, stop/reap and observation.
+Interruption while a directly owned helper is being launched is recorded until
+its handle is retained, then handled under the same lease. A helper that cannot
+be reaped leaves a pending hold and stays supervised; no later managed mutator
+is admitted. Persisted helper dispositions must contain typed terminal/reaped
+evidence; missing or inconsistent fields retain the hold. Prior attempts are
+referenced by retained receipt path, and repeated supervision failures keep
+counts plus first/last detail rather than an unbounded nested history.
+These records describe observed operations, not a live-session
+registry or authenticated history of adapter writeback.
+
+The resource-directory descriptor is outside the mount. It checks host/backing
+identity while a new mounted-root descriptor supplies `fstatfs` evidence after
+mounting. The descriptor observation and native mount table must agree on exact
+root, type, owner, flags and filesystem ID. Informational source text is not
+interpreted as backing identity. Mounted observation descriptors close before
+ordinary unmount. Namespace absence followed by a fresh guard/consumed close
+permits a normal later mount, but grants neither prior-close success nor deletion
+authority. Owned workspaces start unenrolled. Explicit enrollment plus a new
+quiescent close or current-idle observation is required for stale retirement.
+
+First-mount attempt and successful first-use acceptance are separate durable
+facts. Until the initial Git branch/commit and write/fsync/remove probe succeed,
+a mount after recovery must repeat those acceptance checks. Successful acceptance
+is persisted before a usable repository path is returned. Later ordinary branch
+and content changes do not reapply original import expectations.
+
+Owned native snapshot/restore intents use the existing top-level journal and
+bounded operation archive. Catalog calls own their own exclusive core admission;
+no outer backing guard competes with that open. A lost mutation result remains
+unknown even when a later current catalog observation sees its unique name.
+The per-image catalog has 32 non-evicting slots; restore consumes a slot for the
+prior-current recovery state and therefore also refuses at capacity.
+
+`native-location.json` records only the current confined collection, parent,
+immutable resource/backing identities and consumed move admission. The original
+metadata, creation proof, install receipt and first-use acceptance are not
+rewritten. An owned image may occupy only `workspaces/ID` or protected `trash/ID`.
+Typed retire/return journals live at `journals/ID.json`, so a successful rename
+cannot hide the recovery entry point inside an old absolute resource path.
+
+Retirement acquires root publication exclusion, the workspace lease/lock, a
+retention slot and one backing guard. An optional strictly parsed expected
+anchor is compared to that same opened handle before any callback. The callback
+rechecks lifecycle generation, namespace absence and reference exclusion, moves
+once, verifies the destination and syncs both parents. A stale mismatch is a
+reset only after successful consuming close and parent close; missing or failed
+receipts retain the intent and protection. Explicit restore/recovery uses the
+retention mutex without asking for another slot. It observes the sole exact
+location with a fresh guard, preserves the old error, and never replays rename.
+
+Protected native trash is excluded from generic GC. Explicit `purge trash ID
+--yes` uses publication exclusion, the workspace lease/lock and the retention
+mutex, without requesting another retention slot. It validates immutable
+ownership, current location, protection, namespace absence and references, then
+records an exact bounded entry manifest in `journals/ID.json`.
+
+A reserved `staging/native-purge-ID-OP/` container and `native-purge.json` marker
+keep partial deletion out of generic staging removal. The reserved name, marker
+or matching intent independently retains it, including malformed evidence.
+Within one admitted readonly core guard, purge relocates the same resource,
+verifies its destination, fences both parents, durably authorizes the recorded
+backing inode and unlinks it through its bound directory descriptor. The guard
+is consumed afterward. Unlink, directory durability and close dispositions are
+reported separately; a close error cannot undo removal.
+
+Only after successful close reporting does that call remove manifest-bound
+metadata. A later explicit resume can finish authorized metadata for an already
+absent image without reopening it or inventing an old close result. It preserves
+the original failure. Each removal class has durable write-ahead authorization;
+missing entries before authorization or replacement identities stop cleanup.
+The manifest permits only fixed proof, operation/output and empty mount-directory
+paths, with no symlinks, hardlinks, special files or generic recursive deletion.
+The entry limit is 16,384. Each metadata input is limited to 8 MiB before JSON
+decoding, including dispatch, neighboring references and delegated ownership
+proofs. Input whitespace counts toward the limit. Serialized intent output has
+a separate 8 MiB limit. Oversized input preserves the current journal and protection.
+
+After resource and container absence are durably fenced, `lifecycle/ID.json`
+holds a compact `native-purge-complete` receipt before protection and journal
+cleanup. It retains exact store/parent/source/container/protection identities,
+manifest digest and bounded error/close facts. Thus it can finish matching
+bookkeeping after the full journal is gone while refusing reused names.
+Before relocation authorization, a repeated explicit purge can recover an
+unbound reserved container or a missing recorded container only after verifying
+the unchanged original resource, ownership/location proofs, protection and full
+manifest. It durably archives the old attempt under
+`lifecycle/native-purge-abandoned-ID-OP-DIGEST.json` before publishing a fresh
+attempt with a new container name. Archive or replacement publication failures
+leave a retryable old or new journal. Unknown orphan containers stay untouched
+and excluded from generic removal. A bound replacement or any changed original
+still refuses; no such restart is allowed after relocation authorization.
+Installed writable persistence and ordinary distribution qualification remain
+separate from source/core fixture validation.

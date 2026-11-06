@@ -4,6 +4,12 @@ on:
     branches: [main, stable]
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Hosted action
+        type: choice
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact]
+        default: compare
 permissions:
   contents: read
 jobs:
@@ -115,6 +121,89 @@ jobs:
               print(f'Required {contextual_test} successes: expected 1, observed {result.contextual_successes}', file=sys.stderr)
           sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
           PY
+      - name: Check large sparse-seek metadata with default limits
+        if: success() && matrix.os == 'macos-15' && matrix.python == '3.12'
+        timeout-minutes: 9
+        env:
+          STALLION_SEEK_LARGE_METADATA: '1'
+          CFLAGS: ''
+        run: |
+          cd "$RUNNER_TEMP"
+          if ! mkdir -m 700 "$RUNNER_TEMP/sparse-seek-large"; then
+            echo 'UNQUALIFIED large metadata: fresh evidence directory unavailable'
+            exit 2
+          fi
+          export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
+          python -I -B - <<'PY'
+          import os, re, resource, shutil, subprocess, sys, time, unittest
+          from pathlib import Path
+
+          try:
+              temporary = Path(os.environ['RUNNER_TEMP']).resolve()
+              checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+              assert Path.cwd().resolve() == temporary and sys.platform == 'darwin'
+              assert os.environ.get('STALLION_SEEK_LARGE_METADATA') == '1'
+              assert os.environ.get('CFLAGS', '') == ''
+              disk = shutil.disk_usage(temporary).free
+              vm = subprocess.run(['/usr/bin/vm_stat'], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=5, check=True)
+              assert not vm.stderr and len(vm.stdout.encode()) <= 16384
+              page = int(re.search(r'page size of (\d+) bytes', vm.stdout)[1])
+              fields = {k.strip(): int(v) for k, v in
+                        re.findall(r'^([^:\n]+):\s+(\d+)\.', vm.stdout, re.MULTILINE)}
+              memory_estimate = page * sum(fields[k] for k in
+                                          ('Pages free', 'Pages inactive', 'Pages speculative'))
+              print('Large metadata admission:', disk, memory_estimate, flush=True)
+              if disk < 2 * 1024**3 or memory_estimate < 3 * 1024**3:
+                  print('UNQUALIFIED large metadata: insufficient disk/memory headroom', flush=True)
+                  raise SystemExit(2)
+
+              import stallionfs
+              from stallionfs import _image, _scan
+              for module in (stallionfs, _image, _scan):
+                  path = Path(module.__file__).resolve()
+                  assert not path.is_relative_to(checkout), path
+                  print('Installed-wheel module:', path, flush=True)
+              sys.path.insert(0, str(checkout / 'tests'))
+              import test_image
+              assert Path(test_image.__file__).resolve() == checkout / 'tests/test_image.py'
+              selector = 'test_image.ImageCore.test_seek_default_budget_10gib_metadata_shape'
+              suite = unittest.defaultTestLoader.loadTestsFromName(selector)
+              assert suite.countTestCases() == 1
+              assert [test.id() for test in suite] == [selector]
+              resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
+              resource.setrlimit(resource.RLIMIT_FSIZE, (1024**3, 1024**3))
+              resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+          except Exception as error:
+              print('UNQUALIFIED large metadata: admission/setup failed:',
+                    type(error).__name__, str(error), flush=True)
+              raise SystemExit(2)
+
+          class LargeResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.peak_bytes = None
+
+              def addSuccess(self, test):
+                  # The body/instance cleanup finished; class teardown has not run yet.
+                  try:
+                      self.peak_bytes = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+                      if self.peak_bytes > 1536 * 1024**2:
+                          raise RuntimeError('Large metadata child peak RSS exceeds 1.5 GiB')
+                  except Exception:
+                      test_image.ImageCore.retain_requested = True
+                      self.stream.writeln('UNQUALIFIED large metadata: resource observation/refusal')
+                      self.addFailure(test, sys.exc_info())
+                      return
+                  super().addSuccess(test)
+
+          started = time.monotonic()
+          result = unittest.TextTestRunner(verbosity=2, resultclass=LargeResult).run(suite)
+          print('Large metadata resource observation:', time.monotonic() - started,
+                result.peak_bytes, flush=True)
+          raise SystemExit(not (result.testsRun == 1 and result.wasSuccessful()
+                                and not result.skipped))
+          PY
       - name: Validate bounded image diagnostic artifact
         if: failure()
         id: image-diagnostics
@@ -147,6 +236,9 @@ jobs:
             ${{ runner.temp }}/fskit-interface-diagnostics/*.command.json
             ${{ runner.temp }}/fskit-interface-diagnostics/*.stdout.bin
             ${{ runner.temp }}/fskit-interface-diagnostics/*.stderr.bin
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.command.json
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stdout.bin
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stderr.bin
           if-no-files-found: ignore
           retention-days: 1
       - name: Check native code with sanitizers
@@ -183,7 +275,7 @@ jobs:
 
   hosted-docs-screen:
     name: Hosted document clone screen
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'unsigned-app-artifact'
     runs-on: xcode-27
     timeout-minutes: 20
     permissions:
@@ -207,14 +299,25 @@ jobs:
       - name: Build and install public source wheel
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+          PHASE_MODE: ${{ inputs.mode }}
         run: |
           umask 077
+          if [ "$PHASE_MODE" = 'thread-cpu' ]; then
+            export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1"
+          elif [ "$PHASE_MODE" = 'delete-thread-cpu' ]; then
+            export CFLAGS="${CFLAGS:-} -DSTALLIONFS_DIAGNOSTIC_THREAD_CPU=1 -DSTALLIONFS_DIAGNOSTIC_DELETE_CPU=1"
+          elif [ "$PHASE_MODE" = 'directory-feasibility' ] || [ "$PHASE_MODE" = 'directory-docs-feasibility' ]; then
+            export CFLAGS=''
+          elif [ "$PHASE_MODE" != 'compare' ]; then
+            exit 2
+          fi
           mkdir "$SCREEN_ROOT"
           mkdir -p "$SCREEN_ROOT/evidence/receipts" "$SCREEN_ROOT/wheels" "$SCREEN_ROOT/scratch"
           python -m venv "$SCREEN_ROOT/venv"
           "$SCREEN_ROOT/venv/bin/python" -m pip wheel --no-deps --wheel-dir "$SCREEN_ROOT/wheels" "$GITHUB_WORKSPACE"
           "$SCREEN_ROOT/venv/bin/python" -m pip install --force-reinstall --no-deps "$SCREEN_ROOT/wheels/"*.whl
       - name: Record source and hosted environment
+        if: inputs.mode == 'compare'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -248,6 +351,7 @@ jobs:
           (root / 'evidence/environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
           PY
       - name: Collect fixed document clone comparison
+        if: inputs.mode == 'compare'
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         run: |
@@ -279,10 +383,159 @@ jobs:
               (evidence / 'collector-outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
           raise SystemExit(outcome['returncode'])
           PY
+      - name: Collect thread CPU phases
+        if: inputs.mode == 'thread-cpu'
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, sys, time
+          from pathlib import Path
+          from stallionfs._benchmark_budget import command
+          root = Path(os.environ['SCREEN_ROOT'])
+          control = root / 'scratch/phase-control'
+          control.mkdir(mode=0o700)
+          receipts = control / 'receipts'
+          receipts.mkdir(mode=0o700)
+          output = root / 'evidence/thread-cpu-status.json'
+          os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + 160)
+          code = 1
+          try:
+              wheels = list((root / 'wheels').glob('*.whl'))
+              if len(wheels) != 1:
+                  raise RuntimeError('Wheel identity unavailable')
+              argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_phase_probe.py'),
+                  '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]), '--scratch', str(root / 'scratch'),
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA']]
+              code = command(argv, cwd=control, timeout=150, umask=0o077, output_limit=65536).returncode
+          except BaseException:
+              pass
+          if not output.exists():
+              with output.open('x') as artifact:
+                  json.dump({'schema': 1, 'scope': 'hosted diagnostic source build', 'status': 'incomplete',
+                      'target_completion': 'unknown', 'correctness': None, 'counter_status': 'unavailable',
+                      'clone_attempts': None, 'cleanup': 'retained_ephemeral', 'benchmark_verdict': 'not_applicable',
+                      'error': 'outer_capture_incomplete'}, artifact)
+          raise SystemExit(code)
+          PY
+      - name: Collect fixed-cache delete CPU phases
+        if: inputs.mode == 'delete-thread-cpu'
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+          STALLIONFS_DELETE_CPU_HOSTED: '1'
+        run: |
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, signal, sys, time
+          from pathlib import Path
+          from stallionfs._benchmark_budget import command
+          deadline = time.monotonic() + 900
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(deadline)
+          def expired(*_):
+              raise TimeoutError('Aggregate diagnostic deadline exhausted')
+          signal.signal(signal.SIGALRM, expired)
+          signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
+          root = Path(os.environ['SCREEN_ROOT'])
+          control = root / 'scratch/delete-control'; control.mkdir(mode=0o700)
+          receipts = control / 'receipts'; receipts.mkdir(mode=0o700)
+          candidate = control / 'driver-status.json'
+          output = root / 'evidence/delete-thread-cpu-status.json'
+          os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
+          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf'))
+          from native_phase_probe import clean_capture, publish, read_report
+          code, receipt = 1, {}
+          value = {'schema': 1, 'scope': 'hosted fixed-cache delete CPU only', 'status': 'incomplete',
+              'stage': 'outer_capture', 'target_completion': 'unknown', 'delete_attempts': None,
+              'counter_status': 'unavailable', 'cleanup': 'retained_ephemeral', 'correctness': None,
+              'benchmark_verdict': 'not_applicable', 'error': 'outer_capture_incomplete'}
+          try:
+              wheels = list((root / 'wheels').glob('*.whl'))
+              if len(wheels) != 1:
+                  raise RuntimeError('Wheel identity unavailable')
+              argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_delete_phase_probe.py'),
+                  '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]), '--scratch', str(root / 'scratch'),
+                  '--output', str(candidate), '--revision', os.environ['GITHUB_SHA']]
+              # The child stops work at deadline-30. Fifteen seconds then remain
+              # for its status, followed by fifteen for outer reap/publication.
+              allowed = deadline - 15 - time.monotonic()
+              if allowed <= 0:
+                  raise TimeoutError('No aggregate supervision budget')
+              child = command(argv, cwd=control, timeout=allowed, umask=0o077, receipt=receipt, output_limit=65536)
+              capture = dict(receipt)
+              capture['exit_code'] = 0
+              if (child.returncode not in (0, 1) or type(receipt.get('exit_code')) is not int
+                  or receipt['exit_code'] != child.returncode or not clean_capture(capture) or time.monotonic() >= deadline):
+                  raise RuntimeError('Outer completion unavailable')
+              observed = read_report(candidate)
+              if child.returncode == 0:
+                  if observed.get('status') != 'complete' or observed.get('cleanup') != 'complete':
+                      raise RuntimeError('Driver success status unavailable')
+              elif observed.get('status') != 'incomplete':
+                  raise RuntimeError('Failed driver cannot publish success')
+              value, code = observed, child.returncode
+          except BaseException:
+              pass
+          if time.monotonic() >= deadline:
+              raise TimeoutError('No status publication budget')
+          publish(output, value)
+          signal.setitimer(signal.ITIMER_REAL, 0)
+          raise SystemExit(code)
+          PY
+      - name: Collect hosted directory feasibility
+        if: inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility'
+        env:
+          SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
+          STALLIONFS_DIRECTORY_FEASIBILITY_HOSTED: '1'
+          DIRECTORY_DOCS_ONLY: ${{ inputs.mode == 'directory-docs-feasibility' }}
+        run: |
+          umask 077
+          /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -pthread "$GITHUB_WORKSPACE/tests/native_directory_clone_probe.c" -o "$SCREEN_ROOT/directory-clone-probe"
+          cd "$RUNNER_TEMP"
+          "$SCREEN_ROOT/venv/bin/python" -I -B - <<'PY'
+          import json, os, sys, time
+          from pathlib import Path
+          from stallionfs._benchmark_budget import command
+          root = Path(os.environ['SCREEN_ROOT'])
+          control = root / 'scratch/directory-control'
+          control.mkdir(mode=0o700)
+          receipts = control / 'receipts'; receipts.mkdir(mode=0o700)
+          output = root / 'evidence/directory-feasibility-status.json'
+          os.environ['STALLIONFS_BENCHMARK_RECEIPTS'] = str(receipts)
+          docs_only = os.environ['DIRECTORY_DOCS_ONLY'] == 'true'
+          os.environ['STALLIONFS_BENCHMARK_DEADLINE'] = str(time.monotonic() + (900 if docs_only else 210))
+          code = 1
+          try:
+              wheels = list((root / 'wheels').glob('*.whl'))
+              if len(wheels) != 1:
+                  raise RuntimeError('Wheel identity unavailable')
+              argv = [sys.executable, '-I', '-B', str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests/perf/native_directory_clone_probe.py'),
+                  '--binary', str(root / 'venv/bin/stallionfs'), '--wheel', str(wheels[0]),
+                  '--helper', str(root / 'directory-clone-probe'), '--scratch', str(root / 'scratch'),
+                  '--output', str(output), '--revision', os.environ['GITHUB_SHA'],
+                  '--restore-docs-only' if docs_only else '--restore-small-recipes-only']
+              code = command(argv, cwd=control, timeout=890 if docs_only else 200, umask=0o077, output_limit=65536).returncode
+          except BaseException:
+              pass
+          if not output.exists():
+              fallback = {'schema': 1, 'scope': 'hosted nineteen-recipe selective restoration only', 'status': 'incomplete',
+                      'first_recipe_only': False, 'small_recipes_only': True, 'restoration_only': True,
+                      'small_gate_qualified': False, 'full_gate_qualified': False,
+                      'target_completion': 'unknown', 'cases': [], 'docs_attempted': None, 'helper_invocations': None, 'clone_calls': None,
+                      'cleanup': 'retained_ephemeral', 'benchmark_verdict': 'not_applicable',
+                      'concurrency_and_cancellation': 'unresolved', 'error': 'outer_capture_incomplete'}
+              if docs_only:
+                  fallback.update(scope='hosted fixed-docs selective restoration only', small_recipes_only=False,
+                      docs_only=True, docs_gate_qualified=False)
+              with output.open('x') as artifact:
+                  json.dump(fallback, artifact)
+          raise SystemExit(code)
+          PY
       - name: Show correctness and existing case gate
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always()
+        if: always() && inputs.mode == 'compare'
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
@@ -324,7 +577,7 @@ jobs:
       - name: Preserve synthetic screen evidence
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
-        if: always()
+        if: always() && inputs.mode == 'compare'
         uses: actions/upload-artifact@v4
         with:
           name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
@@ -336,5 +589,62 @@ jobs:
             ${{ env.SCREEN_ROOT }}/evidence/native.json.journal
             ${{ env.SCREEN_ROOT }}/evidence/native.json.manifest
             ${{ env.SCREEN_ROOT }}/evidence/receipts/*.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Preserve thread CPU phase status
+        if: always() && inputs.mode == 'thread-cpu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/thread-cpu-status.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Preserve fixed-cache delete CPU status
+        if: always() && inputs.mode == 'delete-thread-cpu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-delete-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/delete-thread-cpu-status.json
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Preserve directory feasibility status
+        if: always() && (inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility')
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-directory-feasibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/directory-feasibility-status.json
+          if-no-files-found: error
+          retention-days: 3
+
+  unsigned-app-artifact:
+    name: Unsigned FSKit build components
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'unsigned-app-artifact'
+    runs-on: xcode-27
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAKEFLAGS: -j1
+      MAX_JOBS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check artifact boundaries and existing package validation
+        run: |
+          python -B -m unittest discover -s tests -p 'test_*package*.py' -v
+          PYTHONPATH=tests python -B -m unittest test_native_directory_clone_probe.DirectoryProbe.test_workflow_routes_each_mode_and_artifact_explicitly -v
+      - name: Build and verify unsigned components
+        run: python -B tools/build_fskit_artifact.py --out "$RUNNER_TEMP/unsigned-app-components"
+      - name: Retain verified unsigned component archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-fskit-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unsigned-app-components/StallionFS-unsigned-arm64.tar.gz
           if-no-files-found: error
           retention-days: 3
