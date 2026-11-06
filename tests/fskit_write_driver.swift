@@ -2649,8 +2649,9 @@ final class RenameFixture {
     let mount: CreationMount, from: StallionItem, to: StallionItem, item: StallionItem
     let child: StallionItem?
     let target: Data?
-    init(_ parent: URL, _ name: String, directory: Bool = false, target: Data? = nil) throws {
-        let m = try CreationMount(parent,name,limit:6); mount = m
+    init(_ parent: URL, _ name: String, directory: Bool = false, target: Data? = nil,
+         capacity: UInt64 = 1024 * 1024, limit: Int = 6) throws {
+        let m = try CreationMount(parent,name,capacity:capacity,limit:limit); mount = m
         self.target = target
         m.serial {
             try! m.volume.diagnosticMutationForTesting { h,r in
@@ -2688,6 +2689,31 @@ final class RenameFixture {
         wait { done in mount.volume.renameResultForTesting(source ?? item,sourceDirectory:oldParent ?? from,sourceName:FSFileName(string:old),
             destinationName:FSFileName(string:new),destinationDirectory:newParent ?? to,overItem:over,
             caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    }
+    func victim(directory: Bool = false, target: Data? = nil, sameParent: Bool = false) -> StallionItem {
+        let parent = sameParent ? from : to
+        if let target {
+            let result = createSymlink(mount,FSFileName(data:target),name:"new",parent:parent)
+            need(result.0 != nil && result.1 == nil && result.2 != nil,"rename victim symlink setup"); return result.2!
+        }
+        let result = mount.create("new",request:creationAttributes(directory ? 0o700 : 0o600),parent:parent,type:directory ? .directory : .file)
+        need(result.0 != nil && result.1 == nil && result.2 != nil,"rename victim setup")
+        let item = result.2!
+        if !directory { mount.serial { try! self.mount.volume.diagnosticMutationForTesting { h,r in
+            need(sfs_image_write(h,item.inode,0,"victim",6,&r) == SFS_OK,"rename victim original bytes")
+        } } }
+        return item
+    }
+    func binding(_ name: String, parent: StallionItem, inode: UInt64?) {
+        mount.serial { var entry = sfs_entry(), r = sfs_result(); let bytes = Data(name.utf8)
+            let status = bytes.withUnsafeBytes { sfs_image_lookup(self.mount.coreHandle,0,parent.inode,$0.baseAddress,$0.count,&entry,&r) }
+            need(inode == nil ? status == SFS_NOT_FOUND : status == SFS_OK && entry.inode == inode!,"rename exact edge \(name)")
+        }
+    }
+    func heldMetadata(_ item: StallionItem) -> sfs_metadata_entry {
+        var value = sfs_pin_stat()
+        mount.serial { var r = sfs_result(); need(sfs_image_pin_stat(self.mount.coreHandle,item.pin!,&value,&r) == SFS_OK,"rename held pin metadata") }
+        return value.metadata
     }
     func names(_ old: String?, _ new: String?, newParent: UInt64? = nil) {
         mount.serial {
@@ -2770,14 +2796,15 @@ func contextualRenames(_ parent: URL) throws {
         need(sfs_image_close(h,&r) == SFS_OK,"rename metadata reopen close")
     }
     try renameRefusals(parent); try renamePolicies(parent); try renameFailures(parent,required:required); try renameQueued(parent)
+    try renameReplacements(parent,required:required); try renameReplacementRefusals(parent)
+    try renameReplacementFailures(parent,required:required); try renameReplacementQueued(parent)
 }
 func renameRefusals(_ parent: URL) throws {
     for symlink in [false,true] {
     let f = try RenameFixture(parent,"rename-refusals-\(symlink)",target:symlink ? Data("../target".utf8) : nil), m = f.mount, v = m.volume, before = v.anchor
     var prepared = false
     m.serial { v.diagnosticBeforePrepare = { prepared = true } }
-    need(code(f.rename(over:f.item).1) == Int(ENOTSUP),"rename overwrite parameter refused")
-    need(code(f.rename("old","old",to:f.from).1) == Int(EEXIST),"same path refused")
+    need(code(f.rename(over:f.item).1) == Int(ESTALE),"missing supplied victim edge refused")
     need(code(f.rename(source:f.to).1) == Int(ESTALE),"wrong actual source identity refused")
     need(code(f.rename("missing").1) == Int(ENOENT),"missing old name refused")
     need(code(f.rename(source:m.root).1) == Int(ENOTSUP),"root rename refused")
@@ -2814,21 +2841,21 @@ func renameRefusals(_ parent: URL) throws {
         var metadata = sfs_metadata_entry()
         need(sfs_image_stat_metadata(a.coreHandle,0,(a.link as! StallionItem).inode,&metadata,&r) == SFS_OK && metadata.link_count == 2,"observe committed multiply linked symlink before rename")
     }
-    let beforeAliases = a.volume.anchor
     for item in [a.file,a.link] {
-        let result: (FSRenameItemResult?,Error?) = wait { done in a.volume.renameResultForTesting(item,sourceDirectory:a.root,sourceName:FSFileName(string:item === a.file ? "file" : "link"),destinationName:FSFileName(string:"new"),destinationDirectory:a.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
-        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && anchorMatches(beforeAliases,a.volume.anchor),"multiply named source rename refused")
+        let name = item === a.file ? "file" : "link"
+        let result: (FSRenameItemResult?,Error?) = wait { done in a.volume.renameResultForTesting(item,sourceDirectory:a.root,sourceName:FSFileName(string:name),destinationName:FSFileName(string:name+"-moved"),destinationDirectory:a.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(result.0 != nil && result.1 == nil,"multiply named source rename succeeds")
     }
     a.serial { var entry = sfs_entry(), metadata = sfs_metadata_entry(), r = sfs_result()
-        for name in ["link","link-alias"] { let bytes = Data(name.utf8)
-            need(bytes.withUnsafeBytes { sfs_image_lookup(a.coreHandle,0,1,$0.baseAddress,$0.count,&entry,&r) } == SFS_OK && entry.inode == (a.link as! StallionItem).inode,"both refused symlink names retain identity")
+        for name in ["link-moved","link-alias"] { let bytes = Data(name.utf8)
+            need(bytes.withUnsafeBytes { sfs_image_lookup(a.coreHandle,0,1,$0.baseAddress,$0.count,&entry,&r) } == SFS_OK && entry.inode == (a.link as! StallionItem).inode,"both remaining symlink names retain identity")
         }
-        need(sfs_image_lookup(a.coreHandle,0,1,"new",3,&entry,&r) == SFS_NOT_FOUND,"multiply linked rename does not publish destination")
-        need(sfs_image_stat_metadata(a.coreHandle,0,(a.link as! StallionItem).inode,&metadata,&r) == SFS_OK && metadata.link_count == 2,"refused symlink keeps both links")
+        for name in ["file","link"] { let bytes = Data(name.utf8); need(bytes.withUnsafeBytes { sfs_image_lookup(a.coreHandle,0,1,$0.baseAddress,$0.count,&entry,&r) } == SFS_NOT_FOUND,"moved alias old edge absent") }
+        need(sfs_image_stat_metadata(a.coreHandle,0,(a.link as! StallionItem).inode,&metadata,&r) == SFS_OK && metadata.link_count == 2,"moved symlink keeps both links")
         symlinkBytes(a.coreHandle,(a.link as! StallionItem).inode,Data("file".utf8))
     }
-    a.close(); namespaceReopened(aliases,"file",inode:aliases.id)
-    for name in ["link","link-alias"] { namespaceReopened(aliases,name,inode:(a.link as! StallionItem).inode) }
+    a.close(); namespaceReopened(aliases,"file",inode:nil); namespaceReopened(aliases,"file-moved",inode:aliases.id); namespaceReopened(aliases,"alias",inode:aliases.id)
+    for name in ["link-moved","link-alias"] { namespaceReopened(aliases,name,inode:(a.link as! StallionItem).inode) }
     var reopened: OpaquePointer?, receipt = sfs_result(), linkedMetadata = sfs_metadata_entry()
     need(sfs_image_open_readonly(aliases.url.path,"image.sfs",&reopened,&receipt) == SFS_OK &&
          sfs_image_stat_metadata(reopened,0,(a.link as! StallionItem).inode,&linkedMetadata,&receipt) == SFS_OK && linkedMetadata.link_count == 2,"reopened refused symlink retains both links")
@@ -3002,6 +3029,325 @@ func renameQueued(_ parent: URL) throws {
     resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"bounded saturated rename drain")
     bm.state(4,cap:6); b.names("old",nil); bm.close()
 }
+func renameReplacements(_ parent: URL, required: FSItem.Attribute) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    // Directory-on-directory and every file/symlink pairing, in both parent layouts.
+    for (index,kinds) in [(false,false),(false,true),(true,false),(true,true)].enumerated() {
+    for sameParent in [false,true] {
+        let f = try RenameFixture(parent,"rename-replace-\(index)-\(sameParent)",target:kinds.0 ? Data("source-target".utf8) : nil,limit:10)
+        let m = f.mount, v = m.volume, victim = f.victim(target:kinds.1 ? Data("victim-target".utf8) : nil,sameParent:sameParent)
+        let destination = sameParent ? f.from : f.to, tokens = [f.item,f.from,f.to,victim].map { $0.pin! }
+        var snapshots: [FSItem.Attributes] = [], constructed = false, committing = false
+        m.serial {
+            victim.retainedModes = kinds.1 ? [] : [.read,.write]
+            v.diagnosticBeforePrepare = { need(victim.lastKnownParent == nil,"replacement candidate is not published during prepare") }
+            v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { need(!committing && victim.lastKnownParent == nil,"four replacement roles precede commit"); snapshots.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSRenameItemResult" { need(snapshots.count == 4 && !committing,"actual replacement constructor receives four validated snapshots"); constructed = true }; return false }
+            v.diagnosticBeforeCommit = { need(victim.lastKnownParent == nil,"no replacement witness before verified commit"); committing = true }
+        }
+        let result = f.rename(to:destination,over:victim)
+        need(result.0 != nil && result.1 == nil && constructed && committing && snapshots.count == 4,"real full-mask file/symlink replacement result")
+        for i in snapshots.indices { for j in snapshots.indices where i != j { need(snapshots[i] !== snapshots[j],"replacement roles are independent snapshots") } }
+        for (a,item) in zip(snapshots.prefix(3),[f.item,f.from,destination]) { checkPreparedAttributes(a,m.metadata(item),required:required) }
+        let detached = f.heldMetadata(victim)
+        checkPreparedAttributes(snapshots[3],detached,required:required,retainedParent:destination.inode)
+        need(detached.link_count == 0 && detached.entry.parent == 0 && detached.entry.name_length == 0 && victim.lastKnownParent?.parent == destination.inode,"victim core detached; committed informational parent only")
+        for (item,token) in zip([f.item,f.from,f.to,victim],tokens) { need(sameBytes(item.pin!,token),"replacement preserves every returned pin") }
+        f.binding("old",parent:f.from,inode:nil); f.binding("new",parent:destination,inode:f.item.inode)
+        need(m.lookup("new",parent:destination) === f.item,"destination lookup returns moved source, not held victim")
+        m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforePrepare = nil; v.diagnosticBeforeCommit = nil }
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size,.fileID,.parentID,.linkCount]
+        func held() -> (FSGetAttributesResult?,Error?) { wait { done in v.attributesResultForTesting(request,item:victim,caller:caller) { done(($0,$1)) } } }
+        let heldResult = held()
+        need(heldResult.0 != nil && heldResult.1 == nil,"overwritten held item satisfies actual get result requirements")
+        let witness = victim.lastKnownParent!
+        for invalid in 0..<3 {
+            m.serial {
+                if invalid == 0 { victim.lastKnownParent = nil }
+                else if invalid == 1 { victim.lastKnownParent = LastKnownParent(item:ObjectIdentifier(f.item),pin:tokens[3],inode:f.item.inode,kind:detached.entry.kind,parent:destination.inode) }
+                else { victim.lastKnownParent = LastKnownParent(item:ObjectIdentifier(victim),pin:tokens[0],inode:victim.inode,kind:detached.entry.kind,parent:destination.inode) }
+            }
+            let refused = held(); need(refused.0 == nil && code(refused.1) == Int(ENOTSUP),"replacement witness rejects missing/wrong-item/wrong-pin provenance")
+            m.serial { victim.lastKnownParent = witness }
+        }
+        if kinds.1 { symlinkReadback(m,victim,Data("victim-target".utf8),heldPin:tokens[3]) }
+        else {
+            let written: (Int,Error?) = wait { done in v.writeCountForTesting(contents:Data("held!!".utf8),to:victim,at:0) { done(($0,$1)) } }
+            let resize = FSItem.SetAttributesRequest(); resize.size = 9
+            let resized: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(resize,on:victim,caller:caller) { done(($0,$1)) } }
+            need(written.0 == 6 && written.1 == nil && resized.0?.size == 9 && resized.1 == nil,"held overwritten file accepts independent write and resize")
+            m.serial { need(try! v.diagnosticReadForTesting(victim,length:16) == Data("held!!".utf8)+Data(repeating:0,count:3),"held victim bytes survive replacement"); _ = try! v.readResultConstructorForTesting(victim) }
+        }
+        if kinds.0 { symlinkReadback(m,f.item,Data("source-target".utf8)) }
+        else { m.serial { need(try! v.diagnosticReadForTesting(f.item,length:16) == Data("original".utf8),"held victim write cannot alter moved source") } }
+        need(wait { v.reclaimForTesting(victim,eligible:false,replyHandler:$0) } == nil,"false victim reclaim")
+        need(victim.lastKnownParent != nil && sameBytes(victim.pin!,tokens[3]),"false victim reclaim retains witness and pin")
+        need(m.reclaim(victim) == nil,"true victim reclaim")
+        m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(victim.lastKnownParent == nil && victim.pin == nil && sfs_image_pin_stat(m.coreHandle,tokens[3],&value,&r) == SFS_INVALID,"true victim reclaim retires token and witness exactly once") }
+        withExtendedLifetime(result.0) {}
+        m.close(); m.reopened("old",parent:f.from.inode,inode:nil); f.reopened("new",parent:destination.inode)
+        var h: OpaquePointer?, r = sfs_result(), metadata = sfs_metadata_entry()
+        need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,victim.inode,&metadata,&r) == SFS_NOT_FOUND,"reopened final victim absent")
+        need(sfs_image_close(h,&r) == SFS_OK,"replacement absence inspection close")
+    } }
+    for sameParent in [false,true] {
+        let f = try RenameFixture(parent,"rename-replace-directory-\(sameParent)",directory:true,limit:10), m = f.mount, v = m.volume
+        let victim = f.victim(directory:true,sameParent:sameParent), destination = sameParent ? f.from : f.to, token = victim.pin!
+        var snapshots: [FSItem.Attributes] = []
+        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { snapshots.append(a); need(victim.lastKnownParent == nil,"directory victim witness private precommit") } } }
+        let result = f.rename(to:destination,over:victim)
+        need(result.0 != nil && result.1 == nil && snapshots.count == 4,"actual full-mask nonempty source directory replaces empty directory")
+        for (a,item) in zip(snapshots.prefix(3),[f.item,f.from,destination]) { checkPreparedAttributes(a,m.metadata(item),required:required) }
+        checkPreparedAttributes(snapshots[3],f.heldMetadata(victim),required:required,retainedParent:destination.inode)
+        m.serial { v.preparedAttributesForTesting = nil; directoryNames(m.coreHandle,f.item.inode,["child"]) }
+        need(m.lookup("child",parent:f.item) === f.child!,"moved directory keeps descendant canonical object")
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.parentID,.linkCount]
+        let held: (FSGetAttributesResult?,Error?) = wait { done in v.attributesResultForTesting(request,item:victim,caller:caller) { done(($0,$1)) } }
+        need(held.0 != nil && held.1 == nil,"held overwritten directory supports actual attributes")
+        need(code(m.create("forbidden",parent:victim).1) == Int(ENOENT),"victim witness cannot authorize create under detached directory")
+        let lookup: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"child"),inDirectory:victim) { done(($0,$2)) } }
+        need(lookup.0 == nil && code(lookup.1) == Int(ENOENT),"detached victim is not a lookup parent")
+        need(code(f.rename("new","forbidden",from:destination,to:victim).1) == Int(ENOENT),"victim witness is not rename-parent authority")
+        need(wait { v.reclaimForTesting(victim,eligible:false,replyHandler:$0) } == nil && sameBytes(token,victim.pin!),"held directory false reclaim retains pin")
+        need(m.reclaim(victim) == nil && victim.lastKnownParent == nil,"held directory true reclaim clears witness")
+        f.binding("old",parent:f.from,inode:nil); f.binding("new",parent:destination,inode:f.item.inode)
+        m.close(); f.reopened("new",parent:destination.inode); m.reopened("child",parent:f.item.inode,inode:f.child!.inode,bytes:Data("original".utf8))
+    }
+    // A victim with another name remains linked and uses its real remaining parent.
+    for symlink in [false,true] {
+        let f = try RenameFixture(parent,"rename-replace-alias-\(symlink)",limit:10), m = f.mount, v = m.volume
+        let victim = f.victim(target:symlink ? Data("victim-target".utf8) : nil), token = victim.pin!
+        m.serial { try! v.diagnosticMutationForTesting { h,r in
+            need(sfs_image_link(h,victim.inode,1,"victim-alias",12,&r) == SFS_OK,"remaining victim alias fixture")
+            need(sfs_image_link(h,f.item.inode,1,"source-alias",12,&r) == SFS_OK,"multiply linked replacement source fixture")
+        } }
+        var snapshots: [FSItem.Attributes] = []
+        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { snapshots.append(a) } } }
+        let result = f.rename(over:victim)
+        need(result.0 != nil && result.1 == nil && snapshots.count == 4 && victim.lastKnownParent == nil && sameBytes(token,victim.pin!),"nonfinal replacement retains real victim alias without historical witness")
+        let metadata = m.metadata(victim)
+        need(metadata.link_count == 1 && metadata.entry.parent == 1,"victim representative parent is remaining root alias, not overwritten destination parent")
+        checkPreparedAttributes(snapshots[3],metadata,required:required)
+        checkPreparedAttributes(snapshots[0],m.metadata(f.item),required:required)
+        need(m.metadata(f.item).link_count == 2 && m.lookup("source-alias") === f.item,"replacement source keeps its other alias")
+        m.serial { v.preparedAttributesForTesting = nil }
+        need(m.lookup("victim-alias") === victim,"remaining alias preserves owned victim")
+        m.close(); f.reopened("new",parent:f.to.inode); m.reopened("victim-alias",inode:victim.inode); f.reopened("source-alias",parent:1)
+    }
+    // No-op ordering precedes missing-victim and nonempty-directory checks.
+    for kind in 0..<3 { for alias in [false,true] where kind != 2 || !alias { for supplied in [false,true] {
+        let f = try RenameFixture(parent,"rename-noop-\(kind)-\(alias)-\(supplied)",directory:kind == 2,target:kind == 1 ? Data("target".utf8) : nil), m = f.mount, v = m.volume
+        if alias { m.serial { try! v.diagnosticMutationForTesting { h,r in need(sfs_image_link(h,f.item.inode,f.to.inode,"new",3,&r) == SFS_OK,"same inode destination alias fixture") } } }
+        let before = v.anchor, metadata = [m.metadata(f.item),m.metadata(f.from),m.metadata(alias ? f.to : f.from)], token = f.item.pin!, counters = v.diagnosticSnapshot().0
+        var snapshots: [FSItem.Attributes] = [], constructors = 0
+        m.serial {
+            v.diagnosticBeforePrepare = { need(false,"no-op must not begin a transaction") }
+            v.diagnosticBeforeCommit = { need(false,"no-op must not commit") }
+            v.renameCommitReceiptForTesting = { _,_ in need(false,"no-op has no commit receipt") }
+            v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { snapshots.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSRenameItemResult" { constructors += 1; need(snapshots.count == 3,"no-op has no overwritten role") }; return false }
+        }
+        let result = f.rename("old",alias ? "new" : "old",to:alias ? f.to : f.from,over:supplied ? f.item : nil)
+        need(result.0 != nil && result.1 == nil && constructors == 1 && snapshots.count == 3 && anchorMatches(before,v.anchor),"actual SDK same-inode result succeeds without mutation")
+        for (a,metadata) in zip(snapshots,metadata) { checkPreparedAttributes(a,metadata,required:required) }
+        need(sameBytes(token,f.item.pin!) && f.item.lastKnownParent == nil && v.diagnosticSnapshot().0.commits == counters.commits,"no-op preserves pin/witness/timestamps/commit count")
+        f.binding("old",parent:f.from,inode:f.item.inode); if alias { f.binding("new",parent:f.to,inode:f.item.inode) }
+        m.close()
+        if kind == 1 && alias {
+            var h: OpaquePointer?, r = sfs_result(), current = sfs_metadata_entry(), entry = sfs_entry()
+            need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK,"same-inode symlink aliases reopen")
+            for (parent,name) in [(f.from.inode,"old"),(f.to.inode,"new")] {
+                let bytes = Data(name.utf8)
+                need(bytes.withUnsafeBytes { sfs_image_lookup(h,0,parent,$0.baseAddress,$0.count,&entry,&r) } == SFS_OK && entry.inode == f.item.inode,"both durable no-op alias edges")
+            }
+            need(sfs_image_stat_metadata(h,0,f.item.inode,&current,&r) == SFS_OK && current.entry.kind == SFS_SYMLINK && current.link_count == 2 &&
+                 current.entry.parent == metadata[0].entry.parent && current.entry.name_length == metadata[0].entry.name_length && sameBytes(current.entry.name,metadata[0].entry.name),"no-op aliases preserve actual representative parent/name and two links")
+            symlinkBytes(h!,f.item.inode,Data("target".utf8))
+            need(sfs_image_close(h,&r) == SFS_OK,"no-op alias inspection close")
+        } else { f.reopened(); if alias { f.reopened("new",parent:f.to.inode) } }
+    } } }
+}
+func renameReplacementRefusals(_ parent: URL) throws {
+    for sourceDirectory in [false,true] { for targetDirectory in [false,true] where sourceDirectory != targetDirectory {
+        let f = try RenameFixture(parent,"rename-replace-type-\(sourceDirectory)",directory:sourceDirectory,limit:10), m = f.mount
+        let victim = f.victim(directory:targetDirectory), before = m.volume.anchor, sourcePin = f.item.pin!, victimPin = victim.pin!
+        let result = f.rename(over:victim)
+        need(result.0 == nil && code(result.1) == Int(sourceDirectory ? ENOTDIR : EISDIR) && anchorMatches(before,m.volume.anchor),"precise replacement type error before mutation")
+        f.binding("old",parent:f.from,inode:f.item.inode); f.binding("new",parent:f.to,inode:victim.inode)
+        need(sameBytes(sourcePin,f.item.pin!) && sameBytes(victimPin,victim.pin!) && victim.lastKnownParent == nil,"type refusal preserves owned operands")
+        m.close(); f.reopened(); m.reopened("new",parent:f.to.inode,inode:victim.inode)
+    } }
+    let nonempty = try RenameFixture(parent,"rename-replace-nonempty",directory:true,limit:10), nm = nonempty.mount
+    let directory = nonempty.victim(directory:true), child = nm.create("child",parent:directory).2!
+    nm.serial { try! nm.volume.diagnosticMutationForTesting { h,r in need(sfs_image_write(h,child.inode,0,"kept",4,&r) == SFS_OK,"nonempty victim child bytes") } }
+    let before = nm.volume.anchor, commits = nm.volume.diagnosticSnapshot().0.commits, pin = directory.pin!
+    var prepared = false
+    nm.serial { nm.volume.diagnosticBeforePrepare = { prepared = true } }
+    let refused = nonempty.rename(over:directory)
+    need(refused.0 == nil && code(refused.1) == Int(ENOTEMPTY) && !prepared && anchorMatches(before,nm.volume.anchor) && nm.volume.diagnosticSnapshot().0.commits == commits,"nonempty victim refuses before begin")
+    nonempty.binding("old",parent:nonempty.from,inode:nonempty.item.inode); nonempty.binding("new",parent:nonempty.to,inode:directory.inode)
+    nm.serial { need(sameBytes(pin,directory.pin!) && directory.lastKnownParent == nil && (try! nm.volume.diagnosticReadForTesting(child,length:8)) == Data("kept".utf8),"nonempty child data and victim token preserved"); nm.volume.diagnosticBeforePrepare = nil }
+    let removed: (FSRemoveItemResult?,Error?) = wait { done in nm.volume.removeResultForTesting(child,name:FSFileName(string:"child"),directory:directory,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(removed.0 != nil && removed.1 == nil && nonempty.rename(over:directory).1 == nil,"ordinary child removal then empty-directory replacement succeeds")
+    nm.close(); nonempty.reopened("new",parent:nonempty.to.inode)
+    for kind in 0..<3 {
+    for policy in 0..<4 {
+        let symlink = kind == 1, directory = kind == 2
+        let f = try RenameFixture(parent,"rename-victim-policy-\(kind)-\(policy)",directory:directory,limit:10), m = f.mount, v = m.volume
+        let victim = f.victim(directory:directory,target:symlink ? Data("target".utf8) : nil)
+        m.serial { try! v.diagnosticMutationForTesting { h,r in
+            if policy == 3 { need(sfs_image_set_xattr(h,victim.inode,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"victim unsupported ACL fixture") }
+            else {
+                var change = sfs_metadata_update()
+                if policy == 0 { change.fields = UInt32(SFS_META_UID.rawValue); change.uid = geteuid()+1 }
+                else if policy == 1 { change.fields = UInt32(SFS_META_FLAGS.rawValue); change.flags = 1 }
+                else { change.fields = UInt32(SFS_META_MODE.rawValue); change.mode = UInt32(directory ? S_IFDIR : symlink ? S_IFLNK : S_IFREG) | 0o6600 }
+                need(sfs_image_set_metadata(h,victim.inode,&change,&r) == SFS_OK,"victim removal policy fixture")
+            }
+        } }
+        let before = v.anchor; var prepared = false
+        m.serial { v.diagnosticBeforePrepare = { prepared = true } }
+        let result = f.rename(over:victim)
+        need(result.0 == nil && code(result.1) == Int(policy == 1 || policy == 3 ? ENOTSUP : EACCES) && !prepared && anchorMatches(before,v.anchor),"victim policy checked independently of source and parents")
+        f.binding("old",parent:f.from,inode:f.item.inode); f.binding("new",parent:f.to,inode:victim.inode)
+        need(victim.lastKnownParent == nil,"refused victim never gains witness")
+        m.close(); f.reopened(); m.reopened("new",parent:f.to.inode,inode:victim.inode)
+    } }
+    let f = try RenameFixture(parent,"rename-victim-identities",limit:10), m = f.mount, v = m.volume, victim = f.victim(), anchor = v.anchor
+    var preparedIdentity = false
+    m.serial { v.diagnosticBeforePrepare = { preparedIdentity = true } }
+    need(code(f.rename().1) == Int(EEXIST),"occupied target without supplied victim cannot overwrite")
+    need(code(f.rename(over:f.from).1) == Int(ESTALE),"wrong owned victim rejected")
+    need(code(f.rename(over:StallionItem(victim.inode)).1) == Int(EINVAL),"foreign same-inode victim object rejected")
+    need(code(f.rename("old","old",to:f.from,over:victim).1) == Int(ESTALE),"same-inode no-op still rejects wrong supplied victim")
+    need(code(f.rename("old","old",to:f.from,over:StallionItem(f.item.inode)).1) == Int(EINVAL),"no-op still rejects foreign supplied source")
+    need(m.reclaim(victim) == nil && code(f.rename(over:victim).1) == Int(EINVAL),"reclaimed victim refused despite live name")
+    need(!preparedIdentity && anchorMatches(anchor,v.anchor),"victim identity refusals never begin")
+    f.binding("old",parent:f.from,inode:f.item.inode); f.binding("new",parent:f.to,inode:victim.inode)
+    m.close(); f.reopened(); m.reopened("new",parent:f.to.inode,inode:victim.inode)
+}
+func renameReplacementFailures(_ parent: URL, required: FSItem.Attribute) throws {
+    for directory in [false,true] {
+    for rejectedRole in 0..<4 {
+        let f = try RenameFixture(parent,"rename-replace-incomplete-\(directory)-\(rejectedRole)",directory:directory,limit:10), m = f.mount, v = m.volume
+        let victim = f.victim(directory:directory), before = v.anchor, tokens = [f.item.pin!,victim.pin!]
+        var role = 0, constructor = false
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSRenameItemResult" { need(victim.lastKnownParent == nil,"incomplete role keeps witness private"); if role == rejectedRole { a.invalidateAllProperties() }; role += 1 } }
+            v.rejectResultForTesting = { _ in constructor = true; return false }
+        }
+        let result = f.rename(over:victim)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && role == rejectedRole+1 && !constructor && anchorMatches(before,v.anchor),"four replacement roles must validate before constructor/commit")
+        f.binding("old",parent:f.from,inode:f.item.inode); f.binding("new",parent:f.to,inode:victim.inode)
+        need(sameBytes(tokens[0],f.item.pin!) && sameBytes(tokens[1],victim.pin!) && victim.lastKnownParent == nil,"abort preserves source/victim pins and linked state")
+        m.close(); f.reopened(); m.reopened("new",parent:f.to.inode,inode:victim.inode)
+    }
+    for scenario in 0..<8 {
+        let f = try RenameFixture(parent,"rename-replace-failure-\(directory)-\(scenario)",directory:directory,capacity:scenario == 7 ? 512 * 1024 : 1024 * 1024,limit:10)
+        let m = f.mount, v = m.volume, victim = f.victim(directory:directory)
+        var retained: StallionItem?, retainedPin: sfs_pin?
+        if scenario == 6 {
+            retained = m.create("retained").2!; retainedPin = retained!.pin!
+            let removed: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(retained!,name:FSFileName(string:"retained"),directory:m.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+            need(removed.0 != nil && removed.1 == nil && retained!.lastKnownParent != nil,"prior committed witness fixture for consumed-error reclaim")
+        }
+        let before = v.anchor, commits = v.diagnosticSnapshot().0.commitSuccess, tokens = [f.item.pin!,victim.pin!]
+        var constructed = false, originalCommit = sfs_result(), capacityFailure = sfs_result()
+        var capacityCalls = 0, capacityBytes: UInt64 = 0, capacityFailures = 0
+        m.serial {
+            v.preparedAttributesForTesting = { name,_ in if name == "FSRenameItemResult" { need(victim.lastKnownParent == nil,"replacement fault cannot publish candidate") } }
+            v.removeCommitReceiptForTesting = { _,_ in need(false,"replacement fault entered remove receipt hook") }
+            v.createCommitReceiptForTesting = { _ in need(false,"replacement fault entered create receipt hook") }
+            if scenario == 0 { v.rejectResultForTesting = { name in if name == "FSRenameItemResult" { constructed = true; return true }; return false } }
+            if scenario == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if scenario == 2 { v.diagnosticBeforeCommit = { sfs_image_clear_read_cache(m.coreHandle); fault(7,1) } }
+            if scenario == 6 { v.renameCommitReceiptForTesting = { original,receipt in originalCommit = original; receipt.fence_succeeded = 0 } }
+            if scenario == 7 { v.diagnosticBeforePrepare = {
+                let payload = Data(repeating:0x5a,count:65536)
+                for index in 0..<8 {
+                    var r = sfs_result()
+                    let status = payload.withUnsafeBytes { sfs_image_write(m.coreHandle,(f.child ?? f.item).inode,UInt64(index)*65536,$0.baseAddress,$0.count,&r) }
+                    if status == SFS_OK { capacityCalls += 1; capacityBytes += UInt64(payload.count); continue }
+                    capacityFailure = r; capacityFailures += 1
+                    need(status == SFS_LIMIT && r.status == SFS_LIMIT && r.limit_reason == SFS_LIMIT_APPEND_CAPACITY,"bounded real replacement capacity exhaustion")
+                    throw sfsError(status,r)
+                }
+                need(false,"eight bounded chunks must reach actual append capacity")
+            } }
+        }
+        if scenario == 3 { fault(1,1) }; if scenario == 4 || scenario == 5 { fault(4,Int32(scenario-3)) }
+        let result = f.rename(over:victim), expected = scenario == 1 ? EACCES : scenario == 2 ? ENOMEM : [3,4,5,7].contains(scenario) ? ENOSPC : EIO
+        need(result.0 == nil && code(result.1) == Int(expected) && anchorMatches(before,v.anchor),"replacement failure \(scenario) original error=\(code(result.1))")
+        if scenario == 0 { need(constructed,"actual four-role constructor reached before rejection") }
+        if (2...5).contains(scenario) { need(hits() > 0,"real replacement core fault hit") }
+        if scenario == 3 { let failure = v.diagnosticSnapshot().2!
+            need(failure.code == Int(ENOSPC) && failure.result.status == SFS_IO && failure.result.system_errno == ENOSPC && failure.result.poisoned != 0,"original replacement append failure poisons handle; no live namespace read follows")
+        }
+        if scenario == 4 || scenario == 5 { need(v.diagnosticSnapshot().2?.result.status == (scenario == 4 ? SFS_IO : SFS_OUTCOME_UNKNOWN),"known versus uncertain replacement fence outcome") }
+        if scenario == 7 {
+            need(capacityFailures == 1 && capacityCalls > 0 && capacityCalls < 8 && capacityBytes == UInt64(capacityCalls)*65536,"count only whole successful capacity chunks; never retry failed call")
+            need(capacityFailure.status == SFS_LIMIT && capacityFailure.limit_reason == SFS_LIMIT_APPEND_CAPACITY && code(result.1) == code(sfsError(capacityFailure.status,capacityFailure)),"retain first actual capacity receipt and its original error independently of abort cleanup")
+        }
+        fault(0,0)
+        m.serial { need(v.ownsForTesting(f.item) && v.ownsForTesting(victim) && sameBytes(tokens[0],f.item.pin!) && sameBytes(tokens[1],victim.pin!) && victim.lastKnownParent == nil,"failed replacement keeps pins and cannot publish witness") }
+        if scenario < 3 || scenario == 7 {
+            f.binding("old",parent:f.from,inode:f.item.inode); f.binding("new",parent:f.to,inode:victim.inode)
+        }
+        if scenario == 6 {
+            need(originalCommit.status == SFS_OK && originalCommit.fence_succeeded == 3 && originalCommit.transaction_active == 0 && v.diagnosticSnapshot().0.commitSuccess == commits+1,"preserve original successful C receipt despite adapter rejection")
+            need(code(m.reclaim(retained!)) == Int(ESTALE),"old-anchor consumed release reports ESTALE")
+            m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(retained!.lastKnownParent == nil && retained!.pin == nil && sfs_image_pin_stat(m.coreHandle,retainedPin!,&value,&r) == SFS_INVALID,"consumed-error reclaim clears previously committed witness without retry") }
+            need(v.diagnosticSnapshot().2?.code == Int(EIO),"cleanup error preserves primary malformed-receipt error")
+        }
+        var laterPreflights = 0
+        if scenario == 3 { m.serial { v.renamePreflightForTesting = { laterPreflights += 1 } } }
+        need(code(f.rename(over:victim).1) == Int(expected),"replacement failure latch suppresses later namespace mutation")
+        if scenario == 3 { need(laterPreflights == 0,"poisoned replacement refuses before any later core preflight") }
+        m.close()
+        if scenario == 6 { f.reopened("new",parent:f.to.inode); m.reopened("old",parent:f.from.inode,inode:nil) }
+        else if scenario != 5 { f.reopened(); m.reopened("new",parent:f.to.inode,inode:victim.inode) }
+        if scenario == 7 && directory { m.reopened("child",parent:f.item.inode,inode:f.child!.inode,bytes:Data("original".utf8)) }
+        // An uncertain commit is retained without asserting either durable namespace.
+    }
+    }
+}
+func renameReplacementQueued(_ parent: URL) throws {
+    for scenario in 0..<3 {
+        let directory = scenario == 2
+        let f = try RenameFixture(parent,"rename-replace-queued-\(scenario)",directory:directory,limit:10), m = f.mount, v = m.volume
+        let victim = f.victim(directory:directory), tokens = [f.item.pin!,victim.pin!]
+        let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), finished = DispatchGroup()
+        var after = v.anchor, replacement: UInt64 = 0, substituted = false
+        v.enqueue { held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume replacement queue") }
+        need(held.wait(timeout:.now()+20) == .success,"hold replacement queue")
+        v.enqueue {
+            try! v.diagnosticMutationForTesting { h,r in
+                if scenario != 2 {
+                    let oldParent = scenario == 0 ? f.from.inode : f.to.inode, oldName = scenario == 0 ? "old" : "new", original = scenario == 0 ? f.item.inode : victim.inode
+                    need(sfs_image_rename_replace(h,oldParent,oldName,3,original,oldParent,"retained",8,0,&r) == SFS_OK,"queue moves original edge before callback")
+                    var initial = sfs_metadata_initial(); initial.mode = UInt32(S_IFREG) | 0o600; initial.uid = geteuid(); initial.gid = getegid()
+                    need(sfs_image_add_metadata(h,oldParent,oldName,3,SFS_FILE,&initial,&replacement,&r) == SFS_OK,"queue substitutes real source/victim inode")
+                } else {
+                    var initial = sfs_metadata_initial(); initial.mode = UInt32(S_IFREG) | 0o600; initial.uid = geteuid(); initial.gid = getegid()
+                    need(sfs_image_add_metadata(h,victim.inode,"child",5,SFS_FILE,&initial,&replacement,&r) == SFS_OK,"queued victim becomes nonempty")
+                    need(sfs_image_write(h,replacement,0,"kept",4,&r) == SFS_OK,"queued child bytes")
+                }
+            }
+            after = v.anchor; substituted = true
+        }
+        finished.enter(); v.renameResultForTesting(f.item,sourceDirectory:f.from,sourceName:FSFileName(string:"old"),destinationName:FSFileName(string:"new"),destinationDirectory:f.to,overItem:victim,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+            need(substituted && result == nil && code(error) == Int(scenario == 2 ? ENOTEMPTY : ESTALE) && anchorMatches(after,v.anchor),"queued replacement revalidates both edges and emptiness"); finished.leave()
+        }
+        resume.signal(); need(finished.wait(timeout:.now()+20) == .success,"queued replacement reply")
+        need(victim.lastKnownParent == nil && sameBytes(tokens[0],f.item.pin!) && sameBytes(tokens[1],victim.pin!),"queued refusal cannot detach or reclaim supplied operands")
+        m.close()
+        if scenario == 0 { f.reopened("retained"); m.reopened("old",parent:f.from.inode,inode:replacement) }
+        else { f.reopened() }
+        if scenario == 1 { m.reopened("retained",parent:f.to.inode,inode:victim.inode); m.reopened("new",parent:f.to.inode,inode:replacement) }
+        else { m.reopened("new",parent:f.to.inode,inode:victim.inode) }
+        if scenario == 2 { m.reopened("child",parent:victim.inode,inode:replacement,bytes:Data("kept".utf8)) }
+    }
+}
 #endif
 
 #if STALLION_CONTEXT_HANDLERS
@@ -3028,13 +3374,20 @@ func symlinkReopened(_ m: CreationMount, _ name: String = "new", parent: UInt64 
     need(metadata.entry.kind == SFS_SYMLINK && metadata.entry.size == UInt64(target.count) && metadata.referenced_data_bytes == 4096 && metadata.link_count == 1 && metadata.entry.parent == parent,"truthful target size/allocation/links/parent")
     symlinkBytes(h!,inode,target); need(sfs_image_close(h,&r) == SFS_OK,"symlink reopen close")
 }
-func symlinkReadback(_ m: CreationMount, _ item: StallionItem, _ target: Data) {
+func symlinkReadback(_ m: CreationMount, _ item: StallionItem, _ target: Data, heldPin: sfs_pin? = nil) {
     let result: (FSReadSymlinkResult?,Error?) = wait { done in m.volume.readlinkResultForTesting(item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
     need(result.0 != nil && result.1 == nil,"actual contextual readlink constructor error=\(code(result.1))")
     // Result classes expose no target getter. This is the same readlinkBody's legacy return, correlated with raw storage.
     let legacy: (FSFileName?,Error?) = wait { done in m.volume.readSymbolicLink(item) { done(($0,$1)) } }
     need(legacy.1 == nil && legacy.0?.data == target,"shared readlink body exact delivered bytes")
-    m.serial { symlinkBytes(m.coreHandle,item.inode,target) }
+    m.serial {
+        if let heldPin {
+            need(item.pin != nil && sameBytes(item.pin!,heldPin),"detached readlink uses original held victim token")
+            var r = sfs_result(), bytes = Data(count:4096), count = 0
+            need(bytes.withUnsafeMutableBytes { sfs_image_readlink(m.coreHandle,0,item.inode,$0.baseAddress,$0.count,&count,&r) } == SFS_NOT_FOUND,"detached symlink remains absent from namespace reads")
+            need(bytes.withUnsafeMutableBytes { sfs_image_pin_readlink(m.coreHandle,heldPin,$0.baseAddress,$0.count,&count,&r) } == SFS_OK && count == target.count && bytes.prefix(count) == target,"held token reads exact detached symlink bytes")
+        } else { symlinkBytes(m.coreHandle,item.inode,target) }
+    }
 }
 func contextualSymlinkCreation(_ parent: URL) throws {
     let required = FSCreateSymlinkResult.requestedAttributes.wantedAttributes
@@ -3561,6 +3914,7 @@ func contextualXattrQueue(_ parent: URL) throws {
         print("SDK unconstructible capability request fields: \(unavailable.map(String.init).joined(separator: ","))")
 #if STALLION_CONTEXT_HANDLERS
         print("RMDIR requested mask: 0x\(String(UInt(bitPattern: FSRemoveItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); final-link branch: actual-result success")
+        print("RENAME requested mask: 0x\(String(UInt(bitPattern: FSRenameItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); replacement and same-inode branches: actual-result success")
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
