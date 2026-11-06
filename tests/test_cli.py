@@ -994,5 +994,174 @@ for name in names:
         self.assertFalse((self.base / 'unused-store').exists())
 
 
+class MountedOperationArguments(unittest.TestCase):
+    """Parser/dispatch checks; these do not exercise a mounted filesystem."""
+    def test_status_and_exact_continuation_arguments(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        workspace, operation = 'a' * 32, 'b' * 32
+        cases = [
+            (['snapshot', workspace, '--name', 'before', '--quiescent', '--continue', operation],
+             'snapshot', (workspace,), {'name': 'before', 'quiescent': True, 'continue_operation': operation}, {'id': 'before'}),
+            (['rollback', workspace, 'before', '--quiescent', '--continue', operation],
+             'rollback', (workspace, 'before'), {'quiescent': True, 'continue_operation': operation}, {'snapshot': 'before'}),
+            (['snapshots', workspace, '--operation', operation],
+             'snapshots', (workspace,), {'operation_id': operation}, {'message': 'Mount completion is unknown.', 'next_action': None}),
+            (['unmount', workspace, '--continue', operation],
+             'continue_unmount', (workspace, operation), {}, {'unmounted': workspace}),
+        ]
+        for argv, method, args, kwargs, result in cases:
+            with self.subTest(command=argv[0]), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                getattr(store.return_value, method).return_value = result
+                self.assertEqual(main(['--json', *argv]), 0)
+                getattr(store.return_value, method).assert_called_once_with(*args, **kwargs)
+                self.assertEqual(json.loads(output.getvalue()), result)
+                if argv[0] == 'snapshots': store.return_value.opportunistic_cleanup.assert_not_called()
+
+    @staticmethod
+    def compound_record(*, root=Path('/private/tmp/store with spaces'), action='restore', name='saved'):
+        workspace, operation = 'a' * 32, 'b' * 32
+        target = {'directory': str(root / 'workspaces' / workspace), 'component': 'image.sfs',
+                  'parent': [1, 2], 'file': [3, 4], 'uuid': 'c' * 32}
+        receipt = {'status': 0, 'poisoned': False, 'transaction_active': False,
+                   'device': 3, 'inode': 4, 'uuid': target['uuid'],
+                   'generation': 2, 'root_digest': 'd' * 64, 'committed_end': 32768}
+        result = {'ok': True, 'committed': True, 'commit_attempted': True, 'outcome': 'committed',
+                  'close_attempted': True, 'guard_close_errno': 0, 'path_errno': 0, 'interrupted': False,
+                  'deadline_expired': False, 'operation': action, 'snapshot': name, 'recovery': 'recovery-held',
+                  'receipt': receipt, 'close_receipt': dict(receipt)}
+        accepted_mount = {'format': 1, 'state': 'mounted', 'target': target, 'profile': 'production',
+                          'operation': 'e' * 32, 'observation': {
+                              'path': target['directory'] + '/volume', 'filesystem': 'stallionfs',
+                              'owner': os.getuid(), 'flags': 0, 'fsid': [71, 1],
+                              'readonly': False, 'ignore_ownership': False, 'device': 'fixture resource'}}
+        return {'workspace': workspace, 'id': operation, 'operation': 'native-mounted-' + action,
+                'target': target, 'name': name, 'recovery_name': 'recovery-held', 'accepted_mount': accepted_mount,
+                'phase': 'committed', 'outcome': 'incomplete', 'originally_mounted': True,
+                'profile': 'production', 'host': '/Applications/StallionFS.app/Contents/MacOS/StallionFS',
+                'child_pending': False, 'helpers': [], 'unmount_attempts': [], 'remount_attempts': [],
+                'bridge_attempted': True, 'bridge_returned': True, 'native_image_result': result,
+                'committed_anchor': {key: receipt[key] for key in ('generation', 'root_digest', 'committed_end')}}
+
+    def test_plain_compound_failures_and_status_preserve_material_outcomes(self):
+        import errno
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        from stallionfs._native_recovery import compound_summary
+        for phase in ('qualification', 'guard', 'unknown-bridge'):
+            record = self.compound_record()
+            if phase == 'unknown-bridge':
+                record.update(phase='bridge-attempted', bridge_returned=False)
+            error = OSError(errno.EIO, phase + ' failure')
+            error.native_candidate_result = {'native_operation': record} if phase == 'guard' else record
+            with self.subTest(phase=phase), patch('stallionfs.core.Store') as store, redirect_stderr(StringIO()) as output:
+                store.return_value.rollback.side_effect = error
+                self.assertEqual(main(['rollback', record['workspace'], record['name'], '--quiescent']), 1)
+                text = output.getvalue()
+                self.assertIn(phase + ' failure', text)
+                if phase == 'unknown-bridge':
+                    self.assertIn('outcome is incomplete', text)
+                    self.assertNotIn('Rollback committed', text)
+                    self.assertNotIn('Recovery snapshot:', text)
+                else:
+                    self.assertIn('Rollback committed', text)
+                    self.assertIn('Recovery snapshot: recovery-held', text)
+                    self.assertIn('Remount was not attempted', text)
+        for mount in ('failed', 'not-launched', 'unknown', 'verified-drift', 'verified-observation-error'):
+            record = self.compound_record()
+            record['phase'] = 'remount-attempted'
+            helper = {'label': 'mount', 'stage': 'remount', 'attempt': 0, 'argv': ['/sbin/mount'],
+                      'child_pending': False, 'pid': 123, 'returncode': 1, 'reaped': True,
+                      'outcome': 'error', 'stdout': '/retained/stdout', 'stderr': '/retained/stderr'}
+            record['helpers'] = [helper]
+            record['remount_attempts'] = [{'launched': True, 'response': {'returncode': 1, 'outcome': 'error'}}]
+            if mount == 'not-launched':
+                helper.update(pid=None, returncode=None, reaped=False, outcome='not-launched')
+                record['remount_attempts'][-1]['response'] = None
+            elif mount == 'unknown':
+                helper.update(returncode=0, outcome='unknown')
+                record['remount_attempts'][-1]['response'] = None
+            elif mount.startswith('verified'):
+                helper.update(returncode=0, outcome='success')
+                attempt = record['remount_attempts'][-1]
+                row = {'path': record['target']['directory'] + '/volume', 'fsid': [1, 2]}
+                attempt.update(response={'returncode': 0, 'outcome': 'success'},
+                    qualified={'profile': record['profile'], 'host': record['host'], 'filesystem': 'stallionfs'},
+                    guard={**record['native_image_result']['receipt'], 'core_consumed': True, 'parent_close_errno': 0},
+                    evidence={'observation': row, 'repo': record['target']['directory'] + '/volume/repo', 'usable': True})
+                record.update(phase='final-verified', final_evidence={'observation': row})
+            status = {'message': compound_summary(record)['message'], 'next_action': None}
+            if mount == 'verified-drift': status['current_mount_matches_completion'] = False
+            if mount == 'verified-observation-error': status['current_observation_error'] = 'backing identity changed'
+            with self.subTest(mount=mount), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                store.return_value.snapshots.return_value = status
+                self.assertEqual(main(['snapshots', record['workspace'], '--operation', record['id']]), 0)
+                text = output.getvalue()
+                self.assertIn('Rollback committed', text)
+                self.assertIn('Recovery snapshot: recovery-held', text)
+                if mount == 'failed': self.assertIn('Remount command failed', text)
+                if mount == 'not-launched': self.assertIn('Remount was not launched', text)
+                if mount == 'unknown': self.assertIn('Mount completion is unknown', text)
+                if mount == 'verified-drift': self.assertIn('current mount differs', text)
+                if mount == 'verified-observation-error': self.assertIn('Current mount observation failed: backing identity changed', text)
+                self.assertNotIn('currently mounted', text)
+
+    def test_generated_compound_commands_parse_the_selected_root_and_name(self):
+        import shlex
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        from stallionfs._native_recovery import compound_status, pending_message, _operation_command
+        root = Path("/private/tmp/custom store's path")
+        name = "--snapshot with 'quotes'"
+        for action in ('snapshot', 'restore'):
+            record = self.compound_record(root=root, action=action, name=name)
+            path = Path(record['target']['directory'])
+            metadata = {'controller_profile': record['profile'], 'native_host': record['host']}
+            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+                 patch('stallionfs._native_recovery.ready', return_value=record['target']), \
+                 patch('stallionfs._native_recovery._mounts_only_at'), \
+                 patch('stallionfs._native.observe', return_value=None):
+                status = compound_status(SimpleNamespace(root=root), path, metadata, record['id'])
+            commands = [(status['next_action'], 'snapshot' if action == 'snapshot' else 'rollback'),
+                        (_operation_command(record, 'snapshots', '--operation', record['id']), 'snapshots')]
+            self.assertIn(commands[1][0], pending_message(record))
+            record['phase'] = 'unmount-attempted'
+            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+                 patch('stallionfs._native_recovery.ready', return_value=record['target']), \
+                 patch('stallionfs._native_recovery._mounts_only_at'), \
+                 patch('stallionfs._native_recovery._matching_mount', return_value=({}, {})), \
+                 patch('stallionfs._native.observe', return_value={'fsid': [1, 2]}):
+                withdrawal = compound_status(SimpleNamespace(root=root), path, metadata, record['id'])
+            self.assertIsInstance(withdrawal['next_action'], str)
+            self.assertTrue(withdrawal['next_action'])
+            commands.append((withdrawal['next_action'], 'continue_unmount'))
+            for command, method in commands:
+                with self.subTest(action=action, method=method), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()):
+                    store.return_value.snapshot.return_value = {'id': name}
+                    store.return_value.rollback.return_value = {'snapshot': name}
+                    store.return_value.snapshots.return_value = {'message': 'Retained.', 'next_action': None}
+                    store.return_value.continue_unmount.return_value = {'unmounted': record['workspace']}
+                    arguments = shlex.split(command)
+                    self.assertEqual(arguments[0], 'sfs')
+                    self.assertEqual(main(arguments[1:]), 0)
+                    store.assert_called_once_with(str(root))
+                    if method == 'snapshot':
+                        store.return_value.snapshot.assert_called_once_with(record['workspace'], name=name, quiescent=True, continue_operation=record['id'])
+                    elif method == 'rollback':
+                        store.return_value.rollback.assert_called_once_with(record['workspace'], name, quiescent=True, continue_operation=record['id'])
+                    elif method == 'snapshots':
+                        store.return_value.snapshots.assert_called_once_with(record['workspace'], operation_id=record['id'])
+                    else:
+                        store.return_value.continue_unmount.assert_called_once_with(record['workspace'], record['id'])
+
+
+
 if __name__ == '__main__':
     unittest.main()

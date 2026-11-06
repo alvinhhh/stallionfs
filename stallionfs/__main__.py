@@ -60,6 +60,8 @@ def main(argv=None):
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
         command.add_argument("id")
+        if action == "unmount":
+            command.add_argument("--continue", dest="continue_operation", metavar="OP", help="Withdraw an accepted mount before a retained snapshot/rollback")
     listing = commands.add_parser("list", help="List stored workspaces, seeds or trash")
     listing.add_argument("kind", nargs="?", choices=["workspaces", "seeds", "trash"], default="workspaces")
     for action in ("remove", "restore"):
@@ -75,13 +77,16 @@ def main(argv=None):
     snapshot = commands.add_parser("snapshot", help="Capture a stopped managed workspace")
     snapshot.add_argument("id")
     snapshot.add_argument("--name", default="")
-    snapshot.add_argument("--quiescent", action="store_true")
+    snapshot.add_argument("--quiescent", action="store_true", help="Assert writers are stopped and flushed; allow a brief native unmount/remount")
+    snapshot.add_argument("--continue", dest="continue_operation", metavar="OP", help="Continue the matching retained operation without repeating its mutation")
     snapshots = commands.add_parser("snapshots", help="List workspace snapshots")
     snapshots.add_argument("id")
+    snapshots.add_argument("--operation", metavar="OP", help="Read retained phase and continuation instructions")
     rollback = commands.add_parser("rollback", help="Restore a snapshot and retain the previous workspace")
     rollback.add_argument("id")
     rollback.add_argument("snapshot")
-    rollback.add_argument("--quiescent", action="store_true")
+    rollback.add_argument("--quiescent", action="store_true", help="Assert writers are stopped and flushed; allow a brief native unmount/remount")
+    rollback.add_argument("--continue", dest="continue_operation", metavar="OP", help="Continue the matching retained operation without repeating its mutation")
     close = commands.add_parser("close", help="Record that all workspace writers have stopped")
     close.add_argument("id")
     close.add_argument("--quiescent", action="store_true")
@@ -184,7 +189,9 @@ def main(argv=None):
             result = store.create(args.seed, name=args.name, jobs=args.jobs, **options)
             text = result["path"]
         elif args.action in ("mount", "unmount"):
-            result = getattr(store, args.action)(args.id)
+            result = (store.continue_unmount(args.id, args.continue_operation)
+                      if args.action == "unmount" and args.continue_operation is not None
+                      else getattr(store, args.action)(args.id))
             text = result.get("path", result.get("unmounted"))
         elif args.action == "list":
             result = store.list(args.kind)
@@ -197,13 +204,19 @@ def main(argv=None):
             result = {"deleted" if args.yes else "would_delete": items}
             text = json.dumps(result)
         elif args.action == "snapshot":
-            result = store.snapshot(args.id, quiescent=args.quiescent, name=args.name)
+            result = store.snapshot(args.id, quiescent=args.quiescent, name=args.name,
+                                    **({"continue_operation": args.continue_operation} if args.continue_operation is not None else {}))
             text = result["id"]
         elif args.action == "snapshots":
-            result = store.snapshots(args.id)
-            text = "\n".join(f"{item['id']}\t{item['name']}" for item in result)
+            result = store.snapshots(args.id, **({"operation_id": args.operation} if args.operation is not None else {}))
+            if args.operation is not None:
+                from ._native_recovery import format_compound_status
+                text = format_compound_status(result)
+            else:
+                text = "\n".join(f"{item['id']}\t{item['name']}" for item in result)
         elif args.action == "rollback":
-            result = store.rollback(args.id, args.snapshot, quiescent=args.quiescent)
+            result = store.rollback(args.id, args.snapshot, quiescent=args.quiescent,
+                                    **({"continue_operation": args.continue_operation} if args.continue_operation is not None else {}))
             text = json.dumps(result)
         elif args.action == "close":
             result = store.close(args.id, quiescent=args.quiescent)
@@ -248,7 +261,13 @@ def main(argv=None):
             details = result.get('native_image_result')
         if details is not None:
             error['native_image_result'] = details
-            if interrupted or isinstance(exc, MemoryError):
+            from ._native_recovery import COMPOUND, compound_summary
+            compound = details if details.get('operation') in COMPOUND else details.get('native_operation')
+            if isinstance(compound, dict) and compound.get('operation') in COMPOUND:
+                summary = compound_summary(compound)
+                error['native_operation_summary'] = summary
+                notes.append(summary['message'])
+            elif interrupted or isinstance(exc, MemoryError):
                 if details.get('committed'):
                     message = ('interrupted' if interrupted else 'response allocation failed') + '; the image change committed'
                 elif details.get('outcome') == 'unknown':

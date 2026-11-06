@@ -242,14 +242,69 @@ These do not authenticate an exact live adapter session or prove a previous
 adapter close succeeded. A fresh guard validates only its own current admission
 and consumed close. Ordinary unmount alone grants no stale-cleanup credit.
 
-Owned native snapshots and rollback require an already unmounted workspace,
-including all nested mountpoints. Use `sfs unmount ID` first, then `sfs snapshot
-ID --name NAME`, `sfs snapshots ID` or `sfs rollback ID NAME`. Rollback saves the
-previous current state under the returned recovery name in the same commit.
-The catalog holds 32 entries without eviction. At 32 entries, both snapshot and
-rollback are refused: rollback also needs one free entry for recovery. Catalog
-entry deletion is not supported. A failed or interrupted mutation retains its
-receipt; `snapshots ID` makes a fresh current observation without replaying it.
+Owned native snapshots and rollback can briefly unmount and remount an accepted
+managed workspace. Stop and flush every writer and release open files and
+directories before asserting `--quiescent`:
+
+```sh
+sfs snapshot ID --name before-change --quiescent
+sfs rollback ID before-change --quiescent
+```
+
+One managed-use lease and one durable operation cover the normal unmount, closed
+image transaction, and verified remount. The flag does not stop other processes.
+Busy volumes or backing handles refuse safely; no forced unmount or pin bypass is
+used. This is a cooperative outage, not an uninterrupted snapshot. Old handles
+do not survive it. New opens after successful remount use the restored namespace.
+An initially unmounted workspace stays unmounted. Without `--quiescent`, owned
+native operations still require an already unmounted workspace, including all
+nested mountpoints. External registrations remain closed-image operations.
+
+Before unmount, a fresh observation must match the accepted mount's target,
+path, filesystem type, owner, flags and filesystem ID, with a qualified module
+profile. This matches recorded observations; it does not authenticate a live
+provider session. The transaction reacquires the exact backing exclusively.
+Rollback saves the state actually admitted by that transaction under the returned
+recovery name, in the same commit. The catalog holds 32 entries without eviction;
+rollback needs one free entry for recovery. Catalog entry deletion is not supported.
+
+Mutation and mount outcomes are separate. A committed snapshot/rollback followed
+by remount failure remains committed. Every remount checks the saved committed
+generation, root digest and committed end with a fresh exclusive guard and
+successful consumed close. Image drift stops remount. The guard releases its
+lock before the mount command: it is not a reservation across that gap, so all
+external users must continue cooperating. Neither namespace absence nor a fresh
+guard proves the previous provider's historical close succeeded.
+
+Use the retained operation ID from failure output to inspect and continue:
+
+```sh
+sfs --json snapshots ID --operation OP
+sfs snapshot ID --name before-change --quiescent --continue OP
+sfs rollback ID before-change --quiescent --continue OP
+```
+
+Continuation requires the same workspace, action and name. It never repeats an
+attempted catalog mutation or creates a new recovery name. Ordinary commands
+preserve a pending compound journal and print its status command.
+
+| Retained phase | Permitted continuation |
+| --- | --- |
+| Prepared | Revalidate the accepted mount, then start the first unmount and mutation. |
+| Unmount response missing | Only terminal helper evidence plus fresh absence and backing admission can allow the first mutation. A present mount is not automatically unmounted again. |
+| Bridge response missing, failed, uncertain or close incomplete | Stop. A matching current catalog cannot repair the original result. |
+| Confirmed commit and successful consumed close | Remount only, checking the saved anchor; or finalize an originally unmounted workspace. |
+| Remount response missing | A present mount requires the same operation's durable qualified observation/usability evidence and terminal helper evidence for finish-only continuation. Otherwise stop. Once separately withdrawn and absent, terminal helper evidence permits a new recorded remount attempt. |
+| Final state verified, completion interrupted | Verify retained final evidence and current state, finish the durable record, then remove the matching journal. |
+| Child pending, unreaped or ownership uncertain | Keep its controller running. A new invocation never signals or waits on a saved PID or infers termination from mount absence. |
+
+Before mutation only, `sfs unmount ID --continue OP` permits explicit normal
+withdrawal of the still-present accepted matching mount, retaining the same
+operation without authorizing a catalog mutation. It refuses an unbound or changed
+mount. For an unresolved present remount without durable evidence, arrange normal
+withdrawal separately after checking the displayed path; the controller does not
+infer authority from that observation. Completed-operation status preserves its
+historical result and reports current mount drift separately.
 
 Cleanup remains disabled by default and needs explicit per-workspace enrollment.
 For an enrolled owned native workspace, `close ID --quiescent` normally unmounts

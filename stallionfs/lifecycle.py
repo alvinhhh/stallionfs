@@ -180,15 +180,19 @@ class Lifecycle:
                 raise core.StallionError('Recovery retention limit reached; explicitly purge unneeded retained data')
             yield
 
-    def snapshot(self, workspace, *, quiescent=False, name=''):
+    def snapshot(self, workspace, *, quiescent=False, name='', continue_operation=None):
         native_result = [None]
-        with self._workspace_lock(workspace, native_result=native_result):
+        with self._workspace_lock(workspace, reconcile=continue_operation is None, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
+            self._continuation_target(meta, quiescent, continue_operation)
             if meta.get('backend') == 'native-image':
                 if meta.get('ownership') == 'store-created':
-                    from ._native_recovery import catalog_locked
+                    from ._native_recovery import catalog_locked, compound_locked
+                    if continue_operation is not None and not name:
+                        raise core.StallionError('Continuation requires the original snapshot name')
                     name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
-                    native_result[0] = catalog_locked(self, path, meta, 'snapshot', name)
+                    native_result[0] = (compound_locked(self, path, meta, 'snapshot', name,
+                        operation_id=continue_operation) if quiescent else catalog_locked(self, path, meta, 'snapshot', name))
                     return native_result[0]
                 name = self._native_name('snapshot-' + uuid.uuid4().hex if name == '' else name)
                 response = {'id': name, 'name': name, 'workspace': workspace, 'backend': 'native-image',
@@ -212,7 +216,34 @@ class Lifecycle:
                 self._mount(path, meta)
             return record
 
-    def snapshots(self, workspace):
+    @staticmethod
+    def _continuation_target(meta, quiescent, operation_id):
+        if operation_id is not None and (not quiescent or meta.get('backend') != 'native-image'
+                                        or meta.get('ownership') != 'store-created'):
+            raise core.StallionError('Continuation requires an owned native workspace and --quiescent')
+
+    def continue_unmount(self, workspace, operation_id):
+        from ._native_recovery import _load_compound, compound_locked
+        with self._workspace_lock(workspace, reconcile=False):
+            path, meta = self.object('workspaces', workspace)
+            self._continuation_target(meta, True, operation_id)
+            record, pending = _load_compound(self, path, operation_id)
+            if not pending:
+                raise core.StallionError('Operation is already complete; withdrawal was not started')
+            action = 'snapshot' if record['operation'] == 'native-mounted-snapshot' else 'restore'
+            return compound_locked(self, path, meta, action, record['name'], operation_id=operation_id, withdrawal=True)
+
+    def snapshots(self, workspace, *, operation_id=None):
+        if operation_id is not None:
+            from ._native_recovery import compound_status
+            core.identifier(workspace, 32)
+            path = self.root / 'workspaces' / workspace
+            core.private_directory(path)
+            meta = core.read_json(path / 'meta.json')
+            if meta.get('id') != workspace:
+                raise core.StallionError('Workspace metadata identity changed')
+            self._continuation_target(meta, True, operation_id)
+            return compound_status(self, path, meta, operation_id)
         _, meta = self.object('workspaces', workspace)
         if meta.get('backend') == 'native-image':
             with self._workspace_lock(workspace):
@@ -248,7 +279,9 @@ class Lifecycle:
             return
         registration = self.root / 'workspaces' / workspace / 'meta.json'
         record = core.read_json(journal)
-        from ._native_recovery import ACTIONS, validate_intent
+        from ._native_recovery import ACTIONS, COMPOUND, validate_intent, pending_message
+        if record.get('operation') in COMPOUND:
+            raise core.StallionError(pending_message(record))
         if record.get('operation') in ACTIONS:
             validate_intent(workspace, record)
             return  # Explicit current admission; never replay catalog or move mutations.
@@ -285,14 +318,17 @@ class Lifecycle:
         self._open(workspace, path, meta)
         journal.unlink()
 
-    def rollback(self, workspace, snapshot, *, quiescent=False):
+    def rollback(self, workspace, snapshot, *, quiescent=False, continue_operation=None):
         native_result = [None]
-        with self._workspace_lock(workspace, native_result=native_result):
+        with self._workspace_lock(workspace, reconcile=continue_operation is None, native_result=native_result):
             path, meta = self.object('workspaces', workspace)
+            self._continuation_target(meta, quiescent, continue_operation)
             if meta.get('backend') == 'native-image':
                 if meta.get('ownership') == 'store-created':
-                    from ._native_recovery import catalog_locked
-                    native_result[0] = catalog_locked(self, path, meta, 'restore', self._native_name(snapshot))
+                    from ._native_recovery import catalog_locked, compound_locked
+                    snapshot = self._native_name(snapshot)
+                    native_result[0] = (compound_locked(self, path, meta, 'restore', snapshot,
+                        operation_id=continue_operation) if quiescent else catalog_locked(self, path, meta, 'restore', snapshot))
                     return native_result[0]
                 snapshot = self._native_name(snapshot)
                 recovery = 'recovery-' + uuid.uuid4().hex

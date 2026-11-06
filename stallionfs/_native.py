@@ -524,20 +524,47 @@ class Operation:
                 'record': str(self.path / 'native-operations' / previous['id'] / 'record.json'),
                 'outcome': previous['outcome']}
 
+    @classmethod
+    def resume(cls, store, path, record):
+        operation = cls.__new__(cls)
+        operation.path = path
+        operation.journal = store.root / 'journals' / (path.name + '.json')
+        operation.directory = path / 'native-operations' / record['id']
+        from .core import private_directory
+        private_directory(operation.directory)
+        operation.record = record
+        return operation
+
     def persist(self):
         self.record['child_pending'] = any(item.get('child_pending') is True for item in self.record['helpers'])
-        _persist(self.directory / 'record.json', self.record)
-        _persist(self.journal, self.record)
+        from ._native_recovery import COMPOUND
+        if self.record.get('operation') in COMPOUND:
+            from .core import read_json
+            if self.journal.exists():
+                current = read_json(self.journal)
+                immutable = ('id', 'workspace', 'operation', 'target', 'name', 'recovery_name',
+                             'profile', 'host', 'originally_mounted', 'accepted_mount')
+                if any(current.get(key) != self.record.get(key) for key in immutable):
+                    raise failure('Native operation owner changed; retained unchanged', self.record)
+            # The journal is authoritative until finish. Publish child ownership
+            # there first, so a stale archival copy cannot authorize continuation.
+            _persist(self.journal, self.record)
+            _persist(self.directory / 'record.json', self.record)
+        else:
+            _persist(self.directory / 'record.json', self.record)
+            _persist(self.journal, self.record)
 
     def command(self, label, argv):
         directory = self.directory / f'{len(self.record["helpers"]):02}-{label}'
         directory.mkdir(mode=0o700)
-        result = {'label': label}
+        result = {'label': label, **getattr(self, 'command_context', {})}
         self.record['helpers'].append(result)
         return execute_owned(argv, result, self.persist, directory)
 
     def finish(self):
-        from .core import sync_directory
+        from .core import sync_directory, read_json
+        if not self.journal.exists() or read_json(self.journal).get('id') != self.record['id']:
+            raise failure('Native operation owner changed; completion retained', self.record)
         self.record['outcome'] = 'complete'
         self.persist()
         self.journal.unlink()
@@ -546,7 +573,9 @@ class Operation:
 
 def check_pending(workspace, record):
     """Require affirmative terminal evidence before replacing a native intent."""
-    from ._native_recovery import ACTIONS, validate_intent
+    from ._native_recovery import ACTIONS, COMPOUND, validate_intent, pending_message
+    if isinstance(record, dict) and record.get('operation') in COMPOUND:
+        raise failure(pending_message(record), {'intent': record})
     if isinstance(record, dict) and record.get('operation') in ACTIONS:
         validate_intent(workspace, record)
         return
@@ -581,6 +610,16 @@ def check_pending(workspace, record):
     allowed = {'native-create': {'verify-package', 'discover'},
                'native-mount': {'verify-package', 'discover', 'mount'},
                'native-unmount': {'unmount'}}[record['operation']]
+    check_helpers(record, allowed)
+
+
+def check_helpers(record, allowed):
+    """Validate retained terminal receipts; never signal or reap a saved PID."""
+    def malformed():
+        raise failure('Operation still has unresolved process ownership. Keep its controller running; no continuation was started.',
+                      {'intent': record})
+    if record.get('child_pending') is not False or not isinstance(record.get('helpers'), list):
+        malformed()
     for item in record['helpers']:
         if (not isinstance(item, dict) or not isinstance(item.get('label'), str) or item['label'] not in allowed
                 or type(item.get('child_pending')) is not bool or item['child_pending']
@@ -848,7 +887,7 @@ def mount_locked(store, path, metadata):
                                       'write_probe': operation.record['write_probe']}
                 _persist(path / 'native-install.json', proof)
             transport['path'] = repo
-            state = {'state': 'mounted', 'target': target, 'observation': row, 'operation': operation.record['id']}
+            state = {'state': 'mounted', 'target': target, 'profile': profile, 'observation': row, 'operation': operation.record['id']}
             _persist(state_path, state)
             operation.record['observed_mount'] = row
             operation.finish()
