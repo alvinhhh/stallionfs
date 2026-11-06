@@ -300,6 +300,26 @@ direct callback tests do not establish mounted persistence or distribution
 eligibility. The production signing/profile, installation, enablement and mounted
 qualification gates remain open until that intended artifact passes them.
 
+The contextual writable profile authorizes regular-file execution only for the
+volume owner, with owner read and execute bits (`0500`), no special permission
+bits, zero flags and no opaque ACL descriptor. Both contextual build flags,
+contextual-write admission, enabled writes, mounted readiness and current writable
+resource access are required. Read-only, legacy and diagnostic fixture profiles
+retain their execution refusal. Every combined access right still needs its own
+original permission; directory search and unrelated reads are unchanged.
+
+Retained detached files use their exact owned pin and current inode permissions
+and ACL. Their last-known parent grants no namespace or execution authority, and
+a replacement path cannot supply the held victim's permissions. Access checks
+grant no open modes and cannot restore an unlinked pathname. This policy is not
+an execution sandbox: an external interpreter can consume readable script data.
+
+Direct callback tests qualify these decisions and SDK result construction only.
+Installed direct script/native launch, loader mappings, new-launch permission
+revocation, executable replacement, retained descriptor/mapping lifetime and
+remount persistence remain required qualification gates. Actual mount flags and
+platform code-signature/quarantine restrictions remain independent constraints.
+
 ## Optional self-contained CLI runtime
 
 `--runtime-inputs /absolute/runtime-inputs.json` extends this same packager with

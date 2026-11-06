@@ -88,7 +88,7 @@ struct Fixture {
     }
 }
 @MainActor func factoryPolicyChecks(_ parent: URL) throws {
-    let fixture = try Fixture(parent,"factory-readonly")
+    let fixture = try Fixture(parent,"factory-readonly",mode:0o700)
     let image = fixture.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
     let modes = [1,2]
@@ -105,6 +105,10 @@ struct Fixture {
         need(coreRO && volume.requestedMountOptions.contains(.readOnly),"public factory readonly core and mount request")
         let active: (FSItem?,Error?) = wait { done in volume.activate { done(($0,$1)) } };need(active.1 == nil,"public factory readonly activation")
         let mounted: Error? = wait { volume.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"public factory readonly mount")
+        let found: (FSItem?,Error?) = wait { done in volume.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$2)) } }
+        need(found.0 != nil && found.1 == nil,"public readonly executable fixture lookup")
+        let access: (FSCheckAccessResult?,Error?) = wait { done in volume.accessForTesting(found.0!,access:.execute,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(access.0 == nil && code(access.1) == Int(EACCES),"readonly selection and missing production flags never grant file execution")
         let written: Error? = wait { done in volume.write(contents:Data([1]),to:active.0!,at:0) { done($1) } }
         need(code(written)==Int(EROFS),"public factory readonly mutation denied")
         let _: Bool = wait { done in volume.unmount { done(true) } }
@@ -330,10 +334,198 @@ struct Fixture {
     let otherDeactivate: Error?=wait { otherVolume.deactivate(options:[],replyHandler:$0) };need(code(otherDeactivate)==Int(EACCES),"never-opened failure retained through deactivate")
     let otherClose: Error?=wait { otherFS.unloadResource(resource:otherResource,replyHandler:$0) };need(code(otherClose)==Int(EACCES),"second image consuming close preserves first delivery failure")
     need(other.contents()==Data("original".utf8),"never-opened data write leaves bytes unchanged")
+    try contextualExecutionAccess(parent,factory:factory)
 #else
     need(reply.0 == nil && code(reply.1)==Int(ENOTSUP),"missing contextual mutation build cannot enable production policy")
 #endif
 }
+
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+// A supplied-state fixture only: this does not model deployed resource changes.
+final class ExecutionResource: FSPathURLResource {
+    var permitsWrites = true
+    override var isWritable: Bool { permitsWrites && super.isWritable }
+}
+func executionAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolume.AccessMask = .execute,
+                     expected: Int32 = 0, caller: CallerIdentity? = nil) {
+    let own = item as? StallionItem, before = volume.anchor, pin = own?.pin.map { rawBytes($0) }
+    let modes = own?.retainedModes, witness = own?.lastKnownParent
+    let count: Int = wait { done in volume.enqueue { done(volume.activeItemCount()) } }
+    var replies = 0
+    let result: (FSCheckAccessResult?,Error?) = wait { done in
+        volume.accessForTesting(item,access:rights,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) {
+            replies += 1; done(($0,$1))
+        }
+    }
+    need(code(result.1) == Int(expected) && (result.0 != nil) == (expected == 0),"execution access result matches independent rights")
+    let _: Bool = wait { done in volume.enqueue {
+        need(replies == 1 && anchorMatches(before,volume.anchor) && volume.activeItemCount() == count &&
+             own?.pin.map { rawBytes($0) } == pin && own?.retainedModes == modes &&
+             own?.lastKnownParent?.item == witness?.item && own?.lastKnownParent?.parent == witness?.parent,
+             "execution access replies once without changing anchor, canonical items, pins, modes or parent witness")
+        done(true)
+    } }
+}
+@MainActor func contextualExecutionAccess(_ parent: URL, factory: Bool) throws {
+    func exercise(_ name: String, mode: UInt32 = 0o700, acl: Bool = false, flags: UInt32 = 0,
+                  owner: uid_t = geteuid(), writable: Bool = true, endError: Int32 = 0, persistedMode: UInt32? = nil,
+                  body: (StallionVolume,FSItem,StallionItem,ExecutionResource,([StallionItem]) -> Void) throws -> Void) throws {
+        let f = try Fixture(parent,"execute-"+name,mode:mode,acl:acl,owner:owner,extra:true,sourceFlags:flags)
+        let fs = factory ? StallionExtension().fileSystem : StallionFileSystem(accessPolicy:.contextualWrites)
+        let resource = ExecutionResource(url:f.url,writable:writable)
+        let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:[]) { done(($0,$1)) } }
+        need(loaded.1 == nil && loaded.0 != nil,"execution uses actual contextual resource admission")
+        let v = loaded.0 as! StallionVolume
+        let active: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }
+        need(active.1 == nil && active.0 != nil,"execution activation")
+        need(wait { v.mount(arguments:[],replyHandler:$0) } == nil,"execution mount callback")
+        let found: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$2)) } }
+        need(found.1 == nil && found.0 != nil,"execution canonical item")
+        let file = found.0 as! StallionItem
+        var held = [file]
+        try body(v,active.0!,file,resource,{ held.append(contentsOf:$0) })
+        let _: Bool = wait { done in v.unmount { done(true) } }
+        for item in held {
+            let owned: Bool = wait { done in v.enqueue { done(v.ownsForTesting(item)) } }
+            if owned && item.pin != nil { need(wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) } == nil,"execution fixture pin reclaimed") }
+        }
+        let deactivated: Error? = wait { v.deactivate(options:[],replyHandler:$0) }
+        need(code(deactivated) == Int(endError),"execution deactivation preserves expected failure")
+        let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) }
+        need(code(unloaded) == Int(endError),"execution factory consumes exact resource")
+        if let persistedMode {
+            var h: OpaquePointer?, r = sfs_result(), metadata = sfs_metadata_entry()
+            need(sfs_image_open_readonly(f.url.path,"image.sfs",&h,&r) == SFS_OK,"execution mode readonly reopen")
+            need(sfs_image_stat_metadata(h,0,f.id,&metadata,&r) == SFS_OK && metadata.mode & 0o777 == persistedMode,"execution mode persists in core image")
+            need(sfs_image_close(h,&r) == SFS_OK && f.contents() == Data("original".utf8),"execution checks preserve stored file contents")
+        }
+    }
+    func lookup(_ v: StallionVolume, _ root: FSItem, _ name: String) -> StallionItem {
+        let found: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:name),inDirectory:root) { done(($0,$2)) } }
+        need(found.1 == nil && found.0 != nil,"execution alias lookup"); return found.0 as! StallionItem
+    }
+    func setMode(_ v: StallionVolume, _ item: FSItem, _ mode: UInt32) {
+        let request = FSItem.SetAttributesRequest(); request.mode = mode
+        let result: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(request,on:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(result.0 != nil && result.1 == nil && request.consumedAttributes == [.mode],"execution mode uses actual contextual setter")
+    }
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    try exercise("rights",persistedMode:0o755) { v,root,file,resource,keep in
+        for mode: UInt32 in [0,0o100,0o400,0o500,0o600,0o700,0o755] {
+            setMode(v,file,mode)
+            let allowed = mode & 0o500 == 0o500
+            executionAccess(v,file,expected:allowed ? 0 : EACCES)
+            executionAccess(v,file,[.execute,.readData],expected:allowed ? 0 : EACCES)
+            executionAccess(v,file,[.execute,.writeData],expected:allowed && mode & 0o200 != 0 ? 0 : EACCES)
+            executionAccess(v,file,[.execute,.writeSecurity],expected:allowed ? 0 : EACCES)
+        }
+        executionAccess(v,file,[.execute,.takeOwnership],expected:EACCES)
+        executionAccess(v,file,[.execute,FSVolume.AccessMask(rawValue:1<<30)],expected:EACCES)
+        for identity in [CallerIdentity(uid:caller.uid+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)] {
+            executionAccess(v,file,expected:EACCES,caller:identity)
+        }
+        if geteuid() != 0 { executionAccess(v,file,expected:EACCES,caller:CallerIdentity(uid:0,gid:0)) }
+        executionAccess(v,file,caller:CallerIdentity(uid:caller.uid,gid:caller.gid+1))
+        need(lookup(v,root,"alias") === file,"hardlink access uses the same current inode")
+        let link = lookup(v,root,"link"); keep([link]); executionAccess(v,link,expected:EACCES)
+        executionAccess(v,root,.search)
+        let before = v.anchor
+        let _: Bool = wait { done in v.enqueue { v.rejectResultForTesting = { $0 == "FSCheckAccessResult" }; done(true) } }
+        executionAccess(v,file,expected:EIO)
+        let _: Bool = wait { done in v.enqueue { v.rejectResultForTesting = nil; done(true) } }
+        executionAccess(v,file); need(anchorMatches(before,v.anchor),"access result construction failure is recoverable and observational")
+        let _: Bool = wait { done in v.enqueue { resource.permitsWrites = false; done(true) } }
+        executionAccess(v,file,expected:EACCES); executionAccess(v,file,.readData); executionAccess(v,root,.search)
+        let _: Bool = wait { done in v.enqueue { resource.permitsWrites = true; done(true) } }
+        executionAccess(v,file)
+        let _: Bool = wait { done in v.unmount { done(true) } }
+        executionAccess(v,file,expected:ENXIO)
+        need(wait { v.mount(arguments:[],replyHandler:$0) } == nil,"execution remount callback")
+        executionAccess(v,file)
+    }
+    for (name,mode,acl,flags,owner,expected) in [
+        ("acl",UInt32(0o700),true,UInt32(0),geteuid(),ENOTSUP),
+        ("flags",UInt32(0o700),false,UInt32(1),geteuid(),ENOTSUP),
+        ("special",UInt32(0o4700),false,UInt32(0),geteuid(),EACCES),
+        ("owner",UInt32(0o700),false,UInt32(0),geteuid()+1,EACCES)] {
+        try exercise(name,mode:mode,acl:acl,flags:flags,owner:owner) { v,_,file,_,_ in
+            executionAccess(v,file,expected:expected)
+            if name == "flags" || name == "special" { executionAccess(v,file,.readData) }
+        }
+    }
+    try exercise("readonly",writable:false) { v,_,file,_,_ in executionAccess(v,file,expected:EACCES) }
+    try exercise("revoked",endError:EACCES) { v,_,file,resource,_ in
+        executionAccess(v,file); resource.revoke(); executionAccess(v,file,expected:EACCES); executionAccess(v,file,expected:EACCES)
+    }
+    try exercise("retained") { v,root,file,_,keep in
+        let source = lookup(v,root,"extra"); keep([source])
+        setMode(v,file,0o500); setMode(v,source,0o400)
+        let removed: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(file,name:FSFileName(string:"alias"),directory:root,caller:caller) { done(($0,$1)) } }
+        need(removed.0 != nil && removed.1 == nil,"remove one held executable alias")
+        executionAccess(v,file)
+        let replaced: (FSRenameItemResult?,Error?) = wait { done in v.renameResultForTesting(source,sourceDirectory:root,sourceName:FSFileName(string:"extra"),destinationName:FSFileName(string:"file"),destinationDirectory:root,overItem:file,caller:caller) { done(($0,$1)) } }
+        need(replaced.0 != nil && replaced.1 == nil && lookup(v,root,"file") === source,"replacement publishes source without substituting held victim")
+        executionAccess(v,file); executionAccess(v,source,expected:EACCES)
+        let token = file.pin!, witness = file.lastKnownParent
+        let _: Bool = wait { done in v.enqueue {
+            need(try! v.diagnosticReadForTesting(file,length:8) == Data("original".utf8) && (try! v.diagnosticReadForTesting(source,length:8)).isEmpty,"held victim and replacement retain distinct contents")
+            file.lastKnownParent = nil; done(true)
+        } }
+        executionAccess(v,file)
+        let _: Bool = wait { done in v.enqueue { file.lastKnownParent = witness; done(true) } }
+        setMode(v,file,0o400); setMode(v,source,0o500)
+        executionAccess(v,file,expected:EACCES); executionAccess(v,source)
+        need(sameBytes(token,file.pin!),"held mode change preserves exact full pin")
+        setMode(v,file,0o500)
+        let _: Bool = wait { done in v.enqueue {
+            try! v.diagnosticMutationForTesting { h,r in
+                need(sfs_image_pin_set_xattr(h,token,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"set detached ACL through exact pin fixture")
+            }; done(true)
+        } }
+        executionAccess(v,file,expected:ENOTSUP); executionAccess(v,source)
+        let _: Bool = wait { done in v.enqueue {
+            try! v.diagnosticMutationForTesting { h,r in
+                need(sfs_image_pin_remove_xattr(h,token,"com.apple.system.Security",25,&r) == SFS_OK,"remove detached ACL fixture")
+            }; done(true)
+        } }
+        executionAccess(v,file); setMode(v,file,0o400)
+        let finalRemoval: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(source,name:FSFileName(string:"file"),directory:root,caller:caller) { done(($0,$1)) } }
+        need(finalRemoval.0 != nil && finalRemoval.1 == nil,"final unlink holds independent source pin")
+        executionAccess(v,source); executionAccess(v,file,expected:EACCES)
+        let absent: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:root) { done(($0,$2)) } }
+        need(absent.0 == nil && code(absent.1) == Int(ENOENT),"held execution access does not restore a pathname")
+        need(wait { v.reclaimForTesting(source,eligible:false,replyHandler:$0) } == nil,"false reclaim keeps execution target")
+        executionAccess(v,source)
+        need(wait { v.reclaimForTesting(source,eligible:true,replyHandler:$0) } == nil,"true reclaim retires execution target")
+        executionAccess(v,source,expected:EINVAL)
+    }
+    try exercise("stale") { v,root,file,_,keep in
+        let oldPin = file.pin!
+        executionAccess(v,StallionItem(file.inode),expected:EINVAL)
+        need(wait { v.reclaimForTesting(file,eligible:true,replyHandler:$0) } == nil,"retire linked execution item")
+        let fresh = lookup(v,root,"file"), freshPin = fresh.pin!; keep([fresh])
+        executionAccess(v,file,expected:EINVAL)
+        let _: Bool = wait { done in v.enqueue { fresh.pin = oldPin; done(true) } }
+        executionAccess(v,fresh,expected:EINVAL)
+        let _: Bool = wait { done in v.enqueue { fresh.pin = freshPin; done(true) } }
+        executionAccess(v,fresh)
+        try exercise("other-volume") { other,_,otherFile,_,_ in
+            executionAccess(v,otherFile,expected:EINVAL); executionAccess(other,fresh,expected:EINVAL)
+            let _: Bool = wait { done in v.enqueue { fresh.pin = otherFile.pin; done(true) } }
+            executionAccess(v,fresh,expected:EINVAL)
+            let _: Bool = wait { done in v.enqueue { fresh.pin = freshPin; done(true) } }
+            executionAccess(v,fresh)
+        }
+    }
+    try exercise("wrong-pin",endError:EIO) { v,root,file,_,_ in
+        let token = file.pin!
+        let _: Bool = wait { done in v.enqueue { file.pin = (root as! StallionItem).pin; done(true) } }
+        executionAccess(v,file,expected:EIO)
+        let _: Bool = wait { done in v.enqueue { file.pin = token; done(true) } }
+        executionAccess(v,file,expected:EIO)
+    }
+}
+#endif
 
 #if STALLION_WRITE_DIAGNOSTIC
 final class Mounted {
@@ -385,6 +577,16 @@ final class Mounted {
         let consumed: Bool = wait { done in volume.enqueue { done(self.volume.unload().consumed) } }
         need(consumed, "quiescent unload consumes ownership")
     }
+}
+
+func executionProfileRefusals(_ parent: URL) throws {
+    for mode: UInt32 in [0o500,0o700,0o755] { for writable in [false,true] {
+        let f = try Fixture(parent,"execution-disabled-\(mode)-\(writable)",mode:mode), m = try Mounted(f,writable:writable)
+        let before = m.volume.anchor
+        let denied: (FSCheckAccessResult?,Error?) = wait { done in m.volume.accessForTesting(m.file,access:.execute,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(denied.0 == nil && code(denied.1) == Int(EACCES) && anchorMatches(before,m.volume.anchor),"fixture-writable and readonly admission cannot enable regular execution")
+        m.close(); need(f.contents() == Data("original".utf8),"disabled execution preserves fixture bytes")
+    } }
 }
 
 func successfulWrites(_ parent: URL) throws {
@@ -1142,6 +1344,34 @@ func contextualPolicyValues() throws {
     denied(EACCES) { try checkOwnerPolicy(m, owner: owner, caller: caller, access: [.readData, .search], writable: false, hasACL: false) }
     m.mode = 0o500
     try checkOwnerPolicy(m, owner: owner, caller: caller, access: [.readData, .search], writable: false, hasACL: false)
+    need(FSVolume.AccessMask.execute == .search,"file execute and directory search are the same SDK bit")
+    m.entry.kind = SFS_FILE
+    for mode: UInt32 in [0,0o100,0o400,0o500,0o600,0o700,0o755,0o1500,0o2500,0o4500] {
+        m.mode = mode
+        denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:false) }
+        for enabled in [false,true] {
+            let expected = enabled && mode & 0o500 == 0o500 && mode & 0o7000 == 0
+            if expected { try checkOwnerPolicy(m,owner:owner,caller:caller,access:[.readData,.execute],writable:true,hasACL:false,allowFileExecution:enabled) }
+            else { denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:false,allowFileExecution:enabled) } }
+        }
+    }
+    m.mode = 0o700
+    for foreign in [CallerIdentity(uid:Int(owner)+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)] {
+        denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:foreign,access:.execute,writable:true,hasACL:false,allowFileExecution:true) }
+    }
+    if owner != 0 { denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:CallerIdentity(uid:0,gid:0),access:.execute,writable:true,hasACL:false,allowFileExecution:true) } }
+    try checkOwnerPolicy(m,owner:owner,caller:CallerIdentity(uid:caller.uid,gid:caller.gid+1),access:.execute,writable:true,hasACL:false,allowFileExecution:true)
+    m.uid = owner+1
+    denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:false,allowFileExecution:true) }
+    m.uid = owner
+    denied(ENOTSUP) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:true,allowFileExecution:true) }
+    m.flags = 1
+    denied(ENOTSUP) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:false,allowFileExecution:true) }
+    try checkOwnerPolicy(m,owner:owner,caller:caller,access:.readData,writable:true,hasACL:false,allowFileExecution:true)
+    m.entry.kind = SFS_DIRECTORY
+    try checkOwnerPolicy(m,owner:owner,caller:caller,access:.search,writable:true,hasACL:false,allowFileExecution:true)
+    m.entry.kind = SFS_SYMLINK; m.flags = 0
+    denied(EACCES) { try checkOwnerPolicy(m,owner:owner,caller:caller,access:.execute,writable:true,hasACL:false,allowFileExecution:true) }
 }
 func unknownCallerAttribute() -> FSItem.Attribute {
     for index in 0..<UInt.bitWidth {
@@ -4857,7 +5087,7 @@ func contextualXattrQueue(_ parent: URL) throws {
         }
         legacy.close()
 #endif
-        try successfulWrites(parent); let unavailable = try attributes(parent)
+        try executionProfileRefusals(parent); try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent); try accessPolicyChecks(parent)
         try queuedResizeAfterDeliveryFailure(parent)
         try retainedTraceSnapshot(parent); try preparedReplyFailure(parent); try detachedTokenRoutes(parent)
@@ -4876,6 +5106,9 @@ func contextualXattrQueue(_ parent: URL) throws {
         print("METADATA requested mask: 0x\(String(UInt(bitPattern: FSSetAttributesResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); mode and timestamp branches: actual-result success")
         print("XATTR supported kinds: file, root, directory, symlink; value/names/freeSpace constructors: actual-result success")
         print("INITIAL TIMES file/directory/symlink: exact selected/default times, two-role results and commit-only consumption success")
+#if STALLION_CONTEXT_WRITES
+        print("OWNER EXECUTION contextual owner policy and FSCheckAccessResult: actual-result success")
+#endif
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")

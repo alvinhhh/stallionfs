@@ -229,7 +229,7 @@ class FSKitInterfaces(unittest.TestCase):
                 self.assertEqual(lines[:2], [
                     'PASS existing-file diagnostic real-core writes, attributes, failures and admission',
                     'UNQUALIFIED installed default-cache routing and syscall error propagation'])
-                self.assertEqual(len(lines), 8 if variant == 'context' else 3)
+                self.assertEqual(len(lines), 9 if variant == 'context' else 3)
                 self.assertIn(lines[2], ('SDK unconstructible capability request fields: 65536',
                                         'SDK unconstructible capability request fields: 65536,131072'))
                 if variant == 'context':
@@ -248,6 +248,9 @@ class FSKitInterfaces(unittest.TestCase):
                     self.assertEqual(lines[7], 'INITIAL TIMES file/directory/symlink: exact selected/default times, '
                                                'two-role results and commit-only consumption success')
                     print(lines[7], flush=True)
+                    self.assertEqual(lines[8], 'OWNER EXECUTION contextual owner policy and FSCheckAccessResult: '
+                                               'actual-result success')
+                    print(lines[8], flush=True)
                 self.assertEqual(child.stderr, '')
                 extension = directory / 'readonly-extension'
                 self.command(variant + '-normal-build', [*swift, '-module-cache-path', directory / 'normal-cache',
