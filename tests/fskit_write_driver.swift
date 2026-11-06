@@ -684,8 +684,23 @@ func contextualSeeks(_ parent: URL) throws {
         need(sfs_image_unlink(h,1,"extra",5,&r) == SFS_OK && sfs_image_unlink(h,1,"alias",5,&r) == SFS_OK,"final unlink of held file")
     } } catch { fatalError("seek unlink fixture: \(error)") } }
     seekAccess(hv,held.file,offset:0,region:.hole,expected:8)
-    let mode = FSItem.SetAttributesRequest(); mode.mode = 0
-    need(held.set(mode).1 == nil,"held seek uses current zero-mode metadata policy")
+    // Core-only unlink supplies no adapter parent witness for a full setter result.
+    // Update this layout fixture through its exact pin, then exercise the real seek callback.
+    let heldItem = held.file as! StallionItem, heldPin = heldItem.pin!, heldModes = heldItem.retainedModes
+    held.serial { do {
+        need(heldItem.lastKnownParent == nil,"core-only detached fixture has no parent witness")
+        try hv.diagnosticMutationForTesting { h,r in
+            var update = sfs_metadata_update(); update.fields = UInt32(SFS_META_MODE.rawValue); update.mode = UInt32(S_IFREG)
+            need(sfs_image_pin_set_metadata(h,heldPin,&update,&r) == SFS_OK,"held seek fixture zero-mode update")
+        }
+        var value = sfs_pin_stat(), r = sfs_result()
+        need(sfs_image_pin_stat(held.coreHandle,heldPin,&value,&r) == SFS_OK,"held seek fixture current exact-pin metadata")
+        need(value.metadata.entry.inode == fileID && value.metadata.entry.kind == SFS_FILE && value.metadata.mode == UInt32(S_IFREG) &&
+             value.linked == 0 && value.metadata.link_count == 0 && value.metadata.entry.parent == 0 && value.metadata.entry.name_length == 0,
+             "zero-mode update preserves detached file identity")
+        need(heldItem.inode == fileID && sameBytes(heldPin,heldItem.pin!) && heldItem.retainedModes == heldModes && heldItem.lastKnownParent == nil,
+             "fixture update preserves full pin and supplies no parent witness or open rights")
+    } catch { fatalError("seek mode fixture: \(error)") } }
     seekAccess(hv,held.file,offset:0,region:.data,expected:0)
     held.serial { do { try hv.diagnosticMutationForTesting { h,r in
         need(sfs_image_pin_set_xattr(h,(held.file as! StallionItem).pin!,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"held ACL update")
