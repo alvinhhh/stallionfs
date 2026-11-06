@@ -893,7 +893,7 @@ func completenessRefused(_ attributes: FSItem.Attributes, required: FSItem.Attri
     do { try StallionVolume.requireValidForTesting(attributes, required: required); need(false, "incomplete snapshot accepted") }
     catch { need(code(error) == Int(ENOTSUP), "incomplete snapshot refusal") }
 }
-func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, required: FSItem.Attribute, exact: Bool = false) {
+func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, required: FSItem.Attribute, exact: Bool = false, retainedParent: UInt64? = nil) {
     let fields: [FSItem.Attribute] = [.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize, .fileID, .parentID,
         .accessTime, .modifyTime, .changeTime, .birthTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
     try! StallionVolume.requireValidForTesting(a, required: required)
@@ -910,7 +910,10 @@ func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, re
     if a.isValid(.size) { need(a.size == m.entry.size, "size") }
     if a.isValid(.allocSize) { need(a.allocSize == m.referenced_data_bytes, "allocation") }
     if a.isValid(.fileID) { need(a.fileID == (try! itemIdentifier(m.entry.inode)), "file identifier") }
-    if a.isValid(.parentID) { need(m.link_count > 0 && a.parentID == (m.entry.inode == 1 ? .parentOfRoot : try! itemIdentifier(m.entry.parent)), "parent identifier") }
+    if a.isValid(.parentID) {
+        if m.link_count > 0 { need(a.parentID == (m.entry.inode == 1 ? .parentOfRoot : try! itemIdentifier(m.entry.parent)), "current namespace parent identifier") }
+        else { need(retainedParent != nil && a.parentID == (try! itemIdentifier(retainedParent!)), "verified retained parent identifier distinct from detached core metadata") }
+    }
     func time(_ actual: timespec, _ expected: sfs_timestamp) {
         need(actual.tv_sec == expected.seconds && actual.tv_nsec == expected.nanoseconds, "timestamp")
     }
@@ -1961,7 +1964,7 @@ func contextualRemovals(_ parent: URL) throws {
         let first = removal(m)
         need(first.0 != nil && first.1 == nil && constructed == 1 && snapshots.count == 2,"actual remove result error=\(code(first.1)) roles=\(snapshots.count) constructors=\(constructed)")
         let childMetadata = namespaceMetadata(m,m.file), parentMetadata = namespaceMetadata(m,m.root), retained = snapshots
-        need(childMetadata.link_count == 2,"current post-removal link count")
+        need(childMetadata.link_count == 2 && file.lastKnownParent == nil,"nonfinal removal uses current metadata without a historical witness")
         checkPreparedAttributes(retained[0],childMetadata,required:required); checkPreparedAttributes(retained[1],parentMetadata,required:required)
         func removeAndCheck(_ item: FSItem, _ name: String, _ directory: FSItem) {
             let priorConstructors = constructed
@@ -1972,6 +1975,7 @@ func contextualRemovals(_ parent: URL) throws {
             checkPreparedAttributes(snapshots[1],namespaceMetadata(m,directory),required:required)
         }
         removeAndCheck(m.file,"third",destination)
+        need(file.lastKnownParent == nil && namespaceMetadata(m,file).entry.parent == 1,"remaining alias parent wins over removed cross-directory edge")
         removeAndCheck(m.link,"symbolic-extra",destination)
         removeAndCheck(m.link,"link",m.root)
         m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil }
@@ -2000,58 +2004,68 @@ func contextualRemovals(_ parent: URL) throws {
 }
 func removalFinalLinks(_ parent: URL, required: FSItem.Attribute) throws {
     for symlink in [false,true] {
-        let f = try Fixture(parent,"remove-final-\(symlink)"), m = try Mounted(f,itemLimit:3), v = m.volume
+        let f = try Fixture(parent,"remove-final-\(symlink)",extra:true), m = try Mounted(f,itemLimit:4), v = m.volume
+        let other = namespaceLookup(m,"extra") as! StallionItem
         if !symlink { need(removal(m,name:Data("alias".utf8)).1 == nil,"prepare final regular name") }
-        let item = (symlink ? m.link : m.file) as! StallionItem, name = symlink ? "link" : "file", token = item.pin!, before = v.anchor, commits = v.diagnosticSnapshot().0.commits
-        var prepared = false, constructed = false
-        m.serial { item.retainedModes = symlink ? [] : [.read,.write]; v.diagnosticBeforePrepare = { prepared = true }
+        let item = (symlink ? m.link : m.file) as! StallionItem, name = symlink ? "link" : "file", token = item.pin!
+        var prepared = false, constructed = false, snapshots: [FSItem.Attributes] = []
+        m.serial {
+            item.retainedModes = symlink ? [] : [.read,.write]
+            need(item.lastKnownParent == nil,"no historical witness on linked item")
+            v.diagnosticBeforePrepare = { need(item.lastKnownParent == nil,"candidate is not published while transaction pending"); prepared = true }
+            v.preparedAttributesForTesting = { type,a in if type == "FSRemoveItemResult" { need(item.lastKnownParent == nil,"removed snapshot uses private transaction candidate only"); snapshots.append(a) } }
             v.rejectResultForTesting = { type in if type == "FSRemoveItemResult" { constructed = true }; return false }
+            v.diagnosticBeforeCommit = { need(item.lastKnownParent == nil,"no witness before verified commit") }
         }
         let result = removal(m,item,name:Data(name.utf8))
-        if required.contains(.parentID) {
-            need(result.0 == nil && code(result.1) == Int(ENOTSUP) && !prepared && !constructed && anchorMatches(before,v.anchor) && commits == v.diagnosticSnapshot().0.commits,"actual required parentID refuses final link before begin")
-            removalName(m,name,inode:item.inode); removalState(m)
-            need(sameBytes(token,item.pin!),"final refusal preserves token")
-            m.close(); namespaceReopened(f,name,inode:item.inode)
-        } else {
-            need(result.0 != nil && result.1 == nil && prepared && constructed,"final success still requires every SDK bit and real constructor")
-            removalName(m,name,inode:nil)
-            m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_OK && value.linked == 0 && value.metadata.link_count == 0,"acknowledged final removal promotes detached live token") }
-            let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size,.linkCount,.fileID]
-            let attributes: (FSItem.Attributes?,Error?) = wait { done in v.getAttributes(request,of:item) { done(($0,$1)) } }
-            need(attributes.1 == nil && attributes.0?.linkCount == 0,"partial token attributes after contextual final removal")
-            need(code(namespaceLink(m,item).1) == Int(ENOENT),"contextually detached item cannot be relinked")
-            let actual: (FSGetAttributesResult?,Error?) = wait { done in v.attributesResultForTesting(request,item:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
-            if FSGetAttributesResult.requestedAttributes.isAttributeWanted(.parentID) { need(actual.0 == nil && code(actual.1) == Int(ENOTSUP),"get result independently refuses required detached parent") }
-            else { need(actual.0 != nil && actual.1 == nil,"actual detached get result validates every own requirement") }
-            if symlink {
-                let target: (FSFileName?,Error?) = wait { done in v.readSymbolicLink(item) { done(($0,$1)) } }
-                need(target.1 == nil && target.0?.data == Data("file".utf8),"contextually detached symlink contents")
-            } else {
-                m.serial { need(try! v.diagnosticReadForTesting(item,length:64) == Data("original".utf8),"contextually detached data") }
-                let xattr: (Data?,Error?) = wait { done in v.getXattr(named:FSFileName(string:"note"),of:item) { done(($0,$1)) } }
-                need(xattr.1 == nil && xattr.0 == Data("value".utf8),"contextually detached xattr")
-                let beforeWrite = v.anchor
-                let write = m.write(Data("detached".utf8))
-                if FSWriteFileResult.requestedAttributes.isAttributeWanted(.parentID) {
-                    need(code(write.1) == Int(ENOTSUP) && anchorMatches(beforeWrite,v.anchor),"write independently refuses required detached parent")
-                } else {
-                    need(write.1 == nil && write.0 == 8,"actual detached write result")
-                    let beforeResize = v.anchor, resize = m.size(11)
-                    if FSSetAttributesResult.requestedAttributes.isAttributeWanted(.parentID) { need(code(resize.1) == Int(ENOTSUP) && anchorMatches(beforeResize,v.anchor),"resize independently refuses required detached parent") }
-                    else { need(resize.1 == nil && resize.0?.size == 11,"actual detached resize result") }
-                }
-            }
-            let no: Error? = wait { v.reclaimForTesting(item,eligible:false,replyHandler:$0) }; need(no == nil,"false reclaim retains detached item")
-            m.serial { need(v.ownsForTesting(item) && sameBytes(token,item.pin!),"false reclaim retains actual token") }
-            let yes: Error? = wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) }; need(yes == nil,"normal detached reclaim")
-            m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(!v.ownsForTesting(item) && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"stale token rejected after one reclaim") }
-            m.close(); namespaceReopened(f,name,inode:nil)
+        need(result.0 != nil && result.1 == nil && prepared && constructed && snapshots.count == 2,"real SDK final unlink result succeeds without reducing requested attributes")
+        removalName(m,name,inode:nil)
+        var detached = sfs_metadata_entry(), witness: LastKnownParent?
+        m.serial {
+            var r = sfs_result(), value = sfs_pin_stat()
+            need(v.ownsForTesting(item) && sameBytes(token,item.pin!) && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_OK,"same held item and token survive final unlink")
+            detached = value.metadata; witness = item.lastKnownParent
+            need(value.linked == 0 && detached.link_count == 0 && detached.entry.parent == 0 && detached.entry.name_length == 0,"core remains namespace-detached")
+            need(witness != nil && witness!.item == ObjectIdentifier(item) && witness!.inode == item.inode && sameBytes(witness!.pin,token) && witness!.parent == 1,"verified relationship published only after successful commit")
+            v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforePrepare = nil; v.diagnosticBeforeCommit = nil
         }
+        checkPreparedAttributes(snapshots[0],detached,required:required,retainedParent:1)
+        checkPreparedAttributes(snapshots[1],namespaceMetadata(m,m.root),required:required)
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = [.size,.linkCount,.fileID,.parentID]
+        func get() -> (FSGetAttributesResult?,Error?) {
+            wait { done in v.attributesResultForTesting(request,item:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        }
+        let actual = get(); need(actual.0 != nil && actual.1 == nil,"held get result satisfies complete actual SDK request")
+        for invalid in 0..<3 {
+            m.serial {
+                if invalid == 0 { item.lastKnownParent = nil }
+                else if invalid == 1 { item.lastKnownParent = LastKnownParent(item:ObjectIdentifier(other),pin:token,inode:other.inode,kind:detached.entry.kind,parent:1) }
+                else { item.lastKnownParent = LastKnownParent(item:ObjectIdentifier(item),pin:other.pin!,inode:item.inode,kind:detached.entry.kind,parent:1) }
+            }
+            let refused = get(); need(refused.0 == nil && code(refused.1) == Int(ENOTSUP),"missing/wrong-source/wrong-real-pin witness cannot supply parent")
+            m.serial { item.lastKnownParent = witness }
+        }
+        need(code(namespaceLink(m,item).1) == Int(ENOENT),"historical relationship cannot relink detached source")
+        if symlink {
+            let target: (FSFileName?,Error?) = wait { done in v.readSymbolicLink(item) { done(($0,$1)) } }
+            let actual: (FSReadSymlinkResult?,Error?) = wait { done in v.readlinkResultForTesting(item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+            need(target.1 == nil && target.0?.data == Data("file".utf8) && actual.0 != nil && actual.1 == nil,"held symlink content and full contextual result")
+        } else {
+            need(m.write(Data("detached".utf8)).1 == nil,"held contextual write succeeds with verified informational parent")
+            let resized = m.size(11); need(resized.1 == nil && resized.0?.size == 11,"held contextual resize succeeds with actual result requirements")
+            m.serial {
+                need(try! v.diagnosticReadForTesting(item,length:64) == Data("detached".utf8) + Data(repeating:0,count:3),"held token read observes committed write/resize")
+                _ = try! v.readResultConstructorForTesting(item) // Actual result constructor; SDK buffer routing remains separate.
+            }
+        }
+        let no: Error? = wait { v.reclaimForTesting(item,eligible:false,replyHandler:$0) }; need(no == nil,"false reclaim retains held item")
+        m.serial { need(v.ownsForTesting(item) && sameBytes(token,item.pin!) && item.lastKnownParent != nil,"false reclaim retains exact witness binding") }
+        let yes: Error? = wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) }; need(yes == nil,"normal detached reclaim")
+        m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(!v.ownsForTesting(item) && item.lastKnownParent == nil && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"true reclaim clears witness and retires pin exactly once") }
+        let extra: Error? = wait { v.reclaimForTesting(other,eligible:true,replyHandler:$0) }; need(extra == nil,"reclaim other real witness-test operand")
+        withExtendedLifetime(result.0) {}
+        m.close(); namespaceReopened(f,name,inode:nil)
     }
-#if STALLION_RESULT_MASK_TRACE
-    print("REMOVE final-link branch: \(required.contains(.parentID) ? "required-parent refusal" : "actual-result success")")
-#endif
 }
 func removalRefusals(_ parent: URL) throws {
     let f = try Fixture(parent,"remove-preflight",extra:true,directory:true), m = try Mounted(f,itemLimit:5), v = m.volume
@@ -2061,7 +2075,7 @@ func removalRefusals(_ parent: URL) throws {
     for (bytes,expected) in [(Data(),EINVAL),(Data([0]),EINVAL),(Data("a/b".utf8),EINVAL),(Data(".".utf8),EINVAL),(Data("..".utf8),EINVAL),(Data(repeating:97,count:256),ENAMETOOLONG),(Data("absent".utf8),ENOENT),(Data("link".utf8),ESTALE)] {
         need(code(removal(m,name:bytes).1) == Int(expected),"precise removal name/identity refusal")
     }
-    need(code(removal(m,m.root).1) == Int(ENOTSUP) && code(removal(m,directory,name:Data("dir".utf8)).1) == Int(ENOTSUP),"root/directory removal excluded")
+    need(code(removal(m,m.root).1) == Int(ENOTSUP),"root removal excluded")
     need(code(removal(m,directory:m.file).1) == Int(ENOTDIR),"non-directory parent refusal")
     need(code(removal(m,StallionItem(f.id)).1) == Int(EINVAL) && code(removal(m,directory:StallionItem(1)).1) == Int(EINVAL),"foreign canonical identities refused")
     let otherFixture = try Fixture(parent,"remove-cross-volume"), other = try Mounted(otherFixture,itemLimit:3)
@@ -2094,21 +2108,30 @@ func removalRefusals(_ parent: URL) throws {
 }
 func removalFailures(_ parent: URL, required: FSItem.Attribute) throws {
     need(!required.isEmpty,"actual removal result requirements")
+    for directory in [false,true] {
     for rejectedRole in 0..<2 {
-        let f = try Fixture(parent,"remove-incomplete-\(rejectedRole)"), m = try Mounted(f,itemLimit:3), v = m.volume, before = v.anchor
-        let token = (m.file as! StallionItem).pin!; var role = 0, constructed = false
-        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRemoveItemResult" { if role == rejectedRole { a.invalidateAllProperties() }; role += 1 } }
+        let f = try Fixture(parent,"remove-incomplete-\(directory)-\(rejectedRole)",directory:directory), m = try Mounted(f,itemLimit:directory ? 4 : 3), v = m.volume, before = v.anchor
+        let item = (directory ? namespaceLookup(m,"dir") : m.file) as! StallionItem, name = directory ? "dir" : "file"
+        let token = item.pin!; var role = 0, constructed = false
+        m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSRemoveItemResult" { need(item.lastKnownParent == nil,"failed role preparation does not publish witness"); if role == rejectedRole { a.invalidateAllProperties() }; role += 1 } }
             v.rejectResultForTesting = { _ in constructed = true; return false }
         }
-        let result = removal(m)
+        let result = removal(m,item,name:Data(name.utf8))
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && role == rejectedRole+1 && !constructed && anchorMatches(before,v.anchor),"both removal roles fail before constructor and commit")
-        need(sameBytes(token,(m.file as! StallionItem).pin!),"rollback retains external pin")
-        removalName(m,"file",inode:f.id); removalState(m); m.close(); namespaceReopened(f,"file",inode:f.id)
+        need(sameBytes(token,item.pin!) && item.lastKnownParent == nil,"rollback retains external pin without publishing witness")
+        removalName(m,name,inode:item.inode); removalState(m,count:directory ? 4 : 3); if directory { need(wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) } == nil,"reclaim retained directory after constructor refusal") }; m.close(); namespaceReopened(f,name,inode:item.inode)
     }
     for scenario in 0..<8 {
-        let f = try Fixture(parent,"remove-failure-\(scenario)",capacity:scenario == 7 ? 160 * 1024 : 16 * 1024 * 1024), m = try Mounted(f,itemLimit:3), v = m.volume, before = v.anchor
-        let token = (m.file as! StallionItem).pin!; var constructed = false, originalCommit = sfs_result(), capacityReceipt = sfs_result()
+        let f = try Fixture(parent,"remove-failure-\(directory)-\(scenario)",capacity:scenario == 7 ? 160 * 1024 : 16 * 1024 * 1024,directory:directory), m = try Mounted(f,itemLimit:directory ? 4 : 3), v = m.volume
+        let item = (directory ? namespaceLookup(m,"dir") : m.file) as! StallionItem, name = directory ? "dir" : "file"
+        if scenario == 6 {
+            let retained = removal(m,m.link,name:Data("link".utf8))
+            need(retained.0 != nil && retained.1 == nil && (m.link as! StallionItem).lastKnownParent != nil,"prepare real committed witness before consumed-error reclaim")
+        }
+        let before = v.anchor, commitsBefore = v.diagnosticSnapshot().0.commitSuccess
+        let token = item.pin!; var constructed = false, originalCommit = sfs_result(), capacityReceipt = sfs_result()
         m.serial {
+            v.preparedAttributesForTesting = { name,_ in if name == "FSRemoveItemResult" { need(item.lastKnownParent == nil,"fault result preparation keeps witness private") } }
             v.createStageForTesting = { _,_ in need(false,"removal failure entered creation") }
             v.createAbortForTesting = { _,_ in need(false,"removal abort used creation hook"); return SFS_IO }
             v.createReleaseForTesting = { _,_,_ in need(false,"removal released through creation hook"); return SFS_IO }
@@ -2133,7 +2156,7 @@ func removalFailures(_ parent: URL, required: FSItem.Attribute) throws {
             } }
         }
         if scenario == 3 { fault(1,1) }; if scenario == 4 || scenario == 5 { fault(4,Int32(scenario-3)) }
-        let result = removal(m), expected = scenario == 1 ? EACCES : scenario == 2 ? ENOMEM : [3,4,5,7].contains(scenario) ? ENOSPC : EIO
+        let result = removal(m,item,name:Data(name.utf8)), expected = scenario == 1 ? EACCES : scenario == 2 ? ENOMEM : [3,4,5,7].contains(scenario) ? ENOSPC : EIO
         need(result.0 == nil && code(result.1) == Int(expected) && anchorMatches(before,v.anchor),"removal failure scenario \(scenario) actual=\(code(result.1))")
         if scenario == 0 { need(constructed,"actual constructor reached before injected rejection") }
         if (2...5).contains(scenario) { need(hits() > 0,"real removal core fault reached") }
@@ -2141,25 +2164,28 @@ func removalFailures(_ parent: URL, required: FSItem.Attribute) throws {
             need(first.result.status == (scenario == 4 ? SFS_IO : SFS_OUTCOME_UNKNOWN) && first.result.poisoned != 0,"known versus unknown removal fence outcome")
         }
         fault(0,0)
-        m.serial { let state = v.createStateForTesting; need(!state.pending && !state.quarantine && state.ticket == 0 && v.ownsForTesting(m.file) && sameBytes(token,(m.file as! StallionItem).pin!) && !v.createOutcomeForTesting.beginAttempted,"failure retains externally returned pins without creation cleanup") }
-        if scenario < 3 || scenario == 7 { removalName(m,"file",inode:f.id); removalState(m) }
+        m.serial { let state = v.createStateForTesting; need(!state.pending && !state.quarantine && state.ticket == 0 && v.ownsForTesting(item) && sameBytes(token,item.pin!) && item.lastKnownParent == nil && !v.createOutcomeForTesting.beginAttempted,"failure retains returned pin and never publishes candidate witness") }
+        if scenario < 3 || scenario == 7 { removalName(m,name,inode:item.inode); removalState(m,count:directory ? 4 : 3) }
         if scenario == 6 {
-            need(originalCommit.status == SFS_OK && originalCommit.fence_succeeded == 3 && originalCommit.transaction_active == 0 && v.diagnosticSnapshot().0.commitSuccess == 1,"original successful C receipt and accounting survive adapter rejection")
+            need(originalCommit.status == SFS_OK && originalCommit.fence_succeeded == 3 && originalCommit.transaction_active == 0 && v.diagnosticSnapshot().0.commitSuccess == commitsBefore + 1,"original successful C receipt and accounting survive adapter rejection")
             let _: Bool = wait { done in v.unmount { done(true) } }
             let _: Error? = wait { v.deactivate(options:[],replyHandler:$0) }
-            m.serial { need(!v.unload().consumed && v.activeItemCount() == 3,"cannot close beneath returned removal operands") }
-            for item in [m.file,m.link] {
+            m.serial { need(!v.unload().consumed && v.activeItemCount() == (directory ? 4 : 3),"cannot close beneath returned removal operands") }
+            need((m.link as! StallionItem).lastKnownParent != nil,"prior committed witness retained until actual reclaim")
+            for item in (directory ? [m.file,m.link,item] : [m.file,m.link]) {
                 let pin = (item as! StallionItem).pin!
                 let error: Error? = wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) }
                 need(code(error) == Int(ESTALE),"consumed pin release can report old-anchor ESTALE")
-                m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(!v.ownsForTesting(item) && (item as! StallionItem).pin == nil && sfs_image_pin_stat(m.coreHandle,pin,&value,&r) == SFS_INVALID,"ESTALE never retries or reinserts consumed pin") }
+                m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(!v.ownsForTesting(item) && (item as! StallionItem).pin == nil && (item as! StallionItem).lastKnownParent == nil && sfs_image_pin_stat(m.coreHandle,pin,&value,&r) == SFS_INVALID,"ESTALE consumes pin and witness without retry or reinsertion") }
             }
             need(v.diagnosticSnapshot().2?.code == Int(EIO),"cleanup error preserves primary receipt failure")
         }
+        if directory && scenario != 6 { need(wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) } == nil,"reclaim retained directory after removal fault") }
         m.close()
-        if scenario == 6 { namespaceReopened(f,"file",inode:nil); namespaceReopened(f,"alias",inode:f.id) }
-        else if scenario != 5 { namespaceReopened(f,"file",inode:f.id); need(f.contents() == Data("original".utf8),"known failure reopened original data") }
+        if scenario == 6 { namespaceReopened(f,name,inode:nil); namespaceReopened(f,"alias",inode:f.id); namespaceReopened(f,"link",inode:nil) }
+        else if scenario != 5 { namespaceReopened(f,name,inode:item.inode); need(f.contents() == Data("original".utf8),"known failure reopened original data") }
         // OUTCOME_UNKNOWN has no asserted disk presence or absence.
+    }
     }
 }
 func removalQueued(_ parent: URL) throws {
@@ -2349,7 +2375,140 @@ func contextualDirectories(_ parent: URL) throws {
     }
     directoryNames(reopened!,a.inode,["B"]); directoryNames(reopened!,b.inode,["C","file"]); directoryNames(reopened!,c.inode,[])
     need(sfs_image_close(reopened,&receipt) == SFS_OK,"directory metadata reopen close")
-    try directoryRefusals(parent); try directoryFailures(parent); try directoryQueuedFailure(parent)
+    try directoryRefusals(parent); try directoryFailures(parent); try directoryQueuedFailure(parent); try directoryRemovals(parent)
+}
+func directoryRemovalRefusals(_ parent: URL) throws {
+    for variant in 0..<12 {
+        let f = try Fixture(parent,"directory-remove-refusal-\(variant)",rootMode:variant == 6 ? 0o500 : variant == 7 ? 0o600 : 0o700,rootACL:variant == 8,directory:true)
+        let m = try Mounted(f,writable:variant != 5,itemLimit:4), v = m.volume
+        let directory = namespaceLookup(m,"dir") as! StallionItem, token = directory.pin, before = v.anchor, commits = v.diagnosticSnapshot().0.commits
+        if variant == 4 { m.resource.revoke() }
+        if variant >= 10 { let e: Error? = wait { v.reclaimForTesting(directory,eligible:true,replyHandler:$0) }; need(e == nil,"prepare reclaimed directory operand") }
+        let item: FSItem = variant == 0 ? StallionItem(directory.inode) : variant == 11 ? m.file : directory
+        let parentItem: FSItem = variant == 1 ? StallionItem(1) : variant == 11 ? directory : m.root
+        let caller = CallerIdentity(uid:Int(geteuid()) + (variant == 9 ? 1 : 0),gid:Int(getegid()))
+        let name = variant == 2 || variant == 11 ? "file" : variant == 3 ? "missing" : "dir"
+        let result: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(item,name:FSFileName(string:name),directory:parentItem,caller:caller) { done(($0,$1)) } }
+        let expected = [EINVAL,EINVAL,ESTALE,ENOENT,EACCES,EROFS,EACCES,EACCES,ENOTSUP,EACCES,EINVAL,EINVAL][variant]
+        need(result.0 == nil && code(result.1) == Int(expected) && anchorMatches(before,v.anchor) && commits == v.diagnosticSnapshot().0.commits,"directory removal ownership, identity, access and resource refusal before mutation")
+        if variant != 5 && variant < 10 {
+            m.serial { need(v.ownsForTesting(directory) && sameBytes(token!,directory.pin!),"directory refusal retains exact returned token") }
+            let e: Error? = wait { v.reclaimForTesting(directory,eligible:true,replyHandler:$0) }; need(e == nil,"reclaim refused directory operand")
+        }
+        m.close(); namespaceReopened(f,"dir",inode:directory.inode); need(f.contents() == Data("original".utf8),"directory refusal preserves unrelated file bytes")
+    }
+}
+func directoryRemovalQueued(_ parent: URL) throws {
+    let m = try CreationMount(parent,"directory-remove-queued"), v = m.volume
+    let created = m.create("dir",request:creationAttributes(0o700),type:.directory)
+    need(created.0 != nil && created.1 == nil && created.2 != nil,"queued directory removal source")
+    let directory = created.2!, token = directory.pin!, held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), done = DispatchGroup()
+    var afterChild = v.anchor, child: UInt64 = 0, committed = false
+    v.enqueue { held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume queued child insertion") }
+    need(held.wait(timeout:.now()+20) == .success,"hold queue before directory removal")
+    v.enqueue {
+        try! v.diagnosticMutationForTesting { h,r in
+            var metadata = sfs_metadata_initial(); metadata.mode = UInt32(S_IFREG) | 0o600; metadata.uid = geteuid(); metadata.gid = getegid()
+            need(sfs_image_add_metadata(h,directory.inode,"child",5,SFS_FILE,&metadata,&child,&r) == SFS_OK,"queued real child insertion")
+            need(sfs_image_write(h,child,0,"retained",8,&r) == SFS_OK,"queued child contents")
+        }
+        afterChild = v.anchor; committed = true
+    }
+    done.enter(); v.removeResultForTesting(directory,name:FSFileName(string:"dir"),directory:m.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { result,error in
+        need(committed && result == nil && code(error) == Int(ENOTEMPTY) && anchorMatches(afterChild,v.anchor),"queued directory observes committed child before removal begin"); done.leave()
+    }
+    resume.signal(); need(done.wait(timeout:.now()+20) == .success,"queued directory removal completes")
+    m.serial { need(v.ownsForTesting(directory) && sameBytes(token,directory.pin!),"queued nonempty refusal retains directory ownership"); directoryNames(m.coreHandle,directory.inode,["child"]) }
+    m.close(); m.reopened("dir",inode:directory.inode); m.reopened("child",parent:directory.inode,inode:child,bytes:Data("retained".utf8))
+}
+func directoryRemovals(_ parent: URL) throws {
+    try directoryRemovalRefusals(parent); try directoryRemovalQueued(parent)
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    let required = FSRemoveItemResult.requestedAttributes.wantedAttributes
+    for populated in [false,true] {
+        let m = try CreationMount(parent,"directory-remove-\(populated)"), v = m.volume
+        let parentResult = m.create("parent",request:creationAttributes(0o700),type:.directory)
+        need(parentResult.0 != nil && parentResult.1 == nil && parentResult.2 != nil,"create nonroot verified removal parent")
+        let parentDirectory = parentResult.2!, parentID = parentDirectory.inode
+        let made = m.create("dir",request:creationAttributes(0o700),parent:parentDirectory,type:.directory)
+        need(made.0 != nil && made.1 == nil && made.2 != nil,"create actual directory removal operand")
+        let directory = made.2!, token = directory.pin!
+        var child: StallionItem?
+        let payload = Data("retained-child".utf8)
+        if populated {
+            let created = m.create("child",parent:directory)
+            need(created.0 != nil && created.1 == nil && created.2 != nil,"create nonempty removal child")
+            child = created.2!
+            let written: (Int,Error?) = wait { done in v.writeCountForTesting(contents:payload,to:child!,at:0) { done(($0,$1)) } }
+            need(written.0 == payload.count && written.1 == nil,"write retained nonempty child")
+        }
+        func remove(_ item: FSItem, _ name: String, _ parent: FSItem) -> (FSRemoveItemResult?,Error?) {
+            wait { done in v.removeResultForTesting(item,name:FSFileName(string:name),directory:parent,caller:caller) { done(($0,$1)) } }
+        }
+        let before = v.anchor, commits = v.diagnosticSnapshot().0.commits
+        if let child {
+            let childToken = child.pin!, denied = remove(directory,"dir",parentDirectory)
+            need(denied.0 == nil && code(denied.1) == Int(ENOTEMPTY) && anchorMatches(before,v.anchor) && commits == v.diagnosticSnapshot().0.commits,"nonempty directory refused before mutation")
+            m.serial {
+                directoryNames(m.coreHandle,1,["parent"]); directoryNames(m.coreHandle,parentID,["dir"]); directoryNames(m.coreHandle,directory.inode,["child"])
+                need(v.ownsForTesting(directory) && v.ownsForTesting(child) && sameBytes(token,directory.pin!) && sameBytes(childToken,child.pin!),"nonempty refusal retains both returned tokens")
+                need(try! v.diagnosticReadForTesting(child,length:payload.count) == payload,"nonempty refusal retains child bytes")
+            }
+            let childRemoval = remove(child,"child",directory)
+            need(childRemoval.0 != nil && childRemoval.1 == nil,"remove child through actual contextual result")
+            need(m.reclaim(child) == nil,"reclaim removed child once")
+            m.serial { directoryNames(m.coreHandle,directory.inode,[]) }
+        }
+        var attributes: [FSItem.Attributes] = [], constructed = false, prepared = false
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSRemoveItemResult" { need(!prepared && directory.lastKnownParent == nil,"directory result candidate is private before commit"); attributes.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSRemoveItemResult" { constructed = true }; return false }
+            v.diagnosticBeforeCommit = { need(directory.lastKnownParent == nil,"directory witness remains unpublished before commit"); prepared = true }
+        }
+        let removed = remove(directory,"dir",parentDirectory)
+        need(removed.0 != nil && removed.1 == nil && constructed && prepared && attributes.count == 2,"actual empty directory removal constructs complete SDK result")
+        var detached = sfs_metadata_entry()
+        m.serial {
+            var value = sfs_pin_stat(), r = sfs_result()
+            need(v.ownsForTesting(directory) && directory.lastKnownParent != nil && sameBytes(token,directory.pin!) && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_OK,"removed directory retains the same owned token")
+            detached = value.metadata
+            need(value.linked == 0 && detached.link_count == 0 && detached.entry.kind == SFS_DIRECTORY && detached.entry.parent == 0 && detached.entry.name_length == 0,"truthful detached directory metadata")
+            directoryNames(m.coreHandle,parentID,[])
+        }
+        checkPreparedAttributes(attributes[0],detached,required:required,retainedParent:parentID); checkPreparedAttributes(attributes[1],m.metadata(parentDirectory),required:required)
+        m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil }
+        let parentRemoved = remove(parentDirectory,"parent",m.root)
+        need(parentRemoved.0 != nil && parentRemoved.1 == nil && m.reclaim(parentDirectory) == nil,"former parent can itself be removed and reclaimed")
+        let wanted = FSItem.GetAttributesRequest(); wanted.wantedAttributes = [.fileID,.linkCount,.size,.parentID]
+        let observed: (FSItem.Attributes?,Error?) = wait { done in v.getAttributes(wanted,of:directory) { done(($0,$1)) } }
+        need(observed.1 == nil && observed.0?.linkCount == 0 && observed.0?.size == 0 && observed.0?.parentID == (try! itemIdentifier(parentID)),"held parent relationship survives former-parent removal/reclaim")
+        let actualHeld: (FSGetAttributesResult?,Error?) = wait { done in v.attributesResultForTesting(wanted,item:directory,caller:caller) { done(($0,$1)) } }
+        need(actualHeld.0 != nil && actualHeld.1 == nil,"held directory satisfies untouched current SDK result requirements")
+        for name in [".","..","child"] {
+            let found: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:name),inDirectory:directory) { done(($0,$2)) } }
+            need(found.0 == nil && code(found.1) == Int(ENOENT),"detached directory cannot be a lookup namespace parent")
+        }
+        var packed = false
+        let enumeration: Error? = wait { done in v.enumerateDirectory(directory,startingAt:.initial,verifier:.initial,attributes:nil,pack:{ _,_,_,_,_ in packed = true; return true }) { done($1) } }
+        need(!packed && code(enumeration) == Int(ENOENT),"detached directory cannot enumerate a namespace")
+        need(code(m.create("invalid",parent:directory).1) == Int(ENOENT),"detached directory cannot accept new children")
+        let linked: (FSCreateLinkResult?,Error?) = wait { done in v.linkResultForTesting(directory,name:FSFileName(string:"alias"),directory:m.root,caller:caller) { done(($0,$1)) } }
+        need(linked.0 == nil && code(linked.1) == Int(ENOENT),"detached directory cannot be relinked")
+        let retained: Error? = wait { v.reclaimForTesting(directory,eligible:false,replyHandler:$0) }
+        need(retained == nil,"false reclaim leaves detached directory retained")
+        m.serial { need(v.ownsForTesting(directory) && sameBytes(token,directory.pin!) && directory.lastKnownParent != nil,"false reclaim retains directory token and witness") }
+        need(m.reclaim(directory) == nil,"true reclaim releases detached directory exactly once")
+        m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(!v.ownsForTesting(directory) && directory.pin == nil && directory.lastKnownParent == nil && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"reclaimed detached directory token invalidated") }
+        need(code(m.reclaim(directory)) == Int(EINVAL),"second reclaim cannot release directory again")
+        m.state(1); withExtendedLifetime(removed.0) {}
+        m.close(); m.reopened("parent",inode:nil)
+        var reopened: OpaquePointer?, receipt = sfs_result(), absent = sfs_metadata_entry()
+        need(sfs_image_open_readonly(m.url.path,"image.sfs",&reopened,&receipt) == SFS_OK,"reopen removed directory lifecycle")
+        for inode in [directory.inode,parentID] {
+            need(sfs_image_stat_metadata(reopened,0,inode,&absent,&receipt) == SFS_NOT_FOUND,"removed directory inode durably absent without looking through a deleted parent")
+        }
+        need(sfs_image_close(reopened,&receipt) == SFS_OK,"close removed directory lifecycle inspection")
+    }
 }
 func directoryRefusals(_ parent: URL) throws {
     let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
@@ -2361,8 +2520,7 @@ func directoryRefusals(_ parent: URL) throws {
         need(code(m.create("child",parent:item).1) == Int(EACCES),"restrictive parent denies nested file")
         need(code(m.create("child",request:creationAttributes(0o700),parent:item,type:.directory).1) == Int(EACCES),"restrictive parent denies nested directory")
         let linked: (FSCreateLinkResult?,Error?) = wait { done in v.linkResultForTesting(item,name:FSFileName(string:"alias"),directory:m.root,caller:caller) { done(($0,$1)) } }
-        let removed: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(item,name:FSFileName(string:"new"),directory:m.root,caller:caller) { done(($0,$1)) } }
-        need(code(linked.1) == Int(ENOTSUP) && code(removed.1) == Int(ENOTSUP),"created directory hardlink and removal remain refused")
+        need(code(linked.1) == Int(ENOTSUP),"created directory hardlink remains refused")
         let size = FSItem.SetAttributesRequest(); size.size = UInt64.max
         let ignored: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(size,on:item,caller:caller) { done(($0,$1)) } }
         need(ignored.0 != nil && ignored.1 == nil && size.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"created directory size remains ignored and unconsumed")
@@ -3401,6 +3559,9 @@ func contextualXattrQueue(_ parent: URL) throws {
         print("PASS existing-file diagnostic real-core writes, attributes, failures and admission")
         print("UNQUALIFIED installed default-cache routing and syscall error propagation")
         print("SDK unconstructible capability request fields: \(unavailable.map(String.init).joined(separator: ","))")
+#if STALLION_CONTEXT_HANDLERS
+        print("RMDIR requested mask: 0x\(String(UInt(bitPattern: FSRemoveItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); final-link branch: actual-result success")
+#endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
         print("PASS contextual empty-file creation, publication reuse, two-role results and outcome-specific cleanup")

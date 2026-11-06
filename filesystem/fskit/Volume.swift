@@ -160,12 +160,20 @@ func checkedLinks(_ value: UInt64) throws -> UInt32 {
 func validateDirectoryLayout(_ cookie: UInt64, _ verifier: UInt64) throws {
     guard cookie == 0 && verifier == 0 else { throw POSIXError(.ENOTSUP) }
 }
+struct LastKnownParent {
+    let item: ObjectIdentifier
+    let pin: sfs_pin
+    let inode: UInt64
+    let kind: sfs_kind
+    let parent: UInt64
+}
 final class StallionItem: FSItem {
     let inode: UInt64
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var retainedModes: FSVolume.OpenModes = []
     var pin: sfs_pin?
     var reclaimed = false
+    var lastKnownParent: LastKnownParent?
 #endif
     init(_ inode: UInt64) { self.inode = inode; super.init() }
 }
@@ -579,7 +587,6 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
               value.linked != 0 || (m.entry.parent == 0 && m.entry.name_length == 0) else {
             let e = POSIXError(.EIO); latch(e); throw e
         }
-        if value.linked == 0 && m.entry.kind == SFS_DIRECTORY { throw POSIXError(.ENOTSUP) }
     }
     private func transactionMetadata(_ h: OpaquePointer, inode: UInt64, receipt: inout sfs_result) throws -> sfs_metadata_entry {
         var value = sfs_pin_stat()
@@ -592,7 +599,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func releaseItem(_ item: StallionItem) -> Error? {
         guard items[item.inode] === item, !item.reclaimed else { return POSIXError(.EINVAL) }
         let token = item.pin
-        item.reclaimed = true; item.pin = nil; item.retainedModes = []
+        item.reclaimed = true; item.pin = nil; item.retainedModes = []; item.lastKnownParent = nil
         items.removeValue(forKey: item.inode)
         guard let pin = token, let handle else {
             let e = POSIXError(.EINVAL); latch(e); rememberDelivery(e); return e
@@ -637,7 +644,19 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         try validateWanted(request.wantedAttributes.rawValue)
         return try populateAttributes(m, request, parents: &parents)
     }
-    private func populateAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence, includeResultPolicy: Bool = false) throws -> FSItem.Attributes {
+    private func detachedParent(_ m: sfs_metadata_entry, candidate: LastKnownParent?) throws -> UInt64 {
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        guard writesEnabled, m.link_count == 0, m.entry.parent == 0, m.entry.name_length == 0,
+              let item = items[m.entry.inode], let pin = try ownedItem(item).pin,
+              let witness = candidate ?? item.lastKnownParent,
+              witness.item == ObjectIdentifier(item), witness.inode == m.entry.inode, witness.kind == m.entry.kind,
+              sameBytes(witness.pin, pin), witness.parent > 0, witness.parent != m.entry.inode else { throw POSIXError(.ENOTSUP) }
+        return witness.parent
+#else
+        throw POSIXError(.ENOTSUP)
+#endif
+    }
+    private func populateAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest, parents: inout ParentEvidence, includeResultPolicy: Bool = false, detachedParent candidate: LastKnownParent? = nil) throws -> FSItem.Attributes {
         let inode = m.entry.inode, a = FSItem.Attributes(); a.invalidateAllProperties()
         parents.core = m.link_count == 0 ? nil : m.entry.parent
         let links = try checkedLinks(m.link_count)
@@ -652,8 +671,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         if request.isAttributeWanted(.allocSize) { a.allocSize = m.referenced_data_bytes }
         if request.isAttributeWanted(.fileID) { a.fileID = try itemIdentifier(inode) }
         if request.isAttributeWanted(.parentID) {
-            guard m.link_count > 0 else { throw POSIXError(.ENOTSUP) }
-            a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent)
+            if m.link_count > 0 { a.parentID = inode == 1 ? .parentOfRoot : try itemIdentifier(m.entry.parent) }
+            else { a.parentID = try itemIdentifier(detachedParent(m, candidate: candidate)) }
         }
         if request.isAttributeWanted(.accessTime) { a.accessTime = try checkedTime(m.access) }
         if request.isAttributeWanted(.modifyTime) { a.modifyTime = try checkedTime(m.modification) }
@@ -934,6 +953,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         do {
             let parent = try self.id(directory), m = try self.metadata(parent)
             guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
+            guard m.link_count > 0 else { throw POSIXError(.ENOENT) }
             if let caller { try self.ownerAccess(m, inode: parent, access: .search, caller: caller) }
             try component(name.data); let inode: UInt64; let returned: FSFileName
             if name.data == Data(".".utf8) { inode = parent; returned = name }
@@ -1057,6 +1077,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             let m = try self.metadata(parent)
             if let caller { try self.ownerAccess(m, inode: parent, access: [.readData, .search], caller: caller) }
             guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
+            guard m.link_count > 0 else { throw POSIXError(.ENOENT) }
             if let request { try validateWanted(request.wantedAttributes.rawValue) }
             returned = try self.directoryVerifier(parent, attributes: request != nil)
             let start = cookie.rawValue
@@ -1398,11 +1419,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return result
     }
     private func preparedResultAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest,
-                                          _ requirements: ResultRequirements, parents: inout ParentEvidence) throws -> FSItem.Attributes {
+                                          _ requirements: ResultRequirements, parents: inout ParentEvidence, detachedParent: LastKnownParent? = nil) throws -> FSItem.Attributes {
         try Self.validateCallerWanted(requirements.caller)
         guard request.wantedAttributes == requirements.sdk.union(requirements.caller) else { throw POSIXError(.EIO) }
         // SDK result snapshots may supply additional truthful policy attributes.
-        let attributes = try populateAttributes(m, request, parents: &parents, includeResultPolicy: true)
+        let attributes = try populateAttributes(m, request, parents: &parents, includeResultPolicy: true, detachedParent: detachedParent)
 #if STALLION_ADAPTER_CHECK
         preparedAttributesForTesting?(String(describing: requirements.type), attributes)
 #endif
@@ -1603,7 +1624,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
             items.removeValue(forKey: pending.inode); pending.ticket = true
         }
-        item?.pin = nil; item?.reclaimed = true; item?.retainedModes = []
+        item?.pin = nil; item?.reclaimed = true; item?.retainedModes = []; item?.lastKnownParent = nil
         if let pin = pending.pin {
             switch pending.ownership {
             case .discarded: break // Abort/automatic discard already retired it.
@@ -1874,7 +1895,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let source = try self.id(item), parent = try self.id(directory)
                 let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
-                guard sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
+                guard source != 1, sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK || sourceMetadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
@@ -1884,9 +1905,18 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 try self.check(status, receipt)
                 guard found.inode == source else { throw POSIXError(.ESTALE) }
+                if sourceMetadata.entry.kind == SFS_DIRECTORY {
+                    // One bounded read; expected-inode unlink rechecks emptiness inside the transaction.
+                    var cursor = sfs_cookie(), child = sfs_entry(), present: Int32 = 0
+                    try self.check(sfs_image_next(h, 0, source, &cursor, &child, &present, &receipt), receipt)
+                    guard anchorMatches(receipt, self.anchor) else { let error = POSIXError(.ESTALE); self.latch(error); throw error }
+                    guard present == 0 else { throw POSIXError(.ENOTEMPTY) }
+                }
                 let requirements = ResultRequirements(FSRemoveItemResult.self), request = try requirements.request()
-                // Detached pins have no parent identity. Do not invent one for a result.
-                guard sourceMetadata.link_count != 1 || !requirements.sdk.contains(.parentID) else { throw POSIXError(.ENOTSUP) }
+                let sourceItem = try self.ownedItem(item)
+                // This verified removal relationship is not a live core namespace parent.
+                let removedParent = sourceMetadata.link_count == 1 ? LastKnownParent(item: ObjectIdentifier(sourceItem),
+                    pin: try self.token(source), inode: source, kind: sourceMetadata.entry.kind, parent: parent) : nil
 #if STALLION_ADAPTER_CHECK
                 self.removeMutationForTesting = true
                 defer { self.removeMutationForTesting = false }
@@ -1897,13 +1927,21 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 }, prepare: { h, r in
                     let sourceMetadata = try self.transactionMetadata(h, inode: source, receipt: &r)
                     let parentMetadata = try self.transactionMetadata(h, inode: parent, receipt: &r)
+                    if let removedParent { _ = try self.detachedParent(sourceMetadata, candidate: removedParent) }
                     var sourceEvidence = ParentEvidence(), parentEvidence = ParentEvidence()
-                    let removed = try self.preparedResultAttributes(sourceMetadata, request, requirements, parents: &sourceEvidence)
+                    let removed = try self.preparedResultAttributes(sourceMetadata, request, requirements, parents: &sourceEvidence, detachedParent: removedParent)
                     let parentAttributes = try self.preparedResultAttributes(parentMetadata, request, requirements, parents: &parentEvidence)
                     return try self.handlerResult(FSRemoveItemResult.self) {
                         FSRemoveItemResult(itemAttributes: removed, directoryAttributes: parentAttributes, freeSpace: nil)
                     }
                 }, receipt: &receipt)
+                if let removedParent {
+                    guard self.items[source] === sourceItem, let pin = sourceItem.pin,
+                          !sourceItem.reclaimed, sameBytes(pin, removedParent.pin) else {
+                        let error = POSIXError(.ESTALE); self.latch(error); self.rememberDelivery(error, receipt); throw error
+                    }
+                    sourceItem.lastKnownParent = removedParent
+                }
                 reply(result, nil)
             } catch { reply(nil, error) }
         }
