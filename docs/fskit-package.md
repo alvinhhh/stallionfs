@@ -221,6 +221,25 @@ start a transaction. Failures preserve the existing rollback or uncertain-outcom
 rules. Direct callback tests do not qualify installed syscall or cache behavior.
 Mounted snapshots and generic stale cleanup remain unsupported.
 
+Contextual attribute setting accepts ordinary owner permission bits and explicit
+access, modification and birth times, including a request combined with regular
+file resize. The original item and caller must pass the owner, ACL, flags and
+special-mode policy. Metadata and security access checks use that same policy;
+security authorization does not implement ACL or ownership changes. Every other
+requested access right still requires its original permission. Mode cannot grant
+the data permission needed by a resize in the same request.
+
+Resize and metadata changes share one transaction. Explicit times are applied
+after resize, even when equal to the original times. Nanoseconds are preserved
+exactly; unsupported date coercions are refused. Full SDK result attributes are
+prepared before commit, and supported fields are acknowledged only after verified
+success. An all-value no-op does not commit. Held detached items retain their
+own token and informational parent relationship; their metadata still does not
+survive the core handle closing. UID/GID, flags and special permission bits remain
+unsupported setters; backup and added times have no on-disk representation and
+remain unconsumed. Installed chmod/fchmod, time-setting and cache behavior require
+separate qualification; direct callback tests do not establish their routing.
+
 Release qualification must bind the final signed artifact to the reviewed
 both-flags build and exercise two complete create/run/write/fsync/unmount/remount
 read cycles through the installed module. Retain package identity, public

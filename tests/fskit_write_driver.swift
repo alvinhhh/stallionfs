@@ -432,27 +432,44 @@ func attributes(_ parent: URL) throws -> [Int] {
         (.inhibitKernelOffloadedIO, { $0.inhibitKernelOffloadedIO = true }, Int(EINVAL))
     ]
     need(fields.count == 18, "SDK27 finite attribute table")
+#if STALLION_CONTEXT_HANDLERS
+    let metadataAllowed = true
+#else
+    let metadataAllowed = false
+#endif
+    let metadataFields: [FSItem.Attribute] = [.mode,.accessTime,.modifyTime,.birthTime]
     var unavailable = Set<Int>()
     let f = try Fixture(parent, "attributes")
     for (field, set, error) in fields {
-        need(code(StallionVolume.sizeRequestError(valid: [field])) == error, "finite policy covers every SDK field")
-        need(code(StallionVolume.sizeRequestError(valid: [.size, field])) == error, "finite policy covers every mixed request")
+        let policyError = metadataAllowed && metadataFields.contains(field) ? 0 : error
+        need(code(StallionVolume.sizeRequestError(valid: [field],metadata:metadataAllowed)) == policyError, "finite policy covers every SDK field")
+        need(code(StallionVolume.sizeRequestError(valid: [.size, field],metadata:metadataAllowed)) == policyError, "finite policy covers every mixed request")
         for mixed in [false, true] {
             let m = try Mounted(f), a = FSItem.SetAttributesRequest(), before = m.volume.anchor.generation
             if mixed { a.size = before + 40 }; set(a)
             if field == .size { a.size = before + 40 }
+            var previous = sfs_metadata_entry()
+            m.serial { var r = sfs_result(); need(sfs_image_stat_metadata(m.coreHandle,0,(m.file as! StallionItem).inode,&previous,&r) == SFS_OK,"attribute table original metadata") }
             let constructed = a.isValid(field)
             if !constructed {
                 need([FSItem.Attribute.supportsLimitedXAttrs, .inhibitKernelOffloadedIO].contains(field), "unexpected unconstructible SDK field")
                 unavailable.insert(field.rawValue)
             }
-            let expectedError = constructed ? error : 0
+            let expectedError = constructed ? policyError : 0
             let result = m.set(a), usesSize = expectedError == 0 && (mixed || field == .size)
+            let usesMetadata = expectedError == 0 && metadataAllowed && constructed && metadataFields.contains(field)
+            var consumed: FSItem.Attribute = usesSize ? [.size] : []
+            if usesMetadata { consumed.insert(field) }
+            let changedMetadata = usesMetadata && (field == .mode ? previous.mode & 0o777 != 0o600 :
+                field == .accessTime ? previous.access.seconds != 1 || previous.access.nanoseconds != 0 :
+                field == .modifyTime ? previous.modification.seconds != 1 || previous.modification.nanoseconds != 0 :
+                previous.birth.seconds != 1 || previous.birth.nanoseconds != 0)
+            let changed = (usesSize && a.size != previous.entry.size) || changedMetadata
             let valid = fields.filter { a.isValid($0.0) }.map { $0.0.rawValue }
             need(code(result.1) == expectedError, "attribute field=\(field.rawValue) mixed=\(mixed) valid=\(valid) expected=\(expectedError) actual=\(code(result.1))")
-            need(a.consumedAttributes == (usesSize ? [.size] : []), "exact consumed fields")
-            need(m.volume.anchor.generation == before + (usesSize ? 1 : 0), "no mutation on rejected mask")
-            need(m.volume.diagnosticSnapshot().0.commits == (usesSize ? 1 : 0), "attribute commit count")
+            need(a.consumedAttributes == consumed, "exact consumed fields")
+            need(m.volume.anchor.generation == before + (changed ? 1 : 0), "no mutation on rejected mask or all-value no-op")
+            need(m.volume.diagnosticSnapshot().0.commits == (changed ? 1 : 0), "attribute commit count")
             if mixed && expectedError != 0 { need(code(m.sync()) == expectedError, "recognized size failure sticks") }
             m.close()
         }
@@ -836,6 +853,260 @@ func reclaimErrorAndRoot(_ parent: URL) throws {
 }
 
 #if STALLION_CONTEXT_HANDLERS
+func metadataValue(_ m: CreationMount, _ item: StallionItem) -> sfs_metadata_entry {
+    var value = sfs_pin_stat()
+    m.serial { var r = sfs_result(); need(sfs_image_pin_stat(m.coreHandle,item.pin!,&value,&r) == SFS_OK,"metadata setter exact held token") }
+    return value.metadata
+}
+func metadataSet(_ m: CreationMount, _ item: FSItem, _ request: FSItem.SetAttributesRequest,
+                 caller: CallerIdentity? = nil) -> (FSItem.Attributes?,Error?) {
+    wait { done in m.volume.setAttributesValueForTesting(request,on:item,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+}
+func metadataReopened(_ m: CreationMount, _ inode: UInt64, _ expected: sfs_metadata_entry) {
+    var h: OpaquePointer?, r = sfs_result(), current = sfs_metadata_entry()
+    need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,inode,&current,&r) == SFS_OK,"metadata readonly reopen")
+    need(current.mode == expected.mode && current.uid == expected.uid && current.gid == expected.gid && current.flags == expected.flags &&
+         current.entry.inode == expected.entry.inode && current.entry.kind == expected.entry.kind && current.entry.parent == expected.entry.parent &&
+         current.entry.name_length == expected.entry.name_length && sameBytes(current.entry.name,expected.entry.name) && current.link_count == expected.link_count &&
+         current.entry.size == expected.entry.size && current.referenced_data_bytes == expected.referenced_data_bytes,"reopened metadata and unselected identity/data fields")
+    for (a,b) in [(current.access,expected.access),(current.modification,expected.modification),(current.birth,expected.birth),(current.change,expected.change)] {
+        need(a.seconds == b.seconds && a.nanoseconds == b.nanoseconds,"reopened exact nanosecond timestamp")
+    }
+    need(sfs_image_close(h,&r) == SFS_OK,"metadata inspection close")
+}
+func metadataRequest() -> FSItem.SetAttributesRequest {
+    let a = FSItem.SetAttributesRequest(); a.mode = 0o700
+    a.accessTime = timespec(tv_sec:-3,tv_nsec:999_999_999)
+    a.modifyTime = timespec(tv_sec:1,tv_nsec:1)
+    a.birthTime = timespec(tv_sec:-10,tv_nsec:123_456_789)
+    return a
+}
+func contextualMetadata(_ parent: URL) throws {
+    let required = FSSetAttributesResult.requestedAttributes.wantedAttributes
+    let fields: FSItem.Attribute = [.mode,.accessTime,.modifyTime,.birthTime]
+    for kind in 0..<4 {
+        let m = try CreationMount(parent,"metadata-values-\(kind)",directory:true,limit:6), v = m.volume
+        let item: StallionItem
+        if kind == 0 { item = m.create("file").2! }
+        else if kind == 1 { item = m.directory as! StallionItem }
+        else if kind == 2 { item = createSymlink(m,FSFileName(string:"target"),name:"link").2! }
+        else { item = m.root as! StallionItem }
+        if kind == 0 { m.serial { try! v.diagnosticMutationForTesting { h,r in
+            need(sfs_image_write(h,item.inode,0,"original",8,&r) == SFS_OK && sfs_image_link(h,item.inode,1,"alias",5,&r) == SFS_OK,"metadata file bytes and real alias")
+        } } }
+        let before = metadataValue(m,item), token = item.pin!, anchor = v.anchor, a = metadataRequest()
+        a.size = kind == 0 ? 13 : UInt64.max
+        var snapshot: FSItem.Attributes?, constructed = false, committing = false
+        m.serial {
+            v.preparedAttributesForTesting = { name,value in if name == "FSSetAttributesResult" { need(!committing && a.consumedAttributes.isEmpty,"metadata snapshot and consumption precede commit"); snapshot = value } }
+            v.rejectResultForTesting = { name in if name == "FSSetAttributesResult" { constructed = true; need(snapshot != nil && !committing && a.consumedAttributes.isEmpty,"real metadata constructor before commit") }; return false }
+            v.diagnosticBeforeCommit = { need(a.consumedAttributes.isEmpty,"no metadata consumption before verified commit"); committing = true }
+        }
+        let result = metadataSet(m,item,a), after = metadataValue(m,item)
+        need(result.0 != nil && result.1 == nil && constructed && committing && snapshot != nil && v.anchor.generation == anchor.generation+1,"actual full-mask atomic metadata result succeeds")
+        need(a.consumedAttributes == fields.union(kind == 0 ? [.size] : []) && sameBytes(token,item.pin!),"exact supported metadata consumption and unchanged owned token")
+        checkPreparedAttributes(snapshot!,after,required:required)
+        need(after.mode == ((before.mode & UInt32(S_IFMT)) | 0o700) && after.access.seconds == -3 && after.access.nanoseconds == 999_999_999 &&
+             after.modification.seconds == 1 && after.modification.nanoseconds == 1 && after.birth.seconds == -10 && after.birth.nanoseconds == 123_456_789,"exact explicit mode and signed nanosecond times")
+        need(after.uid == before.uid && after.gid == before.gid && after.flags == before.flags && after.link_count == before.link_count && after.entry.parent == before.entry.parent,"unselected ownership/flags/links/parent unchanged")
+        m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil }
+        if kind == 0 {
+            need(m.lookup("alias") === item,"mode/time update preserves canonical alias")
+            m.serial { need(try! v.diagnosticReadForTesting(item,length:20) == Data("original".utf8)+Data(repeating:0,count:5),"combined resize preserves data and zero extension") }
+        }
+        if kind == 2 { symlinkReadback(m,item,Data("target".utf8)) }
+        let noOp = metadataRequest(); noOp.size = kind == 0 ? 13 : UInt64.max
+        let sameAnchor = v.anchor, commits = v.diagnosticSnapshot().0.commits
+        m.serial { v.diagnosticBeforePrepare = { need(false,"all-value metadata no-op must not begin") }; v.diagnosticBeforeCommit = { need(false,"metadata no-op must not commit") } }
+        need(metadataSet(m,item,noOp).1 == nil && noOp.consumedAttributes == a.consumedAttributes && anchorMatches(sameAnchor,v.anchor) && v.diagnosticSnapshot().0.commits == commits,"all-request same-value success has no commit")
+        m.close(); metadataReopened(m,item.inode,after)
+        if kind == 0 { m.reopened("file",inode:item.inode,bytes:Data("original".utf8)+Data(repeating:0,count:5)); m.reopened("alias",inode:item.inode) }
+    }
+    // Equal-to-original requested mtime must be restored after resize changes it.
+    let m = try CreationMount(parent,"metadata-resize-original-time"), item = m.create().2!, before = metadataValue(m,item), a = FSItem.SetAttributesRequest()
+    a.size = 19; a.modifyTime = try checkedTime(before.modification)
+    let result = metadataSet(m,item,a), after = metadataValue(m,item)
+    need(result.0 != nil && result.1 == nil && a.consumedAttributes == [.size,.modifyTime] && after.entry.size == 19 &&
+         after.modification.seconds == before.modification.seconds && after.modification.nanoseconds == before.modification.nanoseconds,"explicit original mtime wins over changed resize mtime")
+    checkPreparedAttributes(result.0!,after,required:required); m.close(); metadataReopened(m,item.inode,after)
+    try metadataAccessChecks(parent); try metadataRefusals(parent); try metadataDetached(parent,required:required)
+    try metadataFailures(parent,required:required); try metadataQueued(parent)
+}
+func metadataAccessChecks(_ parent: URL) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    let m = try CreationMount(parent,"metadata-access-mode-zero"), item = m.create().2!, v = m.volume
+    m.serial { try! v.diagnosticMutationForTesting { h,r in var a = sfs_metadata_update(); a.fields = UInt32(SFS_META_MODE.rawValue); a.mode = UInt32(S_IFREG); need(sfs_image_set_metadata(h,item.inode,&a,&r) == SFS_OK,"original owner mode0000") } }
+    func access(_ rights: FSVolume.AccessMask, _ identity: CallerIdentity? = nil) -> (FSCheckAccessResult?,Error?) {
+        wait { done in v.accessForTesting(item,access:rights,caller:identity ?? caller) { done(($0,$1)) } }
+    }
+    for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.writeAttributes,.writeSecurity,.readAttributes]] {
+        let result = access(rights); need(result.0 != nil && result.1 == nil,"real access result allows owner metadata/security without data permission")
+    }
+    for rights: FSVolume.AccessMask in [[.writeAttributes,.writeData],[.writeSecurity,.readData],[.writeAttributes,.writeSecurity,.takeOwnership],FSVolume.AccessMask(rawValue:1<<30)] {
+        need(code(access(rights).1) == Int(EACCES),"combined rights checked against original state; no ownership/unknown grant")
+    }
+    need(code(access(.writeSecurity,CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid()))).1) == Int(EACCES),"owner-scoped security access")
+    let chmod = FSItem.SetAttributesRequest(); chmod.mode = 0o600
+    need(metadataSet(m,item,chmod).1 == nil && chmod.consumedAttributes == [.mode],"owner restores mode0000 through actual setter")
+    need(!v.supportedVolumeCapabilities.doesNotSupportSettingFilePermissions,"writable profile advertises implemented owner permission setting")
+    m.close()
+    for policy in 0..<3 {
+        let m = try CreationMount(parent,"metadata-access-policy-\(policy)"), item = m.create().2!, v = m.volume
+        m.serial { try! v.diagnosticMutationForTesting { h,r in
+            if policy == 0 { need(sfs_image_set_xattr(h,item.inode,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"metadata access ACL fixture") }
+            else { var a = sfs_metadata_update(); a.fields = UInt32(policy == 1 ? SFS_META_FLAGS.rawValue : SFS_META_MODE.rawValue); a.flags = 1; a.mode = UInt32(S_IFREG)|0o4600; need(sfs_image_set_metadata(h,item.inode,&a,&r) == SFS_OK,"metadata access flags/special-mode fixture") }
+        } }
+        for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.writeAttributes,.writeSecurity]] {
+            let result: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(item,access:rights,caller:caller) { done(($0,$1)) } }
+            need(result.0 == nil && code(result.1) == Int(policy == 2 ? EACCES : ENOTSUP),"actual metadata access retains ACL/flags/special-mode policy")
+        }
+        let before = v.anchor, request = metadataRequest()
+        need(code(metadataSet(m,item,request).1) == Int(policy == 2 ? EACCES : ENOTSUP) && request.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"setter independently enforces original policy")
+        m.close()
+    }
+    for writable in [false,true] {
+        let m = try CreationMount(parent,"metadata-access-disabled-\(writable)",writable:writable,enable:false), v = m.volume
+        let result: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.root,access:[.writeAttributes,.writeSecurity],caller:caller) { done(($0,$1)) } }
+        need(result.0 == nil && code(result.1) == Int(EACCES) && v.supportedVolumeCapabilities.doesNotSupportSettingFilePermissions,"read-only or disabled factory keeps metadata access refusal")
+        let a = metadataRequest(); need(code(metadataSet(m,m.root,a).1) == Int(EROFS) && a.consumedAttributes.isEmpty,"disabled setter refuses before mutation")
+        m.close()
+    }
+    let revoked = try CreationMount(parent,"metadata-access-revoked"), rv = revoked.volume; revoked.resource.revoke()
+    let denied: (FSCheckAccessResult?,Error?) = wait { done in rv.accessForTesting(revoked.root,access:.writeSecurity,caller:caller) { done(($0,$1)) } }
+    need(denied.0 == nil && code(denied.1) == Int(EACCES),"revoked metadata access"); revoked.close()
+    // Access authorization is not an unsupported security mutation implementation.
+    for name in ["com.apple.system.Security","com.apple.acl.text","com.apple.macl"] {
+        let f = try Fixture(parent,"metadata-security-xattr-\(name)"), m = try Mounted(f), v = m.volume
+        let allowed: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.file,access:.writeSecurity,caller:caller) { done(($0,$1)) } }
+        need(allowed.0 != nil && allowed.1 == nil,"owner security rights before denied security mutation")
+        let before = v.anchor, result = setXattr(m,name:FSFileName(string:name),value:Data([1]),policy:.alwaysSet)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && anchorMatches(before,v.anchor),"security access cannot enable unsupported ACL xattr mutation"); m.close()
+    }
+}
+func metadataRefusals(_ parent: URL) throws {
+    for scenario in 0..<8 {
+        let m = try CreationMount(parent,"metadata-refusal-\(scenario)"), item = m.create().2!, v = m.volume
+        if scenario == 0 { m.serial { try! v.diagnosticMutationForTesting { h,r in var a = sfs_metadata_update(); a.fields = UInt32(SFS_META_MODE.rawValue); a.mode = UInt32(S_IFREG)|0o400; need(sfs_image_set_metadata(h,item.inode,&a,&r) == SFS_OK,"original denied data-write bit") } } }
+        let before = v.anchor, original = metadataValue(m,item), a = metadataRequest()
+        if scenario == 0 { a.mode = 0o600; a.size = 9 }
+        if scenario == 1 { a.mode = UInt32(S_IFDIR)|0o700 }
+        if scenario == 2 { a.mode = 0o4700 }
+        if scenario == 3 { a.accessTime = timespec(tv_sec:0,tv_nsec:-1) }
+        if scenario == 4 { a.modifyTime = timespec(tv_sec:0,tv_nsec:1_000_000_000) }
+        if scenario == 5 { a.uid = geteuid() }
+        if scenario == 6 { a.gid = getegid() }
+        if scenario == 7 { a.flags = 0 }
+        let result = metadataSet(m,item,a), expected = scenario == 0 ? EACCES : [1,3,4].contains(scenario) ? EINVAL : ENOTSUP
+        need(result.0 == nil && code(result.1) == Int(expected) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"metadata original permission/type/mode/time/ownership/flags refusal")
+        m.close(); metadataReopened(m,item.inode,original)
+    }
+    for seconds in [Int.min,0,Int.max] { for nanoseconds in [0,999_999_999] {
+        let value = try metadataTime(timespec(tv_sec:seconds,tv_nsec:nanoseconds))
+        need(value.seconds == Int64(seconds) && value.nanoseconds == UInt32(nanoseconds),"exact host/core time conversion without floating point")
+    } }
+    for foreign in [false,true] {
+        let m = try CreationMount(parent,"metadata-identity-\(foreign)"), item = m.create().2!, before = m.volume.anchor, a = metadataRequest()
+        if !foreign { need(m.reclaim(item) == nil,"metadata reclaimed item fixture") }
+        let result = metadataSet(m,foreign ? StallionItem(item.inode) : item,a)
+        need(result.0 == nil && code(result.1) == Int(EINVAL) && a.consumedAttributes.isEmpty && anchorMatches(before,m.volume.anchor),"foreign/reclaimed setter object refusal"); m.close()
+    }
+    for (index,caller) in [CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())),CallerIdentity(uid:Int(geteuid()),gid:-1)].enumerated() {
+        let m = try CreationMount(parent,"metadata-caller-\(index)"), item = m.create().2!, before = m.volume.anchor, a = metadataRequest()
+        let result = metadataSet(m,item,a,caller:caller)
+        need(result.0 == nil && code(result.1) == Int(EACCES) && a.consumedAttributes.isEmpty && anchorMatches(before,m.volume.anchor),"actual setter rejects foreign or invalid caller identity"); m.close()
+    }
+}
+func metadataDetached(_ parent: URL, required: FSItem.Attribute) throws {
+    let supported: FSItem.Attribute = [.mode,.accessTime,.modifyTime,.birthTime]
+    for kind in 0..<3 {
+        let m = try CreationMount(parent,"metadata-detached-\(kind)",limit:4), v = m.volume
+        let item = kind == 2 ? createSymlink(m,FSFileName(string:"target"),name:"item").2! : m.create("item",request:creationAttributes(kind == 1 ? 0o700 : 0o600),type:kind == 1 ? .directory : .file).2!
+        if kind == 0 { m.serial { item.retainedModes = [.read,.write]; try! v.diagnosticMutationForTesting { h,r in need(sfs_image_write(h,item.inode,0,"original",8,&r) == SFS_OK,"detached metadata original bytes") } } }
+        let removed: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(item,name:FSFileName(string:"item"),directory:m.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+        need(removed.0 != nil && removed.1 == nil && item.lastKnownParent != nil,"real final unlink before held metadata setter")
+        let token = item.pin!, witness = item.lastKnownParent!, a = metadataRequest(); a.size = kind == 0 ? 13 : UInt64.max
+        let result = metadataSet(m,item,a), actual = metadataValue(m,item)
+        need(result.0 != nil && result.1 == nil && actual.link_count == 0 && actual.entry.parent == 0 && actual.entry.name_length == 0 && sameBytes(token,item.pin!),"actual held metadata setter preserves detached token and namespace state")
+        need(actual.mode & 0o777 == 0o700 && actual.access.seconds == -3 && actual.access.nanoseconds == 999_999_999 && actual.modification.seconds == 1 && actual.modification.nanoseconds == 1 && actual.birth.seconds == -10 && actual.birth.nanoseconds == 123_456_789 && a.consumedAttributes == supported.union(kind == 0 ? [.size] : []),"held update stores and acknowledges actual requested fields")
+        need(item.lastKnownParent?.item == witness.item && item.lastKnownParent?.parent == witness.parent && sameBytes(item.lastKnownParent!.pin,witness.pin),"metadata change cannot replace or transfer historical relationship")
+        checkPreparedAttributes(result.0!,actual,required:required,retainedParent:1)
+        if kind == 0 { m.serial { need(try! v.diagnosticReadForTesting(item,length:20) == Data("original".utf8)+Data(repeating:0,count:5),"held metadata/resize keeps original bytes"); _ = try! v.readResultConstructorForTesting(item) } }
+        if kind == 2 { symlinkReadback(m,item,Data("target".utf8),heldPin:token) }
+        if kind == 1 { need(code(m.create("forbidden",parent:item).1) == Int(ENOENT),"metadata result does not grant detached-parent authority") }
+        need(wait { v.reclaimForTesting(item,eligible:false,replyHandler:$0) } == nil && item.lastKnownParent != nil,"false reclaim retains metadata witness")
+        need(m.reclaim(item) == nil,"metadata true reclaim")
+        m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(item.lastKnownParent == nil && item.pin == nil && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"metadata reclaim retires token and witness") }
+        m.close(); m.reopened("item",inode:nil)
+    }
+}
+func metadataFailures(_ parent: URL, required: FSItem.Attribute) throws {
+    need(!required.isEmpty,"actual SDK metadata result requirements")
+    for directory in [false,true] { for scenario in 0..<8 {
+        let m = try CreationMount(parent,"metadata-failure-\(directory)-\(scenario)",limit:4), v = m.volume
+        let item = m.create("item",request:creationAttributes(directory ? 0o700 : 0o600),type:directory ? .directory : .file).2!
+        if !directory { m.serial { try! v.diagnosticMutationForTesting { h,r in need(sfs_image_write(h,item.inode,0,"original",8,&r) == SFS_OK,"metadata failure baseline bytes") } } }
+        let before = v.anchor, original = metadataValue(m,item), token = item.pin!, a = metadataRequest(), commits = v.diagnosticSnapshot().0.commitSuccess
+        if !directory { a.size = 13 }
+        var reached = false, originalCommit = sfs_result(), committedMetadata = original
+        m.serial {
+            v.preparedAttributesForTesting = { name,value in if name == "FSSetAttributesResult" { reached = true; need(a.consumedAttributes.isEmpty,"no metadata consumption while preparing"); if scenario == 0 { value.invalidateAllProperties() } } }
+            if scenario == 1 { v.rejectResultForTesting = { name in name == "FSSetAttributesResult" } }
+            if scenario == 2 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
+            if scenario == 3 { v.diagnosticBeforeCommit = { sfs_image_clear_read_cache(m.coreHandle); fault(7,1) } }
+            if scenario == 7 {
+                v.diagnosticBeforeCommit = { var value = sfs_pin_stat(), r = sfs_result(); need(sfs_image_pin_stat_transaction(m.coreHandle,token,&value,&r) == SFS_OK && r.transaction_active != 0,"capture actual pending metadata for durable malformed-receipt outcome"); committedMetadata = value.metadata }
+                v.attributesCommitReceiptForTesting = { original,receipt in originalCommit = original; receipt.fence_succeeded = 0 }
+            }
+        }
+        if scenario == 4 { fault(1,1) }; if scenario == 5 || scenario == 6 { fault(4,Int32(scenario-4)) }
+        let result = metadataSet(m,item,a), expected = scenario == 0 ? ENOTSUP : scenario == 2 ? EACCES : scenario == 3 ? ENOMEM : [4,5,6].contains(scenario) ? ENOSPC : EIO
+        need(result.0 == nil && code(result.1) == Int(expected) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"metadata failure keeps original error/no consumption/no acknowledged anchor")
+        if scenario < 4 || scenario == 7 { need(reached,"metadata snapshot preparation reached before injected refusal") }
+        if (3...6).contains(scenario) { need(hits() > 0,"actual metadata core fault hit") }
+        if scenario == 4 || scenario == 5 || scenario == 6 { let failure = v.diagnosticSnapshot().2!
+            need(failure.result.status == (scenario == 6 ? SFS_OUTCOME_UNKNOWN : SFS_IO) && failure.result.poisoned != 0,"metadata poison and unknown outcome retain original core disposition")
+        }
+        if scenario == 7 { need(originalCommit.status == SFS_OK && originalCommit.fence_succeeded == 3 && originalCommit.transaction_active == 0 && v.diagnosticSnapshot().0.commitSuccess == commits+1,"actual successful C commit retained despite malformed receipt rejection") }
+        fault(0,0)
+        m.serial { need(v.ownsForTesting(item) && sameBytes(item.pin!,token) && item.lastKnownParent == nil,"metadata failure never transfers or retires external pin") }
+        let later = metadataRequest(); later.mode = original.mode
+        need(code(metadataSet(m,item,later).1) == Int(expected) && later.consumedAttributes.isEmpty,"metadata failure latch also blocks later metadata-only requests")
+        m.close()
+        if scenario != 6 {
+            metadataReopened(m,item.inode,scenario == 7 ? committedMetadata : original)
+            if !directory { m.reopened("item",inode:item.inode,bytes:scenario == 7 ? Data("original".utf8)+Data(repeating:0,count:5) : Data("original".utf8)) }
+        }
+        // Unknown outcome retains its original error and asserts neither durable metadata state.
+    } }
+    let m = try CreationMount(parent,"metadata-append-capacity",capacity:32768,limit:2), item = m.create("item").2!, v = m.volume
+    let before = v.anchor, original = metadataValue(m,item), a = metadataRequest(), result = metadataSet(m,item,a), receipt = v.diagnosticSnapshot().2!.result
+    need(result.0 == nil && code(result.1) == Int(ENOSPC) && receipt.status == SFS_LIMIT && receipt.limit_reason == SFS_LIMIT_APPEND_CAPACITY && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"real fixed-image metadata capacity refusal")
+    m.close(); metadataReopened(m,item.inode,original)
+}
+func metadataQueued(_ parent: URL) throws {
+    for sameValue in [false,true] {
+        let m = try CreationMount(parent,"metadata-queued-\(sameValue)"), v = m.volume, item = m.create().2!, before = v.anchor, original = metadataValue(m,item)
+        let first = metadataRequest(), later = FSItem.SetAttributesRequest(); later.mode = sameValue ? original.mode : 0o700
+        let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+        var prepared = 0, cleared = false
+        v.enqueue {
+            v.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }
+            v.preparedAttributesForTesting = { name,_ in if name == "FSSetAttributesResult" { prepared += 1 } }
+            held.signal(); need(resume.wait(timeout:.now()+20) == .success,"release metadata queue")
+        }
+        need(held.wait(timeout:.now()+20) == .success,"hold metadata queue")
+        replies.enter(); v.setAttributesValueForTesting(first,on:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { value,error in
+            need(value == nil && code(error) == Int(ENOMEM) && first.consumedAttributes.isEmpty,"first queued metadata preparation failure")
+            v.diagnosticBeforePrepare = nil; cleared = true; replies.leave()
+        }
+        replies.enter(); v.setAttributesValueForTesting(later,on:item,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { value,error in
+            need(cleared && value == nil && code(error) == Int(ENOMEM) && later.consumedAttributes.isEmpty,"queued changed/same-value metadata preserves original failure"); replies.leave()
+        }
+        resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"metadata queued replies")
+        need(prepared == 0 && anchorMatches(before,v.anchor),"no later result preparation or acknowledged mutation after cleared failure")
+        m.close(); metadataReopened(m,item.inode,original)
+    }
+}
 // These values exercise policy only; FSContext.init is unavailable.
 func contextualPolicyValues() throws {
     let owner = geteuid(), caller = CallerIdentity(uid: Int(owner), gid: Int(getegid()))
@@ -3896,8 +4167,15 @@ func contextualXattrQueue(_ parent: URL) throws {
         need(CommandLine.arguments.count == 2, "owned empty parent required")
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
-        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent)
+        try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent); try contextualMetadata(parent)
         try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
+#else
+        let legacyFixture = try Fixture(parent,"legacy-metadata-access"), legacy = try Mounted(legacyFixture)
+        for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.takeOwnership]] {
+            let result: (FSCheckAccessResult?,Error?) = wait { done in legacy.volume.accessForTesting(legacy.file,access:rights,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+            need(result.0 == nil && code(result.1) == Int(EACCES),"legacy access policy does not acquire contextual metadata/security rights")
+        }
+        legacy.close()
 #endif
         try successfulWrites(parent); let unavailable = try attributes(parent)
         try failures(parent); try admission(parent); try lifetimeAndBinding(parent); try accessPolicyChecks(parent)
@@ -3915,6 +4193,7 @@ func contextualXattrQueue(_ parent: URL) throws {
 #if STALLION_CONTEXT_HANDLERS
         print("RMDIR requested mask: 0x\(String(UInt(bitPattern: FSRemoveItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); final-link branch: actual-result success")
         print("RENAME requested mask: 0x\(String(UInt(bitPattern: FSRenameItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); replacement and same-inode branches: actual-result success")
+        print("METADATA requested mask: 0x\(String(UInt(bitPattern: FSSetAttributesResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); mode and timestamp branches: actual-result success")
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
