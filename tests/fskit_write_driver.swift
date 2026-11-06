@@ -2122,7 +2122,7 @@ func removalFailures(_ parent: URL, required: FSItem.Attribute) throws {
         removalName(m,name,inode:item.inode); removalState(m,count:directory ? 4 : 3); if directory { need(wait { v.reclaimForTesting(item,eligible:true,replyHandler:$0) } == nil,"reclaim retained directory after constructor refusal") }; m.close(); namespaceReopened(f,name,inode:item.inode)
     }
     for scenario in 0..<8 {
-        let f = try Fixture(parent,"remove-failure-\(directory)-\(scenario)",capacity:scenario == 7 ? 160 * 1024 : 16 * 1024 * 1024,directory:directory), m = try Mounted(f,itemLimit:directory ? 4 : 3), v = m.volume
+        let f = try Fixture(parent,"remove-failure-\(directory)-\(scenario)",directory:directory,capacity:scenario == 7 ? 160 * 1024 : 16 * 1024 * 1024), m = try Mounted(f,itemLimit:directory ? 4 : 3), v = m.volume
         let item = (directory ? namespaceLookup(m,"dir") : m.file) as! StallionItem, name = directory ? "dir" : "file"
         if scenario == 6 {
             let retained = removal(m,m.link,name:Data("link".utf8))
