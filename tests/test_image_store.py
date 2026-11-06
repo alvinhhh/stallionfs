@@ -251,8 +251,7 @@ class ImageStoreTests(unittest.TestCase):
             snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertEqual((repo / "file").read_text(), "snapshot state\n")
             (repo / "file").write_text("later state\n")
-            with observe_detach():
-                result = fixture.call(store.rollback, value, snapshot["id"], workspace=value)
+            result = fixture.call(store.rollback, value, snapshot["id"], workspace=value)
             self.assertEqual((repo / "file").read_text(), "snapshot state\n")
             self.assertEqual((repo / "untracked").read_text(), "preserved\n")
             self.assertTrue((store.root / "recovery" / result["recovery"] / "workspace.sparseimage").exists())
