@@ -1973,7 +1973,6 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         let charge = oldBytes.count.addingReportingOverflow(newBytes.count)
         var validation: Error?
         do {
-            guard overItem == nil else { throw POSIXError(.ENOTSUP) }
             guard !charge.overflow else { throw POSIXError(.E2BIG) }
             for bytes in [oldBytes, newBytes] {
                 try component(bytes)
@@ -1994,8 +1993,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let source = try self.id(item), oldParent = try self.id(sourceDirectory), newParent = try self.id(destinationDirectory)
                 let sourceMetadata = try self.metadata(source), oldMetadata = try self.metadata(oldParent), newMetadata = try self.metadata(newParent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
-                guard source != 1, sourceMetadata.link_count == 1,
+                guard source != 1,
                       sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
+                if sourceMetadata.entry.kind == SFS_DIRECTORY && sourceMetadata.link_count != 1 { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.flags == 0, oldMetadata.flags == 0, newMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
@@ -2007,36 +2007,95 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let oldStatus = oldBytes.withUnsafeBytes { sfs_image_lookup(h, 0, oldParent, $0.baseAddress, $0.count, &found, &receipt) }
                 try self.check(oldStatus, receipt)
                 guard found.inode == source else { throw POSIXError(.ESTALE) }
+                let suppliedVictim = try overItem.map { try self.ownedItem($0) }
+                if let suppliedVictim { _ = try self.token(suppliedVictim.inode) }
                 let newStatus = newBytes.withUnsafeBytes { sfs_image_lookup(h, 0, newParent, $0.baseAddress, $0.count, &found, &receipt) }
-                if newStatus != SFS_NOT_FOUND { try self.check(newStatus, receipt); throw POSIXError(.EEXIST) }
+                if newStatus != SFS_NOT_FOUND { try self.check(newStatus, receipt) }
                 guard anchorMatches(receipt, self.anchor) else { let error = POSIXError(.ESTALE); self.latch(error); throw error }
                 let requirements = ResultRequirements(FSRenameItemResult.self), request = try requirements.request()
+                func prepared(_ movedMetadata: sfs_metadata_entry, _ sourceParentMetadata: sfs_metadata_entry,
+                              _ destinationParentMetadata: sfs_metadata_entry, _ victimMetadata: sfs_metadata_entry? = nil,
+                              _ removedParent: LastKnownParent? = nil) throws -> FSRenameItemResult {
+                    var movedEvidence = ParentEvidence(), oldEvidence = ParentEvidence(), newEvidence = ParentEvidence(), victimEvidence = ParentEvidence()
+                    let moved = try self.preparedResultAttributes(movedMetadata, request, requirements, parents: &movedEvidence)
+                    let oldDirectory = try self.preparedResultAttributes(sourceParentMetadata, request, requirements, parents: &oldEvidence)
+                    let newDirectory = try self.preparedResultAttributes(destinationParentMetadata, request, requirements, parents: &newEvidence)
+                    let overwritten = try victimMetadata.map { try self.preparedResultAttributes($0, request, requirements, parents: &victimEvidence, detachedParent: removedParent) }
+                    return try self.handlerResult(FSRenameItemResult.self) {
+                        FSRenameItemResult(newName: FSFileName(data: newBytes), renamedItemAttributes: moved,
+                                           sourceDirectoryAttributes: oldDirectory, destinationDirectoryAttributes: newDirectory,
+                                           overItemAttributes: overwritten, freeSpace: nil)
+                    }
+                }
+                // Renaming a name onto itself or another name of the same inode removes nothing.
+                // It must not enter mutate's generation/append-growth contract or publish a witness.
+                if newStatus == SFS_OK && found.inode == source {
+                    guard suppliedVictim == nil || suppliedVictim === item else { throw POSIXError(.ESTALE) }
+                    let result = try prepared(sourceMetadata, oldMetadata, newMetadata)
+                    guard self.resource.isWritable && !self.resource.isRevoked else { throw POSIXError(.EACCES) }
+                    reply(result, nil); return
+                }
+                let victim: StallionItem?, victimMetadata: sfs_metadata_entry?
+                if newStatus == SFS_NOT_FOUND {
+                    guard suppliedVictim == nil else { throw POSIXError(.ESTALE) }
+                    victim = nil; victimMetadata = nil
+                } else {
+                    guard let suppliedVictim else { throw POSIXError(.EEXIST) }
+                    guard suppliedVictim.inode == found.inode else { throw POSIXError(.ESTALE) }
+                    let metadata = try self.metadata(suppliedVictim.inode)
+                    guard metadata.link_count > 0 else { throw POSIXError(.ENOENT) }
+                    guard suppliedVictim.inode != 1, metadata.entry.kind == SFS_FILE || metadata.entry.kind == SFS_SYMLINK || metadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
+                    guard metadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                    guard metadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
+                    try self.ownerAccess(metadata, inode: suppliedVictim.inode, access: .readAttributes, caller: caller)
+                    if sourceMetadata.entry.kind == SFS_DIRECTORY && metadata.entry.kind != SFS_DIRECTORY { throw POSIXError(.ENOTDIR) }
+                    if sourceMetadata.entry.kind != SFS_DIRECTORY && metadata.entry.kind == SFS_DIRECTORY { throw POSIXError(.EISDIR) }
+                    if metadata.entry.kind == SFS_DIRECTORY {
+                        guard metadata.link_count == 1 else { throw POSIXError(.ENOTSUP) }
+                        var cursor = sfs_cookie(), child = sfs_entry(), present: Int32 = 0
+                        try self.check(sfs_image_next(h, 0, suppliedVictim.inode, &cursor, &child, &present, &receipt), receipt)
+                        guard present == 0 else { throw POSIXError(.ENOTEMPTY) }
+                    }
+                    victim = suppliedVictim; victimMetadata = metadata
+                }
+                let removedParent: LastKnownParent?
+                if let victim, let victimMetadata, victimMetadata.link_count == 1 {
+                    removedParent = LastKnownParent(item: ObjectIdentifier(victim), pin: try self.token(victim.inode),
+                                                   inode: victim.inode, kind: victimMetadata.entry.kind, parent: newParent)
+                } else { removedParent = nil }
+#if STALLION_ADAPTER_CHECK
+                self.renameMutationForTesting = true
+                defer { self.renameMutationForTesting = false }
+#endif
                 let result = try self.mutate({ h, r in
                     let status = oldBytes.withUnsafeBytes { old in newBytes.withUnsafeBytes { new in
                         sfs_image_rename_replace(h, oldParent, old.baseAddress, old.count, source,
-                                                 newParent, new.baseAddress, new.count, 0, &r)
+                                                 newParent, new.baseAddress, new.count, victim?.inode ?? 0, &r)
                     } }
                     try self.check(status, r)
                 }, prepare: { h, r in
                     let movedMetadata = try self.transactionMetadata(h, inode: source, receipt: &r)
                     let sourceParentMetadata = try self.transactionMetadata(h, inode: oldParent, receipt: &r)
                     let destinationParentMetadata = try self.transactionMetadata(h, inode: newParent, receipt: &r)
-                    var movedEvidence = ParentEvidence(), oldEvidence = ParentEvidence(), newEvidence = ParentEvidence()
-                    let moved = try self.preparedResultAttributes(movedMetadata, request, requirements, parents: &movedEvidence)
-                    let oldDirectory = try self.preparedResultAttributes(sourceParentMetadata, request, requirements, parents: &oldEvidence)
-                    let newDirectory = try self.preparedResultAttributes(destinationParentMetadata, request, requirements, parents: &newEvidence)
-                    let storedName = FSFileName(data: newBytes)
-                    return try self.handlerResult(FSRenameItemResult.self) {
-                        FSRenameItemResult(newName: storedName, renamedItemAttributes: moved, sourceDirectoryAttributes: oldDirectory,
-                                           destinationDirectoryAttributes: newDirectory, overItemAttributes: nil, freeSpace: nil)
-                    }
+                    let overwritten = try victim.map { try self.transactionMetadata(h, inode: $0.inode, receipt: &r) }
+                    if let removedParent, let overwritten { _ = try self.detachedParent(overwritten, candidate: removedParent) }
+                    return try prepared(movedMetadata, sourceParentMetadata, destinationParentMetadata, overwritten, removedParent)
                 }, receipt: &receipt)
+                if let victim, let removedParent {
+                    guard self.items[victim.inode] === victim, let pin = victim.pin, !victim.reclaimed,
+                          sameBytes(pin, removedParent.pin) else {
+                        let error = POSIXError(.ESTALE); self.latch(error); self.rememberDelivery(error, receipt); throw error
+                    }
+                    victim.lastKnownParent = removedParent
+                }
                 reply(result, nil)
             } catch { reply(nil, error) }
         }
     }
 #if STALLION_ADAPTER_CHECK
+    private var renameMutationForTesting = false
     var renamePreflightForTesting: (() -> Void)?
+    var renameCommitReceiptForTesting: ((sfs_result, inout sfs_result) -> Void)?
     func renameResultForTesting(_ item: FSItem, sourceDirectory: FSItem, sourceName: FSFileName,
                                 destinationName: FSFileName, destinationDirectory: FSItem, overItem: FSItem? = nil,
                                 caller: CallerIdentity, reply: @escaping (FSRenameItemResult?, Error?) -> Void) {
@@ -2253,6 +2312,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             if removeMutationForTesting, status == SFS_OK {
                 let committedReceipt = receipt
                 removeCommitReceiptForTesting?(committedReceipt, &receipt)
+            }
+            if renameMutationForTesting, status == SFS_OK {
+                let committedReceipt = receipt
+                renameCommitReceiptForTesting?(committedReceipt, &receipt)
             }
 #endif
 #else

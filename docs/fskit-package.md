@@ -208,7 +208,18 @@ and the full SDK-required attributes. The relationship is published only after
 a verified commit and discarded when the pin is reclaimed. It grants no
 permission to use a detached directory as a namespace parent or relink an item.
 Direct core edits without that verified callback relationship do not acquire it.
-This does not add overwrite rename, mounted snapshots or generic stale cleanup.
+Contextual rename also accepts atomic replacement of an owned destination item.
+The adapter verifies both name-to-inode bindings and each item's removal policy
+before one core transaction. Files and symlinks can replace either nondirectory
+kind; directories can replace only empty directories. All four result roles use
+current post-transaction metadata and the full SDK-required attributes. A victim
+losing its last name uses the same commit-bound informational parent relationship
+as removal. Its held pin remains independent of the moved source until reclaim.
+Renaming a path onto itself or another name of the same inode is a validated
+no-op: it overwrites nothing, returns no overwritten-item snapshot and does not
+start a transaction. Failures preserve the existing rollback or uncertain-outcome
+rules. Direct callback tests do not qualify installed syscall or cache behavior.
+Mounted snapshots and generic stale cleanup remain unsupported.
 
 Release qualification must bind the final signed artifact to the reviewed
 both-flags build and exercise two complete create/run/write/fsync/unmount/remount
