@@ -229,7 +229,7 @@ class FSKitInterfaces(unittest.TestCase):
                 self.assertEqual(lines[:2], [
                     'PASS existing-file diagnostic real-core writes, attributes, failures and admission',
                     'UNQUALIFIED installed default-cache routing and syscall error propagation'])
-                self.assertEqual(len(lines), 5 if variant == 'context' else 3)
+                self.assertEqual(len(lines), 6 if variant == 'context' else 3)
                 self.assertIn(lines[2], ('SDK unconstructible capability request fields: 65536',
                                         'SDK unconstructible capability request fields: 65536,131072'))
                 if variant == 'context':
@@ -239,6 +239,9 @@ class FSKitInterfaces(unittest.TestCase):
                     self.assertRegex(lines[4], r'^RENAME requested mask: 0x[0-9a-f]+; replacement and same-inode '
                                                r'branches: actual-result success$')
                     print(lines[4], flush=True)
+                    self.assertRegex(lines[5], r'^METADATA requested mask: 0x[0-9a-f]+; mode and timestamp '
+                                               r'branches: actual-result success$')
+                    print(lines[5], flush=True)
                 self.assertEqual(child.stderr, '')
                 extension = directory / 'readonly-extension'
                 self.command(variant + '-normal-build', [*swift, '-module-cache-path', directory / 'normal-cache',

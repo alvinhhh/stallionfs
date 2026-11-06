@@ -111,6 +111,18 @@ func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdent
     guard !hasACL else { throw POSIXError(.ENOTSUP) }
 }
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
+func checkMetadataOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
+    guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
+          caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
+    guard m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY || m.entry.kind == SFS_SYMLINK,
+          m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
+}
+func metadataTime(_ value: timespec) throws -> sfs_timestamp {
+    guard value.tv_nsec >= 0 && value.tv_nsec < 1_000_000_000 else { throw POSIXError(.EINVAL) }
+    guard let seconds = Int64(exactly: value.tv_sec), let nanoseconds = UInt32(exactly: value.tv_nsec) else { throw POSIXError(.EOVERFLOW) }
+    var result = sfs_timestamp(); result.seconds = seconds; result.nanoseconds = nanoseconds; return result
+}
 func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
@@ -732,6 +744,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         c.supportsHardLinks = true; c.supportsSymbolicLinks = true; c.supportsSparseFiles = true
         c.supports64BitObjectIDs = true; c.supportsJournal = false; c.supportsActiveJournal = false
         c.doesNotSupportVolumeSizes = true; c.doesNotSupportSettingFilePermissions = true; c.doesNotSupportImmutableFiles = true
+#if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
+        if writesEnabled { c.doesNotSupportSettingFilePermissions = false }
+#endif
         return c
     }
     var volumeStatistics: FSStatFSResult {
@@ -1199,6 +1214,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         writable = writesEnabled
 #endif
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
+        let metadataRights: FSVolume.AccessMask = [.writeAttributes, .writeSecurity]
+        if writesEnabled && !access.intersection(metadataRights).isEmpty {
+            _ = try ready(mounted: true)
+            guard resource.isWritable else { throw POSIXError(.EACCES) }
+            try checkMetadataOwnerPolicy(m, owner: owner, caller: caller)
+            // Security writes also cover ACL requests. Their mutation callbacks remain unsupported.
+            // Validate every remaining right and the opaque ACL policy against the original item.
+            try ownerAccess(m, inode: inode, access: access.subtracting(metadataRights), caller: caller)
+            return
+        }
         if writesEnabled && access.contains(.writeXattr) {
             try checkXattrOwnerPolicy(m, owner: owner, caller: caller)
             try ownerAccess(m, inode: inode, access: access.subtracting(.writeXattr), caller: caller)
@@ -1559,7 +1584,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         attributes.consumedAttributes = []
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
-            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.size, .allocSize, .modifyTime, .changeTime, .fileID])
+            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.mode, .size, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime, .fileID])
             setWritableAttributes(attributes, item: item, caller: caller, requirements: requirements,
                 request: { try requirements.request() }, prepare: { a in
                     return try self.handlerResult(FSSetAttributesResult.self) { FSSetAttributesResult(attributes: a, freeSpace: nil) }
@@ -2317,6 +2342,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let committedReceipt = receipt
                 renameCommitReceiptForTesting?(committedReceipt, &receipt)
             }
+            if attributesMutationForTesting, status == SFS_OK {
+                let committedReceipt = receipt
+                attributesCommitReceiptForTesting?(committedReceipt, &receipt)
+            }
 #endif
 #else
             let status = sfs_image_commit(h, &receipt); accountCommit(receipt)
@@ -2448,36 +2477,76 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
     }
     // All 18 SDK27 fields are classified before mutation; no guessed mask.
-    static func sizeRequestError(_ a: FSItem.SetAttributesRequest) -> Error? {
+    static func sizeRequestError(_ a: FSItem.SetAttributesRequest, metadata: Bool = false) -> Error? {
         let fields: [FSItem.Attribute] = [.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize,
             .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
             .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
-        return sizeRequestError(valid: fields.filter { a.isValid($0) })
+        return sizeRequestError(valid: fields.filter { a.isValid($0) }, metadata: metadata)
     }
-    static func sizeRequestError(valid: [FSItem.Attribute]) -> Error? {
+    static func sizeRequestError(valid: [FSItem.Attribute], metadata: Bool = false) -> Error? {
         let computed: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID, .changeTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
-        let disabled: [FSItem.Attribute] = [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
+        let disabled: [FSItem.Attribute] = metadata ? [.uid, .gid, .flags] : [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
         if computed.contains(where: { valid.contains($0) }) { return POSIXError(.EINVAL) }
         if disabled.contains(where: { valid.contains($0) }) { return POSIXError(.ENOTSUP) }
         // addedTime and backupTime have no representation and stay unconsumed.
         return nil
     }
 #if STALLION_CONTEXT_HANDLERS
+#if STALLION_ADAPTER_CHECK
+    private var attributesMutationForTesting = false
+    var attributesCommitReceiptForTesting: ((sfs_result, inout sfs_result) -> Void)?
+#endif
     private func setWritableAttributes<T>(_ a: FSItem.SetAttributesRequest, item: FSItem, caller: CallerIdentity,
                                             requirements: ResultRequirements? = nil,
                                             request makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, prepare: @escaping (FSItem.Attributes) throws -> T,
                                             reply: @escaping (T?, Error?) -> Void) {
         let start = DispatchTime.now().uptimeNanoseconds
         a.consumedAttributes = []
-        let hasSize = a.isValid(.size), validation = Self.sizeRequestError(a)
-        enqueue(dataOperation: hasSize, validationError: validation, rejected: { reply(nil, $0) }) {
+        let hasSize = a.isValid(.size), size = hasSize ? a.size : 0
+        let mode: UInt32? = a.isValid(.mode) ? a.mode : nil
+        let metadataFields: [FSItem.Attribute] = [.mode, .accessTime, .modifyTime, .birthTime]
+        let usedMetadata = metadataFields.filter { a.isValid($0) }.reduce(FSItem.Attribute()) { $0.union($1) }
+        let hasMutation = hasSize || !usedMetadata.isEmpty
+        var update = sfs_metadata_update(), validation = Self.sizeRequestError(a, metadata: true)
+        do {
+            if validation == nil {
+                if let mode {
+                    guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
+                    update.fields |= UInt32(SFS_META_MODE.rawValue); update.mode = mode
+                }
+                if a.isValid(.accessTime) { update.fields |= UInt32(SFS_META_ACCESS.rawValue); update.access = try metadataTime(a.accessTime) }
+                if a.isValid(.modifyTime) { update.fields |= UInt32(SFS_META_MODIFICATION.rawValue); update.modification = try metadataTime(a.modifyTime) }
+                if a.isValid(.birthTime) { update.fields |= UInt32(SFS_META_BIRTH.rawValue); update.birth = try metadataTime(a.birthTime) }
+            }
+        } catch { validation = error }
+        let requestedUpdate = update
+        enqueue(dataOperation: hasMutation, validationError: validation, rejected: { reply(nil, $0) }) {
             var receipt = sfs_result(), inode: UInt64 = 0
             if self.failure == nil { self.lastCoreFailure = nil }
             do {
+                // This also guards same-value metadata requests before any native lookup.
+                if hasMutation, let error = self.deliveryError() { throw error }
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
                 let regularSize = hasSize && m.entry.kind == SFS_FILE
-                if regularSize, let error = self.deliveryError() { throw error }
-                try self.ownerAccess(m, inode: inode, access: regularSize ? .writeData : .readAttributes, caller: caller)
+                var access: FSVolume.AccessMask = regularSize ? .writeData : .readAttributes
+                if usedMetadata.contains(.mode) { access.insert(.writeSecurity) }
+                if !usedMetadata.intersection([.accessTime, .modifyTime, .birthTime]).isEmpty { access.insert(.writeAttributes) }
+                try self.ownerAccess(m, inode: inode, access: access, caller: caller)
+                var pendingUpdate = requestedUpdate
+                if let mode {
+                    let kind = m.mode & UInt32(S_IFMT), requestedKind = mode & UInt32(S_IFMT)
+                    guard requestedKind == 0 || requestedKind == kind else { throw POSIXError(.EINVAL) }
+                    pendingUpdate.mode = kind | (mode & 0o777)
+                }
+                if regularSize { guard size <= self.maximumFileSize else { throw POSIXError(.EFBIG) } }
+                func changedTime(_ field: FSItem.Attribute, _ wanted: sfs_timestamp, _ current: sfs_timestamp) -> Bool {
+                    usedMetadata.contains(field) && (wanted.seconds != current.seconds || wanted.nanoseconds != current.nanoseconds)
+                }
+                let changedSize = regularSize && size != m.entry.size
+                let changedMetadata = (mode != nil && pendingUpdate.mode != m.mode) ||
+                    changedTime(.accessTime, pendingUpdate.access, m.access) ||
+                    changedTime(.modifyTime, pendingUpdate.modification, m.modification) ||
+                    changedTime(.birthTime, pendingUpdate.birth, m.birth)
                 let request = try makeRequest()
                 if let requirements { try Self.validateCallerWanted(requirements.caller) }
                 else { try validateWanted(request.wantedAttributes.rawValue) }
@@ -2487,28 +2556,34 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     return try self.attributes(metadata, request, parents: &parents)
                 }
                 let result: T
-                if regularSize {
-                    guard a.size <= self.maximumFileSize else { throw POSIXError(.EFBIG) }
-                    if a.size != m.entry.size {
-                        let pin = try self.token(inode)
-                        result = try self.mutate({ h, r in
-                            try self.check(sfs_image_pin_resize(h, pin, a.size, &r), r)
-                        }, prepare: { h, r in
-                            let pending = try self.transactionMetadata(h, inode: inode, receipt: &r)
-                            return try prepare(snapshot(pending))
-                        }, receipt: &receipt)
-                    } else { result = try prepare(snapshot(m)) }
-                    a.consumedAttributes = [.size]
+                if changedSize || changedMetadata {
+                    let pin = try self.token(inode)
 #if STALLION_ADAPTER_CHECK
-                    self.diagnosticAfterSizeCommit?()
+                    self.attributesMutationForTesting = true
+                    defer { self.attributesMutationForTesting = false }
 #endif
-                } else { result = try prepare(snapshot(m)) }
-                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: nil, result: receipt)
+                    result = try self.mutate({ h, r in
+                        if changedSize { try self.check(sfs_image_pin_resize(h, pin, size, &r), r) }
+                        // Reapply every requested time after resize, including original-valued mtime.
+                        if pendingUpdate.fields != 0 { try self.check(sfs_image_pin_set_metadata(h, pin, &pendingUpdate, &r), r) }
+                    }, prepare: { h, r in
+                        let pending = try self.transactionMetadata(h, inode: inode, receipt: &r)
+                        return try prepare(snapshot(pending))
+                    }, receipt: &receipt)
+                } else {
+                    result = try prepare(snapshot(m))
+                    if hasMutation { guard self.resource.isWritable && !self.resource.isRevoked else { throw POSIXError(.EACCES) } }
+                }
+                a.consumedAttributes = usedMetadata.union(regularSize ? [.size] : [])
+#if STALLION_ADAPTER_CHECK
+                if regularSize { self.diagnosticAfterSizeCommit?() }
+#endif
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? size : 0, started: start, count: 0, error: nil, result: receipt)
                 reply(result, nil)
             } catch {
                 receipt = self.lastCoreFailure ?? receipt
-                if hasSize { self.rememberDelivery(error, receipt) }
-                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? a.size : 0, started: start, count: 0, error: error, result: receipt)
+                if hasMutation { self.rememberDelivery(error, receipt) }
+                self.observeWrite(2, inode: inode, offset: 0, length: hasSize ? size : 0, started: start, count: 0, error: error, result: receipt)
                 reply(nil, error)
             }
         }
