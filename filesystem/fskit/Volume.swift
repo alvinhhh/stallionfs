@@ -1508,10 +1508,14 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
             var answer: UInt64 = 0, found: Int32 = 0, receipt = sfs_result()
             let digest = rawBytes(self.anchor.root_digest)
-            let status = try digest.withUnsafeBufferPointer { bytes -> sfs_status in
 #if STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES
-                if self.writesEnabled {
-                    return sfs_image_pin_seek_region(h, try self.token(inode), self.anchor.generation, bytes.baseAddress,
+            var seekPin: sfs_pin? = nil
+            if self.writesEnabled { seekPin = try self.token(inode) }
+#endif
+            let status = digest.withUnsafeBufferPointer { bytes -> sfs_status in
+#if STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES
+                if let seekPin {
+                    return sfs_image_pin_seek_region(h, seekPin, self.anchor.generation, bytes.baseAddress,
                         UInt64(offset), kind, &budget, &answer, &found, &receipt)
                 }
 #endif
