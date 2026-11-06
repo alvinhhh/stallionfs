@@ -84,11 +84,19 @@ func checkedXattrListTotal(_ total: Int, count: Int, next: Int) throws -> Int {
         next < ReadOnlyLimits.xattrListBytes, total <= ReadOnlyLimits.xattrListBytes - next - 1 else { throw POSIXError(.E2BIG) }
     return total + next + 1
 }
-func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSVolume.AccessMask) throws {
+func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSVolume.AccessMask,
+                    allowFileExecution: Bool = false) throws {
     guard uid == Int(owner) && m.uid == owner else { throw POSIXError(.EACCES) }
     var allowed: FSVolume.AccessMask = [.readAttributes]
     if m.mode & 0o400 != 0 { allowed.formUnion([.readData, .readXattr]) }
     if m.entry.kind == SFS_DIRECTORY && m.mode & 0o100 != 0 { allowed.insert(.search) }
+    // Execute and directory search share a bit; only this regular-file branch
+    // opts into readable owner execution. Other reads/searches keep their policy.
+    if allowFileExecution && m.entry.kind == SFS_FILE && access.contains(.execute) {
+        guard m.mode & 0o500 == 0o500, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
+        guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+        allowed.insert(.execute)
+    }
     guard access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
 }
 struct CallerIdentity {
@@ -98,7 +106,8 @@ struct CallerIdentity {
 }
 // Owner-only profile: a group or root identity never grants an exception.
 func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity,
-                      access: FSVolume.AccessMask, writable: Bool, hasACL: Bool) throws {
+                      access: FSVolume.AccessMask, writable: Bool, hasACL: Bool,
+                      allowFileExecution: Bool = false) throws {
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil else { throw POSIXError(.EACCES) }
     var readAccess = access
     let writes: FSVolume.AccessMask = [.writeData, .appendData]
@@ -107,7 +116,7 @@ func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdent
               m.mode & 0o200 != 0, m.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
         readAccess.subtract(writes)
     }
-    try checkOwnerMode(m, owner: owner, uid: caller.uid, access: readAccess)
+    try checkOwnerMode(m, owner: owner, uid: caller.uid, access: readAccess, allowFileExecution: allowFileExecution)
     guard !hasACL else { throw POSIXError(.ENOTSUP) }
 }
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
@@ -1217,6 +1226,14 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         writable = writesEnabled
 #endif
+        var allowFileExecution = false
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+        allowFileExecution = writesEnabled && selectedAccess == .contextualWrites
+        if allowFileExecution && m.entry.kind == SFS_FILE && access.contains(.execute) {
+            _ = try ready(mounted: true)
+            guard resource.isWritable else { throw POSIXError(.EACCES) }
+        }
+#endif
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         let metadataRights: FSVolume.AccessMask = [.writeAttributes, .writeSecurity]
         if writesEnabled && !access.intersection(metadataRights).isEmpty {
@@ -1245,7 +1262,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             return
         }
 #endif
-        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: false)
+        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: false, allowFileExecution: allowFileExecution)
         // Opaque security descriptors are not an implemented ACL evaluator.
         let name = Data("com.apple.system.Security".utf8)
         var size: UInt64 = 0, r = sfs_result(); let h = try ready()
@@ -1261,7 +1278,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
         if status == SFS_NOT_FOUND { return }
         try check(status, r)
-        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: true)
+        try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: true, allowFileExecution: allowFileExecution)
     }
 #if !STALLION_CONTEXT_HANDLERS
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
