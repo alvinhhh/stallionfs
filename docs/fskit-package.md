@@ -197,6 +197,58 @@ durable and required even when the first mount follows installation recovery;
 failed checks retain the installed image and unresolved probe record. Later
 accepted writable sessions may legitimately change branch and content.
 
+Contextual creation access accepts `addFile` and `addSubdirectory`, separately or
+together, on linked owner directories with write/search mode bits, no special
+mode bits, flags or opaque ACL. This includes the linked root without a namespace
+parent ID. Creation access requires a mounted writable resource; every combined
+right still passes its original permission checks. On regular files the SDK's
+`addSubdirectory` bit remains `appendData` under the existing file policy.
+Directory construction checks `addSubdirectory` and search through that same
+policy. Installed mkdir routing and persistence require separate qualification;
+direct callback tests do not establish them.
+
+File, directory and symbolic-link creation accept optional access, modification
+and birth times in the initial creation transaction. Each concrete signed second
+and nanosecond value is preserved exactly, including zero and negative seconds.
+Omitted times and the child's ctime use the core creation sample; the parent's
+mtime/ctime use that sample independently of restored child times. Invalid
+nanoseconds and mixed unsupported fields reject the entire request. Fields are
+acknowledged only after both complete SDK result roles and the commit validate.
+
+Creation still requires explicit owner mode/UID/GID and the original parent's
+write/search authority. Restrictive initial child modes do not prevent applying
+supplied times. Flags must be absent or zero; file/directory size must be absent
+or zero, and every explicit symlink size is refused. Computed fields, changeTime,
+backupTime, addedTime and capability hints remain unsupported. These callback
+semantics do not establish which attributes Finder or copying utilities supply,
+or qualify installed copy metadata fidelity and close/remount behavior.
+
+Contextual extended-attribute mutation accepts owned regular files, directories
+(including root) and symbolic links. It requires a mounted writable resource,
+owner-write mode, zero flags, no special mode bits and no opaque ACL. Every
+combined access right must independently pass against the original metadata.
+Directory search is required only for a separate search or creation right.
+Symlink attributes belong to the link's exact held inode and pin, never its
+target; a dangling or changed target does not redirect an attribute operation.
+
+Get/list retain owner-read and ACL checks, including on read-only resources and
+readable flagged or special-mode objects. Values are opaque whole values bounded
+at 1 MiB; create-only, replace-only and delete policies use current committed
+existence. Ordinary FinderInfo, quarantine and vendor names are supported; ACL,
+security, compression and provenance namespaces remain refused. ResourceFork
+mutation, including deletion, is regular-file-only; inherited nonregular values
+remain readable. This does not implement named-fork streaming or FinderInfo
+field transformations.
+
+Mutation prepares the SDK free-space result before commit and acknowledges only
+a verified commit. Get/list results carry values and names, not item-attribute
+snapshots. Xattrs change only their stored values and ctime. Held unlinked
+items retain their original pin and last-parent witness without gaining namespace
+authority; detached values are not promised to survive close or crash. Linked
+and root values are checked by closed read-only readback in callback tests.
+Installed Finder/copy behavior, no-follow syscall routing, caching and mounted
+durability require separate qualification.
+
 Contextual removal accepts regular files, symbolic links and empty directories.
 A known nonempty directory returns `ENOTEMPTY` before a transaction begins; the
 core also rechecks the exact name/inode and directory emptiness during unlink.
