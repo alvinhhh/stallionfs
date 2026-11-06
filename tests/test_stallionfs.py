@@ -1518,6 +1518,555 @@ class Workspaces(unittest.TestCase):
             self.assertEqual(receipt['descriptor_close_error'], 'OSError')
             self.assertTrue(self.store.purge('trash', workspace, yes=True)['already_purged'])
 
+    @contextmanager
+    def compound_controller_fixture(self):
+        """Qualified fake namespace, with flat owned helper receipts for recovery."""
+        from stallionfs import _native, _native_recovery
+        with self.native_controller_fixture() as state:
+            def qualify(operation, metadata):
+                if operation.record['operation'] in _native_recovery.COMPOUND:
+                    host = Path(metadata['native_host'])
+                    commands = [('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(host.parent.parent.parent)]),
+                                ('discover', [str(host), '--discover-json'])]
+                    for label, argv in commands:
+                        operation.record['helpers'].append({'label': label, **operation.command_context,
+                            'argv': argv, 'pid': 123, 'returncode': 0, 'reaped': True, 'child_pending': False,
+                            'outcome': 'success', 'stdout': 'fixture-stdout', 'stderr': 'fixture-stderr'})
+                        operation.persist()
+                return 'stallionfs'
+            with patch('stallionfs._native.qualify', side_effect=qualify):
+                yield state
+
+    def test_compound_native_snapshot_and_restore_keep_one_owner(self):
+        from stallionfs import core, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            owners = []
+            original = core.native_operation
+            def mutate(target, action, *names):
+                record = core.read_json(journal)
+                self.assertEqual(record['phase'], 'bridge-attempted')
+                self.assertTrue(record['bridge_attempted'])
+                self.assertFalse(state['rows'])
+                owners.append(record['id'])
+                with self.assertRaises(StallionError):
+                    with self.store._lease(workspace): pass
+                return original(target, action, *names)
+            with patch('stallionfs.core.native_operation', side_effect=mutate):
+                saved = self.store.snapshot(workspace, name='mounted-base', quiescent=True)
+                restored = self.store.rollback(workspace, 'mounted-base', quiescent=True)
+            for result in (saved, restored):
+                record = result['native_operation']
+                _native_recovery.validate_compound(workspace, record)
+                self.assertIn(record['id'], owners)
+                self.assertEqual(record['phase'], 'final-verified')
+                self.assertEqual(record['outcome'], 'complete')
+                self.assertEqual([item['label'] for item in record['helpers']],
+                    ['verify-package', 'discover', 'unmount', 'verify-package', 'discover', 'mount'])
+                self.assertTrue(record['bridge_returned'])
+                self.assertTrue(record['native_image_result']['committed'])
+                self.assertEqual(core.read_json(path / 'native-operations' / record['id'] / 'record.json')['outcome'], 'complete')
+            self.assertFalse(journal.exists())
+            self.assertTrue(state['rows'])
+            self.assertTrue(restored['recovery'].startswith('recovery-'))
+            self.assertTrue(all('-f' not in argv for argv in state['commands']))
+            count = len(state['commands'])
+            self.store.unmount(workspace)
+            count += 1
+            closed = self.store.snapshot(workspace, name='already-closed', quiescent=True)
+            self.assertEqual(closed['mount'], 'kept-unmounted')
+            self.assertEqual(len(state['commands']), count)
+
+    def test_compound_native_binding_and_opt_in_refuse_before_unmount(self):
+        import copy
+        from stallionfs import core
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            mount_path = path / 'native-mount.json'
+            accepted = core.read_json(mount_path)
+            count = len(state['commands'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='no-opt-in')
+                with self.store._lease(workspace):
+                    with self.assertRaises(StallionError): self.store.snapshot(workspace, name='busy', quiescent=True)
+                for key in ('path', 'filesystem', 'owner', 'flags', 'fsid'):
+                    with self.subTest(field=key):
+                        changed = copy.deepcopy(accepted)
+                        changed['observation'][key] = 'mismatch'
+                        from stallionfs import _native
+                        _native._persist(mount_path, changed)
+                        with self.assertRaises(StallionError): self.store.snapshot(workspace, name='bound', quiescent=True)
+                for key in ('target', 'profile', 'state'):
+                    changed = copy.deepcopy(accepted); changed[key] = 'mismatch'
+                    _native._persist(mount_path, changed)
+                    with self.assertRaises(StallionError): self.store.snapshot(workspace, name='bound', quiescent=True)
+                mount_path.unlink()
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='missing', quiescent=True)
+                _native._persist(mount_path, accepted)
+                nested = str(path / 'volume/nested')
+                state['rows'][nested] = {'path': nested}
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='nested', quiescent=True)
+                state['rows'].pop(nested)
+                state['rows'][str(path / 'volume')]['filesystem'] = 'foreign'
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='foreign', quiescent=True)
+                bridge.assert_not_called()
+            self.assertEqual(len(state['commands']), count)
+            self.assertFalse((self.store.root / 'journals' / (workspace + '.json')).exists())
+
+    def test_compound_native_unknown_bridge_never_repaired_by_catalog(self):
+        from stallionfs import core, _native
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            original = core.native_operation
+            def lost(target, action, *names):
+                result = original(target, action, *names)
+                error = OSError(errno.EIO, 'lost original response')
+                error.native_image_result = result
+                raise error
+            with patch('stallionfs.core.native_operation', side_effect=lost):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='once', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            retained = core.read_json(journal)
+            operation = retained['id']
+            self.assertFalse(retained['bridge_returned'])
+            self.assertTrue(retained['native_image_result']['committed'])
+            target = _native.installed_target(self.store, path, core.read_json(path / 'meta.json'))
+            self.assertIn('once', [item['name'] for item in original(target, 'snapshots')['snapshots']])
+            before = journal.read_bytes()
+            for command in (lambda: self.store.mount(workspace), lambda: self.store.unmount(workspace),
+                            lambda: self.store.snapshots(workspace), lambda: self.store.snapshot(workspace, name='other'),
+                            lambda: self.store.rollback(workspace, 'once'), lambda: self.store.close(workspace, quiescent=True),
+                            lambda: self.store.enroll(workspace), lambda: self.store.move(workspace),
+                            lambda: self.store.run(workspace, ['/usr/bin/true'])):
+                with self.assertRaises(StallionError): command()
+                self.assertEqual(journal.read_bytes(), before)
+            status = self.store.snapshots(workspace, operation_id=operation)
+            self.assertIn('Do not repeat', status['message'])
+            self.assertIsNone(status['next_action'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(StallionError):
+                    self.store.snapshot(workspace, name='once', quiescent=True, continue_operation=operation)
+                bridge.assert_not_called()
+            self.assertFalse(state['rows'])
+
+    def test_compound_native_prepared_unmount_loss_and_withdrawal(self):
+        from stallionfs import core, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            with patch('stallionfs._native_recovery._unmount_compound', side_effect=OSError(errno.EIO, 'before unmount')):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='prepared', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            op = core.read_json(journal)['id']
+            self.assertEqual(self.store.snapshots(workspace, operation_id=op)['phase'], 'prepared')
+            state['unmount_status'] = 1
+            with patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='prepared', quiescent=True, continue_operation=op)
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='prepared', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            state['unmount_status'] = 0
+            withdrawn = self.store.continue_unmount(workspace, op)
+            self.assertFalse(withdrawn['mutation_started'])
+            self.assertEqual(withdrawn['native_operation']['phase'], 'offline')
+            result = self.store.snapshot(workspace, name='prepared', quiescent=True, continue_operation=op)
+            self.assertEqual(result['native_operation']['id'], op)
+            # Lose the owned unmount response after terminal bookkeeping.
+            state['interrupt'] = True
+            with self.assertRaises(subprocess.TimeoutExpired): self.store.snapshot(workspace, name='lost-unmount', quiescent=True)
+            op = core.read_json(journal)['id']
+            self.assertEqual(core.read_json(journal)['phase'], 'unmount-attempted')
+            count = sum(argv[0] == '/sbin/umount' for argv in state['commands'])
+            state['interrupt'] = False
+            result = self.store.snapshot(workspace, name='lost-unmount', quiescent=True, continue_operation=op)
+            self.assertEqual(sum(argv[0] == '/sbin/umount' for argv in state['commands']), count)
+            _native_recovery.validate_compound(workspace, result['native_operation'])
+
+    def test_compound_native_commit_continuation_anchor_and_intent_checks(self):
+        from stallionfs import core, _native, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            with patch('stallionfs._native_recovery._remount_compound', side_effect=OSError(errno.EIO, 'before remount')):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='committed', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            record = core.read_json(journal); op = record['id']
+            self.assertEqual(record['phase'], 'committed')
+            before_commands = len(state['commands'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                for command in (lambda: self.store.snapshot(workspace, name='different', quiescent=True, continue_operation=op),
+                                lambda: self.store.rollback(workspace, 'committed', quiescent=True, continue_operation=op),
+                                lambda: self.store.snapshot(workspace, name='committed', continue_operation=op),
+                                lambda: self.store.snapshot(workspace, quiescent=True, continue_operation=op)):
+                    with self.assertRaises(StallionError): command()
+                original_guard = _native.guarded
+                for field in ('generation', 'root_digest', 'committed_end'):
+                    def drift(target, *args, **kwargs):
+                        self.assertEqual(kwargs['expected_anchor'], record['committed_anchor'])
+                        observed = original_guard(target)
+                        observed[field] = ('f' * 64 if field == 'root_digest' else observed[field] + 1)
+                        return observed
+                    with patch('stallionfs._native.guarded', side_effect=drift):
+                        with self.assertRaisesRegex(StallionError, 'current image has changed'):
+                            self.store.snapshot(workspace, name='committed', quiescent=True, continue_operation=op)
+                self.assertEqual(len(state['commands']), before_commands)
+                result = self.store.snapshot(workspace, name='committed', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            self.assertEqual(result['native_operation']['committed_anchor'], record['committed_anchor'])
+            self.assertEqual(result['mount'], 'verified')
+            _native_recovery.validate_compound(workspace, result['native_operation'])
+
+    def test_compound_native_lost_mount_response_requires_durable_evidence(self):
+        from stallionfs import core, _native, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            original = _native.execute_owned
+            def lose_mount(argv, *args, **kwargs):
+                result = original(argv, *args, **kwargs)
+                if argv[0] == '/sbin/mount': raise OSError(errno.EIO, 'mount response lost')
+                return result
+            with patch('stallionfs._native.execute_owned', side_effect=lose_mount):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='lost-mount', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            op = core.read_json(journal)['id']
+            count = len(state['commands'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaisesRegex(StallionError, 'Mount completion is unknown'):
+                    self.store.snapshot(workspace, name='lost-mount', quiescent=True, continue_operation=op)
+                self.assertEqual(len(state['commands']), count)
+                # Represents separately arranged normal withdrawal; controller
+                # never claims authority from the unbound present observation.
+                state['rows'].clear()
+                result = self.store.snapshot(workspace, name='lost-mount', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            self.assertEqual(len(result['native_operation']['remount_attempts']), 2)
+            # Interrupt after same-operation observation/usability is durable.
+            with patch('stallionfs._native_recovery._verify_final', side_effect=OSError(errno.EIO, 'finish interrupted')):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='observed', quiescent=True)
+            record = core.read_json(journal); op = record['id']
+            record['remount_attempts'][-1]['response'] = None
+            _native._persist(journal, record)
+            count = len(state['commands'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                result = self.store.snapshot(workspace, name='observed', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            self.assertEqual(len(state['commands']), count)
+            self.assertIsNone(result['native_operation']['remount_attempts'][-1]['response'])
+            _native_recovery.validate_compound(workspace, result['native_operation'])
+
+    def test_compound_native_busy_close_failure_and_unresolved_child_stop(self):
+        from stallionfs import core, _native
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            with patch('stallionfs._native.guarded', side_effect=OSError(errno.EBUSY, 'still held')), \
+                 patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='busy-guard', quiescent=True)
+                bridge.assert_not_called()
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            record = core.read_json(journal); op = record['id']
+            record['helpers'][-1].update(child_pending=True, reaped=False, returncode=None, outcome='running')
+            record['child_pending'] = True
+            _native._persist(journal, record)
+            before = journal.read_bytes()
+            with patch('os.kill') as kill, patch('os.waitpid') as waitpid, patch('stallionfs.core.native_operation') as bridge:
+                with self.store._lease(workspace):
+                    status = self.store.snapshots(workspace, operation_id=op)
+                self.assertIn('unresolved process ownership', status['message'])
+                self.assertNotIn('current_observation', status)
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='busy-guard', quiescent=True, continue_operation=op)
+                kill.assert_not_called(); waitpid.assert_not_called(); bridge.assert_not_called()
+            self.assertEqual(before, journal.read_bytes())
+            # Restore the owned supervisor's terminal fixture evidence.
+            record['helpers'][-1].update(child_pending=False, reaped=True, returncode=0, outcome='unknown')
+            record['child_pending'] = False
+            _native._persist(journal, record)
+            original = core.native_operation
+            def bad_close(target, action, *names):
+                result = original(target, action, *names)
+                result['ok'] = False; result['close_receipt']['status'] = 1
+                return result
+            with patch('stallionfs.core.native_operation', side_effect=bad_close):
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='busy-guard', quiescent=True, continue_operation=op)
+            with patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='busy-guard', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            self.assertFalse(state['rows'])
+
+    def test_compound_native_finish_order_and_historical_completion(self):
+        from stallionfs import core, _native
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            unlink = Path.unlink
+            interrupted = []
+            def check_finish(candidate, *args, **kwargs):
+                if candidate == journal:
+                    record = core.read_json(journal)
+                    archive = core.read_json(path / 'native-operations' / record['id'] / 'record.json')
+                    self.assertEqual(record['outcome'], 'complete')
+                    self.assertEqual(archive['outcome'], 'complete')
+                    self.assertEqual(record['phase'], 'final-verified')
+                    if not interrupted:
+                        interrupted.append(record['id'])
+                        raise OSError(errno.EIO, 'journal removal interrupted')
+                return unlink(candidate, *args, **kwargs)
+            with patch.object(Path, 'unlink', check_finish):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='finish', quiescent=True)
+                op = interrupted[0]
+                self.store.snapshot(workspace, name='finish', quiescent=True, continue_operation=op)
+            self.assertFalse(journal.exists())
+            count = len(state['commands'])
+            state['rows'][str(path / 'volume')]['fsid'] = (71, 9000)
+            with patch('stallionfs.core.native_operation') as bridge:
+                historical = self.store.snapshot(workspace, name='finish', quiescent=True, continue_operation=op)
+                bridge.assert_not_called()
+            self.assertFalse(historical['current_status']['current_mount_matches_completion'])
+            self.assertEqual(historical['native_operation']['outcome'], 'complete')
+            self.assertEqual(len(state['commands']), count)
+
+    def test_compound_native_bridge_dispositions_and_phase_marker_interruption(self):
+        import copy
+        from stallionfs import core, _native, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture():
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            # Retain the affirmative returned receipt before its phase advance.
+            original = _native.Operation.persist
+            stopped = []
+            def interrupt_phase(operation):
+                if operation.record.get('phase') == 'bridge-attempted' and operation.record.get('bridge_returned') and not stopped:
+                    stopped.append(operation.record['id'])
+                    original(operation)
+                    raise OSError(errno.EIO, 'after returned receipt, before phase advance')
+                return original(operation)
+            with patch.object(_native.Operation, 'persist', interrupt_phase):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='receipt', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            record = core.read_json(journal)
+            self.assertTrue(_native_recovery._confirmed_bridge(record))
+            for key, value in (('ok', False), ('committed', False), ('commit_attempted', False),
+                               ('outcome', 'unknown'), ('close_attempted', False), ('guard_close_errno', errno.EIO),
+                               ('interrupted', True), ('deadline_expired', True), ('path_errno', errno.EIO)):
+                malformed = copy.deepcopy(record); malformed['native_image_result'][key] = value
+                self.assertFalse(_native_recovery._confirmed_bridge(malformed), key)
+            for receipt in ('receipt', 'close_receipt'):
+                for key, value in (('status', 1), ('poisoned', True), ('transaction_active', True),
+                                   ('generation', 900000), ('root_digest', 'f' * 64), ('committed_end', 900000),
+                                   ('uuid', 'f' * 32), ('inode', 900000)):
+                    malformed = copy.deepcopy(record); malformed['native_image_result'][receipt][key] = value
+                    self.assertFalse(_native_recovery._confirmed_bridge(malformed), (receipt, key))
+            self.assertIn('committed', self.store.snapshots(workspace, operation_id=stopped[0])['message'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                self.store.snapshot(workspace, name='receipt', quiescent=True, continue_operation=stopped[0])
+                bridge.assert_not_called()
+
+    def test_compound_native_qualification_and_identity_drift_stop(self):
+        from stallionfs import core, _native, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            before = len(state['commands'])
+            with patch('stallionfs._native.qualify', side_effect=StallionError('module changed')), \
+                 patch('stallionfs.core.native_operation') as bridge:
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='qualification', quiescent=True)
+                bridge.assert_not_called()
+            self.assertEqual(len(state['commands']), before)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            record = core.read_json(journal); op = record['id']
+            self.assertEqual(record['phase'], 'prepared')
+            target = dict(record['target'], uuid='f' * 32)
+            with patch('stallionfs._native_recovery.ready', return_value=target):
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='qualification', quiescent=True, continue_operation=op)
+            metadata = core.read_json(path / 'meta.json')
+            for key, value in (('controller_profile', 'private-sfsro27'), ('native_host', '/different/Contents/MacOS/StallionFS')):
+                _native._persist(path / 'meta.json', {**metadata, key: value})
+                with self.assertRaises(StallionError): self.store.snapshot(workspace, name='qualification', quiescent=True, continue_operation=op)
+                _native._persist(path / 'meta.json', metadata)
+            self.assertEqual(len(state['commands']), before)
+            result = self.store.snapshot(workspace, name='qualification', quiescent=True, continue_operation=op)
+            _native_recovery.validate_compound(workspace, result['native_operation'])
+
+    def test_compound_native_failed_catalog_mutation_keeps_image_unmounted(self):
+        from stallionfs import core
+        seed = self.prepare()
+        for action in ('duplicate', 'missing', 'full'):
+            with self.subTest(action=action), self.compound_controller_fixture() as state:
+                created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+                workspace = created['id']; path = Path(created['path']).parent.parent
+                self.store.snapshot(workspace, name='existing', quiescent=True)
+                if action == 'full':
+                    self.store.unmount(workspace)
+                    for index in range(31): self.store.snapshot(workspace, name='fill-' + str(index))
+                    self.store.mount(workspace)
+                    command = lambda **kwargs: self.store.snapshot(workspace, name='overflow', quiescent=True, **kwargs)
+                elif action == 'duplicate':
+                    command = lambda **kwargs: self.store.snapshot(workspace, name='existing', quiescent=True, **kwargs)
+                else:
+                    command = lambda **kwargs: self.store.rollback(workspace, 'missing', quiescent=True, **kwargs)
+                with self.assertRaises(StallionError): command()
+                journal = self.store.root / 'journals' / (workspace + '.json')
+                retained = core.read_json(journal)
+                self.assertEqual(retained['phase'], 'bridge-attempted')
+                self.assertFalse(retained['bridge_returned'])
+                self.assertFalse(retained['native_image_result']['committed'])
+                self.assertFalse(state['rows'])
+                with patch('stallionfs.core.native_operation') as bridge:
+                    with self.assertRaises(StallionError): command(continue_operation=retained['id'])
+                    bridge.assert_not_called()
+
+    def test_compound_native_not_launched_remount_uses_actual_executor_receipt(self):
+        import copy
+        from stallionfs import core, _native
+        seed = self.prepare()
+        executor = _native.execute_owned
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            fake = _native.execute_owned
+            def execute(argv, *args, **kwargs):
+                if argv[0] == '/sbin/mount':
+                    with patch('stallionfs._native.subprocess.Popen', side_effect=OSError(errno.EAGAIN, 'launch unavailable')):
+                        return executor(argv, *args, **kwargs)
+                return fake(argv, *args, **kwargs)
+            original_bridge = core.native_operation
+            with patch('stallionfs.core.native_operation', wraps=original_bridge) as bridge:
+                with patch('stallionfs._native.execute_owned', side_effect=execute):
+                    with self.assertRaises(OSError): self.store.snapshot(workspace, name='launch-once', quiescent=True)
+                self.assertEqual(bridge.call_count, 1)
+                journal = self.store.root / 'journals' / (workspace + '.json')
+                record = core.read_json(journal); op = record['id']; helper = record['helpers'][-1]
+                self.assertEqual(helper['outcome'], 'not-launched')
+                self.assertIsNone(helper['pid']); self.assertIsNone(helper['returncode'])
+                self.assertIs(helper['reaped'], False); self.assertIs(helper['child_pending'], False)
+                self.assertEqual(record['error']['errno'], errno.EAGAIN)
+                self.assertEqual(record['error']['native_os_result'], helper)
+                self.assertEqual(record['error']['helper_index'], len(record['helpers']) - 1)
+                status = self.store.snapshots(workspace, operation_id=op)
+                self.assertEqual(status['disposition']['mount'], 'not-launched')
+                self.assertIn('Remount was not launched', status['message'])
+                first = json.dumps(record['error'], sort_keys=True)
+                variants = []
+                pending = copy.deepcopy(record); pending['child_pending'] = True
+                pending['helpers'][-1].update(child_pending=True, outcome='launch-pending')
+                variants.append(pending)
+                unreaped = copy.deepcopy(record)
+                unreaped['helpers'][-1].update(pid=123, reaped=False, outcome='unknown')
+                variants.append(unreaped)
+                malformed = copy.deepcopy(record); malformed['helpers'][-1].pop('stdout')
+                variants.append(malformed)
+                for invalid in variants:
+                    _native._persist(journal, invalid)
+                    before = journal.read_bytes()
+                    with patch('os.kill') as kill, patch('os.waitpid') as waitpid:
+                        with self.assertRaises(StallionError):
+                            self.store.snapshot(workspace, name='launch-once', quiescent=True, continue_operation=op)
+                        kill.assert_not_called(); waitpid.assert_not_called()
+                    self.assertEqual(journal.read_bytes(), before)
+                _native._persist(journal, record)
+                with patch('stallionfs._native.guarded', wraps=_native.guarded) as guard:
+                    completed = self.store.snapshot(workspace, name='launch-once', quiescent=True, continue_operation=op)
+                    self.assertTrue(any(call.kwargs.get('expected_anchor') == record['committed_anchor'] for call in guard.call_args_list))
+                self.assertEqual(bridge.call_count, 1)
+                self.assertEqual(json.dumps(completed['native_operation']['error'], sort_keys=True), first)
+                self.assertEqual(len(completed['native_operation']['remount_attempts']), 2)
+                self.assertTrue(state['rows'])
+                def refuse_unmount_launch(argv, *args, **kwargs):
+                    if argv[0] == '/sbin/umount':
+                        with patch('stallionfs._native.subprocess.Popen', side_effect=OSError(errno.EAGAIN, 'unmount launch unavailable')):
+                            return executor(argv, *args, **kwargs)
+                    return fake(argv, *args, **kwargs)
+                with patch('stallionfs._native.execute_owned', side_effect=refuse_unmount_launch):
+                    with self.assertRaises(OSError): self.store.snapshot(workspace, name='withdraw-once', quiescent=True)
+                unmount_record = core.read_json(journal); unmount_op = unmount_record['id']
+                self.assertEqual(unmount_record['helpers'][-1]['outcome'], 'not-launched')
+                self.assertEqual(bridge.call_count, 1)
+                with self.assertRaises(StallionError):
+                    self.store.snapshot(workspace, name='withdraw-once', quiescent=True, continue_operation=unmount_op)
+                withdrawn = self.store.continue_unmount(workspace, unmount_op)
+                self.assertFalse(withdrawn['mutation_started'])
+                self.assertEqual(bridge.call_count, 1)
+                self.store.snapshot(workspace, name='withdraw-once', quiescent=True, continue_operation=unmount_op)
+                self.assertEqual(bridge.call_count, 2)
+
+    def test_compound_native_first_failure_and_receipts_survive_refused_retries(self):
+        from stallionfs import core, _native
+        seed = self.prepare()
+        with self.compound_controller_fixture():
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            original = core.native_operation
+            def response_loss(target, action, *names):
+                error = OSError(errno.EIO, 'original bridge response lost')
+                error.native_image_result = original(target, action, *names)
+                raise error
+            with patch('stallionfs.core.native_operation', side_effect=response_loss):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='receipt-held', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            initial = core.read_json(journal); op = initial['id']
+            first = json.dumps(initial['error'], sort_keys=True)
+            carrier = json.dumps(initial['native_image_result'], sort_keys=True)
+            self.assertEqual(initial['error']['errno'], errno.EIO)
+            self.assertEqual(initial['error']['native_image_result'], initial['native_image_result'])
+            with patch('stallionfs.core.native_operation') as bridge:
+                for index in range(3):
+                    with self.assertRaises(StallionError):
+                        self.store.snapshot(workspace, name='receipt-held', quiescent=True, continue_operation=op)
+                    with self.assertRaises(StallionError): self.store.continue_unmount(workspace, op)
+                    current = core.read_json(journal)
+                    self.assertEqual(json.dumps(current['error'], sort_keys=True), first)
+                    self.assertEqual(json.dumps(current['native_image_result'], sort_keys=True), carrier)
+                    self.assertFalse(current['bridge_returned'])
+                    self.assertEqual(current['later_errors']['count'], 2 * (index + 1))
+                    self.assertEqual(set(current['later_errors']), {'count', 'latest'})
+                bridge.assert_not_called()
+
+    def test_compound_native_committed_failure_keeps_first_guard_after_withdrawal(self):
+        from stallionfs import core, _native
+        seed = self.prepare()
+        with self.compound_controller_fixture():
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            first_error = OSError(errno.EIO, 'original guard failed')
+            first_receipt = {'status': 1, 'diagnostic': 'original guard'}
+            first_error.native_candidate_result = {'current_guard': first_receipt}
+            with patch('stallionfs._native_recovery._remount_compound', side_effect=first_error):
+                with self.assertRaises(OSError): self.store.snapshot(workspace, name='guard-held', quiescent=True)
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            initial = core.read_json(journal); op = initial['id']
+            first = json.dumps(initial['error'], sort_keys=True)
+            carrier = json.dumps(initial['native_image_result'], sort_keys=True)
+            later_error = OSError(errno.EBUSY, 'later guard failed')
+            later_error.native_current_guard = {'status': 2, 'diagnostic': 'later guard'}
+            with patch('stallionfs.core.native_operation') as bridge:
+                for index in range(3):
+                    with self.assertRaises(StallionError): self.store.continue_unmount(workspace, op)
+                    with patch('stallionfs._native_recovery._remount_compound', side_effect=later_error):
+                        with self.assertRaises(OSError):
+                            self.store.snapshot(workspace, name='guard-held', quiescent=True, continue_operation=op)
+                    current = core.read_json(journal)
+                    self.assertEqual(json.dumps(current['error'], sort_keys=True), first)
+                    self.assertEqual(json.dumps(current['native_image_result'], sort_keys=True), carrier)
+                    self.assertEqual(current['failed_current_guard'], first_receipt)
+                    self.assertEqual(current['later_errors']['count'], 2 * (index + 1))
+                    self.assertEqual(current['later_errors']['latest']['native_current_guard'], later_error.native_current_guard)
+                bridge.assert_not_called()
+
     def test_owned_native_catalog_real_content_round_trip_and_names(self):
         import hashlib
         import test_image as capture
