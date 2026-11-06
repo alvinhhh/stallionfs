@@ -126,7 +126,11 @@ func metadataTime(_ value: timespec) throws -> sfs_timestamp {
 func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity) throws {
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
-    guard m.entry.kind == SFS_FILE, m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    switch m.entry.kind {
+    case SFS_FILE, SFS_DIRECTORY, SFS_SYMLINK: break
+    default: throw POSIXError(.ENOTSUP)
+    }
+    guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o200 != 0, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func writableXattrName(_ bytes: Data) throws {
@@ -1225,14 +1229,19 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             return
         }
         if writesEnabled && access.contains(.writeXattr) {
+            _ = try ready(mounted: true)
+            guard resource.isWritable else { throw POSIXError(.EACCES) }
             try checkXattrOwnerPolicy(m, owner: owner, caller: caller)
             try ownerAccess(m, inode: inode, access: access.subtracting(.writeXattr), caller: caller)
             return
         }
-        if writesEnabled && m.entry.kind == SFS_DIRECTORY && access.contains(.addFile) {
+        let creationRights = access.intersection([.addFile, .addSubdirectory])
+        if writesEnabled && m.entry.kind == SFS_DIRECTORY && !creationRights.isEmpty {
+            _ = try ready(mounted: true)
+            guard resource.isWritable else { throw POSIXError(.EACCES) }
             try checkLinkParentPolicy(m, owner: owner, caller: caller)
-            // The reduced request still passes the existing owner and ACL checks.
-            try ownerAccess(m, inode: inode, access: access.subtracting(.addFile), caller: caller)
+            // Every remaining right and the ACL policy use the original metadata.
+            try ownerAccess(m, inode: inode, access: access.subtracting(creationRights), caller: caller)
             return
         }
 #endif
@@ -1622,7 +1631,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             default: throw POSIXError(.ENOTSUP)
             }
             let unsupported: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID,
-                .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
+                .changeTime, .backupTime, .addedTime,
                 .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
             guard !unsupported.contains(where: { attributes.isValid($0) }),
                   attributes.isValid(.mode), attributes.isValid(.uid), attributes.isValid(.gid) else { throw POSIXError(.ENOTSUP) }
@@ -1636,6 +1645,18 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             if attributes.isValid(.size) { guard self.kind != SFS_SYMLINK, attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
             var value = sfs_metadata_initial()
             value.mode = modeKind | (mode & 0o777); value.uid = uid; value.gid = gid
+            if attributes.isValid(.accessTime) {
+                value.access = try metadataTime(attributes.accessTime)
+                value.restore |= UInt32(SFS_RESTORE_ACCESS.rawValue); used.insert(.accessTime)
+            }
+            if attributes.isValid(.modifyTime) {
+                value.modification = try metadataTime(attributes.modifyTime)
+                value.restore |= UInt32(SFS_RESTORE_MODIFICATION.rawValue); used.insert(.modifyTime)
+            }
+            if attributes.isValid(.birthTime) {
+                value.birth = try metadataTime(attributes.birthTime)
+                value.restore |= UInt32(SFS_RESTORE_BIRTH.rawValue); used.insert(.birthTime)
+            }
             initial = value; consumed = used
         }
     }
@@ -1727,7 +1748,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 guard self.resource.isWritable else { throw POSIXError(.EACCES) }
                 let parent = try self.id(directory), parentMetadata = try self.metadata(parent)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
-                try self.ownerAccess(parentMetadata, inode: parent, access: values.kind == SFS_DIRECTORY ? .search : [.addFile, .search], caller: caller)
+                try self.ownerAccess(parentMetadata, inode: parent, access: values.kind == SFS_DIRECTORY ? [.addSubdirectory, .search] : [.addFile, .search], caller: caller)
                 var found = sfs_entry()
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
@@ -2166,6 +2187,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 guard self.resource.isWritable else { throw POSIXError(.EACCES) }
                 let inode = try self.id(item), m = try self.metadata(inode), pin = try self.token(inode)
                 try self.ownerAccess(m, inode: inode, access: .writeXattr, caller: caller)
+                // Whole-value resource forks remain a regular-file-only mutation.
+                // Check the queued item's current kind for deletion as well as set.
+                guard m.entry.kind == SFS_FILE || !bytes.elementsEqual("com.apple.ResourceFork".utf8) else { throw POSIXError(.EPERM) }
                 var information = sfs_image_information()
                 try self.check(sfs_image_get_information(h, &information, &receipt), receipt)
                 guard receipt.transaction_active == 0 else { throw POSIXError(.EBUSY) }
@@ -2178,6 +2202,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let exists = status == SFS_OK
                 if policy == .mustCreate && exists { throw POSIXError(.EEXIST) }
                 if (policy == .mustReplace || policy == .delete) && !exists { throw POSIXError(.ENOATTR) }
+#if STALLION_ADAPTER_CHECK
+                self.xattrMutationForTesting = true
+                defer { self.xattrMutationForTesting = false }
+#endif
                 let result = try self.mutate({ h, r in
                     let changed = bytes.withUnsafeBytes { name -> sfs_status in
                         if policy == .delete { return sfs_image_pin_remove_xattr(h, pin, name.baseAddress, name.count, &r) }
@@ -2194,6 +2222,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
     }
 #if STALLION_ADAPTER_CHECK
+    private var xattrMutationForTesting = false
+    var xattrCommitReceiptForTesting: ((sfs_result, inout sfs_result) -> Void)?
     func setXattrResultForTesting(_ name: FSFileName, value: Data?, item: FSItem, policy: FSVolume.SetXattrPolicy,
                                   caller: CallerIdentity, reply: @escaping (FSSetXattrResult?, Error?) -> Void) {
         setXattrHandler(name, value: value, item: item, policy: policy, caller: caller, reply: reply)
@@ -2341,6 +2371,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             if renameMutationForTesting, status == SFS_OK {
                 let committedReceipt = receipt
                 renameCommitReceiptForTesting?(committedReceipt, &receipt)
+            }
+            if xattrMutationForTesting, status == SFS_OK {
+                let committedReceipt = receipt
+                xattrCommitReceiptForTesting?(committedReceipt, &receipt)
             }
             if attributesMutationForTesting, status == SFS_OK {
                 let committedReceipt = receipt

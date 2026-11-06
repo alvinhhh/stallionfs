@@ -39,11 +39,11 @@ struct Fixture {
     let url: URL
     let id: UInt64
     let identity: UUID
-    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid(), extra: Bool = false, sourceFlags: UInt32 = 0, rootFlags: UInt32 = 0, rootMode: UInt32 = 0o700, rootACL: Bool = false, directory: Bool = false, capacity: UInt64 = 16 * 1024 * 1024) throws {
+    init(_ parent: URL, _ name: String, mode: UInt32 = 0o600, acl: Bool = false, owner: uid_t = geteuid(), extra: Bool = false, sourceFlags: UInt32 = 0, rootFlags: UInt32 = 0, rootMode: UInt32 = 0o700, rootACL: Bool = false, directory: Bool = false, capacity: UInt64 = 16 * 1024 * 1024, xattrProfile: Bool = false) throws {
         fault(0, 0); url = parent.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         var h: OpaquePointer?, r = sfs_result(), m = sfs_metadata_initial(), inode: UInt64 = 0
-        m.mode = UInt32(S_IFDIR) | rootMode; m.uid = geteuid(); m.gid = getegid(); m.flags = rootFlags
+        m.mode = UInt32(S_IFDIR) | (xattrProfile ? mode : rootMode); m.uid = xattrProfile ? owner : geteuid(); m.gid = getegid(); m.flags = xattrProfile ? sourceFlags : rootFlags
         need(sfs_image_create_metadata_version(url.path, "image.sfs", capacity, 6, &m, &h, &r) == SFS_OK, "create disposable")
         need(sfs_image_begin(h, &r) == SFS_OK, "begin producer")
         m.mode = UInt32(S_IFREG) | mode; m.uid = owner; m.flags = sourceFlags
@@ -52,12 +52,19 @@ struct Fixture {
         need(sfs_image_link(h, inode, 1, "alias", 5, &r) == SFS_OK, "create alias")
         need(sfs_image_set_xattr(h, fileID, "note", 4, "value", 5, &r) == SFS_OK, "regular opaque xattr")
         if extra { need(sfs_image_add_metadata(h, 1, "extra", 5, SFS_FILE, &m, &inode, &r) == SFS_OK, "extra capacity operand") }
-        m.mode = UInt32(S_IFLNK) | 0o700; m.uid = geteuid(); m.flags = 0
+        m.mode = UInt32(S_IFLNK) | (xattrProfile ? mode : 0o700); m.uid = xattrProfile ? owner : geteuid(); m.flags = xattrProfile ? sourceFlags : 0
         need(sfs_image_symlink_metadata(h, 1, "link", 4, "file", 4, &m, &inode, &r) == SFS_OK, "create symlink")
+        var xattrOwners = [UInt64(1), inode]
         if directory {
-            m.mode = UInt32(S_IFDIR) | 0o700
+            m.mode = UInt32(S_IFDIR) | (xattrProfile ? mode : 0o700)
             need(sfs_image_add_metadata(h, 1, "dir", 3, SFS_DIRECTORY, &m, &inode, &r) == SFS_OK, "namespace fixture directory")
+            xattrOwners.append(inode)
         }
+        if xattrProfile { for target in xattrOwners {
+            need(sfs_image_set_xattr(h,target,"note",4,"value",5,&r) == SFS_OK,"nonregular opaque xattr fixture")
+            need(sfs_image_set_xattr(h,target,"com.apple.ResourceFork",22,"inherited",9,&r) == SFS_OK,"inherited nonregular opaque resource fork")
+            if acl { need(sfs_image_set_xattr(h,target,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"nonregular ACL fixture") }
+        } }
         if rootACL { need(sfs_image_set_xattr(h, 1, "com.apple.system.Security", 25, nil, 0, &r) == SFS_OK, "parent security descriptor") }
         if acl {
             let key = Data("com.apple.system.Security".utf8)
@@ -1534,6 +1541,11 @@ func queuedResizeAfterDeliveryFailure(_ parent: URL) throws {
 }
 
 #if STALLION_CONTEXT_HANDLERS
+func namespaceAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolume.AccessMask,
+                     caller: CallerIdentity? = nil) -> (FSCheckAccessResult?, Error?) {
+    wait { done in volume.accessForTesting(item, access: rights,
+        caller: caller ?? CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0,$1)) } }
+}
 func namespaceLink(_ m: Mounted, _ item: FSItem? = nil, name: Data = Data("new-name".utf8),
                    directory: FSItem? = nil, caller: CallerIdentity? = nil) -> (FSCreateLinkResult?, Error?) {
     wait { done in m.volume.linkResultForTesting(item ?? m.file, name: FSFileName(data: name), directory: directory ?? m.root,
@@ -1582,6 +1594,10 @@ func contextualLinks(_ parent: URL) throws {
         let destination = cross ? namespaceLookup(m, "dir") : m.root
         let aliasName = cross ? String(repeating: "n", count: 255) : "Hard-Link-Ω"
         if cross { need(code(namespaceLink(m,destination).1) == Int(ENOTSUP), "nonroot directory link refusal") }
+        for rights: FSVolume.AccessMask in [[.addFile], [.addSubdirectory], [.addFile,.addSubdirectory,.search]] {
+            let access = namespaceAccess(v,destination,rights)
+            need(access.0 != nil && access.1 == nil, "actual root or linked-parent creation access result")
+        }
         var snapshots: [FSItem.Attributes] = [], commitStarted = false
         m.serial {
             v.preparedAttributesForTesting = { name, value in
@@ -1590,7 +1606,7 @@ func contextualLinks(_ parent: URL) throws {
             v.rejectResultForTesting = { name in if name == "FSCreateLinkResult" { need(snapshots.count == 2 && !commitStarted, "real link constructor precommit") }; return false }
             v.diagnosticBeforeCommit = { commitStarted = true }
             try! v.linkAccessForTesting(destination, access: [.addFile, .search], caller: caller)
-            let refused: [FSVolume.AccessMask] = [.addSubdirectory, .delete, [.addFile, .delete]]
+            let refused: [FSVolume.AccessMask] = [.delete, [.addFile, .delete]]
             for access in refused {
                 do { try v.linkAccessForTesting(destination, access: access, caller: caller); need(false, "link policy granted unrelated mutation") }
                 catch { need(code(error) == Int(EACCES), "other access bits remain refused") }
@@ -1666,9 +1682,9 @@ func contextualLinks(_ parent: URL) throws {
         let expected = index < 4 ? ENOTSUP : EACCES
         need(code(namespaceLink(m).1) == Int(expected) && !prepared && anchorMatches(v.anchor, before), "real namespace policy refusal")
         if [1,3,5,6,7].contains(index) {
-            m.serial {
-                do { try v.linkAccessForTesting(m.root, access: .addFile, caller: caller); need(false, "private addFile bypass") }
-                catch { need(code(error) == Int(expected), "same parent policy in access check") }
+            for rights: FSVolume.AccessMask in [[.addFile], [.addSubdirectory], [.addFile,.addSubdirectory,.search]] {
+                let access = namespaceAccess(v,m.root,rights,caller:caller)
+                need(access.0 == nil && code(access.1) == Int(expected), "same parent policy in actual creation access check")
             }
         }
         namespaceAbsent(m); m.close(); namespaceReopened(f, "new-name", inode: nil)
@@ -1925,7 +1941,206 @@ final class CreationMount {
         need(sfs_image_close(h,&r) == SFS_OK,"creation reopened close")
     }
 }
+struct InitialTimes {
+    let access: timespec?, modification: timespec?, birth: timespec?
+    init(_ request: FSItem.SetAttributesRequest) {
+        access = request.isValid(.accessTime) ? request.accessTime : nil
+        modification = request.isValid(.modifyTime) ? request.modifyTime : nil
+        birth = request.isValid(.birthTime) ? request.birthTime : nil
+    }
+    var consumed: FSItem.Attribute {
+        var value: FSItem.Attribute = []
+        if access != nil { value.insert(.accessTime) }
+        if modification != nil { value.insert(.modifyTime) }
+        if birth != nil { value.insert(.birthTime) }
+        return value
+    }
+    func check(_ child: sfs_metadata_entry) {
+        for (actual,selected) in [(child.access,access),(child.modification,modification),(child.birth,birth)] {
+            if let selected {
+                need(actual.seconds == Int64(selected.tv_sec) && actual.nanoseconds == UInt32(selected.tv_nsec),"initial selected signed seconds and nanoseconds are exact")
+            } else {
+                need(actual.seconds == child.change.seconds && actual.nanoseconds == child.change.nanoseconds,"omitted initial time equals the child's creation sample")
+            }
+        }
+    }
+}
+func timedCreationAttributes(_ mode: UInt32 = 0o600, selection: Int = 7, sample: Int = 0) -> FSItem.SetAttributesRequest {
+    let a = creationAttributes(mode), seconds = [Int.min,-3,0,Int.max], nanos = [0,1,123_456_789,999_999_999]
+    if selection & 1 != 0 { a.accessTime = timespec(tv_sec:seconds[sample % 4],tv_nsec:nanos[sample % 4]) }
+    if selection & 2 != 0 { a.modifyTime = timespec(tv_sec:seconds[(sample+1) % 4],tv_nsec:nanos[(sample+1) % 4]) }
+    if selection & 4 != 0 { a.birthTime = timespec(tv_sec:seconds[(sample+2) % 4],tv_nsec:nanos[(sample+2) % 4]) }
+    return a
+}
+func creationParentTimes(_ original: sfs_metadata_entry, _ parent: sfs_metadata_entry, _ child: sfs_metadata_entry) {
+    var expected = original; expected.modification = child.change; expected.change = child.change
+    xattrMetadataUnchanged(expected,parent)
+    need(parent.change.seconds == child.change.seconds && parent.change.nanoseconds == child.change.nanoseconds,
+         "parent mtime/ctime share the creation sample, with parent access/birth and other metadata preserved")
+}
+func creationTimesReopened(_ m: CreationMount, _ inode: UInt64, _ expected: InitialTimes, _ parentBefore: sfs_metadata_entry, mode: UInt32) {
+    var h: OpaquePointer?, r = sfs_result(), child = sfs_metadata_entry(), parent = sfs_metadata_entry()
+    need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK,"initial times readonly reopen")
+    need(sfs_image_stat_metadata(h,0,inode,&child,&r) == SFS_OK && sfs_image_stat_metadata(h,0,parentBefore.entry.inode,&parent,&r) == SFS_OK,"initial child and parent readonly metadata")
+    expected.check(child); creationParentTimes(parentBefore,parent,child)
+    let type = child.entry.kind == SFS_FILE ? S_IFREG : child.entry.kind == SFS_DIRECTORY ? S_IFDIR : S_IFLNK
+    need(child.mode == UInt32(type) | (mode & 0o777) && child.uid == geteuid() && child.gid == getegid() && child.flags == 0 && child.link_count == 1,"restored times preserve initial mode, IDs, flags and link count")
+    need(sfs_image_close(h,&r) == SFS_OK,"initial times readonly close")
+}
+func createTimedKind(_ m: CreationMount, kind: Int, name: String = "new", request: FSItem.SetAttributesRequest,
+                     parent: FSItem? = nil) -> (Bool,Error?,StallionItem?) {
+    if kind == 2 {
+        let result = createSymlink(m,FSFileName(string:"../missing/./target"),name:name,parent:parent,attributes:request)
+        return (result.0 != nil,result.1,result.2)
+    }
+    let result = m.create(name,request:request,parent:parent,type:kind == 1 ? .directory : .file)
+    return (result.0 != nil,result.1,result.2)
+}
+func initialTimeParentIdentity(_ parent: URL, kind: Int) throws {
+    for scenario in 0..<6 {
+        let m = try CreationMount(parent,"initial-time-parent-\(kind)-\(scenario)",directory:true), v = m.volume
+        let directory = m.directory as! StallionItem, originalPin = directory.pin!, parentBefore = m.metadata(directory)
+        let a = timedCreationAttributes(0), before = v.anchor
+        var operand: FSItem = directory
+        if scenario == 0 { operand = StallionItem(directory.inode) }
+        if scenario == 1 { m.serial { directory.pin = nil } }
+        if scenario == 2 { m.serial { directory.pin = sfs_pin() } }
+        if scenario == 3 { m.serial { directory.pin = (m.root as! StallionItem).pin } }
+        if scenario == 4 { need(m.reclaim(directory) == nil,"reclaim timed creation parent") }
+        if scenario == 5 { let _: Bool = wait { done in v.unmount { done(true) } } }
+        let result = createTimedKind(m,kind:kind,request:a,parent:operand)
+        need(!result.0 && result.2 == nil && code(result.1) == Int(scenario == 3 ? EIO : scenario == 5 ? ENXIO : EINVAL) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"initial values cannot waive canonical full-pin or mounted-parent authority")
+        if (1...3).contains(scenario) { m.serial { directory.pin = originalPin } }
+        if scenario == 5 { need(wait { v.mount(arguments:[],replyHandler:$0) } == nil,"restore mounted state after timed refusal") }
+        m.close(); m.reopened(parent:directory.inode,inode:nil); metadataReopened(m,directory.inode,parentBefore)
+    }
+    let m = try CreationMount(parent,"initial-time-detached-parent-\(kind)",directory:true), directory = m.directory as! StallionItem
+    let removed: (FSRemoveItemResult?,Error?) = wait { done in m.volume.removeResultForTesting(directory,name:FSFileName(string:"dir"),directory:m.root,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    need(removed.0 != nil && removed.1 == nil,"detach real parent before timed creation")
+    let a = timedCreationAttributes(), before = m.volume.anchor, originalRoot = m.metadata(m.root)
+    let result = createTimedKind(m,kind:kind,request:a,parent:directory)
+    need(!result.0 && result.2 == nil && code(result.1) == Int(ENOENT) && a.consumedAttributes.isEmpty && anchorMatches(before,m.volume.anchor),"timed creation cannot promote detached parent witness to namespace authority")
+    m.close(); m.reopened("dir",inode:nil); metadataReopened(m,1,originalRoot)
+}
+func initialDirectoryStageFailures(_ parent: URL) throws {
+    for stage in ["reserved","before-add","added","allocated","bound","inserted"] {
+        let m = try CreationMount(parent,"initial-directory-stage-\(stage)"), v = m.volume, before = v.anchor, originalParent = m.metadata(m.root)
+        weak var unreturned: StallionItem?
+        m.serial { v.createStageForTesting = { point,item in if point == stage { unreturned = item; throw POSIXError(.ENOMEM) } } }
+        let a = timedCreationAttributes(0o700), result = m.create(request:a,type:.directory), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && result.2 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"timed directory stage failure does not acknowledge fields")
+        need(outcome.releaseAttempted == (stage == "reserved") && outcome.discarded == (stage != "reserved") && !outcome.commitSucceeded && unreturned == nil,"timed directory stage retains exact reservation cleanup")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
+    }
+}
+func contextualInitialTimes(_ parent: URL, kind: Int) throws {
+    let required = kind == 2 ? FSCreateSymlinkResult.requestedAttributes.wantedAttributes : FSCreateItemResult.requestedAttributes.wantedAttributes
+    let resultName = kind == 2 ? "FSCreateSymlinkResult" : "FSCreateItemResult"
+    for nested in [false,true] { for (sample,selection) in [1,2,4,7,0].enumerated() {
+        let m = try CreationMount(parent,"initial-times-\(kind)-\(nested)-\(selection)",directory:nested), v = m.volume
+        let directory = nested ? m.directory! : m.root, originalParent = m.metadata(directory)
+        let a = timedCreationAttributes(sample % 2 == 0 ? 0 : 0o500,selection:selection,sample:sample), expected = InitialTimes(a)
+        a.flags = 0; if kind != 2 { a.size = 0 }
+        var snapshots: [FSItem.Attributes] = [], constructors = 0
+        m.serial {
+            v.preparedAttributesForTesting = { name,value in if name == resultName { need(a.consumedAttributes.isEmpty,"initial fields unconsumed during role preparation"); snapshots.append(value) } }
+            v.rejectResultForTesting = { name in if name == resultName { need(a.consumedAttributes.isEmpty && snapshots.count == 2,"two complete roles before initial timestamp commit"); constructors += 1 }; return false }
+            v.diagnosticBeforeCommit = { need(a.consumedAttributes.isEmpty,"initial times unconsumed before commit") }
+        }
+        let result = createTimedKind(m,kind:kind,request:a,parent:directory)
+        need(result.0 && result.1 == nil && result.2 != nil && constructors == 1 && snapshots.count == 2 && snapshots[0] !== snapshots[1],"real timed creation constructor and distinct complete roles")
+        let consumed: FSItem.Attribute = [.mode,.uid,.gid,.flags]
+        need(a.consumedAttributes == consumed.union(expected.consumed).union(kind == 2 ? [] : [.size]),"exact selected creation fields consumed only after verified commit")
+        let item = result.2!, child = m.metadata(item), updatedParent = m.metadata(directory), retained = snapshots
+        expected.check(child); creationParentTimes(originalParent,updatedParent,child)
+        need(child.mode & 0o777 == a.mode && child.entry.size == (kind == 2 ? UInt64("../missing/./target".utf8.count) : 0),"restrictive child mode and existing zero-size/target-size semantics")
+        checkPreparedAttributes(retained[0],child,required:required); checkPreparedAttributes(retained[1],updatedParent,required:required)
+        if kind == 2 { m.serial { symlinkBytes(m.coreHandle,item.inode,Data("../missing/./target".utf8)) } }
+        // Reuse the same mount, then verify retained snapshots have not changed.
+        m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil }
+        let next = createTimedKind(m,kind:kind,name:"next",request:timedCreationAttributes(0o700,sample:sample+1),parent:directory)
+        need(next.0 && next.1 == nil,"consecutive timed creation on same parent")
+        checkPreparedAttributes(retained[0],child,required:required); checkPreparedAttributes(retained[1],updatedParent,required:required)
+        let finalParent = m.metadata(directory)
+        m.close(); m.reopened(parent:originalParent.entry.inode,inode:item.inode)
+        metadataReopened(m,item.inode,child); metadataReopened(m,originalParent.entry.inode,finalParent)
+        if kind == 2 { symlinkReopened(m,parent:originalParent.entry.inode,inode:item.inode,target:Data("../missing/./target".utf8)) }
+    } }
+    try initialTimeParentIdentity(parent,kind:kind)
+    try initialTimeRefusals(parent,kind:kind)
+    try initialTimeQueuedCapture(parent,kind:kind)
+}
+func initialTimeRefusals(_ parent: URL, kind: Int) throws {
+    let m = try CreationMount(parent,"initial-time-refusals-\(kind)"), v = m.volume, before = v.anchor, originalParent = m.metadata(m.root)
+    var reserved = false
+    m.serial { v.createStageForTesting = { stage,_ in if stage == "reserved" { reserved = true } } }
+    for field in 0..<3 { for nanos in [-2,-1,1_000_000_000,Int.max] {
+        let a = timedCreationAttributes(), invalid = timespec(tv_sec:-3,tv_nsec:nanos)
+        if field == 0 { a.accessTime = invalid }; if field == 1 { a.modifyTime = invalid }; if field == 2 { a.birthTime = invalid }
+        let result = createTimedKind(m,kind:kind,request:a)
+        need(!result.0 && result.2 == nil && code(result.1) == Int(EINVAL) && a.consumedAttributes.isEmpty,"invalid concrete initial time atomically refuses all fields before reserve")
+    } }
+    let unsupported: [(FSItem.SetAttributesRequest)->Void] = [
+        {$0.type = .file},{$0.linkCount = 1},{$0.allocSize = 0},{$0.fileID = FSItem.Identifier(rawValue:3)!},
+        {$0.parentID = FSItem.Identifier(rawValue:2)!},{$0.changeTime = timespec(tv_sec:1,tv_nsec:0)},
+        {$0.backupTime = timespec(tv_sec:1,tv_nsec:0)},{$0.addedTime = timespec(tv_sec:1,tv_nsec:0)},{$0.flags = 1},{$0.size = 1}]
+    for set in unsupported {
+        let a = timedCreationAttributes(); set(a); let result = createTimedKind(m,kind:kind,request:a)
+        need(!result.0 && result.2 == nil && code(result.1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"supported initial times do not partially acknowledge mixed unsupported fields")
+    }
+    for field in [FSItem.Attribute.supportsLimitedXAttrs,.inhibitKernelOffloadedIO] {
+        let a = timedCreationAttributes()
+        if field == .supportsLimitedXAttrs { a.supportsLimitedXAttrs = true } else { a.inhibitKernelOffloadedIO = true }
+        if a.isValid(field) {
+            let result = createTimedKind(m,kind:kind,request:a)
+            need(!result.0 && result.2 == nil && code(result.1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"constructible capability hints remain unsupported with initial times")
+        }
+    }
+    if kind == 2 {
+        let a = timedCreationAttributes(); a.size = 0
+        need(code(createTimedKind(m,kind:kind,request:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"times cannot waive explicit zero symlink-size refusal")
+    }
+    need(!reserved && anchorMatches(before,v.anchor) && v.diagnosticSnapshot().0.commits == 0,"invalid/mixed timestamps leave zero reservations and commits")
+    m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
+}
+func initialTimeQueuedCapture(_ parent: URL, kind: Int) throws {
+    for revoked in [false,true] {
+        let m = try CreationMount(parent,"initial-time-capture-\(kind)-\(revoked)"), v = m.volume, originalParent = m.metadata(m.root), before = v.anchor
+        let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), finished = DispatchSemaphore(value:0)
+        let a = timedCreationAttributes(0,selection:5), expected = InitialTimes(a), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+        var item: StallionItem?, returned = false
+        m.serial { v.createStageForTesting = { stage,value in if stage == "inserted" { item = value } } }
+        v.enqueue { held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume captured initial times") }
+        need(held.wait(timeout:.now()+20) == .success,"hold initial-time delivery queue")
+        if kind == 2 {
+            v.symlinkResultForTesting(FSFileName(string:"new"),directory:m.root,attributes:a,linkContents:FSFileName(string:"../target"),caller:caller) { result,error in
+                returned = result != nil; need(revoked ? result == nil && code(error) == Int(EACCES) : result != nil && error == nil,"queued timed symlink delivery disposition"); finished.signal()
+            }
+        } else {
+            v.createResultForTesting(FSFileName(string:"new"),type:kind == 1 ? .directory : .file,directory:m.root,attributes:a,caller:caller) { result,error in
+                returned = result != nil; need(revoked ? result == nil && code(error) == Int(EACCES) : result != nil && error == nil,"queued timed item delivery disposition"); finished.signal()
+            }
+        }
+        // The callback has captured scalars already. Later object changes are not new input.
+        a.accessTime = timespec(tv_sec:44,tv_nsec:-1); a.modifyTime = timespec(tv_sec:45,tv_nsec:1); a.birthTime = timespec(tv_sec:46,tv_nsec:2); a.mode = 0o777
+        if revoked { m.resource.revoke() }
+        resume.signal(); need(finished.wait(timeout:.now()+20) == .success,"captured timestamp callback finishes")
+        if revoked {
+            need(!returned && item == nil && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"revocation before reservation cannot consume captured times")
+            m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
+        } else {
+            let baseFields: FSItem.Attribute = [.mode,.uid,.gid]
+            need(returned && item != nil && a.consumedAttributes == baseFields.union(expected.consumed),"captured supported fields alone consumed")
+            m.returned.append(item!); let child = m.metadata(item!), updatedParent = m.metadata(m.root)
+            expected.check(child); need(child.mode & 0o777 == 0,"captured restrictive mode remains unchanged")
+            creationParentTimes(originalParent,updatedParent,child)
+            m.close(); creationTimesReopened(m,item!.inode,expected,originalParent,mode:0)
+            if kind == 2 { symlinkReopened(m,inode:item!.inode,target:Data("../target".utf8)) }
+        }
+    }
+}
 func contextualCreates(_ parent: URL) throws {
+    try contextualInitialTimes(parent,kind:0)
     let required = FSCreateItemResult.requestedAttributes.wantedAttributes
 #if STALLION_RESULT_MASK_TRACE
     let raw = UInt(bitPattern:required.rawValue)
@@ -1992,11 +2207,10 @@ func creationRefusals(_ parent: URL) throws {
     let unsupported: [(FSItem.Attribute,(FSItem.SetAttributesRequest)->Void)] = [
         (.type,{$0.type = .file}),(.linkCount,{$0.linkCount = 1}),(.allocSize,{$0.allocSize = 0}),
         (.fileID,{$0.fileID = FSItem.Identifier(rawValue:3)!}),(.parentID,{$0.parentID = FSItem.Identifier(rawValue:2)!}),
-        (.accessTime,{$0.accessTime = timespec(tv_sec:1,tv_nsec:0)}),(.modifyTime,{$0.modifyTime = timespec(tv_sec:1,tv_nsec:0)}),
-        (.changeTime,{$0.changeTime = timespec(tv_sec:1,tv_nsec:0)}),(.birthTime,{$0.birthTime = timespec(tv_sec:1,tv_nsec:0)}),
+        (.changeTime,{$0.changeTime = timespec(tv_sec:1,tv_nsec:0)}),
         (.backupTime,{$0.backupTime = timespec(tv_sec:1,tv_nsec:0)}),(.addedTime,{$0.addedTime = timespec(tv_sec:1,tv_nsec:0)})]
     for (field,set) in unsupported {
-        let a = creationAttributes(); set(a); need(a.isValid(field),"construct explicit unsupported creation field")
+        let a = timedCreationAttributes(); set(a); need(a.isValid(field),"construct explicit unsupported creation field")
         let result = m.create(request:a)
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"atomic unsupported creation request")
     }
@@ -2005,10 +2219,10 @@ func creationRefusals(_ parent: URL) throws {
         need(code(m.create(request:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"missing required creation field")
     }
     for (mode,expected) in [(UInt32(0o4600),ENOTSUP),(UInt32(S_IFDIR) | 0o700,EINVAL),(UInt32(1)<<31,ENOTSUP)] {
-        need(code(m.create(request:creationAttributes(mode)).1) == Int(expected),"unsupported/conflicting creation mode")
+        need(code(m.create(request:timedCreationAttributes(mode)).1) == Int(expected),"unsupported/conflicting creation mode")
     }
     for field in [FSItem.Attribute.flags,.size,.uid,.gid] {
-        let a = creationAttributes()
+        let a = timedCreationAttributes()
         if field == .flags { a.flags = 1 }; if field == .size { a.size = 1 }; if field == .uid { a.uid = geteuid() + 1 }; if field == .gid { a.gid = getegid() + 1 }
         need(code(m.create(request:a).1) == Int(field == .uid || field == .gid ? EACCES : ENOTSUP) && a.consumedAttributes.isEmpty,"unsupported value without mutation")
     }
@@ -2031,16 +2245,16 @@ func creationRefusals(_ parent: URL) throws {
         let policy = try CreationMount(parent,"create-policy-\(spec)",rootMode:spec == 0 ? 0o500 : spec == 1 ? 0o1700 : 0o700,
             rootFlags:spec == 2 ? 1 : 0,rootOwner:spec == 3 ? geteuid() + 1 : geteuid(),acl:spec == 4,
             writable:spec != 5,enable:spec != 6)
-        let error = policy.create().1
+        let error = policy.create(request:timedCreationAttributes()).1
         need(code(error) == Int(spec == 2 || spec == 4 ? ENOTSUP : spec >= 5 ? EROFS : EACCES),"parent policy/write gate")
         policy.close(); policy.reopened(inode:nil)
     }
     let revoked = try CreationMount(parent,"create-revoked"), revokedAnchor = revoked.volume.anchor
     revoked.resource.revoke()
-    need(code(revoked.create().1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"revocation before create reservation")
+    need(code(revoked.create(request:timedCreationAttributes()).1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"revocation before create reservation")
     revoked.close(); revoked.reopened(inode:nil)
     let readonly = try CreationMount(parent,"create-read-mode")
-    let result = readonly.create(request:creationAttributes(0o400))
+    let result = readonly.create(request:timedCreationAttributes(0o400))
     need(result.0 != nil && result.1 == nil && result.2 != nil,"initial read-only mode is honored")
     let written: (Int,Error?) = wait { done in readonly.volume.writeCountForTesting(contents:Data([1]),to:result.2!,at:0) { done(($0,$1)) } }
     need(written.0 == 0 && code(written.1) == Int(EACCES),"new file owner write permission enforced"); readonly.close(); readonly.reopened(inode:result.2!.inode)
@@ -2048,28 +2262,31 @@ func creationRefusals(_ parent: URL) throws {
 func creationFailures(_ parent: URL, required: FSItem.Attribute) throws {
     for stage in ["reserved","before-add","added","allocated","bound","inserted"] {
         let m = try CreationMount(parent,"create-stage-\(stage)"), v = m.volume, before = v.anchor
+        let originalParent = m.metadata(m.root)
         weak var unreturned: StallionItem?
         m.serial { v.createStageForTesting = { point,item in if point == stage { unreturned = item; throw POSIXError(.ENOMEM) } } }
-        let a = creationAttributes(), result = m.create(request:a)
+        let a = timedCreationAttributes(), result = m.create(request:a)
         need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"creation stage rollback \(stage)")
         let outcome = v.createOutcomeForTesting
         need(outcome.releaseAttempted == (stage == "reserved") && outcome.discarded == (stage != "reserved") && !outcome.commitSucceeded,"stage-specific pin cleanup")
         m.serial { need(unreturned == nil,"unreturned failed item not retained") }
-        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
     need(!required.isEmpty,"actual creation result requirements")
     for role in 0..<2 {
         let m = try CreationMount(parent,"create-incomplete-\(role)"), v = m.volume; var seen = 0, constructed = false
+        let originalParent = m.metadata(m.root)
         m.serial {
             v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { if seen == role { a.invalidateAllProperties() }; seen += 1 } }
             v.rejectResultForTesting = { _ in constructed = true; return false }
         }
-        let result = m.create()
-        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role + 1 && !constructed,"each role completeness before actual constructor")
-        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+        let a = timedCreationAttributes(), result = m.create(request:a)
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role + 1 && !constructed && a.consumedAttributes.isEmpty,"each role completeness before actual constructor")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
     for scenario in 0..<7 {
         let m = try CreationMount(parent,"create-failure-\(scenario)"), v = m.volume, before = v.anchor; var constructor = false
+        let originalParent = m.metadata(m.root)
         m.serial {
             if scenario == 0 { v.rejectResultForTesting = { name in if name == "FSCreateItemResult" { constructor = true; return true }; return false } }
             if scenario == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
@@ -2077,7 +2294,7 @@ func creationFailures(_ parent: URL, required: FSItem.Attribute) throws {
             if scenario == 6 { v.createCommitReceiptForTesting = { $0.fence_succeeded = 0 } }
         }
         if scenario == 3 { fault(1,1) }; if scenario == 4 || scenario == 5 { fault(4,Int32(scenario - 3)) }
-        let a = creationAttributes(), result = m.create(request:a), outcome = v.createOutcomeForTesting
+        let a = timedCreationAttributes(), result = m.create(request:a), outcome = v.createOutcomeForTesting
         let expected = scenario == 1 ? EACCES : scenario == 2 ? ENOMEM : (3...5).contains(scenario) ? ENOSPC : EIO
         need(result.0 == nil && code(result.1) == Int(expected) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"create failure scenario \(scenario) actual=\(code(result.1))")
         if scenario == 0 { need(constructor,"real failable constructor exercised before rejection") }
@@ -2092,29 +2309,30 @@ func creationFailures(_ parent: URL, required: FSItem.Attribute) throws {
         let token = v.createTokenForTesting!
         if scenario == 6 { m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"promoted never-returned token was already released") } }
         m.close()
-        if scenario == 6 { m.reopened(inode:2) }
-        else if scenario != 5 { m.reopened(inode:nil) } // Unknown publication is never called absence.
+        if scenario == 6 { m.reopened(inode:2); creationTimesReopened(m,2,InitialTimes(a),originalParent,mode:a.mode) }
+        else if scenario != 5 { m.reopened(inode:nil); metadataReopened(m,1,originalParent) } // Unknown publication is never called absence.
     }
     for capacity in [UInt64(16384),UInt64(20480)] {
         let m = try CreationMount(parent,"create-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        let originalParent = m.metadata(m.root)
         m.serial { var info = sfs_image_information(), r = sfs_result()
             need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 16384 && info.append_headroom == capacity - 16384,"real root-only capacity setup")
         }
-        let result = m.create(), outcome = v.createOutcomeForTesting
-        need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT,"actual append limit")
+        let a = timedCreationAttributes(), result = m.create(request:a), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT && a.consumedAttributes.isEmpty,"actual append limit")
         need(outcome.beginAttempted && outcome.beginSucceeded == (capacity == 20480) && outcome.discarded == (capacity == 20480) && outcome.releaseAttempted == (capacity == 16384),"begin LIMIT retains versus mutation LIMIT discards")
-        m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil)
+        m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
     let fatal = try CreationMount(parent,"create-begin-discard"), path = fatal.url.appendingPathComponent("image.sfs").path
     fatal.serial { fatal.volume.createStageForTesting = { stage,_ in if stage == "reserved" { need(chmod(path,0o400) == 0,"owned fixture identity failure setup") } } }
-    let failed = fatal.create(), outcome = fatal.volume.createOutcomeForTesting
+    let failed = fatal.create(request:timedCreationAttributes()), outcome = fatal.volume.createOutcomeForTesting
     need(chmod(path,0o600) == 0,"restore owned fixture mode")
     need(failed.0 == nil && code(failed.1) == Int(EINVAL) && outcome.beginAttempted && !outcome.beginSucceeded && outcome.discarded && !outcome.releaseAttempted,"begin read failure discards live reservation")
     fatal.close(); fatal.reopened(inode:nil)
     let exhausted = try CreationMount(parent,"create-pin-exhaustion"), e = exhausted.volume
     var heldPins: [sfs_pin] = []
     exhausted.serial { var r = sfs_result(); for _ in 0..<3 { var pin = sfs_pin(); need(sfs_image_pin_reserve(exhausted.coreHandle,&pin,&r) == SFS_OK,"occupy actual core slots"); heldPins.append(pin) } }
-    need(code(exhausted.create().1) == Int(ENFILE) && !e.createOutcomeForTesting.beginAttempted && !e.createOutcomeForTesting.releaseAttempted,"core pin failure with free adapter capacity")
+    need(code(exhausted.create(request:timedCreationAttributes()).1) == Int(ENFILE) && !e.createOutcomeForTesting.beginAttempted && !e.createOutcomeForTesting.releaseAttempted,"core pin failure with free adapter capacity")
     exhausted.serial { var r = sfs_result(); for pin in heldPins { need(sfs_image_pin_release(exhausted.coreHandle,pin,&r) == SFS_OK,"release separately owned reservations") } }
     exhausted.state(1); exhausted.close(); exhausted.reopened(inode:nil)
     let quarantine = try CreationMount(parent,"create-release-quarantine"), q = quarantine.volume
@@ -2123,9 +2341,9 @@ func creationFailures(_ parent: URL, required: FSItem.Attribute) throws {
         q.createStageForTesting = { stage,_ in if stage == "reserved" { throw POSIXError(.ENOMEM) } }
         q.createReleaseForTesting = { _,_,r in releases += 1; r.status = SFS_BUSY; return SFS_BUSY }
     }
-    need(code(quarantine.create().1) == Int(ENOMEM),"primary error survives synthetic release BUSY")
+    need(code(quarantine.create(request:timedCreationAttributes()).1) == Int(ENOMEM),"primary error survives synthetic release BUSY")
     quarantine.serial { let state = q.createStateForTesting; need(state.pending && state.quarantine && state.ticket == 1 && q.activeItemCount() == 1 && releases == 1,"bounded token-only release quarantine") }
-    need(code(quarantine.create("later").1) == Int(ENOMEM) && releases == 1,"no automatic retry after quarantine")
+    need(code(quarantine.create("later",request:timedCreationAttributes()).1) == Int(ENOMEM) && releases == 1,"no automatic retry after quarantine")
     quarantine.close(); quarantine.reopened(inode:nil)
 }
 func creationDelivery(_ parent: URL) throws {
@@ -2133,13 +2351,14 @@ func creationDelivery(_ parent: URL) throws {
     saturated.volume.enqueue { enteredFull.signal(); need(resumeFull.wait(timeout:.now()+20) == .success,"resume saturated creation queue") }
     need(enteredFull.wait(timeout:.now()+20) == .success,"hold saturated creation queue")
     for _ in 0..<ReadOnlyLimits.callbacks { drained.enter(); saturated.volume.enqueue(rejected:{ _ in need(false,"fill creation budget") }) { drained.leave() } }
-    let refused: (FSCreateItemResult?,Error?) = wait { done in saturated.volume.createResultForTesting(FSFileName(string:"new"),directory:saturated.root,attributes:creationAttributes(),caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
+    let refused: (FSCreateItemResult?,Error?) = wait { done in saturated.volume.createResultForTesting(FSFileName(string:"new"),directory:saturated.root,attributes:timedCreationAttributes(),caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
     need(refused.0 == nil && code(refused.1) == Int(EAGAIN) && saturated.volume.linkBudgetForTesting.0 == ReadOnlyLimits.callbacks,"saturated create admission adds no ticket")
     resumeFull.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain saturation")
     saturated.state(1); saturated.close(); saturated.reopened(inode:nil)
     for quarantine in [false,true] {
         let m = try CreationMount(parent,"create-queued-\(quarantine)",directory:quarantine), v = m.volume, before = v.anchor
         let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+        let originalParent = m.metadata(m.root)
         var preflights = 0, cleared = false
         weak var unreturned: StallionItem?
         v.enqueue {
@@ -2148,7 +2367,7 @@ func creationDelivery(_ parent: URL) throws {
             entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume create queue")
         }
         need(entered.wait(timeout:.now()+20) == .success,"hold create queue")
-        let first = creationAttributes(), next = creationAttributes(), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+        let first = timedCreationAttributes(), next = timedCreationAttributes(), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
         replies.enter(); v.createResultForTesting(FSFileName(string:"first"),directory:m.root,attributes:first,caller:caller) { result,error in
             need(result == nil && code(error) == Int(ENOMEM),"first create primary failure")
             v.createStageForTesting = nil; v.createAbortForTesting = nil; cleared = true; replies.leave()
@@ -2168,7 +2387,7 @@ func creationDelivery(_ parent: URL) throws {
         let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
         v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release failed create queue") }
         need(held.wait(timeout:.now()+20) == .success,"hold already failed queue")
-        let refused: (FSCreateItemResult?,Error?) = wait { done in v.createResultForTesting(FSFileName(string:"again"),directory:m.root,attributes:creationAttributes(),caller:caller) { done(($0,$1)) } }
+        let refused: (FSCreateItemResult?,Error?) = wait { done in v.createResultForTesting(FSFileName(string:"again"),directory:m.root,attributes:timedCreationAttributes(),caller:caller) { done(($0,$1)) } }
         need(refused.0 == nil && code(refused.1) == Int(ENOMEM) && v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"admission returns charge without entering held queue")
         release.signal(); m.serial {}
         if !quarantine { m.state(1); m.absent("first"); m.absent("next") }
@@ -2181,6 +2400,7 @@ func creationDelivery(_ parent: URL) throws {
             m.serial { need(!v.ownsForTesting(m.directory!) && v.activeItemCount() == 1,"BUSY release never resurrects reclaimed item") }
         }
         m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil)
+        if !quarantine { metadataReopened(m,1,originalParent) }
     }
 }
 #endif
@@ -2600,7 +2820,15 @@ func directoryMetadata(_ value: sfs_metadata_entry, parent: UInt64, mode: UInt32
          value.uid == geteuid() && value.gid == getegid(),"truthful directory kind/mode/parent/size/extents/link/owner")
 }
 func contextualDirectories(_ parent: URL) throws {
+    try contextualInitialTimes(parent,kind:1)
     let m = try CreationMount(parent,"directory-reuse"), v = m.volume, required = FSCreateItemResult.requestedAttributes.wantedAttributes
+    let rights: [FSVolume.AccessMask] = [.addFile,.addSubdirectory,[.addFile,.addSubdirectory],
+        [.addFile,.search],[.addSubdirectory,.search],[.addFile,.addSubdirectory,.search]]
+    for access in rights {
+        let result = namespaceAccess(v,m.root,access)
+        need(result.0 != nil && result.1 == nil,"actual linked root creation access without a namespace parent ID")
+    }
+    need(m.metadata(m.root).entry.parent == 0,"root creation authority uses linked root metadata")
     var snapshots: [FSItem.Attributes] = [], beforeCommit = true, constructors = 0
     m.serial {
         v.removeCommitReceiptForTesting = { _,_ in need(false,"directory creation entered removal receipt hook") }
@@ -2618,6 +2846,10 @@ func contextualDirectories(_ parent: URL) throws {
     m.serial { directoryNames(m.coreHandle,a.inode,[]) }; m.state(2)
     func create(_ name: String, _ parent: FSItem, _ mode: UInt32, _ type: FSItem.ItemType) -> StallionItem {
         let prior = constructors
+        for access in rights {
+            let result = namespaceAccess(v,parent,access)
+            need(result.0 != nil && result.1 == nil,"actual nested creation access before constructor")
+        }
         m.serial { snapshots = []; beforeCommit = true }
         let attributes = creationAttributes(mode), result = m.create(name,request:attributes,parent:parent,type:type)
         need(result.0 != nil && result.1 == nil && result.2 != nil && constructors == prior+1 && snapshots.count == 2 && attributes.consumedAttributes == [.mode,.uid,.gid],"nested actual result error=\(code(result.1))")
@@ -2649,7 +2881,111 @@ func contextualDirectories(_ parent: URL) throws {
     }
     directoryNames(reopened!,a.inode,["B"]); directoryNames(reopened!,b.inode,["C","file"]); directoryNames(reopened!,c.inode,[])
     need(sfs_image_close(reopened,&receipt) == SFS_OK,"directory metadata reopen close")
-    try directoryRefusals(parent); try directoryFailures(parent); try directoryQueuedFailure(parent); try directoryRemovals(parent)
+    need(FSCreateItemResult.requestedAttributes.wantedAttributes == required,"directory constructors preserve full SDK requirements")
+    try directoryAccessChecks(parent); try directoryRefusals(parent); try directoryFailures(parent); try directoryQueuedFailure(parent); try directoryRemovals(parent)
+}
+func directoryAccessChecks(_ parent: URL) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    let rights: [FSVolume.AccessMask] = [.addFile,.addSubdirectory,[.addFile,.addSubdirectory],
+        [.addFile,.search],[.addSubdirectory,.search],[.addFile,.addSubdirectory,.search]]
+    let required = FSCreateItemResult.requestedAttributes.wantedAttributes
+    // Write/search authority does not imply permission to list or read xattrs.
+    for nested in [false,true] {
+        let m = try CreationMount(parent,"directory-access-mode300-\(nested)",directory:nested,rootMode:0o300), v = m.volume
+        let directory = nested ? m.directory! : m.root
+        if nested { m.serial { try! v.diagnosticMutationForTesting { h,r in
+            var value = sfs_metadata_update(); value.fields = UInt32(SFS_META_MODE.rawValue); value.mode = UInt32(S_IFDIR)|0o300
+            need(sfs_image_set_metadata(h,(directory as! StallionItem).inode,&value,&r) == SFS_OK,"linked nonroot mode0300 fixture")
+        } } }
+        let before = v.anchor, commits = v.diagnosticSnapshot().0.commits, token = (directory as! StallionItem).pin!
+        for access in rights + [[.addSubdirectory,.readAttributes],[.addFile,.addSubdirectory,.writeAttributes,.writeSecurity]] {
+            let result = namespaceAccess(v,directory,access)
+            need(result.0 != nil && result.1 == nil,"actual mode0300 creation and original-state metadata access")
+        }
+        for extra: FSVolume.AccessMask in [.listDirectory,.readXattr,.delete,.deleteChild,.takeOwnership,FSVolume.AccessMask(rawValue:1<<30)] {
+            for access in rights {
+                let result = namespaceAccess(v,directory,access.union(extra))
+                need(result.0 == nil && code(result.1) == Int(EACCES),"creation rights cannot grant original-mode read, removal, ownership or unknown rights")
+            }
+        }
+        for access in rights {
+            let result = namespaceAccess(v,directory,access.union(.writeXattr))
+            need(result.0 != nil && result.1 == nil,"mode0300 independently grants directory creation and xattr writes")
+        }
+        var identities = [CallerIdentity(uid:caller.uid+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)]
+        if geteuid() != 0 { identities.append(CallerIdentity(uid:0,gid:0)) }
+        for identity in identities { for access in rights {
+            let result = namespaceAccess(v,directory,access,caller:identity)
+            need(result.0 == nil && code(result.1) == Int(EACCES),"creation access requires representable exact owner without root bypass")
+        } }
+        let differentGroup = namespaceAccess(v,directory,[.addSubdirectory,.search],caller:CallerIdentity(uid:caller.uid,gid:caller.gid+1))
+        need(differentGroup.0 != nil && differentGroup.1 == nil,"creation policy does not add caller group equality")
+        need(anchorMatches(before,v.anchor) && commits == v.diagnosticSnapshot().0.commits && sameBytes(token,(directory as! StallionItem).pin!),"access results do not mutate or replace parent authority")
+        var snapshots: [FSItem.Attributes] = [], constructed = false, committed = false
+        m.serial {
+            v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { need(!committed,"mode0300 directory snapshots precede commit"); snapshots.append(a) } }
+            v.rejectResultForTesting = { name in if name == "FSCreateItemResult" { need(snapshots.count == 2 && !committed,"mode0300 real constructor has both full roles"); constructed = true }; return false }
+            v.diagnosticBeforeCommit = { committed = true }
+        }
+        let request = creationAttributes(0o700), made = m.create("child",request:request,parent:directory,type:.directory)
+        need(made.0 != nil && made.1 == nil && made.2 != nil && constructed && committed && snapshots.count == 2 && request.consumedAttributes == [.mode,.uid,.gid],"actual mode0300 directory constructor and verified acknowledgment")
+        checkPreparedAttributes(snapshots[0],m.metadata(made.2!),required:required); checkPreparedAttributes(snapshots[1],m.metadata(directory),required:required)
+        need(m.lookup("child",parent:directory) === made.2!,"mode0300 child canonical lookup")
+        let directoryID = (directory as! StallionItem).inode
+        m.close(); m.reopened("child",parent:directoryID,inode:made.2!.inode)
+    }
+    // The SDK's directory aliases remain ordinary byte rights on regular files.
+    for mode in [UInt32(0o200),UInt32(0o400)] {
+        let f = try Fixture(parent,"directory-access-file-\(mode)",mode:mode), m = try Mounted(f), v = m.volume, before = v.anchor
+        for access: FSVolume.AccessMask in [.writeData,.appendData,.addSubdirectory,[.writeData,.appendData]] {
+            let result = namespaceAccess(v,m.file,access)
+            need(mode == 0o200 ? result.0 != nil && result.1 == nil : result.0 == nil && code(result.1) == Int(EACCES),"regular file write/append aliases retain original owner mode policy")
+            let symlink = namespaceAccess(v,m.link,access)
+            need(symlink.0 == nil && code(symlink.1) == Int(EACCES),"directory create aliases do not grant symlink byte writes")
+        }
+        if mode == 0o200 {
+            let result = namespaceAccess(v,m.file,[.appendData,.readData])
+            need(result.0 == nil && code(result.1) == Int(EACCES),"file append cannot grant missing original read authority")
+        }
+        need(anchorMatches(before,v.anchor),"file alias access does not mutate")
+        m.close(); need(f.contents() == Data("original".utf8),"file alias access preserves durable bytes")
+    }
+    let unmounted = try CreationMount(parent,"directory-access-unmounted"), uv = unmounted.volume, before = uv.anchor
+    let _: Bool = wait { done in uv.unmount { done(true) } }
+    for access in rights {
+        let result = namespaceAccess(uv,unmounted.root,access)
+        need(result.0 == nil && code(result.1) == Int(ENXIO),"unmounted directory access callback refused")
+        unmounted.serial {
+            do { try uv.linkAccessForTesting(unmounted.root,access:access,caller:caller); need(false,"unmounted owner policy granted creation") }
+            catch { need(code(error) == Int(ENXIO),"creation policy itself requires mounted readiness") }
+        }
+    }
+    need(anchorMatches(before,uv.anchor),"unmounted access preserves anchor")
+    let remounted: Error? = wait { uv.mount(arguments:[],replyHandler:$0) }; need(remounted == nil,"remount after refused directory access")
+    unmounted.close(); unmounted.reopened("child",inode:nil)
+    let identityMount = try CreationMount(parent,"directory-access-pins",directory:true), iv = identityMount.volume
+    let other = try CreationMount(parent,"directory-access-other-volume"), identityAnchor = iv.anchor
+    let directory = identityMount.directory as! StallionItem, originalPin = directory.pin!
+    for access in rights {
+        let result = namespaceAccess(iv,other.root,access)
+        need(result.0 == nil && code(result.1) == Int(EINVAL),"equal inode numbers from another volume do not confer parent authority")
+    }
+    other.close()
+    for missing in [true,false] {
+        identityMount.serial { directory.pin = missing ? nil : sfs_pin() }
+        for access in rights {
+            let result = namespaceAccess(iv,directory,access)
+            need(result.0 == nil && code(result.1) == Int(EINVAL),"missing or invalid live parent pin refuses actual creation access")
+        }
+        let request = creationAttributes(0o700), made = identityMount.create("child",request:request,parent:directory,type:.directory)
+        need(made.0 == nil && code(made.1) == Int(EINVAL) && request.consumedAttributes.isEmpty && anchorMatches(identityAnchor,iv.anchor),"invalid parent pin refuses directory mutation before acknowledgment")
+        identityMount.serial { directory.pin = originalPin }
+    }
+    identityMount.serial { directory.pin = (identityMount.root as! StallionItem).pin }
+    let mismatched = namespaceAccess(iv,directory,[.addSubdirectory,.search])
+    need(mismatched.0 == nil && code(mismatched.1) == Int(EIO) && anchorMatches(identityAnchor,iv.anchor),"valid token for another inode cannot authorize directory creation")
+    identityMount.serial { directory.pin = originalPin }
+    identityMount.close(); identityMount.reopened("child",parent:directory.inode,inode:nil)
 }
 func directoryRemovalRefusals(_ parent: URL) throws {
     for variant in 0..<12 {
@@ -2766,6 +3102,13 @@ func directoryRemovals(_ parent: URL) throws {
         let enumeration: Error? = wait { done in v.enumerateDirectory(directory,startingAt:.initial,verifier:.initial,attributes:nil,pack:{ _,_,_,_,_ in packed = true; return true }) { done($1) } }
         need(!packed && code(enumeration) == Int(ENOENT),"detached directory cannot enumerate a namespace")
         need(code(m.create("invalid",parent:directory).1) == Int(ENOENT),"detached directory cannot accept new children")
+        let detachedAnchor = v.anchor
+        for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+            let result = namespaceAccess(v,directory,access)
+            need(result.0 == nil && code(result.1) == Int(ENOENT),"held directory witness cannot grant namespace creation access")
+        }
+        let detachedRequest = creationAttributes(0o700), detachedCreate = m.create("invalid-directory",request:detachedRequest,parent:directory,type:.directory)
+        need(detachedCreate.0 == nil && code(detachedCreate.1) == Int(ENOENT) && detachedRequest.consumedAttributes.isEmpty && anchorMatches(detachedAnchor,v.anchor),"held directory cannot accept a directory or acknowledge attributes")
         let linked: (FSCreateLinkResult?,Error?) = wait { done in v.linkResultForTesting(directory,name:FSFileName(string:"alias"),directory:m.root,caller:caller) { done(($0,$1)) } }
         need(linked.0 == nil && code(linked.1) == Int(ENOENT),"detached directory cannot be relinked")
         let retained: Error? = wait { v.reclaimForTesting(directory,eligible:false,replyHandler:$0) }
@@ -2786,19 +3129,24 @@ func directoryRemovals(_ parent: URL) throws {
 }
 func directoryRefusals(_ parent: URL) throws {
     let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
-    for mode in [UInt32(0o500),UInt32(0o600)] {
+    for mode in [UInt32(0o500),UInt32(0o600),UInt32(0o200),UInt32(0o100),UInt32(0o000)] {
         let m = try CreationMount(parent,"directory-mode-\(mode)"), v = m.volume
-        let result = m.create(request:creationAttributes(mode),type:.directory)
+        let result = m.create(request:timedCreationAttributes(mode),type:.directory)
         need(result.0 != nil && result.1 == nil && result.2 != nil,"restrictive initial directory mode is honored")
         let item = result.2!, before = v.anchor
         need(code(m.create("child",parent:item).1) == Int(EACCES),"restrictive parent denies nested file")
-        need(code(m.create("child",request:creationAttributes(0o700),parent:item,type:.directory).1) == Int(EACCES),"restrictive parent denies nested directory")
+        need(code(m.create("child",request:timedCreationAttributes(0o700),parent:item,type:.directory).1) == Int(EACCES),"restrictive parent denies nested directory")
         let linked: (FSCreateLinkResult?,Error?) = wait { done in v.linkResultForTesting(item,name:FSFileName(string:"alias"),directory:m.root,caller:caller) { done(($0,$1)) } }
         need(code(linked.1) == Int(ENOTSUP),"created directory hardlink remains refused")
         let size = FSItem.SetAttributesRequest(); size.size = UInt64.max
         let ignored: (FSItem.Attributes?,Error?) = wait { done in v.setAttributesValueForTesting(size,on:item,caller:caller) { done(($0,$1)) } }
         need(ignored.0 != nil && ignored.1 == nil && size.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"created directory size remains ignored and unconsumed")
-        m.serial { do { try v.linkAccessForTesting(m.root,access:.addSubdirectory,caller:caller); need(false,"standalone addSubdirectory grant expanded") } catch { need(code(error) == Int(EACCES),"standalone directory grant remains refused") } }
+        let rootAccess = namespaceAccess(v,m.root,.addSubdirectory,caller:caller)
+        need(rootAccess.0 != nil && rootAccess.1 == nil,"actual standalone addSubdirectory result on eligible root")
+        for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+            let result = namespaceAccess(v,item,access,caller:caller)
+            need(result.0 == nil && code(result.1) == Int(EACCES),"restrictive child parent denies both creation rights")
+        }
         m.state(2)
         let write: (Int,Error?) = wait { done in v.writeCountForTesting(contents:Data([1]),to:item,at:0) { done(($0,$1)) } }
         need(write.0 == 0 && code(write.1) == Int(EINVAL) && anchorMatches(before,v.anchor),"directory data write refused")
@@ -2812,54 +3160,73 @@ func directoryRefusals(_ parent: URL) throws {
         need(code(m.create(request:a,type:.directory).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"directory requires explicit mode and IDs")
     }
     for (mode,error) in [(UInt32(S_IFREG)|0o700,EINVAL),(UInt32(0o1700),ENOTSUP),(UInt32(0o4700),ENOTSUP),(UInt32(1)<<31,ENOTSUP)] {
-        let a = creationAttributes(mode); need(code(m.create(request:a,type:.directory).1) == Int(error) && a.consumedAttributes.isEmpty,"directory mode mismatch/special/unknown refusal")
+        let a = timedCreationAttributes(mode); need(code(m.create(request:a,type:.directory).1) == Int(error) && a.consumedAttributes.isEmpty,"directory mode mismatch/special/unknown refusal")
     }
     for field in 0..<6 {
-        let a = creationAttributes(0o700)
-        if field == 0 { a.uid = geteuid()+1 }; if field == 1 { a.gid = getegid()+1 }; if field == 2 { a.flags = 1 }; if field == 3 { a.size = 1 }; if field == 4 { a.type = .directory }; if field == 5 { a.birthTime = timespec(tv_sec:1,tv_nsec:0) }
+        let a = timedCreationAttributes(0o700)
+        if field == 0 { a.uid = geteuid()+1 }; if field == 1 { a.gid = getegid()+1 }; if field == 2 { a.flags = 1 }; if field == 3 { a.size = 1 }; if field == 4 { a.type = .directory }; if field == 5 { a.changeTime = timespec(tv_sec:1,tv_nsec:0) }
         need(code(m.create(request:a,type:.directory).1) == Int(field < 2 ? EACCES : ENOTSUP) && a.consumedAttributes.isEmpty,"directory unsupported mixture is atomic")
     }
     for identity in [CallerIdentity(uid:caller.uid+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)] {
-        need(code(m.create(request:creationAttributes(0o700),type:.directory,caller:identity).1) == Int(EACCES),"directory caller identity refusal")
+        need(code(m.create(request:timedCreationAttributes(0o700),type:.directory,caller:identity).1) == Int(EACCES),"directory caller identity refusal")
     }
-    need(code(m.create(request:creationAttributes(0o700),parent:StallionItem(1),type:.directory).1) == Int(EINVAL),"directory foreign parent refusal")
+    need(code(m.create(request:timedCreationAttributes(0o700),parent:StallionItem(1),type:.directory).1) == Int(EINVAL),"directory foreign parent refusal")
+    for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+        let result = namespaceAccess(v,StallionItem(1),access)
+        need(result.0 == nil && code(result.1) == Int(EINVAL),"actual access refuses foreign canonical parent")
+    }
     need(!reserved && anchorMatches(before,v.anchor),"directory scalar refusals precede reservation"); m.state(1); m.absent()
-    let valid = m.create("valid",request:creationAttributes(0o700),type:.directory)
+    let valid = m.create("valid",request:timedCreationAttributes(0o700),type:.directory)
     need(valid.0 != nil && valid.1 == nil && valid.2 != nil,"valid directory after preflight refusals")
     let acknowledged = v.anchor
-    need(code(m.create("valid",request:creationAttributes(0o700),type:.directory).1) == Int(EEXIST) && anchorMatches(acknowledged,v.anchor),"directory duplicate refusal")
+    need(code(m.create("valid",request:timedCreationAttributes(0o700),type:.directory).1) == Int(EEXIST) && anchorMatches(acknowledged,v.anchor),"directory duplicate refusal")
     let file = m.create("file"); need(file.2 != nil && file.1 == nil,"directory refusal regular parent setup")
-    need(code(m.create(request:creationAttributes(0o700),parent:file.2!,type:.directory).1) == Int(ENOTDIR),"directory non-directory parent")
-    need(m.reclaim(valid.2!) == nil && code(m.create(request:creationAttributes(0o700),parent:valid.2!,type:.directory).1) == Int(EINVAL),"directory reclaimed parent refusal")
+    need(code(m.create(request:timedCreationAttributes(0o700),parent:file.2!,type:.directory).1) == Int(ENOTDIR),"directory non-directory parent")
+    need(m.reclaim(valid.2!) == nil && code(m.create(request:timedCreationAttributes(0o700),parent:valid.2!,type:.directory).1) == Int(EINVAL),"directory reclaimed parent refusal")
+    for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+        let result = namespaceAccess(v,valid.2!,access)
+        need(result.0 == nil && code(result.1) == Int(EINVAL),"actual access refuses reclaimed directory")
+    }
     m.close(); m.reopened("valid",inode:valid.2!.inode); m.reopened(inode:nil)
     for spec in 0..<7 {
         let p = try CreationMount(parent,"directory-policy-\(spec)",rootMode:spec == 0 ? 0o500 : spec == 1 ? 0o1700 : 0o700,
             rootFlags:spec == 2 ? 1 : 0,rootOwner:spec == 3 ? geteuid()+1 : geteuid(),acl:spec == 4,writable:spec != 5,enable:spec != 6)
-        let a = creationAttributes(0o700), anchor = p.volume.anchor
+        let a = timedCreationAttributes(0o700), anchor = p.volume.anchor
+        for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+            let result = namespaceAccess(p.volume,p.root,access)
+            need(result.0 == nil && code(result.1) == Int(spec == 2 || spec == 4 ? ENOTSUP : EACCES) && anchorMatches(anchor,p.volume.anchor),"actual access retains owner, mode, ACL, flags and disabled-write refusals")
+        }
         let result = p.create(request:a,type:.directory)
         need(result.0 == nil && code(result.1) == Int(spec == 2 || spec == 4 ? ENOTSUP : spec >= 5 ? EROFS : EACCES) && a.consumedAttributes.isEmpty && anchorMatches(anchor,p.volume.anchor),"directory real parent/write policy")
         p.close(); p.reopened(inode:nil)
     }
     let revoked = try CreationMount(parent,"directory-revoked"), revokedAnchor = revoked.volume.anchor
-    revoked.resource.revoke(); need(code(revoked.create(request:creationAttributes(0o700),type:.directory).1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"directory revoked resource preflight")
+    revoked.resource.revoke(); need(code(revoked.create(request:timedCreationAttributes(0o700),type:.directory).1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"directory revoked resource preflight")
+    for access: FSVolume.AccessMask in [.addFile,.addSubdirectory,[.addFile,.addSubdirectory,.search]] {
+        let result = namespaceAccess(revoked.volume,revoked.root,access)
+        need(result.0 == nil && code(result.1) == Int(EACCES) && anchorMatches(revokedAnchor,revoked.volume.anchor),"actual creation access refuses revoked resource")
+    }
     revoked.close(); revoked.reopened(inode:nil)
 }
 func directoryFailures(_ parent: URL) throws {
+    try initialDirectoryStageFailures(parent)
     for role in 0..<2 {
         let m = try CreationMount(parent,"directory-incomplete-\(role)",directory:role == 1), v = m.volume, before = v.anchor
+        let parentItem = m.directory ?? m.root, originalParent = m.metadata(parentItem)
         var seen = 0, constructed = false
         m.serial {
             v.removeCommitReceiptForTesting = { _,_ in need(false,"directory abort used removal receipt hook") }
             v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { if seen == role { a.invalidateAllProperties() }; seen += 1 } }
             v.rejectResultForTesting = { _ in constructed = true; return false }
         }
-        let a = creationAttributes(0o700), result = m.create(request:a,parent:m.directory,type:.directory)
+        let a = timedCreationAttributes(0o700), result = m.create(request:a,parent:m.directory,type:.directory)
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role+1 && !constructed && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"each directory role invalidation rolls back before constructor")
         let outcome = v.createOutcomeForTesting; need(outcome.discarded && !outcome.releaseAttempted,"directory failed reserved pin discarded once")
-        m.state(role == 1 ? 2 : 1); m.close(); m.reopened(parent:role == 1 ? (m.directory as! StallionItem).inode : 1,inode:nil)
+        m.state(role == 1 ? 2 : 1); m.close(); m.reopened(parent:role == 1 ? (m.directory as! StallionItem).inode : 1,inode:nil); metadataReopened(m,originalParent.entry.inode,originalParent)
     }
     for scenario in 0..<5 {
         let m = try CreationMount(parent,"directory-failure-\(scenario)"), v = m.volume, before = v.anchor
+        let originalParent = m.metadata(m.root)
         var constructed = false
         m.serial {
             v.removeCommitReceiptForTesting = { _,_ in need(false,"directory fault used removal receipt hook") }
@@ -2868,7 +3235,7 @@ func directoryFailures(_ parent: URL) throws {
             if scenario == 4 { v.createCommitReceiptForTesting = { $0.fence_succeeded = 0 } }
         }
         if scenario == 2 || scenario == 3 { fault(4,Int32(scenario-1)) }
-        let a = creationAttributes(0o700), result = m.create(request:a,type:.directory), outcome = v.createOutcomeForTesting
+        let a = timedCreationAttributes(0o700), result = m.create(request:a,type:.directory), outcome = v.createOutcomeForTesting
         need(result.0 == nil && code(result.1) == Int(scenario == 1 ? EACCES : scenario == 2 || scenario == 3 ? ENOSPC : EIO) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"directory failure scenario \(scenario) actual=\(code(result.1))")
         if scenario == 0 { need(constructed,"actual directory constructor before injected rejection") }
         if scenario == 2 || scenario == 3 { need(hits() > 0 && outcome.original.status == (scenario == 2 ? SFS_IO : SFS_OUTCOME_UNKNOWN),"directory actual fence outcome") }
@@ -2880,30 +3247,32 @@ func directoryFailures(_ parent: URL) throws {
         } else { need(outcome.discarded && !outcome.releaseAttempted,"directory discard never double releases") }
         m.close()
         if scenario == 4 {
-            m.reopened(inode:2)
+            m.reopened(inode:2); creationTimesReopened(m,2,InitialTimes(a),originalParent,mode:a.mode)
             var h: OpaquePointer?, r = sfs_result(), metadata = sfs_metadata_entry()
             need(sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) == SFS_OK && sfs_image_stat_metadata(h,0,2,&metadata,&r) == SFS_OK,"durable directory after rejected successful receipt")
             directoryMetadata(metadata,parent:1,mode:0o700); directoryNames(h!,2,[]); need(sfs_image_close(h,&r) == SFS_OK,"promoted directory reopen close")
-        } else if scenario != 3 { m.reopened(inode:nil) }
+        } else if scenario != 3 { m.reopened(inode:nil); metadataReopened(m,1,originalParent) }
     }
     for capacity in [UInt64(16384),UInt64(20480)] {
         let m = try CreationMount(parent,"directory-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        let originalParent = m.metadata(m.root)
         m.serial { var info = sfs_image_information(), r = sfs_result(); need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 16384 && info.append_headroom == capacity-16384,"directory capacity setup geometry") }
-        let result = m.create(request:creationAttributes(0o700),type:.directory), outcome = v.createOutcomeForTesting
-        need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT && outcome.original.limit_reason == SFS_LIMIT_APPEND_CAPACITY,"actual directory append capacity refusal")
+        let a = timedCreationAttributes(0o700), result = m.create(request:a,type:.directory), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT && outcome.original.limit_reason == SFS_LIMIT_APPEND_CAPACITY && a.consumedAttributes.isEmpty,"actual directory append capacity refusal")
         need(outcome.beginAttempted && outcome.beginSucceeded == (capacity == 20480) && outcome.discarded == (capacity == 20480) && outcome.releaseAttempted == (capacity == 16384),"directory begin reservation versus mutation discard")
-        m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil)
+        m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
 }
 func directoryQueuedFailure(_ parent: URL) throws {
     let m = try CreationMount(parent,"directory-queued"), v = m.volume, before = v.anchor
+    let originalParent = m.metadata(m.root)
     let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), finished = DispatchGroup()
     var preflights = 0, cleared = false
     v.enqueue { v.createStageForTesting = { stage,_ in if stage == "preflight" { preflights += 1 }; if stage == "inserted" { throw POSIXError(.ENOMEM) } }
         held.signal(); need(release.wait(timeout:.now()+20) == .success,"resume queued directory")
     }
     need(held.wait(timeout:.now()+20) == .success,"hold queued directory")
-    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), first = creationAttributes(), next = creationAttributes(0o700)
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), first = timedCreationAttributes(), next = timedCreationAttributes(0o700)
     finished.enter(); v.createResultForTesting(FSFileName(string:"first"),directory:m.root,attributes:first,caller:caller) { result,error in
         need(result == nil && code(error) == Int(ENOMEM),"preceding file creation fails"); v.createStageForTesting = nil; cleared = true; finished.leave()
     }
@@ -2913,7 +3282,7 @@ func directoryQueuedFailure(_ parent: URL) throws {
     need(v.linkBudgetForTesting.0 == 2 && v.linkBudgetForTesting.1 == 2 * ReadOnlyLimits.callbackOverhead + 9,"both kind callbacks admitted and charged")
     release.signal(); need(finished.wait(timeout:.now()+20) == .success,"queued directory replies")
     m.serial { need(preflights == 1 && first.consumedAttributes.isEmpty && next.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"queued error precedes directory reservation/begin") }
-    m.state(1); m.absent("first"); m.absent("next"); m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil)
+    m.state(1); m.absent("first"); m.absent("next"); m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil); metadataReopened(m,1,originalParent)
 }
 #endif
 
@@ -3664,6 +4033,7 @@ func symlinkReadback(_ m: CreationMount, _ item: StallionItem, _ target: Data, h
     }
 }
 func contextualSymlinkCreation(_ parent: URL) throws {
+    try contextualInitialTimes(parent,kind:2)
     let required = FSCreateSymlinkResult.requestedAttributes.wantedAttributes
 #if STALLION_RESULT_MASK_TRACE
     let raw = UInt(bitPattern:required.rawValue)
@@ -3734,18 +4104,18 @@ func symlinkRefusals(_ parent: URL) throws {
     m.serial { v.createStageForTesting = { stage,_ in if stage == "reserved" { reserved = true } } }
     let empty = FSFileName(data:Data([0,120])); need(empty.data.isEmpty,"leading NUL delivers empty target")
     for (contents,expected) in [(FSFileName(data:Data()),EINVAL),(empty,EINVAL),(FSFileName(data:Data(repeating:120,count:4097)),ENAMETOOLONG)] {
-        let a = creationAttributes(0o700); need(code(createSymlink(m,contents,attributes:a).1) == Int(expected) && a.consumedAttributes.isEmpty,"invalid delivered target before reserve")
+        let a = timedCreationAttributes(0o700); need(code(createSymlink(m,contents,attributes:a).1) == Int(expected) && a.consumedAttributes.isEmpty,"invalid delivered target before reserve")
     }
-    for size in [UInt64(0),UInt64(6),UInt64.max] { let a = creationAttributes(0o700); a.size = size; need(code(createSymlink(m,target,attributes:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"every supplied symlink size refused") }
+    for size in [UInt64(0),UInt64(6),UInt64.max] { let a = timedCreationAttributes(0o700); a.size = size; need(code(createSymlink(m,target,attributes:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"every supplied symlink size refused") }
     for missing in 0..<3 {
         let a = FSItem.SetAttributesRequest(); if missing != 0 { a.mode = 0o700 }; if missing != 1 { a.uid = geteuid() }; if missing != 2 { a.gid = getegid() }
         need(code(createSymlink(m,target,attributes:a).1) == Int(ENOTSUP) && a.consumedAttributes.isEmpty,"explicit required symlink fields")
     }
-    for mode in [UInt32(S_IFREG)|0o700,UInt32(S_IFDIR)|0o700] { need(code(createSymlink(m,target,attributes:creationAttributes(mode)).1) == Int(EINVAL),"conflicting symlink mode kind") }
-    for mode in [UInt32(0o1700),UInt32(0o2700),UInt32(0o4700),UInt32(1)<<31] { need(code(createSymlink(m,target,attributes:creationAttributes(mode)).1) == Int(ENOTSUP),"special/unknown symlink mode") }
+    for mode in [UInt32(S_IFREG)|0o700,UInt32(S_IFDIR)|0o700] { need(code(createSymlink(m,target,attributes:timedCreationAttributes(mode)).1) == Int(EINVAL),"conflicting symlink mode kind") }
+    for mode in [UInt32(0o1700),UInt32(0o2700),UInt32(0o4700),UInt32(1)<<31] { need(code(createSymlink(m,target,attributes:timedCreationAttributes(mode)).1) == Int(ENOTSUP),"special/unknown symlink mode") }
     for field in 0..<5 {
-        let a = creationAttributes(0o700)
-        if field == 0 { a.uid = geteuid()+1 }; if field == 1 { a.gid = getegid()+1 }; if field == 2 { a.flags = 1 }; if field == 3 { a.type = .symlink }; if field == 4 { a.birthTime = timespec(tv_sec:1,tv_nsec:0) }
+        let a = timedCreationAttributes(0o700)
+        if field == 0 { a.uid = geteuid()+1 }; if field == 1 { a.gid = getegid()+1 }; if field == 2 { a.flags = 1 }; if field == 3 { a.type = .symlink }; if field == 4 { a.changeTime = timespec(tv_sec:1,tv_nsec:0) }
         need(code(createSymlink(m,target,attributes:a).1) == Int(field < 2 ? EACCES : ENOTSUP) && a.consumedAttributes.isEmpty,"symlink explicit unsupported/mismatched attributes")
     }
     for caller in [CallerIdentity(uid:-1,gid:0),CallerIdentity(uid:Int(geteuid()),gid:-1),CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid()))] { need(code(createSymlink(m,target,caller:caller).1) == Int(EACCES),"symlink actual caller validation") }
@@ -3762,10 +4132,10 @@ func symlinkRefusals(_ parent: URL) throws {
     for spec in 0..<8 {
         let p = try CreationMount(parent,"symlink-policy-\(spec)",rootMode:spec == 0 ? 0o500 : spec == 1 ? 0o600 : spec == 2 ? 0o1700 : 0o700,
             rootFlags:spec == 3 ? 1 : 0,rootOwner:spec == 4 ? geteuid()+1 : geteuid(),acl:spec == 5,writable:spec != 6,enable:spec != 7)
-        need(code(createSymlink(p,target).1) == Int(spec == 3 || spec == 5 ? ENOTSUP : spec >= 6 ? EROFS : EACCES),"symlink isolated parent/write policy")
+        need(code(createSymlink(p,target,attributes:timedCreationAttributes(0o700)).1) == Int(spec == 3 || spec == 5 ? ENOTSUP : spec >= 6 ? EROFS : EACCES),"symlink isolated parent/write policy")
         p.close(); p.reopened(inode:nil)
     }
-    let restrictive = try CreationMount(parent,"symlink-restrictive"), link = createSymlink(restrictive,target,attributes:creationAttributes(0o200))
+    let restrictive = try CreationMount(parent,"symlink-restrictive"), link = createSymlink(restrictive,target,attributes:timedCreationAttributes(0o200))
     need(link.0 != nil && link.1 == nil && link.2 != nil,"explicit restrictive symlink mode retained")
     let read: (FSReadSymlinkResult?,Error?) = wait { done in restrictive.volume.readlinkResultForTesting(link.2!,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
     need(read.0 == nil && code(read.1) == Int(EACCES),"creation does not grant contextual readlink")
@@ -3776,22 +4146,25 @@ func symlinkFailures(_ parent: URL) throws {
     let target = FSFileName(string:"../target")
     for role in 0..<2 {
         let m = try CreationMount(parent,"symlink-incomplete-\(role)"), v = m.volume, before = v.anchor
+        let originalParent = m.metadata(m.root)
         var seen = 0, constructed = false
         m.serial { v.preparedAttributesForTesting = { name,a in if name == "FSCreateSymlinkResult" { if seen == role { a.invalidateAllProperties() }; seen += 1 } }; v.rejectResultForTesting = { _ in constructed = true; return false } }
-        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a)
+        let a = timedCreationAttributes(0o700), result = createSymlink(m,target,attributes:a)
         need(result.0 == nil && code(result.1) == Int(ENOTSUP) && seen == role+1 && !constructed && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"symlink role invalid before concrete constructor")
-        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
-    for stage in ["added","bound"] {
+    for stage in ["reserved","before-add","added","allocated","bound","inserted"] {
         let m = try CreationMount(parent,"symlink-stage-\(stage)"), v = m.volume
+        let originalParent = m.metadata(m.root)
         weak var unreturned: StallionItem?
         m.serial { v.createStageForTesting = { observed,item in if observed == stage { unreturned = item; throw POSIXError(.ENOMEM) } } }
-        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
-        need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && outcome.discarded && !outcome.releaseAttempted && unreturned == nil,"symlink stage cleanup without double release or object retention")
-        m.state(1); m.absent(); m.close(); m.reopened(inode:nil)
+        let a = timedCreationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
+        need(result.0 == nil && code(result.1) == Int(ENOMEM) && a.consumedAttributes.isEmpty && outcome.discarded == (stage != "reserved") && outcome.releaseAttempted == (stage == "reserved") && unreturned == nil,"symlink stage cleanup without double release or object retention")
+        m.state(1); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
     }
     for scenario in 0..<5 {
         let m = try CreationMount(parent,"symlink-failure-\(scenario)"), v = m.volume, before = v.anchor
+        let originalParent = m.metadata(m.root)
         var constructed = false
         m.serial {
             v.removeCommitReceiptForTesting = { _,_ in need(false,"symlink entered removal receipt") }
@@ -3800,7 +4173,7 @@ func symlinkFailures(_ parent: URL) throws {
             if scenario == 4 { v.createCommitReceiptForTesting = { $0.fence_succeeded = 0 } }
         }
         if scenario == 2 || scenario == 3 { fault(4,Int32(scenario-1)) }
-        let a = creationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
+        let a = timedCreationAttributes(0o700), result = createSymlink(m,target,attributes:a), outcome = v.createOutcomeForTesting
         need(result.0 == nil && code(result.1) == Int(scenario == 1 ? EACCES : scenario == 2 || scenario == 3 ? ENOSPC : EIO) && a.consumedAttributes.isEmpty && anchorMatches(before,v.anchor),"symlink failure \(scenario) error=\(code(result.1))")
         if scenario == 0 { need(constructed,"real concrete constructor precedes injected symlink failure") }
         if scenario == 2 || scenario == 3 { need(hits() > 0 && outcome.original.status == (scenario == 2 ? SFS_IO : SFS_OUTCOME_UNKNOWN),"actual symlink first/second fence disposition") }
@@ -3811,26 +4184,28 @@ func symlinkFailures(_ parent: URL) throws {
             m.serial { var r = sfs_result(), value = sfs_pin_stat(); need(sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID && !v.createStateForTesting.pending && v.activeItemCount() == 1,"unreturned promoted symlink token consumed") }
         } else { need(outcome.discarded && !outcome.releaseAttempted,"discarded symlink reservation not released twice") }
         m.close()
-        if scenario == 4 { symlinkReopened(m,inode:2,target:target.data) }
-        else if scenario != 3 { m.reopened(inode:nil) }
+        if scenario == 4 { symlinkReopened(m,inode:2,target:target.data); creationTimesReopened(m,2,InitialTimes(a),originalParent,mode:a.mode) }
+        else if scenario != 3 { m.reopened(inode:nil); metadataReopened(m,1,originalParent) }
     }
     for capacity in [UInt64(16384),UInt64(20480),UInt64(40960)] {
         let m = try CreationMount(parent,"symlink-limit-\(capacity)",capacity:capacity,limit:2), v = m.volume
+        let originalParent = m.metadata(m.root)
         m.serial { var info = sfs_image_information(), r = sfs_result(); need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.committed_end == 16384 && info.append_headroom == capacity-16384,"actual symlink root-only capacity geometry") }
         let contents = FSFileName(data:Data(repeating:120,count:4096)); need(contents.data.count == 4096,"actual max target delivered")
-        let a = creationAttributes(0o700), result = createSymlink(m,contents,attributes:a), outcome = v.createOutcomeForTesting
+        let a = timedCreationAttributes(0o700), result = createSymlink(m,contents,attributes:a), outcome = v.createOutcomeForTesting
         if capacity == 40960 {
             need(result.0 != nil && result.1 == nil && result.2 != nil && v.anchor.committed_end == 40960,"six symlink cells fit exact capacity")
             m.state(2,cap:2); m.close(); symlinkReopened(m,inode:result.2!.inode,target:contents.data)
+            creationTimesReopened(m,result.2!.inode,InitialTimes(a),originalParent,mode:a.mode)
         } else {
             need(result.0 == nil && code(result.1) == Int(ENOSPC) && outcome.original.status == SFS_LIMIT && outcome.original.limit_reason == SFS_LIMIT_APPEND_CAPACITY && a.consumedAttributes.isEmpty,"actual symlink append capacity failure")
             need(outcome.beginSucceeded == (capacity == 20480) && outcome.discarded == (capacity == 20480) && outcome.releaseAttempted == (capacity == 16384),"symlink begin reservation versus mutation discard")
-            m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil)
+            m.state(1,cap:2); m.absent(); m.close(); m.reopened(inode:nil); metadataReopened(m,1,originalParent)
         }
     }
     let q = try CreationMount(parent,"symlink-release-quarantine"), v = q.volume
     q.serial { v.createStageForTesting = { stage,_ in if stage == "reserved" { throw POSIXError(.ENOMEM) } }; v.createReleaseForTesting = { _,_,r in r.status = SFS_IO; r.system_errno = EIO; return SFS_IO } }
-    let failure = createSymlink(q,target)
+    let failure = createSymlink(q,target,attributes:timedCreationAttributes(0o700))
     q.serial { need(failure.0 == nil && code(failure.1) == Int(ENOMEM) && v.createStateForTesting.pending && v.createStateForTesting.quarantine && v.createStateForTesting.ticket == 1 && v.activeItemCount() == 1 && v.createOutcomeForTesting.release.status == SFS_IO,"primary symlink failure plus unresolved release quarantine") }
     q.close(); q.reopened(inode:nil)
 }
@@ -3838,6 +4213,7 @@ func symlinkQueued(_ parent: URL) throws {
     for quarantine in [false,true] {
         let m = try CreationMount(parent,"symlink-queued-\(quarantine)",directory:quarantine), v = m.volume, before = v.anchor
         let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
+        let originalParent = m.metadata(m.root)
         var preflights = 0, cleared = false
         weak var unreturned: StallionItem?
         v.enqueue {
@@ -3846,7 +4222,7 @@ func symlinkQueued(_ parent: URL) throws {
             held.signal(); need(resume.wait(timeout:.now()+20) == .success,"resume symlink queue")
         }
         need(held.wait(timeout:.now()+20) == .success,"hold symlink queue")
-        let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), first = creationAttributes(0o700), next = creationAttributes(0o700), target = FSFileName(string:"../target")
+        let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), first = timedCreationAttributes(0o700), next = timedCreationAttributes(0o700), target = FSFileName(string:"../target")
         replies.enter(); v.symlinkResultForTesting(FSFileName(string:"first"),directory:m.root,attributes:first,linkContents:target,caller:caller) { result,error in
             need(result == nil && code(error) == Int(ENOMEM),"first symlink failure"); v.createStageForTesting = nil; v.createAbortForTesting = nil; cleared = true; replies.leave()
         }
@@ -3861,8 +4237,10 @@ func symlinkQueued(_ parent: URL) throws {
         }
         need(v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"symlink queue releases all charges")
         m.close(); m.reopened("first",inode:nil); m.reopened("next",inode:nil)
+        if !quarantine { metadataReopened(m,1,originalParent) }
     }
     let m = try CreationMount(parent,"symlink-budget"), v = m.volume
+    let originalParent = m.metadata(m.root)
     let held = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), replies = DispatchGroup()
     let name = FSFileName(string:String(repeating:"n",count:255)), target = FSFileName(data:Data(repeating:120,count:4096)), caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
     need(name.data.count == 255 && target.data.count == 4096,"maximum delivered name/target")
@@ -3870,17 +4248,18 @@ func symlinkQueued(_ parent: URL) throws {
     need(held.wait(timeout:.now()+20) == .success,"hold saturated symlink queue")
     var successes = 0, duplicates = 0
     for _ in 0..<ReadOnlyLimits.callbacks {
-        replies.enter(); v.symlinkResultForTesting(name,directory:m.root,attributes:creationAttributes(0o700),linkContents:target,caller:caller) { result,error in
+        replies.enter(); v.symlinkResultForTesting(name,directory:m.root,attributes:timedCreationAttributes(0o700),linkContents:target,caller:caller) { result,error in
             need((result != nil && error == nil) || (result == nil && code(error) == Int(EEXIST)),"first max symlink succeeds and later duplicate names refuse"); if result != nil { successes += 1 } else { duplicates += 1 }; replies.leave()
         }
     }
     need(v.linkBudgetForTesting.0 == 256 && v.linkBudgetForTesting.1 == 2_162_432,"exact max name+target callback bound")
-    let refused: (FSCreateSymlinkResult?,Error?) = wait { done in v.symlinkResultForTesting(name,directory:m.root,attributes:creationAttributes(0o700),linkContents:target,caller:caller) { done(($0,$1)) } }
+    let refused: (FSCreateSymlinkResult?,Error?) = wait { done in v.symlinkResultForTesting(name,directory:m.root,attributes:timedCreationAttributes(0o700),linkContents:target,caller:caller) { done(($0,$1)) } }
     need(refused.0 == nil && code(refused.1) == Int(EAGAIN),"saturated symlink admission refuses without charge")
     resume.signal(); need(replies.wait(timeout:.now()+20) == .success,"bounded symlink admission drain")
     need(successes == 1 && duplicates == 255,"exact saturated symlink outcomes")
     let item = m.lookup(String(repeating:"n",count:255)) as! StallionItem; m.returned.append(item)
     m.state(2); symlinkReadback(m,item,target.data); m.close(); symlinkReopened(m,String(repeating:"n",count:255),inode:item.inode,target:target.data)
+    creationTimesReopened(m,item.inode,InitialTimes(timedCreationAttributes(0o700)),originalParent,mode:0o700)
 }
 #endif
 
@@ -3906,10 +4285,10 @@ func coreXattr(_ h: OpaquePointer, inode: UInt64, name: Data, view: sfs_view = 0
     } }
     need(read == SFS_OK && count == data.count,"exact complete binary xattr"); return data
 }
-func reopenedXattr(_ f: Fixture, name: Data = Data("note".utf8), view: sfs_view = 0) -> Data? {
+func reopenedXattr(_ f: Fixture, name: Data = Data("note".utf8), view: sfs_view = 0, inode: UInt64? = nil) -> Data? {
     fault(0,0); var h: OpaquePointer?, r = sfs_result()
     need(sfs_image_open_readonly(f.url.path,"image.sfs",&h,&r) == SFS_OK,"xattr reopen")
-    let value = coreXattr(h!,inode:f.id,name:name,view:view)
+    let value = coreXattr(h!,inode:inode ?? f.id,name:name,view:view)
     need(sfs_image_close(h,&r) == SFS_OK,"xattr reopen close"); return value
 }
 func xattrMetadataUnchanged(_ before: sfs_metadata_entry, _ after: sfs_metadata_entry) {
@@ -3992,6 +4371,241 @@ func contextualXattrValues(_ parent: URL) throws {
     for (name,value) in delivered { need(reopenedXattr(f,name:name) == value,"reopened ordinary xattr bytes") }
     need(reopenedXattr(f,name:large.data) == limit && reopenedXattr(f,name:absent.data) == nil && f.contents() == Data("original".utf8),"reopened value limit, deletion and unchanged file bytes")
 }
+func xattrItems(_ m: Mounted) -> [FSItem] {
+    [m.file,m.root,namespaceLookup(m,"dir"),m.link]
+}
+func releaseXattrDirectory(_ m: Mounted, _ items: [FSItem]) {
+    let error: Error? = wait { m.volume.reclaimForTesting(items[2],eligible:true,replyHandler:$0) }
+    need(error == nil,"release xattr directory")
+}
+func xattrReadback(_ m: Mounted, _ item: FSItem, _ expected: Data) {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    let value: (FSGetXattrResult?,Error?) = wait { done in m.volume.xattrResultForTesting(item,caller:caller) { done(($0,$1)) } }
+    let list: (FSListXattrsResult?,Error?) = wait { done in m.volume.xattrsResultForTesting(item,caller:caller) { done(($0,$1)) } }
+    need(value.0 != nil && value.1 == nil && list.0 != nil && list.1 == nil,"actual SDK value and names result constructors")
+    let bytes: (Data?,Error?) = wait { done in m.volume.getXattr(named:FSFileName(string:"note"),of:item) { done(($0,$1)) } }
+    let names: ([FSFileName]?,Error?) = wait { done in m.volume.listXattrs(of:item) { done(($0,$1)) } }
+    need(bytes.0 == expected && bytes.1 == nil && names.1 == nil && names.0!.map(\.data).contains(Data("note".utf8)),"exact committed value and enumerated name")
+}
+func reopenedXattrMetadata(_ f: Fixture, inode: UInt64) -> sfs_metadata_entry {
+    fault(0,0); var h: OpaquePointer?, r = sfs_result(), value = sfs_metadata_entry()
+    need(sfs_image_open_readonly(f.url.path,"image.sfs",&h,&r) == SFS_OK,"xattr metadata reopen")
+    need(sfs_image_stat_metadata(h,0,inode,&value,&r) == SFS_OK,"xattr reopened metadata")
+    need(sfs_image_close(h,&r) == SFS_OK,"xattr metadata reopen close"); return value
+}
+func contextualXattrKinds(_ parent: URL) throws {
+    let f = try Fixture(parent,"xattr-kinds",mode:0o700,directory:true,xattrProfile:true), m = try Mounted(f), items = xattrItems(m)
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    var persisted: [(UInt64,Data)] = []
+    for (kind,item) in items.enumerated() {
+        let before = namespaceMetadata(m,item), binary = Data([0,255,UInt8(kind),0,128])
+        let key = FSFileName(string:"org.example.binary")
+        for name in ["com.apple.system.Security","com.apple.system.other","com.apple.acl.text","com.apple.decmpfs","com.apple.macl","com.apple.provenance"] {
+            for policy in [FSVolume.SetXattrPolicy.alwaysSet,.delete] {
+                need(code(setXattr(m,name:FSFileName(string:name),value:Data(),policy:policy,item:item).1) == Int(ENOTSUP),"each kind retains forbidden security and semantic namespaces")
+            }
+        }
+        let outsider = CallerIdentity(uid:caller.uid+1,gid:caller.gid)
+        need(code(setXattr(m,value:Data(),item:item,caller:outsider).1) == Int(EACCES),"foreign caller cannot write an owned kind")
+        for policy in [FSVolume.SetXattrPolicy.mustReplace,.delete] {
+            need(code(setXattr(m,name:key,value:policy == .delete ? nil : binary,policy:policy,item:item).1) == Int(ENOATTR),"new kind missing attribute policy")
+        }
+        need(setXattr(m,name:key,value:Data(),policy:.mustCreate,item:item).1 == nil,"new kind empty create")
+        m.serial { need(coreXattr(m.coreHandle,inode:before.entry.inode,name:key.data) == Data(),"new kind empty value remains present") }
+        need(code(setXattr(m,name:key,value:binary,policy:.mustCreate,item:item).1) == Int(EEXIST),"new kind existing create refusal")
+        need(setXattr(m,name:key,value:binary,policy:.mustReplace,item:item).1 == nil,"new kind replace")
+        need(setXattr(m,name:key,value:Data([9]),policy:.delete,item:item).1 == nil,"new kind delete ignores bounded payload")
+        need(setXattr(m,value:nil,policy:.delete,item:item).1 == nil,"new kind nil delete")
+        let result = setXattr(m,value:binary,policy:.mustCreate,item:item)
+        need(result.0 != nil && result.1 == nil,"actual SDK free-space result on supported kind")
+        xattrReadback(m,item,binary)
+        for (name,data) in [("com.apple.FinderInfo",Data(repeating:0,count:32)),("com.apple.quarantine",Data("0081;0;test;".utf8))] {
+            need(setXattr(m,name:FSFileName(string:name),value:data,item:item).1 == nil,"ordinary FinderInfo and quarantine are opaque values")
+        }
+        let fork = FSFileName(string:"com.apple.ResourceFork"), anchor = m.volume.anchor
+        if kind == 0 {
+            need(setXattr(m,name:fork,value:binary,item:item).1 == nil && setXattr(m,name:fork,value:nil,policy:.delete,item:item).1 == nil,"regular resource fork remains supported")
+        } else {
+            for policy in [FSVolume.SetXattrPolicy.alwaysSet,.mustCreate,.mustReplace,.delete] {
+                need(code(setXattr(m,name:fork,value:policy == .delete ? nil : binary,policy:policy,item:item).1) == Int(EPERM),"nonregular resource fork set and delete refuse before existence checks")
+            }
+            need(anchorMatches(anchor,m.volume.anchor),"resource fork refusal cannot commit")
+            m.serial { need(coreXattr(m.coreHandle,inode:before.entry.inode,name:fork.data) == Data("inherited".utf8),"refused fork mutation preserves inherited bytes") }
+        }
+        for rights: FSVolume.AccessMask in [[.writeXattr],[.readXattr,.writeXattr],[.writeXattr,.writeAttributes,.writeSecurity]] {
+            let access = namespaceAccess(m.volume,item,rights,caller:caller)
+            need(access.0 != nil && access.1 == nil,"original owner read/write/metadata intersection")
+        }
+        let unrelated: FSVolume.AccessMask = [.writeXattr,.writeSecurity]
+        for right: FSVolume.AccessMask in [.delete,.deleteChild,.takeOwnership,FSVolume.AccessMask(rawValue:1<<30)] {
+            need(code(namespaceAccess(m.volume,item,unrelated.union(right)).1) == Int(EACCES),"xattr grant cannot authorize unrelated rights")
+        }
+        let large = FSFileName(string:"large"), value = Data(repeating:0xa5,count:ReadOnlyLimits.xattrValue)
+        need(setXattr(m,name:large,value:value,item:item).1 == nil,"each kind accepts bounded whole value")
+        let bound = m.volume.anchor
+        for policy in [FSVolume.SetXattrPolicy.alwaysSet,.delete] {
+            need(code(setXattr(m,name:large,value:Data(count:ReadOnlyLimits.xattrValue+1),policy:policy,item:item).1) == Int(E2BIG),"each kind bounds set and ignored delete bytes")
+        }
+        need(anchorMatches(bound,m.volume.anchor),"oversized values do not commit")
+        need(setXattr(m,name:large,value:nil,policy:.delete,item:item).1 == nil,"remove bounded test value")
+        let after = namespaceMetadata(m,item); xattrMetadataUnchanged(before,after)
+        persisted.append(((item as! StallionItem).inode,binary))
+    }
+    // Aliases address the link inode; replacing or removing its lexical target cannot retarget EA operations.
+    need(namespaceLink(m,m.link,name:Data("link-alias".utf8)).1 == nil,"hardlink a symlink")
+    let alias = namespaceLookup(m,"link-alias"); need(alias === m.link,"symlink aliases share canonical identity")
+    need(setXattr(m,value:Data([7]),item:alias).1 == nil,"symlink alias xattr")
+    xattrReadback(m,m.link,Data([7])); xattrReadback(m,m.file,persisted[0].1)
+    need(removal(m,name:Data("file".utf8)).1 == nil,"remove lexical symlink target")
+    need(setXattr(m,value:Data([8]),item:m.link).1 == nil,"dangling symlink xattr")
+    need(namespaceLink(m,items[2],name:Data("file".utf8)).1 != nil,"directory hardlink remains refused")
+    need(namespaceLink(m,m.link,name:Data("file".utf8)).1 == nil,"replace target name with another symlink alias")
+    need(setXattr(m,value:Data([9]),item:m.link).1 == nil,"changed target cannot redirect xattr")
+    xattrReadback(m,m.file,persisted[0].1)
+    releaseXattrDirectory(m,items); m.close()
+    for (index,entry) in persisted.enumerated() {
+        need(reopenedXattr(f,inode:entry.0) == (index == 3 ? Data([9]) : entry.1),"closed readonly readback for each linked kind and root")
+        for (name,value) in [("com.apple.FinderInfo",Data(repeating:0,count:32)),("com.apple.quarantine",Data("0081;0;test;".utf8))] {
+            need(reopenedXattr(f,name:Data(name.utf8),inode:entry.0) == value,"closed ordinary xattr bytes")
+        }
+    }
+    need(f.contents() == Data("original".utf8),"link xattrs never change target contents")
+}
+func contextualXattrKindPolicy(_ parent: URL) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    // Read admission is deliberately independent of the stricter mutation policy.
+    for readOnly in [false,true] { for profile in 0..<5 {
+        let mode: UInt32 = profile == 0 ? 0o400 : profile == 1 ? 0o1600 : 0o600
+        let flags: UInt32 = profile == 2 ? 1 : profile == 3 ? 0x8000 : 0
+        let f = try Fixture(parent,"xattr-kind-read-\(readOnly)-\(profile)",mode:mode,sourceFlags:flags,directory:true,xattrProfile:true)
+        let m = try Mounted(f,writable:!readOnly), items = xattrItems(m), before = m.volume.anchor
+        for item in items {
+            xattrReadback(m,item,Data("value".utf8))
+            if item !== m.file {
+                let fork: (Data?,Error?) = wait { done in m.volume.getXattr(named:FSFileName(string:"com.apple.ResourceFork"),of:item) { done(($0,$1)) } }
+                need(fork.0 == Data("inherited".utf8) && fork.1 == nil,"read policy retains inherited nonregular resource fork bytes")
+            }
+            need(namespaceAccess(m.volume,item,.readXattr).1 == nil,"read0400 alone admitted without search, writable resource or mutation flags")
+            if readOnly || profile != 4 {
+                let expected = readOnly ? EROFS : profile >= 2 ? ENOTSUP : EACCES
+                for policy in [FSVolume.SetXattrPolicy.alwaysSet,.delete] {
+                    need(code(setXattr(m,value:policy == .delete ? nil : Data([1]),policy:policy,item:item).1) == Int(expected),"readable object still refuses mutation")
+                }
+                need(namespaceAccess(m.volume,item,[.readXattr,.writeXattr]).0 == nil,"read grant cannot satisfy combined mutation mask")
+            }
+        }
+        need(anchorMatches(before,m.volume.anchor) && m.volume.diagnosticSnapshot().0.commits == 0,"read and refusal matrix makes no commit")
+        releaseXattrDirectory(m,items); m.close()
+    } }
+    for profile in 0..<5 {
+        let f = try Fixture(parent,"xattr-kind-denial-\(profile)",mode:profile == 0 ? 0 : 0o600,acl:profile == 1,owner:profile == 2 ? geteuid()+1 : geteuid(),directory:true,xattrProfile:true)
+        let m = try Mounted(f), items = xattrItems(m), before = m.volume.anchor
+        let identity = profile == 3 ? CallerIdentity(uid:-1,gid:caller.gid) : profile == 4 ? CallerIdentity(uid:caller.uid,gid:-1) : caller
+        for item in items {
+            let expected = profile == 1 ? ENOTSUP : EACCES
+            let value: (FSGetXattrResult?,Error?) = wait { done in m.volume.xattrResultForTesting(item,caller:identity) { done(($0,$1)) } }
+            let list: (FSListXattrsResult?,Error?) = wait { done in m.volume.xattrsResultForTesting(item,caller:identity) { done(($0,$1)) } }
+            need(value.0 == nil && code(value.1) == Int(expected) && list.0 == nil && code(list.1) == Int(expected),"new kind read mode/ACL/exact caller refusal")
+            for policy in [FSVolume.SetXattrPolicy.alwaysSet,.delete] {
+                need(code(setXattr(m,value:Data(),policy:policy,item:item,caller:identity).1) == Int(expected),"new kind write mode/ACL/exact caller refusal")
+            }
+            for rights: FSVolume.AccessMask in [[.writeXattr],[.readXattr,.writeXattr],[.writeXattr,.writeAttributes,.writeSecurity]] {
+                need(code(namespaceAccess(m.volume,item,rights,caller:identity).1) == Int(expected),"combined rights retain original-state denial")
+            }
+        }
+        need(anchorMatches(before,m.volume.anchor) && m.volume.diagnosticSnapshot().0.commits == 0,"policy refusals preserve receipt and no-commit state")
+        releaseXattrDirectory(m,items); m.close()
+    }
+    for mode: UInt32 in [0o200,0o300] {
+        let f = try Fixture(parent,"xattr-write-only-\(mode)",mode:mode,directory:true,xattrProfile:true), m = try Mounted(f), items = xattrItems(m)
+        for (kind,item) in items.enumerated() {
+            need(setXattr(m,value:Data([2]),item:item).1 == nil && namespaceAccess(m.volume,item,.writeXattr).1 == nil,"write0200 alone admits EA without read/search")
+            need(code(namespaceAccess(m.volume,item,[.readXattr,.writeXattr]).1) == Int(EACCES),"write cannot grant missing read0400")
+            if kind == 1 || kind == 2 {
+                let result = namespaceAccess(m.volume,item,[.addSubdirectory,.writeXattr,.writeAttributes,.writeSecurity])
+                need(mode == 0o300 ? result.0 != nil && result.1 == nil : result.0 == nil && code(result.1) == Int(EACCES),"creation plus EA requires independent original search bit")
+            }
+        }
+        releaseXattrDirectory(m,items); m.close()
+    }
+    let readFixture = try Fixture(parent,"xattr-kind-result-refusal",directory:true,xattrProfile:true), readMount = try Mounted(readFixture), readItems = xattrItems(readMount)
+    let readAnchor = readMount.volume.anchor
+    for item in readItems { for operation in ["FSGetXattrResult","FSListXattrsResult"] {
+        var reached = false
+        readMount.serial { readMount.volume.rejectResultForTesting = { type in reached = reached || type == operation; return type == operation } }
+        let rejected: (Bool,Error?) = wait { done in
+            if operation == "FSGetXattrResult" { readMount.volume.xattrResultForTesting(item,caller:caller) { done(($0 == nil,$1)) } }
+            else { readMount.volume.xattrsResultForTesting(item,caller:caller) { done(($0 == nil,$1)) } }
+        }
+        need(reached && rejected.0 && code(rejected.1) == Int(EIO),"new-kind value/names constructor rejection")
+    } }
+    readMount.serial { readMount.volume.rejectResultForTesting = nil }
+    need(anchorMatches(readAnchor,readMount.volume.anchor) && readMount.volume.diagnosticSnapshot().0.commits == 0,"read constructor failures preserve anchor and ownership")
+    for item in readItems { xattrReadback(readMount,item,Data("value".utf8)) }
+    releaseXattrDirectory(readMount,readItems); readMount.close()
+    // Immutable metadata is a policy input only; core images do not admit that flag.
+    for kind in [SFS_FILE,SFS_DIRECTORY,SFS_SYMLINK] {
+        var metadata = sfs_metadata_entry(); metadata.entry.kind = kind; metadata.uid = geteuid(); metadata.mode = 0o600; metadata.flags = UInt32(UF_IMMUTABLE)
+        do { try checkXattrOwnerPolicy(metadata,owner:geteuid(),caller:caller); need(false,"immutable policy input admitted") }
+        catch { need(code(error) == Int(ENOTSUP),"explicit immutable policy denial") }
+    }
+}
+func contextualXattrKindIdentity(_ parent: URL) throws {
+    for kind in 1..<4 { for scenario in 0..<7 {
+        let f = try Fixture(parent,"xattr-kind-identity-\(kind)-\(scenario)",directory:true,xattrProfile:true), m = try Mounted(f), items = xattrItems(m)
+        let item = items[kind] as! StallionItem, token = item.pin!, before = m.volume.anchor
+        var target: FSItem = item
+        if scenario == 0 { target = StallionItem(item.inode) }
+        if scenario == 1 { m.serial { item.pin = nil } }
+        if scenario == 2 { m.serial { item.pin = sfs_pin() } }
+        if scenario == 3 { m.serial { item.pin = (m.file as! StallionItem).pin } }
+        if scenario == 4 { need(wait { m.volume.reclaimForTesting(item,eligible:true,replyHandler:$0) } == nil,"reclaim new-kind xattr target") }
+        if scenario == 5 { m.resource.revoke() }
+        if scenario == 6 { let _: Bool = wait { done in m.volume.unmount { done(true) } } }
+        let expected = scenario == 3 ? EIO : scenario == 5 ? EACCES : scenario == 6 ? ENXIO : EINVAL
+        let access = namespaceAccess(m.volume,target,.writeXattr)
+        need(access.0 == nil && code(access.1) == Int(expected),"actual access rejects foreign/reclaimed/wrong-pin/revoked/unmounted item")
+        for policy in [FSVolume.SetXattrPolicy.alwaysSet,.delete] {
+            let result = setXattr(m,value:Data([3]),policy:policy,item:target)
+            need(result.0 == nil && code(result.1) == Int(expected),"setter shares exact canonical full-pin and resource gates")
+        }
+        need(anchorMatches(before,m.volume.anchor) && m.volume.diagnosticSnapshot().0.commits == 0,"identity/resource refusal leaves committed anchor")
+        if (1...3).contains(scenario) { m.serial { item.pin = token } }
+        if scenario == 6 { need(wait { m.volume.mount(arguments:[],replyHandler:$0) } == nil,"remount after xattr access refusal") }
+        if !(kind == 2 && scenario == 4) { releaseXattrDirectory(m,items) }
+        m.close(); need(reopenedXattr(f,inode:item.inode) == Data("value".utf8),"identity refusals preserve closed xattrs")
+    } }
+}
+func contextualXattrDetachedKinds(_ parent: URL) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    for symlink in [false,true] {
+        let m = try CreationMount(parent,"xattr-detached-kind-\(symlink)",limit:3), v = m.volume
+        let target = Data("../missing/../../target".utf8)
+        let item = symlink ? createSymlink(m,FSFileName(data:target),name:"item").2! : m.create("item",request:creationAttributes(0o700),type:.directory).2!
+        func set(_ value: Data?, _ policy: FSVolume.SetXattrPolicy = .alwaysSet) -> (FSSetXattrResult?,Error?) {
+            wait { done in v.setXattrResultForTesting(FSFileName(string:"note"),value:value,item:item,policy:policy,caller:caller) { done(($0,$1)) } }
+        }
+        need(set(Data([1])).1 == nil,"linked EA before final unlink")
+        let removed: (FSRemoveItemResult?,Error?) = wait { done in v.removeResultForTesting(item,name:FSFileName(string:"item"),directory:m.root,caller:caller) { done(($0,$1)) } }
+        need(removed.0 != nil && removed.1 == nil && item.lastKnownParent != nil,"real final unlink retains parent witness")
+        let token = item.pin!, witness = item.lastKnownParent!, original = metadataValue(m,item)
+        need(set(Data([0,255]),.mustReplace).1 == nil,"held directory/symlink exact-pin replacement")
+        xattrMetadataUnchanged(original,metadataValue(m,item))
+        need(item.lastKnownParent?.item == witness.item && item.lastKnownParent?.parent == witness.parent && sameBytes(item.lastKnownParent!.pin,witness.pin) && sameBytes(item.pin!,token),"EA changes preserve last-parent witness and full pin")
+        let value: (FSGetXattrResult?,Error?) = wait { done in v.xattrResultForTesting(item,caller:caller) { done(($0,$1)) } }
+        let names: (FSListXattrsResult?,Error?) = wait { done in v.xattrsResultForTesting(item,caller:caller) { done(($0,$1)) } }
+        need(value.0 != nil && value.1 == nil && names.0 != nil && names.1 == nil,"held get/list constructors do not fabricate a parent")
+        m.serial { need(coreXattr(m.coreHandle,inode:item.inode,name:Data("note".utf8),pin:token) == Data([0,255]),"held bytes through original pin") }
+        if symlink { symlinkReadback(m,item,target,heldPin:token) }
+        else { need(code(m.create("forbidden",parent:item).1) == Int(ENOENT),"EA grant does not confer detached namespace authority") }
+        need(wait { v.reclaimForTesting(item,eligible:false,replyHandler:$0) } == nil,"false reclaim preserves held EA owner")
+        need(set(nil,.delete).1 == nil && set(Data(),.mustCreate).1 == nil,"held delete and empty re-create")
+        need(m.reclaim(item) == nil,"true reclaim retires held EA owner")
+        need(code(set(Data()).1) == Int(EINVAL),"retired EA target refuses")
+        m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(item.pin == nil && item.lastKnownParent == nil && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"retirement clears witness and pin") }
+        m.close(); m.reopened("item",inode:nil)
+    }
+}
 func contextualXattrRefusals(_ parent: URL) throws {
     for index in 0..<5 {
         let f = try Fixture(parent,"xattr-policy-\(index)",mode:index == 0 ? 0o400 : index == 1 ? 0o1600 : 0o600,
@@ -4018,7 +4632,7 @@ func contextualXattrRefusals(_ parent: URL) throws {
         need(denied.0 == nil && code(denied.1) == Int(EACCES),"combined xattr and metadata/security rights preserve exact owner and valid caller identity")
     }
     let directory = namespaceLookup(m,"dir")
-    for item in [m.root,m.link,directory] { need(code(setXattr(m,value:Data(),item:item).1) == Int(ENOTSUP),"nonregular xattr target refused") }
+    for item in [m.root,m.link,directory] { need(code(setXattr(m,name:FSFileName(string:"com.apple.ResourceFork"),value:Data(),item:item).1) == Int(EPERM),"nonregular resource fork mutation refused") }
     need(code(setXattr(m,value:Data(),item:StallionItem(f.id)).1) == Int(EINVAL),"foreign canonical item refused")
     m.serial { var r = sfs_result(); need(sfs_image_begin(m.coreHandle,&r) == SFS_OK,"active transaction refusal setup") }
     need(code(setXattr(m,value:Data()).1) == Int(EBUSY),"xattr cannot enter an existing transaction")
@@ -4048,108 +4662,138 @@ func contextualXattrRefusals(_ parent: URL) throws {
     need(setXattr(detached,value:nil,policy:.delete).1 == nil,"detached xattr delete"); detached.close()
 }
 func contextualXattrFailures(_ parent: URL) throws {
-    for mode in 0..<8 {
-        let f = try Fixture(parent,"xattr-failure-\(mode)"), m = try Mounted(f), v = m.volume, anchor = v.anchor
+    for kind in 0..<4 { for mode in 0..<9 {
+        let f = try Fixture(parent,"xattr-failure-\(kind)-\(mode)",directory:true,xattrProfile:true), m = try Mounted(f), v = m.volume, anchor = v.anchor
+        let items = xattrItems(m), item = items[kind], inode = (item as! StallionItem).inode, original = namespaceMetadata(m,item)
+        var originalCommit = sfs_result()
         m.serial {
             if mode == 0 { v.rejectResultForTesting = { $0 == "FSSetXattrResult" } }
             if mode == 1 { v.diagnosticBeforeCommit = { m.resource.revoke() } }
             if mode == 2 { v.diagnosticBeforePrepare = { sfs_image_clear_read_cache(m.coreHandle); fault(8,1) } }
+            if mode == 8 { v.xattrCommitReceiptForTesting = { original,receipt in originalCommit = original; receipt.fence_succeeded = 0 } }
         }
         if mode == 3 { fault(7,1) }
         if mode == 4 { fault(1,1) }
         if mode == 5 || mode == 6 { fault(4,Int32(mode-4)) }
         if mode == 7 { fault(6,1) }
-        let result = setXattr(m,value:Data([8,0,255]))
-        let expected = mode == 0 || mode == 2 ? EIO : mode == 1 ? EACCES : mode == 3 ? ENOMEM : mode == 7 ? ENXIO : ENOSPC
+        let result = setXattr(m,value:Data([8,0,255]),item:item)
+        let expected = mode == 0 || mode == 2 || mode == 8 ? EIO : mode == 1 ? EACCES : mode == 3 ? ENOMEM : mode == 7 ? ENXIO : ENOSPC
         need(result.0 == nil && code(result.1) == Int(expected) && anchorMatches(v.anchor,anchor),"xattr failure never acknowledges a result")
-        if mode >= 2 { need(hits() > 0,"real core fault reached") }
+        if (2...7).contains(mode) { need(hits() > 0,"real core fault reached") }
         if mode == 5 || mode == 6 {
             let failure = v.diagnosticSnapshot().2!
             need(failure.result.status == (mode == 5 ? SFS_IO : SFS_OUTCOME_UNKNOWN) &&
                  failure.result.phase == (mode == 5 ? SFS_PHASE_RECORD_BARRIER : SFS_PHASE_COMMIT_BARRIER) &&
                  failure.result.poisoned != 0,"original xattr fence receipt retained")
-            fault(0,0); need(code(setXattr(m,value:Data()).1) == Int(ENOSPC),"xattr fence failure stays sticky")
+            fault(0,0); need(code(setXattr(m,value:Data(),item:item).1) == Int(ENOSPC),"xattr fence failure stays sticky")
         }
         if mode == 0 {
             m.serial { var r = sfs_result(), info = sfs_image_information()
                 need(sfs_image_get_information(m.coreHandle,&info,&r) == SFS_OK && r.transaction_active == 0 && anchorMatches(r,anchor),"result failure verified abort") }
             need(code(m.sync()) == Int(EIO),"xattr constructor failure survives sync")
         }
-        fault(0,0); m.close()
-        let persisted = reopenedXattr(f)
-        if mode != 6 { need(persisted == Data("value".utf8),"failed xattr leaves acknowledged value") }
-        else { need(persisted == Data("value".utf8) || persisted == Data([8,0,255]),"unknown xattr publication is one complete state") }
-        need(f.contents() == Data("original".utf8),"xattr fault never changes file data")
+        fault(0,0)
+        if mode == 8 {
+            need(originalCommit.status == SFS_OK && originalCommit.fence_succeeded == 3 && originalCommit.transaction_active == 0 && v.diagnosticSnapshot().0.commitSuccess == 1,"malformed EA receipt preserves original actual successful commit")
+            need(code(setXattr(m,value:Data(),item:item).1) == Int(EIO),"malformed receipt remains first delivery error")
+            for held in [items[0],items[2],items[3]] {
+                let own = held as! StallionItem, token = own.pin!
+                need(code(wait { v.reclaimForTesting(held,eligible:true,replyHandler:$0) }) == Int(ESTALE),"old anchor reports consumed-error reclaim")
+                m.serial { var value = sfs_pin_stat(), r = sfs_result(); need(own.pin == nil && own.lastKnownParent == nil && !v.ownsForTesting(own) && sfs_image_pin_stat(m.coreHandle,token,&value,&r) == SFS_INVALID,"consumed error retires exact pin without retry") }
+            }
+            need(v.diagnosticSnapshot().2?.code == Int(EIO),"cleanup preserves malformed receipt error")
+        } else { releaseXattrDirectory(m,items) }
+        m.close()
+        if mode != 6 {
+            need(reopenedXattr(f,inode:inode) == (mode == 8 ? Data([8,0,255]) : Data("value".utf8)),"closed EA recovery follows known commit outcome")
+            let recovered = reopenedXattrMetadata(f,inode:inode); xattrMetadataUnchanged(original,recovered)
+            if mode != 8 { need(sameBytes(original.change,recovered.change),"known abort preserves original ctime") }
+            need(f.contents() == Data("original".utf8),"known EA failure preserves file data")
+        }
+        // An unknown commit outcome retains its error and asserts neither durable state.
+    } }
+    for kind in 0..<4 {
+        let f = try Fixture(parent,"xattr-capacity-\(kind)",directory:true,capacity:512*1024,xattrProfile:true), m = try Mounted(f), anchor = m.volume.anchor
+        let items = xattrItems(m), item = items[kind], inode = (item as! StallionItem).inode, original = namespaceMetadata(m,item)
+        let result = setXattr(m,value:Data(count:ReadOnlyLimits.xattrValue),item:item)
+        need(result.0 == nil && code(result.1) == Int(ENOSPC) && anchorMatches(m.volume.anchor,anchor),"real xattr append capacity refuses atomically")
+        let failure = m.volume.diagnosticSnapshot().2!
+        need(failure.result.status == SFS_LIMIT && failure.result.limit_reason == SFS_LIMIT_APPEND_CAPACITY,"capacity receipt preserves limit reason")
+        releaseXattrDirectory(m,items); m.close(); need(reopenedXattr(f,inode:inode) == Data("value".utf8),"capacity failure preserves original xattr")
+        let recovered = reopenedXattrMetadata(f,inode:inode); xattrMetadataUnchanged(original,recovered)
+        need(sameBytes(original.change,recovered.change),"capacity failure preserves ctime")
     }
-    let f = try Fixture(parent,"xattr-capacity",capacity:128*1024), m = try Mounted(f), anchor = m.volume.anchor
-    let result = setXattr(m,value:Data(count:ReadOnlyLimits.xattrValue))
-    need(result.0 == nil && code(result.1) == Int(ENOSPC) && anchorMatches(m.volume.anchor,anchor),"real xattr append capacity refuses atomically")
-    let failure = m.volume.diagnosticSnapshot().2!
-    need(failure.result.status == SFS_LIMIT && failure.result.limit_reason == SFS_LIMIT_APPEND_CAPACITY,"capacity receipt preserves limit reason")
-    m.close(); need(reopenedXattr(f) == Data("value".utf8),"capacity failure preserves original xattr")
 }
 func contextualXattrQueue(_ parent: URL) throws {
-    let f = try Fixture(parent,"xattr-queue"), m = try Mounted(f), v = m.volume
-    let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), replies = DispatchGroup()
-    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), name = FSFileName(string:"race"), data = Data([0,255])
-    var outcomes: [Int] = []
-    v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release xattr policy race") }
-    need(held.wait(timeout:.now()+20) == .success,"hold xattr queue")
-    for _ in 0..<2 {
-        replies.enter(); v.setXattrResultForTesting(name,value:data,item:m.file,policy:.mustCreate,caller:caller) { result,error in
-            need((result != nil) == (error == nil),"xattr result and error exclusive"); outcomes.append(code(error)); replies.leave()
+    for kind in 0..<4 {
+        let f = try Fixture(parent,"xattr-queue-\(kind)",directory:true,xattrProfile:true), m = try Mounted(f), v = m.volume
+        let items = xattrItems(m), item = items[kind], inode = (item as! StallionItem).inode
+        let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), replies = DispatchGroup()
+        let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid())), name = FSFileName(string:"race"), data = Data([0,255])
+        var outcomes: [Int] = []
+        v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release xattr policy race") }
+        need(held.wait(timeout:.now()+20) == .success,"hold xattr queue")
+        for _ in 0..<2 {
+            replies.enter(); v.setXattrResultForTesting(name,value:data,item:item,policy:.mustCreate,caller:caller) { result,error in
+                need((result != nil) == (error == nil),"xattr result and error exclusive"); outcomes.append(code(error)); replies.leave()
+            }
         }
-    }
-    let deletedName = FSFileName(string:"note")
-    replies.enter(); v.setXattrResultForTesting(deletedName,value:data,item:m.file,policy:.delete,caller:caller) { result,error in
-        need(result != nil && error == nil,"queued delete ignores retained value"); replies.leave()
-    }
-    let charged = v.linkBudgetForTesting
-    need(charged.0 == 3 && charged.1 == 2*(ReadOnlyLimits.callbackOverhead+name.data.count+data.count) +
-         ReadOnlyLimits.callbackOverhead+deletedName.data.count+data.count,"queued xattrs charge name and value, including ignored delete bytes")
-    release.signal(); need(replies.wait(timeout:.now()+20) == .success,"both xattr policies finish")
-    m.serial {}
-    need(outcomes == [0,Int(EEXIST)] && v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"serialized create-only policy and ticket release")
-    m.close(); need(reopenedXattr(f,name:name.data) == data && reopenedXattr(f) == nil,"policy-race winner and deletion persist")
-    let failedFixture = try Fixture(parent,"xattr-queued-failure"), failed = try Mounted(failedFixture), fv = failed.volume, anchor = fv.anchor
-    let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), done = DispatchGroup()
-    fv.enqueue { fv.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }; entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"release failing xattr queue") }
-    need(entered.wait(timeout:.now()+20) == .success,"hold failing xattr queue")
-    for index in 0..<2 {
-        done.enter(); fv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:failed.file,policy:.alwaysSet,caller:caller) { result,error in
-            need(result == nil && code(error) == Int(ENOMEM),"queued xattr returns first failure")
-            if index == 0 { fv.diagnosticBeforePrepare = nil }; done.leave()
+        let deletedName = FSFileName(string:"note")
+        replies.enter(); v.setXattrResultForTesting(deletedName,value:data,item:item,policy:.delete,caller:caller) { result,error in
+            need(result != nil && error == nil,"queued delete ignores retained value"); replies.leave()
         }
+        let charged = v.linkBudgetForTesting
+        need(charged.0 == 3 && charged.1 == 2*(ReadOnlyLimits.callbackOverhead+name.data.count+data.count) +
+             ReadOnlyLimits.callbackOverhead+deletedName.data.count+data.count,"queued xattrs charge name and value, including ignored delete bytes")
+        release.signal(); need(replies.wait(timeout:.now()+20) == .success,"both xattr policies finish")
+        m.serial {}
+        need(outcomes == [0,Int(EEXIST)] && v.linkBudgetForTesting.0 == 0 && v.linkBudgetForTesting.1 == 0,"serialized create-only policy and ticket release")
+        releaseXattrDirectory(m,items); m.close(); need(reopenedXattr(f,name:name.data,inode:inode) == data && reopenedXattr(f,inode:inode) == nil,"policy-race winner and deletion persist")
+        let failedFixture = try Fixture(parent,"xattr-queued-failure-\(kind)",directory:true,xattrProfile:true), failed = try Mounted(failedFixture), fv = failed.volume, anchor = fv.anchor
+        let failedItems = xattrItems(failed), failedItem = failedItems[kind], failedInode = (failedItem as! StallionItem).inode, failedMetadata = namespaceMetadata(failed,failedItem)
+        let entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), done = DispatchGroup()
+        fv.enqueue { fv.diagnosticBeforePrepare = { throw POSIXError(.ENOMEM) }; entered.signal(); need(resume.wait(timeout:.now()+20) == .success,"release failing xattr queue") }
+        need(entered.wait(timeout:.now()+20) == .success,"hold failing xattr queue")
+        for index in 0..<2 {
+            done.enter(); fv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:failedItem,policy:.alwaysSet,caller:caller) { result,error in
+                need(result == nil && code(error) == Int(ENOMEM),"queued xattr returns first failure")
+                if index == 0 { fv.diagnosticBeforePrepare = nil }; done.leave()
+            }
+        }
+        resume.signal(); need(done.wait(timeout:.now()+20) == .success,"drain failing xattr queue")
+        need(anchorMatches(fv.anchor,anchor) && fv.diagnosticSnapshot().0.commits == 0 && code(failed.sync()) == Int(ENOMEM),"no later xattr commit after delivery failure")
+        failed.serial {}
+        need(fv.linkBudgetForTesting.0 == 0 && fv.linkBudgetForTesting.1 == 0,"failed xattr tickets returned")
+        releaseXattrDirectory(failed,failedItems); failed.close(); need(reopenedXattr(failedFixture,inode:failedInode) == Data("value".utf8),"queued failure preserves reopened xattr")
+        let recovered = reopenedXattrMetadata(failedFixture,inode:failedInode); xattrMetadataUnchanged(failedMetadata,recovered)
+        need(sameBytes(failedMetadata.change,recovered.change),"queued abort preserves original ctime")
+        let budgetFixture = try Fixture(parent,"xattr-admission-\(kind)",directory:true,xattrProfile:true), budgetMount = try Mounted(budgetFixture), bv = budgetMount.volume
+        let budgetItems = xattrItems(budgetMount), budgetItem = budgetItems[kind], budgetInode = (budgetItem as! StallionItem).inode
+        let blocked = DispatchSemaphore(value:0), unblock = DispatchSemaphore(value:0), drained = DispatchGroup()
+        bv.enqueue { blocked.signal(); need(unblock.wait(timeout:.now()+20) == .success,"release saturated xattr queue") }
+        need(blocked.wait(timeout:.now()+20) == .success,"hold saturated xattr queue")
+        for _ in 0..<ReadOnlyLimits.callbacks {
+            drained.enter(); bv.enqueue(rejected:{ _ in need(false,"fill xattr callback budget") }) { drained.leave() }
+        }
+        let full = bv.linkBudgetForTesting
+        need(code(setXattr(budgetMount,value:data,item:budgetItem).1) == Int(EAGAIN) && bv.linkBudgetForTesting.0 == full.0 &&
+             bv.linkBudgetForTesting.1 == full.1,"xattr saturation rejects without consuming a ticket")
+        unblock.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain saturated xattr queue")
+        let cutoff = DispatchSemaphore(value:0), continueCutoff = DispatchSemaphore(value:0), completed = DispatchGroup()
+        bv.enqueue { cutoff.signal(); need(continueCutoff.wait(timeout:.now()+20) == .success,"release xattr unmount cutoff") }
+        need(cutoff.wait(timeout:.now()+20) == .success,"hold xattr before unmount")
+        completed.enter(); bv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:budgetItem,policy:.alwaysSet,caller:caller) { result,error in
+            need(result != nil && error == nil,"precutoff xattr commits"); completed.leave()
+        }
+        completed.enter(); bv.unmount { completed.leave() }
+        need(code(setXattr(budgetMount,value:data,policy:.delete,item:budgetItem).1) == Int(EAGAIN),"postcutoff xattr immediately refused")
+        continueCutoff.signal(); need(completed.wait(timeout:.now()+20) == .success,"xattr and ordered unmount complete")
+        need(code(setXattr(budgetMount,value:data,item:budgetItem).1) == Int(ENXIO) && bv.linkBudgetForTesting.0 == 0 &&
+             bv.linkBudgetForTesting.1 == 0,"unmounted xattr refuses and releases all tickets")
+        releaseXattrDirectory(budgetMount,budgetItems); budgetMount.close(); need(reopenedXattr(budgetFixture,inode:budgetInode) == data,"only precutoff xattr persists")
     }
-    resume.signal(); need(done.wait(timeout:.now()+20) == .success,"drain failing xattr queue")
-    need(anchorMatches(fv.anchor,anchor) && fv.diagnosticSnapshot().0.commits == 0 && code(failed.sync()) == Int(ENOMEM),"no later xattr commit after delivery failure")
-    failed.serial {}
-    need(fv.linkBudgetForTesting.0 == 0 && fv.linkBudgetForTesting.1 == 0,"failed xattr tickets returned")
-    failed.close(); need(reopenedXattr(failedFixture) == Data("value".utf8),"queued failure preserves reopened xattr")
-    let budgetFixture = try Fixture(parent,"xattr-admission"), budgetMount = try Mounted(budgetFixture), bv = budgetMount.volume
-    let blocked = DispatchSemaphore(value:0), unblock = DispatchSemaphore(value:0), drained = DispatchGroup()
-    bv.enqueue { blocked.signal(); need(unblock.wait(timeout:.now()+20) == .success,"release saturated xattr queue") }
-    need(blocked.wait(timeout:.now()+20) == .success,"hold saturated xattr queue")
-    for _ in 0..<ReadOnlyLimits.callbacks {
-        drained.enter(); bv.enqueue(rejected:{ _ in need(false,"fill xattr callback budget") }) { drained.leave() }
-    }
-    let full = bv.linkBudgetForTesting
-    need(code(setXattr(budgetMount,value:data).1) == Int(EAGAIN) && bv.linkBudgetForTesting.0 == full.0 &&
-         bv.linkBudgetForTesting.1 == full.1,"xattr saturation rejects without consuming a ticket")
-    unblock.signal(); need(drained.wait(timeout:.now()+20) == .success,"drain saturated xattr queue")
-    let cutoff = DispatchSemaphore(value:0), continueCutoff = DispatchSemaphore(value:0), completed = DispatchGroup()
-    bv.enqueue { cutoff.signal(); need(continueCutoff.wait(timeout:.now()+20) == .success,"release xattr unmount cutoff") }
-    need(cutoff.wait(timeout:.now()+20) == .success,"hold xattr before unmount")
-    completed.enter(); bv.setXattrResultForTesting(FSFileName(string:"note"),value:data,item:budgetMount.file,policy:.alwaysSet,caller:caller) { result,error in
-        need(result != nil && error == nil,"precutoff xattr commits"); completed.leave()
-    }
-    completed.enter(); bv.unmount { completed.leave() }
-    need(code(setXattr(budgetMount,value:data,policy:.delete).1) == Int(EAGAIN),"postcutoff xattr immediately refused")
-    continueCutoff.signal(); need(completed.wait(timeout:.now()+20) == .success,"xattr and ordered unmount complete")
-    need(code(setXattr(budgetMount,value:data).1) == Int(ENXIO) && bv.linkBudgetForTesting.0 == 0 &&
-         bv.linkBudgetForTesting.1 == 0,"unmounted xattr refuses and releases all tickets")
-    budgetMount.close(); need(reopenedXattr(budgetFixture) == data,"only precutoff xattr persists")
 }
+
 #endif
 
 #endif
@@ -4168,13 +4812,14 @@ func contextualXattrQueue(_ parent: URL) throws {
 #if STALLION_WRITE_DIAGNOSTIC
 #if STALLION_CONTEXT_HANDLERS
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-unhooked" {
-            try contextualXattrValues(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
+            let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
+            try contextualXattrValues(parent); try contextualXattrKinds(parent)
             print("PASS contextual xattr policies, binary values and persistence with unhooked core")
             return
         }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-focused" {
             let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
-            try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
+            try contextualXattrValues(parent); try contextualXattrKinds(parent); try contextualXattrKindPolicy(parent); try contextualXattrKindIdentity(parent); try contextualXattrDetachedKinds(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
             print("PASS contextual xattr policies, authorization, failure atomicity and queued admission")
             return
         }
@@ -4183,7 +4828,7 @@ func contextualXattrQueue(_ parent: URL) throws {
         let parent = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
         try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent); try contextualMetadata(parent)
-        try contextualXattrValues(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
+        try contextualXattrValues(parent); try contextualXattrKinds(parent); try contextualXattrKindPolicy(parent); try contextualXattrKindIdentity(parent); try contextualXattrDetachedKinds(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
 #else
         let legacyFixture = try Fixture(parent,"legacy-metadata-access"), legacy = try Mounted(legacyFixture)
         for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.takeOwnership]] {
@@ -4209,6 +4854,8 @@ func contextualXattrQueue(_ parent: URL) throws {
         print("RMDIR requested mask: 0x\(String(UInt(bitPattern: FSRemoveItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); final-link branch: actual-result success")
         print("RENAME requested mask: 0x\(String(UInt(bitPattern: FSRenameItemResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); replacement and same-inode branches: actual-result success")
         print("METADATA requested mask: 0x\(String(UInt(bitPattern: FSSetAttributesResult.requestedAttributes.wantedAttributes.rawValue),radix:16)); mode and timestamp branches: actual-result success")
+        print("XATTR supported kinds: file, root, directory, symlink; value/names/freeSpace constructors: actual-result success")
+        print("INITIAL TIMES file/directory/symlink: exact selected/default times, two-role results and commit-only consumption success")
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")
