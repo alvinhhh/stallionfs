@@ -320,6 +320,32 @@ revocation, executable replacement, retained descriptor/mapping lifetime and
 remount persistence remain required qualification gates. Actual mount flags and
 platform code-signature/quarantine restrictions remain independent constraints.
 
+The SDK27 contextual interface implements sparse data/hole seek for regular
+files, on both read-only and writable volumes. Mapped 4096-byte blocks count as
+data through EOF, including allocated zeros and zero-filled growth tails;
+unmapped blocks are holes. Queries use committed state and exact retained pins,
+including detached replacement victims. They do not change atime or open modes.
+Current owner/read-attributes and opaque-ACL policy applies; the callback has no
+per-descriptor mode identity. This does not prove mounted write-only-descriptor
+or permission-change behavior.
+
+Negative offsets, unknown regions and nonregular items return `EINVAL`;
+at/beyond EOF or exhausted data returns `ENXIO`. A hole search starting below EOF
+can return EOF. The at-EOF hole policy follows Darwin's syscall description;
+FSKit's callback wording does not explicitly document that exception or the
+beyond-EOF errno. Installed forwarding remains a qualification gate.
+
+One query budget covers the complete mapping traversal: 4 GiB each for metadata
+read/hash work and 128 Mi checks, with cancellation and finite memory. Dense
+next-hole work is linear in visited mapping metadata, not file bytes; sparse
+gaps are skipped. Exhaustion returns nonpoisoning `EAGAIN`, never invented EOF.
+These limits are not a guarantee that arbitrary valid large files complete.
+The opt-in 10 GiB mapping-shape test encodes 2,621,440 mappings with shared raw
+payload and minimum leaf occupancy; it qualifies metadata traversal only.
+Actual dense 10 GiB payload/copy completion, installed seek routing and existing
+sparse copy/import round trips remain separate gates. Clone support remains
+pending. SDK26.2/legacy builds do not reference the new seek handler API.
+
 ## Optional self-contained CLI runtime
 
 `--runtime-inputs /absolute/runtime-inputs.json` extends this same packager with

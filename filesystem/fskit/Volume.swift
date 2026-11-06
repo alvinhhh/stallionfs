@@ -205,7 +205,7 @@ final class StallionItem: FSItem {
 
 // The two interfaces share Objective-C selectors and must never coexist.
 #if STALLION_CONTEXT_HANDLERS
-extension StallionVolume: FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.XattrHandler {}
+extension StallionVolume: FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.XattrHandler, FSVolume.SeekRegionHandler {}
 #else
 extension StallionVolume: FSVolume.Operations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations {}
 #endif
@@ -1469,6 +1469,72 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         guard let result else { throw POSIXError(.EIO) }
         return result
     }
+    func seek(within item: FSItem, from offset: off_t, region: FSVolume.SeekRegion, context: FSContext,
+              replyHandler: @escaping (FSSeekRegionResult?, Error?) -> Void) {
+        seekHandler(item, offset: offset, region: region, caller: CallerIdentity(context), reply: replyHandler)
+    }
+#if STALLION_ADAPTER_CHECK
+    var seekBudgetForTesting: sfs_verify_budget?
+    var preparedSeekOffsetForTesting: ((off_t) -> Void)?
+    func seekResultForTesting(_ item: FSItem, offset: off_t, region: FSVolume.SeekRegion, caller: CallerIdentity,
+                              reply: @escaping (FSSeekRegionResult?, Error?) -> Void) {
+        seekHandler(item, offset: offset, region: region, caller: caller, reply: reply)
+    }
+#endif
+    private func seekHandler(_ item: FSItem, offset: off_t, region: FSVolume.SeekRegion, caller: CallerIdentity,
+                             reply: @escaping (FSSeekRegionResult?, Error?) -> Void) { enqueue(rejected: { reply(nil, $0) }) {
+        do {
+            let h = try self.ready(mounted: true), inode = try self.id(item), m = try self.metadata(inode)
+            guard m.entry.kind == SFS_FILE, offset >= 0 else { throw POSIXError(.EINVAL) }
+            let kind: sfs_seek_region
+            switch region {
+            case .data: kind = SFS_SEEK_DATA
+            case .hole: kind = SFS_SEEK_HOLE
+            default: throw POSIXError(.EINVAL)
+            }
+            // Layout metadata policy: neither readable mode nor an aggregate
+            // retained-open mode identifies this request's descriptor authority.
+            try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller)
+            var budget = sfs_image_seek_budget()
+#if STALLION_ADAPTER_CHECK
+            budget = self.seekBudgetForTesting ?? budget
+#endif
+            // self owns resource for the entire serialized synchronous query.
+            // This observer never calls back into or mutates the core handle.
+            budget.context = Unmanaged.passUnretained(self.resource).toOpaque()
+            budget.cancelled = { context in
+                guard let context else { return 1 }
+                return Unmanaged<FSPathURLResource>.fromOpaque(context).takeUnretainedValue().isRevoked ? 1 : 0
+            }
+            var answer: UInt64 = 0, found: Int32 = 0, receipt = sfs_result()
+            let digest = rawBytes(self.anchor.root_digest)
+            let status = try digest.withUnsafeBufferPointer { bytes -> sfs_status in
+#if STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES
+                if self.writesEnabled {
+                    return sfs_image_pin_seek_region(h, try self.token(inode), self.anchor.generation, bytes.baseAddress,
+                        UInt64(offset), kind, &budget, &answer, &found, &receipt)
+                }
+#endif
+                return sfs_image_seek_region(h, 0, self.anchor.generation, bytes.baseAddress, inode,
+                    UInt64(offset), kind, &budget, &answer, &found, &receipt)
+            }
+            if status == SFS_INCOMPLETE {
+                _ = try self.ready(mounted: true)
+                throw POSIXError(receipt.incomplete_reason == SFS_INCOMPLETE_CANCELLED ? .ECANCELED : .EAGAIN)
+            }
+            if status == SFS_STATE { throw POSIXError(.ESTALE) }
+            try self.check(status, receipt)
+            guard found != 0 else { throw POSIXError(.ENXIO) }
+            guard answer >= UInt64(offset), answer <= m.entry.size,
+                  kind != SFS_SEEK_DATA || answer < m.entry.size, let returned = off_t(exactly: answer) else { throw POSIXError(.EIO) }
+#if STALLION_ADAPTER_CHECK
+            self.preparedSeekOffsetForTesting?(returned)
+#endif
+            let value = try self.handlerResult(FSSeekRegionResult.self) { FSSeekRegionResult(returnedOffset: returned) }
+            _ = try self.ready(mounted: true)
+            reply(value, nil)
+        } catch { reply(nil, error) }
+    } }
     private func preparedResultAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest,
                                           _ requirements: ResultRequirements, parents: inout ParentEvidence, detachedParent: LastKnownParent? = nil) throws -> FSItem.Attributes {
         try Self.validateCallerWanted(requirements.caller)
