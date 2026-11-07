@@ -334,8 +334,11 @@ func generalNamespaceChecks(_ parent: URL) throws {
     catch { need(code(error) == Int(EACCES), "stored read mode enforced") }
     permissions.mode = 0o400
     try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .readData)
-    do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .execute); fatalError("unqualified execute grant") }
-    catch { need(code(error) == Int(EACCES), "file execution denied") }
+    for mode: UInt32 in [0o400,0o500,0o700,0o755] {
+        permissions.mode = mode
+        do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .execute); fatalError("unqualified execute grant") }
+        catch { need(code(error) == Int(EACCES), "default file execution denied even with owner execute bit") }
+    }
     permissions.entry.kind = SFS_DIRECTORY; permissions.mode = 0o100
     try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()), access: .search)
     do { try checkOwnerMode(permissions, owner: geteuid(), uid: Int(geteuid()) + 1, access: .search); fatalError("foreign owner grant") }

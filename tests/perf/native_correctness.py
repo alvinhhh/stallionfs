@@ -15,6 +15,85 @@ import os
 import stat
 import struct
 import sys
+from contextlib import contextmanager, nullcontext
+
+
+DOCS_ENTRIES = 5107
+DOCS_LOGICAL_BYTES = 116777216
+DOCS_MAX_FILE = 8 * 1024 * 1024
+
+
+class SnapshotBudget:
+    """Opt-in limits for explicit observation buffers, not Python heap or RSS.
+
+    Callers release retained snapshots explicitly. Native ACL getters may allocate
+    opaque objects before their sizes can be queried; these limits cannot bound
+    those internal allocations or exclude concurrent namespace replacement.
+    """
+    def __init__(self):
+        self.live = 0
+        self.snapshots = {}
+
+    def begin(self):
+        return {'bytes': 0, 'paths': 0, 'holes': 0, 'released': False}
+
+    def reserve(self, ticket, size):
+        if type(size) is not int or size < 0 or ticket['released']:
+            raise ValueError('Invalid snapshot reservation')
+        if ticket['bytes'] + size > 8 * 1024 * 1024 or self.live + size > 32 * 1024 * 1024:
+            raise ValueError('Snapshot observation budget exceeded')
+        ticket['bytes'] += size
+        self.live += size
+
+    @contextmanager
+    def temporary(self, ticket, size):
+        self.reserve(ticket, size)
+        try:
+            yield
+        finally:
+            ticket['bytes'] -= size
+            self.live -= size
+
+    def discard(self, ticket):
+        if not ticket['released']:
+            self.live -= ticket['bytes']; ticket['bytes'] = 0; ticket['released'] = True
+
+    def retain(self, snapshot, ticket):
+        self.snapshots[id(snapshot)] = (snapshot, ticket)
+        return snapshot
+
+    def release(self, snapshot):
+        if snapshot is not None:
+            item = self.snapshots.pop(id(snapshot))
+            if item[0] is not snapshot: raise ValueError('Snapshot ownership changed')
+            self.discard(item[1])
+
+    def path(self, ticket, encoded):
+        if len(encoded) > 1024 or ticket['paths'] + len(encoded) > 1024 * 1024:
+            raise ValueError('Snapshot path budget exceeded')
+        # Inventory, decoded keys, sorted names and later retained references.
+        self.reserve(ticket, 4 * len(encoded))
+        ticket['paths'] += len(encoded)
+
+
+def docs_shape(entries):
+    """The existing enriched docs shape; raw destinations may have split aliases."""
+    if len(entries) != DOCS_ENTRIES:
+        raise ValueError('Unexpected docs entry count')
+    kinds = [row['kind'] for row in entries.values()]
+    files = [row for row in entries.values() if row['kind'] == 'file']
+    classes = {}
+    for name, row in entries.items():
+        depth = name.count('/') + bool(name) - (row['kind'] != 'directory')
+        if depth > 2: raise ValueError('Unexpected docs depth')
+        if row['kind'] == 'file':
+            key = tuple(row['device_inode']); classes[key] = classes.get(key, 0) + 1
+    if (kinds.count('file') != 5002 or kinds.count('directory') != 105
+            or len(files) + 105 != len(entries)
+            or sum(row['size'] for row in files) != DOCS_LOGICAL_BYTES
+            or max(row['size'] for row in files) != DOCS_MAX_FILE
+            or max(classes.values()) > 2):
+        raise ValueError('Unexpected docs fixture shape')
 
 
 FIELDS = ("kind", "mode", "uid", "gid", "mtime_ns", "flags", "xattrs", "acl",
@@ -87,13 +166,15 @@ def _darwin_metadata_api():
     libc.acl_to_text.restype = ctypes.c_void_p
     libc.acl_free.argtypes = [ctypes.c_void_p]
     libc.acl_free.restype = ctypes.c_int
+    libc.acl_size.argtypes = [ctypes.c_void_p]
+    libc.acl_size.restype = ctypes.c_ssize_t
     libc.fgetattrlist.argtypes = [ctypes.c_int, ctypes.POINTER(_AttrList), ctypes.c_void_p,
                                  ctypes.c_size_t, ctypes.c_ulong]
     libc.fgetattrlist.restype = ctypes.c_int
     return libc
 
 
-def _acl(path):
+def _acl(path, *, budget=None, ticket=None):
     """Read the final entry's extended ACL, including a symlink's own ACL."""
     if sys.platform == "linux":
         if stat.S_ISLNK(os.lstat(path).st_mode):
@@ -125,6 +206,12 @@ def _acl(path):
         raise OSError(error or errno.EIO, "Cannot read extended ACL", os.fsdecode(path))
     text = None
     try:
+        if budget is not None:
+            ctypes.set_errno(0)
+            size = libc.acl_size(acl)
+            error = ctypes.get_errno()
+            if size < 0: raise OSError(error or errno.EIO, 'Cannot size extended ACL')
+            if not 0 < size <= 65536: raise ValueError('ACL observation budget exceeded')
         length = ctypes.c_ssize_t()
         ctypes.set_errno(0)
         text = libc.acl_to_text(acl, ctypes.byref(length))
@@ -132,22 +219,27 @@ def _acl(path):
             raise OSError(ctypes.get_errno() or errno.EIO, "Cannot serialize extended ACL", os.fsdecode(path))
         if length.value < 0:
             raise RuntimeError("Invalid ACL text length")
-        return {"text_hex": ctypes.string_at(text, length.value).hex(), "unavailable": None}
+        if budget is not None:
+            if length.value > 65536: raise ValueError('ACL observation budget exceeded')
+            budget.reserve(ticket, 2 * length.value)
+        with budget.temporary(ticket, 2 * length.value) if budget is not None else nullcontext():
+            return {"text_hex": ctypes.string_at(text, length.value).hex(), "unavailable": None}
     finally:
         # Free both allocations even if the first release reports an error.
+        primary = sys.exc_info()[1]
         release_error = None
         for pointer in (text, acl):
             if pointer:
                 ctypes.set_errno(0)
                 if libc.acl_free(pointer):
                     release_error = ctypes.get_errno() or errno.EIO
-        if release_error:
+        if release_error and (budget is None or primary is None):
             raise OSError(release_error, "Cannot release ACL allocation")
 
 
-def _xattrs(path):
+def _xattrs(path, *, budget=None, ticket=None):
     """Return every name/value as hex, without following the final symlink."""
-    if hasattr(os, "listxattr"):
+    if budget is None and hasattr(os, "listxattr"):
         return {os.fsencode(name).hex(): os.getxattr(path, name, follow_symlinks=False).hex()
                 for name in sorted(os.listxattr(path, follow_symlinks=False), key=os.fsencode)}
     if sys.platform != "darwin":
@@ -162,31 +254,48 @@ def _xattrs(path):
         return result
 
     length = checked(libc.listxattr(encoded, None, 0, 1))  # XATTR_NOFOLLOW
-    names = ctypes.create_string_buffer(length)
-    actual = checked(libc.listxattr(encoded, names, length, 1))
-    if actual != length or (actual and names.raw[actual - 1] != 0):
-        raise RuntimeError("Extended-attribute names changed while snapshotting")
-    result = {}
-    for name in sorted(names.raw[:actual].split(b"\0")[:-1]):
-        length = checked(libc.getxattr(encoded, name, None, 0, 0, 1))
-        value = ctypes.create_string_buffer(length)
-        actual = checked(libc.getxattr(encoded, name, value, length, 0, 1))
-        if actual != length:
-            raise RuntimeError("Extended-attribute value changed while snapshotting")
-        result[name.hex()] = value.raw[:actual].hex()
-    return result
+    if budget is not None and length > 65536: raise ValueError('Xattr names budget exceeded')
+    with budget.temporary(ticket, 3 * length) if budget is not None else nullcontext():
+        names = ctypes.create_string_buffer(length)
+        actual = checked(libc.listxattr(encoded, names, length, 1))
+        if actual != length or (actual and names.raw[actual - 1] != 0):
+            raise RuntimeError("Extended-attribute names changed while snapshotting")
+        result = {}
+        for name in sorted(names.raw[:actual].split(b"\0")[:-1]):
+            length = checked(libc.getxattr(encoded, name, None, 0, 0, 1))
+            if budget is not None:
+                if length > 1048576: raise ValueError('Xattr value budget exceeded')
+                budget.reserve(ticket, 2 * (len(name) + length))
+            with budget.temporary(ticket, 2 * length) if budget is not None else nullcontext():
+                value = ctypes.create_string_buffer(length)
+                try:
+                    actual = checked(libc.getxattr(encoded, name, value, length, 0, 1))
+                    if actual != length:
+                        raise RuntimeError("Extended-attribute value changed while snapshotting")
+                    result[name.hex()] = value.raw[:actual].hex()
+                finally:
+                    if budget is not None: del value
+        if budget is not None:
+            del names
+            if result: del name
+        return result
 
 
-def _holes(fd, size):
+def _holes(fd, size, *, budget=None, ticket=None):
     if not hasattr(os, "SEEK_DATA") or not hasattr(os, "SEEK_HOLE"):
         return {"ranges": None, "unavailable": "SEEK_DATA/SEEK_HOLE unavailable"}
     position, holes = 0, []
+    def append(start, end):
+        if budget is not None:
+            if ticket['holes'] >= 2 * DOCS_ENTRIES: raise ValueError('Sparse observation budget exceeded')
+            budget.reserve(ticket, 64); ticket['holes'] += 1
+        holes.append([start, end])
     while position < size:
         try:
             data = os.lseek(fd, position, os.SEEK_DATA)
         except OSError as exc:
             if exc.errno == errno.ENXIO:
-                holes.append([position, size])
+                append(position, size)
                 break
             if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
                 return {"ranges": None, "unavailable": f"SEEK_DATA: errno {exc.errno}"}
@@ -194,7 +303,7 @@ def _holes(fd, size):
         if not position <= data < size:
             raise RuntimeError("Invalid SEEK_DATA offset")
         if data > position:
-            holes.append([position, data])
+            append(position, data)
         try:
             hole = os.lseek(fd, data, os.SEEK_HOLE)
         except OSError as exc:
@@ -212,15 +321,88 @@ def _stable(info):
             info.st_size, info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_flags", None))
 
 
-def snapshot(root, *, allow_special=False, observe_sharing=False):
+def _inventory_signature(info):
+    return (_stable(info), info.st_nlink, getattr(info, 'st_birthtime_ns', None), getattr(info, 'st_gen', None))
+
+
+def _bounded_inventory(root, budget, ticket, docs):
+    """Stat-only admission in the existing reader; no metadata or data reads."""
+    observed = {}; logical = 0; device = None
+    def visit(path, relative, depth):
+        nonlocal logical, device
+        if len(observed) >= DOCS_ENTRIES: raise ValueError('Snapshot entry budget exceeded')
+        budget.path(ticket, relative)
+        budget.reserve(ticket, 512)  # Bounded scalar/clone/digest observation slots.
+        info = os.lstat(path)
+        if device is None: device = info.st_dev
+        if info.st_dev != device: raise ValueError('Snapshot crosses a device')
+        kind = ('file' if stat.S_ISREG(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode)
+                else 'symlink' if stat.S_ISLNK(info.st_mode) else None)
+        if kind is None or depth > 2 + (kind != 'directory'):
+            raise ValueError('Unsupported snapshot shape')
+        if kind == 'file':
+            if not 0 <= info.st_size <= DOCS_MAX_FILE: raise ValueError('Snapshot file budget exceeded')
+            logical += info.st_size
+            if logical > DOCS_LOGICAL_BYTES: raise ValueError('Snapshot logical budget exceeded')
+        if kind == 'symlink' and not 0 <= info.st_size <= 1024:
+            raise ValueError('Snapshot symlink budget exceeded')
+        item = {'info': info, 'kind': kind, 'names': []}; observed[relative] = item
+        if kind == 'directory':
+            with os.scandir(path) as children:
+                for child in children:
+                    if len(observed) + len(item['names']) >= DOCS_ENTRIES:
+                        raise ValueError('Snapshot entry budget exceeded')
+                    name = child.name
+                    if len(relative) + bool(relative) + len(name) > 1024:
+                        raise ValueError('Snapshot path budget exceeded')
+                    budget.reserve(ticket, 2 * len(name))
+                    item['names'].append(name)
+            item['names'].sort()
+            for name in item['names']:
+                visit(os.path.join(path, name), relative + b'/' + name if relative else name, depth + 1)
+        if _inventory_signature(os.lstat(path)) != _inventory_signature(info):
+            raise RuntimeError('Fixture changed during stat admission')
+    visit(root, b'', 0)
+    if docs:
+        docs_shape({os.fsdecode(name): {'kind': row['kind'], 'size': row['info'].st_size,
+                    'device_inode': [row['info'].st_dev, row['info'].st_ino]} for name, row in observed.items()})
+    return observed
+
+
+def snapshot(root, *, allow_special=False, observe_sharing=False, budget=None, docs=False):
+    if budget is None:
+        if docs: raise ValueError('Docs snapshot requires an observation budget')
+        return _snapshot(root, allow_special=allow_special, observe_sharing=observe_sharing)
+    ticket = budget.begin()
+    try:
+        result = _snapshot(root, allow_special=allow_special, observe_sharing=observe_sharing,
+                           budget=budget, ticket=ticket, docs=docs)
+        return budget.retain(result, ticket)
+    except BaseException:
+        budget.discard(ticket)
+        raise
+
+
+def _snapshot(root, *, allow_special=False, observe_sharing=False, budget=None, ticket=None, docs=False):
     """Read a stable fixture; opt-in special entries are metadata-only, never opened."""
-    root = os.fsencode(os.fspath(root))
+    root = os.fspath(root)
+    if budget is not None and len(root) > 4096: raise ValueError('Snapshot root path budget exceeded')
+    root = os.fsencode(root)
+    if budget is not None:
+        if len(root) > 4096: raise ValueError('Snapshot root path budget exceeded')
+        budget.reserve(ticket, 4 * len(root))
     entries, links = {}, {}
+    inventory = _bounded_inventory(root, budget, ticket, docs) if budget is not None else None
+    if budget is not None: budget.reserve(ticket, 1024 * 1024)
     buffer = bytearray(1024 * 1024)
     view = memoryview(buffer)
 
     def visit(path, relative):
         before = os.lstat(path)
+        if inventory is not None:
+            admitted = inventory.get(relative)
+            if admitted is None or _inventory_signature(before) != _inventory_signature(admitted['info']):
+                raise RuntimeError('Fixture changed after stat admission')
         kind = ("file" if stat.S_ISREG(before.st_mode) else
                 "directory" if stat.S_ISDIR(before.st_mode) else
                 "symlink" if stat.S_ISLNK(before.st_mode) else None)
@@ -237,28 +419,46 @@ def snapshot(root, *, allow_special=False, observe_sharing=False):
                "device_inode": [before.st_dev, before.st_ino],
                "link_count": before.st_nlink,
                "allocated_bytes": before.st_blocks * 512,
-               "xattrs": _xattrs(path), "acl": _acl(path)}
+               "xattrs": (_xattrs(path, budget=budget, ticket=ticket) if budget is not None else _xattrs(path)),
+               "acl": (_acl(path, budget=budget, ticket=ticket) if budget is not None else _acl(path))}
         if kind == "file":
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
             with os.fdopen(fd, "rb", buffering=0) as stream:
                 if _stable(os.fstat(stream.fileno())) != _stable(before):
                     raise RuntimeError("File changed before reading")
                 digest = hashlib.sha256()
-                while count := stream.readinto(buffer):
+                offset = 0
+                while count := stream.readinto(view[:min(len(buffer), before.st_size - offset + 1)]
+                                               if budget is not None else buffer):
+                    if budget is not None and offset + count > before.st_size:
+                        raise RuntimeError('File grew beyond admitted size')
                     digest.update(view[:count])
+                    offset += count
+                if budget is not None and offset != before.st_size:
+                    raise RuntimeError('File shrank below admitted size')
                 row.update(size=before.st_size, sha256=digest.hexdigest(),
-                           holes=_holes(stream.fileno(), before.st_size))
+                           holes=(_holes(stream.fileno(), before.st_size, budget=budget, ticket=ticket)
+                                  if budget is not None else _holes(stream.fileno(), before.st_size)))
                 if observe_sharing:
                     row["clone_attributes"] = _clone_attributes(stream.fileno())
                 if _stable(os.fstat(stream.fileno())) != _stable(before):
                     raise RuntimeError("File changed while reading")
         elif kind == "symlink":
+            if budget is not None: budget.reserve(ticket, 4 * before.st_size)
             row["symlink_bytes"] = os.readlink(path).hex()
         elif kind == "special":
             row.update(special_type=stat.S_IFMT(before.st_mode), rdev=before.st_rdev)
         else:
             with os.scandir(path) as children:
-                names = sorted(child.name for child in children)
+                if inventory is None:
+                    names = sorted(child.name for child in children)
+                else:
+                    names = []
+                    for child in children:
+                        if len(names) >= len(admitted['names']): raise RuntimeError('Directory changed after admission')
+                        names.append(child.name)
+                    names.sort()
+                    if names != admitted['names']: raise RuntimeError('Directory changed after admission')
             for name in names:
                 visit(os.path.join(path, name), relative + b"/" + name if relative else name)
         if kind != "directory":
@@ -266,6 +466,8 @@ def snapshot(root, *, allow_special=False, observe_sharing=False):
         after = os.lstat(path)
         if _stable(after) != _stable(before):
             raise RuntimeError(f"Fixture changed while snapshotting: {os.fsdecode(relative)}")
+        if inventory is not None and _inventory_signature(after) != _inventory_signature(admitted['info']):
+            raise RuntimeError('Fixture changed after stat admission')
         row["atime_after_read_ns"] = after.st_atime_ns
         entries[os.fsdecode(relative)] = row
 
@@ -403,12 +605,14 @@ def verify_clone(source, destination, baseline=None):
     return result
 
 
-def clone_sharing(source_after, destination):
+def clone_sharing(source_after, destination, *, summary_only=False, budget=None, ticket=None):
     """Adjudicate sequential post-copy data-stream observations on stable owned files."""
+    if budget is not None and not summary_only:
+        raise ValueError('Budgeted sharing requires a bounded summary')
     counts = dict(shared=0, not_shared=0, unknown=0, not_applicable=0)
-    exceptions, digest, compressed = [], hashlib.sha256(), io.BytesIO()
+    exceptions, digest, compressed = [], hashlib.sha256(), None if summary_only else io.BytesIO()
     byte_count = 0
-    with gzip.GzipFile(fileobj=compressed, mode="wb", mtime=0) as encoded:
+    with (nullcontext(None) if summary_only else gzip.GzipFile(fileobj=compressed, mode="wb", mtime=0)) as encoded:
         for path in sorted(source_after["entries"].keys() | destination["entries"].keys()):
             left, right = source_after["entries"].get(path), destination["entries"].get(path)
             if not any(entry and entry["kind"] == "file" for entry in (left, right)):
@@ -435,13 +639,19 @@ def clone_sharing(source_after, destination):
                 reason = "Matching nonzero clone IDs and full-sharing flags" if shared else "Full data-stream sharing not observed"
             pair.update(status=status, reason=reason)
             counts[status] += 1
-            line = json.dumps(pair, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-            encoded.write(line)
-            digest.update(line)
-            byte_count += len(line)
-            if status != "shared": exceptions.append({"path": path, "status": status, "reason": reason})
+            with budget.temporary(ticket, 8 * (len(os.fsencode(path)) + 1024)) if budget is not None else nullcontext():
+                line = json.dumps(pair, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+                if encoded is not None: encoded.write(line)
+                digest.update(line)
+                byte_count += len(line)
+                if budget is not None: del line
+            if not summary_only and status != "shared": exceptions.append({"path": path, "status": status, "reason": reason})
     outcome = (False if counts["not_shared"] else
                None if counts["unknown"] or not counts["shared"] else True)
+    if summary_only:
+        return {'full_data_stream_sharing': outcome, 'counts': counts,
+                'observations_sha256': digest.hexdigest(), 'observations_bytes': byte_count,
+                'scope': 'All data-bearing regular-file pairs evaluated; raw observations remain private.'}
     return {"full_data_stream_sharing": outcome, "counts": counts, "exceptions": exceptions,
             "observations_gzip_b64": base64.b64encode(compressed.getvalue()).decode("ascii"),
             "observations_sha256": digest.hexdigest(), "observations_bytes": byte_count,

@@ -18,28 +18,143 @@ with mock.patch.object(sys, 'path', [str(PERF), *sys.path]):
     spec.loader.exec_module(workspace)
 
 
-def rows(wall=1.0, cpu=0.005, count=10):
+def rows(wall=1.0, cpu=0.005, count=10, mode='cli'):
     return [dict(pair_id=i + 1, phase='timing', ok=True, validated=True,
-                 total_s=wall, total_cpu_s=cpu,
+                 total_s=wall, total_cpu_s=cpu, invocation_mode=mode,
                  precision_floor={'wall_s': 1e-9, 'cpu_s': 0.000012006})
             for i in range(count)]
 
 
+class WorkspaceCLI(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve() / 'store'
+        self.root.mkdir(mode=0o700)
+        for collection in ('workspaces', 'trash', 'staging'): (self.root / collection).mkdir(mode=0o700)
+        self.ident, self.seed = 'b' * 32, 'a' * 64
+        self.active = self.root / 'workspaces' / self.ident / 'repo'
+        self.retired = self.root / 'trash' / self.ident / 'repo'
+        self.cli = workspace.FolderCLI('/installed/stallionfs', self.root, self.seed)
+
+    def record(self, workspace_path, **changes):
+        return dict(id=self.ident, seed=self.seed, path=str(workspace_path)) | changes
+
+    def test_candidate_pins_installed_cli_helper_and_workspace_entry_points(self):
+        prefix = self.root.parent / 'environment'
+        executable = prefix / 'bin' / 'stallionfs'
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b'\xcf\xfa\xed\xfe' + b'not executed'); executable.chmod(0o700)
+        helper = executable.with_name('stallionfs-python')
+        helper.write_text('not executed'); helper.chmod(0o700)
+        package = prefix / 'lib' / 'stallionfs'; package.mkdir(parents=True)
+        for name in ('__init__.py', '__main__.py', 'lifecycle.py'): (package / name).write_text('not imported')
+        with mock.patch.object(workspace.sys, 'executable', str(executable.with_name('python'))), \
+                mock.patch.object(workspace.sys, 'prefix', str(prefix)), \
+                mock.patch.object(workspace, 'stallionfs', mock.Mock(__file__=str(package / '__init__.py'))):
+            before = workspace.candidate_fingerprints(executable)
+            self.assertEqual(set(before), {str(path) for path in
+                (executable, helper, package / '__main__.py', package / 'lifecycle.py')})
+            helper.write_text('changed helper')
+            self.assertNotEqual(workspace.candidate_fingerprints(executable), before)
+            with mock.patch.object(workspace.sys, 'executable', '/different/bin/python'), \
+                    self.assertRaisesRegex(RuntimeError, 'same installed environment'):
+                workspace.candidate_fingerprints(executable)
+            executable.write_text('script')
+            with self.assertRaisesRegex(RuntimeError, 'native executable'):
+                workspace.candidate_fingerprints(executable)
+
+    def test_cli_lifecycle_includes_exact_create_remove_and_completed_gc_commands(self):
+        def command(argv):
+            action = argv[4]
+            if action == 'create':
+                self.active.mkdir(parents=True)
+                return json.dumps(self.record(self.active))
+            if action == 'remove':
+                self.active.parent.rename(self.retired.parent)
+                return json.dumps(self.record(self.retired))
+            shutil.rmtree(self.retired.parent)
+            return json.dumps({'deleted': [self.ident]})
+        with mock.patch.object(workspace, 'run', side_effect=command) as run:
+            created = self.cli.create()
+            self.cli.verify_created([created])
+            retired = self.cli.remove(created[1])
+            self.cli.verify_path(retired[0])
+            deleted = self.cli.reclaim()
+            self.cli.verify_reclamation(deleted, [created[1]])
+        prefix = ['/installed/stallionfs', '--root', str(self.root), '--json']
+        self.assertEqual(run.call_args_list, [mock.call(prefix + ['create', self.seed]),
+            mock.call(prefix + ['remove', self.ident]), mock.call(prefix + ['gc', '--older-than', '0', '--yes'])])
+        self.assertFalse(self.active.parent.exists()); self.assertFalse(self.retired.parent.exists())
+
+    def test_cli_refuses_unexpected_identity_path_seed_and_nonobject_results(self):
+        for result in (self.record(self.active, id='B' * 32), self.record(self.active, seed='c' * 64),
+                       self.record(self.active, path=str(self.root.parent / 'outside')),
+                       self.record(self.active, path=None), [], None):
+            with self.subTest(result=result), mock.patch.object(workspace, 'run', return_value=json.dumps(result)), \
+                    self.assertRaises(RuntimeError):
+                self.cli.create()
+        with mock.patch.object(workspace, 'run', return_value=json.dumps(self.record(self.retired, id='c' * 32))), \
+                self.assertRaisesRegex(RuntimeError, 'unexpected identity'):
+            self.cli.remove(self.ident)
+
+    def test_cli_refuses_reused_identity_symlink_or_replaced_store(self):
+        self.active.mkdir(parents=True)
+        created = (self.active, self.ident)
+        with self.assertRaisesRegex(RuntimeError, 'reused an identity'):
+            self.cli.verify_created([created, created])
+        self.active.rmdir()
+        self.active.symlink_to(self.root.parent, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, 'owned directory'):
+            self.cli.verify_created([created])
+        self.active.unlink()
+        self.active.mkdir()
+        previous = self.root.with_name('previous')
+        self.root.rename(previous); self.root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(RuntimeError, 'store identity changed'):
+            self.cli.verify_created([created])
+
+    def test_cli_refuses_partial_duplicate_or_falsely_completed_reclamation(self):
+        self.retired.mkdir(parents=True)
+        for deleted in (None, [], [self.ident, self.ident], ['c' * 32], [123], [self.ident]):
+            with self.subTest(deleted=deleted), self.assertRaises(RuntimeError):
+                self.cli.verify_reclamation(deleted, [self.ident])
+        shutil.rmtree(self.retired.parent)
+        expired = self.root / 'staging' / 'build-retained' / 'expired'
+        expired.mkdir(parents=True)
+        payload = expired / 'payload'; payload.write_bytes(b'retained workspace data')
+        with mock.patch.object(workspace, 'run', return_value=json.dumps({'deleted': [self.ident]})), \
+                self.assertRaisesRegex(RuntimeError, 'retained staging'):
+            self.cli.verify_reclamation(self.cli.reclaim(), [self.ident])
+        self.assertEqual(payload.read_bytes(), b'retained workspace data')
+        shutil.rmtree(expired.parent)
+        self.cli.verify_reclamation([self.ident], [self.ident])
+
+
 class WorkspaceStatistics(unittest.TestCase):
     def test_completion_requires_finished_cleanup(self):
-        for cleanup in (True, False):
-            with self.subTest(cleanup=cleanup), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        for cleanup, mode in ((True, 'api_diagnostic'), (False, 'api_diagnostic'),
+                              (True, 'cli'), (False, 'cli')):
+            with self.subTest(cleanup=cleanup, mode=mode), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 root = Path(directory).resolve()
+                binary = root / 'stallionfs'; binary.write_text('not executed')
                 output = root / 'report.json'
                 arguments = ['run.py', '--scratch', str(root), '--npm-cache', str(root),
                              '--output', str(output), '--source-files', '1', '--concurrency', '1',
                              '--methods', 'stallionfs_folder']
+                arguments += ['--binary', str(binary)] if mode == 'cli' else ['--api-diagnostic']
                 store = mock.Mock(root=root / 'store')
                 store.prepare.return_value = {'id': 'seed'}
                 store.create.return_value = {'id': 'workspace', 'path': str(root / 'workspace')}
                 store.gc.return_value = ['workspace']
+                cli = mock.Mock()
+                cli.create.return_value = (root / 'workspace', 'workspace')
+                cli.remove.return_value = (root / 'retired', 'workspace')
+                cli.reclaim.return_value = ['workspace']
                 stack.enter_context(mock.patch.object(sys, 'argv', arguments))
                 stack.enter_context(mock.patch.object(workspace, 'Store', return_value=store))
+                stack.enter_context(mock.patch.object(workspace, 'FolderCLI', return_value=cli))
+                stack.enter_context(mock.patch.object(workspace, 'candidate_fingerprints', return_value={'binary': 'hash'}))
                 stack.enter_context(mock.patch.object(workspace, 'git'))
                 stack.enter_context(mock.patch.object(workspace, 'digest', return_value='same-content'))
                 stack.enter_context(mock.patch.object(workspace, 'run', side_effect=lambda argv, *args:
@@ -56,7 +171,10 @@ class WorkspaceStatistics(unittest.TestCase):
                     self.assertTrue(report['passed'])
                     self.assertTrue(report['cleanup_passed'])
                     self.assertEqual(report['status'], 'complete')
+                    self.assertEqual(report['format'], 4)
+                    self.assertEqual(report['workspace_invocation'], mode)
                     self.assertEqual(len(report['raw']['1']['stallionfs_folder']), 10)
+                    self.assertEqual({row['invocation_mode'] for row in report['raw']['1']['stallionfs_folder']}, {mode})
                 else:
                     with self.assertRaisesRegex(RuntimeError, 'cleanup did not complete'):
                         workspace.main()
@@ -64,6 +182,11 @@ class WorkspaceStatistics(unittest.TestCase):
                     self.assertFalse(report['passed'])
                     self.assertFalse(report.get('cleanup_passed', False))
                     self.assertFalse(output.exists())
+                if mode == 'cli':
+                    store.create.assert_not_called(); store.move.assert_not_called(); store.gc.assert_not_called()
+                    self.assertEqual((cli.create.call_count, cli.remove.call_count, cli.reclaim.call_count), (11, 11, 11))
+                    self.assertEqual(cli.verify_reclamation.call_count, 11)
+                else: cli.create.assert_not_called()
 
     def test_explicit_node_and_npm_reach_preparation_and_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,7 +197,7 @@ class WorkspaceStatistics(unittest.TestCase):
             output = root / 'report.json'
             arguments = ['run.py', '--scratch', str(root), '--npm-cache', str(root),
                          '--output', str(output), '--node', str(node), '--npm', str(npm),
-                         '--source-files', '1']
+                         '--source-files', '1', '--api-diagnostic']
             store = mock.Mock()
             store.prepare.side_effect = RuntimeError('stop at preparation')
             def command(argv, *args):
@@ -95,7 +218,7 @@ class WorkspaceStatistics(unittest.TestCase):
 
     def test_runtime_options_require_both_paths_before_commands(self):
         with mock.patch.object(sys, 'argv', ['run.py', '--scratch', '/unused', '--npm-cache', '/unused',
-                                            '--output', '/unused/report', '--node', '/unused/node']), \
+                                            '--output', '/unused/report', '--node', '/unused/node', '--api-diagnostic']), \
                 mock.patch.object(workspace, 'run') as command, redirect_stderr(io.StringIO()), \
                 self.assertRaises(SystemExit) as failure:
             workspace.main()
@@ -105,7 +228,7 @@ class WorkspaceStatistics(unittest.TestCase):
     def test_summary_keeps_existing_keys_and_adds_distribution(self):
         keys = ('ready_s', 'remove_s', 'reclaim_s', 'total_s',
                 'ready_cpu_s', 'remove_cpu_s', 'reclaim_cpu_s', 'total_cpu_s')
-        result = workspace.summary([dict.fromkeys(keys, i) for i in range(1, 11)])
+        result = workspace.summary([{**dict.fromkeys(keys, i), 'invocation_mode': 'cli'} for i in range(1, 11)])
         self.assertEqual(set(result), set(keys))
         for value in result.values():
             self.assertEqual(value['median'], 5.5)
@@ -114,7 +237,7 @@ class WorkspaceStatistics(unittest.TestCase):
             self.assertAlmostEqual(value['sample_variance'], 55 / 6)
 
     def test_pairs_use_sample_identity_and_timing_precision(self):
-        baseline, candidate = rows(wall=2.0, cpu=0.01), rows()
+        baseline, candidate = rows(wall=2.0, cpu=0.01, mode='git_npm_cli'), rows()
         for index, (left, right) in enumerate(zip(baseline, candidate)):
             left['total_s'] += index / 128
             right['total_s'] += index / 128
@@ -129,7 +252,7 @@ class WorkspaceStatistics(unittest.TestCase):
         self.assertEqual(values['total_cpu_s']['phase'], 'timing')
 
     def test_unequal_sample_counts_cannot_win(self):
-        result = workspace.paired_totals({'worktree_install': rows(wall=2, count=11),
+        result = workspace.paired_totals({'worktree_install': rows(wall=2, count=11, mode='git_npm_cli'),
                                            'stallionfs_folder': rows()})
         for value in result['methods']['stallionfs_folder'].values():
             self.assertEqual(value['complete_pairs'], 10)
@@ -142,7 +265,7 @@ class WorkspaceStatistics(unittest.TestCase):
             with self.subTest(change=change):
                 candidate = rows(count=11)
                 candidate[4].update(change)
-                result = workspace.paired_totals({'worktree_install': rows(wall=2, count=11),
+                result = workspace.paired_totals({'worktree_install': rows(wall=2, count=11, mode='git_npm_cli'),
                                                    'stallionfs_folder': candidate})
                 for value in result['methods']['stallionfs_folder'].values():
                     self.assertEqual(value['decision'], 'incomplete_pairs')
@@ -158,11 +281,39 @@ class WorkspaceStatistics(unittest.TestCase):
         candidate = rows()
         candidate[1]['pair_id'] = candidate[0]['pair_id']
         with self.assertRaisesRegex(ValueError, 'duplicate pair_id'):
-            workspace.paired_totals({'worktree_install': rows(), 'stallionfs_folder': candidate})
+            workspace.paired_totals({'worktree_install': rows(mode='git_npm_cli'), 'stallionfs_folder': candidate})
+
+    def test_invocation_modes_cannot_be_mixed_or_inferred_from_historical_rows(self):
+        baseline = rows(wall=2, mode='git_npm_cli')
+        for mode in ('api_diagnostic', None):
+            candidate = rows()
+            candidate[4]['invocation_mode'] = mode
+            with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, 'Missing or mixed'):
+                workspace.paired_totals({'worktree_install': baseline, 'stallionfs_folder': candidate})
+            with self.subTest(summary_mode=mode), self.assertRaisesRegex(RuntimeError, 'Missing or mixed'):
+                workspace.summary(candidate)
+        historical = rows()
+        for row in historical: del row['invocation_mode']
+        with self.assertRaisesRegex(RuntimeError, 'Missing or mixed'):
+            workspace.paired_totals({'worktree_install': baseline, 'stallionfs_folder': historical})
+        diagnostic = workspace.paired_totals({'worktree_install': baseline,
+                                              'stallionfs_folder': rows(mode='api_diagnostic')})
+        self.assertTrue(diagnostic['diagnostic_only'])
+        self.assertEqual(diagnostic['invocation_modes']['stallionfs_folder'], 'api_diagnostic')
+
+    def test_api_diagnostic_requires_explicit_selection_before_commands(self):
+        arguments = ['run.py', '--scratch', '/unused', '--npm-cache', '/unused', '--output', '/unused/report']
+        for invocation in ([], ['--api-diagnostic', '--binary', '/unused/stallionfs']):
+            with self.subTest(invocation=invocation), mock.patch.object(sys, 'argv', arguments + invocation), \
+                    mock.patch.object(workspace, 'run') as command, redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                workspace.main()
+            self.assertEqual(error.exception.code, 2)
+            command.assert_not_called()
 
     def test_too_few_samples_fail_before_running_commands(self):
         arguments = ['run.py', '--scratch', '/unused', '--npm-cache', '/unused',
-                     '--output', '/unused/result.json']
+                     '--output', '/unused/result.json', '--api-diagnostic']
         for samples in ('1', '9'):
             with self.subTest(samples=samples), redirect_stderr(io.StringIO()), \
                     mock.patch.object(sys, 'argv', [*arguments, '--samples', samples]), \

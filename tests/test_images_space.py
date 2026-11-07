@@ -135,14 +135,14 @@ class ImageSpace(unittest.TestCase):
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             filler.unlink()
             fullsync(repo / 'recovered', b'write after freeing space')
-            with observe_detach():
-                images.detach(first, point)
+            images.detach(first, point)
             repo = images.attach(first, point)
             self.assert_original(repo)
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             self.assertEqual((repo / 'recovered').read_bytes(), b'write after freeing space')
             self.assertFalse((repo / 'filler').exists())
-            images.detach(first, point)
+            with observe_detach():
+                images.detach(first, point)
         # Compare closed bytes before mounting these untouched images for content checks.
         with failure_scope(self.base, self.seed):
             self.assertEqual(digest(self.seed), seed_digest)

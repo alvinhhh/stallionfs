@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from . import __version__
@@ -38,6 +39,8 @@ def main(argv=None):
     move_mode.add_argument("--replace", action="store_true", help="Replace the destination atomically")
     move_mode.add_argument("--exchange", action="store_true", help="Swap two existing paths atomically")
     commands.add_parser("volumes", help="List mounted filesystems")
+    command_setup = commands.add_parser('command', help='Manage this user\'s sfs command link')
+    command_setup.add_argument('operation', choices=('status', 'install', 'remove'))
     prepare = commands.add_parser("prepare", help="Prepare a clean commit once")
     prepare.add_argument("source")
     prepare.add_argument("--ref", default="HEAD")
@@ -49,10 +52,16 @@ def main(argv=None):
     create = commands.add_parser("create", help="Clone a prepared seed")
     create.add_argument("seed")
     create.add_argument("--name", default="")
+    create.add_argument('--backend', choices=('native-image',), help='Use an owned native image with a mounted repository')
+    create.add_argument('--capacity-gib', type=int, help='Required capacity for native images')
+    create.add_argument('--native-profile', choices=('production', 'private-sfsro27'), default='production')
+    create.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     create.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Folder clone workers; use 1 for lower CPU use")
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
         command.add_argument("id")
+        if action == "unmount":
+            command.add_argument("--continue", dest="continue_operation", metavar="OP", help="Withdraw an accepted mount before a retained snapshot/rollback")
     listing = commands.add_parser("list", help="List stored workspaces, seeds or trash")
     listing.add_argument("kind", nargs="?", choices=["workspaces", "seeds", "trash"], default="workspaces")
     for action in ("remove", "restore"):
@@ -68,13 +77,16 @@ def main(argv=None):
     snapshot = commands.add_parser("snapshot", help="Capture a stopped managed workspace")
     snapshot.add_argument("id")
     snapshot.add_argument("--name", default="")
-    snapshot.add_argument("--quiescent", action="store_true")
+    snapshot.add_argument("--quiescent", action="store_true", help="Assert writers are stopped and flushed; allow a brief native unmount/remount")
+    snapshot.add_argument("--continue", dest="continue_operation", metavar="OP", help="Continue the matching retained operation without repeating its mutation")
     snapshots = commands.add_parser("snapshots", help="List workspace snapshots")
     snapshots.add_argument("id")
+    snapshots.add_argument("--operation", metavar="OP", help="Read retained phase and continuation instructions")
     rollback = commands.add_parser("rollback", help="Restore a snapshot and retain the previous workspace")
     rollback.add_argument("id")
     rollback.add_argument("snapshot")
-    rollback.add_argument("--quiescent", action="store_true")
+    rollback.add_argument("--quiescent", action="store_true", help="Assert writers are stopped and flushed; allow a brief native unmount/remount")
+    rollback.add_argument("--continue", dest="continue_operation", metavar="OP", help="Continue the matching retained operation without repeating its mutation")
     close = commands.add_parser("close", help="Record that all workspace writers have stopped")
     close.add_argument("id")
     close.add_argument("--quiescent", action="store_true")
@@ -94,7 +106,7 @@ def main(argv=None):
     purge = commands.add_parser("purge", help="Preview or permanently delete retained data")
     purge.add_argument("kind", choices=("snapshots", "recovery", "trash"))
     purge.add_argument("id")
-    purge.add_argument("--yes", action="store_true")
+    purge.add_argument("--yes", action="store_true", help="Permanently delete selected data, including all snapshots inside a native image")
     commands.add_parser("doctor", help="Test native cloning and write isolation")
     from . import benchmark
     benchmark.parser(commands)
@@ -116,6 +128,19 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'command':
+        if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
+            parser.error('--root applies to workspace commands')
+        try:
+            from ._command import run, describe
+            result = run(args.operation)
+            print(json.dumps(result, sort_keys=True) if args.json else describe(result))
+            return 0
+        except (OSError, ValueError, ImportError, KeyError, TypeError, KeyboardInterrupt, MemoryError) as error:
+            interrupted = isinstance(error, KeyboardInterrupt)
+            message = 'interrupted; inspect command status' if interrupted else str(error)
+            print(json.dumps({'error': message}) if args.json else 'stallionfs: ' + message, file=sys.stderr)
+            return 130 if interrupted else 1
     if args.action == 'benchmark':
         return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
@@ -157,10 +182,16 @@ def main(argv=None):
             result = store.prepare(args.source, ref=args.ref, key=args.key, command=setup, image_size=args.image_size)
             text = result["id"]
         elif args.action == "create":
-            result = store.create(args.seed, name=args.name, jobs=args.jobs)
+            options = {}
+            if args.backend is not None or args.capacity_gib is not None or args.native_host is not None or args.native_profile != 'production':
+                options = dict(backend=args.backend, capacity_gib=args.capacity_gib,
+                               native_profile=args.native_profile, native_host=args.native_host)
+            result = store.create(args.seed, name=args.name, jobs=args.jobs, **options)
             text = result["path"]
         elif args.action in ("mount", "unmount"):
-            result = getattr(store, args.action)(args.id)
+            result = (store.continue_unmount(args.id, args.continue_operation)
+                      if args.action == "unmount" and args.continue_operation is not None
+                      else getattr(store, args.action)(args.id))
             text = result.get("path", result.get("unmounted"))
         elif args.action == "list":
             result = store.list(args.kind)
@@ -173,13 +204,19 @@ def main(argv=None):
             result = {"deleted" if args.yes else "would_delete": items}
             text = json.dumps(result)
         elif args.action == "snapshot":
-            result = store.snapshot(args.id, quiescent=args.quiescent, name=args.name)
+            result = store.snapshot(args.id, quiescent=args.quiescent, name=args.name,
+                                    **({"continue_operation": args.continue_operation} if args.continue_operation is not None else {}))
             text = result["id"]
         elif args.action == "snapshots":
-            result = store.snapshots(args.id)
-            text = "\n".join(f"{item['id']}\t{item['name']}" for item in result)
+            result = store.snapshots(args.id, **({"operation_id": args.operation} if args.operation is not None else {}))
+            if args.operation is not None:
+                from ._native_recovery import format_compound_status
+                text = format_compound_status(result)
+            else:
+                text = "\n".join(f"{item['id']}\t{item['name']}" for item in result)
         elif args.action == "rollback":
-            result = store.rollback(args.id, args.snapshot, quiescent=args.quiescent)
+            result = store.rollback(args.id, args.snapshot, quiescent=args.quiescent,
+                                    **({"continue_operation": args.continue_operation} if args.continue_operation is not None else {}))
             text = json.dumps(result)
         elif args.action == "close":
             result = store.close(args.id, quiescent=args.quiescent)
@@ -214,7 +251,7 @@ def main(argv=None):
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
         return result["returncode"] if args.action == "run" else 0
-    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError) as exc:
+    except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError, subprocess.TimeoutExpired) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)
         notes = list(getattr(exc, "__notes__", ()))
@@ -224,7 +261,13 @@ def main(argv=None):
             details = result.get('native_image_result')
         if details is not None:
             error['native_image_result'] = details
-            if interrupted or isinstance(exc, MemoryError):
+            from ._native_recovery import COMPOUND, compound_summary
+            compound = details if details.get('operation') in COMPOUND else details.get('native_operation')
+            if isinstance(compound, dict) and compound.get('operation') in COMPOUND:
+                summary = compound_summary(compound)
+                error['native_operation_summary'] = summary
+                notes.append(summary['message'])
+            elif interrupted or isinstance(exc, MemoryError):
                 if details.get('committed'):
                     message = ('interrupted' if interrupted else 'response allocation failed') + '; the image change committed'
                 elif details.get('outcome') == 'unknown':

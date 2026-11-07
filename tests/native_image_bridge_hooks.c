@@ -101,3 +101,15 @@ ssize_t sfs_bridge_test_import_pwrite(int fd, const void *bytes, size_t size, of
     if (bridge_flags & 131072) { bridge_flags &= ~131072; errno = ENOSPC; return -1; }
     return pwrite(fd, bytes, size, offset);
 }
+
+int sfs_bridge_test_parent_close(int fd) {
+    int status = close(fd);
+    if (!status && (bridge_flags & 262144)) { bridge_flags &= ~262144; errno = EIO; return -1; }
+    return status;
+}
+enum sfs_status sfs_bridge_test_guard_open(const char *directory, const char *name, sfs_image **out, sfs_result *r) {
+    enum sfs_status status = sfs_image_open_readonly(directory,name,out,r);
+    if (status == SFS_OK && (bridge_flags & 1048576)) { bridge_flags &= ~1048576; bridge_flags |= 128; }
+    if (status == SFS_OK && (bridge_flags & 524288)) { bridge_flags &= ~524288; raise(SIGINT); }
+    return status;
+}
