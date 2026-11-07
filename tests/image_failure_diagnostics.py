@@ -306,7 +306,7 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
 @contextmanager
 def observe_detach():
     """Observe only the first detach command in this explicit test operation."""
-    observation = dict(started=False, operation_id=None)
+    observation = dict(started=False, operation_id=None, pre_observation='unavailable')
     token = _detach_observation.set(observation)
     try:
         yield
@@ -356,7 +356,14 @@ def artifact_available(directory):
             return False
         for line in lines:
             value = json.loads(line)
-            if not isinstance(value, dict) or value.get('kind') not in _fields or set(value) - {'kind'} != _fields[value['kind']] | _metadata:
+            if not isinstance(value, dict) or value.get('kind') not in _fields:
+                return False
+            required = _fields[value['kind']] | _metadata
+            optional = {'pre_observation'} if value['kind'] in ('observation', 'failure') else set()
+            if not required <= set(value) - {'kind'} <= required | optional:
+                return False
+            if ('pre_observation' in value and
+                    value['pre_observation'] not in ('attempted', 'unavailable', 'not-selected')):
                 return False
             if (type(value['operation_id']) is not int or value['operation_id'] < 0 or
                     value['phase'] not in ('before', 'after', 'standalone') or
@@ -647,6 +654,16 @@ class Diagnostics:
         return str(backing), devices, str(point), volumes[0]['dev-entry'], identity
 
     @staticmethod
+    def _raw_devices(devices):
+        # Derive only counterparts of the independently validated attachment graph.
+        # Missing nodes remain an inconclusive lsof result, not proof of no holder.
+        if (not isinstance(devices, list) or not 0 < len(devices) <= 32 or
+                not all(isinstance(device, str) and _device.fullmatch(device) for device in devices) or
+                len(set(devices)) != len(devices)):
+            raise ValueError('invalid device mapping')
+        return ['/dev/r' + device.removeprefix('/dev/') for device in devices]
+
+    @staticmethod
     def _holder_identity(lines, image, identity):
         # lsof's D is hexadecimal st_dev; i is the decimal inode number.
         # A pathname without both fields cannot establish the held backing inode.
@@ -720,7 +737,10 @@ class Diagnostics:
             dates = [datetime.fromtimestamp(second, timezone.utc).strftime('%Y-%m-%d %H:%M:%S+0000')
                      for second in (first, last)]
             predicate = (f'process == "diskarbitrationd" AND subsystem == "{DA_SUBSYSTEM}" AND '
-                         f'(eventMessage CONTAINS "{target}," OR eventMessage CONTAINS "{target} (")')
+                         f'((eventMessage CONTAINS "unable to eject {target} (status code ") OR '
+                         f'(eventMessage CONTAINS "dispatched response, id = " AND '
+                         f'eventMessage CONTAINS[c] "eject" AND eventMessage CONTAINS[c] "approval" AND '
+                         f'eventMessage CONTAINS "disk = {target}, dissented, status = "))')
             argv = ['/usr/bin/log', 'show', '--style', 'ndjson', '--start', dates[0], '--end', dates[1],
                     '--timezone', 'UTC', '--no-pager', '--no-info', '--no-debug', '--no-signpost',
                     '--no-loss', '--predicate', predicate]
@@ -790,6 +810,9 @@ class Diagnostics:
             if observation is not None:
                 observation['operation_id'] = operation_id
                 observation['deadline'] = deadline
+                if before:
+                    # Admission is not proof that mapping/capture completed.
+                    observation['pre_observation'] = 'attempted'
             self.operation_id, self.phase = operation_id, phase
             if before:
                 saved_remaining = self.remaining
@@ -806,6 +829,8 @@ class Diagnostics:
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
                        failed_device=args[2] if args[1] == 'detach' and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
+                       pre_observation=(observation.get('pre_observation', 'unavailable')
+                                        if observation is not None else 'not-selected'),
                        observation='immediately before detach command' if before else 'post-failure observation')
             if scope is None:
                 self._emit(deadline, 'unavailable', reason='no explicit owned fixture context')
@@ -833,7 +858,8 @@ class Diagnostics:
             # Exact backing/device queries remain useful when detached or remapped.
             # Only the caller's expected, independently observed mount can scope +f.
             point = point if matches else None
-            queries = [([], [image, *devices])]
+            raw_devices = self._raw_devices(devices)
+            queries = [([], [image, *devices, *raw_devices])]
             if point is not None:
                 queries.append((['+f'], [point]))
             for options, names in queries:
@@ -856,7 +882,7 @@ class Diagnostics:
                 for line in raw_lines:
                     if line.startswith('n'):
                         name = line[1:]
-                        allowed = name in [image, *devices, point] or (point is not None and name.startswith(point + '/') and '..' not in Path(name).parts)
+                        allowed = name in [image, *devices, *raw_devices, point] or (point is not None and name.startswith(point + '/') and '..' not in Path(name).parts)
                         # Ambiguous name/annotation text must not smuggle a second path.
                         allowed = allowed and not any(c.isspace() for c in name)
                         display_truncated |= allowed and len(line) > 512

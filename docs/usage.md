@@ -195,6 +195,172 @@ sfs purge trash WORKSPACE_ID
 ```
 
 `purge` is deliberate permanent deletion. Inspect the data first. Interrupted deletion retains its remainder in staging and reports that path, keeping usable snapshot listings clear of partial entries. Pending rollback journals and mounted images prevent purging. Keep any previous rollback repository you need by copying `recovery/RECOVERY_ID/repo` to a new path before purging its slot; image recovery remains a closed `workspace.sparseimage` backing file.
+## Owned native workspaces
+
+Native workspaces require a qualified, signed StallionFS package enabled in
+File System Extensions settings. The production filesystem type is `stallionfs`.
+The current controller requires macOS 27 and a writable package; packaging,
+discovery and offline tests alone do not qualify an installed release. See
+[FSKit packaging](fskit-package.md) for the remaining distribution and mounted
+validation requirements.
+
+Prepare an ordinary folder seed, then create an independent native image:
+
+```sh
+seed=$(sfs prepare /path/to/project --key dependencies-v1 -- npm ci)
+sfs --json create "$seed" --backend native-image --capacity-gib 8 --name parser
+sfs run WORKSPACE_ID -- python3 -c 'from pathlib import Path; Path("result").write_text("saved")'
+sfs unmount WORKSPACE_ID
+sfs mount WORKSPACE_ID
+```
+
+Successful creation prints the mounted `volume/repo` path, containing the
+prepared commit, dependencies and a new workspace branch. Each image has a fresh
+UUID. Creation verifies the imported image, installs only its owned resource
+directory, completes its ownership proof, then mounts and checks the writable
+repository path. Capacity is required in GiB; APFS-image seeds are not accepted.
+Ordinary folder creation remains the default.
+
+`run` holds the managed-use lease while the command executes. Stop shells,
+editors and other users before `unmount`; unmount never forces a busy volume.
+After successful ordinary unmount, the controller requires namespace absence
+and a fresh exact-image guard with successful consumed close. Later mounts allow
+legitimate content and Git changes; they do not reset the original branch or
+require the creation anchor to remain current.
+
+On failure, use `--json` and retain the reported workspace, journal and operation
+files. A completed install survives mount failure. If the target is absent,
+`mount ID` can try a new operation after the previous helper is reaped. If a
+matching mount exists but completion is unresolved, explicitly `unmount ID`
+before mounting again. An unresolved executing helper blocks new managed
+mutators; keep its controller supervising it. Timeout/interruption never means
+that the OS rolled the operation back. Installation recovery before first mount
+uses a new guard of the retained image; it does not repeat import or rename.
+
+The controller uses ordinary macOS type dispatch and current mount observations.
+These do not authenticate an exact live adapter session or prove a previous
+adapter close succeeded. A fresh guard validates only its own current admission
+and consumed close. Ordinary unmount alone grants no stale-cleanup credit.
+
+Owned native snapshots and rollback can briefly unmount and remount an accepted
+managed workspace. Stop and flush every writer and release open files and
+directories before asserting `--quiescent`:
+
+```sh
+sfs snapshot ID --name before-change --quiescent
+sfs rollback ID before-change --quiescent
+```
+
+One managed-use lease and one durable operation cover the normal unmount, closed
+image transaction, and verified remount. The flag does not stop other processes.
+Busy volumes or backing handles refuse safely; no forced unmount or pin bypass is
+used. This is a cooperative outage, not an uninterrupted snapshot. Old handles
+do not survive it. New opens after successful remount use the restored namespace.
+An initially unmounted workspace stays unmounted. Without `--quiescent`, owned
+native operations still require an already unmounted workspace, including all
+nested mountpoints. External registrations remain closed-image operations.
+
+Before unmount, a fresh observation must match the accepted mount's target,
+path, filesystem type, owner, flags and filesystem ID, with a qualified module
+profile. This matches recorded observations; it does not authenticate a live
+provider session. The transaction reacquires the exact backing exclusively.
+Rollback saves the state actually admitted by that transaction under the returned
+recovery name, in the same commit. The catalog holds 32 entries without eviction;
+rollback needs one free entry for recovery. Catalog entry deletion is not supported.
+
+Mutation and mount outcomes are separate. A committed snapshot/rollback followed
+by remount failure remains committed. Every remount checks the saved committed
+generation, root digest and committed end with a fresh exclusive guard and
+successful consumed close. Image drift stops remount. The guard releases its
+lock before the mount command: it is not a reservation across that gap, so all
+external users must continue cooperating. Neither namespace absence nor a fresh
+guard proves the previous provider's historical close succeeded.
+
+Use the retained operation ID from failure output to inspect and continue:
+
+```sh
+sfs --json snapshots ID --operation OP
+sfs snapshot ID --name before-change --quiescent --continue OP
+sfs rollback ID before-change --quiescent --continue OP
+```
+
+Continuation requires the same workspace, action and name. It never repeats an
+attempted catalog mutation or creates a new recovery name. Ordinary commands
+preserve a pending compound journal and print its status command.
+
+| Retained phase | Permitted continuation |
+| --- | --- |
+| Prepared | Revalidate the accepted mount, then start the first unmount and mutation. |
+| Unmount response missing | Only terminal helper evidence plus fresh absence and backing admission can allow the first mutation. A present mount is not automatically unmounted again. |
+| Bridge response missing, failed, uncertain or close incomplete | Stop. A matching current catalog cannot repair the original result. |
+| Confirmed commit and successful consumed close | Remount only, checking the saved anchor; or finalize an originally unmounted workspace. |
+| Remount response missing | A present mount requires the same operation's durable qualified observation/usability evidence and terminal helper evidence for finish-only continuation. Otherwise stop. Once separately withdrawn and absent, terminal helper evidence permits a new recorded remount attempt. |
+| Final state verified, completion interrupted | Verify retained final evidence and current state, finish the durable record, then remove the matching journal. |
+| Child pending, unreaped or ownership uncertain | Keep its controller running. A new invocation never signals or waits on a saved PID or infers termination from mount absence. |
+
+Before mutation only, `sfs unmount ID --continue OP` permits explicit normal
+withdrawal of the still-present accepted matching mount, retaining the same
+operation without authorizing a catalog mutation. It refuses an unbound or changed
+mount. For an unresolved present remount without durable evidence, arrange normal
+withdrawal separately after checking the displayed path; the controller does not
+infer authority from that observation. Completed-operation status preserves its
+historical result and reports current mount drift separately.
+
+Cleanup remains disabled by default and needs explicit per-workspace enrollment.
+For an enrolled owned native workspace, `close ID --quiescent` normally unmounts
+and records a fresh current image baseline. Cleanup can also observe an enrolled,
+already-unmounted workspace left open by a crash; its seven-day idle period
+starts at that new observation, never at an inferred crash time. Preview does
+not create an idle baseline. Mount/run, catalog mutation and restore clear it.
+The final retirement guard must still match that exact anchor and lifecycle.
+
+Native retirement moves the same owned directory into protected trash and uses
+one of the store's 32 retention slots. Explicit `remove ID` requires the same
+enrollment and seven-day stale baseline. `restore ID` resolves an interrupted
+move without replay, or returns protected trash to its workspace location. It
+works at full retention, frees the existing protection slot, and leaves the
+workspace unmounted; use `mount ID` afterward. Original creation, installation
+and successful first-use evidence remain unchanged. Native `run --auto-retire`
+is not supported.
+
+To permanently delete one owned native workspace already in protected trash:
+
+```sh
+sfs purge trash WORKSPACE_ID
+sfs purge trash WORKSPACE_ID --yes
+```
+
+The first command previews without changing pending move or purge records.
+`--yes` permanently removes the current filesystem **and every snapshot and
+recovery entry inside that image**. This unlinks the image; it does not securely
+erase storage media. It cannot purge an external registration, a mounted
+resource, a workspace in managed use, or an unconfirmed installation.
+
+Deletion checks an exact manifest of private owned entries before touching data.
+Unexpected files, links, nonempty unmounted volume directories, or changed
+identities stop it. The manifest is limited to 16,384 entries and the durable
+intent to 8 MiB. Every metadata input, including whitespace, is bounded to
+8 MiB before decoding; oversized input leaves existing recovery records unchanged.
+Exceeding a limit refuses deletion. Purge works when all
+32 retention slots are occupied and never runs automatically.
+
+An interrupted purge reports whether the image name is already absent. Run the
+same `purge trash WORKSPACE_ID --yes` command to finish only its recorded remaining
+entries. A failed close after unlink cannot restore the image. The reserved
+staging container and top-level journal retain partial work; do not edit or move
+them. Conflicting or unbound replacement entries remain untouched. A compact
+completion receipt makes repeating a completed purge harmless and rejects reused
+names. If a crash occurred before relocation authorization and left an unbound
+or missing staging container, the same explicit command verifies the unchanged
+original, durably archives the old attempt and starts a fresh attempt. Any unknown
+orphan container remains untouched and retained. Permanent deletion is separate
+from recoverable `remove` and `restore`.
+
+`--native-host PATH` selects the containing app's `Contents/MacOS/StallionFS`
+discovery executable. `--native-profile private-sfsro27` is reserved for explicit
+private qualification with that short type; it is not the production default.
+Neither option installs, registers, enables or signs an extension.
+
 ## Closed native images
 
 Register an existing native image without moving or copying its backing file:
@@ -215,8 +381,8 @@ most 32 snapshots; full catalogs fail without evicting an existing root.
 These commands operate on closed images. The managed lease and ordinary core
 exclusive inode lock reject cooperating active users, including the current
 FSKit loader while it retains its core handle. They do not detect arbitrary
-noncooperating writers or qualify mounted kernel caching. Native mount/run,
-cleanup enrollment, retirement and removal are unsupported by these commands.
+noncooperating writers or qualify mounted kernel caching. Mount/run for external registrations, cleanup enrollment, retirement and
+removal are unsupported by these commands.
 Registering an external file grants no authority to delete it.
 
 The immediate parent must be private, owned and local writable APFS. Registration

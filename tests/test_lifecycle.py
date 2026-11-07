@@ -325,6 +325,82 @@ class NativeReferenceTests(unittest.TestCase):
                         self.assertEqual(len(injected), 1)
 
 
+class ImageRollbackStateTests(unittest.TestCase):
+    def test_unmounted_busy_rollback_preserves_open_state_until_explicit_recovery(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory(prefix='image-rollback-state-mock-') as temporary:
+            store = Store(Path(temporary).resolve() / 'store')
+            workspace, snapshot = 'a' * 32, 'b' * 32
+            path, saved = store.root / 'workspaces' / workspace, store.root / 'snapshots' / snapshot
+            path.mkdir(mode=0o700); saved.mkdir(mode=0o700)
+            image, backup, point = path / 'workspace.sparseimage', saved / 'workspace.sparseimage', path / 'volume'
+            image.write_bytes(b'current synthetic image'); image.chmod(0o600)
+            backup.write_bytes(b'saved synthetic image'); backup.chmod(0o600)
+            point.mkdir(mode=0o700)
+            meta = {'id': workspace, 'commit': 'c' * 40, 'branch': 'main', 'backend': 'image'}
+            write_json(path / 'meta.json', meta)
+            write_json(saved / 'meta.json', {'id': snapshot, 'workspace': workspace, 'backend': 'image',
+                                           'payload': lifecycle.identity(backup)})
+            identities = lifecycle.identity(image), lifecycle.identity(backup)
+            mounted = {'device': '/dev/disk999', 'mountpoint': str(point), 'volume_device': '/dev/disk1000s1'}
+            state, commands = {'attached': True}, []
+            first, final = StallionError('first busy'), StallionError('final busy')
+            first.returncode = final.returncode = errno.EBUSY
+            def inventory(actual):
+                self.assertEqual(actual, image)
+                return mounted.copy() if state['attached'] else None
+            def command(*args):
+                self.assertEqual(args, ('/usr/bin/hdiutil', 'detach', '/dev/disk999'))
+                commands.append(args)
+                if len(commands) <= 2:
+                    mounted.update(mountpoint=None, volume_device=None)
+                    raise first if len(commands) == 1 else final
+                state['attached'] = False
+                return b''
+            def attach(*args):
+                self.assertEqual(args, ('/usr/sbin/diskutil', 'image', 'attach', '--nobrowse', '--plist',
+                    '--mountOptions', 'owners', '--mountPoint', point, image))
+                state['attached'] = True
+                mounted.update(mountpoint=str(point), volume_device='/dev/disk1000s1')
+                return {}
+            with patch.object(images, 'mounted', side_effect=inventory), \
+                    patch.object(images, '_command', side_effect=command), \
+                    patch.object(images, '_plist', side_effect=attach) as attaching, \
+                    patch.object(images, '_require_supported'), \
+                    patch.object(images.os.path, 'ismount', return_value=False), \
+                    patch.object(_scan, 'mounts', return_value=[]), \
+                    patch.object(images, 'flush') as flush, patch.object(images, 'clone') as clone, \
+                    patch.object(_scan, 'move') as exchange, patch.object(store, '_standalone_git'), \
+                    patch.object(core, 'git', return_value='main'), \
+                    patch.object(subprocess, 'Popen', side_effect=AssertionError('unexpected subprocess')):
+                store.enroll(workspace); store.cleanup_config(enabled=True)
+                with self.assertRaises(StallionError) as caught:
+                    store.rollback(workspace, snapshot)
+                self.assertIs(caught.exception, final)
+                self.assertIs(caught.exception.__context__, first)
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(read_json(store._state(workspace))['status'], 'open')
+                self.assertIsNone(images.mounted(image)['mountpoint'])
+                self.assertEqual((lifecycle.identity(image), lifecycle.identity(backup)), identities)
+                for name in ('recovery', 'journals', 'trash'):
+                    self.assertEqual(list((store.root / name).iterdir()), [])
+                flush.assert_not_called(); clone.assert_not_called(); exchange.assert_not_called()
+                self.assertEqual(store.cleanup(apply=True)['retired'], [])
+                self.assertEqual(len(commands), 2)
+                with self.assertRaisesRegex(StallionError, 'already attached'):
+                    store.mount(workspace)
+                attaching.assert_not_called()
+                self.assertEqual(len(commands), 2)
+                # A later explicit caller action is separate from the failed rollback.
+                self.assertEqual(store.unmount(workspace), {'unmounted': workspace})
+                self.assertEqual(len(commands), 3); self.assertIsNone(images.mounted(image))
+                self.assertEqual(store.mount(workspace)['path'], str(point / 'repo'))
+                attaching.assert_called_once()
+                self.assertEqual(read_json(store._state(workspace))['status'], 'open')
+                self.assertEqual(len(commands), 3)
+                flush.assert_not_called(); clone.assert_not_called(); exchange.assert_not_called()
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'requires native APFS clone and exchange')
 class LifecycleTests(unittest.TestCase):
     def setUp(self):

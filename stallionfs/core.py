@@ -5,6 +5,7 @@ from __future__ import annotations
 from ._scan import _private_directory
 
 import contextlib
+import contextvars
 import errno
 import fcntl
 import json
@@ -59,6 +60,21 @@ def owned_native_target(path, metadata):
             target['file'] != [info.st_dev, info.st_ino]):
         raise StallionError('Native candidate backing identity changed')
     proof = read_json(path / 'native-create.json')
+    validate_native_creation_proof(metadata, proof)
+    # Reuse the unchanged external target validator only for its identity schema.
+    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
+                'file': target['file'], 'uuid': target['uuid']}
+    native_target({'ownership': 'external-reference', 'native_image': resolved})
+    return resolved
+
+
+def validate_native_creation_proof(metadata, proof):
+    """Validate immutable import lineage without treating its old path as current."""
+    target = metadata.get('native_image')
+    if (metadata.get('ownership') != 'store-created' or metadata.get('backend') != 'native-image'
+            or metadata.get('state') != 'candidate' or not isinstance(target, dict)
+            or target.get('component') != 'image.sfs' or set(target) != {'component', 'parent', 'object', 'file', 'uuid', 'anchor'}):
+        raise StallionError('Invalid native creation lineage')
     identifier(metadata.get('id'), 32)
     identifier(metadata.get('seed'), 64)
     identifier(metadata.get('transaction'), 32)
@@ -92,21 +108,24 @@ def owned_native_target(path, metadata):
             result.get('identity', {}).get('uuid') != target['uuid'] or result.get('anchor') != target['anchor'] or
             any(result.get(key, {}).get('status') != 0 for key in ('close', 'reopen', 'reopen_close'))):
         raise StallionError('Native candidate lacks matching completed creation proof')
-    # Reuse the unchanged external target validator only for its identity schema.
-    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
-                'file': target['file'], 'uuid': target['uuid']}
-    native_target({'ownership': 'external-reference', 'native_image': resolved})
-    return resolved
+    native_target({'ownership': 'external-reference', 'native_image': {
+        'directory': '/creation-proof', 'component': target['component'],
+        'parent': target['object'], 'file': target['file'], 'uuid': target['uuid']}})
+    return target
 
 
 def native_retention_reason(path):
     """Observe protected native stage shapes without following directory aliases."""
     path = Path(path)
+    if path.name.startswith('native-purge-'):
+        return 'reserved native purge tombstone'
     def failed(error):
         raise error
     for parent, directories, files in os.walk(path, followlinks=False, onerror=failed):
         parent = Path(parent)
         names = set(directories) | set(files)
+        if 'native-purge.json' in names:
+            return 'native purge marker'
         if names & {'native-create', 'native-create.json'}:
             return 'native creation marker'
         if 'image.sfs' in names and (parent == path or parent.name == 'owned'):
@@ -182,10 +201,17 @@ def native_failure_details(error):
     return None
 
 
-def run(args, cwd=None, *, capture=True):
+def run(args, cwd=None, *, capture=True, internal_git=False):
     # Inherited Git routing variables must never redirect an operation elsewhere.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if internal_git:
+        from . import _bundle
+        try:
+            executable, env = _bundle.git_environment(env)
+        except (ValueError, OSError) as error:
+            raise StallionError('Invalid bundled Git: ' + str(error)) from error
+        args = [executable, *args[1:]]
     if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
         from ._benchmark_budget import command
         result = command(args, cwd=cwd, environment=env, persist_success=False)
@@ -213,7 +239,7 @@ def run(args, cwd=None, *, capture=True):
 def git(repo, *args):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
-                "-C", repo, *args])
+                "-C", repo, *args], internal_git=True)
 
 
 def identifier(value, length):
@@ -222,11 +248,43 @@ def identifier(value, length):
     return value
 
 
+class MetadataLimitError(StallionError):
+    """Metadata refused before decoding; retain existing recovery evidence."""
+
+
+_json_read_limit = contextvars.ContextVar('stallionfs_json_read_limit', default=None)
+
+
+@contextlib.contextmanager
+def json_read_limit(max_bytes):
+    """Bound this operation and its delegated metadata reads, then restore scope."""
+    previous = _json_read_limit.get()
+    token = _json_read_limit.set(max_bytes if previous is None else min(previous, max_bytes))
+    try:
+        yield
+    finally:
+        _json_read_limit.reset(token)
+
+
 def read_json(path):
     if path.is_symlink() or not path.is_file():
         raise StallionError(f"Missing or unsafe metadata: {path}")
     try:
-        value = json.loads(path.read_text())
+        limit = _json_read_limit.get()
+        if limit is None:
+            data = path.read_text()
+        else:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise StallionError(f"Unsafe metadata: {path}")
+                if info.st_size > limit:
+                    raise MetadataLimitError(f"Metadata exceeds {limit} byte limit: {path}")
+                data = stream.read(limit + 1)
+                if len(data) > limit:
+                    raise MetadataLimitError(f"Metadata exceeds {limit} byte limit: {path}")
+        value = json.loads(data)
         if not isinstance(value, dict) or value.get("format") != 1:
             raise ValueError("unsupported format")
         return value
@@ -358,6 +416,9 @@ class Store(Lifecycle):
                     raise StallionError(f'Staging contains {reason}; retained at {path}')
                 for journal in (self.root / 'journals').iterdir():
                     record = read_json(journal)
+                    if (record.get('operation') == 'native-purge'
+                            and record.get('container') == path.name):
+                        raise StallionError(f'Native purge intent protects staging at {path}')
                     if record.get('operation') == 'native-create' and record.get('stage') == str(path):
                         raise StallionError(f'Native creation intent protects staging at {path}')
                 image = path / "workspace.sparseimage"
@@ -377,9 +438,13 @@ class Store(Lifecycle):
         if metadata.get("id") != value:
             raise StallionError(f"Metadata ID mismatch: {path}")
         if metadata.get('backend') == 'native-image':
-            if kind != 'workspaces':
-                raise StallionError('Native image registrations are not seeds or trash')
-            native_target(metadata)
+            if kind not in ('workspaces', 'trash') or (kind == 'trash' and metadata.get('ownership') != 'store-created'):
+                raise StallionError('External native image registrations are not seeds or trash')
+            if metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                installed_target(self, path, metadata, confirmed=False)
+            else:
+                native_target(metadata)
             return path, metadata
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(metadata.get("commit", ""))):
             raise StallionError(f"Invalid commit in metadata: {path}")
@@ -405,7 +470,11 @@ class Store(Lifecycle):
             metadata = read_json(registration / 'meta.json')
             if metadata.get('backend') != 'native-image':
                 continue
-            target = native_target(metadata)
+            if metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                target = installed_target(self, registration, metadata, confirmed=False)
+            else:
+                target = native_target(metadata)
             references.append(tuple(target['file']))
             try:
                 parent = Path(target['directory']).lstat()
@@ -432,6 +501,14 @@ class Store(Lifecycle):
 
     def _refuse_owned_native_reference(self, target):
         expected = target['file']
+        from itertools import chain
+        for workspace in chain((self.root / 'workspaces').iterdir(), (self.root / 'trash').iterdir()):
+            metadata = read_json(workspace / 'meta.json')
+            if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
+                from ._native import installed_target
+                owned = installed_target(self, workspace, metadata, confirmed=False)
+                if owned['file'] == expected:
+                    raise StallionError('An installed owned native image cannot be registered as external')
         for stage in (self.root / 'staging').iterdir():
             private_directory(stage)
             if os.path.lexists(stage / 'owned'):
@@ -445,6 +522,16 @@ class Store(Lifecycle):
                     raise StallionError('A retained native candidate cannot be registered as an external image')
         for journal in (self.root / 'journals').iterdir():
             record = read_json(journal)
+            if record.get('operation') == 'native-purge':
+                from ._native_purge import validate
+                validate(record, journal.stem)
+                if record['target']['file'] == expected:
+                    raise StallionError('Native purge intent protects this backing image')
+                continue
+            if record.get('operation') in ('native-retire', 'native-return'):
+                if record.get('target', {}).get('file') == expected:
+                    raise StallionError('Unresolved native move protects this backing image')
+                continue
             if record.get('operation') != 'native-create':
                 continue
             if record.get('creation_attempted') is not False and record.get('native_image', {}).get('file') is None:
@@ -510,8 +597,8 @@ class Store(Lifecycle):
                 raise error from closing_error
             raise
 
-    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None):
-        """Produce a retained verified image; public workspace creation is unchanged."""
+    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None, install_profile=None, native_host=None):
+        """Produce a retained verified image; optionally continue into guarded installation."""
         import uuid
         from . import _image
         from .lifecycle import identity, replace_json
@@ -565,6 +652,9 @@ class Store(Lifecycle):
                 if read_json(journal).get('transaction') != transaction:
                     raise StallionError('Native candidate intent ownership changed')
                 with self._workspace_lock(workspace, reconcile=False, native_result=native_result):
+                    if install_profile is not None:
+                        from ._native import preflight_create
+                        preflight_create(self, response, intent, stage, journal, install_profile, native_host)
                     repo = host / 'repo'
                     clone_tree(base / 'repo', repo, jobs=jobs)
                     branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
@@ -645,6 +735,9 @@ class Store(Lifecycle):
                         response['host_cleanup_error'] = str(error)
                     else:
                         response['host_cleanup_complete'] = True
+                    if install_profile is not None:
+                        from ._native import install_candidate
+                        return install_candidate(self, response, intent, metadata, install_profile, native_host)
                     # The intent remains an observational hold, never an exchange journal.
                     return response
 
@@ -728,7 +821,32 @@ class Store(Lifecycle):
                     path.rename(stage / "expired")
             return {"deleted" if yes else "would_delete": seed}
 
-    def create(self, seed, *, name="", jobs=4):
+    def create(self, seed, *, name="", jobs=4, backend=None, capacity_gib=None,
+               native_profile='production', native_host=None):
+        if backend == 'native-image':
+            result = self._build_owned_native_candidate(seed, name=name, jobs=jobs,
+                native_capacity_gib=capacity_gib, install_profile=native_profile, native_host=native_host)
+            workspace = result['workspace']
+            try:
+                mounted_result = [result]
+                with self._workspace_lock(workspace, native_result=mounted_result):
+                    path, metadata = self.object('workspaces', workspace)
+                    from ._native import mount_locked
+                    mounted = mount_locked(self, path, metadata)
+                    mounted_result[0] = {**mounted, 'installation': result}
+                    return mounted_result[0]
+            except BaseException as error:
+                try:
+                    receipt = getattr(error, 'native_candidate_result', None)
+                    if isinstance(receipt, dict):
+                        receipt['installation'] = result
+                    else:
+                        error.native_candidate_result = result
+                except (AttributeError, MemoryError):
+                    pass
+                raise
+        if backend is not None or capacity_gib is not None or native_host is not None or native_profile != 'production':
+            raise StallionError('Native capacity/profile/host options require --backend native-image')
         import uuid
         identifier(seed, 64)
         if type(jobs) is not int or not 1 <= jobs <= 4:
@@ -759,7 +877,10 @@ class Store(Lifecycle):
 
     def _mount(self, path, metadata):
         if metadata.get('backend') == 'native-image':
-            raise StallionError('Mounted native image sessions are not supported by this command')
+            if metadata.get('ownership') != 'store-created':
+                raise StallionError('Mounting external native registrations is not supported')
+            from ._native import mount_locked
+            return mount_locked(self, path, metadata)
         repo = path / "repo"
         if metadata.get("backend") == "image":
             from . import images
@@ -781,17 +902,26 @@ class Store(Lifecycle):
 
     def mount(self, workspace):
         identifier(workspace, 32)
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, metadata = self.object("workspaces", workspace)
             self._open(workspace, path, metadata)
-            return self._mount(path, metadata)
+            result = self._mount(path, metadata)
+            if metadata.get('backend') == 'native-image':
+                native_result[0] = result
+            return result
 
     def unmount(self, workspace):
         identifier(workspace, 32)
-        with self._workspace_lock(workspace):
+        native_result = [None]
+        with self._workspace_lock(workspace, native_result=native_result):
             path, metadata = self.object("workspaces", workspace)
             if metadata.get('backend') == 'native-image':
-                raise StallionError('Mounted native image sessions are not supported by this command')
+                if metadata.get('ownership') != 'store-created':
+                    raise StallionError('Unmounting external native registrations is not supported')
+                from ._native import unmount_locked
+                native_result[0] = unmount_locked(self, path, metadata)
+                return native_result[0]
             if metadata.get("backend") != "image":
                 raise StallionError("This workspace is an ordinary folder")
             self._open(workspace, path, metadata)
@@ -810,8 +940,11 @@ class Store(Lifecycle):
                 if meta.get("backend") == "image":
                     target = path / ("workspace.sparseimage" if kind == "seeds" else "volume/repo")
                 elif meta.get('backend') == 'native-image':
-                    native = native_target(meta)
-                    target = Path(native['directory']) / native['component']
+                    if meta.get('ownership') == 'store-created':
+                        target = path / 'volume/repo'
+                    else:
+                        native = native_target(meta)
+                        target = Path(native['directory']) / native['component']
                 values.append({**meta, "path": str(target)})
             except FileNotFoundError:
                 continue  # An object can be moved by another process while listing.
@@ -820,25 +953,44 @@ class Store(Lifecycle):
     def move(self, workspace, *, restore=False):
         identifier(workspace, 32)
         source, destination = ("trash", "workspaces") if restore else ("workspaces", "trash")
-        with lock(self.root / ".lock"), self._workspace_lock(workspace):
-            path, metadata = self.object(source, workspace)
-            if metadata.get('backend') == 'native-image':
-                raise StallionError('External native image registrations cannot be removed or retired')
-            self._guard_native_tree(path)
-            target = self.root / destination / workspace
-            if target.exists() or target.is_symlink():
-                raise StallionError("Destination already exists")
-            if metadata.get("backend") == "image":
-                from . import images
-                images.detach(path / "workspace.sparseimage", path / "volume")
-            self._open(workspace, path, metadata)
-            path.rename(target)
-            self._open(workspace, target, metadata)
-            # Directory mtime records trash age without an extra metadata transaction.
-            os.utime(target, None, follow_symlinks=False)
-            if restore:
-                return self._mount(target, metadata)
-            return {**metadata, "path": str(target / ("workspace.sparseimage" if metadata.get("backend") == "image" else "repo"))}
+        native_result = [None]
+        try:
+            with lock(self.root / ".lock"), self._workspace_lock(workspace, reconcile=False, native_result=native_result):
+                journal = self.root / "journals" / (workspace + ".json")
+                if journal.exists() and read_json(journal).get("operation") in ("native-retire", "native-return"):
+                    from ._native_recovery import move_locked
+                    native_result[0] = move_locked(self, workspace, restore=restore)
+                    return native_result[0]
+                self._reconcile(workspace)
+                path, metadata = self.object(source, workspace)
+                if metadata.get('backend') == 'native-image':
+                    if metadata.get('ownership') != 'store-created':
+                        raise StallionError('External native image registrations cannot be removed or retired')
+                    from ._native_recovery import move_locked
+                    native_result[0] = move_locked(self, workspace, restore=restore)
+                    return native_result[0]
+                self._guard_native_tree(path)
+                target = self.root / destination / workspace
+                if target.exists() or target.is_symlink():
+                    raise StallionError("Destination already exists")
+                if metadata.get("backend") == "image":
+                    from . import images
+                    images.detach(path / "workspace.sparseimage", path / "volume")
+                self._open(workspace, path, metadata)
+                path.rename(target)
+                self._open(workspace, target, metadata)
+                # Directory mtime records trash age without an extra metadata transaction.
+                os.utime(target, None, follow_symlinks=False)
+                if restore:
+                    return self._mount(target, metadata)
+                return {**metadata, "path": str(target / ("workspace.sparseimage" if metadata.get("backend") == "image" else "repo"))}
+        except BaseException as error:
+            if native_result[0] is not None:
+                try:
+                    error.native_image_result = native_result[0]
+                except BaseException:
+                    pass  # A receipt failure must not replace the primary close error.
+            raise
 
     def gc(self, *, older_than=86400, yes=False, jobs=4):
         if type(jobs) is not int or not 1 <= jobs <= 4:
@@ -892,5 +1044,5 @@ class Store(Lifecycle):
             if (source / "probe").read_bytes() != b"stallionfs\n":
                 raise StallionError("Copy-on-write isolation check failed")
         return {"backend": "apfs-clonefile", "isolation": "passed", "root": str(self.root),
-                "git": run(["git", "--version"]), "python": platform.python_version(),
+                "git": run(["git", "--version"], internal_git=True), "python": platform.python_version(),
                 "staging_entries": [p.name for p in (self.root / "staging").iterdir()]}

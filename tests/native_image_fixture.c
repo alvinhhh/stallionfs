@@ -34,14 +34,18 @@ static void same_metadata(sfs_view view, sfs_inode inode) {
     same_time(a.birth,b.birth); same_time(a.access,b.access); same_time(a.modification,b.modification); same_time(a.change,b.change);
 }
 static void hex(const unsigned char *p,size_t n) { for (size_t i=0;i<n;i++) printf("%02x",p[i]); }
-static void describe(const char *path) {
+static sfs_inode path_inode(const char *path) {
     sfs_inode inode=1; char *copy=strdup(path),*rest=copy,*name;
     assert(copy);
     while ((name=strsep(&rest,"/"))) {
         if (!*name || !strcmp(name,".")) continue;
         sfs_entry entry; OK(sfs_image_lookup(image,0,inode,name,strlen(name),&entry,&receipt)); inode=entry.inode;
     }
-    free(copy); sfs_metadata_entry m; OK(sfs_image_stat_metadata(image,0,inode,&m,&receipt));
+    free(copy); return inode;
+}
+static void describe(const char *path) {
+    sfs_inode inode = path_inode(path);
+    sfs_metadata_entry m; OK(sfs_image_stat_metadata(image,0,inode,&m,&receipt));
     sfs_result anchor=receipt;
     printf("{\"inode\":%" PRIu64 ",\"kind\":%d,\"size\":%" PRIu64 ",\"mode\":%u,\"uid\":%u,\"gid\":%u,\"flags\":%u,\"links\":%" PRIu64 ",\"mapped_bytes\":%" PRIu64,
         inode,m.entry.kind,m.entry.size,m.mode,m.uid,m.gid,m.flags,m.link_count,m.referenced_data_bytes);
@@ -107,7 +111,13 @@ int main(int argc, char **argv) {
         OK(sfs_image_commit(image,&receipt));
     } else {
         OK(sfs_image_open(argv[2],"image.sfs",&image,&receipt));
-        if (!strcmp(argv[1],"edit")) {
+        if (!strcmp(argv[1],"write-path")) {
+            assert(argc == 5); sfs_inode inode = path_inode(argv[3]);
+            OK(sfs_image_begin(image,&receipt));
+            OK(sfs_image_write(image,inode,0,argv[4],strlen(argv[4]),&receipt));
+            OK(sfs_image_resize(image,inode,strlen(argv[4]),&receipt));
+            OK(sfs_image_commit(image,&receipt));
+        } else if (!strcmp(argv[1],"edit")) {
             sfs_inode id = lookup(0,"file").inode, newer;
             sfs_metadata_initial file = initial(S_IFREG|0600);
             OK(sfs_image_begin(image,&receipt));

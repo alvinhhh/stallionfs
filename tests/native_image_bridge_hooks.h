@@ -18,3 +18,6 @@ enum sfs_status sfs_bridge_test_import_close(sfs_image *, sfs_result *);
 enum sfs_status sfs_bridge_test_import_write(sfs_image *, sfs_inode, uint64_t, const void *, size_t, sfs_result *);
 void *sfs_bridge_test_import_malloc(size_t);
 ssize_t sfs_bridge_test_import_pwrite(int, const void *, size_t, off_t);
+
+int sfs_bridge_test_parent_close(int);
+enum sfs_status sfs_bridge_test_guard_open(const char *, const char *, sfs_image **, sfs_result *);

@@ -49,6 +49,7 @@ class NativeImageCLI(unittest.TestCase):
                     '-include', tests / 'native_image_bridge_hooks.h', '-c', filesystem / 'image.c', '-o', normal])
         bridge = cls.artifacts / 'diagnostic-bridge.o'
         cls.owned('diagnostic-bridge', [*flags, '-Dclock_gettime=sfs_bridge_test_clock',
+                    '-Dclose=sfs_bridge_test_parent_close', '-Dsfs_image_open_readonly=sfs_bridge_test_guard_open',
                     '-DPyLong_FromLongLong=sfs_bridge_test_signed', '-DPyLong_FromUnsignedLongLong=sfs_bridge_test_unsigned',
                     '-DPyUnicode_FromStringAndSize=sfs_bridge_test_text',
                     '-Dsfs_image_snapshot=sfs_bridge_test_snapshot', '-Dsfs_image_prepare_restore=sfs_bridge_test_restore',
@@ -250,6 +251,154 @@ class NativeImageCLI(unittest.TestCase):
             # Deliberate unlink is followed only by terminal consuming close.
         _image.with_backing_guard(destination, unlink)
         self.assertEqual(tokens[-1].close_result['status'], 0)
+
+    def test_guard_wrapper_retains_precallback_carrier_and_primary_extraction_errors(self):
+        from stallionfs import _native
+        from unittest.mock import patch
+        receipt = {'core_consumed': True, 'status': 0, 'parent_close_errno': 0}
+        class Token:
+            fail = False
+            @property
+            def close_result(self):
+                if self.fail: raise MemoryError('receipt allocation')
+                return receipt
+        for fallback in (False, True):
+            token = Token()
+            error = OSError('pre-callback failure')
+            carrier = RuntimeError('fallback') if fallback else error
+            carrier.native_backing_guard = token
+            if fallback: error.__context__ = carrier
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+            self.assertIs(error.native_current_guard, receipt)
+            self.assertIs(carrier.native_backing_guard, token)
+            token.fail = True
+            del error.native_current_guard
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+            self.assertIs(carrier.native_backing_guard, token)
+        for denied in ('native_backing_guard', '__context__'):
+            class HostileError(Exception):
+                def __getattribute__(self, name):
+                    if name == denied: raise RuntimeError('diagnostic attribute refused')
+                    return super().__getattribute__(name)
+            error = HostileError('original')
+            with patch('stallionfs._native._image.with_backing_guard', side_effect=error):
+                with self.assertRaises(HostileError) as caught: _native.guarded({}, expected_anchor={})
+            self.assertIs(caught.exception, error)
+        error = OSError('original before diagnostic allocation failure')
+        token = Token(); error.native_backing_guard = token
+        with patch('stallionfs._native._image.with_backing_guard', side_effect=error), \
+             patch('stallionfs._native.set', side_effect=MemoryError('seen allocation'), create=True):
+            with self.assertRaises(OSError) as caught: _native.guarded({}, expected_anchor={})
+        self.assertIs(caught.exception, error)
+        self.assertIs(error.native_backing_guard, token)
+
+    def test_scoped_backing_guard_expected_anchor_exact_and_copied_before_open(self):
+        from stallionfs import _image
+        import errno
+        directory = self.seed()
+        info = directory.stat()
+        target = dict(directory=str(directory), component='image.sfs', parent=[info.st_dev, info.st_ino], file=None)
+        inspected = _image.inspect(target); target.update(inspected['identity'])
+        expected = {key: inspected['receipt'][key] for key in ('generation', 'root_digest', 'committed_end')}
+        tokens = []
+        def held(token):
+            tokens.append(token)
+            with self.assertRaises(OSError) as caught: _image.with_backing_guard(target, lambda _: None)
+            self.assertEqual(caught.exception.errno, errno.EBUSY)
+            return 17
+        self.assertEqual(_image.with_backing_guard(target, held), 17)
+        self.assertEqual(_image.with_backing_guard(target, held, None), 17)
+        self.assertEqual(_image.with_backing_guard(target, held, expected), 17)
+        self.assertEqual(len(tokens), 3)
+        for token in tokens:
+            self.assertTrue(token.close_result['core_consumed'])
+            with self.assertRaises(RuntimeError): token.verify(target)
+        for key in expected:
+            mismatch = dict(expected)
+            mismatch[key] = '0' * 64 if key == 'root_digest' else mismatch[key] + 1
+            with self.assertRaises(OSError) as caught:
+                _image.with_backing_guard(target, lambda _: self.fail('stale callback invoked'), mismatch)
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertTrue(caught.exception.native_anchor_mismatch)
+            receipt = caught.exception.native_backing_guard.close_result
+            self.assertTrue(receipt['core_consumed'])
+            self.assertEqual(receipt['status'], 0)
+            self.assertEqual(receipt['parent_close_errno'], 0)
+        class AnchorDict(dict): pass
+        class AnchorInteger(int): pass
+        class AnchorDigest(str): pass
+        invalid = [{}, dict(expected, extra=1), {key: value for key, value in expected.items() if key != 'generation'}]
+        invalid += [AnchorDict(expected), dict(expected, generation=AnchorInteger(expected['generation'])),
+                    dict(expected, committed_end=AnchorInteger(expected['committed_end'])),
+                    dict(expected, root_digest=AnchorDigest(expected['root_digest']))]
+        for key in ('generation', 'committed_end'):
+            invalid += [dict(expected, **{key: value}) for value in (True, False, -1, 1 << 64, 1.0, '1')]
+        invalid += [dict(expected, root_digest=value) for value in ('A' * 64, 'g' * 64, '0' * 63, b'0' * 64)]
+        for value in invalid:
+            # Invalid expected values must fail before a nonexistent resource is opened.
+            with self.assertRaises((ValueError, TypeError, OverflowError)):
+                _image.with_backing_guard(dict(target, directory='/nonexistent-native-anchor-test'),
+                                          lambda _: self.fail('invalid anchor callback invoked'), value)
+        mutable = dict(expected)
+        class Directory:
+            def __fspath__(self):
+                mutable['generation'] += 1
+                return str(directory)
+        self.assertEqual(_image.with_backing_guard(dict(target, directory=Directory()), lambda _: 19, mutable), 19)
+        self.assertTrue(_image.snapshot(target, 'advance-anchor')['ok'])
+        with self.assertRaises(OSError) as caught:
+            _image.with_backing_guard(target, lambda _: self.fail('old committed anchor accepted'), expected)
+        self.assertTrue(caught.exception.native_anchor_mismatch)
+        self.assertEqual(caught.exception.native_backing_guard.close_result['status'], 0)
+
+    def test_scoped_backing_guard_anchor_mismatch_retains_close_and_allocation_failures(self):
+        directory = self.seed()
+        script = textwrap.dedent('''            import ctypes,importlib.util,json,sys
+            from pathlib import Path
+            module_path,directory=sys.argv[1:]
+            spec=importlib.util.spec_from_file_location('stallionfs._image',module_path)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            control=ctypes.CDLL(module_path).sfs_bridge_test_configure
+            control.argtypes=[ctypes.c_int]*4;control.restype=None
+            info=Path(directory).stat()
+            target=dict(directory=directory,component='image.sfs',parent=[info.st_dev,info.st_ino],file=None)
+            observed=module.inspect(target);target.update(observed['identity'])
+            anchor={k:observed['receipt'][k] for k in ('generation','root_digest','committed_end')}
+            stale=dict(anchor,generation=anchor['generation']+1)
+            for flags in (0,1048576,262144,64,1048576|262144|64):
+                called=[];control(0,0,flags,0)
+                try:module.with_backing_guard(target,lambda token:called.append(token),stale)
+                except OSError as error:
+                    assert error.native_anchor_mismatch and not called
+                    carrier=error.native_backing_guard
+                    if flags & 64:
+                        try:carrier.close_result
+                        except MemoryError:pass
+                        else:raise AssertionError('report allocation fault not exercised')
+                    receipt=carrier.close_result
+                    assert receipt['core_consumed']
+                    assert (receipt['status'] != 0) == bool(flags & 1048576)
+                    assert (receipt['parent_close_errno'] != 0) == bool(flags & 262144)
+                else:raise AssertionError('mismatch returned success')
+                control(0,0,0,0)
+                assert module.with_backing_guard(target,lambda _:7,anchor)==7
+            control(0,0,524288,0);called=[]
+            try:module.with_backing_guard(target,lambda token:called.append(token),anchor)
+            except KeyboardInterrupt as error:
+                assert not called
+                assert error.native_backing_guard.close_result['core_consumed']
+            else:raise AssertionError('pre-callback cancellation was lost')
+            control(0,0,0,0)
+            print('PASS expected-anchor mismatch, consumed close, parent close, report allocation and cancellation')
+        ''')
+        child = self.owned('guard-expected-faults', [sys.executable, '-I', '-B', '-c', script,
+                                                    self.diagnostic, directory])
+        self.assertEqual(child.stdout, 'PASS expected-anchor mismatch, consumed close, parent close, report allocation and cancellation\n')
+        self.assertEqual(child.stderr, '')
 
     def test_scoped_backing_guard_preserves_consumed_close_error_and_primary(self):
         directory = self.seed()
@@ -843,6 +992,175 @@ for name in names:
         self.assertEqual(json.loads(result.stdout), dict(files=1, directories=0, symlinks=0,
                                                         other=0, logical_bytes=3, skipped_mounts=0))
         self.assertFalse((self.base / 'unused-store').exists())
+
+
+class MountedOperationArguments(unittest.TestCase):
+    """Parser/dispatch checks; these do not exercise a mounted filesystem."""
+    def test_status_and_exact_continuation_arguments(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        workspace, operation = 'a' * 32, 'b' * 32
+        cases = [
+            (['snapshot', workspace, '--name', 'before', '--quiescent', '--continue', operation],
+             'snapshot', (workspace,), {'name': 'before', 'quiescent': True, 'continue_operation': operation}, {'id': 'before'}),
+            (['rollback', workspace, 'before', '--quiescent', '--continue', operation],
+             'rollback', (workspace, 'before'), {'quiescent': True, 'continue_operation': operation}, {'snapshot': 'before'}),
+            (['snapshots', workspace, '--operation', operation],
+             'snapshots', (workspace,), {'operation_id': operation}, {'message': 'Mount completion is unknown.', 'next_action': None}),
+            (['unmount', workspace, '--continue', operation],
+             'continue_unmount', (workspace, operation), {}, {'unmounted': workspace}),
+        ]
+        for argv, method, args, kwargs, result in cases:
+            with self.subTest(command=argv[0]), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                getattr(store.return_value, method).return_value = result
+                self.assertEqual(main(['--json', *argv]), 0)
+                getattr(store.return_value, method).assert_called_once_with(*args, **kwargs)
+                self.assertEqual(json.loads(output.getvalue()), result)
+                if argv[0] == 'snapshots': store.return_value.opportunistic_cleanup.assert_not_called()
+
+    @staticmethod
+    def compound_record(*, root=Path('/private/tmp/store with spaces'), action='restore', name='saved'):
+        workspace, operation = 'a' * 32, 'b' * 32
+        target = {'directory': str(root / 'workspaces' / workspace), 'component': 'image.sfs',
+                  'parent': [1, 2], 'file': [3, 4], 'uuid': 'c' * 32}
+        receipt = {'status': 0, 'poisoned': False, 'transaction_active': False,
+                   'device': 3, 'inode': 4, 'uuid': target['uuid'],
+                   'generation': 2, 'root_digest': 'd' * 64, 'committed_end': 32768}
+        result = {'ok': True, 'committed': True, 'commit_attempted': True, 'outcome': 'committed',
+                  'close_attempted': True, 'guard_close_errno': 0, 'path_errno': 0, 'interrupted': False,
+                  'deadline_expired': False, 'operation': action, 'snapshot': name, 'recovery': 'recovery-held',
+                  'receipt': receipt, 'close_receipt': dict(receipt)}
+        accepted_mount = {'format': 1, 'state': 'mounted', 'target': target, 'profile': 'production',
+                          'operation': 'e' * 32, 'observation': {
+                              'path': target['directory'] + '/volume', 'filesystem': 'stallionfs',
+                              'owner': os.getuid(), 'flags': 0, 'fsid': [71, 1],
+                              'readonly': False, 'ignore_ownership': False, 'device': 'fixture resource'}}
+        return {'workspace': workspace, 'id': operation, 'operation': 'native-mounted-' + action,
+                'target': target, 'name': name, 'recovery_name': 'recovery-held', 'accepted_mount': accepted_mount,
+                'phase': 'committed', 'outcome': 'incomplete', 'originally_mounted': True,
+                'profile': 'production', 'host': '/Applications/StallionFS.app/Contents/MacOS/StallionFS',
+                'child_pending': False, 'helpers': [], 'unmount_attempts': [], 'remount_attempts': [],
+                'bridge_attempted': True, 'bridge_returned': True, 'native_image_result': result,
+                'committed_anchor': {key: receipt[key] for key in ('generation', 'root_digest', 'committed_end')}}
+
+    def test_plain_compound_failures_and_status_preserve_material_outcomes(self):
+        import errno
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        from stallionfs._native_recovery import compound_summary
+        for phase in ('qualification', 'guard', 'unknown-bridge'):
+            record = self.compound_record()
+            if phase == 'unknown-bridge':
+                record.update(phase='bridge-attempted', bridge_returned=False)
+            error = OSError(errno.EIO, phase + ' failure')
+            error.native_candidate_result = {'native_operation': record} if phase == 'guard' else record
+            with self.subTest(phase=phase), patch('stallionfs.core.Store') as store, redirect_stderr(StringIO()) as output:
+                store.return_value.rollback.side_effect = error
+                self.assertEqual(main(['rollback', record['workspace'], record['name'], '--quiescent']), 1)
+                text = output.getvalue()
+                self.assertIn(phase + ' failure', text)
+                if phase == 'unknown-bridge':
+                    self.assertIn('outcome is incomplete', text)
+                    self.assertNotIn('Rollback committed', text)
+                    self.assertNotIn('Recovery snapshot:', text)
+                else:
+                    self.assertIn('Rollback committed', text)
+                    self.assertIn('Recovery snapshot: recovery-held', text)
+                    self.assertIn('Remount was not attempted', text)
+        for mount in ('failed', 'not-launched', 'unknown', 'verified-drift', 'verified-observation-error'):
+            record = self.compound_record()
+            record['phase'] = 'remount-attempted'
+            helper = {'label': 'mount', 'stage': 'remount', 'attempt': 0, 'argv': ['/sbin/mount'],
+                      'child_pending': False, 'pid': 123, 'returncode': 1, 'reaped': True,
+                      'outcome': 'error', 'stdout': '/retained/stdout', 'stderr': '/retained/stderr'}
+            record['helpers'] = [helper]
+            record['remount_attempts'] = [{'launched': True, 'response': {'returncode': 1, 'outcome': 'error'}}]
+            if mount == 'not-launched':
+                helper.update(pid=None, returncode=None, reaped=False, outcome='not-launched')
+                record['remount_attempts'][-1]['response'] = None
+            elif mount == 'unknown':
+                helper.update(returncode=0, outcome='unknown')
+                record['remount_attempts'][-1]['response'] = None
+            elif mount.startswith('verified'):
+                helper.update(returncode=0, outcome='success')
+                attempt = record['remount_attempts'][-1]
+                row = {'path': record['target']['directory'] + '/volume', 'fsid': [1, 2]}
+                attempt.update(response={'returncode': 0, 'outcome': 'success'},
+                    qualified={'profile': record['profile'], 'host': record['host'], 'filesystem': 'stallionfs'},
+                    guard={**record['native_image_result']['receipt'], 'core_consumed': True, 'parent_close_errno': 0},
+                    evidence={'observation': row, 'repo': record['target']['directory'] + '/volume/repo', 'usable': True})
+                record.update(phase='final-verified', final_evidence={'observation': row})
+            status = {'message': compound_summary(record)['message'], 'next_action': None}
+            if mount == 'verified-drift': status['current_mount_matches_completion'] = False
+            if mount == 'verified-observation-error': status['current_observation_error'] = 'backing identity changed'
+            with self.subTest(mount=mount), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                store.return_value.snapshots.return_value = status
+                self.assertEqual(main(['snapshots', record['workspace'], '--operation', record['id']]), 0)
+                text = output.getvalue()
+                self.assertIn('Rollback committed', text)
+                self.assertIn('Recovery snapshot: recovery-held', text)
+                if mount == 'failed': self.assertIn('Remount command failed', text)
+                if mount == 'not-launched': self.assertIn('Remount was not launched', text)
+                if mount == 'unknown': self.assertIn('Mount completion is unknown', text)
+                if mount == 'verified-drift': self.assertIn('current mount differs', text)
+                if mount == 'verified-observation-error': self.assertIn('Current mount observation failed: backing identity changed', text)
+                self.assertNotIn('currently mounted', text)
+
+    def test_generated_compound_commands_parse_the_selected_root_and_name(self):
+        import shlex
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        from stallionfs._native_recovery import compound_status, pending_message, _operation_command
+        root = Path("/private/tmp/custom store's path")
+        name = "--snapshot with 'quotes'"
+        for action in ('snapshot', 'restore'):
+            record = self.compound_record(root=root, action=action, name=name)
+            path = Path(record['target']['directory'])
+            metadata = {'controller_profile': record['profile'], 'native_host': record['host']}
+            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+                 patch('stallionfs._native_recovery.ready', return_value=record['target']), \
+                 patch('stallionfs._native_recovery._mounts_only_at'), \
+                 patch('stallionfs._native.observe', return_value=None):
+                status = compound_status(SimpleNamespace(root=root), path, metadata, record['id'])
+            commands = [(status['next_action'], 'snapshot' if action == 'snapshot' else 'rollback'),
+                        (_operation_command(record, 'snapshots', '--operation', record['id']), 'snapshots')]
+            self.assertIn(commands[1][0], pending_message(record))
+            record['phase'] = 'unmount-attempted'
+            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+                 patch('stallionfs._native_recovery.ready', return_value=record['target']), \
+                 patch('stallionfs._native_recovery._mounts_only_at'), \
+                 patch('stallionfs._native_recovery._matching_mount', return_value=({}, {})), \
+                 patch('stallionfs._native.observe', return_value={'fsid': [1, 2]}):
+                withdrawal = compound_status(SimpleNamespace(root=root), path, metadata, record['id'])
+            self.assertIsInstance(withdrawal['next_action'], str)
+            self.assertTrue(withdrawal['next_action'])
+            commands.append((withdrawal['next_action'], 'continue_unmount'))
+            for command, method in commands:
+                with self.subTest(action=action, method=method), patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()):
+                    store.return_value.snapshot.return_value = {'id': name}
+                    store.return_value.rollback.return_value = {'snapshot': name}
+                    store.return_value.snapshots.return_value = {'message': 'Retained.', 'next_action': None}
+                    store.return_value.continue_unmount.return_value = {'unmounted': record['workspace']}
+                    arguments = shlex.split(command)
+                    self.assertEqual(arguments[0], 'sfs')
+                    self.assertEqual(main(arguments[1:]), 0)
+                    store.assert_called_once_with(str(root))
+                    if method == 'snapshot':
+                        store.return_value.snapshot.assert_called_once_with(record['workspace'], name=name, quiescent=True, continue_operation=record['id'])
+                    elif method == 'rollback':
+                        store.return_value.rollback.assert_called_once_with(record['workspace'], name, quiescent=True, continue_operation=record['id'])
+                    elif method == 'snapshots':
+                        store.return_value.snapshots.assert_called_once_with(record['workspace'], operation_id=record['id'])
+                    else:
+                        store.return_value.continue_unmount.assert_called_once_with(record['workspace'], record['id'])
+
 
 
 if __name__ == '__main__':

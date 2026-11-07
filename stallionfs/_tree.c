@@ -21,6 +21,93 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+#include <inttypes.h>
+
+#define CPU_WORKERS 4
+#if defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+#define CPU_MARKER "stallionfs-delete-thread-cpu-v1"
+#define CPU_SCHEMA 1
+#define CPU_PROFILE_OPERATION DELETING
+#define CPU_PHASE0_NAME "entry_unlinkat"
+#define CPU_PHASE1_NAME "directory_unlinkat"
+enum cpu_phase { CPU_UNLINK_ENTRY, CPU_UNLINK_DIRECTORY, CPU_PHASES };
+#else
+#define CPU_MARKER "stallionfs-thread-cpu-v2"
+#define CPU_SCHEMA 2
+#define CPU_PROFILE_OPERATION CLONING
+#define CPU_PHASE0_NAME "fclonefileat"
+#define CPU_PHASE1_NAME "directory_metadata"
+enum cpu_phase { CPU_FCLONEFILEAT, CPU_DIRECTORY, CPU_PHASES };
+#endif
+enum cpu_status { CPU_OK, CPU_CLOCK, CPU_RANGE, CPU_NESTED, CPU_OVERFLOW, CPU_BOUND, CPU_JOIN, CPU_OPERATION };
+struct cpu_counter { uint64_t calls, failures, ns; };
+struct cpu_slot {
+    uint64_t start, total;
+    struct cpu_counter phase[CPU_PHASES];
+    enum cpu_status status;
+    unsigned active;
+};
+struct cpu_profile {
+    int fd, enabled;
+    enum cpu_status status;
+    struct cpu_slot slots[CPU_WORKERS + 1];
+    char path[PATH_MAX];
+};
+struct cpu_token { struct cpu_slot *slot; uint64_t start; unsigned phase, entered; };
+static _Thread_local struct cpu_slot *cpu_current;
+
+static int cpu_now(uint64_t *ns) {
+    int saved = errno;
+    struct timespec value;
+    int valid = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0;
+    if (valid) valid = value.tv_sec >= 0 && value.tv_nsec >= 0 && value.tv_nsec < 1000000000L &&
+        (uint64_t)value.tv_sec <= (UINT64_MAX - (uint64_t)value.tv_nsec) / 1000000000ULL;
+    if (valid) *ns = (uint64_t)value.tv_sec * 1000000000ULL + (uint64_t)value.tv_nsec;
+    errno = saved;
+    return valid;
+}
+static void cpu_add(struct cpu_slot *slot, uint64_t *value, uint64_t add) {
+    if (UINT64_MAX - *value < add) slot->status = CPU_OVERFLOW;
+    else *value += add;
+}
+static void cpu_start(struct cpu_slot *slot) {
+    if (slot && !cpu_now(&slot->start)) slot->status = CPU_CLOCK;
+}
+static void cpu_stop(struct cpu_slot *slot) {
+    if (!slot) return;
+    uint64_t end;
+    if (slot->active) slot->status = CPU_NESTED;
+    if (!slot->status) {
+        if (!cpu_now(&end)) slot->status = CPU_CLOCK;
+        else if (end < slot->start) slot->status = CPU_RANGE;
+        else slot->total = end - slot->start;
+    }
+}
+static struct cpu_token cpu_enter(unsigned phase) {
+    struct cpu_token token = {.slot = cpu_current, .phase = phase};
+    if (!token.slot) return token;
+    if (token.slot->active) { token.slot->status = CPU_NESTED; return token; }
+    token.slot->active = phase + 1;
+    token.entered = 1;
+    cpu_add(token.slot, &token.slot->phase[phase].calls, 1);
+    if (!token.slot->status && !cpu_now(&token.start)) token.slot->status = CPU_CLOCK;
+    return token;
+}
+static void cpu_leave(struct cpu_token token, int failed) {
+    if (!token.slot || !token.entered) return;
+    struct cpu_counter *counter = &token.slot->phase[token.phase];
+    uint64_t end;
+    if (failed) cpu_add(token.slot, &counter->failures, 1);
+    if (!token.slot->status) {
+        if (!cpu_now(&end)) token.slot->status = CPU_CLOCK;
+        else if (end < token.start) token.slot->status = CPU_RANGE;
+        else cpu_add(token.slot, &counter->ns, end - token.start);
+    }
+    token.slot->active = 0;
+}
+#endif
+
 #define QUEUE_LIMIT 24
 #define DEPTH_LIMIT 512
 
@@ -30,6 +117,88 @@ extern ssize_t freadlink(int, char *, size_t) __attribute__((weak_import, availa
 #endif
 
 enum operation { CLONING, COPYING, DELETING };
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+static struct cpu_profile cpu_open(enum operation operation, unsigned workers) {
+    int saved = errno;
+    struct cpu_profile profile = {.fd = -1};
+    const char *path = getenv("STALLIONFS_DIAGNOSTIC_THREAD_CPU_REPORT");
+    if (operation == CPU_PROFILE_OPERATION && path && path[0] && strlen(path) < PATH_MAX - sizeof(".pending")) {
+        char pending[PATH_MAX];
+        strcpy(profile.path, path);
+        snprintf(pending, sizeof(pending), "%s.pending", path);
+        struct stat info;
+        if (lstat(path, &info) && errno == ENOENT)
+            profile.fd = open(pending, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (profile.fd >= 0 && (fstat(profile.fd, &info) || !S_ISREG(info.st_mode) ||
+            info.st_uid != geteuid() || (info.st_mode & 0777) != 0600)) {
+            close(profile.fd); profile.fd = -1;
+        }
+        profile.status = workers <= CPU_WORKERS ? CPU_OK : CPU_BOUND;
+        profile.enabled = profile.fd >= 0 && !profile.status;
+    }
+    errno = saved;
+    return profile;
+}
+static void cpu_counter_json(FILE *stream, const struct cpu_counter *counter) {
+    fprintf(stream, "{\"calls\":%" PRIu64 ",\"failures\":%" PRIu64 ",\"cpu_ns\":%" PRIu64 "}",
+            counter->calls, counter->failures, counter->ns);
+}
+/* Called only after all worker joins, main finalization and the last clock read. */
+static void cpu_report(struct cpu_profile *profile, unsigned requested, unsigned started, int error) {
+    int saved = errno;
+    if (profile->fd < 0) return;
+    enum cpu_status status = profile->status;
+    struct cpu_slot sum = {0};
+    if (started > CPU_WORKERS) status = CPU_BOUND;
+    if (!status) for (unsigned i = 0; i <= started; i++) {
+        struct cpu_slot *slot = &profile->slots[i];
+        if (slot->status) { status = slot->status; break; }
+        uint64_t clone = slot->phase[0].ns, directory = slot->phase[1].ns;
+        if (UINT64_MAX - clone < directory || clone + directory > slot->total) { status = CPU_RANGE; break; }
+        cpu_add(&sum, &sum.total, slot->total);
+        for (unsigned phase = 0; phase < CPU_PHASES; phase++) {
+            cpu_add(&sum, &sum.phase[phase].calls, slot->phase[phase].calls);
+            cpu_add(&sum, &sum.phase[phase].failures, slot->phase[phase].failures);
+            cpu_add(&sum, &sum.phase[phase].ns, slot->phase[phase].ns);
+        }
+    }
+    if (!status) status = sum.status;
+    if (error) status = CPU_OPERATION;
+    const char *names[] = {"available", "clock_read_invalid", "clock_range_invalid", "nested_phase",
+                          "counter_overflow", "worker_bound", "join_failed", "operation_failed"};
+    FILE *stream = fdopen(profile->fd, "w");
+    int complete = 0;
+    if (stream) {
+        fprintf(stream, "{\"schema\":%d,\"marker\":\"" CPU_MARKER "\",\"status\":\"%s\","
+                "\"workers_requested\":%u,\"workers_started\":%u,\"main_fallback\":%s,"
+                "\"scope\":\"instrumented run_tree main and worker spans\",\"counters\":",
+                CPU_SCHEMA, names[status], requested, started, started ? "false" : "true");
+        if (status) fputs("null,\"slots\":[]}", stream);
+        else {
+            fprintf(stream, "{\"total_cpu_ns\":%" PRIu64 ",\"" CPU_PHASE0_NAME "\":", sum.total);
+            cpu_counter_json(stream, &sum.phase[0]);
+            fputs(",\"" CPU_PHASE1_NAME "\":", stream); cpu_counter_json(stream, &sum.phase[1]);
+            fputs("},\"slots\":[", stream);
+            for (unsigned i = 0; i <= started; i++) {
+                struct cpu_slot *slot = &profile->slots[i];
+                fprintf(stream, "%s{\"slot\":%u,\"total_cpu_ns\":%" PRIu64 ",\"" CPU_PHASE0_NAME "\":", i ? "," : "", i, slot->total);
+                cpu_counter_json(stream, &slot->phase[0]);
+                fputs(",\"" CPU_PHASE1_NAME "\":", stream); cpu_counter_json(stream, &slot->phase[1]);
+                fputc('}', stream);
+            }
+            fputs("]}", stream);
+        }
+        complete = !ferror(stream) && !fflush(stream) && !fsync(fileno(stream));
+        if (fclose(stream)) complete = 0;
+    } else close(profile->fd);
+    char pending[PATH_MAX];
+    snprintf(pending, sizeof(pending), "%s.pending", profile->path);
+    if (complete) link(pending, profile->path);
+    unlink(pending);
+    profile->fd = -1;
+    errno = saved;
+}
+#endif
 struct object_identity { dev_t device; ino_t inode; mode_t type; };
 struct job {
     int source, destination;
@@ -65,6 +234,9 @@ struct tree {
     atomic_int error;
     char error_path[PATH_MAX];
 };
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+struct cpu_worker_context { struct tree *state; struct cpu_slot *slot; int main_fallback; };
+#endif
 struct path {
     char *owned;
     const char *name;
@@ -528,7 +700,20 @@ static int clear_acl(int fd) {
 static int first_inode(enum operation operation, struct tree *tree, int input, int parent,
                         const char *name, const struct stat *identity,
                         stallion_cancel_fn cancel, void *context) {
-    if (operation == CLONING) return fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
+    if (operation == CLONING) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
+        struct cpu_token token = cpu_enter(CPU_FCLONEFILEAT);
+#endif
+        int result = fclonefileat(input, parent, name, CLONE_NOFOLLOW | CLONE_ACL);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
+        int error = errno;
+        cpu_leave(token, result != 0);
+        errno = error;
+#endif
+        return result;
+    }
     struct copy_progress progress = {.tree = tree, .cancel = cancel, .context = context};
     if (copy_stopped(&progress)) { errno = progress.error; return -1; }
     int output = -1, error = 0, cloned = 0;
@@ -622,7 +807,17 @@ done:
 }
 static int directory_metadata(struct tree *state, struct job *job, int input, int output,
                                stallion_cancel_fn cancel, void *context) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    !(defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU)
+    if (state->operation == CLONING) {
+        struct cpu_token token = cpu_enter(CPU_DIRECTORY);
+        int result = fcopyfile(input, output, NULL, COPYFILE_METADATA);
+        cpu_leave(token, result != 0);
+        return result;
+    }
+#else
     if (state->operation == CLONING) return fcopyfile(input, output, NULL, COPYFILE_METADATA);
+#endif
     struct copy_progress progress = {.tree = state, .cancel = cancel, .context = context};
     return ordinary_metadata(input, output, &job->source_stat, COPYFILE_METADATA, &progress, NULL, NULL);
 }
@@ -841,7 +1036,20 @@ static void finish(struct tree *state, struct job *job) {
                     fail(state, errno, parent_fd, job->name);
                 else if (current.st_dev != state->device || current.st_ino != job->inode ||
                          !S_ISDIR(current.st_mode)) fail(state, ESTALE, parent_fd, job->name);
-                else if (unlinkat(parent_fd, job->name, AT_REMOVEDIR)) fail(state, errno, parent_fd, job->name);
+                else {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+                    struct cpu_token token = cpu_enter(CPU_UNLINK_DIRECTORY);
+#endif
+                    int removed = unlinkat(parent_fd, job->name, AT_REMOVEDIR);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+                    int saved = errno;
+                    cpu_leave(token, removed != 0);
+                    errno = saved;
+#endif
+                    if (removed) fail(state, errno, parent_fd, job->name);
+                }
             }
         }
         if (close(job->source)) fail(state, errno, parent_fd, job->name);
@@ -922,7 +1130,18 @@ static void process(struct tree *state, struct job *job) {
         }
         if (type == DT_DIR) directory(state, job, name, entry->d_ino);
         else if (state->operation == DELETING) {
-            if (unlinkat(job->source, name, 0)) fail(state, errno, job->source, name);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+            struct cpu_token token = cpu_enter(CPU_UNLINK_ENTRY);
+#endif
+            int removed = unlinkat(job->source, name, 0);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU && \
+    defined(STALLIONFS_DIAGNOSTIC_DELETE_CPU) && STALLIONFS_DIAGNOSTIC_DELETE_CPU
+            int saved = errno;
+            cpu_leave(token, removed != 0);
+            errno = saved;
+#endif
+            if (removed) fail(state, errno, job->source, name);
         } else if (type == DT_REG || type == DT_LNK) {
             if (clone_leaf(state, job, name, type, entry->d_ino))
                 fail(state, errno, job->source, name);
@@ -932,11 +1151,23 @@ static void process(struct tree *state, struct job *job) {
     finish(state, job);
 }
 static void *worker(void *context) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+    struct cpu_worker_context *diagnostic = context;
+    struct tree *state = diagnostic->state;
+    struct cpu_slot *previous = cpu_current;
+    cpu_current = diagnostic->slot;
+    if (!diagnostic->main_fallback) cpu_start(cpu_current);
+#else
     struct tree *state = context;
+#endif
     for (;;) {
         pthread_mutex_lock(&state->mutex);
         while (!state->queued && state->live) pthread_cond_wait(&state->available, &state->mutex);
         if (!state->live) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+            if (!diagnostic->main_fallback) cpu_stop(cpu_current);
+            cpu_current = previous;
+#endif
             state->exited++;
             pthread_cond_broadcast(&state->available);
             pthread_mutex_unlock(&state->mutex);
@@ -969,12 +1200,32 @@ static int run_tree(int source, int destination, int parent, const char *name,
     atomic_init(&state.error, 0);
     state.queue[0] = root;
     pthread_t threads[4];
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+    struct cpu_profile profile = cpu_open(operation, workers);
+    struct cpu_slot *previous = cpu_current;
+    cpu_current = profile.enabled ? &profile.slots[0] : NULL;
+    cpu_start(cpu_current);
+    struct cpu_worker_context diagnostic[sizeof(threads) / sizeof(threads[0])];
+#endif
     unsigned started = 0;
     for (; started < workers; started++) {
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+        diagnostic[started] = (struct cpu_worker_context){.state = &state,
+            .slot = profile.enabled && started < CPU_WORKERS ? &profile.slots[started + 1] : NULL};
+        int result = pthread_create(&threads[started], NULL, worker, &diagnostic[started]);
+#else
         int result = pthread_create(&threads[started], NULL, worker, &state);
+#endif
         if (result) { fail(&state, result, parent, name); break; }
     }
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+    if (!started) {
+        diagnostic[0] = (struct cpu_worker_context){.state = &state, .slot = cpu_current, .main_fallback = 1};
+        worker(&diagnostic[0]);
+    }
+#else
     if (!started) worker(&state);
+#endif
     pthread_mutex_lock(&state.mutex);
     while (state.exited < started) {
         pthread_mutex_unlock(&state.mutex);
@@ -993,6 +1244,9 @@ static int run_tree(int source, int destination, int parent, const char *name,
     pthread_mutex_unlock(&state.mutex);
     for (unsigned i = 0; i < started; i++) {
         int result = pthread_join(threads[i], NULL);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+        if (result) profile.status = CPU_JOIN;
+#endif
         if (result) fail(&state, result, parent, name);
     }
     if (cancel && cancel(context)) fail(&state, EINTR, parent, name);
@@ -1030,6 +1284,11 @@ static int run_tree(int source, int destination, int parent, const char *name,
     if (error) path_error(error_path, capacity, state.error_path);
     pthread_cond_destroy(&state.available);
     pthread_mutex_destroy(&state.mutex);
+#if defined(STALLIONFS_DIAGNOSTIC_THREAD_CPU) && STALLIONFS_DIAGNOSTIC_THREAD_CPU
+    cpu_stop(cpu_current);
+    cpu_current = previous;
+    cpu_report(&profile, workers, started, error);
+#endif
     errno = error;
     return error ? -1 : 0;
 }
