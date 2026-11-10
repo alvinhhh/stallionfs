@@ -603,7 +603,7 @@ class Workspaces(unittest.TestCase):
         repo = path / 'volume/repo'
         clone_tree(self.store.root / 'seeds' / seed['id'] / 'repo', repo)
         git(repo, 'checkout', '-b', 'wrong-initial-branch')
-        with self.native_controller_fixture():
+        with self.native_controller_fixture() as mounted:
             with self.assertRaises(StallionError): self.store.mount(path.name)
             self.assertFalse(read_json(path / 'native-install.json')['first_use']['accepted'])
             self.store.unmount(path.name)
@@ -628,6 +628,75 @@ class Workspaces(unittest.TestCase):
                 self.assertFalse(journal['write_probe']['complete'])
                 self.assertEqual(journal['outcome'], 'incomplete')
                 self.store.unmount(path.name)
+            immutable = {name: (path / name).read_bytes() for name in ('native-create.json', 'meta.json')}
+            ownership = read_json(path / 'native-install.json')
+            for key in ('first_mount_attempted', 'first_use'): ownership.pop(key)
+            original_write, original_fsync, original_close = os.write, os.fsync, os.close
+            original_unlink = Path.unlink
+            for fault in ('short-write', 'fsync', 'close', 'unlink'):
+                with self.subTest(probe_fault=fault):
+                    absent = (path / 'native-mount.json').read_bytes()
+                    self.assertEqual(read_json(path / 'native-mount.json')['state'], 'absent')
+                    probe = {'path': None, 'fd': None, 'data': None}
+                    fired, closed = [], []
+                    def opened(candidate, flags, *args, **kwargs):
+                        fd = original_open(candidate, flags, *args, **kwargs)
+                        candidate = Path(candidate)
+                        if candidate.parent == repo and candidate.name.startswith('.stallionfs-write-'):
+                            self.assertIsNone(probe['path'])
+                            probe.update(path=candidate, fd=fd)
+                        return fd
+                    def written(fd, data):
+                        if fd == probe['fd']:
+                            probe['data'] = data[:-1] if fault == 'short-write' else data
+                            if fault == 'short-write':
+                                fired.append(fault)
+                                count = original_write(fd, probe['data'])
+                                self.assertEqual(count, len(probe['data']))
+                                return count
+                        return original_write(fd, data)
+                    def synced(fd):
+                        if fd == probe['fd'] and fault == 'fsync':
+                            fired.append(fault)
+                            raise OSError(errno.EIO, 'probe fsync failed')
+                        return original_fsync(fd)
+                    def finished(fd):
+                        current = fd == probe['fd']
+                        result = original_close(fd)
+                        if current:
+                            probe['fd'] = None
+                            closed.append(fd)
+                            if fault == 'close':
+                                fired.append(fault)
+                                raise OSError(errno.EIO, 'probe close report failed')
+                        return result
+                    def unlinked(candidate, *args, **kwargs):
+                        if candidate == probe['path'] and fault == 'unlink':
+                            fired.append(fault)
+                            raise OSError(errno.EIO, 'probe unlink failed')
+                        return original_unlink(candidate, *args, **kwargs)
+                    with patch('stallionfs._native.os.open', side_effect=opened), \
+                         patch('stallionfs._native.os.write', side_effect=written), \
+                         patch('stallionfs._native.os.fsync', side_effect=synced), \
+                         patch('stallionfs._native.os.close', side_effect=finished), \
+                         patch.object(Path, 'unlink', unlinked):
+                        with self.assertRaises(OSError) as caught: self.store.mount(path.name)
+                    self.assertEqual(caught.exception.errno, errno.EIO)
+                    self.assertEqual(fired, [fault])
+                    self.assertIsNone(probe['fd'])
+                    self.assertEqual(len(closed), 1)
+                    self.assertEqual(probe['path'].read_bytes(), probe['data'])
+                    installed_proof = read_json(path / 'native-install.json')
+                    self.assertTrue(installed_proof.pop('first_mount_attempted'))
+                    self.assertEqual(installed_proof.pop('first_use'), {'accepted': False})
+                    self.assertEqual(installed_proof, ownership)
+                    for name, data in immutable.items(): self.assertEqual((path / name).read_bytes(), data)
+                    journal = read_json(self.store.root / 'journals' / (path.name + '.json'))
+                    self.assertEqual(journal['write_probe'], {'path': str(probe['path']), 'complete': False})
+                    self.assertEqual(journal['outcome'], 'incomplete')
+                    self.assertEqual((path / 'native-mount.json').read_bytes(), absent)
+                    self.assertIn(str(path / 'volume'), mounted['rows'])
+                    self.store.unmount(path.name)
             self.store.mount(path.name)
             self.assertTrue(read_json(path / 'native-install.json')['first_use']['accepted'])
             self.store.unmount(path.name)

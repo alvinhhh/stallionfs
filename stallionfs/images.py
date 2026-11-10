@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ctypes
-import errno
 import fcntl
 import os
 from pathlib import Path
@@ -91,9 +90,19 @@ def _image(value, *, new=False):
 def _attachments(image):
     identity = image.stat()
     matches = []
-    for entry in _plist('/usr/bin/hdiutil', 'info', '-plist').get('images', []):
-        recorded = entry.get('image-path')
-        if not isinstance(recorded, str) or Path(os.path.realpath(recorded)) != image:
+    inventory = _plist('/usr/bin/hdiutil', 'info', '-plist').get('images')
+    if not isinstance(inventory, list):
+        raise _error('Invalid image attachment inventory')
+    for entry in inventory:
+        recorded = entry.get('image-path') if isinstance(entry, dict) else None
+        if (not isinstance(recorded, str) or not recorded or '\0' in recorded
+                or not Path(recorded).is_absolute()):
+            raise _error('Invalid image attachment path in inventory')
+        try:
+            recorded_image = Path(recorded).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise _error('Cannot classify image attachment path in inventory') from error
+        if recorded_image != image:
             continue
         if entry.get('owner-uid') != os.getuid():
             raise _error(f"Image attachment belongs to another user: {image}")
@@ -114,6 +123,8 @@ def mounted(image):
         return None
     entry = matches[0]
     entities = entry.get('system-entities', [])
+    if not isinstance(entities, list) or not all(isinstance(e, dict) for e in entities):
+        raise _error(f"Invalid attachment entity metadata: {image}")
     devices = [e.get('dev-entry') for e in entities]
     if not devices or not all(isinstance(d, str) and re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', d) for d in devices):
         raise _error(f"Invalid attachment device metadata: {image}")
@@ -178,7 +189,6 @@ def attach(image, mountpoint):
 
 def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
-    from .core import StallionError
     image, point = _image(image), _path(mountpoint)
     _directory(point.parent)
     identity = image.stat()
@@ -189,29 +199,21 @@ def detach(image, mountpoint):
         return
     if current['mountpoint'] not in (None, str(point)):
         raise _error(f"Image is mounted at a different path: {current['mountpoint']}")
-    try:
-        _command('/usr/bin/hdiutil', 'detach', current['device'])
-    except StallionError as original:
-        if getattr(original, 'returncode', None) != errno.EBUSY:
-            raise
-        try:
-            remaining = mounted(image)
-            from ._scan import mounts
-            unmounted = (remaining is not None and remaining['device'] == current['device'] and
-                         remaining['mountpoint'] is None and remaining['volume_device'] is None and
-                         not os.path.ismount(point) and
-                         not any(m['device'] in (current['device'], current['volume_device']) or
-                                 Path(m['path']).is_relative_to(point) for m in mounts()))
-            after = image.stat()
-            unchanged = (identity.st_dev, identity.st_ino) == (after.st_dev, after.st_ino)
-        except (OSError, StallionError) as inspection:
-            raise original from inspection
-        if not unmounted or not unchanged:
-            raise
-        # A normal detach may unmount successfully but fail at the final image eject.
-        _command('/usr/bin/hdiutil', 'detach', remaining['device'])
-    if mounted(image) is not None or os.path.ismount(point):
-        raise _error(f"Image remains attached; keep its files: {image}")
+    if (current['image'] != str(image) or
+            not re.fullmatch(r'/dev/disk[0-9]+', current['device'])):
+        raise _error(f"Invalid image attachment target: {image}")
+    # Keep the selected device from this owned image; never choose another
+    # whole device if its attachment mapping changes before the command.
+    confirmed = mounted(image)
+    before = image.stat()
+    if confirmed != current or (identity.st_dev, identity.st_ino) != (before.st_dev, before.st_ino):
+        raise _error(f"Image attachment changed before eject: {image}")
+    _command('/usr/sbin/diskutil', 'eject', current['device'])
+    remaining = mounted(image)
+    after = image.stat()
+    if (remaining is not None or os.path.ismount(point) or
+            (identity.st_dev, identity.st_ino) != (after.st_dev, after.st_ino)):
+        raise _error(f"Image remains attached or changed; keep its files: {image}")
 
 
 def flush(image):
@@ -256,6 +258,7 @@ def build(source_repo, destination_image, capacity_gib):
     _directory(source, private=False)
     validate_tree(source)
     point = Path(tempfile.mkdtemp(prefix='.prepare-mount-', dir=destination.parent))
+    detach_attempted = False
     try:
         _command('/usr/bin/hdiutil', 'create', '-size', f'{capacity_gib}g', '-type', 'SPARSE',
                  '-fs', 'APFS', '-volname', 'stallionfs', '-uid', os.getuid(), '-gid', os.getgid(),
@@ -267,11 +270,12 @@ def build(source_repo, destination_image, capacity_gib):
         os.chmod(point, 0o700)
         _directory(point)
         _command('/usr/bin/ditto', source, repo)
+        detach_attempted = True
         detach(destination, point)
         flush(destination)
         return destination
     except BaseException as original:
-        if destination.exists():
+        if not detach_attempted and destination.exists():
             try:
                 state = mounted(destination)
                 if state:
