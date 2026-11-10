@@ -1161,12 +1161,13 @@ static void counters(const char *name) {
 }
 typedef struct { unsigned char ref[56], min[263], max[263]; uint16_t min_n, max_n, level; } fixture_node;
 typedef struct { unsigned char *p; size_t n; uint64_t capacity; unsigned minor; } fixture;
+static size_t fixture_storage_bytes = 16u * 1024u * 1024u;
 static fixture fixture_start(void) {
-    fixture f = { calloc(1, 16 * 1024 * 1024), 8192, TEST_CAPACITY, 2 }; assert(f.p);
+    fixture f = { calloc(1, fixture_storage_bytes), 8192, TEST_CAPACITY, 2 }; assert(f.p);
     for (unsigned i = 0; i < 16; i++) f.p[24 + i] = (unsigned char)(i + 1); return f;
 }
 static fixture_node append_cell(fixture *f, unsigned type, const unsigned char *cell) {
-    assert(f->n + CELL <= 16 * 1024 * 1024); fixture_node node = {0};
+    assert(f->n + CELL <= fixture_storage_bytes); fixture_node node = {0};
     memcpy(f->p + f->n, cell, CELL); put32(node.ref, type); put64(node.ref + 8, f->n); put64(node.ref + 16, CELL);
     f->n += CELL; ref_hash(f->p, node.ref, f->n); return node;
 }
@@ -5595,6 +5596,196 @@ static void mapped_blocks(void) {
     assert(found==0 && block==99 && r.transaction_active && clock_calls==query_clock_calls); OK(sfs_image_abort(h,&r));
     close_image(h); retain(3900);
 }
+
+typedef struct { uint64_t calls, stop; } seek_poll;
+static int seek_cancel(void *context) {
+    seek_poll *p = context; ++p->calls; return p->stop && p->calls >= p->stop;
+}
+static void seek_expect(sfs_image *h, sfs_result binding, sfs_view view, sfs_inode id, const sfs_pin *pin,
+                        uint64_t offset, enum sfs_seek_region region, enum sfs_status expected,
+                        int present, uint64_t answer, const sfs_verify_budget *budget) {
+    sfs_result r; uint64_t value = UINT64_MAX; int found = 77;
+    sfs_verify_budget before = *budget; unsigned clocks = clock_calls;
+    enum sfs_status e = pin ? sfs_image_pin_seek_region(h,*pin,binding.generation,binding.root_digest,offset,region,budget,&value,&found,&r) :
+        sfs_image_seek_region(h,view,binding.generation,binding.root_digest,id,offset,region,budget,&value,&found,&r);
+    assert(e == expected && !memcmp(&before,budget,sizeof(before)) && clocks == clock_calls);
+    if (e == SFS_OK) { assert(found == present && value == (present ? answer : UINT64_MAX)); assert(r.generation == binding.generation && !memcmp(r.root_digest,binding.root_digest,32)); }
+    else { assert(found == 77 && value == UINT64_MAX); if (e == SFS_INCOMPLETE) assert(!r.poisoned && r.incomplete_reason != SFS_INCOMPLETE_NONE); }
+}
+static void seek_regions(void) {
+    sfs_image *h; sfs_result r; hardlink_create(&h,TEST_CAPACITY);
+    sfs_metadata_initial file = metadata_input(SFS_FILE), dir = metadata_input(SFS_DIRECTORY), link = metadata_input(SFS_SYMLINK);
+    link.mode=0120700;
+    sfs_inode a,b,hole,empty,directory_id,link_id;
+    OK(sfs_image_begin(h,&r));
+    OK(sfs_image_add_metadata(h,1,"a",1,SFS_FILE,&file,&a,&r));
+    OK(sfs_image_add_metadata(h,1,"b",1,SFS_FILE,&file,&b,&r));
+    OK(sfs_image_add_metadata(h,1,"hole",4,SFS_FILE,&file,&hole,&r));
+    OK(sfs_image_add_metadata(h,1,"empty",5,SFS_FILE,&file,&empty,&r));
+    OK(sfs_image_add_metadata(h,1,"dir",3,SFS_DIRECTORY,&dir,&directory_id,&r));
+    OK(sfs_image_symlink_metadata(h,1,"link",4,"a",1,&link,&link_id,&r));
+    unsigned char zero[CELL] = {0};
+    OK(sfs_image_resize(h,a,5*CELL+7,&r)); OK(sfs_image_resize(h,b,2*CELL,&r));
+    OK(sfs_image_resize(h,hole,SFS_FILE_MAX,&r));
+    OK(sfs_image_write(h,a,CELL,zero,CELL,&r)); OK(sfs_image_write(h,a,2*CELL,zero,3,&r));
+    OK(sfs_image_write(h,a,5*CELL,zero,7,&r)); OK(sfs_image_write(h,b,0,"b",1,&r));
+    OK(sfs_image_link(h,a,1,"alias",5,&r)); OK(sfs_image_commit(h,&r));
+    sfs_view view; OK(sfs_image_begin(h,&r)); OK(sfs_image_snapshot(h,"before",6,&view,&r)); OK(sfs_image_commit(h,&r));
+    sfs_result binding = r; sfs_verify_budget budget = sfs_image_seek_budget();
+    OK(sfs_image_pin_configure(h,16,1024*1024,&r)); sfs_pin pin, victim, wrong[3];
+    OK(sfs_image_pin_acquire(h,a,&pin,&r)); OK(sfs_image_pin_acquire(h,b,&victim,&r));
+    const struct { uint64_t at,data,hole; int found; } cases[] = {
+        {0,CELL,0,1},{CELL,CELL,3*CELL,1},{CELL+9,CELL+9,3*CELL,1},
+        {2*CELL+100,2*CELL+100,3*CELL,1},{3*CELL,5*CELL,3*CELL,1},
+        {5*CELL+6,5*CELL+6,5*CELL+7,1},{5*CELL+7,0,0,0},{6*CELL,0,0,0}
+    };
+    size_t length; unsigned char *before = bytes("image",&length); reset("",0);
+    for (unsigned route=0;route<3;route++) for (unsigned i=0;i<sizeof(cases)/sizeof(*cases);i++) {
+        seek_expect(h,binding,route==1?view:0,a,route==2?&pin:NULL,cases[i].at,SFS_SEEK_DATA,SFS_OK,cases[i].found,cases[i].data,&budget);
+        seek_expect(h,binding,route==1?view:0,a,route==2?&pin:NULL,cases[i].at,SFS_SEEK_HOLE,SFS_OK,cases[i].found,cases[i].hole,&budget);
+    }
+    for (unsigned kind=1;kind<=2;kind++) {
+        seek_expect(h,binding,0,empty,NULL,0,(enum sfs_seek_region)kind,SFS_OK,0,0,&budget);
+        seek_expect(h,binding,0,hole,NULL,SFS_FILE_MAX-1,(enum sfs_seek_region)kind,SFS_OK,kind==SFS_SEEK_HOLE,SFS_FILE_MAX-1,&budget);
+        seek_expect(h,binding,0,hole,NULL,SFS_FILE_MAX,(enum sfs_seek_region)kind,SFS_OK,0,0,&budget);
+    }
+    sfs_inode invalid[] = {1,directory_id,link_id};
+    for (unsigned i=0;i<3;i++) {
+        sfs_pin p; OK(sfs_image_pin_acquire(h,invalid[i],&p,&r));
+        for (unsigned kind=1;kind<=2;kind++) {
+            seek_expect(h,binding,0,invalid[i],NULL,0,(enum sfs_seek_region)kind,SFS_INVALID,0,0,&budget);
+            seek_expect(h,binding,0,0,&p,UINT64_C(100000),(enum sfs_seek_region)kind,SFS_INVALID,0,0,&budget);
+        }
+        OK(sfs_image_pin_release(h,p,&r));
+    }
+    seek_expect(h,binding,0,a,NULL,UINT64_MAX,SFS_SEEK_HOLE,SFS_INVALID,0,0,&budget);
+    seek_expect(h,binding,0,a,NULL,0,(enum sfs_seek_region)99,SFS_INVALID,0,0,&budget);
+    seek_expect(h,binding,99,a,NULL,0,SFS_SEEK_HOLE,SFS_NOT_FOUND,0,0,&budget);
+    sfs_result stale = binding; ++stale.generation;
+    seek_expect(h,stale,0,a,NULL,0,SFS_SEEK_HOLE,SFS_STATE,0,0,&budget);
+    for (unsigned field=0;field<6;field++) {
+        sfs_verify_budget invalid_budget=budget;
+        if (field==0) invalid_budget.raw_cells=0; else if (field==1) invalid_budget.metadata_read_bytes=0;
+        else if (field==2) invalid_budget.metadata_hash_bytes=0; else if (field==3) invalid_budget.checks=0;
+        else if (field==4) invalid_budget.auxiliary_bytes=0; else invalid_budget.auxiliary_io_bytes=0;
+        seek_expect(h,binding,0,a,NULL,0,SFS_SEEK_DATA,SFS_INVALID,0,0,&invalid_budget);
+    }
+    uint64_t sentinel=UINT64_MAX; int sentinel_found=77; unsigned invalid_clocks=clock_calls;
+    assert(sfs_image_seek_region(h,0,binding.generation,binding.root_digest,a,0,SFS_SEEK_DATA,&budget,NULL,&sentinel_found,&r)==SFS_INVALID && sentinel_found==77);
+    assert(sfs_image_pin_seek_region(h,pin,binding.generation,binding.root_digest,0,SFS_SEEK_DATA,&budget,&sentinel,NULL,&r)==SFS_INVALID && sentinel==UINT64_MAX);
+    assert(clock_calls==invalid_clocks);
+    wrong[0]=wrong[1]=wrong[2]=pin; ++wrong[0].instance; ++wrong[1].incarnation; wrong[2].session[0]^=1;
+    for (unsigned i=0;i<3;i++) seek_expect(h,binding,0,0,&wrong[i],0,SFS_SEEK_HOLE,SFS_INVALID,0,0,&budget);
+    image_unwritten(); unchanged("image",before,length); free(before);
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_write(h,a,0,zero,CELL,&r));
+    seek_expect(h,binding,0,a,&pin,0,SFS_SEEK_HOLE,SFS_OK,1,0,&budget); OK(sfs_image_abort(h,&r));
+    /* Growth within a mapped block remains data; shrinking then regrowing
+     * removes later mappings without treating a visible zero tail as a hole. */
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_resize(h,a,2*CELL+1,&r)); OK(sfs_image_commit(h,&r));
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_resize(h,a,6*CELL,&r)); OK(sfs_image_commit(h,&r)); binding=r;
+    seek_expect(h,binding,0,a,&pin,2*CELL+100,SFS_SEEK_HOLE,SFS_OK,1,3*CELL,&budget);
+    seek_expect(h,binding,0,a,&pin,3*CELL,SFS_SEEK_DATA,SFS_OK,0,0,&budget);
+    seek_expect(h,binding,view,a,NULL,5*CELL,SFS_SEEK_DATA,SFS_OK,1,5*CELL,&budget);
+    /* A retained replacement victim keeps its own layout, then final unlink
+     * detaches a, without making its old namespace reachable. */
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_rename_replace(h,1,"a",1,a,1,"b",1,b,&r)); OK(sfs_image_commit(h,&r)); binding=r;
+    seek_expect(h,binding,0,0,&victim,0,SFS_SEEK_HOLE,SFS_OK,1,CELL,&budget);
+    seek_expect(h,binding,0,a,&pin,0,SFS_SEEK_DATA,SFS_OK,1,CELL,&budget);
+    hardlink_name(h,0,1,"b",a);
+    OK(sfs_image_begin(h,&r)); OK(sfs_image_unlink(h,1,"alias",5,&r)); OK(sfs_image_unlink(h,1,"b",1,&r)); OK(sfs_image_commit(h,&r)); binding=r;
+    seek_expect(h,binding,0,0,&pin,0,SFS_SEEK_DATA,SFS_OK,1,CELL,&budget);
+    seek_expect(h,binding,0,a,NULL,0,SFS_SEEK_DATA,SFS_NOT_FOUND,0,0,&budget);
+    OK(sfs_image_pin_release(h,pin,&r));
+    seek_expect(h,binding,0,0,&pin,0,SFS_SEEK_DATA,SFS_INVALID,0,0,&budget);
+    OK(sfs_image_pin_release(h,victim,&r)); close_image(h); retain(3910);
+}
+
+/* Metadata-shape oracle only: all mappings exist, but share one raw cell.
+ * It does not qualify actual 10 GiB payload generation, copying or mounting. */
+static fixture seek_shape(uint64_t size, int gap, int minimum_occupancy) {
+    fixture f = fixture_start(); f.minor=3; f.capacity=UINT64_C(1)<<30; put32(f.p+12,3);
+    unsigned char raw[CELL]={0}; fixture_node data=append_cell(&f,6,raw), extent={0};
+    unsigned count=(unsigned)((size+CELL-1)/CELL), mappings=gap?2:count;
+    assert(count>=1); if (gap && count==1) mappings=1;
+    unsigned groups=minimum_occupancy && mappings>48 ? mappings/16 : (mappings+47)/48, at=0;
+    const unsigned huge_levels[]={163840,10240,640,40,2,1};
+    int huge=minimum_occupancy && !gap && size==(UINT64_C(10)<<30);
+    if (huge) assert(groups==huge_levels[0]);
+    fixture_node *nodes=calloc(groups,sizeof(*nodes)); assert(nodes);
+    for (unsigned i=0;i<groups;i++) {
+        unsigned n=mappings/groups+(i<mappings%groups); unsigned char rows[48*72]={0};
+        assert(n<=48 && (groups==1 || n>=16));
+        for (unsigned j=0;j<n;j++,at++) { uint64_t block=gap && at ? count-1 : at;
+            put64(rows+j*72,block); memcpy(rows+j*72+8,data.ref,56);
+            put16(rows+j*72+64,(uint16_t)(size-block*CELL<CELL?size-block*CELL:CELL)); }
+        nodes[i]=page(&f,3,0,rows,n,72,NULL);
+    }
+    unsigned level=0;
+    while (groups>1) {
+        unsigned parents=minimum_occupancy && groups>=32 ? groups/16 : (groups+47)/48, used=0; ++level;
+        if (huge) assert(level<sizeof(huge_levels)/sizeof(*huge_levels) && parents==huge_levels[level]);
+        for (unsigned i=0;i<parents;i++) { unsigned n=groups/parents+(i<groups%parents); assert(n<=48 && (parents==1?n>=2:n>=16)); nodes[i]=page(&f,3,level,NULL,n,72,nodes+used); used+=n; }
+        groups=parents;
+    }
+    extent=nodes[0]; free(nodes);
+    if (huge) assert(level==5 && get16(record(f.p,extent.ref,f.n)+70)==2);
+    unsigned char ir[440]={0}, nr[280]={0}; put64(ir,2); put64(ir+8,1); put32(ir+16,SFS_FILE); put32(ir+20,1); put64(ir+24,size); memcpy(ir+32,extent.ref,56); ir[88]='a'; fixture_tuple(ir+352,SFS_FILE,mappings);
+    put64(nr,1); put32(nr+8,1); nr[12]='a'; put64(nr+267,2);
+    fixture_node inodes=tree(&f,1,ir,1), names=tree(&f,2,nr,1), ns=namespace_cell(&f,inodes,names,3,1), catalog={0};
+    finish_fixture(&f,ns,catalog); return f;
+}
+static void seek_dense(int large) {
+    const uint64_t sizes[]={1024,40000,50000,20000,25000000,4096,UINT64_C(64)<<20,UINT64_C(10)<<30};
+    sfs_verify_budget budget=sfs_image_seek_budget();
+    for (unsigned i=large?7:0;i<(large?8:7);i++) for (unsigned gap=0;gap<2;gap++) {
+        fixture_storage_bytes=large && !gap ? 768u*1024u*1024u : 16u*1024u*1024u;
+        fixture f=seek_shape(sizes[i],gap,1); fixture_save(&f); fixture_storage_bytes=16u*1024u*1024u;
+        sfs_image *h; sfs_result r; reset("",0); open_readonly(&h,&r); sfs_result binding=r;
+        for (unsigned warm=0;warm<2;warm++) {
+            seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,SFS_OK,1,gap && sizes[i]>CELL ? CELL : sizes[i],&budget);
+            seek_expect(h,binding,0,2,NULL,sizes[i]-1,SFS_SEEK_DATA,SFS_OK,1,sizes[i]-1,&budget);
+            if (gap && sizes[i]>2*CELL) seek_expect(h,binding,0,2,NULL,CELL,SFS_SEEK_DATA,SFS_OK,1,(sizes[i]-1)/CELL*CELL,&budget);
+        }
+        assert(!raw_hashes); image_unwritten();
+        if (!large && i==6 && !gap) {
+            for (unsigned stop=0;stop<5;stop++) {
+                sfs_verify_budget limited=budget; seek_poll poll={0,0};
+                sfs_image_clear_read_cache(h);
+                if (stop==0) limited.metadata_read_bytes=64*CELL;
+                else if (stop==1) limited.metadata_hash_bytes=64*CELL;
+                else if (stop==2) limited.checks=10000;
+                else { poll.stop=stop==3?10000:1; limited.cancelled=seek_cancel; limited.context=&poll; }
+                seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,SFS_INCOMPLETE,0,0,&limited);
+            }
+            seek_poll count={0,0}; sfs_verify_budget observed=budget; observed.cancelled=seek_cancel; observed.context=&count;
+            sfs_image_clear_read_cache(h); seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,SFS_OK,1,sizes[i],&observed);
+            seek_poll final={0,count.calls}; observed.context=&final; sfs_image_clear_read_cache(h);
+            seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,SFS_INCOMPLETE,0,0,&observed); assert(final.calls==final.stop);
+            sfs_verify_budget limited=budget; limited.checks=10000;
+            seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,SFS_INCOMPLETE,0,0,&limited);
+        }
+        close_image(h); retain(3920+(int)i*2+(int)gap);
+    }
+}
+static void seek_corruption(void) {
+    for (unsigned damage=0;damage<6;damage++) {
+        fixture f=seek_shape(1024*CELL,0,1);
+        unsigned char *ns=namespace_at(f.p,f.p,f.n), *inode=leaf_row(f.p,ns+64,2,f.n,440);
+        unsigned char *row=leaf_row(f.p,inode+32,900,f.n,72);
+        if (damage==0) row[8+24]^=1; /* Raw digest is not consulted by layout. */
+        else if (damage==1) put64(row,get64(row-72));
+        else if (damage==2) put16(row+64,0);
+        else if (damage==3) row[66]=1;
+        else if (damage==4) put64(row+8+8,(uint64_t)(row-f.p)/CELL*CELL); /* non-backward raw reference */
+        else row[64]^=1; /* Leave the index digest invalid. */
+        if (damage!=5) { rehash_integer_tree(f.p,inode+32,f.n); seal_namespace(f.p,f.p,f.n,1); seal_namespace(f.p,f.p+CELL,f.n,1); }
+        size_t length=f.n; save("image",f.p,length);
+        sfs_image *h; sfs_result r; reset("",0); open_readonly(&h,&r); sfs_result binding=r;
+        sfs_verify_budget budget=sfs_image_seek_budget();
+        seek_expect(h,binding,0,2,NULL,0,SFS_SEEK_HOLE,damage==0?SFS_OK:SFS_CORRUPT,1,1024*CELL,&budget);
+        image_unwritten(); unchanged("image",f.p,length); free(f.p); close_image(h); retain(3940+(int)damage);
+    }
+}
 int main(int argc, char **argv) {
     assert(argc==2); int before=descriptors(); directory(argv[1]);
     const unsigned char sentinel[]="owned sentinel must remain unchanged"; save("sentinel",sentinel,sizeof(sentinel));
@@ -5614,6 +5805,9 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"restore-faults")) restore_faults();
     else if(!strcmp(argv[1],"snapshot-catalog")) snapshot_catalog();
     else if(!strcmp(argv[1],"mapped-blocks")) mapped_blocks();
+    else if(!strcmp(argv[1],"seek-regions")) { seek_regions(); seek_corruption(); }
+    else if(!strcmp(argv[1],"seek-dense")) seek_dense(0);
+    else if(!strcmp(argv[1],"seek-dense-10gib-metadata")) seek_dense(1);
 #ifdef SFS_IMAGE_DIAGNOSTIC_TESTING
     else if(!strcmp(argv[1],"diagnostic-receipts")) diagnostic_receipts();
 #endif
@@ -5638,7 +5832,8 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);
-    if(strcmp(argv[1],"mapped-blocks")&&strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
+    /* seek-regions mutates metadata fixtures; seek_expect checks each query's clock neutrality. */
+    if(strcmp(argv[1],"seek-regions")&&strcmp(argv[1],"mapped-blocks")&&strcmp(argv[1],"cache")&&strcmp(argv[1],"snapshot-catalog")&&strcmp(argv[1],"diagnostic-receipts")&&strncmp(argv[1],"metadata",8)&&strncmp(argv[1],"symlink",7)&&strncmp(argv[1],"xattr",5)&&strncmp(argv[1],"hardlink",8)&&strncmp(argv[1],"restore",7)) assert(!clock_calls);
     unchanged("sentinel",sentinel,sizeof(sentinel)); free(durable); assert(!allocated); assert(descriptors()==before);
     printf("%s %s\n", (!strcmp(argv[1],"creation-success-alteration") || !strcmp(argv[1],"creation-corrective")) ? "COMPLETE" : "PASS", argv[1]); return 0;
 }

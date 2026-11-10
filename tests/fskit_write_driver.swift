@@ -87,6 +87,24 @@ struct Fixture {
         need(sfs_image_close(h, &r) == SFS_OK, "reopen close"); return bytes
     }
 }
+#if STALLION_CONTEXT_HANDLERS
+func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region: FSVolume.SeekRegion,
+                expected: off_t? = nil, error: Int32 = 0, caller: CallerIdentity? = nil) {
+    let before = volume.anchor
+    var supplied: off_t?, replies = 0
+    let _: Bool = wait { done in volume.enqueue { volume.preparedSeekOffsetForTesting = { supplied = $0 }; done(true) } }
+    let result: (FSSeekRegionResult?,Error?) = wait { done in
+        volume.seekResultForTesting(item,offset:offset,region:region,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) {
+            replies += 1; done(($0,$1))
+        }
+    }
+    let _: Bool = wait { done in volume.enqueue { volume.preparedSeekOffsetForTesting = nil; done(true) } }
+    need(replies == 1 && code(result.1) == Int(error) && (result.0 != nil) == (error == 0),"seek real SDK result/error and one reply")
+    if error == 0 { need(expected != nil && supplied == expected,"checked offset passed to the real opaque SDK constructor") }
+    need(anchorMatches(before,volume.anchor),"seek never changes committed anchor")
+}
+#endif
+
 @MainActor func factoryPolicyChecks(_ parent: URL) throws {
     let fixture = try Fixture(parent,"factory-readonly",mode:0o700)
     let image = fixture.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
@@ -107,6 +125,9 @@ struct Fixture {
         let mounted: Error? = wait { volume.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"public factory readonly mount")
         let found: (FSItem?,Error?) = wait { done in volume.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$2)) } }
         need(found.0 != nil && found.1 == nil,"public readonly executable fixture lookup")
+#if STALLION_CONTEXT_HANDLERS
+        seekAccess(volume,found.0!,offset:0,region:.hole,expected:8)
+#endif
         let access: (FSCheckAccessResult?,Error?) = wait { done in volume.accessForTesting(found.0!,access:.execute,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
         need(access.0 == nil && code(access.1) == Int(EACCES),"readonly selection and missing production flags never grant file execution")
         let written: Error? = wait { done in volume.write(contents:Data([1]),to:active.0!,at:0) { done($1) } }
@@ -126,6 +147,7 @@ struct Fixture {
     let denied: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:revoked,arguments:[]) { done(($0,$1)) } }
     need(denied.0 == nil && code(denied.1)==Int(EACCES),"public factory revoked resource denied")
     let after = try Data(contentsOf:image);need(after==before,"revoked load preserves image")
+
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
     let configurationResource = FSPathURLResource(url:fixture.url,writable:true)
     fs.setLoadConfigurationHookForTesting { configurationResource.revoke() }
@@ -411,6 +433,7 @@ func executionAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolum
     }
     let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
     try exercise("rights",persistedMode:0o755) { v,root,file,resource,keep in
+        seekAccess(v,file,offset:0,region:.hole,expected:8)
         for mode: UInt32 in [0,0o100,0o400,0o500,0o600,0o700,0o755] {
             setMode(v,file,mode)
             let allowed = mode & 0o500 == 0o500
@@ -532,12 +555,12 @@ final class Mounted {
     let volume: StallionVolume, root: FSItem, file: FSItem, alias: FSItem, link: FSItem
     let coreHandle: OpaquePointer
     let resource: FSPathURLResource
-    init(_ fixture: Fixture, writable: Bool = true, itemLimit: Int = ReadOnlyLimits.activeItems) throws {
+    init(_ fixture: Fixture, writable: Bool = true, itemLimit: Int = ReadOnlyLimits.activeItems, suppliedResource: FSPathURLResource? = nil) throws {
         fault(0, 0); var h: OpaquePointer?, r = sfs_result()
         let opened = writable ? sfs_image_open(fixture.url.path, "image.sfs", &h, &r) : sfs_image_open_readonly(fixture.url.path, "image.sfs", &h, &r)
         need(opened == SFS_OK, "open adapter")
         coreHandle = h!
-        resource = FSPathURLResource(url: fixture.url, writable: writable)
+        resource = suppliedResource ?? FSPathURLResource(url: fixture.url, writable: writable)
         volume = StallionVolume(admission: .forTesting(handle: h!, anchor: r, writable: writable), resource: resource, scope: false, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
         if writable { try volume.enableWriteDiagnostic(expectedUUID: fixture.identity) }
         let v = volume
@@ -578,6 +601,164 @@ final class Mounted {
         need(consumed, "quiescent unload consumes ownership")
     }
 }
+
+#if STALLION_CONTEXT_HANDLERS
+// Supplied-state cancellation only, not a model of native FSKit revocation.
+final class SeekResource: FSPathURLResource {
+    var observationsBeforeRevocation: Int?
+    override var isRevoked: Bool {
+        if let left = observationsBeforeRevocation {
+            if left == 0 { return true }
+            observationsBeforeRevocation = left - 1
+        }
+        return super.isRevoked
+    }
+}
+func contextualSeeks(_ parent: URL) throws {
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    for writable in [false,true] {
+        let f = try Fixture(parent,"seek-\(writable)",extra:true,directory:true)
+        // Produce a sparse regular file through the existing committed core.
+        var h: OpaquePointer?, r = sfs_result()
+        need(sfs_image_open(f.url.path,"image.sfs",&h,&r) == SFS_OK,"seek producer open")
+        need(sfs_image_begin(h,&r) == SFS_OK && sfs_image_resize(h,f.id,5*4096+7,&r) == SFS_OK,"seek producer sparse length")
+        need(sfs_image_write(h,f.id,2*4096,"",1,&r) == SFS_OK && sfs_image_write(h,f.id,5*4096,"",1,&r) == SFS_OK,"seek allocated zeros")
+        need(sfs_image_commit(h,&r) == SFS_OK && sfs_image_close(h,&r) == SFS_OK,"seek producer commit")
+        let image = f.url.appendingPathComponent("image.sfs"), bytes = try Data(contentsOf:image)
+        let m = try Mounted(f,writable:writable), v = m.volume
+        let own = m.file as! StallionItem, pin = own.pin.map { rawBytes($0) }, modes = own.retainedModes
+        let table: [(off_t,off_t?,off_t?)] = [(0,0,4096),(100,100,4096),(4096,8192,4096),(8193,8193,12288),
+                                           (12288,20480,12288),(20486,20486,20487),(20487,nil,nil),(25000,nil,nil)]
+        for (offset,data,hole) in table {
+            seekAccess(v,m.file,offset:offset,region:.data,expected:data,error:data == nil ? ENXIO : 0)
+            seekAccess(v,m.alias,offset:offset,region:.hole,expected:hole,error:hole == nil ? ENXIO : 0)
+        }
+        seekAccess(v,m.file,offset:-1,region:.data,error:EINVAL)
+        // The SDK declares NSUInteger storage; construct an unknown callback
+        // value without relying on an imported enum initializer's validation.
+        need(MemoryLayout<FSVolume.SeekRegion>.size == MemoryLayout<UInt>.size,"SDK seek region storage")
+        seekAccess(v,m.file,offset:0,region:unsafeBitCast(UInt(99),to:FSVolume.SeekRegion.self),error:EINVAL)
+        seekAccess(v,FSItem(),offset:0,region:.data,error:EINVAL)
+        let directory: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"dir"),inDirectory:m.root) { done(($0,$2)) } }
+        need(directory.1 == nil && directory.0 != nil,"seek directory lookup")
+        for item in [m.root,m.link,directory.0!] { seekAccess(v,item,offset:0,region:.hole,error:EINVAL); seekAccess(v,item,offset:25000,region:.data,error:EINVAL) }
+        for identity in [CallerIdentity(uid:caller.uid+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)] {
+            seekAccess(v,m.file,offset:0,region:.data,error:EACCES,caller:identity)
+        }
+        if geteuid() != 0 { seekAccess(v,m.file,offset:0,region:.data,error:EACCES,caller:CallerIdentity(uid:0,gid:0)) }
+        m.serial { var limited = sfs_image_seek_budget(); limited.checks = 1; v.seekBudgetForTesting = limited }
+        seekAccess(v,m.file,offset:0,region:.hole,error:EAGAIN)
+        m.serial { v.seekBudgetForTesting = nil; v.rejectResultForTesting = { $0 == "FSSeekRegionResult" } }
+        seekAccess(v,m.file,offset:0,region:.hole,error:EIO)
+        m.serial { v.rejectResultForTesting = nil }
+        seekAccess(v,m.file,offset:0,region:.hole,expected:4096)
+        need(own.pin.map { rawBytes($0) } == pin && own.retainedModes == modes,"layout grants no pin or open modes")
+        if writable { need(wait { v.reclaimForTesting(directory.0!,eligible:true,replyHandler:$0) } == nil,"seek directory pin cleanup") }
+        let _: Bool = wait { done in v.unmount { done(true) } }
+        seekAccess(v,m.file,offset:0,region:.data,error:ENXIO)
+        m.close(); let after = try Data(contentsOf:image); need(after == bytes,"all read-only queries preserve image bytes")
+    }
+    for mode: UInt32 in [0,0o200,0o400] {
+        let f = try Fixture(parent,"seek-mode-\(mode)",mode:mode), m = try Mounted(f)
+        if mode != 0 { need(wait { m.volume.openForTesting(m.file,modes:mode == 0o200 ? .write : .read,caller:caller,reply:$0) } == nil,"seek fixture retained mode") }
+        let modes = (m.file as! StallionItem).retainedModes
+        seekAccess(m.volume,m.file,offset:0,region:.hole,expected:8)
+        need((m.file as! StallionItem).retainedModes == modes,"seek accepts metadata policy without upgrading descriptor modes")
+        m.close()
+    }
+    let acl = try Fixture(parent,"seek-acl",acl:true), aclMount = try Mounted(acl)
+    seekAccess(aclMount.volume,aclMount.file,offset:0,region:.data,error:ENOTSUP); aclMount.close()
+    let foreign = try Fixture(parent,"seek-owner",owner:geteuid()+1), foreignMount = try Mounted(foreign)
+    seekAccess(foreignMount.volume,foreignMount.file,offset:0,region:.data,error:EACCES); foreignMount.close()
+    let identity = try Fixture(parent,"seek-held",extra:true), held = try Mounted(identity), hv = held.volume
+    let other: (FSItem?,Error?) = wait { done in hv.lookupItem(named:FSFileName(string:"extra"),inDirectory:held.root) { done(($0,$2)) } }
+    need(other.1 == nil && other.0 != nil,"held victim lookup")
+    let victim = other.0 as! StallionItem, fileID = (held.file as! StallionItem).inode
+    held.serial { do { try hv.diagnosticMutationForTesting { h,r in
+        need(sfs_image_resize(h,victim.inode,8192,&r) == SFS_OK && sfs_image_write(h,victim.inode,4096,"x",1,&r) == SFS_OK,"victim distinct layout")
+        need(sfs_image_rename_replace(h,1,"file",4,fileID,1,"extra",5,victim.inode,&r) == SFS_OK,"replace held victim")
+    } } catch { fatalError("seek replacement fixture: \(error)") } }
+    seekAccess(hv,victim,offset:0,region:.data,expected:4096)
+    seekAccess(hv,held.file,offset:0,region:.data,expected:0)
+    held.serial { do { try hv.diagnosticMutationForTesting { h,r in
+        need(sfs_image_unlink(h,1,"extra",5,&r) == SFS_OK && sfs_image_unlink(h,1,"alias",5,&r) == SFS_OK,"final unlink of held file")
+    } } catch { fatalError("seek unlink fixture: \(error)") } }
+    seekAccess(hv,held.file,offset:0,region:.hole,expected:8)
+    // Core-only unlink supplies no adapter parent witness for a full setter result.
+    // Update this layout fixture through its exact pin, then exercise the real seek callback.
+    let heldItem = held.file as! StallionItem, heldPin = heldItem.pin!, heldModes = heldItem.retainedModes
+    held.serial { do {
+        need(heldItem.lastKnownParent == nil,"core-only detached fixture has no parent witness")
+        try hv.diagnosticMutationForTesting { h,r in
+            var update = sfs_metadata_update(); update.fields = UInt32(SFS_META_MODE.rawValue); update.mode = UInt32(S_IFREG)
+            need(sfs_image_pin_set_metadata(h,heldPin,&update,&r) == SFS_OK,"held seek fixture zero-mode update")
+        }
+        var value = sfs_pin_stat(), r = sfs_result()
+        need(sfs_image_pin_stat(held.coreHandle,heldPin,&value,&r) == SFS_OK,"held seek fixture current exact-pin metadata")
+        need(value.metadata.entry.inode == fileID && value.metadata.entry.kind == SFS_FILE && value.metadata.mode == UInt32(S_IFREG) &&
+             value.linked == 0 && value.metadata.link_count == 0 && value.metadata.entry.parent == 0 && value.metadata.entry.name_length == 0,
+             "zero-mode update preserves detached file identity")
+        need(heldItem.inode == fileID && sameBytes(heldPin,heldItem.pin!) && heldItem.retainedModes == heldModes && heldItem.lastKnownParent == nil,
+             "fixture update preserves full pin and supplies no parent witness or open rights")
+    } catch { fatalError("seek mode fixture: \(error)") } }
+    seekAccess(hv,held.file,offset:0,region:.data,expected:0)
+    held.serial { do { try hv.diagnosticMutationForTesting { h,r in
+        need(sfs_image_pin_set_xattr(h,(held.file as! StallionItem).pin!,"com.apple.system.Security",25,nil,0,&r) == SFS_OK,"held ACL update")
+    } } catch { fatalError("seek ACL fixture: \(error)") } }
+    seekAccess(hv,held.file,offset:0,region:.data,error:ENOTSUP)
+    let exact = victim.pin!
+    held.serial { var stale = exact; stale.incarnation += 1; victim.pin = stale }
+    seekAccess(hv,victim,offset:0,region:.data,error:EINVAL)
+    held.serial { victim.pin = exact }
+    need(wait { hv.reclaimForTesting(victim,eligible:true,replyHandler:$0) } == nil,"held victim reclaimed")
+    seekAccess(hv,victim,offset:0,region:.data,error:EINVAL); held.close()
+    for final in [false,true] {
+        let f = try Fixture(parent,"seek-revoked-\(final)")
+        let resource = SeekResource(url:f.url,writable:true), m = try Mounted(f,suppliedResource:resource)
+        if final { m.serial { m.volume.rejectResultForTesting = { name in if name == "FSSeekRegionResult" { resource.revoke() }; return false } } }
+        else { m.serial { resource.observationsBeforeRevocation = 8 } }
+        seekAccess(m.volume,m.file,offset:0,region:.hole,error:EACCES); m.close()
+    }
+}
+
+func nativeSeekOracle(_ parent: URL) throws -> String {
+    var rows: [[String:Int64]] = []
+    for size: off_t in [0,12295] {
+        let path = parent.appendingPathComponent("seek-apfs-\(size)").path
+        let producer = Darwin.open(path,O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0o600)
+        need(producer >= 0 && ftruncate(producer,size) == 0,"APFS seek oracle setup")
+        var filesystem = statfs()
+        need(fstatfs(producer,&filesystem) == 0,"APFS seek oracle filesystem")
+        let kind = withUnsafeBytes(of:filesystem.f_fstypename) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
+        need(kind == "apfs","native oracle requires actual APFS")
+        if size != 0 { var byte: UInt8 = 1; need(pwrite(producer,&byte,1,4096) == 1,"APFS sparse oracle byte") }
+        need(Darwin.close(producer) == 0,"APFS oracle producer close")
+        for mode in [O_RDONLY,O_WRONLY] {
+            let fd = Darwin.open(path,mode|O_CLOEXEC); need(fd >= 0,"APFS oracle existing descriptor")
+            for changed in [false,true] {
+                if changed { need(chmod(path,0) == 0,"APFS oracle mode removal") }
+                for offset: off_t in [-1,0,4096,8192,size,size+1] { for region in [SEEK_DATA,SEEK_HOLE] {
+                    need(lseek(fd,1,SEEK_SET) == 1,"APFS oracle initial descriptor offset")
+                    errno = 0; let value = lseek(fd,offset,region), error = value == -1 ? errno : 0
+                    let position = lseek(fd,0,SEEK_CUR)
+                    need(value != -1 || position == 1,"failed native seek preserves descriptor position")
+                    if value >= 0 { need(value >= offset && value <= size,"native oracle bounded successful offset") }
+                    rows.append(["size":Int64(size),"mode":Int64(mode),"changed":changed ? 1 : 0,"from":Int64(offset),"region":Int64(region),"value":Int64(value),"errno":Int64(error),"position":Int64(position)])
+                } }
+                if changed { need(chmod(path,0o600) == 0,"APFS oracle restore mode") }
+            }
+            need(Darwin.close(fd) == 0,"APFS oracle descriptor close")
+        }
+    }
+    let constructors: [[String:Int64]] = [-1,0,Int64.max].map { value in
+        // The header documents nil on validation failure but imports as nonoptional.
+        let result: FSSeekRegionResult? = FSSeekRegionResult(returnedOffset:off_t(value))
+        return ["offset":value,"accepted":result == nil ? 0 : 1]
+    }
+    let report: [String:Any] = ["os":ProcessInfo.processInfo.operatingSystemVersionString,"rows":rows,"constructors":constructors]
+    return String(data:try JSONSerialization.data(withJSONObject:report,options:[.sortedKeys]),encoding:.utf8)!
+}
+#endif
 
 func executionProfileRefusals(_ parent: URL) throws {
     for mode: UInt32 in [0o500,0o700,0o755] { for writable in [false,true] {
@@ -5079,6 +5260,8 @@ func contextualXattrQueue(_ parent: URL) throws {
 #if STALLION_CONTEXT_HANDLERS
         try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent); try queuedResizeAfterIncompleteSnapshot(parent); try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent); try contextualDirectories(parent); try contextualRenames(parent); try contextualSymlinkCreation(parent); try contextualMetadata(parent)
         try contextualXattrValues(parent); try contextualXattrKinds(parent); try contextualXattrKindPolicy(parent); try contextualXattrKindIdentity(parent); try contextualXattrDetachedKinds(parent); try contextualXattrRefusals(parent); try contextualXattrFailures(parent); try contextualXattrQueue(parent)
+        try contextualSeeks(parent)
+        let seekOracle = try nativeSeekOracle(parent)
 #else
         let legacyFixture = try Fixture(parent,"legacy-metadata-access"), legacy = try Mounted(legacyFixture)
         for rights: FSVolume.AccessMask in [[.writeAttributes],[.writeSecurity],[.takeOwnership]] {
@@ -5109,6 +5292,8 @@ func contextualXattrQueue(_ parent: URL) throws {
 #if STALLION_CONTEXT_WRITES
         print("OWNER EXECUTION contextual owner policy and FSCheckAccessResult: actual-result success")
 #endif
+        print("SEEK contextual layout policy and FSSeekRegionResult: actual-result success")
+        print("SEEK APFS oracle: \(seekOracle)")
 #endif
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
         print("PASS contextual hardlinks, two-role results, refusal, rollback and queued delivery gates")

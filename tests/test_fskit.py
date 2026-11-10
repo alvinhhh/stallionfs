@@ -194,6 +194,7 @@ class FSKitInterfaces(unittest.TestCase):
                          'readlinkresultfortesting', 'xattrresultfortesting', 'xattrsresultfortesting',
                          'enumerationresultfortesting', 'readresultconstructorfortesting',
                          'preparedattributesfortesting', 'rejectresultfortesting',
+                         'seekresultfortesting', 'seekbudgetfortesting', 'preparedseekoffsetfortesting',
                          'resultrequestfortesting', 'requirevalidfortesting', 'requireresultvalidityfortesting',
                          'linkresultfortesting', 'linkaccessfortesting', 'linkbudgetfortesting',
                          'linkpreflightfortesting', 'snapshotfortesting', 'createlinkhandler',
@@ -229,7 +230,7 @@ class FSKitInterfaces(unittest.TestCase):
                 self.assertEqual(lines[:2], [
                     'PASS existing-file diagnostic real-core writes, attributes, failures and admission',
                     'UNQUALIFIED installed default-cache routing and syscall error propagation'])
-                self.assertEqual(len(lines), 9 if variant == 'context' else 3)
+                self.assertEqual(len(lines), 11 if variant == 'context' else 3)
                 self.assertIn(lines[2], ('SDK unconstructible capability request fields: 65536',
                                         'SDK unconstructible capability request fields: 65536,131072'))
                 if variant == 'context':
@@ -251,6 +252,14 @@ class FSKitInterfaces(unittest.TestCase):
                     self.assertEqual(lines[8], 'OWNER EXECUTION contextual owner policy and FSCheckAccessResult: '
                                                'actual-result success')
                     print(lines[8], flush=True)
+                    self.assertEqual(lines[9], 'SEEK contextual layout policy and FSSeekRegionResult: actual-result success')
+                    print(lines[9], flush=True)
+                    self.assertTrue(lines[10].startswith('SEEK APFS oracle: '))
+                    oracle = json.loads(lines[10].removeprefix('SEEK APFS oracle: '))
+                    self.assertEqual(len(oracle['rows']), 96)
+                    self.assertEqual([row['offset'] for row in oracle['constructors']], [-1, 0, 2**63-1])
+                    self.assertTrue(oracle['os'])
+                    print(lines[10], flush=True)
                 self.assertEqual(child.stderr, '')
                 extension = directory / 'readonly-extension'
                 self.command(variant + '-normal-build', [*swift, '-module-cache-path', directory / 'normal-cache',
