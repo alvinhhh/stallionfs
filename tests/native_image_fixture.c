@@ -85,15 +85,19 @@ static void describe(const char *path) {
 int main(int argc, char **argv) {
     assert(argc >= 3);
     if (!strcmp(argv[1],"host-times")) {
-        assert(argc==3); struct stat st; assert(!lstat(argv[2],&st));
-        printf("{\"birth\":[%lld,%ld],\"access\":[%lld,%ld],\"modification\":[%lld,%ld]}\n",
-            (long long)st.st_birthtimespec.tv_sec,st.st_birthtimespec.tv_nsec,
-            (long long)st.st_atimespec.tv_sec,st.st_atimespec.tv_nsec,
-            (long long)st.st_mtimespec.tv_sec,st.st_mtimespec.tv_nsec); return 0;
+        for (int i=2;i<argc;i++) {
+            struct stat st; assert(!lstat(argv[i],&st));
+            printf("{\"birth\":[%lld,%ld],\"access\":[%lld,%ld],\"modification\":[%lld,%ld]}\n",
+                (long long)st.st_birthtimespec.tv_sec,st.st_birthtimespec.tv_nsec,
+                (long long)st.st_atimespec.tv_sec,st.st_atimespec.tv_nsec,
+                (long long)st.st_mtimespec.tv_sec,st.st_mtimespec.tv_nsec);
+        }
+        return 0;
     }
     if (!strcmp(argv[1],"describe")) {
-        assert(argc==4); OK(sfs_image_open_readonly(argv[2],"image.sfs",&image,&receipt));
-        describe(argv[3]); OK(sfs_image_close(image,&receipt)); return 0;
+        assert(argc>=4); OK(sfs_image_open_readonly(argv[2],"image.sfs",&image,&receipt));
+        for (int i=3;i<argc;i++) describe(argv[i]);
+        OK(sfs_image_close(image,&receipt)); return 0;
     }
     if (!strcmp(argv[1],"seed")) {
         sfs_metadata_initial root = initial(S_IFDIR|0700), file = initial(S_IFREG|0640), link = initial(S_IFLNK|0700);

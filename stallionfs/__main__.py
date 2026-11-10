@@ -198,7 +198,7 @@ def main(argv=None):
             text = "\n".join(f"{item['id']}\t{item.get('name', '')}\t{item['path']}" for item in result)
         elif args.action in ("remove", "restore"):
             result = store.move(args.id, restore=args.action == "restore")
-            text = result["path"]
+            text = result["path"] if "path" in result else result["restored" if args.action == "restore" else "retired"]
         elif args.action == "gc":
             items = store.gc(older_than=args.older_than * 3600, yes=args.yes, jobs=args.jobs)
             result = {"deleted" if args.yes else "would_delete": items}
