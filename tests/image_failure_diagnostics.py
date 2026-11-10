@@ -304,7 +304,7 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
 
 @contextmanager
 def observe_detach():
-    """Observe only the first detach command in this explicit test operation."""
+    """Observe before validation of the first detach in this test operation."""
     observation = dict(started=False, operation_id=None, pre_observation='unavailable')
     token = _detach_observation.set(observation)
     try:
@@ -481,8 +481,19 @@ class Diagnostics:
         self.backing_identities = {}
         self.eject_contexts = {}
         self.eject_log_attempted = False
+        self.patches = []
+        self.closed = False
 
     def close(self):
+        self.closed = True
+        for target, name, original, wrapper in reversed(self.patches):
+            if getattr(target, name, None) is wrapper:
+                previous = getattr(original, '__dict__', {}).get('_image_diagnostics')
+                while previous is not None and previous[0].closed:
+                    original = previous[1]
+                    previous = getattr(original, '__dict__', {}).get('_image_diagnostics')
+                setattr(target, name, original)
+        self.patches.clear()
         if self.fd is not None:
             fd, self.fd = self.fd, None
             os.close(fd)
@@ -600,8 +611,9 @@ class Diagnostics:
             raise ValueError("unknown fixture scope")
         _private(base, True)
         creating = args[1] == "create"
+        selecting = not creating and args[2] is None
         target = str(args[-1] if creating else args[2])
-        if not creating and not _device.fullmatch(target):
+        if not creating and not selecting and not _device.fullmatch(target):
             raise ValueError("invalid failed device")
         image = Path(target) if creating else expected_image
         if image is not None and (not image.is_absolute() or image.resolve() != image or not image.is_relative_to(base)):
@@ -613,7 +625,8 @@ class Diagnostics:
         matches = []
         for record in records:
             entities = record.get('system-entities', [])
-            if (creating and record.get('image-path') == str(image)) or (not creating and any(e.get('dev-entry') == target for e in entities)):
+            if (((creating or selecting) and record.get('image-path') == str(image)) or
+                    (not creating and not selecting and any(e.get('dev-entry') == target for e in entities))):
                 matches.append(record)
         if len(matches) != 1:
             raise ValueError("missing or ambiguous attachment")
@@ -828,11 +841,11 @@ class Diagnostics:
                        message=None if before else _message(error),
                        expected_busy=bool(scope and scope['expected']),
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
-                       failed_device=args[2] if args[1] == 'eject' and _device.fullmatch(args[2]) else None,
+                       failed_device=args[2] if args[1] == 'eject' and isinstance(args[2], str) and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
                        pre_observation=(observation.get('pre_observation', 'unavailable')
                                         if observation is not None else 'not-selected'),
-                       observation='immediately before detach command' if before else 'post-failure observation')
+                       observation='before detach validation' if before else 'post-failure observation')
             if scope is None:
                 self._emit(deadline, 'unavailable', reason='no explicit owned fixture context')
                 return operation_id
@@ -845,6 +858,9 @@ class Diagnostics:
             matches = point is not None and point == expected_point
             first_identity = self.backing_identities.setdefault(operation_id, identity)
             same_backing = first_identity == identity
+            if before and observation is not None:
+                targets = [device for device in devices if re.fullmatch(r'/dev/disk[0-9]+', device)]
+                observation['observed_target'] = targets[0] if targets else None
             if not before and same_backing:
                 self.eject_contexts[operation_id] = dict(image=image, target=args[2],
                                                         identity=identity, deadline=deadline)
@@ -920,26 +936,27 @@ class Diagnostics:
 
 def install(images, directory):
     diagnostics = Diagnostics(directory)
-    original = images._command
+    # Preserve surrounding installations without executing nested collectors.
+    previous_command = images._command
+    previous = getattr(previous_command, '__dict__', {}).get('_image_diagnostics')
+    original = previous[2] if previous is not None else previous_command
 
     def command(*args):
+        if diagnostics.closed or images._command is not command:
+            return original(*args)
         creating = len(args) >= 3 and args[:2] == ('/usr/bin/hdiutil', 'create')
         ejecting = (len(args) == 3 and args[:2] == ('/usr/sbin/diskutil', 'eject')
                     and isinstance(args[2], str) and re.fullmatch(r'/dev/disk[0-9]+', args[2]))
         if not (creating or ejecting):
             return original(*args)
         observation = _detach_observation.get() if ejecting else None
-        if observation is not None and not observation['started']:
-            observation['started'] = True
-            try:
-                diagnostics.before(args, _scope.get(), observation)
-            except Exception:
-                pass  # Observation failure cannot prevent the requested detach.
         if observation is not None:
             observation['diagnostics'] = diagnostics
             observation.setdefault('scope', _scope.get())
             observation.setdefault('target', args[2])
-            observation['target_changed'] = observation.get('target_changed', False) or observation['target'] != args[2]
+            observation['target_changed'] = (observation.get('target_changed', False) or
+                                             observation['target'] != args[2] or
+                                             observation.get('observed_target') != args[2])
             diagnostics.eject_contexts.pop(observation['operation_id'], None)
             if 'start_ns' not in observation:
                 observation['start_ns'], observation['start_mono'] = time.time_ns(), time.monotonic()
@@ -963,5 +980,44 @@ def install(images, directory):
                     pass
             raise
 
+    command._image_diagnostics = (diagnostics, previous_command, original)
+    diagnostics.patches.append((images, '_command', previous_command, command))
     images._command = command
+    previous_detach = getattr(images, 'detach', None)
+    if previous_detach is not None:
+        previous = getattr(previous_detach, '__dict__', {}).get('_image_diagnostics')
+        original_detach = previous[2] if previous is not None else previous_detach
+        def detach(image, mountpoint):
+            if diagnostics.closed or images.detach is not detach:
+                return original_detach(image, mountpoint)
+            observation, scope = _detach_observation.get(), _scope.get()
+            if observation is not None and not observation['started']:
+                observation['started'] = True
+                identity = None
+                try:
+                    if (scope is not None and scope['image'] == Path(image) and
+                            scope['mountpoint'] == Path(mountpoint) and
+                            scope['base'].is_absolute() and scope['base'].resolve() == scope['base'] and
+                            scope['image'].is_absolute() and scope['image'].resolve() == scope['image'] and
+                            scope['image'].is_relative_to(scope['base'])):
+                        _private(scope['base'], True)
+                        info = _private(scope['image'])
+                        identity = (info.st_dev, info.st_ino)
+                        diagnostics.before(('/usr/sbin/diskutil', 'eject', None), scope, observation)
+                except Exception:
+                    pass  # Observation failure cannot prevent ordinary validation.
+                if identity is not None:
+                    try:
+                        info = _private(scope['image'])
+                        unchanged = identity == (info.st_dev, info.st_ino)
+                    except Exception:
+                        unchanged = False
+                    if not unchanged:
+                        from stallionfs.images import _error
+                        raise _error('Owned backing identity changed during detach observation')
+            return original_detach(image, mountpoint)
+
+        detach._image_diagnostics = (diagnostics, previous_detach, original_detach)
+        diagnostics.patches.append((images, 'detach', previous_detach, detach))
+        images.detach = detach
     return diagnostics

@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from stallionfs.core import StallionError, Store, git, read_json, remove_tree, write_json
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_seed_create
+    from .image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope, observe_seed_create
+    from image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
 
 
 class ImageFixture:
@@ -385,7 +385,8 @@ class ImageStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StallionError, "external worktree"):
                 fixture.call(store.snapshot, value, workspace=value, expected=True)
             git(repo, "config", "--local", "--unset", "include.path")
-            fixture.call(store.unmount, value, workspace=value)
+            with observe_detach():
+                fixture.call(store.unmount, value, workspace=value)
             closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertFalse(repo.exists())
             fixture.call(store.mount, value, workspace=value)
