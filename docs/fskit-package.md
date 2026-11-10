@@ -443,6 +443,11 @@ translocated, symlinked and mounted-volume candidates are refused. These actions
 manage a command link; they do not install, replace or remove the app or prepare
 an FSKit module for an update.
 
+`Extension Settings` opens the macOS File System Extensions pane for manual
+module enablement and any macOS authorization. `Quit StallionFS` (Command-Q)
+uses normal app termination. Command setup must finish before the app can quit
+or its panel can close.
+
 The corresponding bundled CLI actions are `sfs command status`, `sfs command
 install` and `sfs command remove`; place `--json` before `command` for structured
 output. They run before workspace Store initialization. Status creates no
