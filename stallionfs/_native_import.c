@@ -15,8 +15,10 @@
 
 #define CELL UINT64_C(4096)
 #define NONE UINT64_MAX
-/* These are private scratch records, never an image or recovery format. A
- * sequential inventory bounds memory independently of entry/link counts. */
+/* These are private scratch records, never an image or recovery format.
+ * Inventory and payloads remain disk-backed. Identity lookup uses O(unique
+ * inodes) auxiliary RAM: 32-byte slots at at most half occupancy, with both
+ * tables resident while growing. Directory enumeration remains constant RAM. */
 typedef struct {
     struct stat captured;
     uint64_t parent, depth, first, inode, attributes, attributes_end, ranges, range_count;
@@ -25,11 +27,14 @@ typedef struct {
 } record;
 typedef struct { uint64_t start, end; } range;
 typedef struct { uint64_t length; uint32_t name_length; } attribute;
+typedef struct { uint64_t device, inode, earliest_plus_one, count; } identity_slot;
 typedef struct {
     const sfs_import_options *options;
     sfs_import_report *report;
     int root, destination, stage, inventory, values, ranges, names;
     uint64_t count, value_end, range_end, current;
+    identity_slot *identities;
+    size_t identity_capacity, identity_used;
     sfs_image *image;
 } importer;
 
@@ -75,6 +80,61 @@ static int stable_stat(const struct stat *a, const struct stat *b) {
         a->st_nlink == b->st_nlink && a->st_size == b->st_size &&
         same_time(a->st_birthtimespec,b->st_birthtimespec) && same_time(a->st_mtimespec,b->st_mtimespec) &&
         same_time(a->st_ctimespec,b->st_ctimespec);
+}
+static uint64_t identity_hash(uint64_t device, uint64_t inode) {
+    uint64_t key=inode ^ (device+UINT64_C(0x9e3779b97f4a7c15));
+    key=(key^(key>>30))*UINT64_C(0xbf58476d1ce4e5b9);
+    key=(key^(key>>27))*UINT64_C(0x94d049bb133111eb);
+    return key^(key>>31);
+}
+static identity_slot *identity_find(importer *c,identity_slot *table,size_t capacity,uint64_t device,uint64_t inode) {
+    size_t at=(size_t)identity_hash(device,inode)&(capacity-1);
+    for (size_t probes=0;probes<capacity;probes++,at=(at+1)&(capacity-1)) {
+        if (poll(c)) return NULL;
+        identity_slot *slot=&table[at];
+        if (!slot->earliest_plus_one || (slot->device==device && slot->inode==inode)) return slot;
+    }
+    fail(c,"representation-limit",EOVERFLOW); return NULL;
+}
+static int identity_grow(importer *c) {
+    if (c->identity_capacity>SIZE_MAX/2) return fail(c,"representation-limit",EOVERFLOW);
+    size_t capacity=c->identity_capacity ? c->identity_capacity*2 : 16;
+    if (capacity>SIZE_MAX/sizeof(identity_slot)) return fail(c,"representation-limit",EOVERFLOW);
+    identity_slot *table=malloc(capacity*sizeof(*table));
+    if (!table) return fail(c,"io",ENOMEM);
+    memset(table,0,capacity*sizeof(*table));
+    for (size_t i=0;i<c->identity_capacity;i++) {
+        if (poll(c)) { free(table); return -1; }
+        identity_slot *old=&c->identities[i];
+        if (!old->earliest_plus_one) continue;
+        identity_slot *slot=identity_find(c,table,capacity,old->device,old->inode);
+        if (!slot) { free(table); return -1; }
+        *slot=*old;
+    }
+    free(c->identities); c->identities=table; c->identity_capacity=capacity;
+    return 0;
+}
+static int identity_capture(importer *c,uint64_t index,record *r) {
+    if (!c->identity_capacity && identity_grow(c)) return -1;
+    uint64_t device=(uint64_t)r->captured.st_dev,inode=(uint64_t)r->captured.st_ino;
+    identity_slot *slot=identity_find(c,c->identities,c->identity_capacity,device,inode);
+    if (!slot) return -1;
+    if (!slot->earliest_plus_one) {
+        if (c->identity_used>=c->identity_capacity/2) {
+            if (identity_grow(c)) return -1;
+            slot=identity_find(c,c->identities,c->identity_capacity,device,inode);
+            if (!slot) return -1;
+        }
+        if (index==UINT64_MAX) return fail(c,"representation-limit",EOVERFLOW);
+        *slot=(identity_slot){.device=device,.inode=inode,.earliest_plus_one=index+1,.count=1};
+        c->identity_used++; return 0;
+    }
+    record first;
+    if (get_record(c,slot->earliest_plus_one-1,&first)) return -1;
+    if (S_ISDIR(r->captured.st_mode) || !stable_stat(&first.captured,&r->captured)) return fail(c,"source-changed",ESTALE);
+    if (slot->count==UINT64_MAX) return fail(c,"representation-limit",EOVERFLOW);
+    slot->count++; r->first=first.first; r->captured.st_atimespec=first.captured.st_atimespec;
+    return 0;
 }
 static int close_fd(importer *c, int fd) {
     if (fd < 0 || !close(fd)) return 0;
@@ -285,6 +345,7 @@ static int inventory(importer *c) {
     if (fstat(c->root,&root.captured)) return fail(c,"io",errno);
     if (supported_stat(c,&root.captured) || put_record(c,0,&root)) return -1;
     c->count=1;
+    if (identity_capture(c,0,&root)) return -1;
     for (uint64_t i=0;i<c->count;i++) {
         c->current=i; record r; if (get_record(c,i,&r)) return -1;
         int fd=open_record(c,i); if (fd<0) return -1;
@@ -310,13 +371,7 @@ static int inventory(importer *c) {
                 if (put_record(c,c->count,&child)) { failed=1; break; }
                 uint64_t child_index=c->count++; c->current=child_index;
                 if (supported_stat(c,&child.captured)) { failed=1; break; }
-                for (uint64_t j=0;j<child_index;j++) {
-                    record seen; if (get_record(c,j,&seen)) { failed=1; break; }
-                    if (seen.captured.st_dev==child.captured.st_dev && seen.captured.st_ino==child.captured.st_ino) {
-                        if (S_ISDIR(child.captured.st_mode) || !stable_stat(&seen.captured,&child.captured)) { failed=fail(c,"source-changed",ESTALE); break; }
-                        child.first=seen.first; child.captured.st_atimespec=seen.captured.st_atimespec; break;
-                    }
-                }
+                failed=identity_capture(c,child_index,&child);
                 if (failed || put_record(c,child_index,&child)) { failed=1; break; }
                 c->current=i; memcpy(previous,name,child.length+1);
             }
@@ -329,9 +384,10 @@ static int inventory(importer *c) {
         c->current=i; record r; if (get_record(c,i,&r)) return -1;
         c->report->parent_steps=sfs_import_budget_add(c->report->parent_steps,r.depth,&c->report->budget_saturated);
         if (S_ISDIR(r.captured.st_mode)) continue;
-        uint64_t links=0;
-        for (uint64_t j=0;j<c->count;j++) { record other; if (get_record(c,j,&other)) return -1; if (other.first==r.first) links++; }
-        if (links!=(uint64_t)r.captured.st_nlink) return fail(c,"external-hardlink",ENOTSUP);
+        identity_slot *slot=identity_find(c,c->identities,c->identity_capacity,(uint64_t)r.captured.st_dev,(uint64_t)r.captured.st_ino);
+        if (!slot) return -1;
+        if (!slot->earliest_plus_one) return fail(c,"source-changed",ESTALE);
+        if (slot->count!=(uint64_t)r.captured.st_nlink) return fail(c,"external-hardlink",ENOTSUP);
     }
     c->report->entries=c->count;
     uint64_t bytes;
@@ -760,6 +816,7 @@ done:
     }
     if (c.destination>=0 && report->creation_attempted) observe(&c);
     failure_path(&c);
+    free(c.identities);
     close_fd(&c,c.inventory); close_fd(&c,c.values); close_fd(&c,c.ranges); close_fd(&c,c.names);
     close_fd(&c,c.root); close_fd(&c,c.destination); close_fd(&c,c.stage);
     if (report->reason || report->cleanup_error) report->candidate_complete=0;

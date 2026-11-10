@@ -2938,6 +2938,96 @@ class Workspaces(unittest.TestCase):
                 self.assertFalse((self.store.root / 'workspaces' / intent['workspace']).exists())
         self.assertEqual(self.store.list(), [])
 
+    def test_failed_native_preflight_keeps_candidate_without_blocking_unrelated_purge(self):
+        from stallionfs import core
+        seed = self.prepare()
+        created = self.store.create(seed['id'])
+        workspace, repo = created['id'], Path(created['path'])
+        snapshot = self.store.snapshot(workspace, quiescent=True)['id']
+        (repo / 'file').write_text('recovery contents\n')
+        recovery = self.store.rollback(workspace, snapshot, quiescent=True)['recovery']
+        self.store.move(workspace)
+        with patch('stallionfs._native.preflight_create', side_effect=StallionError('preflight refused')), \
+             patch('stallionfs._image.create_from_tree') as importer:
+            with self.assertRaisesRegex(StallionError, 'preflight refused'):
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        importer.assert_not_called()
+        journal = next((self.store.root / 'journals').iterdir())
+        record = core.read_json(journal)
+        stage, candidate = Path(record['stage']), Path(record['candidate'])
+        before = {path: path.read_bytes() for path in (journal, stage / 'native-create')}
+        identities = [(path.stat().st_dev, path.stat().st_ino) for path in (stage, candidate)]
+        for kind, value in (('snapshots', snapshot), ('recovery', recovery), ('trash', workspace)):
+            with self.subTest(kind=kind):
+                retained = self.store.root / kind / value
+                self.assertEqual(self.store.purge(kind, value), {'would_delete': str(retained)})
+                self.assertTrue((retained / 'repo/file').is_file())
+                self.assertEqual(self.store.purge(kind, value, yes=True), {'deleted': str(retained)})
+                self.assertFalse(retained.exists())
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+                self.assertEqual([(path.stat().st_dev, path.stat().st_ino) for path in (stage, candidate)], identities)
+        self.assertEqual(list((self.store.root / 'journals').iterdir()), [journal])
+
+    def test_uncertain_native_create_intents_still_block_unrelated_purge(self):
+        import copy
+        from stallionfs import core
+        seed = self.prepare()
+        created = self.store.create(seed['id'])
+        snapshot = self.store.snapshot(created['id'], quiescent=True)['id']
+        retained = self.store.root / 'snapshots' / snapshot
+        with patch('stallionfs._native.preflight_create', side_effect=StallionError('preflight refused')):
+            with self.assertRaises(StallionError):
+                self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+        journal = next((self.store.root / 'journals').iterdir())
+        record = core.read_json(journal)
+        original = journal.read_bytes()
+        stage, candidate, final = (Path(record[key]) for key in ('stage', 'candidate', 'final'))
+        marker = (stage / 'native-create').read_bytes()
+        cases = {
+            'unknown': {'operation': 'unknown'},
+            'rollback': {'operation': 'rollback', 'backend': 'folder'},
+            'workspace': {'workspace': 'f' * 32},
+            'malformed': {'transaction': None},
+            'pending-helper': {'child_pending': True, 'helpers': []},
+            'malformed-helper': {'child_pending': False, 'helpers': [{}]},
+            'stage-outside': {'stage': str(self.base / 'outside')},
+            'stage-relative': {'stage': 'staging/build-relative'},
+            'stage-noncanonical': {'stage': str(stage.parent) + '/./' + stage.name},
+            'candidate-outside': {'candidate': str(retained)},
+            'final-outside': {'final': str(retained)},
+            'stage-identity': {'stage_identity': [record['stage_identity'][0], record['stage_identity'][1] + 1]},
+            'candidate-identity': {'object': [record['object'][0], record['object'][1] + 1]},
+        }
+        def refused():
+            pending = journal.read_bytes()
+            for yes in (False, True):
+                with self.assertRaisesRegex(StallionError, 'pending rollback|uncertain native'):
+                    self.store.purge('snapshots', snapshot, yes=yes)
+                self.assertTrue((retained / 'repo/file').is_file())
+                self.assertEqual(journal.read_bytes(), pending)
+                self.assertEqual((stage / 'native-create').read_bytes(), marker)
+        for name, updates in cases.items():
+            with self.subTest(case=name):
+                changed = copy.deepcopy(record); changed.update(updates)
+                journal.write_text(json.dumps(changed))
+                refused()
+        journal.write_bytes(original)
+        final.mkdir(mode=0o700)
+        core.write_json(final / 'meta.json', {'id': journal.stem, 'backend': 'folder'})
+        try:
+            with self.subTest(case='final-exists'): refused()
+        finally:
+            (final / 'meta.json').unlink()
+            final.rmdir()
+        for path in (stage, candidate):
+            held = path.with_name(path.name + '-held')
+            path.rename(held); path.symlink_to(held, target_is_directory=True)
+            try:
+                with self.subTest(case='symlink-' + path.name): refused()
+            finally:
+                path.unlink(); held.rename(path)
+        self.assertEqual(journal.read_bytes(), original)
+
     def test_native_candidate_precreate_intent_failure_never_calls_importer(self):
         seed = self.prepare()
         with patch('stallionfs.core.sync_directory', side_effect=OSError(errno.ENOSPC, 'full')), \
@@ -2992,6 +3082,7 @@ with open('islands', 'wb') as f:
     f.truncate(32775); f.seek(0); f.write(b'A'*4096); f.seek(24576); f.write(bytes(4096)); f.seek(32768); f.write(b'partial')
 fd=os.open('raw-é'.encode(), os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o640); os.write(fd,b'raw name'); os.close(fd)
 os.link('file','hard'); os.link('link','link-alias',follow_symlinks=False)
+os.link('file','dependencies/hard'); os.link('link','dependencies/link-alias',follow_symlinks=False)
 Path('dangling').symlink_to('missing/../still-missing')
 setx('file','org.example.binary',b'\x00\xff\x02')
 setx('file','org.example.empty',b'')

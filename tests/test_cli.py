@@ -119,6 +119,37 @@ class NativeImageCLI(unittest.TestCase):
     def register(self, directory):
         return self.command('register-native-image', directory / 'image.sfs')['id']
 
+    def test_native_fixture_describe_batch_matches_single_paths_and_refuses_missing(self):
+        directory = self.seed()
+        image = directory / 'image.sfs'
+        before = (image.stat().st_ino, hashlib.sha256(image.read_bytes()).hexdigest())
+        paths = ('.', 'file', 'alias', 'link')
+        singles = [json.loads(self.owned('describe-single', [self.fixture, 'describe', directory, path]).stdout)
+                   for path in paths]
+        batch = self.owned('describe-batch', [self.fixture, 'describe', directory, *paths])
+        rows = [json.loads(line) for line in batch.stdout.splitlines()]
+        self.assertEqual(len(rows), len(paths))
+        self.assertEqual(rows, singles)
+        host_paths = (directory, image)
+        host_singles = [json.loads(self.owned('host-time-single', [self.fixture, 'host-times', path]).stdout)
+                        for path in host_paths]
+        host_batch = self.owned('host-time-batch', [self.fixture, 'host-times', *host_paths])
+        host_rows = [json.loads(line) for line in host_batch.stdout.splitlines()]
+        self.assertEqual(len(host_rows), len(host_paths))
+        self.assertEqual(host_rows, host_singles)
+        # The checker intentionally refuses an absent path. Keep that expected
+        # nonzero result inside a clean capture, never accept partial rows.
+        script = ('import json,resource,subprocess,sys; '
+                  'resource.setrlimit(resource.RLIMIT_CORE,(0,0)); '
+                  'p=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=5); '
+                  'print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))')
+        for arguments in ([self.fixture, 'describe', directory, 'file', 'missing'],
+                          [self.fixture, 'host-times', directory, directory / 'missing']):
+            child = self.owned('checker-missing', [sys.executable, '-I', '-c', script, *arguments], 10)
+            observed = json.loads(child.stdout)
+            self.assertNotEqual(observed['returncode'], 0)
+        self.assertEqual((image.stat().st_ino, hashlib.sha256(image.read_bytes()).hexdigest()), before)
+
     def test_installed_registration_snapshot_rollback_exact_state_and_recovery(self):
         directory = self.seed()
         image = directory / 'image.sfs'
@@ -654,6 +685,33 @@ for line in sys.stdin:
             destination = base / 'owned'; destination.mkdir(mode=0o700)
             (source / 'file').write_bytes(b'imported bytes')
             (source / 'second').write_bytes(b'second file')
+            if case in ('identity-resize', 'identity-resize-signal', 'identity-resize-success'):
+                for index in range(7):
+                    (source / f'extra-{index}').write_bytes(b'extra')
+                if case == 'identity-resize-success':
+                    os.link(source / 'file', source / 'a-link')
+                    os.link(source / 'file', source / 'b-link')
+            if case == 'identity-collision':
+                # Select two distinct real inodes colliding in the initial
+                # table; move them into the source without external aliases.
+                pool = base / 'collision-inputs'; pool.mkdir(mode=0o700)
+                buckets = {}
+                mask = (1 << 64) - 1
+                for index in range(17):
+                    path = pool / str(index); path.write_bytes(f'collision-{index}'.encode())
+                    info = path.stat()
+                    device = ctypes.c_int32(info.st_dev).value & mask
+                    key = info.st_ino ^ ((device + 0x9e3779b97f4a7c15) & mask)
+                    key = ((key ^ (key >> 30)) * 0xbf58476d1ce4e5b9) & mask
+                    key = ((key ^ (key >> 27)) * 0x94d049bb133111eb) & mask
+                    bucket = (key ^ (key >> 31)) & 15
+                    if bucket in buckets:
+                        buckets[bucket].rename(source / 'collision-a')
+                        path.rename(source / 'collision-b')
+                        break
+                    buckets[bucket] = path
+                else:
+                    raise AssertionError('seventeen identities must collide in sixteen slots')
             os.environ['SFS_TEST_MUTATE_PATH'] = str(source / ('added' if case == 'directory-change' else 'file'))
             if case == 'source-allocation':
                 libc = ctypes.CDLL(None, use_errno=True)
@@ -682,7 +740,10 @@ for line in sys.stdin:
                  ('reopen-read', 0, 0, 512), ('reopen-close', 0, 0, 2048),
                  ('response-allocation', 0, 0, 4096), ('creation-signal', 0, 0, 2),
                  ('import-signal', 0, 0, 8192), ('read-change', 0, 0, 16384),
-                 ('directory-change', 0, 0, 32768), ('source-allocation', 0, 0, 65536), ('scratch-full', 0, 0, 131072)]
+                 ('directory-change', 0, 0, 32768), ('source-allocation', 0, 0, 65536), ('scratch-full', 0, 0, 131072),
+                 ('identity-allocation', 0, 0, 2097152), ('identity-resize', 0, 0, 4194304),
+                 ('identity-resize-signal', 0, 0, 8388608), ('identity-collision', 0, 0, 0),
+                 ('identity-resize-success', 0, 0, 0)]
         for case, kind, ordinal, flags in cases:
             with self.subTest(case=case):
                 child = self.owned('import-' + case, [sys.executable, '-I', '-c', script,
@@ -693,12 +754,23 @@ for line in sys.stdin:
                     self.assertTrue(result['candidate_complete'])
                     self.assertTrue(result['verified'])
                     self.assertEqual(result['reopen_close']['status'], 0)
+                elif case in ('identity-collision', 'identity-resize-success'):
+                    self.assertTrue(result['candidate_complete'], observed)
+                    self.assertTrue(result['verified'], result)
+                    self.assertEqual(result['resources']['entries'], 5 if case == 'identity-collision' else 12)
                 else:
                     self.assertFalse(result['candidate_complete'], observed)
-                if case in ('precreate-signal', 'source-allocation', 'scratch-full'):
-                    if case == 'precreate-signal': self.assertEqual(observed['exception'], 'KeyboardInterrupt')
+                if case in ('precreate-signal', 'source-allocation', 'scratch-full',
+                            'identity-allocation', 'identity-resize', 'identity-resize-signal'):
+                    if case in ('precreate-signal', 'identity-resize-signal'):
+                        self.assertEqual(observed['exception'], 'KeyboardInterrupt')
                     self.assertFalse(observed['exists'])
                     self.assertFalse(result['creation_attempted'])
+                    if case in ('source-allocation', 'identity-allocation', 'identity-resize'):
+                        self.assertEqual(result['reason'], 'io')
+                        self.assertEqual(result['local_error'], __import__('errno').ENOMEM)
+                    if case == 'identity-resize-signal':
+                        self.assertEqual(result['reason'], 'verification-incomplete')
                 else:
                     self.assertTrue(observed['exists'], observed)
                     self.assertTrue(result['creation_attempted'])
@@ -1062,6 +1134,27 @@ for name in names:
 
 class MountedOperationArguments(unittest.TestCase):
     """Parser/dispatch checks; these do not exercise a mounted filesystem."""
+    def test_remove_restore_render_native_ids_and_ordinary_paths(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        workspace = 'a' * 32
+        for action, key in (('remove', 'retired'), ('restore', 'restored')):
+            native = {key: workspace, 'mounted': False, 'next': 'sfs mount ' + workspace,
+                      'native_operation': {'outcome': 'complete'}}
+            for result, plain in ((native, workspace), ({'id': workspace, 'path': '/ordinary/repo'}, '/ordinary/repo')):
+                for json_output in (False, True):
+                    with self.subTest(action=action, native='path' not in result, json=json_output), \
+                         patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                        store.return_value.move.return_value = result
+                        self.assertEqual(main([*(['--json'] if json_output else []), action, workspace]), 0)
+                        store.return_value.move.assert_called_once_with(workspace, restore=action == 'restore')
+                        if json_output:
+                            self.assertEqual(json.loads(output.getvalue()), result)
+                        else:
+                            self.assertEqual(output.getvalue(), plain + '\n')
+
     def test_status_and_exact_continuation_arguments(self):
         from contextlib import redirect_stdout
         from io import StringIO

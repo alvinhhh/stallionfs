@@ -615,6 +615,31 @@ class Lifecycle:
         return {kind: [p.name for p in (self.root / kind).iterdir()]
                 for kind in ('snapshots', 'recovery', 'protected')}
 
+    def _check_purge_journals(self):
+        from ._native import check_pending
+        for journal in (self.root / 'journals').iterdir():
+            try:
+                record = core.read_json(journal)
+                if record.get('operation') != 'native-create':
+                    raise core.StallionError('Journal may protect retained data')
+                check_pending(journal.stem, record)
+                stage = Path(record['stage'])
+                candidate = stage / 'owned'
+                final = self.root / 'workspaces' / journal.stem
+                if (str(stage) != record['stage'] or '..' in stage.parts
+                        or stage.parent != self.root / 'staging'
+                        or record['candidate'] != str(candidate)
+                        or record['final'] != str(final) or os.path.lexists(final)):
+                    raise core.StallionError('Native creation locations are uncertain')
+                core.private_directory(stage)
+                core.private_directory(candidate)
+                if identity(stage) != record['stage_identity'] or identity(candidate) != record['object']:
+                    raise core.StallionError('Native creation identities changed')
+                # This unpublished candidate is confined to staging. Keep its
+                # intent and data while allowing unrelated retained data to be purged.
+            except (core.StallionError, OSError, ValueError, KeyError, TypeError) as error:
+                raise core.StallionError('Resolve pending rollback or uncertain native creation before purging retained data') from error
+
     def purge(self, kind, value, *, yes=False):
         if kind not in ('snapshots', 'recovery', 'trash'):
             raise core.StallionError('Purge accepts snapshots, recovery, or trash')
@@ -644,8 +669,7 @@ class Lifecycle:
                     raise core.StallionError('Retained object not found: ' + value)
                 core.private_directory(path)
                 self._guard_native_tree(path)
-                if next((self.root / 'journals').iterdir(), None) is not None:
-                    raise core.StallionError('Resolve pending rollback before purging retained data')
+                self._check_purge_journals()
                 self._no_mounts(path)
                 image = path / 'workspace.sparseimage'
                 if os.path.lexists(image):
