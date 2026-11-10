@@ -146,6 +146,72 @@ class NativeImageCLI(unittest.TestCase):
         symbols = self.owned('production-symbols', ['/usr/bin/nm', _image.__file__]).stdout.lower()
         self.assertFalse(any(word in symbols for word in ('sfs_diag_', 'sfs_bridge_test_', 'sfs_image_diagnostic_')))
 
+    def test_rollback_process_death_preserves_commit_recovery_and_releases_lease(self):
+        import selectors
+        import signal
+        directory = self.seed()
+        workspace = self.register(directory)
+        self.command('snapshot', workspace, '--name', 'before')
+        newer = self.owned('edit', [self.fixture, 'edit', directory]).stdout.strip()
+        # Pause after the ordinary bridge has committed and consumed its core
+        # handle, before the Store releases its lease or the CLI prints success.
+        script = textwrap.dedent('''
+            import json, os, signal, sys
+            from stallionfs import core
+            from stallionfs.__main__ import main
+            root, workspace, ready = sys.argv[1:]
+            original = core.native_operation
+            def operation(target, action, *names):
+                result = original(target, action, *names)
+                if action == 'restore':
+                    observed = {key: result[key] for key in
+                        ('ok', 'committed', 'outcome', 'recovery')}
+                    observed['fence_succeeded'] = result['receipt']['fence_succeeded']
+                    observed['close_status'] = result['close_receipt']['status']
+                    with os.fdopen(int(ready), 'w') as stream:
+                        stream.write(json.dumps(observed) + '\\n')
+                        stream.flush()
+                    while True:
+                        signal.pause()
+                return result
+            core.native_operation = operation
+            raise SystemExit(main(['--root', root, '--json', 'rollback', workspace, 'before']))
+        ''')
+        reader, writer = os.pipe()
+        child = None
+        try:
+            child = subprocess.Popen([sys.executable, '-I', '-B', '-c', script,
+                                      str(self.store), workspace, str(writer)],
+                                     pass_fds=(writer,), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            os.close(writer); writer = None
+            with selectors.DefaultSelector() as selector:
+                selector.register(reader, selectors.EVENT_READ)
+                self.assertTrue(selector.select(15), 'rollback commit acknowledgement timed out')
+            observed = json.loads(os.read(reader, 4096))
+            self.assertEqual({key: observed[key] for key in
+                              ('ok', 'committed', 'outcome', 'fence_succeeded', 'close_status')},
+                             dict(ok=True, committed=True, outcome='committed', fence_succeeded=3, close_status=0))
+            blocked = self.command('snapshot', workspace, '--name', 'blocked', status=1)
+            self.assertIn('managed use', blocked['error'])
+            child.kill()
+            stdout, stderr = child.communicate(timeout=10)
+            self.assertEqual((child.returncode, stdout, stderr), (-signal.SIGKILL, '', ''))
+        finally:
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+            if child is not None and child.poll() is None:
+                child.kill(); child.communicate(timeout=10)
+        # Discover the lost response's recovery name from a new public CLI
+        # process, without replaying rollback or manufacturing a success result.
+        snapshots = self.command('snapshots', workspace)
+        self.assertEqual([row['id'] for row in snapshots], ['before', observed['recovery']])
+        self.owned('verify-killed-target', [self.fixture, 'verify', directory, 'before', newer])
+        self.owned('verify-killed-recovery', [self.fixture, 'verify-edited', directory, observed['recovery']])
+        self.assertEqual(self.command('snapshot', workspace, '--name', 'after-kill')['id'], 'after-kill')
+        self.assertEqual(list((self.store / 'journals').iterdir()), [])
+
     def test_scoped_backing_guard_retains_exact_inode_and_consumes_after_exceptions(self):
         from stallionfs import _image
         import errno

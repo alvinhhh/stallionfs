@@ -592,9 +592,12 @@ class Lifecycle:
                                     raise core.StallionError('Existing protection requires explicit restore or purge')
                                 core.write_json(protection, {'id': workspace, 'object': identity(path),
                                                             'generation': state['generation'], 'retired_at': now})
-                                # Protection precedes rename, including when rename succeeds then raises.
+                                # Persist protection before a rename can expose the object to GC.
+                                core.sync_directory(protection.parent)
                                 from ._scan import move
                                 move(path, self.root / 'trash' / workspace)
+                                core.sync_directory(path.parent)
+                                core.sync_directory(self.root / 'trash')
                         result['retired' if apply else 'would_retire'].append(workspace)
             except (core.StallionError, OSError, ValueError, TypeError) as error:
                 result['skipped'].append({'id': workspace, 'reason': str(error)})

@@ -154,11 +154,26 @@ int main(int argc, char **argv) {
             sfs_verify_budget budget = {131072,536870912,536870912,50000000,33554432,1073741824,NULL,NULL};
             OK(sfs_image_verify(image,&budget,&receipt)); assert(receipt.coverage == SFS_COVERAGE_FULL_REACHABLE);
         } else if (!strcmp(argv[1],"verify-edited")) {
-            assert(argc == 4); sfs_view view; unsigned char bytes[8]; size_t count;
+            assert(argc == 4); sfs_view view; unsigned char bytes[16384]; size_t count;
             OK(sfs_image_snapshot_view(image,argv[3],strlen(argv[3]),&view,&receipt));
             sfs_entry e = lookup(view,"file"); assert(e.size == 16384);
             OK(sfs_image_read(image,view,e.inode,0,bytes,sizeof(bytes),&count,&receipt));
-            assert(count == sizeof(bytes) && !memcmp(bytes,"modified",8));
+            assert(count == sizeof(bytes) && !memcmp(bytes,"modified",8) && !memcmp(bytes+8192,"TAIL",4));
+            for (size_t i=8;i<sizeof(bytes);++i) if (i<8192 || i>=8196) assert(!bytes[i]);
+            assert(lookup(view,"alias").inode == e.inode);
+            sfs_metadata_entry metadata; OK(sfs_image_stat_metadata(image,view,e.inode,&metadata,&receipt));
+            assert(metadata.mode == (S_IFREG|0640) && metadata.uid == geteuid() && metadata.gid == getegid() && metadata.link_count == 2);
+            uint64_t length;
+            OK(sfs_image_xattr_size(image,view,e.inode,"org.example/test",16,&length,&receipt)); assert(length == 3);
+            OK(sfs_image_read_xattr(image,view,e.inode,"org.example/test",16,0,bytes,3,&count,&receipt));
+            assert(count == 3 && !memcmp(bytes,"new",3));
+            const unsigned char resource[] = {0,255,3,0,128};
+            OK(sfs_image_xattr_size(image,view,e.inode,"com.apple.ResourceFork",22,&length,&receipt)); assert(length == sizeof(resource));
+            OK(sfs_image_read_xattr(image,view,e.inode,"com.apple.ResourceFork",22,0,bytes,sizeof(resource),&count,&receipt));
+            assert(count == sizeof(resource) && !memcmp(bytes,resource,sizeof(resource)));
+            sfs_inode link = lookup(view,"link").inode;
+            OK(sfs_image_readlink(image,view,link,bytes,sizeof(bytes),&count,&receipt)); assert(count == 4 && !memcmp(bytes,"file",4));
+            sfs_entry missing; assert(sfs_image_lookup(image,view,1,"newer",5,&missing,&receipt) == SFS_NOT_FOUND);
         } else assert(0);
     }
     OK(sfs_image_close(image,&receipt)); return 0;
