@@ -613,6 +613,71 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.store.gc(older_than=0, yes=True), [])
         self.assertTrue((self.store.root / 'trash' / self.workspace / 'repo/file').exists())
 
+    def test_retirement_protection_sync_failure_stops_before_move(self):
+        self.stale()
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        with patch.object(core, 'sync_directory', side_effect=OSError('protection sync failed')) as sync:
+            with patch.object(_scan, 'move') as move:
+                result = self.store.cleanup(apply=True)
+        self.assertEqual(result['retired'], [])
+        self.assertEqual(result['skipped'], [{'id': self.workspace, 'reason': 'protection sync failed'}])
+        sync.assert_called_once_with(protection.parent)
+        move.assert_not_called()
+        self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+        self.assertTrue(protection.exists())
+        self.assertFalse((self.store.root / 'trash' / self.workspace).exists())
+
+    def test_retirement_syncs_protection_before_move_and_collections_before_success(self):
+        self.stale()
+        events = []
+        sync = core.sync_directory
+        move = _scan.move
+
+        def record_sync(path):
+            sync(path)
+            events.append(('sync', path))
+
+        def record_move(source, destination):
+            self.assertEqual(events, [('sync', self.store.root / 'protected')])
+            move(source, destination)
+            events.append(('move', source, destination))
+
+        with patch.object(core, 'sync_directory', side_effect=record_sync):
+            with patch.object(_scan, 'move', side_effect=record_move):
+                result = self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        self.assertEqual(result['retired'], [self.workspace])
+        self.assertEqual(events, [('sync', self.store.root / 'protected'),
+                                  ('move', self.path, trash),
+                                  ('sync', self.store.root / 'workspaces'),
+                                  ('sync', self.store.root / 'trash')])
+        self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+        self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+
+    def test_retirement_collection_sync_failure_keeps_protected_restorable_trash(self):
+        for failed_collection in ('workspaces', 'trash'):
+            with self.subTest(collection=failed_collection):
+                self.stale()
+                sync = core.sync_directory
+
+                def fail_sync(path):
+                    if path == self.store.root / failed_collection:
+                        raise OSError('collection sync failed')
+                    sync(path)
+
+                with patch.object(core, 'sync_directory', side_effect=fail_sync):
+                    result = self.store.cleanup(apply=True)
+                self.assertEqual(result['retired'], [])
+                self.assertEqual(result['skipped'], [{'id': self.workspace, 'reason': 'collection sync failed'}])
+                self.assertFalse(self.path.exists())
+                self.assertTrue((self.store.root / 'protected' / f'{self.workspace}.json').exists())
+                self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+                trash = self.store.root / 'trash' / self.workspace
+                self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+                self.store.move(self.workspace, restore=True)
+                self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+                self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
+
     def test_failed_retirement_rename_preserves_current_and_protection(self):
         self.stale()
         with patch.object(_scan, 'move', side_effect=OSError('rename failed')):
