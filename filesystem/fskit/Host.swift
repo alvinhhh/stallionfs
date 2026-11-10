@@ -261,6 +261,7 @@ final class CommandPanel: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let install = NSButton(title: "Install Command", target: nil, action: nil)
     private let remove = NSButton(title: "Remove Command", target: nil, action: nil)
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
+    private let extensionSettings = NSButton(title: "Extension Settings", target: nil, action: nil)
     private var busy = false
 
     override init() {
@@ -272,7 +273,8 @@ final class CommandPanel: NSObject, NSApplicationDelegate, NSWindowDelegate {
         install.target = self; install.action = #selector(installCommand)
         remove.target = self; remove.action = #selector(removeCommand)
         refresh.target = self; refresh.action = #selector(refreshStatus)
-        let buttons = NSStackView(views: [install, remove, refresh])
+        extensionSettings.target = self; extensionSettings.action = #selector(openExtensionSettings)
+        let buttons = NSStackView(views: [install, remove, refresh, extensionSettings])
         let content = NSStackView(views: [status, location, setup, buttons])
         content.orientation = .vertical
         content.alignment = .leading
@@ -295,6 +297,11 @@ final class CommandPanel: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func installCommand() { perform("install") }
     @objc private func removeCommand() { perform("remove") }
     @objc func refreshStatus() { perform("status") }
+    @objc private func openExtensionSettings() {
+        if !FSClient.shared.openFileSystemExtensionsSettings() {
+            status.stringValue = "Extension Settings could not be opened"
+        }
+    }
 
     private func perform(_ action: String) {
         guard !busy else { return }
@@ -350,6 +357,16 @@ struct Host {
         }
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
+        let menu = NSMenu()
+        let applicationMenu = NSMenu(title: "StallionFS")
+        let quit = NSMenuItem(title: "Quit StallionFS", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = app
+        quit.keyEquivalentModifierMask = .command
+        applicationMenu.addItem(quit)
+        let applicationItem = NSMenuItem(title: "StallionFS", action: nil, keyEquivalent: "")
+        applicationItem.submenu = applicationMenu
+        menu.addItem(applicationItem)
+        app.mainMenu = menu
         let panel = CommandPanel()
         app.delegate = panel
         panel.window.makeKeyAndOrderFront(nil)
