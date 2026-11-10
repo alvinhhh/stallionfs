@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from stallionfs.core import StallionError, Store, git, read_json, remove_tree, write_json
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
+    from .image_failure_diagnostics import failure_scope, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
+    from image_failure_diagnostics import failure_scope, observe_seed_create
 
 
 class ImageFixture:
@@ -114,81 +114,222 @@ class ImageRecoveryTests(unittest.TestCase):
         self.assertEqual(raised.exception.returncode, errno.EBUSY)
         self.assertIn('localized busy message', str(raised.exception))
 
-    def test_detach_completes_only_verified_unmounted_busy_attachment_once(self):
-        from stallionfs import images, _scan
-        cases = ('success', 'still-mounted', 'changed-device', 'changed-image', 'inspection-error',
-                 'mount-inventory-error', 'unrelated-mountpoint', 'volume-still-mounted',
-                 'unrelated-volume', 'already-detached', 'second-busy', 'still-attached',
-                 'nonbusy', 'unstructured-error', 'interrupt', 'first-success')
-        for case in cases:
+    def test_detach_uses_one_unchanged_target_and_preserves_every_command_error(self):
+        from stallionfs import images
+        for status in (1, 5, 16, 64, None, 'interrupt'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                image, point = base / 'workspace.sparseimage', base / 'volume'
+                image.write_bytes(b'owned image'); image.chmod(0o600)
+                current = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
+                               volume_device='/dev/disk1000s1')
+                primary = KeyboardInterrupt() if status == 'interrupt' else StallionError('eject failed')
+                if isinstance(status, int):
+                    primary.returncode = status
+                with patch.object(images, 'mounted', return_value=current) as inspect, \
+                        patch.object(images, '_command', side_effect=primary) as command:
+                    with self.assertRaises(type(primary)) as raised:
+                        images.detach(image, point)
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(inspect.call_count, 2)
+                command.assert_called_once_with('/usr/sbin/diskutil', 'eject', '/dev/disk999')
+                self.assertEqual(image.read_bytes(), b'owned image')
+
+    def test_detach_refuses_changed_mapping_or_backing_before_command(self):
+        from stallionfs import images
+        for change in ('device', 'volume_device', 'mountpoint', 'image', 'missing', 'backing', 'owner'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                image, point = base / 'workspace.sparseimage', base / 'volume'
+                image.write_bytes(b'owned image'); image.chmod(0o600)
+                current = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
+                               volume_device='/dev/disk1000s1')
+                calls = []
+                def mounted(_image):
+                    calls.append(_image)
+                    if len(calls) == 1:
+                        return current
+                    if change == 'backing':
+                        image.rename(base / 'original.sparseimage')
+                        image.write_bytes(b'replaced'); image.chmod(0o600)
+                        return current
+                    if change == 'owner':
+                        raise StallionError('attachment belongs to another user')
+                    return None if change == 'missing' else dict(current, **{change: 'changed'})
+                with patch.object(images, 'mounted', side_effect=mounted), \
+                        patch.object(images, '_command') as command:
+                    with self.assertRaises(StallionError):
+                        images.detach(image, point)
+                command.assert_not_called()
+                self.assertTrue(image.exists())
+
+    def test_attachment_inventory_requires_explicit_classifiable_records(self):
+        from stallionfs import images
+        invalid = ({}, {'images': None}, {'images': {}}, {'images': 'bad'},
+                   {'images': [None]}, {'images': [{}]}, {'images': [{'image-path': ''}]},
+                   {'images': [{'image-path': 'relative.sparseimage'}]},
+                   {'images': [{'image-path': '/bad\0path'}]})
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            image, point = base / 'workspace.sparseimage', base / 'volume'
+            image.write_bytes(b'owned image'); image.chmod(0o600)
+            valid = {'images': [dict({'image-path': str(image), 'owner-uid': os.getuid(),
+                                     'system-entities': [{'dev-entry': '/dev/disk999'}]})]}
+            for inventory in invalid:
+                for phase in ('before', 'after'):
+                    with self.subTest(inventory=inventory, phase=phase), \
+                            patch.object(images, '_plist', side_effect=[inventory] if phase == 'before'
+                                         else [valid, valid, inventory]), \
+                            patch.object(images, '_command') as command, \
+                            patch.object(images.os.path, 'ismount', return_value=False):
+                        with self.assertRaises(StallionError):
+                            images.detach(image, point)
+                        self.assertEqual(command.call_count, int(phase == 'after'))
+                        self.assertEqual(image.read_bytes(), b'owned image')
+            unrelated = base / 'unrelated.sparseimage'
+            unrelated.write_bytes(b'unrelated image'); unrelated.chmod(0o600)
+            for inventory in ({'images': []}, {'images': [{'image-path': str(unrelated)}]}):
+                with self.subTest(inventory=inventory), patch.object(images, '_plist', return_value=inventory), \
+                        patch.object(images, '_command') as command, \
+                        patch.object(images.os.path, 'ismount', return_value=False):
+                    self.assertIsNone(images.mounted(image))
+                    images.detach(image, point)
+                    command.assert_not_called()
+            for entries in (None, {}, [None], [{}], [{'dev-entry': '/dev/disk999s1'}]):
+                bad = {'images': [dict(valid['images'][0], **{'system-entities': entries})]}
+                with self.subTest(entries=entries), patch.object(images, '_plist', return_value=bad):
+                    with self.assertRaises(StallionError):
+                        images.mounted(image)
+
+    def test_inventory_resolves_owned_alias_and_refuses_unclassifiable_paths(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            image, point = base / 'workspace.sparseimage', base / 'volume'
+            image.write_bytes(b'owned image'); image.chmod(0o600)
+            alias = base / 'alias.sparseimage'; alias.symlink_to(image)
+            entry = {'image-path': str(alias), 'owner-uid': os.getuid(),
+                     'system-entities': [{'dev-entry': '/dev/disk999'}]}
+            valid = {'images': [entry]}
+            with patch.object(images, '_plist', return_value=valid):
+                self.assertEqual(images.mounted(image), dict(image=str(image), device='/dev/disk999',
+                                                            mountpoint=None, volume_device=None))
+            missing, loop, denied = base / 'missing.sparseimage', base / 'loop.sparseimage', base / 'denied.sparseimage'
+            loop.symlink_to(loop)
+            denied.symlink_to(image)
+            original_lstat = os.lstat
+            for recorded in (missing, loop, denied):
+                for phase in ('before', 'after'):
+                    primary = PermissionError('inventory path is unreadable')
+                    def lstat(path, *args, **kwargs):
+                        if Path(path) == denied:
+                            raise primary
+                        return original_lstat(path, *args, **kwargs)
+                    unknown = {'images': [dict(entry, **{'image-path': str(recorded)})]}
+                    with self.subTest(recorded=recorded.name, phase=phase), \
+                            patch.object(images.os, 'lstat', side_effect=lstat), \
+                            patch.object(images, '_plist', side_effect=[unknown] if phase == 'before'
+                                         else [valid, valid, unknown]), \
+                            patch.object(images, '_command') as command, \
+                            patch.object(images.os.path, 'ismount', return_value=False):
+                        with self.assertRaisesRegex(StallionError, 'Cannot classify') as caught:
+                            images.detach(image, point)
+                    self.assertEqual(command.call_count, int(phase == 'after'))
+                    self.assertIsInstance(caught.exception.__cause__, (OSError, RuntimeError))
+                    if recorded == denied:
+                        self.assertIs(caught.exception.__cause__, primary)
+                    self.assertEqual(image.read_bytes(), b'owned image')
+
+    def test_real_inventory_rejects_owner_change_reordered_target_and_disappearance(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            image, point = base / 'workspace.sparseimage', base / 'volume'
+            image.write_bytes(b'owned image'); image.chmod(0o600)
+            entry = {'image-path': str(image), 'owner-uid': os.getuid(),
+                     'system-entities': [{'dev-entry': '/dev/disk999'}, {'dev-entry': '/dev/disk1000'}]}
+            initial = {'images': [entry]}
+            changes = ({'images': []}, {'images': [entry, entry]},
+                       {'images': [dict(entry, **{'owner-uid': os.getuid() + 1})]},
+                       {'images': [dict(entry, **{'system-entities': list(reversed(entry['system-entities']))})]})
+            for changed in changes:
+                with self.subTest(changed=changed), patch.object(images, '_plist', side_effect=[initial, changed]), \
+                        patch.object(images, '_command') as command:
+                    with self.assertRaises(StallionError):
+                        images.detach(image, point)
+                command.assert_not_called()
+                self.assertEqual(image.read_bytes(), b'owned image')
+
+    def test_eject_success_requires_absence_and_unchanged_backing(self):
+        from stallionfs import images
+        for case in ('success', 'attached', 'mounted', 'replaced', 'private', 'wrong-point', 'absent-mounted'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary).resolve()
                 image, point = base / 'workspace.sparseimage', base / 'volume'
-                image.write_bytes(b'owned image')
-                image.chmod(0o600)
-                point.mkdir(mode=0o700)
-                initial = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
-                               volume_device='/dev/disk1000s1')
-                remaining = {**initial, 'mountpoint': None, 'volume_device': None}
-                first = StallionError('first detach failed')
-                first.returncode = errno.EPERM if case == 'nonbusy' else errno.EBUSY
-                if case == 'unstructured-error':
-                    first = StallionError('no machine status')
-                if case == 'interrupt':
-                    first = KeyboardInterrupt()
-                second = StallionError('second detach failed')
-                second.returncode = errno.EBUSY
-                inspection = OSError('inspection failed')
-                if case == 'still-mounted':
-                    remaining = initial
-                elif case == 'changed-device':
-                    remaining = {**remaining, 'device': '/dev/disk998'}
-                elif case == 'inspection-error':
-                    remaining = inspection
-                elif case == 'already-detached':
-                    remaining = None
-                states = [initial, remaining, remaining if case == 'still-attached' else None]
-                if case == 'first-success':
-                    states = [initial, None]
-                commands = []
+                image.write_bytes(b'owned image'); image.chmod(0o600)
+                current = dict(image=str(image), device='/dev/disk999', mountpoint=None, volume_device=None)
+                if case == 'wrong-point':
+                    current['mountpoint'] = str(base / 'other')
+                inventory = {'images': [{'image-path': str(image), 'owner-uid': os.getuid(),
+                                        'system-entities': [{'dev-entry': '/dev/disk999'}]}]}
                 def command(*args):
-                    commands.append(args)
-                    if len(commands) == 1:
-                        if case == 'changed-image':
-                            image.rename(base / 'original.sparseimage')
-                            image.write_bytes(b'replacement image')
-                            image.chmod(0o600)
-                        if case != 'first-success':
-                            raise first
-                    elif case == 'second-busy':
-                        raise second
+                    if case == 'replaced':
+                        image.rename(base / 'original.sparseimage')
+                        image.write_bytes(b'replaced'); image.chmod(0o600)
+                    elif case == 'private':
+                        image.chmod(0o644)
                     return b''
-                native = []
-                if case == 'volume-still-mounted':
-                    native = [dict(device=initial['volume_device'], path=str(base / 'elsewhere'))]
-                elif case == 'unrelated-volume':
-                    native = [dict(device='/dev/disk998s1', path=str(point))]
-                options = {'side_effect': inspection} if case == 'mount-inventory-error' else {'return_value': native}
-                with patch.object(images, 'mounted', side_effect=states), \
-                     patch.object(images, '_command', side_effect=command), \
-                     patch.object(images.os.path, 'ismount', return_value=case == 'unrelated-mountpoint'), \
-                     patch.object(_scan, 'mounts', **options):
-                    if case in ('success', 'first-success'):
+                if case in ('wrong-point', 'absent-mounted'):
+                    context = patch.object(images, 'mounted', return_value=current if case == 'wrong-point' else None)
+                else:
+                    context = patch.object(images, '_plist', side_effect=[inventory, inventory,
+                        inventory if case == 'attached' else {'images': []}])
+                with context, patch.object(images, '_command', side_effect=command) as native, \
+                        patch.object(images.os.path, 'ismount', return_value=case in ('mounted', 'absent-mounted')):
+                    if case == 'success':
                         images.detach(image, point)
                     else:
-                        with self.assertRaises(KeyboardInterrupt if case == 'interrupt' else StallionError) as raised:
+                        with self.assertRaises(StallionError):
                             images.detach(image, point)
-                        if case == 'still-attached':
-                            self.assertIn('remains attached', str(raised.exception))
-                        else:
-                            self.assertIs(raised.exception, second if case == 'second-busy' else first)
-                        if case in ('inspection-error', 'mount-inventory-error'):
-                            self.assertIs(raised.exception.__cause__, inspection)
-                        if case == 'second-busy':
-                            self.assertIs(raised.exception.__context__, first)
-                attempts = 2 if case in ('success', 'second-busy', 'still-attached') else 1
-                self.assertEqual(commands, [('/usr/bin/hdiutil', 'detach', initial['device'])] * attempts)
+                self.assertEqual(native.call_count, 0 if case in ('wrong-point', 'absent-mounted') else 1)
                 self.assertTrue(image.exists())
+
+    def test_build_never_retries_detach_or_loses_primary_recovery_error(self):
+        from stallionfs import images
+        for failure in ('detach', 'interrupt', 'populate', 'cleanup', 'flush'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                source, image = base / 'source', base / 'workspace.sparseimage'
+                source.mkdir(mode=0o700)
+                primary = KeyboardInterrupt('eject interrupted') if failure == 'interrupt' else OSError(failure)
+                primary.returncode = 64
+                recovery = StallionError('cleanup failed')
+                def command(*args):
+                    if args[1] == 'create':
+                        image.write_bytes(b'preserved image'); image.chmod(0o600)
+                    elif failure in ('populate', 'cleanup'):
+                        raise primary
+                    return b''
+                detach_error = primary if failure in ('detach', 'interrupt') else recovery if failure == 'cleanup' else None
+                with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                        patch.object(images, '_command', side_effect=command), \
+                        patch.object(images, 'attach', side_effect=lambda _image, point: point / 'repo'), \
+                        patch.object(images.os, 'chown'), \
+                        patch.object(images, 'mounted', return_value={'device': '/dev/disk999'}) as inspect, \
+                        patch.object(images, 'detach', side_effect=detach_error) as detach, \
+                        patch.object(images, 'flush', side_effect=primary if failure == 'flush' else None) as flush:
+                    with self.assertRaises(BaseException) as caught:
+                        images.build(source, image, 1)
+                detach.assert_called_once()
+                self.assertEqual(inspect.call_count, int(failure in ('populate', 'cleanup')))
+                self.assertEqual(flush.call_count, int(failure == 'flush'))
+                if failure == 'cleanup':
+                    self.assertIs(caught.exception.__cause__, primary)
+                    self.assertIn('cleanup failed', str(caught.exception))
+                    self.assertIn('keep image', str(caught.exception))
+                else:
+                    self.assertIs(caught.exception, primary)
+                self.assertEqual(image.read_bytes(), b'preserved image')
 
     def test_staging_retains_attached_or_uninspectable_image(self):
         from stallionfs import images
@@ -256,8 +397,7 @@ class ImageStoreTests(unittest.TestCase):
             self.assertEqual((repo / "untracked").read_text(), "preserved\n")
             self.assertTrue((store.root / "recovery" / result["recovery"] / "workspace.sparseimage").exists())
             fixture.call(store.enroll, value, workspace=value)
-            with observe_detach():
-                closed = fixture.call(store.close, value, quiescent=True, workspace=value)
+            closed = fixture.call(store.close, value, quiescent=True, workspace=value)
             closed["closed_at"] -= lifecycle.STALE_SECONDS + 10
             lifecycle.replace_json(store._state(value), closed)
             fixture.call(store.cleanup_config, enabled=True)

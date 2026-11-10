@@ -2,7 +2,6 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
-import errno
 import json
 import os
 from pathlib import Path
@@ -312,7 +311,9 @@ def observe_detach():
         yield
     except Exception as error:
         reporter = observation.get('diagnostics')
-        if (reporter is not None and getattr(error, 'returncode', None) == errno.EBUSY and
+        status = observation.get('command_status')
+        if (reporter is not None and observation.get('command_error') is error and
+                type(status) is int and status != 0 and
                 not (observation.get('scope') or {}).get('expected', False)):
             try:
                 reporter.eject_log(observation)
@@ -827,7 +828,7 @@ class Diagnostics:
                        message=None if before else _message(error),
                        expected_busy=bool(scope and scope['expected']),
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
-                       failed_device=args[2] if args[1] == 'detach' and _device.fullmatch(args[2]) else None,
+                       failed_device=args[2] if args[1] == 'eject' and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
                        pre_observation=(observation.get('pre_observation', 'unavailable')
                                         if observation is not None else 'not-selected'),
@@ -922,9 +923,12 @@ def install(images, directory):
     original = images._command
 
     def command(*args):
-        if len(args) < 3 or args[0] != '/usr/bin/hdiutil' or args[1] not in ('create', 'detach'):
+        creating = len(args) >= 3 and args[:2] == ('/usr/bin/hdiutil', 'create')
+        ejecting = (len(args) == 3 and args[:2] == ('/usr/sbin/diskutil', 'eject')
+                    and isinstance(args[2], str) and re.fullmatch(r'/dev/disk[0-9]+', args[2]))
+        if not (creating or ejecting):
             return original(*args)
-        observation = _detach_observation.get() if args[1] == 'detach' else None
+        observation = _detach_observation.get() if ejecting else None
         if observation is not None and not observation['started']:
             observation['started'] = True
             try:
@@ -940,11 +944,13 @@ def install(images, directory):
             if 'start_ns' not in observation:
                 observation['start_ns'], observation['start_mono'] = time.time_ns(), time.monotonic()
         try:
-            if args[1] == 'create':
+            if creating:
                 return _observed_create(original, args)
-            return original(*args, '-verbose')
+            return original(*args)
         except Exception as error:
             if observation is not None:
+                observation['command_error'] = error
+                observation['command_status'] = getattr(error, 'returncode', None)
                 observation['end_ns'], observation['end_mono'] = time.time_ns(), time.monotonic()
             try:
                 diagnostics.report(args, error, _scope.get(),
