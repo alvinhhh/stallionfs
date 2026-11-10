@@ -1415,6 +1415,92 @@ enum sfs_status sfs_image_next_mapped_block(sfs_image *h, sfs_view view,
     return e;
 }
 
+sfs_verify_budget sfs_image_seek_budget(void) {
+    /* 10 GiB dense: 2,621,440 mappings, at least 16 rows/nonroot leaf.
+     * Even charging three leaf visits and every internal revisit without
+     * cache credit fits 4 GiB read/hash and 128M checks. Qualification uses
+     * these exact limits; larger files are not promised to fit. */
+    return (sfs_verify_budget){ .raw_cells = 1,
+        .metadata_read_bytes = UINT64_C(4) << 30,
+        .metadata_hash_bytes = UINT64_C(4) << 30,
+        .checks = UINT64_C(128) << 20, .auxiliary_bytes = 1, .auxiliary_io_bytes = 1 };
+}
+/* Consume a dense run with the existing cursor, validating each leaf a bounded
+ * number of times instead of once per mapping. Cache-owned leaf bytes remain
+ * borrowed only during the local loop: charge can observe cancellation but
+ * its callback cannot reenter the handle. No reader call occurs in that loop. */
+static enum sfs_status cursor_hole(cursor *c, uint64_t *next) {
+    for (;;) {
+        uint8_t row[MAX_ROW]; int found; enum sfs_status e = cursor_next(c, row, &found);
+        if (e || !found) return e;
+        uint64_t block = get64(row);
+        if (block < *next) return SFS_CORRUPT;
+        if (block != *next) return SFS_OK;
+        e = charge(c->reader, SFS_INCOMPLETE_CHECKS, 1); if (e) return e;
+        ++*next;
+        cursor_frame *f = &c->frames[c->depth - 1]; const uint8_t *b;
+        e = page_read(c->reader, &f->ref, f->before, f->context, &b); if (e) return e;
+        unsigned count = page_count(b);
+        while (f->index < count) {
+            e = charge(c->reader, SFS_INCOMPLETE_CHECKS, 1); if (e) return e;
+            block = get64(row_at(b, MAP_EXTENT, f->index, c->reader->a.minor));
+            if (block < *next) return SFS_CORRUPT;
+            if (block != *next) return SFS_OK;
+            ++f->index; ++*next;
+        }
+    }
+}
+static enum sfs_status seek_region(sfs_image *h, sfs_view view, sfs_inode id,
+    const sfs_pin *pin, uint64_t generation, const uint8_t digest[32],
+    uint64_t offset, enum sfs_seek_region region, const sfs_verify_budget *budget,
+    uint64_t *out_offset, int *found, sfs_result *result_out) {
+    enum sfs_status e = pin ? pin_gate(h, 0, 0, result_out) : ready(h, 0, 0, result_out);
+    if (e) return e;
+    if (!out_offset || !found || !digest || !generation || !valid_budget(budget) ||
+        offset > SFS_FILE_MAX || (region != SFS_SEEK_DATA && region != SFS_SEEK_HOLE))
+        return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
+    if (generation != h->current.generation || memcmp(digest, h->current.root.digest, 32))
+        return result(h, SFS_STATE, SFS_PHASE_NONE, 0, result_out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
+    sfs_verify_budget remaining = *budget;
+    reader r = current_reader(h, 0); r.budget = &remaining;
+    namespace ns; node n; reference attrs; uint64_t next_inode;
+    uint64_t answer = 0; int present = 0;
+    e = charge(&r, SFS_INCOMPLETE_CHECKS, 1);
+    if (!e && pin) e = pin_committed(&r, *pin, &n, &attrs, &next_inode);
+    else if (!e) { e = selected_namespace(&r, view, &ns); if (!e) e = node_get(&r, &ns, id, 1, &n); }
+    if (!e && n.e.kind != SFS_FILE) e = SFS_INVALID;
+    if (!e && offset < n.e.size) {
+        uint64_t block = offset / CELL; key seek = number_key(block); cursor c;
+        e = cursor_start(&c, &r, n.extent, MAP_EXTENT, UINT64_MAX, n.e.size, &seek);
+        if (!e && region == SFS_SEEK_DATA) {
+            uint8_t row[MAX_ROW]; e = cursor_next(&c, row, &present);
+            if (!e && present) { uint64_t mapped = get64(row); if (mapped < block) e = SFS_CORRUPT; else answer = mapped == block ? offset : mapped * CELL; }
+        } else if (!e) {
+            uint64_t next = block; e = cursor_hole(&c, &next);
+            if (!e) { answer = next == block ? offset : next * CELL; if (answer > n.e.size) answer = n.e.size; present = 1; }
+        }
+    }
+    if (!e && stable(h)) e = io_failure(&r, SFS_PHASE_IDENTITY);
+    if (!e) e = charge(&r, SFS_INCOMPLETE_CHECKS, 1);
+    if (!e) { if (present) *out_offset = answer; *found = present; }
+    touched_result(&r, e, result_out);
+    if (e == SFS_INCOMPLETE && result_out) result_out->incomplete_reason = r.incomplete;
+    return e;
+}
+enum sfs_status sfs_image_seek_region(sfs_image *h, sfs_view view,
+    uint64_t generation, const uint8_t digest[32], sfs_inode id,
+    uint64_t offset, enum sfs_seek_region region, const sfs_verify_budget *budget,
+    uint64_t *out_offset, int *found, sfs_result *out) {
+    return seek_region(h, view, id, NULL, generation, digest, offset, region, budget, out_offset, found, out);
+}
+enum sfs_status sfs_image_pin_seek_region(sfs_image *h, sfs_pin pin,
+    uint64_t generation, const uint8_t digest[32], uint64_t offset,
+    enum sfs_seek_region region, const sfs_verify_budget *budget,
+    uint64_t *out_offset, int *found, sfs_result *out) {
+    return seek_region(h, 0, 0, &pin, generation, digest, offset, region, budget, out_offset, found, out);
+}
+
 enum sfs_status sfs_image_lookup(sfs_image *h, sfs_view view, sfs_inode parent, const void *name, size_t length, sfs_entry *out, sfs_result *result_out) {
     enum sfs_status e = ready(h, 0, 0, result_out); if (e) return e; if (!out || !valid_name(name, length)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, result_out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, result_out);
