@@ -769,7 +769,7 @@ class DiagnosticTests(unittest.TestCase):
         # A missed mock must fail before any actual command can start.
         self.spawn = patch.object(diagnostics.subprocess, 'Popen', side_effect=AssertionError('unmocked subprocess')).start()
         self.addCleanup(patch.stopall)
-        self.args = ('/usr/bin/hdiutil', 'detach', '/dev/disk999')
+        self.args = ('/usr/sbin/diskutil', 'eject', '/dev/disk999')
         self.record = {'owner-uid': os.getuid(), 'image-path': str(self.image),
                        'system-entities': [{'dev-entry': '/dev/disk999'}]}
 
@@ -1133,186 +1133,191 @@ class DiagnosticTests(unittest.TestCase):
                  mountpoint=first_mount, stage='body', expected=False)])
         self.assertEqual(self.reporter.attempts, 1)
         self.assertEqual(self.events()[0]['message'], 'unexpected recovery failure')
-        self.assertEqual(observations, [False, True])
+        self.assertEqual(observations, [False, False])
         self.assertIsNone(diagnostics._detach_observation.get())
         self.assertIsNone(diagnostics._scope.get())
 
-    def test_seed_setup_observes_exact_detach_arguments_returns_and_recovery_without_resetting_quota(self):
-        token = object()
-        primary = image_cases.StallionError('initial detach busy'); primary.returncode = errno.EBUSY
-        for recover in (False, True):
-            with self.subTest(recover=recover):
+    def test_seed_setup_retains_actual_build_failure_without_spending_observation(self):
+        for interrupt in (False, True):
+            with self.subTest(interrupt=interrupt):
                 fixture = image_cases.Images()
-                base = self.base / ('setup-recovery' if recover else 'setup-success')
+                base = self.base / ('setup-interrupt' if interrupt else 'setup-error')
                 base.mkdir(mode=0o700)
-                initial, recovery = base / 'initial-point', str(base / 'recovery-point')
-                forwarded = []
-                native = Mock(side_effect=[primary, token] if recover else [token])
-                def mapping(args, scope, _deadline):
-                    self.assertEqual(scope['stage'], 'setup')
-                    self.assertEqual(scope['base'], base)
-                    self.assertEqual(scope['image'], fixture.seed)
-                    self.assertEqual(scope['mountpoint'], Path(initial))
-                    info = fixture.seed.stat()
-                    return str(fixture.seed), ['/dev/disk999'], None, None, (info.st_dev, info.st_ino)
-                def detach(image, point):
-                    forwarded.append((image, point))
-                    self.assertEqual(diagnostics._scope.get(), dict(base=base, image=Path(image),
-                        workspace=None, mountpoint=Path(point), stage='setup', expected=False))
-                    self.assertIsNotNone(diagnostics._detach_observation.get())
-                    return image_cases.images._command(*self.args)
-                def build(source, destination, capacity):
-                    self.assertEqual((source, destination, capacity), (fixture.source, fixture.seed, 1))
-                    self.assertEqual(diagnostics._scope.get(), dict(base=base, image=destination,
-                        workspace=None, mountpoint=None, stage='setup', expected=False))
-                    destination.write_bytes(b'synthetic seed'); destination.chmod(0o600)
-                    try:
-                        self.assertIs(image_cases.images.detach(destination, initial), token)
-                    except type(primary) as error:
-                        self.assertTrue(recover); self.assertIs(error, primary)
-                        self.assertIsNone(diagnostics._detach_observation.get())
-                        self.assertIsNone(diagnostics._scope.get()['mountpoint'])
-                        self.assertIs(image_cases.images.detach(str(destination), recovery), token)
-                        raise
-                    return destination
-                with patch.object(image_cases.tempfile, 'mkdtemp', return_value=str(base)), \
-                        patch.object(image_cases.subprocess, 'run') as xattr, \
-                        patch.object(image_cases.images, '_command', native), \
-                        patch.object(diagnostics, 'Diagnostics', return_value=self.reporter), \
-                        patch.object(image_cases.images, 'detach', side_effect=detach) as original, \
-                        patch.object(image_cases.images, 'build', side_effect=build) as building, \
-                        patch.object(self.reporter, '_mapping', side_effect=mapping), \
-                        patch.object(self.reporter, '_capture', side_effect=lambda *_: captured()), \
-                        patch.object(self.reporter, 'eject_log') as eject, \
-                        patch.object(image_cases.shutil, 'rmtree') as remove, \
-                        patch.object(fixture, 'addCleanup') as register:
-                    diagnostics.install(image_cases.images, self.base / 'unused')
-                    if recover:
-                        with self.assertRaises(type(primary)) as caught: fixture.setUp()
-                        self.assertIs(caught.exception, primary)
-                    else: fixture.setUp()
-                    self.assertIs(image_cases.images.detach, original)
-                    expected = [(fixture.seed, initial)] + ([(str(fixture.seed), recovery)] if recover else [])
-                    self.assertEqual(forwarded, expected)
-                    self.assertEqual(original.call_count, len(expected)); self.assertEqual(native.call_count, len(expected))
-                    building.assert_called_once(); xattr.assert_called_once()
-                    remove.assert_not_called(); register.assert_not_called()
-                    self.assertEqual(eject.call_count, int(recover))
-                    self.assertEqual(self.reporter.before_attempts, 1)
-                    self.assertEqual(self.reporter.attempts, int(recover))
-                self.assertEqual(fixture.seed.read_bytes(), b'synthetic seed')
-                self.assertEqual((fixture.source / 'file').read_bytes(), b'original')
-                self.assertIsNone(diagnostics._scope.get()); self.assertIsNone(diagnostics._detach_observation.get())
-        self.assertEqual(self.reporter.before_attempts, 1)
-        self.assertEqual(self.reporter.attempts, 1)
-
-    def test_seed_setup_exhausted_before_quota_captures_owned_failures_and_preserves_four_calls(self):
-        fixture = image_cases.Images()
-        base = self.base / 'setup-failed'; base.mkdir(mode=0o700)
-        points = (base / 'initial-point', str(base / 'recovery-point'))
-        first, final = image_cases.StallionError('initial busy'), image_cases.StallionError('recovery busy')
-        first.returncode = final.returncode = errno.EBUSY
-        self.reporter.before_attempts = 1
-        native = Mock(side_effect=[first, first, final, final])
-        forwarded = []
-        def mapping(_args, scope, _deadline):
-            image = scope['image']; info = image.stat()
-            self.assertEqual(scope['base'], base); self.assertEqual(scope['stage'], 'setup')
-            self.assertEqual(image, fixture.seed)
-            self.assertEqual(scope['mountpoint'], Path(points[0] if len(forwarded) == 1 else points[1]))
-            return str(image), ['/dev/disk999'], None, None, (info.st_dev, info.st_ino)
-        def detach(image, point):
-            forwarded.append((image, point))
-            self.assertEqual(diagnostics._scope.get()['mountpoint'], Path(point))
-            self.assertIsNotNone(diagnostics._detach_observation.get())
-            try: image_cases.images._command(*self.args)
-            except image_cases.StallionError:
-                return image_cases.images._command(*self.args)
-        def build(_source, destination, _capacity):
-            self.assertEqual(diagnostics._scope.get()['mountpoint'], None)
-            destination.write_bytes(b'retained seed'); destination.chmod(0o600)
-            try: image_cases.images.detach(destination, points[0])
-            except image_cases.StallionError as error:
-                self.assertIs(error, first)
-                return image_cases.images.detach(str(destination), points[1])
-        with patch.object(image_cases.tempfile, 'mkdtemp', return_value=str(base)), \
-                patch.object(image_cases.subprocess, 'run'), \
-                patch.object(image_cases.images, '_command', native), \
-                patch.object(diagnostics, 'Diagnostics', return_value=self.reporter), \
-                patch.object(image_cases.images, 'detach', side_effect=detach) as original, \
-                patch.object(image_cases.images, 'build', side_effect=build) as building, \
-                patch.object(self.reporter, '_mapping', side_effect=mapping) as mapped, \
-                patch.object(self.reporter, '_capture', side_effect=lambda *_: captured()) as holders, \
-                patch.object(self.reporter, 'eject_log') as eject, \
-                patch.object(image_cases.shutil, 'rmtree') as remove, \
-                patch.object(fixture, 'addCleanup') as register:
-            diagnostics.install(image_cases.images, self.base / 'unused')
-            with self.assertRaises(type(final)) as caught: fixture.setUp()
-            self.assertIs(caught.exception, final)
-            self.assertIs(image_cases.images.detach, original)
-            self.assertEqual(forwarded, [(fixture.seed, points[0]), (str(fixture.seed), points[1])])
-            self.assertEqual(original.call_count, 2); self.assertEqual(native.call_count, 4)
-            self.assertEqual(native.call_args_list, [call(*self.args, '-verbose')] * 4)
-            self.assertEqual(mapped.call_count, 4); self.assertEqual(holders.call_count, 4)
-            self.assertEqual(eject.call_count, 2); building.assert_called_once()
-            remove.assert_not_called(); register.assert_not_called()
-        self.assertEqual(self.reporter.before_attempts, 1); self.assertEqual(self.reporter.attempts, 4)
-        events = self.events()
-        self.assertEqual(len([event for event in events if event['kind'] == 'failure']), 4)
-        self.assertFalse(any(event['kind'] == 'observation' for event in events))
-        self.assertFalse(any(event.get('reason') == 'no explicit owned fixture context' for event in events))
-        self.assertEqual(fixture.seed.read_bytes(), b'retained seed')
-        self.assertEqual((fixture.source / 'file').read_bytes(), b'original')
-        self.assertIsNone(diagnostics._scope.get()); self.assertIsNone(diagnostics._detach_observation.get())
-
-    def test_image_cleanup_observes_detach_and_retains_fixture_on_failure(self):
-        fixture = image_cases.Images()
-        fixture.base = self.base / 'cleanup-case'
-        fixture.base.mkdir(mode=0o700)
-        image = fixture.base / 'copy.sparseimage'
-        image.write_bytes(b'synthetic backing')
-        primary = image_cases.StallionError('cleanup busy')
-        for mounted_point in (str(fixture.base / 'volume'), None):
-            with self.subTest(mountpoint=mounted_point):
-                point = mounted_point or fixture.base / 'unused'
-                def detach(actual_image, actual_point):
-                    self.assertEqual((actual_image, actual_point), (image, point))
-                    self.assertEqual(diagnostics._scope.get(), dict(base=fixture.base,
-                        image=image, workspace=None, mountpoint=Path(point),
-                        stage='cleanup', expected=False))
-                    self.assertIsNotNone(diagnostics._detach_observation.get())
+                primary = KeyboardInterrupt('interrupted') if interrupt else image_cases.StallionError('eject failed')
+                primary.returncode = 64
+                point = base / 'prepare-mount'; point.mkdir(mode=0o700)
+                def command(*args):
+                    if args[1] == 'create':
+                        fixture.seed.write_bytes(b'retained seed'); fixture.seed.chmod(0o600)
+                    return b''
+                def detach(image, mountpoint):
+                    self.assertEqual((image, mountpoint), (fixture.seed, point))
+                    self.assertEqual(diagnostics._scope.get()['stage'], 'setup')
+                    self.assertIsNone(diagnostics._detach_observation.get())
                     raise primary
-                with patch.object(image_cases.images, 'mounted', return_value=dict(mountpoint=mounted_point)), \
+                with patch.object(image_cases.tempfile, 'mkdtemp', side_effect=[str(base), str(point)]), \
+                        patch.object(image_cases.subprocess, 'run'), \
+                        patch.object(image_cases.images, '_require_supported'), \
+                        patch('stallionfs.core.validate_tree'), \
+                        patch.object(image_cases.images.os, 'chown'), \
+                        patch.object(image_cases.images, '_command', side_effect=command), \
+                        patch.object(image_cases.images, 'attach', return_value=point / 'repo'), \
+                        patch.object(image_cases.images, 'detach', side_effect=detach) as native, \
+                        patch.object(image_cases.images, 'mounted') as inspect, \
+                        patch.object(image_cases.shutil, 'rmtree') as remove:
+                    with self.assertRaises(type(primary)) as caught:
+                        fixture.setUp()
+                    fixture.tearDown()
+                self.assertIs(caught.exception, primary)
+                native.assert_called_once(); inspect.assert_not_called(); remove.assert_not_called()
+                self.assertEqual(fixture.failed_images, {fixture.seed})
+                self.assertTrue(fixture.retain)
+                self.assertEqual(fixture.seed.read_bytes(), b'retained seed')
+                self.assertEqual(self.reporter.before_attempts, 0)
+                self.assertIsNone(diagnostics._scope.get())
+
+    def test_actual_clone_fixture_selects_remounted_detach_and_never_retries_failure(self):
+        for failure in ('none', 'release', 'selected', 'interrupt', 'body'):
+            with self.subTest(failure=failure):
+                fixture = image_cases.Images('test_clone_ownership_busy_detach_and_recovery')
+                fixture.base = self.base / ('clone-' + failure); fixture.base.mkdir(mode=0o700)
+                fixture.seed = fixture.base / 'seed.sparseimage'
+                fixture.seed.write_bytes(b'seed'); fixture.seed.chmod(0o600)
+                first, second = fixture.base / 'first.sparseimage', fixture.base / 'second.sparseimage'
+                first_point = fixture.base / 'first'
+                attached, points, repos, calls, selected = set(), {}, {}, [], []
+                primary = KeyboardInterrupt('selected interrupt') if failure == 'interrupt' else image_cases.StallionError(failure)
+                primary.returncode = 64
+                native = [dict(path=str(first_point), device='/dev/disk998', readonly=False, ignore_ownership=False)]
+                def clone(source, destination):
+                    if source in attached:
+                        raise image_cases.StallionError('attached source')
+                    shutil.copyfile(source, destination)
+                def attach(image, point):
+                    if image not in repos:
+                        point.mkdir(mode=0o700)
+                        repo = point / 'repo'; repo.mkdir()
+                        (repo / 'file').write_bytes(b'original'); (repo / 'file').chmod(0o640)
+                        (repo / 'link').symlink_to('file')
+                        repos[image], points[image] = repo, point
+                    attached.add(image)
+                    return repos[image]
+                def mounted(image):
+                    from stallionfs._scan import mounts
+                    record = mounts()[0]
+                    if record['readonly'] or record['ignore_ownership'] or record['device'] != '/dev/disk998':
+                        raise image_cases.StallionError('changed mapping')
+                    return dict(image=str(image), device='/dev/disk999', mountpoint=str(points[image]),
+                                volume_device='/dev/disk998') if image in attached else None
+                def command(*args):
+                    scope = diagnostics._scope.get()
+                    image = scope['image']
+                    observed = diagnostics._detach_observation.get() is not None
+                    calls.append(image); selected.append(observed)
+                    if ((failure == 'release' and image == first and not observed) or
+                            (failure in ('selected', 'interrupt') and observed)):
+                        raise primary
+                    attached.remove(image)
+                    return b''
+                def detach(image, point):
+                    if points[image] != point:
+                        raise image_cases.StallionError('wrong mountpoint')
+                    if diagnostics._scope.get()['expected']:
+                        raise image_cases.StallionError('intentional busy')
+                    return image_cases.images._command(*self.args)
+                def xattr(*args):
+                    if failure == 'body':
+                        raise primary
+                    return b'attribute'
+                with patch.object(image_cases.images, 'clone', side_effect=clone), \
+                        patch.object(image_cases.images, 'attach', side_effect=attach), \
+                        patch.object(image_cases.images, 'mounted', side_effect=mounted), \
                         patch.object(image_cases.images, 'detach', side_effect=detach), \
+                        patch.object(image_cases.images, '_command', side_effect=command), \
+                        patch.object(image_cases.subprocess, 'check_output', side_effect=xattr), \
+                        patch('stallionfs._scan.mounts', return_value=native), \
+                        patch.object(image_cases.shutil, 'rmtree') as remove:
+                    collector = diagnostics.install(image_cases.images, fixture.base / 'diagnostics')
+                    self.addCleanup(collector.close)
+                    def mapping(args, scope, deadline):
+                        image = scope['image']; info = image.stat()
+                        return str(image), ['/dev/disk999'], None, None, (info.st_dev, info.st_ino)
+                    with patch.object(collector, '_mapping', side_effect=mapping), \
+                            patch.object(collector, '_capture', return_value=captured(b'', status=1)), \
+                            patch.object(collector, 'eject_log') as query:
+                        if failure == 'none':
+                            fixture._callTestMethod(fixture.test_clone_ownership_busy_detach_and_recovery)
+                            self.assertFalse(fixture.failed_images or fixture.retain)
+                            self.assertEqual((repos[first] / 'file').read_bytes(), b'changed')
+                            self.assertEqual((repos[second] / 'file').read_bytes(), b'original')
+                            self.assertEqual((repos[fixture.seed] / 'file').read_bytes(), b'original')
+                        else:
+                            with self.assertRaises(type(primary)) as caught:
+                                fixture._callTestMethod(fixture.test_clone_ownership_busy_detach_and_recovery)
+                            self.assertIs(caught.exception, primary)
+                        before_cleanup = list(calls)
+                        fixture.tearDown()
+                        self.assertEqual(calls, before_cleanup)
+                        self.assertEqual(query.call_count, int(failure == 'selected'))
+                    if failure == 'none':
+                        remove.assert_called_once_with(fixture.base)
+                        self.assertFalse(attached)
+                    else:
+                        remove.assert_not_called()
+                        self.assertTrue(fixture.retain)
+                        self.assertTrue(fixture.seed.exists() and first.exists() and second.exists())
+                self.assertEqual(selected, [] if failure == 'body' else [False] if failure == 'release'
+                                 else [False, True] if failure != 'none' else [False, True, False, False])
+                self.assertEqual(collector.before_attempts, int(failure not in ('body', 'release')))
+                self.assertIsNone(diagnostics._scope.get()); self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_cleanup_uncertainty_retains_actual_fixture_and_primary(self):
+        for failure in ('detach', 'inventory', 'interrupt', 'postinventory'):
+            with self.subTest(failure=failure):
+                fixture = image_cases.Images()
+                fixture.base = self.base / ('cleanup-' + failure); fixture.base.mkdir(mode=0o700)
+                image = fixture.base / 'copy.sparseimage'; image.write_bytes(b'keep')
+                point = fixture.base / 'volume'
+                primary = KeyboardInterrupt() if failure == 'interrupt' else image_cases.StallionError(failure)
+                state = dict(mountpoint=str(point))
+                states = [primary] if failure == 'inventory' else [state, primary] if failure == 'postinventory' else [state]
+                def detach(actual_image, actual_point):
+                    self.assertEqual((actual_image, actual_point), (image, str(point)))
+                    self.assertEqual(diagnostics._scope.get()['stage'], 'cleanup')
+                    self.assertIsNone(diagnostics._detach_observation.get())
+                    if failure != 'postinventory':
+                        raise primary
+                with patch.object(image_cases.images, 'mounted', side_effect=states) as inspect, \
+                        patch.object(image_cases.images, 'detach', side_effect=detach) as command, \
                         patch.object(image_cases.shutil, 'rmtree') as remove:
                     with self.assertRaises(type(primary)) as caught:
                         fixture.tearDown()
-                    self.assertIs(caught.exception, primary)
-                    remove.assert_not_called()
-                self.assertTrue(image.exists())
-                self.assertIsNone(diagnostics._scope.get())
-                self.assertIsNone(diagnostics._detach_observation.get())
+                    count = inspect.call_count
+                    fixture.tearDown()
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(inspect.call_count, count)
+                self.assertEqual(command.call_count, int(failure != 'inventory'))
+                remove.assert_not_called()
+                self.assertEqual(image.read_bytes(), b'keep')
 
-    def test_eject_query_follows_both_existing_attempts_and_keeps_original_exception(self):
-        first, final = space.images._error('first busy'), space.images._error('final busy')
-        first.returncode = final.returncode = errno.EBUSY
+    def test_one_eject_failure_keeps_command_identity_and_exact_arguments(self):
+        primary = space.images._error('eject failed'); primary.returncode = 64
         order = []
-        errors = iter([first, final])
         def original(*args):
-            order.append('detach')
-            raise next(errors)
-        current = dict(device='/dev/disk999', mountpoint=str(self.point), volume_device='/dev/disk999s1')
-        remaining = dict(current, mountpoint=None, volume_device=None)
+            order.append('eject')
+            raise primary
+        current = dict(image=str(self.image), device='/dev/disk999', mountpoint=str(self.point),
+                       volume_device='/dev/disk999s1')
         with patch.object(space.images, '_command', side_effect=original) as command, \
-                patch.object(space.images, 'mounted', side_effect=[current, remaining]), \
-                patch.object(space.images.os.path, 'ismount', return_value=False), \
-                patch('stallionfs._scan.mounts', return_value=[]):
+                patch.object(space.images, 'mounted', return_value=current):
             collector = diagnostics.install(space.images, self.base / 'unused')
+            self.addCleanup(collector.close)
             def before(args, scope, observation):
-                order.append('before')
-                observation['operation_id'] = 1
+                order.append('before'); observation['operation_id'] = 1
             def query(observation):
-                self.assertEqual(command.call_count, 2)
+                command.assert_called_once_with(*self.args)
+                self.assertIs(observation['command_error'], primary)
+                self.assertEqual(observation['command_status'], 64)
                 self.assertEqual(observation['target'], '/dev/disk999')
                 self.assertLessEqual(observation['start_ns'], observation['end_ns'])
                 order.append('log')
@@ -1320,15 +1325,14 @@ class DiagnosticTests(unittest.TestCase):
                     patch.object(collector, 'report', side_effect=lambda *a, **k: order.append('report')), \
                     patch.object(collector, 'eject_log', side_effect=query), \
                     diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
-                    self.assertRaises(type(final)) as caught:
+                    self.assertRaises(type(primary)) as caught:
                 with diagnostics.observe_detach():
                     space.images.detach(self.image, self.point)
-        self.assertIs(caught.exception, final)
-        self.assertEqual(command.call_args_list, [call(*self.args, '-verbose')] * 2)
-        self.assertEqual(order, ['before', 'detach', 'report', 'detach', 'report', 'log'])
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(order, ['before', 'eject', 'report', 'log'])
         self.assertIsNone(diagnostics._detach_observation.get())
 
-    def test_snapshot_fixture_spends_preallowance_on_close_and_retains_original_busy_failure(self):
+    def test_snapshot_fixture_preserves_preallowance_and_retains_original_failure(self):
         from stallionfs import lifecycle as store_lifecycle
         base = self.base / 'snapshot-fixture'
         base.mkdir(mode=0o700)
@@ -1361,11 +1365,11 @@ class DiagnosticTests(unittest.TestCase):
 
         store.snapshot.side_effect = snapshot
         store.mount.side_effect = lambda *args: saved_repo.rename(repo)
-        first, final = space.images._error('close primary busy'), space.images._error('close final busy')
-        first.returncode = final.returncode = errno.EBUSY
+        first = space.images._error('close primary busy')
+        first.returncode = 64
         attachment = dict(operation='rollback', attached=True, mounted=True)
         commands, before_operations, log_windows = [], [], []
-        current = dict(device='/dev/disk999', mountpoint=str(point), volume_device='/dev/disk999s1')
+        current = dict(image=str(image), device='/dev/disk999', mountpoint=str(point), volume_device='/dev/disk999s1')
 
         def mounted(actual_image):
             self.assertEqual(actual_image, image)
@@ -1379,7 +1383,7 @@ class DiagnosticTests(unittest.TestCase):
             if attachment['operation'] == 'rollback':
                 attachment['attached'] = False
                 return b''
-            raise first if len(commands) == 2 else final
+            raise first
 
         def rollback(*args):
             space.images.detach(image, point)
@@ -1430,45 +1434,39 @@ class DiagnosticTests(unittest.TestCase):
 
             def capture(argv, deadline):
                 if argv[0] == '/usr/bin/log':
-                    self.assertEqual(len(commands), 3)
-                    observation = diagnostics._detach_observation.get()
-                    log_windows.append((observation['start_ns'], observation['end_ns']))
+                    log_windows.append(argv)
                 return captured(b'', status=0 if argv[0] == '/usr/bin/log' else 1)
 
             with patch.object(collector, '_mapping', side_effect=mapping), \
                     patch.object(collector, '_capture', side_effect=capture), \
-                    self.assertRaises(type(final)) as caught:
+                    self.assertRaises(type(first)) as caught:
                 lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
-            self.assertIs(caught.exception, final)
+            self.assertIs(caught.exception, first)
             flush.assert_not_called()
             publish.assert_not_called()
             remove.assert_not_called()
         current_identity = (image.stat().st_dev, image.stat().st_ino)
         self.assertNotEqual(earlier_identity, current_identity)
-        self.assertEqual(before_operations, [('close', current_identity)])
-        self.assertEqual(collector.before_attempts, 1)
-        self.assertEqual(collector.attempts, 2)
-        self.assertEqual(commands, [('rollback', (*self.args, '-verbose'), False),
-                                    ('close', (*self.args, '-verbose'), True),
-                                    ('close', (*self.args, '-verbose'), True)])
+        self.assertEqual(before_operations, [])
+        self.assertEqual(collector.before_attempts, 0)
+        self.assertEqual(collector.attempts, 1)
+        self.assertEqual(commands, [('rollback', self.args, False), ('close', self.args, False)])
         store.rollback.assert_called_once_with(identifier, 'snapshot')
         store.close.assert_called_once_with(identifier, quiescent=True)
         store.unmount.assert_called_once_with(identifier)
         self.assertEqual(open_state, dict(status='open', generation='unchanged'))
         self.assertEqual(state_file.read_bytes(), original_state)
         self.assertTrue(base.exists() and image.exists())
-        self.assertEqual(len(log_windows), 1)
-        self.assertLessEqual(*log_windows[0])
+        self.assertEqual(log_windows, [])
         events = self.events()
         mappings = [event for event in events if event['kind'] == 'mapping']
-        self.assertEqual([event['mountpoint'] for event in mappings], [str(point), None, None])
+        self.assertEqual([event['mountpoint'] for event in mappings], [None])
         self.assertEqual({(event['backing_device'], event['backing_inode']) for event in mappings}, {current_identity})
         failures = [event for event in events if event['kind'] == 'failure']
-        self.assertEqual([event['message'] for event in failures], ['close primary busy', 'close final busy'])
-        self.assertEqual({event['pre_observation'] for event in failures}, {'attempted'})
+        self.assertEqual([event['message'] for event in failures], ['close primary busy'])
+        self.assertEqual({event['pre_observation'] for event in failures}, {'not-selected'})
         self.assertEqual(len({event['operation_id'] for event in events}), 1)
-        eject = next(event for event in events if event['kind'] == 'eject_log')
-        self.assertEqual((eject['window_start_ns'], eject['window_end_ns']), log_windows[0])
+        self.assertFalse(any(event['kind'] == 'eject_log' for event in events))
         self.assertLessEqual(collector.events, diagnostics.EVENTS)
         self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
         self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
@@ -1476,13 +1474,31 @@ class DiagnosticTests(unittest.TestCase):
         self.assertIsNone(diagnostics._scope.get())
         self.assertIsNone(diagnostics._detach_observation.get())
 
+        # The same suite-wide collector still admits the later selected lifetime.
+        later = SimpleNamespace(_command=Mock(side_effect=first))
+        with patch.object(diagnostics, 'Diagnostics', return_value=collector):
+            diagnostics.install(later, collector.directory)
+        info = self.image.stat()
+        with patch.object(collector, '_mapping', return_value=(str(self.image), ['/dev/disk999'],
+                          None, None, (info.st_dev, info.st_ino))), \
+                patch.object(collector, '_capture', return_value=captured(b'', status=1)), \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                self.assertRaises(type(first)) as caught:
+            with diagnostics.observe_detach():
+                later._command(*self.args)
+        self.assertIs(caught.exception, first)
+        self.assertEqual(collector.before_attempts, 1)
+        before = [event for event in self.events() if event['kind'] == 'mapping' and event['phase'] == 'before']
+        self.assertEqual(len(before), 1)
+        self.assertEqual((before[0]['backing_device'], before[0]['backing_inode']), (info.st_dev, info.st_ino))
+
     def test_second_detach_pairs_mounted_prestate_with_failed_eject_and_retained_cleanup(self):
         first, final = space.images._error('primary busy'), space.images._error('fallback busy')
         first.returncode = final.returncode = errno.EBUSY
         state = dict(attached=True, mounted=True)
         identity = (self.image.stat().st_dev, self.image.stat().st_ino)
         order, commands, log_windows = [], [], []
-        current = dict(device='/dev/disk999', mountpoint=str(self.point), volume_device='/dev/disk999s1')
+        current = dict(image=str(self.image), device='/dev/disk999', mountpoint=str(self.point), volume_device='/dev/disk999s1')
         def mounted(image):
             self.assertEqual(image, self.image)
             return (dict(current, mountpoint=str(self.point) if state['mounted'] else None,
@@ -1520,7 +1536,7 @@ class DiagnosticTests(unittest.TestCase):
             def capture(argv, deadline):
                 if argv[0] == '/usr/bin/log':
                     observation = diagnostics._detach_observation.get()
-                    self.assertEqual(len(commands), 3)
+                    self.assertEqual(len(commands), 2)
                     self.assertLessEqual(observation['start_ns'], observation['end_ns'])
                     log_windows.append((observation['start_ns'], observation['end_ns']))
                     order.append('log')
@@ -1536,10 +1552,10 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertFalse(collector.directory.exists())
                 state.update(attached=True, mounted=True)  # Synthetic remount after successful detach.
                 with diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
-                        self.assertRaises(type(final)) as caught:
+                        self.assertRaises(type(first)) as caught:
                     with diagnostics.observe_detach():
                         space.images.detach(self.image, self.point)
-                self.assertIs(caught.exception, final)
+                self.assertIs(caught.exception, first)
                 fixture = space.ImageSpace()
                 fixture.base, fixture.image_points = self.base, {self.image: self.point}
                 with patch.object(space.shutil, 'rmtree') as remove, \
@@ -1547,18 +1563,18 @@ class DiagnosticTests(unittest.TestCase):
                     fixture.clean()
                 remove.assert_not_called()
         self.assertTrue(self.image.exists())
-        self.assertEqual(commands, [(*self.args, '-verbose')] * 5)
+        self.assertEqual(commands, [self.args] * 3)
         events = self.events()
         selected = events[0]['operation_id']
         paired = [event for event in events if event['operation_id'] == selected]
         mappings = [event for event in paired if event['kind'] == 'mapping']
-        self.assertEqual([event['mountpoint'] for event in mappings], [str(self.point), None, None])
+        self.assertEqual([event['mountpoint'] for event in mappings], [str(self.point), None])
         self.assertEqual({(event['backing_device'], event['backing_inode']) for event in mappings}, {identity})
         failures = [event for event in paired if event['kind'] == 'failure']
-        self.assertEqual([event['message'] for event in failures], ['primary busy', 'fallback busy'])
+        self.assertEqual([event['message'] for event in failures], ['primary busy'])
         self.assertEqual({event['pre_observation'] for event in failures}, {'attempted'})
         self.assertEqual([event['stage'] for event in events if event['kind'] == 'failure'],
-                         ['body', 'body', 'cleanup', 'cleanup'])
+                         ['body', 'cleanup'])
         eject = next(event for event in paired if event['kind'] == 'eject_log')
         self.assertEqual((eject['window_start_ns'], eject['window_end_ns']), log_windows[0])
         self.assertEqual((eject['target'], eject['query_status']), ('/dev/disk999', 'empty'))
@@ -1626,52 +1642,97 @@ class DiagnosticTests(unittest.TestCase):
         write([legacy[0], dict(legacy[1], pre_observation='unavailable')])
         self.assertFalse(diagnostics.artifact_available(self.reporter.directory))
 
-    def test_eject_query_skips_success_expected_refusal_other_errors_and_cancellation(self):
-        busy, other = space.images._error('busy'), space.images._error('other')
-        busy.returncode, other.returncode = errno.EBUSY, 5
-        for result, expected in ((b'ok', False), (busy, True), (other, False),
-                                 (KeyboardInterrupt(), False), (SystemExit(2), False)):
-            with self.subTest(result=type(result).__name__, expected=expected):
-                images = SimpleNamespace(_command=Mock(side_effect=result if isinstance(result, BaseException) else None,
-                                                       return_value=result))
+    def test_eject_log_requires_the_observed_commands_integer_failure_status(self):
+        cases = [(status, False) for status in (0, None, True, False, '16', 1, 5, 16, 64, -1)]
+        cases += [(16, True)]
+        for status, expected in cases:
+            with self.subTest(status=status, expected=expected):
+                error = space.images._error('command failed')
+                if status is not None:
+                    error.returncode = status
+                original = Mock(side_effect=error)
+                images = SimpleNamespace(_command=original)
                 collector = diagnostics.install(images, self.base / 'unused')
+                self.addCleanup(collector.close)
                 with patch.object(collector, 'before'), patch.object(collector, 'report'), \
                         patch.object(collector, 'eject_log') as query, \
                         diagnostics.failure_scope(self.base, self.image, expected=expected):
-                    if isinstance(result, BaseException):
-                        with self.assertRaises(type(result)):
-                            with diagnostics.observe_detach():
-                                images._command(*self.args)
-                    else:
+                    with self.assertRaises(type(error)) as caught:
                         with diagnostics.observe_detach():
-                            self.assertEqual(images._command(*self.args), b'ok')
-                query.assert_not_called()
+                            images._command(*self.args)
+                self.assertIs(caught.exception, error)
+                original.assert_called_once_with(*self.args)
+                self.assertEqual(query.call_count, int(type(status) is int and status != 0 and not expected))
 
-    def test_recovery_success_or_log_error_cannot_change_detach_result(self):
-        busy = space.images._error('busy')
-        busy.returncode = errno.EBUSY
-        for recovered in (True, False):
-            with self.subTest(recovered=recovered):
-                images = SimpleNamespace(_command=Mock(side_effect=[busy, b'ok' if recovered else busy]))
+    def test_later_errors_and_interrupts_cannot_authorize_eject_log(self):
+        for case in ('success', 'inspection', 'replacement', 'unrelated', 'interrupt', 'exit'):
+            with self.subTest(case=case):
+                command_error = space.images._error('command failed'); command_error.returncode = 64
+                later = KeyboardInterrupt() if case == 'interrupt' else SystemExit(2) if case == 'exit' else OSError('later failure')
+                later.returncode = 16
+                images = SimpleNamespace(_command=Mock(side_effect=command_error if case == 'replacement'
+                                                       else later if case in ('interrupt', 'exit') else None,
+                                                       return_value=b'ok'))
                 collector = diagnostics.install(images, self.base / 'unused')
+                self.addCleanup(collector.close)
                 with patch.object(collector, 'before'), patch.object(collector, 'report'), \
-                        patch.object(collector, 'eject_log', side_effect=OSError('log failed')) as query, \
+                        patch.object(collector, 'eject_log') as query, \
                         diagnostics.failure_scope(self.base, self.image):
                     def operation():
                         with diagnostics.observe_detach():
-                            try:
-                                images._command(*self.args)
-                            except type(busy):
-                                return images._command(*self.args)
-                    if recovered:
-                        self.assertEqual(operation(), b'ok')
-                        query.assert_not_called()
+                            if case != 'unrelated':
+                                try:
+                                    images._command(*self.args)
+                                except type(command_error):
+                                    raise later
+                            if case != 'success':
+                                raise later
+                    if case == 'success':
+                        operation()
                     else:
-                        with self.assertRaises(type(busy)) as caught:
+                        with self.assertRaises(type(later)) as caught:
                             operation()
-                        self.assertIs(caught.exception, busy)
-                        query.assert_called_once()
-                        self.assertIn('Eject log unavailable: OSError', busy.__notes__)
+                        self.assertIs(caught.exception, later)
+                query.assert_not_called()
+
+    def test_log_error_cannot_replace_the_single_eject_failure(self):
+        primary = space.images._error('eject failed'); primary.returncode = 64
+        original = Mock(side_effect=primary)
+        images = SimpleNamespace(_command=original)
+        collector = diagnostics.install(images, self.base / 'unused')
+        self.addCleanup(collector.close)
+        with patch.object(collector, 'before'), patch.object(collector, 'report'), \
+                patch.object(collector, 'eject_log', side_effect=OSError('log failed')) as query, \
+                diagnostics.failure_scope(self.base, self.image), self.assertRaises(type(primary)) as caught:
+            with diagnostics.observe_detach():
+                images._command(*self.args)
+        self.assertIs(caught.exception, primary)
+        original.assert_called_once_with(*self.args)
+        query.assert_called_once()
+        self.assertIn('Eject log unavailable: OSError', primary.__notes__)
+
+    def test_only_exact_normal_whole_device_eject_is_intercepted(self):
+        commands = (('/usr/bin/hdiutil', 'detach', '/dev/disk999'),
+                    ('/usr/sbin/diskutil', 'eject', '/dev/disk999s1'),
+                    ('/usr/sbin/diskutil', 'eject', '/dev/disk999', 'force'),
+                    ('/usr/sbin/diskutil', 'eject', '/dev/rdisk999'),
+                    ('/usr/sbin/diskutil', 'unmountDisk', '/dev/disk999'),
+                    ('/usr/sbin/diskutil', 'eject', Path('/dev/disk999')))
+        for args in commands:
+            with self.subTest(args=args):
+                primary = OSError('unselected error'); primary.returncode = 64
+                original = Mock(side_effect=primary)
+                images = SimpleNamespace(_command=original)
+                collector = diagnostics.install(images, self.base / 'unused')
+                self.addCleanup(collector.close)
+                with patch.object(collector, 'before') as before, patch.object(collector, 'report') as report, \
+                        patch.object(collector, 'eject_log') as query, \
+                        diagnostics.failure_scope(self.base, self.image), self.assertRaises(type(primary)) as caught:
+                    with diagnostics.observe_detach():
+                        images._command(*args)
+                self.assertIs(caught.exception, primary)
+                original.assert_called_once_with(*args)
+                before.assert_not_called(); report.assert_not_called(); query.assert_not_called()
 
     def test_artifact_rejects_unscoped_eject_log_records(self):
         observation = self.eject_observation()
@@ -1764,7 +1825,7 @@ class DiagnosticTests(unittest.TestCase):
                 with patch.object(self.reporter, '_capture', side_effect=values) as capture, \
                         patch.object(diagnostics.os.path, 'ismount', return_value=mounted), \
                         patch.object(diagnostics.os, 'stat', side_effect=device_stat):
-                    self.reporter.report(('/usr/bin/hdiutil', 'detach', devices[0]), OSError('busy'), self.scope())
+                    self.reporter.report(('/usr/sbin/diskutil', 'eject', devices[0]), OSError('busy'), self.scope())
                 self.assertEqual(capture.call_count, 4 if mounted else 3)
                 command = capture.call_args_list[2].args[0]
                 self.assertEqual(command[command.index('--'):], ['--', str(self.image), *devices,
