@@ -526,6 +526,18 @@ class ImageCore(unittest.TestCase):
     def test_committed_mapped_positions_views_budgets_and_output_atomicity(self):
         self.scenario('mapped-blocks')
 
+    def test_committed_seek_regions_views_pins_and_output_atomicity(self):
+        self.scenario('seek-regions')
+
+    def test_seek_default_budget_dense_shapes_and_cancellation(self):
+        self.scenario('seek-dense', timeout=180)
+
+    # Register only in the dedicated hosted invocation: ordinary and sanitizer
+    # discovery retain their existing no-unexpected-skips contract.
+    if os.environ.get('STALLION_SEEK_LARGE_METADATA') == '1':
+        def test_seek_default_budget_10gib_metadata_shape(self):
+            self.scenario('seek-dense-10gib-metadata', timeout=300)
+
     def test_full_budgets_cancellation_auxiliary_errors_and_cleanup(self):
         self.scenario('budgets')
 

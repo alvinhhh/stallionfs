@@ -121,6 +121,89 @@ jobs:
               print(f'Required {contextual_test} successes: expected 1, observed {result.contextual_successes}', file=sys.stderr)
           sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
           PY
+      - name: Check large sparse-seek metadata with default limits
+        if: success() && matrix.os == 'macos-15' && matrix.python == '3.12'
+        timeout-minutes: 9
+        env:
+          STALLION_SEEK_LARGE_METADATA: '1'
+          CFLAGS: ''
+        run: |
+          cd "$RUNNER_TEMP"
+          if ! mkdir -m 700 "$RUNNER_TEMP/sparse-seek-large"; then
+            echo 'UNQUALIFIED large metadata: fresh evidence directory unavailable'
+            exit 2
+          fi
+          export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
+          python -I -B - <<'PY'
+          import os, re, resource, shutil, subprocess, sys, time, unittest
+          from pathlib import Path
+
+          try:
+              temporary = Path(os.environ['RUNNER_TEMP']).resolve()
+              checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+              assert Path.cwd().resolve() == temporary and sys.platform == 'darwin'
+              assert os.environ.get('STALLION_SEEK_LARGE_METADATA') == '1'
+              assert os.environ.get('CFLAGS', '') == ''
+              disk = shutil.disk_usage(temporary).free
+              vm = subprocess.run(['/usr/bin/vm_stat'], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=5, check=True)
+              assert not vm.stderr and len(vm.stdout.encode()) <= 16384
+              page = int(re.search(r'page size of (\d+) bytes', vm.stdout)[1])
+              fields = {k.strip(): int(v) for k, v in
+                        re.findall(r'^([^:\n]+):\s+(\d+)\.', vm.stdout, re.MULTILINE)}
+              memory_estimate = page * sum(fields[k] for k in
+                                          ('Pages free', 'Pages inactive', 'Pages speculative'))
+              print('Large metadata admission:', disk, memory_estimate, flush=True)
+              if disk < 2 * 1024**3 or memory_estimate < 3 * 1024**3:
+                  print('UNQUALIFIED large metadata: insufficient disk/memory headroom', flush=True)
+                  raise SystemExit(2)
+
+              import stallionfs
+              from stallionfs import _image, _scan
+              for module in (stallionfs, _image, _scan):
+                  path = Path(module.__file__).resolve()
+                  assert not path.is_relative_to(checkout), path
+                  print('Installed-wheel module:', path, flush=True)
+              sys.path.insert(0, str(checkout / 'tests'))
+              import test_image
+              assert Path(test_image.__file__).resolve() == checkout / 'tests/test_image.py'
+              selector = 'test_image.ImageCore.test_seek_default_budget_10gib_metadata_shape'
+              suite = unittest.defaultTestLoader.loadTestsFromName(selector)
+              assert suite.countTestCases() == 1
+              assert [test.id() for test in suite] == [selector]
+              resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
+              resource.setrlimit(resource.RLIMIT_FSIZE, (1024**3, 1024**3))
+              resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+          except Exception as error:
+              print('UNQUALIFIED large metadata: admission/setup failed:',
+                    type(error).__name__, str(error), flush=True)
+              raise SystemExit(2)
+
+          class LargeResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.peak_bytes = None
+
+              def addSuccess(self, test):
+                  # The body/instance cleanup finished; class teardown has not run yet.
+                  try:
+                      self.peak_bytes = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+                      if self.peak_bytes > 1536 * 1024**2:
+                          raise RuntimeError('Large metadata child peak RSS exceeds 1.5 GiB')
+                  except Exception:
+                      test_image.ImageCore.retain_requested = True
+                      self.stream.writeln('UNQUALIFIED large metadata: resource observation/refusal')
+                      self.addFailure(test, sys.exc_info())
+                      return
+                  super().addSuccess(test)
+
+          started = time.monotonic()
+          result = unittest.TextTestRunner(verbosity=2, resultclass=LargeResult).run(suite)
+          print('Large metadata resource observation:', time.monotonic() - started,
+                result.peak_bytes, flush=True)
+          raise SystemExit(not (result.testsRun == 1 and result.wasSuccessful()
+                                and not result.skipped))
+          PY
       - name: Validate bounded image diagnostic artifact
         if: failure()
         id: image-diagnostics
@@ -153,6 +236,9 @@ jobs:
             ${{ runner.temp }}/fskit-interface-diagnostics/*.command.json
             ${{ runner.temp }}/fskit-interface-diagnostics/*.stdout.bin
             ${{ runner.temp }}/fskit-interface-diagnostics/*.stderr.bin
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.command.json
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stdout.bin
+            ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stderr.bin
           if-no-files-found: ignore
           retention-days: 1
       - name: Check native code with sanitizers
