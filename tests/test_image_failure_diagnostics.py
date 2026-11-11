@@ -1597,6 +1597,198 @@ class DiagnosticTests(unittest.TestCase):
                 collector.close()
                 self.image.chmod(0o600)
 
+    def test_snapshot_observation_workflow_selects_intel_closed_snapshot_only(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        step = workflow.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
+        expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
+        predicate = re.fullmatch(r"\$\{\{ matrix\.os == '([^']+)' && '([^']+)' \|\| '([^']+)' \}\}", expression)
+        self.assertIsNotNone(predicate)
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", workflow, re.MULTILINE)
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(workflow.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
+        self.assertEqual(predicate.groups(), ('macos-26-intel', 'closed-snapshot', 'initial-unmount'))
+        for runner, python, images in rows:
+            with self.subTest(runner=runner, python=python, images=images):
+                selected = predicate[2] if runner == predicate[1] else predicate[3]
+                self.assertEqual(selected, 'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount')
+
+    def test_snapshot_observation_selector_validates_once_before_fixture_work(self):
+        key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
+        valid = (None, 'initial-unmount', 'closed-snapshot')
+        values = (*valid, '', 'unknown', 'INITIAL-UNMOUNT', 'Closed-snapshot',
+                  ' initial-unmount', 'closed-snapshot ', 'initial-unmount\n')
+        sentinel = OSError('stop before fixture allocation')
+        for value in values:
+            with self.subTest(value=value), patch.dict(os.environ):
+                os.environ.pop(key, None)
+                if value is not None:
+                    os.environ[key] = value
+                with patch.object(os.environ, 'get', wraps=os.environ.get) as read, \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', side_effect=sentinel) as allocate, \
+                        patch.object(lifecycle, 'Store') as store, patch.object(lifecycle, 'git') as git, \
+                        patch.object(lifecycle, 'image_fixture') as fixture, \
+                        self.assertRaises(OSError if value in valid else ValueError) as caught:
+                    lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                self.assertEqual([entry for entry in read.call_args_list if entry.args[0] == key],
+                                 [call(key, 'initial-unmount')])
+                self.assertEqual(allocate.call_count, int(value in valid))
+                if value in valid:
+                    self.assertIs(caught.exception, sentinel)
+                store.assert_not_called(); git.assert_not_called(); fixture.assert_not_called()
+
+    def test_snapshot_observation_selects_one_operation_and_preserves_selected_or_earlier_failure(self):
+        cases = ((None, None), ('initial-unmount', None), ('closed-snapshot', None),
+                 ('initial-unmount', 'initial-unmount'), ('closed-snapshot', 'closed-snapshot'),
+                 ('closed-snapshot', 'initial-unmount'))
+        for selection, failure in cases:
+            with self.subTest(selection=selection, failure=failure), \
+                    tempfile.TemporaryDirectory(dir=self.base) as temporary, patch.dict(os.environ):
+                key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
+                os.environ.pop(key, None)
+                if selection is not None:
+                    os.environ[key] = selection
+                selected = selection or 'initial-unmount'
+                base = Path(temporary)
+                identifier = 'b' * 32
+                root = base / 'store'
+                point = root / 'workspaces' / identifier / 'volume'
+                repo = point / 'repo'
+                repo.mkdir(parents=True, mode=0o700)
+                point.parent.chmod(0o700)
+                image = point.parent / 'workspace.sparseimage'
+                image.write_bytes(b'owned retained backing'); image.chmod(0o600)
+                identity = (image.stat().st_dev, image.stat().st_ino)
+                workspace = dict(id=identifier, backend='image', path=str(repo))
+                store = Mock(root=root)
+                store.prepare.return_value = dict(id='seed')
+                store.create.return_value = workspace
+                store.list.return_value = [workspace]
+                store.cleanup.return_value = dict(retired=[identifier])
+                store.gc.return_value = []
+                store.close.return_value = dict(closed_at=100000)
+                primary = space.images._error('original selected or earlier eject failure'); primary.returncode = 64
+                state = dict(operation='initial-unmount', attached=True, mounted=True)
+                commands, before_operations, log_windows = [], [], []
+                saved = base / 'saved-repo'
+                snapshot_calls = []
+
+                def mounted(actual):
+                    self.assertEqual(actual, image)
+                    return (dict(image=str(image), device='/dev/disk999',
+                                 mountpoint=str(point) if state['mounted'] else None,
+                                 volume_device='/dev/disk999s1' if state['mounted'] else None)
+                            if state['attached'] else None)
+
+                def command(*args):
+                    commands.append((state['operation'], args, diagnostics._detach_observation.get() is not None))
+                    state['mounted'] = False
+                    if state['operation'] == failure:
+                        raise primary
+                    state['attached'] = False
+                    # Selection was read once before any fixture work.
+                    os.environ[key] = 'invalid-after-initial-unmount'
+                    return b''
+
+                def snapshot(*args):
+                    snapshot_calls.append(args)
+                    if len(snapshot_calls) == 1:
+                        raise lifecycle.StallionError('external worktree')
+                    if len(snapshot_calls) == 2:
+                        state.update(operation='closed-snapshot', attached=True, mounted=True)
+                        space.images.detach(image, point)
+                        repo.rename(saved)
+                    return dict(id='snapshot')
+
+                def rollback(*args):
+                    (repo / 'file').write_text('snapshot state\n')
+                    recovery = root / 'recovery' / 'saved'
+                    recovery.mkdir(parents=True)
+                    (recovery / 'workspace.sparseimage').write_bytes(b'recovery')
+                    return dict(recovery='saved')
+
+                def restore(*args, **kwargs):
+                    store.list.return_value = []
+                    return workspace
+
+                store.unmount.side_effect = lambda *args: space.images.detach(image, point)
+                store.snapshot.side_effect = snapshot
+                store.mount.side_effect = lambda *args: saved.rename(repo)
+                store.rollback.side_effect = rollback
+                store.move.side_effect = restore
+                with patch.object(space.images, 'mounted', side_effect=mounted), \
+                        patch.object(space.images.os.path, 'ismount', return_value=False), \
+                        patch.object(space.images, '_command', side_effect=command), \
+                        patch.object(lifecycle, 'Store', return_value=store), \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(base)), \
+                        patch.object(lifecycle, 'git'), patch.object(lifecycle, 'read_json', return_value=dict(status='open')), \
+                        patch('stallionfs.lifecycle.replace_json'), patch.object(lifecycle, 'remove_tree') as remove:
+                    collector = diagnostics.install(space.images, base / 'diagnostics')
+                    self.addCleanup(collector.close)
+
+                    def mapping(args, scope, deadline):
+                        if collector.phase == 'before':
+                            before_operations.append(state['operation'])
+                        return (str(image), ['/dev/disk999', '/dev/disk999s1'],
+                                str(point) if state['mounted'] else None,
+                                '/dev/disk999s1' if state['mounted'] else None, identity)
+
+                    def capture(argv, deadline):
+                        if argv[0] == '/usr/bin/log':
+                            observed = diagnostics._detach_observation.get()
+                            log_windows.append((observed['start_ns'], observed['end_ns']))
+                        return captured(b'', status=0 if argv[0] == '/usr/bin/log' else 1)
+
+                    with patch.object(collector, '_mapping', side_effect=mapping), \
+                            patch.object(collector, '_capture', side_effect=capture):
+                        if failure is None:
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                        else:
+                            with self.assertRaises(type(primary)) as caught:
+                                lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            self.assertIs(caught.exception, primary)
+                            self.assertEqual(caught.exception.returncode, 64)
+                    store.unmount.assert_called_once_with(identifier)
+                    expected_operations = ['initial-unmount'] if failure == 'initial-unmount' else ['initial-unmount', 'closed-snapshot']
+                    self.assertEqual([item[0] for item in commands], expected_operations)
+                    self.assertEqual([item[1] for item in commands], [self.args] * len(commands))
+                    self.assertEqual([item[2] for item in commands], [item == selected for item in expected_operations])
+                    observed = failure != 'initial-unmount' or selected == 'initial-unmount'
+                    self.assertEqual(before_operations, [selected] if observed else [])
+                    self.assertEqual(collector.before_attempts, int(observed))
+                    self.assertEqual(collector.attempts, int(failure is not None))
+                    events = [json.loads(line) for line in (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+                    if failure is not None:
+                        remove.assert_not_called()
+                        for later in (store.mount, store.rollback, store.enroll, store.close, store.cleanup_config,
+                                      store.cleanup, store.gc, store.move):
+                            later.assert_not_called()
+                        self.assertEqual(len(snapshot_calls), 1 if failure == 'initial-unmount' else 2)
+                        failed = next(event for event in events if event['kind'] == 'failure')
+                        self.assertEqual((failed['pre_observation'], failed['failed_device'], failed['workspace']),
+                                         ('attempted' if observed else 'not-selected', '/dev/disk999', identifier))
+                        mappings = [event for event in events if event['kind'] == 'mapping']
+                        self.assertEqual([event['phase'] for event in mappings], ['before', 'after'] if observed else ['after'])
+                        self.assertEqual({event['operation_id'] for event in mappings}, {failed['operation_id']})
+                        logs = [event for event in events if event['kind'] == 'eject_log']
+                        self.assertEqual(len(logs), int(observed))
+                        if observed:
+                            self.assertEqual((logs[0]['operation_id'], logs[0]['target']), (failed['operation_id'], '/dev/disk999'))
+                            self.assertEqual((logs[0]['window_start_ns'], logs[0]['window_end_ns']), log_windows[0])
+                            self.assertEqual(logs[0]['query_status'], 'empty')
+                        else:
+                            self.assertEqual(log_windows, [])
+                    else:
+                        self.assertEqual(len(snapshot_calls), 3)
+                        remove.assert_called_once_with(base)
+                    self.assertEqual(image.read_bytes(), b'owned retained backing')
+                    self.assertLessEqual(collector.events, diagnostics.EVENTS)
+                    self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+                    self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
+                    self.assertTrue(diagnostics.artifact_available(collector.directory))
+                    collector.close()
+                self.assertIsNone(diagnostics._scope.get())
+                self.assertIsNone(diagnostics._detach_observation.get())
+
     def test_snapshot_fixture_observes_first_unmount_failure_without_retry(self):
         base = self.base / 'unmount-fixture'
         base.mkdir(mode=0o700)
@@ -1650,7 +1842,8 @@ class DiagnosticTests(unittest.TestCase):
                     return SimpleNamespace(st_dev=42)
             return real_stat(path, *args, **kwargs)
 
-        with patch.object(space.images, '_command', side_effect=command), \
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='initial-unmount'), \
+                patch.object(space.images, '_command', side_effect=command), \
                 patch.object(space.images, 'mounted', return_value=current), \
                 patch.object(space.images.os.path, 'ismount', side_effect=lambda path: state['mounted']), \
                 patch.object(diagnostics.os, 'stat', side_effect=device_stat), \
@@ -1799,7 +1992,8 @@ class DiagnosticTests(unittest.TestCase):
         store._state.return_value = state_file
         store._closed_payload.side_effect = lambda *args, **kwargs: store_lifecycle.Lifecycle._closed_payload(store, *args, **kwargs)
         store.close.side_effect = lambda *args, **kwargs: store_lifecycle.Lifecycle.close(store, *args, **kwargs)
-        with patch.object(space.images, '_command', side_effect=original), \
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='initial-unmount'), \
+                patch.object(space.images, '_command', side_effect=original), \
                 patch.object(space.images, 'mounted', side_effect=mounted), \
                 patch.object(space.images.os.path, 'ismount', return_value=False), \
                 patch('stallionfs._scan.mounts', return_value=[]), \

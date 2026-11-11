@@ -1,6 +1,6 @@
 """Real disk-image lifecycle checks; enable with STALLIONFS_TEST_IMAGES=1."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import os
 from pathlib import Path
@@ -365,6 +365,9 @@ class ImageRecoveryTests(unittest.TestCase):
                      "requires macOS disk-image access and explicit test selection")
 class ImageStoreTests(unittest.TestCase):
     def test_snapshot_rollback_and_protected_retirement(self):
+        observation = os.environ.get('STALLIONFS_TEST_SNAPSHOT_OBSERVATION', 'initial-unmount')
+        if observation not in ('initial-unmount', 'closed-snapshot'):
+            raise ValueError('Snapshot observation must be initial-unmount or closed-snapshot')
         from stallionfs import lifecycle
         base = Path(tempfile.mkdtemp(prefix="stallionfs-image-lifecycle-test-")).resolve()
         store = Store(base / "store")
@@ -385,9 +388,10 @@ class ImageStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StallionError, "external worktree"):
                 fixture.call(store.snapshot, value, workspace=value, expected=True)
             git(repo, "config", "--local", "--unset", "include.path")
-            with observe_detach():
+            with observe_detach() if observation == 'initial-unmount' else nullcontext():
                 fixture.call(store.unmount, value, workspace=value)
-            closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
+            with observe_detach() if observation == 'closed-snapshot' else nullcontext():
+                closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertFalse(repo.exists())
             fixture.call(store.mount, value, workspace=value)
             snapshot = fixture.call(store.snapshot, value, workspace=value)
