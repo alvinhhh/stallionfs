@@ -41,6 +41,7 @@ jobs:
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
           python -I -B - <<'PY'
