@@ -6,6 +6,7 @@ import contextlib
 import copy
 import errno
 import fcntl
+import io
 import json
 import os
 import re
@@ -189,6 +190,46 @@ class CreateRecovery(unittest.TestCase):
         self.assertEqual(state, (self.root / 'lifecycle' / (self.workspace + '.json')).read_bytes())
         self.assertEqual(proof, (self.final / 'native-install.json').read_bytes())
         self.assertTrue(all(expected == self.anchor for _, expected in self.guard_calls))
+
+    def test_public_cli_inspection_continuation_and_mount_handoff(self):
+        from stallionfs.__main__ import main
+        import shlex
+        def invoke(*arguments, structured=False):
+            output, error = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), \
+                 patch.object(core.Store, '__init__', side_effect=AssertionError('creating store')), \
+                 patch.object(core.Store, 'opportunistic_cleanup', side_effect=AssertionError('cleanup')):
+                status = main(['--root', str(self.root), *(['--json'] if structured else []), 'creations', *arguments])
+            return status, output.getvalue(), error.getvalue()
+        before = self.snapshot()
+        status, output, error = invoke(self.workspace)
+        inspect = shlex.join(['sfs', '--root', str(self.root), 'creations', self.workspace])
+        self.assertEqual((status, error), (0, ''))
+        self.assertIn('Creation retained. Files preserved. Workspace unavailable. Run ' + inspect + ' to inspect.', output)
+        self.assertIn(self.transaction, output)
+        self.assertEqual(before, self.snapshot())
+        status, output, error = invoke(self.workspace, '--continue', 'a' * 32, structured=True)
+        self.assertEqual((status, output), (1, ''))
+        self.assertEqual(json.loads(error)['status'], 'blocked')
+        self.assertEqual(before, self.snapshot())
+        mount = shlex.join(['sfs', '--root', str(self.root), 'mount', self.workspace])
+        for repeated in (False, True):
+            with self.subTest(repeated=repeated):
+                status, output, error = invoke(self.workspace, '--continue', self.transaction)
+                self.assertEqual((status, error), (0, ''))
+                self.assertIn('Workspace installed and unmounted. Run ' + mount + '.', output)
+                self.assertEqual(self.ident(self.final / 'image.sfs'), self.target['file'])
+                self.assertIn(self.transaction, output)
+        proof = self.read(self.final / 'native-install.json')
+        proof.update(first_mount_attempted=True, first_use={'accepted': True, 'operation': '8' * 32})
+        self.save(self.final / 'native-install.json', proof)
+        self.guard_calls.clear(); before = self.snapshot()
+        status, output, error = invoke(self.workspace, '--continue', self.transaction)
+        self.assertEqual((status, error), (0, ''))
+        self.assertIn('handoff: "mount-state"', output)
+        self.assertNotIn('Workspace installed and unmounted.', output)
+        self.assertEqual(self.guard_calls, [])
+        self.assertEqual(before, self.snapshot())
 
     def test_anchor_mismatch_before_any_write(self):
         self.guard_anchor = dict(self.anchor, generation=3)

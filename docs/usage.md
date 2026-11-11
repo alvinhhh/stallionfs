@@ -237,6 +237,25 @@ mutators; keep its controller supervising it. Timeout/interruption never means
 that the OS rolled the operation back. Installation recovery before first mount
 uses a new guard of the retained image; it does not repeat import or rename.
 
+Inspect retained creation evidence with `sfs creations` or `sfs creations ID`.
+For a verified candidate, copy its reported `transaction` into
+`sfs creations ID --continue TRANSACTION`. This installs the retained resource
+directory without importing again. An `installed-unmounted` result directs you
+to `sfs mount ID`. The reported resource path is not a
+mounted repository. Once mounting has been attempted, continuation reports
+`already-installed` with a `mount-state` handoff; follow the mount/unmount
+instructions above.
+
+Place global options before the command: `sfs --root PATH --json creations ID`.
+Complete all-store inspection exits 0, including retained or blocked entries.
+By-ID inspection exits 0 only for a loaded candidate or installed workspace.
+Busy, unavailable, incomplete inspection and refused continuation exit 1 and
+write the full result to stderr; successful results use stdout. Inspection does
+not initialize or repair a store. For explicit continuation, `--native-host PATH`
+can select the containing-app executable when installation settings are first
+recorded. Omitting it preserves recorded settings; conflicting settings are
+refused. It requires `--continue`.
+
 The controller uses ordinary macOS type dispatch and current mount observations.
 These do not authenticate an exact live adapter session or prove a previous
 adapter close succeeded. A fresh guard validates only its own current admission

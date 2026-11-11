@@ -2,11 +2,37 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 
 from . import __version__
+
+
+def _creation_output(result, root, continuing):
+    complete = result.get('status') == 'observed' and result.get('inventory_complete') is True
+    loaded = {'candidate', 'installed-unconfirmed', 'already-installed'}
+    success = ((result.get('status') == 'installed-unmounted' or
+                (result.get('status') == 'already-installed' and result.get('handoff') == 'mount-state')) if continuing else
+               complete and (result.get('scope') == 'store' or
+                             any(row.get('status') in loaded for row in result['entries'])))
+    command = ['sfs']
+    default_root = (Path.home() / 'Library/Application Support/stallionfs').absolute()
+    ambient_root = Path(os.environ.get('STALLIONFS_HOME', str(default_root))).expanduser().absolute()
+    if root != default_root or root != ambient_root:
+        command += ['--root', str(root)]
+    lines = [f'{key}: {json.dumps(value, sort_keys=True)}' for key, value in result.items() if key != 'entries']
+    for row in result.get('entries', ()):
+        lines.append('entry: ' + json.dumps(row, sort_keys=True))
+        if complete and row.get('status') in {'candidate', 'installed-unconfirmed'}:
+            inspect = shlex.join([*command, 'creations', row['workspace']])
+            lines.append(f'Creation retained. Files preserved. Workspace unavailable. Run {inspect} to inspect.')
+    if continuing and result.get('status') == 'installed-unmounted':
+        mount = shlex.join([*command, 'mount', result['workspace']])
+        lines.append(f'Workspace installed and unmounted. Run {mount}.')
+    return success, '\n'.join(lines)
 
 
 def main(argv=None):
@@ -57,6 +83,10 @@ def main(argv=None):
     create.add_argument('--native-profile', choices=('production', 'private-sfsro27'), default='production')
     create.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     create.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Folder clone workers; use 1 for lower CPU use")
+    creations = commands.add_parser('creations', help='Inspect retained native creations or continue an exact transaction')
+    creations.add_argument('id', nargs='?', metavar='ID')
+    creations.add_argument('--continue', dest='continue_operation', metavar='TRANSACTION', help='Continue the matching retained creation')
+    creations.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
         command.add_argument("id")
@@ -128,6 +158,14 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'creations':
+        if args.continue_operation is not None and args.id is None:
+            parser.error('creations --continue requires ID')
+        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation)):
+            if value is not None and re.fullmatch('[0-9a-f]{32}', value) is None:
+                parser.error(label + ' must contain 32 lowercase hexadecimal characters')
+        if args.native_host is not None and args.continue_operation is None:
+            parser.error('--native-host requires --continue')
     if args.action == 'command':
         if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
             parser.error('--root applies to workspace commands')
@@ -145,8 +183,20 @@ def main(argv=None):
         return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
     try:
-        store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)
-        if args.action == "scan":
+        store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes", "creations"} else Store(args.root)
+        if args.action == 'creations':
+            from ._native_create_recovery import inventory, continue_creation
+            root = Path(args.root).expanduser().absolute()
+            continuing = args.continue_operation is not None
+            result = (continue_creation(root, args.id, args.continue_operation, host=args.native_host)
+                      if continuing else inventory(root, args.id))
+            success, text = _creation_output(result, root, continuing)
+            if args.json:
+                output = result if success else {**result, 'error': result.get('code', result['status'])}
+                text = json.dumps(output, sort_keys=True)
+            print(text, file=sys.stdout if success else sys.stderr)
+            return 0 if success else 1
+        elif args.action == "scan":
             try:
                 from ._scan import scan
             except ImportError as exc:
