@@ -1,6 +1,7 @@
 """Opt-in, bounded ENOSPC check inside disposable one-GiB APFS images."""
 import errno
 import fcntl
+from functools import wraps
 import hashlib
 import os
 from pathlib import Path
@@ -33,18 +34,38 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def retain_failure(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException as error:
+            if isinstance(error, unittest.SkipTest) and getattr(self, 'headroom_skip', False):
+                self.headroom_skip = False
+                raise
+            self.retain = True
+            try:
+                error.add_note(f'Test files retained at {self.base}; no further cleanup will run')
+            except BaseException:
+                pass
+            raise
+    return guarded
+
+
 @unittest.skipUnless(
     os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and sys.platform == 'darwin'
     and int(platform.mac_ver()[0].split('.')[0] or 0) >= 26,
     'Set STALLIONFS_TEST_IMAGES=1 on macOS 26+ for the bounded disk-full test',
 )
 class ImageSpace(unittest.TestCase):
+    @retain_failure
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-space-')).resolve()
         self.image_points = {}
         # Registered before setup so a failed build never leaves an unexamined mount.
         self.addCleanup(self.clean)
         if shutil.disk_usage(self.base).free < 3 * 1024 ** 3:
+            self.headroom_skip = True
             self.skipTest('This disposable one-GiB image test needs three GiB host headroom')
         self.source = self.base / 'source'
         self.source.mkdir(mode=0o700)
@@ -60,6 +81,8 @@ class ImageSpace(unittest.TestCase):
 
     def clean(self):
         # A failed/unknown/busy detach aborts cleanup and retains every image.
+        if getattr(self, 'retain', False):
+            return
         try:
             for image in self.base.glob('*.sparseimage'):
                 expected_point = self.image_points.get(image)
@@ -95,6 +118,7 @@ class ImageSpace(unittest.TestCase):
         ]).rstrip(b'\n'), b'retained')
         self.assertEqual(os.readlink(repo / 'link'), 'sentinel')
 
+    @retain_failure
     def test_volume_full_preserves_existing_data_and_other_images(self):
         first, sibling = self.base / 'full.sparseimage', self.base / 'sibling.sparseimage'
         point = self.base / 'full'

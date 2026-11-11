@@ -12,6 +12,16 @@ python3 -m compileall -q stallionfs
 
 Reinstall after changing native C code; both the extension and CLI need rebuilding.
 
+## Git dependency
+
+Source, sdist and editable builds compile the pinned Git dependency for the current arm64 or x86_64 host. The recipe targets macOS 13 and uses the macOS system curl library with pinned public headers. The complete wheel may require a newer macOS version because of the Python toolchain used for its extensions; its platform tag is computed from the actual binaries.
+
+The first build downloads the two archives pinned in `stallionfs/_git_sources.py`. For an offline source build, put those exact archives in an owned directory and set `STALLIONFS_BUILD_INPUTS` to it. The remaining patches, headers manifest, configuration and alias source are included in the sdist. No global package or system Git installation is changed.
+
+Each built runtime contains `SOURCES.txt`, both component licenses, a sanitized Git source archive, the complete patches, eleven curl headers, and an archive of the exact build scripts with their original paths. `SOURCES.txt` describes rebuilding entirely from those delivered files through `--delivered-sources`; that mode has no download fallback. The sanitized source omits optional non-build contributor instructions and retains dated notices for modified files. The manifest records the original archive, sanitized source, patches, recipe, final modified source and payload as separate identities.
+
+The Python package's regular-file runtime is separate from a signed native companion. An app uses its own private Git and corresponding source, and does not copy the wheel's `_git` tree. Keep the complete adjacent `.sources` directory with the app in the same distributed ZIP or disk image. Generic Git inspection does not grant native creation or recovery authority. Native compatibility and installed-runtime qualification remain separate checks.
+
 On macOS 26+, include the disk-image tests:
 
 ```sh

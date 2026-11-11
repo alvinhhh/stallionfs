@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import tempfile
 from pathlib import Path
 import subprocess
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -374,6 +375,10 @@ class RuntimeAssembly(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.root.chmod(0o700)
+        self.bundle = package._runtime_bundle()
+        bundle_patch = patch.object(package, '_runtime_bundle', return_value=self.bundle)
+        bundle_patch.start()
+        self.addCleanup(bundle_patch.stop)
 
     def inputs(self):
         python = self.root / 'python'
@@ -397,9 +402,10 @@ class RuntimeAssembly(unittest.TestCase):
             descriptor[name + '_sha256'] = digest(data)
         python_descriptor = json_file(self.root / 'python.json', descriptor)
         git = self.root / 'git'
-        put(git / 'bin/git', b'inert git', 0o755)
+        put(git / 'bin/git', b'inert git', 0o700)
         (git / 'libexec/git-core').mkdir(parents=True)
         (git / 'share/git-core/templates').mkdir(parents=True)
+        put(git / 'share/git-core/templates/template', b'inert template', 0o600)
         (git / 'libexec/git-core/git').symlink_to('../../bin/git')
         inventory = json_file(self.root / 'git-tree.json', package._runtime_inventory(git))
         qualification = json_file(self.root / 'git-qualification.json', {
@@ -407,7 +413,9 @@ class RuntimeAssembly(unittest.TestCase):
             'static_closure_accepted': True, 'local_correctness_passed': True, 'synthetic_fixture': True})
         sources = {path.relative_to(SOURCE).as_posix(): path.read_bytes()
                    for path in (SOURCE / 'stallionfs').iterdir() if path.is_file() and path.suffix in ('.py', '.c', '.h')}
-        sources.update({name: (SOURCE / name).read_bytes() for name in ('setup.py', 'pyproject.toml')})
+        sources.update({name: (SOURCE / name).read_bytes() for name in ('setup.py', 'pyproject.toml',
+            'tools/build_git_runtime.py', 'tools/_git_capture.py',
+            *('tools/git-inputs/' + name for name in ('combined.patch', 'notices.patch', 'config.mak', 'header-manifest.json', 'alias.c')))})
         build_sources = {name: digest(data) for name, data in sources.items()}
         files = {name: data for name, data in sources.items() if name.startswith('stallionfs/') and name.endswith('.py')}
         resources = {}
@@ -436,16 +444,87 @@ class RuntimeAssembly(unittest.TestCase):
         license = put(self.root / 'COPYING', b'Git license fixture')
         source = put(self.root / 'git-source.tar.xz', b'Git corresponding source fixture')
         config = put(self.root / 'config.mak', b'Git build recipe fixture')
+        hook_patch = put(self.root / 'hook.patch', b'Git hook patch fixture')
+        notices = put(self.root / 'notices.patch', b'Git change notices fixture')
+        alias = put(self.root / 'alias.c', b'Git alias source fixture')
+        header_rows = []
+        header_inputs = {}
+        for row in json.loads((SOURCE / 'tools/git-inputs/header-manifest.json').read_bytes()):
+            data = ('inert header ' + row['file']).encode()
+            header_rows.append(dict(row, bytes=len(data), sha256=digest(data)))
+            header_inputs['Git/sources/' + row['file']] = put(self.root / row['file'], data)
+        curl_headers = json_file(self.root / 'curl-headers.json', header_rows)
+        # Substitute only the recognized pins for these inert owned fixtures.
+        self.bundle.GIT_CONTRACT = dict(self.bundle.GIT_CONTRACT, source_distribution_sha256=pinned(source)['sha256'],
+            build_config_sha256=pinned(config)['sha256'], input_inventory_sha256=pinned(inventory)['sha256'],
+            combined_patch_sha256=pinned(hook_patch)['sha256'], notice_patch_sha256=pinned(notices)['sha256'],
+            alias_source_sha256=pinned(alias)['sha256'], curl_header_manifest_sha256=pinned(curl_headers)['sha256'])
+        self.bundle.QUALIFIED_GIT_INPUTS = frozenset({pinned(inventory)['sha256']})
+        qualification_value = json.loads(qualification.read_bytes())
+        qualification_value['native_create'] = dict(self.bundle.GIT_CONTRACT)
+        json_file(qualification, qualification_value)
+        source_inputs = {'Git/sources/git-source.tar.xz': source, 'Git/sources/config.mak': config,
+            'Git/sources/combined.patch': hook_patch, 'Git/sources/header-manifest.json': curl_headers,
+            'Git/sources/notices.patch': notices, 'Git/sources/alias.c': alias, **header_inputs}
+        script_bytes = io.BytesIO()
+        with tarfile.open(fileobj=script_bytes, mode='w:xz') as archive:
+            for name in ('tools/build_git_runtime.py', 'tools/_git_capture.py', 'stallionfs/_git_sources.py',
+                         'stallionfs/_bundle.py', *('tools/git-inputs/' + name for name in
+                         ('combined.patch', 'notices.patch', 'config.mak', 'header-manifest.json', 'alias.c'))):
+                data = (source_inputs['Git/sources/' + Path(name).name].read_bytes()
+                        if name.startswith('tools/git-inputs/') else (SOURCE / name).read_bytes())
+                member = tarfile.TarInfo(name); member.size = len(data); archive.addfile(member, io.BytesIO(data))
+        curl_license = put(self.root / 'CURL-COPYING', b'Curl license fixture')
+        source_inputs.update({'Git/COPYING': license, 'Git/CURL-COPYING': curl_license,
+            'Git/SOURCES.txt': put(self.root / 'SOURCES.txt', b'Offline rebuild fixture'),
+            'Git/sources/build-scripts.tar.xz': put(self.root / 'build-scripts.tar.xz', script_bytes.getvalue())})
         value = {'schema': 1, 'python_descriptor': pinned(python_descriptor),
                  'git': {'root': str(git), 'inventory': pinned(inventory), 'qualification': pinned(qualification)},
-                 'wheel': pinned(wheel), 'licenses': [dict(pinned(license), destination='Git/COPYING')],
-                 'sources': [dict(pinned(source), destination='Git/source.tar.xz'), dict(pinned(config), destination='Git/config.mak')]}
+                 'wheel': pinned(wheel), 'licenses': [dict(pinned(license), destination='Git/COPYING'),
+                                                     dict(pinned(curl_license), destination='Git/CURL-COPYING')],
+                 'sources': [dict(pinned(path), destination=name) for name, path in source_inputs.items()]}
         self.descriptor = json_file(self.root / 'runtime-inputs.json', value)
         self.value = value
         self.app = self.root / 'Assembled With Spaces.app'
         self.manifest = self.root / 'candidate.json'
         self.host = put(self.root / 'host', mode=0o755)
         self.extension = put(self.root / 'extension', mode=0o755)
+
+    def test_regular_wheel_git_is_verified_then_omitted_from_app_members(self):
+        self.inputs()
+        with zipfile.ZipFile(self.value['wheel']['path']) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        prefix = 'stallionfs/_git/'
+        payload = {'bin/git': b'inert Git', 'libexec/git-core/git': b'inert native alias',
+                   'share/git-core/templates/description': b'inert template', 'COPYING': b'Git license fixture'}
+        payload.update({row['destination'][len('Git/'):]: Path(row['path']).read_bytes() for row in self.value['sources']})
+        source = {key: self.bundle.GIT_CONTRACT[key] for key in self.bundle.GIT_SOURCE_KEYS}
+        manifest = {'schema': 1, 'kind': 'package-git-runtime', 'source': source, 'build': {},
+            'files': [{'path': name, 'mode': '0o755' if name.startswith(('bin/', 'libexec/')) else '0o644',
+                       'size': len(data), 'sha256': digest(data)} for name, data in payload.items()]}
+        files.update({prefix + name: data for name, data in payload.items()})
+        files[prefix + 'manifest.json'] = json.dumps(manifest).encode()
+        record = 'stallionfs-0.6.3.dist-info/RECORD'; files.pop(record)
+        files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+            + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as archive:
+            for name, data in files.items(): archive.writestr(name, data)
+        python = json.loads(Path(self.value['python_descriptor']['path']).read_bytes())
+        metadata = json.loads(Path(python['metadata_file']).read_bytes())
+        admitted, *_, source_assets = package._runtime_source_wheel(stream.getvalue(), metadata, {})
+        self.assertFalse(any(name.startswith(prefix) for name in admitted))
+        self.assertIn('stallionfs/_bundle.py', admitted)
+        self.assertEqual(len(source_assets), 21)
+        for change in ('extra', 'bytes', 'manifest', 'source'):
+            changed = dict(files)
+            if change == 'extra': changed[prefix + 'unlisted'] = b'not admitted'
+            elif change == 'bytes': changed[prefix + 'bin/git'] = b'substituted'
+            elif change == 'manifest': changed.pop(prefix + 'manifest.json')
+            else:
+                value = json.loads(changed[prefix + 'manifest.json']); value['source']['combined_patch_sha256'] = '0' * 64
+                changed[prefix + 'manifest.json'] = json.dumps(value).encode()
+            with self.subTest(change=change), self.assertRaises(ValueError): package._runtime_package_git(changed)
 
     def inspect(self, argv, directory):
         if argv[0] == '/usr/bin/lipo': return 'arm64'
@@ -481,6 +560,67 @@ class RuntimeAssembly(unittest.TestCase):
             sidecar = self.root / value['source_sidecar']['path']
             self.assertEqual(value['source_sidecar']['inventory'], package._runtime_inventory(sidecar))
             self.assertTrue((self.app / 'Contents/Resources/Licenses/Git/COPYING').is_file())
+            descriptor = json.loads((self.app / self.bundle.DESCRIPTOR).read_bytes())
+            payload = self.bundle.git_payload(self.app / 'Contents/Resources/Runtime/Git')
+            self.assertEqual(descriptor['schema'], 2)
+            self.assertEqual(descriptor['git'], dict(self.bundle.GIT_CONTRACT,
+                payload_entries=payload['entries'], payload_sha256=payload['sha256']))
+            self.assertEqual(value['git'], descriptor['git'])
+            self.assertEqual(value['descriptor_sha256'], digest((self.app / self.bundle.DESCRIPTOR).read_bytes()))
+            self.assertEqual((self.app / 'Contents/Resources/Runtime/Git/bin/git').stat().st_mode & 0o777, 0o755)
+            self.assertEqual((self.app / 'Contents/Resources/Runtime/Git/share/git-core/templates/template').stat().st_mode & 0o777, 0o644)
+
+    def test_complete_offline_source_set_is_required_before_app_output(self):
+        self.inputs()
+        original = json.loads(self.descriptor.read_bytes())
+        self.assertEqual(len(original['sources']), 21)
+        for change in ('header', 'scripts', 'instructions', 'curl-license', 'raw-archive', 'changed-header'):
+            value = json.loads(json.dumps(original))
+            if change in ('header', 'scripts', 'instructions'):
+                suffix = {'header': '/typecheck-gcc.h', 'scripts': '/build-scripts.tar.xz',
+                          'instructions': '/SOURCES.txt'}[change]
+                value['sources'] = [row for row in value['sources'] if not row['destination'].endswith(suffix)]
+            elif change == 'curl-license':
+                value['licenses'] = [row for row in value['licenses'] if row['destination'] != 'Git/CURL-COPYING']
+            elif change == 'raw-archive':
+                extra = put(self.root / 'unexpected-archive', b'not part of the delivered source set')
+                value['sources'].append(dict(pinned(extra), destination='Git/git-2.56.0.tar.xz'))
+            else:
+                changed = put(self.root / 'changed-header', b'changed public header')
+                next(row for row in value['sources'] if row['destination'].endswith('/typecheck-gcc.h')).update(pinned(changed))
+            json_file(self.descriptor, value)
+            with self.subTest(change=change), self.assertRaises(ValueError): self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())
+
+    def test_native_contract_and_actual_source_build_inventory_pins_are_required(self):
+        self.inputs()
+        original = json.loads(self.descriptor.read_bytes())
+        qualification_path = Path(original['git']['qualification']['path'])
+        qualification = json.loads(qualification_path.read_bytes())
+        for change in ('missing', 'unknown', 'extra', 'boolean-schema', 'source', 'build', 'inventory'):
+            value = json.loads(json.dumps(original))
+            declaration = json.loads(json.dumps(qualification))
+            if change == 'missing': declaration.pop('native_create')
+            elif change == 'unknown': declaration['native_create']['contract'] = 'unknown-contract'
+            elif change == 'extra': declaration['native_create']['trusted'] = True
+            elif change == 'boolean-schema': declaration['native_create']['schema'] = True
+            elif change in ('source', 'build'):
+                index = 0 if change == 'source' else 1
+                replacement = put(self.root / (change + '-replacement'), b'different pinned input')
+                value['sources'][index].update(pinned(replacement))
+            else:
+                inventory = put(self.root / 'different-inventory.json',
+                    Path(value['git']['inventory']['path']).read_bytes() + b'\n')
+                value['git']['inventory'] = pinned(inventory)
+                declaration['inventory_sha256'] = pinned(inventory)['sha256']
+            json_file(qualification_path, declaration)
+            value['git']['qualification'] = pinned(qualification_path)
+            json_file(self.descriptor, value)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'contract|provenance'):
+                self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())
 
     def test_missing_substituted_qualification_license_and_wheel_inputs_refuse_before_output(self):
         self.inputs()

@@ -37,7 +37,7 @@ class CreateRecovery(unittest.TestCase):
         for path in (self.root / '.lock', self.root / 'locks' / ('use-' + self.workspace),
                      self.root / 'locks' / ('workspace-' + self.workspace)):
             path.touch(mode=0o600)
-        self.stage = self.root / 'staging' / 'build-fixture'
+        self.stage = self.root / 'staging' / ('native-create-' + self.transaction)
         self.stage.mkdir(mode=0o700)
         self.owned = self.stage / 'owned'; self.owned.mkdir(mode=0o700)
         self.final = self.root / 'workspaces' / self.workspace
@@ -72,6 +72,9 @@ class CreateRecovery(unittest.TestCase):
                      'capacity_gib': 1, 'native_image': self.target, 'creation_proof': 'native-create.json'}
         self.proof = {'operation': 'native-create', 'id': self.workspace, 'transaction': self.transaction,
                       'seed': self.seed, 'native_image': self.target, 'import_contract': 'prepared-tree-v1', 'result': result}
+        from native_writer_fixture import qualify, writer
+        qualify(self)
+        self.proof['writer'] = writer(self.meta, self.stage)
         self.record = {'operation': 'native-create', 'workspace': self.workspace, 'transaction': self.transaction,
                        'seed': self.seed, 'stage': str(self.stage), 'stage_identity': self.ident(self.stage),
                        'candidate': str(self.owned), 'object': self.ident(self.owned), 'final': str(self.final),
@@ -550,10 +553,10 @@ class CreateRecovery(unittest.TestCase):
             self.assertEqual(self.continuation()['status'], 'blocked')
         remnants = {p: (self.ident(p), p.read_bytes()) for p in self.journal.parent.iterdir() if p.name.startswith('.')}
         self.assertTrue(remnants)
-        stage = self.root / 'staging' / 'build-other'; stage.mkdir(mode=0o700)
+        workspace, transaction = 'b' * 32, 'c' * 32
+        stage = self.root / 'staging' / ('native-create-' + transaction); stage.mkdir(mode=0o700)
         owned = stage / 'owned'; owned.mkdir(mode=0o700)
         image = owned / 'image.sfs'; image.write_bytes(b'other candidate'); image.chmod(0o600)
-        workspace, transaction = 'b' * 32, 'c' * 32
         target = dict(self.target, parent=self.ident(stage), object=self.ident(owned), file=self.ident(image), uuid='d' * 32)
         result = copy.deepcopy(self.proof['result'])
         result['identity'] = {'file': target['file'], 'uuid': target['uuid']}; result['observed_file'] = target['file']
@@ -561,6 +564,8 @@ class CreateRecovery(unittest.TestCase):
             result[key].update(device=target['file'][0], inode=target['file'][1], uuid=target['uuid'])
         meta = dict(self.meta, id=workspace, transaction=transaction, branch='stallionfs/fixture-' + workspace, native_image=target)
         proof = dict(self.proof, id=workspace, transaction=transaction, native_image=target, result=result)
+        from native_writer_fixture import writer
+        proof['writer'] = writer(meta, stage)
         record = dict(self.record, workspace=workspace, transaction=transaction, stage=str(stage), stage_identity=self.ident(stage),
                       candidate=str(owned), object=self.ident(owned), final=str(self.final.parent / workspace), result=result,
                       native_image={key: target[key] for key in ('component', 'file', 'uuid', 'anchor')})

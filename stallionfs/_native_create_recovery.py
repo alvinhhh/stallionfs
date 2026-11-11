@@ -20,6 +20,7 @@ MAX_TOTAL_BYTES = 32 * 1024 * 1024
 PARENTS = ('journals', 'staging', 'workspaces', 'locks', 'lifecycle')
 KEYS = {'operation', 'workspace', 'transaction', 'seed', 'stage', 'stage_identity', 'candidate', 'object', 'final'}
 PRODUCER = KEYS | {'creation_attempted', 'outcome', 'native_image', 'result', 'helpers', 'child_pending', 'discovery'}
+PROTOCOL2 = {'protocol', 'spec_digest', 'phase', 'actors', 'replacement', 'disposal', 'completion_file'}
 META = {'id', 'seed', 'transaction', 'name', 'branch', 'commit', 'created', 'backend', 'ownership', 'state',
         'capacity_gib', 'native_image', 'creation_proof'}
 PROOF = {'operation', 'id', 'transaction', 'seed', 'native_image', 'import_contract', 'result'}
@@ -297,7 +298,7 @@ def completed_result(result, target):
 
 
 def origin_metadata(metadata, proof):
-    require(set(metadata) == META and set(proof) == PROOF, 'unknown-creation-schema')
+    require(set(metadata) == META and set(proof) in (PROOF, PROOF | {'writer'}), 'unknown-creation-schema')
     core.validate_native_creation_proof(metadata, proof)
     completed_result(proof['result'], metadata['native_image'])
     name = metadata['name']
@@ -374,9 +375,38 @@ def lifecycle(a, workspace, origin, expected=None):
     return state
 
 
+def preflight_archive(a, record, stage):
+    archive = stage / 'discovery'
+    if 'helpers' in record or 'child_pending' in record:
+        require('helpers' in record and 'child_pending' in record and a.exists(archive), 'missing-helper-archive')
+        archived = a.read(archive / 'record.json')
+        expected = {k: record[k] for k in KEYS | {'helpers', 'child_pending'}}
+        if 'discovery' in record:
+            require(type(record['discovery']) is dict and record['discovery'].get('protocol') == 1
+                    and record['discovery'].get('ok') is True and type(record['discovery'].get('modules')) is list,
+                    'invalid-discovery')
+            expected['discovery'] = record['discovery']
+        expected.update(creation_attempted=False, outcome='preparing',
+                        native_image={'component': 'image.sfs', 'file': None, 'uuid': None, 'anchor': None})
+        if record.get('protocol') in (2, 3):
+            expected.update(protocol=record['protocol'], spec_digest=record['spec_digest'], phase='preflight', actors=[])
+        require(archived == expected, 'archive-journal-disagreement')
+    else:
+        require('discovery' not in record and not a.exists(archive), 'unexpected-helper-archive')
+
+
 def load(a, workspace, transaction=None, *, profile=None, host=None):
     journal = a.root / 'journals' / (workspace + '.json')
     final = a.root / 'workspaces' / workspace
+    from ._native_creation_purge import completed, disposal_state
+    if a.exists(journal):
+        record = a.read(journal)
+        if 'disposal' in record:
+            return disposal_state(a, record, workspace, transaction)
+    completion = completed(a, workspace, transaction)
+    if completion is not None:
+        return {'status': 'purged', 'path': Path(completion['stage']), 'record': completion,
+                'origin': {'id': workspace, 'transaction': completion['transaction']}}
     if not a.exists(journal):
         require(a.exists(final), 'no-authoritative-journal')
         metadata = a.read(final / 'meta.json')
@@ -399,32 +429,25 @@ def load(a, workspace, transaction=None, *, profile=None, host=None):
         return {'status': 'already-installed', 'path': final, 'metadata': metadata, 'origin': origin,
                 'target': target, 'proof': proof, 'journal': journal}
     record = a.read(journal)
-    require(set(record) <= PRODUCER | {'installation'}, 'unknown-journal-schema')
+    require(set(record) <= PRODUCER | {'installation'} | (PROTOCOL2 if record.get('protocol') in (2, 3) else set()), 'unknown-journal-schema')
     stage = ownership(a, record, workspace)
     require(transaction is None or record['transaction'] == transaction, 'transaction-mismatch')
     a.directory(stage)
     require(a.bindings[stage] == record['stage_identity'], 'stage-substitution')
     marker = a.read(stage / 'native-create')
-    require(set(marker) <= PRODUCER and {k: record.get(k) for k in PRODUCER if k in record} == marker,
-            'marker-journal-disagreement')
+    if record.get('protocol') in (2, 3):
+        from . import _native_create_request as request
+        spec = request.validate(a, record, stage_required=False)
+        if record.get('phase') in request.PREINSTALL and record.get('result', {}).get('candidate_complete') is not True:
+            return {'status': 'retained', 'path': stage, 'stage': stage, 'record': record, 'journal': journal,
+                    'spec': spec, 'origin': {'id': workspace, 'transaction': record['transaction']}}
+    else:
+        require(set(marker) <= PRODUCER and {k: record.get(k) for k in PRODUCER if k in record} == marker,
+                'marker-journal-disagreement')
     require(record.get('creation_attempted') is True and record.get('outcome') == 'candidate-created'
             and set(record.get('native_image', {})) == {'component', 'file', 'uuid', 'anchor'}, 'incomplete-candidate')
     _native.check_pending(workspace, record)
-    archive = stage / 'discovery'
-    if 'helpers' in record or 'child_pending' in record:
-        require('helpers' in record and 'child_pending' in record and a.exists(archive), 'missing-helper-archive')
-        archived = a.read(archive / 'record.json')
-        expected = {k: record[k] for k in KEYS | {'helpers', 'child_pending'}}
-        if 'discovery' in record:
-            require(type(record['discovery']) is dict and record['discovery'].get('protocol') == 1
-                    and record['discovery'].get('ok') is True and type(record['discovery'].get('modules')) is list,
-                    'invalid-discovery')
-            expected['discovery'] = record['discovery']
-        expected.update(creation_attempted=False, outcome='preparing',
-                        native_image={'component': 'image.sfs', 'file': None, 'uuid': None, 'anchor': None})
-        require(archived == expected, 'archive-journal-disagreement')
-    else:
-        require('discovery' not in record and not a.exists(archive), 'unexpected-helper-archive')
+    preflight_archive(a, record, stage)
     source = stage / 'owned'
     present_source, present_final = a.exists(source), a.exists(final)
     require(present_source != present_final, 'ambiguous-location')
@@ -554,6 +577,15 @@ def discover(a):
 
 
 def conflicts(a, loaded, owners):
+    if loaded['status'] == 'purged':
+        completion = loaded['record']
+        for path, other in owners:
+            related = any(other.get(key) == completion[key] for key in ('workspace', 'transaction', 'stage'))
+            if related:
+                require(path == str(a.root / 'journals' / (completion['workspace'] + '.json'))
+                        and other.get('disposal') == completion['disposal']
+                        and other.get('spec_digest') == completion['spec_digest'], 'conflicting-owner', path)
+        return
     record = loaded.get('record')
     if record is None:
         record = {'workspace': loaded['origin']['id'], 'transaction': loaded['origin']['transaction'],
@@ -581,11 +613,24 @@ def inventory(root, workspace=None):
         if workspace is not None:
             core.identifier(workspace, 32)
         with core.Store.existing(root, shared=True) as (_, a):
+            result['store'] = str(a.root)
             if workspace is None:
                 rows, owners, affected = discover(a)
                 result['entries'].extend(rows)
                 result['incomplete_paths'].extend(affected)
-                identifiers = sorted({r['workspace'] for r in rows if 'workspace' in r})
+                identifiers = {r['workspace'] for r in rows if 'workspace' in r}
+                for name in a.names(a.root / 'lifecycle'):
+                    if re.fullmatch(r'[0-9a-f]{32}\.json', name):
+                        if name[:-5] in identifiers:
+                            continue  # Its journal loader admits any partial completion.
+                        try:
+                            state = a.read(a.root / 'lifecycle' / name)
+                            if state.get('operation') == 'native-create-purge':
+                                identifiers.add(name[:-5])
+                        except (OSError, ValueError, TypeError, RecursionError, core.StallionError) as error:
+                            result['entries'].append(diagnostic(error, a.root / 'lifecycle' / name))
+                            result['incomplete_paths'].append(str(a.root / 'lifecycle' / name))
+                identifiers = sorted(identifiers)
             else:
                 identifiers, owners = [workspace], []
             for value in identifiers:
@@ -593,7 +638,11 @@ def inventory(root, workspace=None):
                     loaded = load(a, value)
                     conflicts(a, loaded, owners)
                     result['entries'].append({'workspace': value, 'transaction': loaded['origin']['transaction'],
-                                              'status': loaded['status'], 'path': str(loaded['path'])})
+                                              'status': loaded['status'], 'path': str(loaded['path']),
+                                              'authoritative': True,
+                                              **loaded.get('inspection', {}),
+                                              **({'replacement': loaded['record']['replacement']}
+                                                 if loaded.get('record', {}).get('replacement') else {})})
                 except (OSError, ValueError, TypeError, RecursionError, core.StallionError) as error:
                     result['entries'].append(dict(diagnostic(error), workspace=value))
                     if isinstance(error, (OSError, ValueError, RecursionError)) or getattr(error, 'code', '') in ('entry-budget', 'document-budget', 'read-budget'):
@@ -611,6 +660,8 @@ def finalize(a, loaded):
     source, final, journal = loaded['source'], loaded['final'], loaded['journal']
     target = loaded['target']
     anchor = origin['native_image']['anchor']
+    from ._native_create_authority import proof
+    proof(origin, a.read(loaded['path'] / 'native-create.json'))
     tokens = []
 
     def relocate(token):
@@ -715,13 +766,50 @@ def finalize(a, loaded):
     return {'status': 'installed-unmounted', 'workspace': origin['id'], 'transaction': origin['transaction'], 'path': str(final)}
 
 
+def installed_result(a, loaded):
+    response = {'workspace': loaded['origin']['id'], 'transaction': loaded['origin']['transaction'],
+                'path': str(loaded['path'])}
+    if loaded['proof']['first_mount_attempted']:
+        return {**response, 'status': 'already-installed', 'handoff': 'mount-state'}
+    from ._native_create_authority import proof
+    proof(loaded['origin'], a.read(loaded['path'] / 'native-create.json'))
+    require(not a.names(loaded['path'] / 'volume'), 'occupied-volume')
+    anchor = loaded['origin']['native_image']['anchor']
+    _native.guarded(loaded['target'], lambda token: a.check(), anchor=anchor, expected_anchor=anchor)
+    a.check()
+    os.fsync(a.directory(loaded['journal'].parent))
+    return {**response, 'status': 'installed-unmounted', 'already_installed': True}
+
+
 def continue_creation(root, workspace, transaction, *, profile=None, host=None):
     """Exact transaction continuation. Internal statuses carry no CLI wording."""
     response = {'status': 'blocked', 'workspace': workspace, 'transaction': transaction}
     try:
         core.identifier(workspace, 32)
         core.identifier(transaction, 32)
-        with core.Store.existing(root, shared=False) as (_, a):
+        with core.Store.existing(root, shared=False) as (store, a):
+            from ._native_creation_purge import completed, disposal_state
+            journal = a.root / 'journals' / (workspace + '.json')
+            if a.exists(journal):
+                record = a.read(journal)
+                if 'disposal' in record:
+                    loaded = disposal_state(a, record, workspace, transaction)
+                    return {**response, 'status': loaded['status'], **loaded['inspection']}
+            completion = completed(a, workspace, transaction)
+            if completion is not None:
+                from ._native_create_retry import follow_purged
+                return follow_purged(store, a, completion)
+            journal = a.root / 'journals' / (workspace + '.json')
+            if a.exists(journal):
+                record = a.read(journal)
+                if record.get('protocol') in (2, 3):
+                    from . import _native_create_request as request, _native_create_retry as retry
+                    require(record.get('transaction') == transaction, 'transaction-mismatch')
+                    if record.get('phase') in request.PREINSTALL and record.get('result', {}).get('candidate_complete') is not True:
+                        spec, held = retry.acquire(a, record)
+                        require((profile is None or profile == spec['profile'])
+                                and (host is None or str(host) == spec['host']), 'settings-frozen')
+                        return retry.continue_locked(store, a, record, spec, held)
             a.lock(a.root / 'locks' / ('use-' + workspace))
             a.lock(a.root / 'locks' / ('workspace-' + workspace))
             rows, owners, affected = discover(a)
@@ -729,17 +817,7 @@ def continue_creation(root, workspace, transaction, *, profile=None, host=None):
             loaded = load(a, workspace, transaction, profile=profile, host=host)
             conflicts(a, loaded, owners)
             if loaded['status'] == 'already-installed':
-                proof = loaded['proof']
-                if proof['first_mount_attempted']:
-                    response.update(status='already-installed', handoff='mount-state', path=str(loaded['path']))
-                else:
-                    require(not a.names(loaded['path'] / 'volume'), 'occupied-volume')
-                    anchor = loaded['origin']['native_image']['anchor']
-                    _native.guarded(loaded['target'], lambda token: a.check(), anchor=anchor, expected_anchor=anchor)
-                    # An earlier unlink may have succeeded before its directory sync or response failed.
-                    a.check()
-                    os.fsync(a.directory(loaded['journal'].parent))
-                    response.update(status='installed-unmounted', already_installed=True, path=str(loaded['path']))
+                response.update(installed_result(a, loaded))
             else:
                 response.update(finalize(a, loaded))
     except (OSError, ValueError, TypeError, RecursionError, core.StallionError) as error:

@@ -108,7 +108,8 @@ def validate_compound(workspace, record):
         'mount': ['/sbin/mount', '-t', _native.PROFILES[record['profile']]['type'],
                   record['target']['directory'], str(Path(record['target']['directory']) / 'volume')]}
     for helper in record['helpers']:
-        if 'argv' in helper and helper['argv'] != command_paths[helper['label']]: bad()
+        if 'argv' in helper and helper['argv'] != command_paths[helper['label']]:
+            if helper['label'] != 'verify-package' or helper['argv'] != _native.package_argv(host): bad()
     if record['outcome'] == 'complete' and record['phase'] != 'final-verified': bad()
 
 
@@ -670,6 +671,8 @@ def location(store, path, metadata, *, override=None):
 
 
 def ready(store, path, metadata):
+    from ._native_create_authority import installed
+    installed(path, metadata)
     target = _native.installed_target(store, path, metadata)
     proof = core.read_json(path / 'native-install.json')
     first = proof.get('first_use')
@@ -837,6 +840,8 @@ def recover_move(store, workspace):
     path, saved = candidates[0]
     if core.read_json(path / 'meta.json') != metadata:
         raise core.StallionError('Native moved metadata changed')
+    from ._native_create_authority import installed
+    installed(path, metadata)
     target = _native.installed_target(store, path, metadata, _location=saved)
     intended_source = store.root / record['source_location']['collection'] / workspace
     if record['target'] != dict(target, directory=str(intended_source)):

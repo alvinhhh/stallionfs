@@ -197,7 +197,8 @@ class Build:
         metadata = {'python_tag': 'cp313', 'target_triple': 'aarch64-apple-darwin',
                     'python_config_vars': {name: str(sysconfig.get_config_var(name) or 0)
                         for name in ('Py_GIL_DISABLED', 'Py_DEBUG', 'EXT_SUFFIX')}}
-        files, scripts, extensions, tag, build_sources = package._runtime_source_wheel(built_wheel.read_bytes(), metadata, {})
+        files, scripts, extensions, tag, build_sources, wheel_assets = package._runtime_source_wheel(
+            built_wheel.read_bytes(), metadata, {})
         observations = package._inspect_runtime_wheel(files, scripts, extensions, work)
         validate_wheel_targets(observations)
         for index in range(4):
@@ -220,7 +221,10 @@ class Build:
                     'package': package_receipt,
                     'wheel': {'tag': tag, 'record_and_current_source_validated': True,
                               'native_members': observations,
-                              'build_source_sha256': build_sources},
+                              'build_source_sha256': build_sources,
+                              'git_source_assets': {'stallionfs/_git/' + name: {
+                                  'sha256': digest(data), 'size': len(data)}
+                                  for name, data in sorted(wheel_assets.items())}},
                     'symbol_checks': {'production_contextual_writes': True, 'forbidden_symbols_absent': True},
                     'files': {name: {'sha256': digest(data), 'size': len(data)} for name, data in sorted(contents.items())}}
         (payload / 'provenance.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')

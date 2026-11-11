@@ -417,6 +417,22 @@ preparation and user workspace commands retain their existing PATH behavior.
 Caller-selected external tools/configuration remain outside the private Git
 closure; no network, credential or keychain qualification is implied.
 
+The schema-2 runtime descriptor adds a compact native-creation Git contract:
+source, build-config and input-inventory hashes plus the assembled payload's
+canonical tree hash and entry count. Native creation selects it from the same
+companion Host used for package verification, including source/wheel callers.
+Schema-1 descriptors remain usable by generic/bootstrap paths but do not grant
+native branch-mutation authority. Package verification must accept that same
+app under the expected publisher requirement before the first creation effect.
+
+Signing changes Mach-O bytes. The signing controller must finalize the Git
+payload descriptor after nested Git signing and before the outer app seal.
+The internal finalizer requires the assembled descriptor hash, original payload
+rows and exact resulting hashes of independently verified signature transforms;
+it refuses other byte, namespace, link or mode changes. It does not sign or
+verify signatures itself. Controlled verifier fixtures do not qualify a signed
+companion, installed package or mounted filesystem.
+
 With this option only, app directories become `0755`, executable inputs/helper
 `0755` and ordinary resources `0644`; the receipt remains `0600`. Licenses are
 inside `Contents/Resources/Licenses`; a fresh sibling `APP.app.sources`

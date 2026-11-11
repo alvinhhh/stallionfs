@@ -11,7 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from stallionfs import __main__ as cli, core, _native, _native_create_recovery as recovery
+from stallionfs import (__main__ as cli, core, _native, _native_create_recovery as recovery,
+                       _native_creation_purge as purge)
 
 
 class NativeCreateCLI(unittest.TestCase):
@@ -66,13 +67,20 @@ class NativeCreateCLI(unittest.TestCase):
 
     def test_parser_help_and_rejection_before_storage(self):
         with patch.object(recovery, 'inventory', side_effect=AssertionError('inventory')), \
-             patch.object(recovery, 'continue_creation', side_effect=AssertionError('continue')):
+             patch.object(recovery, 'continue_creation', side_effect=AssertionError('continue')), \
+             patch.object(purge, 'purge_creation', side_effect=AssertionError('purge')):
             for arguments in (['--continue', self.transaction], [self.workspace, '--continue'],
                               ['A' * 32], ['../outside'], [self.workspace, '--continue', 'f' * 31],
                               [self.workspace, '--continue', 'F' * 32], ['--native-host', '/host'],
                               [self.workspace, '--native-host', '/host'], [self.workspace, '--yes'],
                               [self.workspace, '--backend', 'native-image'], [self.workspace, '--native-profile', 'production'],
-                              [self.workspace, '--seed', 'x'], [self.workspace, '--json']):
+                              [self.workspace, '--seed', 'x'], [self.workspace, '--json'],
+                              ['--purge', self.transaction], [self.workspace, '--purge'],
+                              [self.workspace, '--purge', 'F' * 32],
+                              [self.workspace, '--purge', '../outside'], [self.workspace, '--confirm'],
+                              [self.workspace, '--continue', self.transaction, '--confirm'],
+                              [self.workspace, '--purge', self.transaction, '--continue', self.transaction],
+                              [self.workspace, '--purge', self.transaction, '--native-host', '/host']):
                 with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
                     cli.main(['creations', *arguments])
                 self.assertEqual(raised.exception.code, 2)
@@ -82,6 +90,8 @@ class NativeCreateCLI(unittest.TestCase):
             self.assertEqual(raised.exception.code, 0)
             self.assertIn('[ID]', help_output.getvalue())
             self.assertIn('--continue TRANSACTION', help_output.getvalue())
+            self.assertIn('--purge TRANSACTION', help_output.getvalue())
+            self.assertIn('--confirm', help_output.getvalue())
             self.assertIn('--native-host NATIVE_HOST', help_output.getvalue())
         self.assertFalse(self.root.exists())
 
@@ -225,6 +235,131 @@ class NativeCreateCLI(unittest.TestCase):
                 with patch.object(cli.argparse.ArgumentParser, 'parse_args', autospec=True, side_effect=inspect_parser), \
                      self.assertRaises(ParsedCommand):
                     cli.main(command[1:])
+
+    def test_authoritative_retained_classification_and_replacement_results(self):
+        for authoritative, expected in ((True, 0), (False, 1), (None, 1)):
+            result = self.observation('retained')
+            if authoritative is not None:
+                result['entries'][0]['authoritative'] = authoritative
+            with self.subTest(authoritative=authoritative), patch.object(recovery, 'inventory', return_value=result):
+                status, output, error = self.invoke(['--root', str(self.root), 'creations', self.workspace])
+            self.assertEqual(status, expected)
+            self.assertEqual('Files preserved' in output + error, authoritative is True)
+            self.assertIn('entry: ' + json.dumps(result['entries'][0], sort_keys=True), output + error)
+        child = {'workspace': '3' * 32, 'transaction': '4' * 32}
+        original = {'workspace': self.workspace, 'transaction': self.transaction}
+        for state, expected in (('replacement-created', 0), ('retained-child', 1)):
+            result = {'status': state, **child, 'original': original,
+                      'result': {'metadata': {'state': 'candidate', **child}}}
+            with self.subTest(state=state), patch.object(recovery, 'continue_creation', return_value=result):
+                arguments = ['--root', str(self.root), 'creations', self.workspace, '--continue', self.transaction]
+                status, output, error = self.invoke(arguments)
+                self.assertEqual(status, expected)
+                self.assertNotIn('Workspace installed', output + error)
+                self.assertNotIn('Files preserved', output + error)
+                self.assertIn('original: ' + json.dumps(original, sort_keys=True), output + error)
+                status, output, error = self.invoke(['--json', *arguments])
+                payload = json.loads(output if expected == 0 else error)
+                self.assertEqual(payload, result if expected == 0 else {**result, 'error': state})
+
+    def test_purge_preview_confirmation_status_copy_and_complete_json(self):
+        replacement = {'workspace': '3' * 32, 'transaction': '4' * 32, 'spec_digest': 'a' * 64}
+        messages = {
+            'preview': 'No files removed. Add --confirm to permanently remove this creation’s retained files.',
+            'purged': 'Creation purge complete.',
+            'writer-unverified': 'Creation retained. A process may still be writing.',
+            'blocked': 'Creation retained. Run {inspect} to inspect.',
+            'interrupted': 'Creation purge interrupted. Some files may have been removed. Run {inspect} to inspect.',
+        }
+        for confirm in (False, True):
+            for state, message in messages.items():
+                result = {'status': state, 'workspace': self.workspace, 'transaction': self.transaction,
+                          'stage': '/retained/stage', 'input': '/retained/input/repo', 'backing': '/retained/owned/image.sfs',
+                          'replacement': replacement, 'files_removed': None if state == 'interrupted' else False,
+                          'eligible': state in {'preview', 'purged'}}
+                if state == 'blocked':
+                    result['code'] = 'exact-refusal'
+                if state == 'purged':
+                    result['already_complete'] = True
+                before = copy.deepcopy(result)
+                arguments = ['--root', str(self.root), 'creations', self.workspace, '--purge', self.transaction]
+                if confirm:
+                    arguments.append('--confirm')
+                expected = 0 if state in {'preview', 'purged'} else 1
+                inspect = shlex.join(['sfs', '--root', str(self.root), 'creations', self.workspace])
+                with self.subTest(state=state, confirm=confirm), \
+                     patch.object(recovery, 'inventory', side_effect=AssertionError('inventory')), \
+                     patch.object(recovery, 'continue_creation', side_effect=AssertionError('continue')), \
+                     patch.object(purge, 'purge_creation', return_value=result) as dispatch:
+                    status, output, error = self.invoke(arguments)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(error if expected == 0 else output, '')
+                    self.assertEqual((output + error).splitlines()[-1], message.format(inspect=inspect))
+                    dispatch.assert_called_once_with(self.root, self.workspace, self.transaction, confirm=confirm)
+                    dispatch.reset_mock()
+                    status, output, error = self.invoke(['--json', *arguments])
+                    self.assertEqual(status, expected)
+                    self.assertEqual(error if expected == 0 else output, '')
+                    self.assertEqual(json.loads(output if expected == 0 else error),
+                                     result if expected == 0 else {**result, 'error': result.get('code', state)})
+                    dispatch.assert_called_once_with(self.root, self.workspace, self.transaction, confirm=confirm)
+                self.assertEqual(result, before)
+        self.assertFalse(self.root.exists())
+
+    def test_purge_inspection_commands_round_trip_conflicting_environment(self):
+        default = str(Path.home() / 'Library/Application Support/stallionfs')
+        parse_args = cli.argparse.ArgumentParser.parse_args
+        class ParsedCommand(Exception):
+            pass
+        for selected in (default, str(self.base / "space and ' quote"), "~/creation root's store"):
+            root = Path(selected).expanduser().absolute()
+            for state in ('blocked', 'interrupted'):
+                result = {'status': state, 'workspace': self.workspace, 'transaction': self.transaction}
+                with self.subTest(selected=selected, state=state), \
+                     patch.dict(os.environ, {'STALLIONFS_HOME': str(self.base / 'different store')}), \
+                     patch.object(purge, 'purge_creation', return_value=result) as dispatch, \
+                     patch.object(Path, 'resolve', side_effect=AssertionError('root resolve')):
+                    status, output, error = self.invoke(['--root', selected, 'creations', self.workspace,
+                                                         '--purge', self.transaction])
+                    self.assertEqual((status, output), (1, ''))
+                    dispatch.assert_called_once_with(root, self.workspace, self.transaction, confirm=False)
+                    command = shlex.split(error.split('Run ', 1)[1].removesuffix(' to inspect.\n'))
+                    self.assertEqual(command, ['sfs', '--root', str(root), 'creations', self.workspace])
+                    def inspect_parser(parser, arguments):
+                        parsed = parse_args(parser, arguments)
+                        self.assertEqual(Path(parsed.root).expanduser().absolute(), root)
+                        self.assertEqual(parsed.id, self.workspace)
+                        self.assertIsNone(parsed.purge_creation)
+                        self.assertIsNone(parsed.continue_operation)
+                        self.assertIsNone(parsed.native_host)
+                        raise ParsedCommand
+                    with patch.object(cli.argparse.ArgumentParser, 'parse_args', autospec=True, side_effect=inspect_parser), \
+                         self.assertRaises(ParsedCommand):
+                        cli.main(command[1:])
+
+    def test_real_purge_refusals_and_busy_preview_leave_owned_store_unchanged(self):
+        arguments = ['--root', str(self.root), '--json', 'creations', self.workspace, '--purge', self.transaction]
+        before = self.snapshot()
+        status, output, error = self.invoke(arguments)
+        self.assertEqual((status, output), (1, ''))
+        self.assertEqual(json.loads(error)['status'], 'blocked')
+        self.assertEqual(self.snapshot(), before)
+        self.make_store()
+        stage = self.root / 'staging' / 'unbound'
+        stage.mkdir(mode=0o700)
+        self.save(stage / 'native-create', {'workspace': self.workspace, 'transaction': self.transaction})
+        before = self.snapshot()
+        for confirm in (False, True):
+            status, output, error = self.invoke([*arguments, *(['--confirm'] if confirm else [])])
+            self.assertEqual((status, output), (1, ''))
+            self.assertEqual(json.loads(error)['status'], 'blocked')
+            self.assertEqual(self.snapshot(), before)
+        with (self.root / '.lock').open('rb') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, output, error = self.invoke(arguments)
+            self.assertEqual((status, output), (1, ''))
+            self.assertEqual(json.loads(error)['status'], 'writer-unverified')
+        self.assertEqual(self.snapshot(), before)
 
     def test_real_empty_missing_busy_and_unbound_inventory_is_read_only(self):
         before = self.snapshot()
