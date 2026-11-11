@@ -22,6 +22,52 @@ func wait<T>(_ call: (@escaping (T) -> Void) -> Void) -> T {
     return result!
 }
 func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
+let fixtureFileSystemIdentity = try! StallionFileSystemIdentity(extensionAttributes: ["FSShortName": "sfsro27"])
+func fixtureFileSystem(accessPolicy: StallionFileSystem.AccessPolicy = .readOnly) -> StallionFileSystem {
+    StallionFileSystem(identity: .success(fixtureFileSystemIdentity), accessPolicy: accessPolicy)
+}
+func checkVolumeStatistics(_ volume: StallionVolume, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) {
+    for _ in 0..<32 {
+        let s = volume.volumeStatistics
+        need(s.fileSystemTypeName == identity.rawValue && s.blockSize == 4096 && s.ioSize == 4096,
+             "constant statistics retain the admitted package identity and block sizes")
+        need(s.totalBlocks == 0 && s.availableBlocks == 0 && s.freeBlocks == 0 && s.usedBlocks == 0 &&
+             s.totalBytes == 0 && s.availableBytes == 0 && s.freeBytes == 0 && s.usedBytes == 0 &&
+             s.totalFiles == 0 && s.freeFiles == 0 && s.fileSystemSubType == 0 &&
+             volume.supportedVolumeCapabilities.doesNotSupportVolumeSizes,
+             "unsupported capacity fields retain their defaults")
+        s.totalBlocks = 123; s.blockSize = 8192
+    }
+}
+private final class IdentityRefusalResource: FSPathURLResource {
+    override var isRevoked: Bool { fatalError("invalid module identity reached core-open admission") }
+}
+@MainActor func identityRefusalChecks(_ url: URL) {
+    let resource = IdentityRefusalResource(url: url, writable: false)
+    let invalid: [Any?] = [nil, NSNull(), [], "stallionfs", 1, [:],
+        ["FSShortName": NSNull()], ["FSShortName": 1], ["FSShortName": true],
+        ["FSShortName": ["stallionfs"]], ["FSShortName": ["name": "stallionfs"]],
+        ["FSShortName": ""], ["FSShortName": "unknown"], ["FSShortName": "STALLIONFS"],
+        ["FSShortName": "stallionfs "], ["FSShortName": "sfsro27\0"]]
+    // This unbundled helper also exercises the actual own-bundle resolver.
+    let owners = invalid.map { StallionExtension.fileSystemForTesting(extensionAttributes: $0) } +
+        [StallionExtension().fileSystem]
+    for owner in owners {
+        hooksReset()
+        var probes = 0, loads = 0
+        let probe: (FSProbeResult?, Error?) = wait { done in owner.probeResource(resource: resource) {
+            probes += 1; done(($0, $1))
+        } }
+        let load: (FSVolume?, Error?) = wait { done in owner.loadResource(resource: resource, arguments: []) {
+            loads += 1; done(($0, $1))
+        } }
+        need(probes == 1 && loads == 1 && probe.0 == nil && load.0 == nil &&
+             code(probe.1) == Int(EINVAL) && code(load.1) == Int(EINVAL),
+             "missing, malformed and unknown module identities fail both callbacks once")
+        need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0,
+             "invalid identity rejects before every core-open admission")
+    }
+}
 // Historical fixture assertions are test inputs, never production admission.
 func anchorMatches(_ result: sfs_result) -> Bool {
     rawBytes(result.uuid) == FixtureIdentity.uuid && result.generation == FixtureIdentity.generation &&
@@ -169,7 +215,7 @@ func unmountOrderingChecks(_ volume: StallionVolume, root: FSItem) {
 }
 
 func resourceUnloadChecks(_ url: URL) {
-    let owner = StallionFileSystem(), path = FSPathURLResource(url: url, writable: false)
+    let owner = fixtureFileSystem(), path = FSPathURLResource(url: url, writable: false)
     let loaded: (FSVolume?, Error?) = wait { done in owner.loadResource(resource: path, force: false) { done(($0, $1)) } }
     need(loaded.1 == nil && loaded.0 is StallionVolume, "resource owner loads real image")
     let volume = loaded.0 as! StallionVolume
@@ -189,6 +235,8 @@ func resourceUnloadChecks(_ url: URL) {
     let ordinaryReply = DispatchSemaphore(value: 0), unmounted = DispatchSemaphore(value: 0)
     volume.enqueue { held.signal(); release.wait() }
     need(held.wait(timeout: .now() + 10) == .success, "owned queue held")
+    hooksReset(); checkVolumeStatistics(volume)
+    need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "statistics never wait for the blocked volume queue or call the core")
     owner.unloadResource(resource: path) { error in
         need(code(error) == Int(EBUSY) && hooksCloses() == 0, "owner busy unload retains handle and scope")
         busyReply.signal()
@@ -389,7 +437,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         var h: OpaquePointer?, r = sfs_result(), info = sfs_image_information()
         need(sfs_image_open_readonly(url.path, "image.sfs", &h, &r) == SFS_OK, "general open")
         need(sfs_image_get_information(h, &info, &r) == SFS_OK && info.minor == 6, "general information")
-        let v = StallionVolume(admission: .forTesting(handle: h!, anchor: info.committed), resource: FSPathURLResource(url: url, writable: false), scope: false,
+        let v = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: h!, anchor: info.committed), resource: FSPathURLResource(url: url, writable: false), scope: false,
                               queue: DispatchQueue(label: "sfs.general"), itemLimit: 2)
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
         need(activated.0 != nil && activated.1 == nil, "general activation")
@@ -481,12 +529,12 @@ func generalNamespaceChecks(_ parent: URL) throws {
     let original = try damaged.read(upToCount: 1)!
     try damaged.seek(toOffset: anchors[1].committed_end - 1)
     try damaged.write(contentsOf: Data([original[0] ^ 0xff])); try damaged.close()
-    let corruptFS = StallionFileSystem()
+    let corruptFS = fixtureFileSystem()
     let corrupt: (FSProbeResult?, Error?) = wait { done in
         corruptFS.probeResource(resource: FSPathURLResource(url: urls[1], writable: false)) { done(($0, $1)) }
     }
     need(corrupt.0 == nil && code(corrupt.1) == Int(EIO), "corrupt root refused without fixture fallback")
-    let legacy = try make("general-legacy", minor: 5), fs = StallionFileSystem()
+    let legacy = try make("general-legacy", minor: 5), fs = fixtureFileSystem()
     let unsupported: (FSProbeResult?, Error?) = wait { done in fs.probeResource(resource: FSPathURLResource(url: legacy, writable: false)) { done(($0, $1)) } }
     need(unsupported.0 == nil && code(unsupported.1) == Int(ENOTSUP), "unsupported mounted format refused")
     need(code(sfsError(SFS_EXISTS, sfs_result())) == Int(EEXIST), "exact duplicate error")
@@ -497,15 +545,17 @@ func generalNamespaceChecks(_ parent: URL) throws {
     static func main() throws {
         need(CommandLine.arguments.count == 2, "one fixture parent")
         let url = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        identityRefusalChecks(url)
         let path = FSPathURLResource(url: url, writable: false)
-        let fileSystem = StallionFileSystem()
+        let fileSystem = fixtureFileSystem()
         let probe: (FSProbeResult?, Error?) = wait { done in fileSystem.probeResource(resource: path) { done(($0, $1)) } }
         need(probe.0 != nil && probe.1 == nil, "independent readonly probe")
         var handle: OpaquePointer?, r = sfs_result()
         need(sfs_image_open_readonly(url.path, "image.sfs", &handle, &r) == SFS_OK && handle != nil && anchorMatches(r), "real readonly admission")
         need(r.coverage == SFS_COVERAGE_ROOT_ONLY, "root-only admission")
         let queue = DispatchQueue(label: "sfs.offline")
-        let volume = StallionVolume(admission: .forTesting(handle: handle!, anchor: r), resource: path, scope: false, queue: queue)
+        let volume = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: handle!, anchor: r), resource: path, scope: false, queue: queue)
+        checkVolumeStatistics(volume)
         let inactive: Error? = wait { done in volume.mount(arguments: [], replyHandler: done) }
         need(inactive != nil, "inactive mount refused")
         let rootReply: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
@@ -678,6 +728,8 @@ func generalNamespaceChecks(_ parent: URL) throws {
         let closeCount = hooksCloses()
         let again: Error? = wait { done in volume.enqueue { done(volume.unload().error) } }
         need(code(again) == Int(EIO) && hooksCloses() == closeCount, "duplicate unload no retry")
+        hooksReset(); checkVolumeStatistics(volume)
+        need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "statistics after consumed unload never call the core")
         need(sfs_image_open_readonly(url.path, "image.sfs", &competitor, &busy) == SFS_OK, "lock released after close error")
         need(sfs_image_close(competitor, &busy) == SFS_OK, "competitor close")
         need(hooksWrites() == 0, "no image mutation")
@@ -685,7 +737,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         var poisonedHandle: OpaquePointer?, poisonedAnchor = sfs_result()
         need(sfs_image_open_readonly(url.path, "image.sfs", &poisonedHandle, &poisonedAnchor) == SFS_OK &&
              poisonedHandle != nil && anchorMatches(poisonedAnchor), "fatal case readonly admission")
-        let poisoned = StallionVolume(admission: .forTesting(handle: poisonedHandle!, anchor: poisonedAnchor), resource: path, scope: false,
+        let poisoned = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: poisonedHandle!, anchor: poisonedAnchor), resource: path, scope: false,
                                       queue: DispatchQueue(label: "sfs.offline.fatal"))
         let poisonRoot: (FSItem?, Error?) = wait { done in poisoned.activate { done(($0, $1)) } }
         need(poisonRoot.0 != nil && poisonRoot.1 == nil, "fatal case activation")
@@ -716,6 +768,8 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(code(poisonDeactivate) == Int(EIO) && poisonActivate.0 == nil && code(poisonActivate.1) == Int(EIO) &&
              code(poisonRemount) == Int(EIO) && code(poisonSync) == Int(EIO), "first fatal error retained")
         need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "purge cannot revive or perform I/O")
+        checkVolumeStatistics(poisoned)
+        need(hooksReads() == 0 && hooksWrites() == 0 && hooksCloses() == 0, "poisoned statistics never call the core")
         let poisonClose: Error? = wait { done in poisoned.enqueue { done(poisoned.unload().error) } }
         let poisonCloseCount = hooksCloses()
         let poisonDuplicate: Error? = wait { done in poisoned.enqueue { done(poisoned.unload().error) } }
@@ -730,7 +784,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(sfs_image_open_readonly(url.path, "image.sfs", &prefixHandle, &prefixAnchor) == SFS_OK &&
              prefixHandle != nil && anchorMatches(prefixAnchor), "prefix case readonly admission")
         let borrowedPrefixHandle = prefixHandle!
-        let prefixVolume = StallionVolume(admission: .forTesting(handle: borrowedPrefixHandle, anchor: prefixAnchor), resource: path, scope: false,
+        let prefixVolume = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: borrowedPrefixHandle, anchor: prefixAnchor), resource: path, scope: false,
                                           queue: DispatchQueue(label: "sfs.offline.prefix"))
         let prefixRoot: (FSItem?, Error?) = wait { done in prefixVolume.activate { done(($0, $1)) } }
         need(prefixRoot.0 != nil && prefixRoot.1 == nil, "prefix case activation")

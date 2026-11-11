@@ -25,6 +25,23 @@ func resultMaskTrace(_ text: String) {
 }
 #endif
 func code(_ error: Error?) -> Int { (error as NSError?)?.code ?? 0 }
+let fixtureFileSystemIdentity = try! StallionFileSystemIdentity(extensionAttributes: ["FSShortName": "sfsro27"])
+func fixtureFileSystem(accessPolicy: StallionFileSystem.AccessPolicy = .readOnly, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) -> StallionFileSystem {
+    StallionFileSystem(identity: .success(identity), accessPolicy: accessPolicy)
+}
+func checkVolumeStatistics(_ volume: StallionVolume, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) {
+    for _ in 0..<32 {
+        let s = volume.volumeStatistics
+        need(s.fileSystemTypeName == identity.rawValue && s.blockSize == 4096 && s.ioSize == 4096,
+             "constant statistics retain the admitted package identity and block sizes")
+        need(s.totalBlocks == 0 && s.availableBlocks == 0 && s.freeBlocks == 0 && s.usedBlocks == 0 &&
+             s.totalBytes == 0 && s.availableBytes == 0 && s.freeBytes == 0 && s.usedBytes == 0 &&
+             s.totalFiles == 0 && s.freeFiles == 0 && s.fileSystemSubType == 0 &&
+             volume.supportedVolumeCapabilities.doesNotSupportVolumeSizes,
+             "unsupported capacity fields retain their defaults")
+        s.totalBlocks = 123; s.blockSize = 8192
+    }
+}
 func wait<T>(_ operation: (@escaping (T) -> Void) -> Void) -> T {
     let done = DispatchSemaphore(value: 0); var result: T?
     operation { result = $0; done.signal() }
@@ -106,6 +123,13 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
 #endif
 
 @MainActor func factoryPolicyChecks(_ parent: URL) throws {
+    for identity in [StallionFileSystemIdentity.production, .privateDiagnostic] {
+        let directory = parent.appendingPathComponent(identity.rawValue, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try factoryPolicyChecks(directory, identity: identity)
+    }
+}
+@MainActor func factoryPolicyChecks(_ parent: URL, identity: StallionFileSystemIdentity) throws {
     let fixture = try Fixture(parent,"factory-readonly",mode:0o700)
     let image = fixture.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
@@ -113,12 +137,13 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
 #else
     let modes = [0,1,2]
 #endif
-    let fs = StallionExtension().fileSystem
+    let fs = StallionExtension.fileSystemForTesting(extensionAttributes: ["FSShortName": identity.rawValue])
     for mode in modes {
         let resource = FSPathURLResource(url:fixture.url,writable:mode != 2)
         let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:mode == 1 ? ["--rdonly"] : []) { done(($0,$1)) } }
         need(loaded.0 != nil && loaded.1 == nil,"public factory readonly load")
         let volume = loaded.0 as! StallionVolume
+        checkVolumeStatistics(volume, identity: identity)
         let coreRO: Bool = wait { done in volume.enqueue { done(volume.coreReadOnlyForTesting()) } }
         need(coreRO && volume.requestedMountOptions.contains(.readOnly),"public factory readonly core and mount request")
         let active: (FSItem?,Error?) = wait { done in volume.activate { done(($0,$1)) } };need(active.1 == nil,"public factory readonly activation")
@@ -135,11 +160,13 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
         let _: Bool = wait { done in volume.unmount { done(true) } }
         let deactivated: Error? = wait { volume.deactivate(options:[],replyHandler:$0) };need(deactivated == nil,"public factory readonly deactivation")
         let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(unloaded == nil,"public factory readonly unload")
+        checkVolumeStatistics(volume, identity: identity)
         let again: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:mode == 1 ? ["--rdonly"] : []) { done(($0,$1)) } }
         need(again.1 == nil && again.0 !== volume,"same public factory and resource reopen with new ownership")
         let fresh = again.0 as! StallionVolume
         let freshRO: Bool = wait { done in fresh.enqueue { done(fresh.coreReadOnlyForTesting()) } }
         need(freshRO && fresh.requestedMountOptions.contains(.readOnly),"reopened factory retains readonly selection")
+        checkVolumeStatistics(fresh, identity: identity)
         let freshClose: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(freshClose == nil,"fresh readonly ownership consumed")
         let after = try Data(contentsOf:image);need(after==before,"public factory denied mutation preserves image")
     }
@@ -158,13 +185,13 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     let recovered: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:healthy,arguments:[]) { done(($0,$1)) } }
     need(recovered.1 == nil && recovered.0 != nil,"same factory recovers after configuration failure")
     let recoveredClose: Error? = wait { fs.unloadResource(resource:healthy,replyHandler:$0) };need(recoveredClose == nil,"recovered fresh handle closes")
-    try accessPolicyChecks(parent,factory:true)
+    try accessPolicyChecks(parent,factory:true,identity:identity)
 #endif
 }
 
-@MainActor func accessPolicyChecks(_ parent: URL, factory: Bool = false) throws {
+@MainActor func accessPolicyChecks(_ parent: URL, factory: Bool = false, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) throws {
     func makeFileSystem() -> StallionFileSystem {
-        factory ? StallionExtension().fileSystem : StallionFileSystem(accessPolicy:.contextualWrites)
+        factory ? StallionExtension.fileSystemForTesting(extensionAttributes: ["FSShortName": identity.rawValue]) : fixtureFileSystem(accessPolicy:.contextualWrites)
     }
     let f = try Fixture(parent,"access-policy"), resource = FSPathURLResource(url: f.url,writable: true)
     let image = f.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
@@ -183,17 +210,19 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
         need(code(error) == expectedError,"admission deactivation preserves delivery outcome")
         let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) }
         need(code(unloaded) == expectedError,"admission unload consumes handle and preserves outcome")
+        checkVolumeStatistics(volume, identity: factory ? identity : fixtureFileSystemIdentity)
     }
     // SDK FSTaskOptions.init is unavailable. Exercise its exact shared decoder;
     // installed task delivery is a separate qualification requirement.
     for mode in 0..<3 {
-        let fs = mode == 0 ? StallionFileSystem() : makeFileSystem()
+        let fs = mode == 0 ? fixtureFileSystem(identity: identity) : makeFileSystem()
 #if STALLION_WRITE_DIAGNOSTIC
         if mode == 2 { fs.diagnosticUUID = f.identity }
 #endif
         let reply = load(fs,["--rdonly"])
         need(reply.1 == nil && reply.0 != nil,"explicit readonly dominates every opt-in")
         let volume = reply.0 as! StallionVolume
+        checkVolumeStatistics(volume, identity: factory ? identity : fixtureFileSystemIdentity)
         let coreRO: Bool = wait { done in volume.enqueue { done(volume.coreReadOnlyForTesting()) } }
         need(coreRO && volume.requestedMountOptions.contains(.readOnly),"readonly core policy and mount request")
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
@@ -231,6 +260,7 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     need(reply.1 == nil && reply.0 != nil,"explicit contextual mutation admission")
     let v = reply.0 as! StallionVolume
     need(v.volumeID.uuid==f.identity && !v.requestedMountOptions.contains(.readOnly),"stored volume identity and admitted mode")
+    let _: Bool = wait { done in v.enqueue { checkVolumeStatistics(v, identity: factory ? identity : fixtureFileSystemIdentity); done(true) } }
     let coreRO: Bool = wait { done in v.enqueue { done(v.coreReadOnlyForTesting()) } }
     need(!coreRO,"mutation admission uses actual writable core")
     var competing: OpaquePointer?, receipt = sfs_result()
@@ -268,7 +298,16 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     need(opened == nil && modes()==[.read,.write],"authorized open grants all modes only on success")
     let foreignExisting: Error?=wait { v.openForTesting(item,modes:[.read,.write],caller:foreign,reply:$0) }
     need(code(foreignExisting)==Int(EACCES) && modes()==[.read,.write],"failed foreign acquisition preserves existing writer grant")
-    let written: (FSWriteFileResult?,Error?)=wait { done in v.write(contents:Data("changed!".utf8),to:item,at:0) { done(($0,$1)) } }
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    v.enqueue { held.signal(); need(release.wait(timeout: .now() + 10) == .success,"statistics release pending writer") }
+    need(held.wait(timeout: .now() + 10) == .success,"writer queue held")
+    let written: (FSWriteFileResult?,Error?)=wait { done in
+        v.write(contents:Data("changed!".utf8),to:item,at:0) {
+            checkVolumeStatistics(v, identity: factory ? identity : fixtureFileSystemIdentity); done(($0,$1))
+        }
+        checkVolumeStatistics(v, identity: factory ? identity : fixtureFileSystemIdentity)
+        release.signal()
+    }
     need(written.0 != nil && written.1 == nil,"retained write admission uses shared real-core commit")
     let reduced: Error?=wait { v.closeForTesting(item,modes:.write,caller:foreign,reply:$0) }
     need(reduced == nil && modes() == .write,"different closing caller may reduce retained modes")
@@ -356,7 +395,7 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     let otherDeactivate: Error?=wait { otherVolume.deactivate(options:[],replyHandler:$0) };need(code(otherDeactivate)==Int(EACCES),"never-opened failure retained through deactivate")
     let otherClose: Error?=wait { otherFS.unloadResource(resource:otherResource,replyHandler:$0) };need(code(otherClose)==Int(EACCES),"second image consuming close preserves first delivery failure")
     need(other.contents()==Data("original".utf8),"never-opened data write leaves bytes unchanged")
-    try contextualExecutionAccess(parent,factory:factory)
+    try contextualExecutionAccess(parent,factory:factory,identity:identity)
 #else
     need(reply.0 == nil && code(reply.1)==Int(ENOTSUP),"missing contextual mutation build cannot enable production policy")
 #endif
@@ -388,12 +427,12 @@ func executionAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolum
         done(true)
     } }
 }
-@MainActor func contextualExecutionAccess(_ parent: URL, factory: Bool) throws {
+@MainActor func contextualExecutionAccess(_ parent: URL, factory: Bool, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) throws {
     func exercise(_ name: String, mode: UInt32 = 0o700, acl: Bool = false, flags: UInt32 = 0,
                   owner: uid_t = geteuid(), writable: Bool = true, endError: Int32 = 0, persistedMode: UInt32? = nil,
                   body: (StallionVolume,FSItem,StallionItem,ExecutionResource,([StallionItem]) -> Void) throws -> Void) throws {
         let f = try Fixture(parent,"execute-"+name,mode:mode,acl:acl,owner:owner,extra:true,sourceFlags:flags)
-        let fs = factory ? StallionExtension().fileSystem : StallionFileSystem(accessPolicy:.contextualWrites)
+        let fs = factory ? StallionExtension.fileSystemForTesting(extensionAttributes: ["FSShortName": identity.rawValue]) : fixtureFileSystem(accessPolicy:.contextualWrites)
         let resource = ExecutionResource(url:f.url,writable:writable)
         let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:[]) { done(($0,$1)) } }
         need(loaded.1 == nil && loaded.0 != nil,"execution uses actual contextual resource admission")
@@ -561,7 +600,7 @@ final class Mounted {
         need(opened == SFS_OK, "open adapter")
         coreHandle = h!
         resource = suppliedResource ?? FSPathURLResource(url: fixture.url, writable: writable)
-        volume = StallionVolume(admission: .forTesting(handle: h!, anchor: r, writable: writable), resource: resource, scope: false, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
+        volume = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: h!, anchor: r, writable: writable), resource: resource, scope: false, queue: DispatchQueue(label: "sfs.write.test"), itemLimit: itemLimit)
         if writable { try volume.enableWriteDiagnostic(expectedUUID: fixture.identity) }
         let v = volume
         let activated: (FSItem?, Error?) = wait { done in v.activate { done(($0, $1)) } }
@@ -575,7 +614,12 @@ final class Mounted {
         need(file === alias, "aliases share canonical item")
     }
     func write(_ data: Data, at offset: off_t = 0, alias: Bool = false) -> (Int, Error?) {
-        wait { done in volume.writeCountForTesting(contents: data, to: alias ? self.alias : file, at: offset) { done(($0, $1)) } }
+        checkVolumeStatistics(volume)
+        let result: (Int, Error?) = wait { done in volume.writeCountForTesting(contents: data, to: alias ? self.alias : file, at: offset) {
+            checkVolumeStatistics(self.volume); done(($0, $1))
+        } }
+        checkVolumeStatistics(volume)
+        return result
     }
     func set(_ request: FSItem.SetAttributesRequest, item: FSItem? = nil) -> (FSItem.Attributes?, Error?) {
         wait { done in volume.setAttributesValueForTesting(request, on: item ?? file, caller: CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))) { done(($0, $1)) } }
@@ -599,6 +643,7 @@ final class Mounted {
         }
         let consumed: Bool = wait { done in volume.enqueue { done(self.volume.unload().consumed) } }
         need(consumed, "quiescent unload consumes ownership")
+        checkVolumeStatistics(volume)
     }
 }
 
@@ -1010,7 +1055,7 @@ func admission(_ parent: URL) throws {
 func lifetimeAndBinding(_ parent: URL) throws {
     let f = try Fixture(parent, "lifetime")
     let resource = FSPathURLResource(url: f.url, writable: true)
-    let unbound = StallionFileSystem()
+    let unbound = fixtureFileSystem()
     let loaded: (FSVolume?, Error?) = wait { done in unbound.loadResource(resource: resource, force: false) { done(($0,$1)) } }
     need(loaded.1 == nil && (loaded.0 as! StallionVolume).requestedMountOptions.contains(.readOnly), "public default resource remains read-only")
 #if STALLION_CONTEXT_HANDLERS
@@ -1022,10 +1067,10 @@ func lifetimeAndBinding(_ parent: URL) throws {
     need(refusedLink.0 == nil && code(refusedLink.1) == Int(EROFS), "writable generic resource without UUID cannot link")
 #endif
     let unloaded: Error? = wait { unbound.unloadResource(resource: resource, replyHandler: $0) }; need(unloaded == nil, "unbound unload")
-    let wrong = StallionFileSystem(); wrong.diagnosticUUID = UUID()
+    let wrong = fixtureFileSystem(); wrong.diagnosticUUID = UUID()
     let denied: (FSVolume?, Error?) = wait { done in wrong.loadResource(resource: resource, force: false) { done(($0,$1)) } }
     need(denied.0 == nil && code(denied.1) == Int(EACCES), "wrong UUID binding refused")
-    let bound = StallionFileSystem(); bound.diagnosticUUID = f.identity
+    let bound = fixtureFileSystem(); bound.diagnosticUUID = f.identity
     let readonlyResource = FSPathURLResource(url: f.url, writable: false)
     let deniedMode: (FSVolume?, Error?) = wait { done in bound.loadResource(resource: readonlyResource, force: false) { done(($0,$1)) } }
     need(deniedMode.0 == nil && code(deniedMode.1) == Int(EACCES), "resource writable gate")
@@ -1193,7 +1238,7 @@ func pinOwnershipLimits(_ parent: URL) throws {
     let allocation = try Fixture(parent, "pin-allocation")
     var h: OpaquePointer?, r = sfs_result()
     need(sfs_image_open(allocation.url.path, "image.sfs", &h, &r) == SFS_OK, "allocation fixture open")
-    let volume = StallionVolume(admission: .forTesting(handle: h!, anchor: r, writable: true), resource: FSPathURLResource(url: allocation.url, writable: true), scope: false, queue: DispatchQueue(label: "sfs.pin.allocation"))
+    let volume = StallionVolume(identity: fixtureFileSystemIdentity, admission: .forTesting(handle: h!, anchor: r, writable: true), resource: FSPathURLResource(url: allocation.url, writable: true), scope: false, queue: DispatchQueue(label: "sfs.pin.allocation"))
     fault(7, 1)
     do { try volume.enableWriteDiagnostic(expectedUUID: allocation.identity); fatalError("pin allocation should fail before exposure") }
     catch { need(code(error) == Int(ENOMEM) && hits() == 1 && !volume.diagnosticWritable, "pin configuration NOMEM stays unexposed") }
@@ -2273,7 +2318,7 @@ final class CreationMount {
         let status = writable ? sfs_image_open(url.path,"image.sfs",&h,&r) : sfs_image_open_readonly(url.path,"image.sfs",&h,&r)
         need(status == SFS_OK,"creation fixture open"); coreHandle = h!
         resource = FSPathURLResource(url:url,writable:writable)
-        volume = StallionVolume(admission:.forTesting(handle:h!,anchor:r,writable:writable),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.create.test"),itemLimit:limit)
+        volume = StallionVolume(identity: fixtureFileSystemIdentity, admission:.forTesting(handle:h!,anchor:r,writable:writable),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.create.test"),itemLimit:limit)
         let v = volume
         if writable && enable { try v.enableWriteDiagnostic(expectedUUID:identity) }
         let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }
@@ -3976,7 +4021,7 @@ func renamePolicies(_ parent: URL) throws {
             m.close(); var h: OpaquePointer?, r = sfs_result()
             let status = spec == 0 ? sfs_image_open_readonly(m.url.path,"image.sfs",&h,&r) : sfs_image_open(m.url.path,"image.sfs",&h,&r)
             need(status == SFS_OK,"rename unbound gate open")
-            let resource = FSPathURLResource(url:m.url,writable:spec != 0), v = StallionVolume(admission:.forTesting(handle:h!,anchor:r),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.rename.gate"))
+            let resource = FSPathURLResource(url:m.url,writable:spec != 0), v = StallionVolume(identity: fixtureFileSystemIdentity, admission:.forTesting(handle:h!,anchor:r),resource:resource,scope:false,queue:DispatchQueue(label:"sfs.rename.gate"))
             let activation: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }; need(activation.1 == nil,"rename gate activate")
             let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) }; need(mounted == nil,"rename gate mount")
             let result: (FSRenameItemResult?,Error?) = wait { done in v.renameResultForTesting(activation.0!,sourceDirectory:activation.0!,sourceName:FSFileName(string:"A"),destinationName:FSFileName(string:"new"),destinationDirectory:activation.0!,caller:CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) { done(($0,$1)) } }
