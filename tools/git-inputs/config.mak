@@ -1,0 +1,14 @@
+prefix = /stallionfs-private-git
+RUNTIME_PREFIX = YesPlease
+INSTALL_SYMLINKS = YesPlease
+NO_HOMEBREW = YesPlease
+NO_FINK = YesPlease
+NO_DARWIN_PORTS = YesPlease
+NO_GETTEXT = YesPlease
+NO_PERL = YesPlease
+NO_PYTHON = YesPlease
+NO_TCLTK = YesPlease
+NO_GITWEB = YesPlease
+CURL_CONFIG = /usr/bin/curl-config
+SHELL_PATH = /bin/sh
+NO_RUST = YesPlease

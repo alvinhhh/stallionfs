@@ -186,8 +186,10 @@ class OrdinaryCopy(unittest.TestCase):
                     self.assertEqual((destination / 'nested/data').stat().st_ino,
                                      (destination / 'nested/alias').stat().st_ino)
                     self.assertEqual((destination / 'nested/data').stat().st_nlink, 2)
-                    self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
-            self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+                    report = self.checks.verify_source(before, self.checks.snapshot(source))
+                    self.assertTrue(report['unchanged'], report)
+            report = self.checks.verify_source(outside_before, self.checks.snapshot(outside))
+            self.assertTrue(report['unchanged'], report)
         finally:
             for path in protected:
                 if path.exists():
@@ -308,8 +310,10 @@ class OrdinaryCopy(unittest.TestCase):
                 (destination / 'b/file').write_bytes(b'changed')
                 self.assertEqual((destination / 'c/file').read_bytes(), b'changed')
                 self.assertEqual((source / 'a/file').read_bytes(), b'original')
-                self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
-        self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+                report = self.checks.verify_source(before, self.checks.snapshot(source))
+                self.assertTrue(report['unchanged'], report)
+        report = self.checks.verify_source(outside_before, self.checks.snapshot(outside))
+        self.assertTrue(report['unchanged'], report)
 
     def test_existing_destinations_are_never_merged_replaced_or_followed(self):
         source = self.base / 'source'

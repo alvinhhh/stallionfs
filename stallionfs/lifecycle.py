@@ -122,7 +122,8 @@ class Lifecycle:
         if any(Path(row['path']).is_relative_to(root) for row in mounts()):
             raise core.StallionError(f'Workspace contains a mounted volume: {path}')
 
-    def _standalone_git(self, repo):
+    def _standalone_git(self, repo, *, runtime=None):
+        from ._native_create_git import inspect_standalone
         gitdir = repo / '.git'
         if (not gitdir.is_dir() or gitdir.is_symlink() or
                 any(os.path.lexists(gitdir / name) for name in
@@ -130,16 +131,7 @@ class Lifecycle:
                 any(gitdir.rglob('*.lock'))):
             raise core.StallionError('Workspace requires standalone Git storage without active Git locks')
         core.validate_tree(gitdir)
-        if Path(core.git(repo, 'rev-parse', '--absolute-git-dir')).resolve() != gitdir.resolve():
-            raise core.StallionError('Workspace uses external Git storage')
-        for config in (gitdir / 'config', gitdir / 'config.worktree'):
-            if not config.exists():
-                continue
-            values = core.git(repo, 'config', '--file', config, '--no-includes', '--list').splitlines()
-            for line in values:
-                key = line.partition('=')[0].lower()
-                if key == 'core.worktree' or key == 'include.path' or key.startswith('includeif.'):
-                    raise core.StallionError('Workspace Git configuration contains external worktree or include references')
+        inspect_standalone(repo, branch=True, structure_required=False, runtime=runtime)
 
     def _closed_payload(self, path, meta, *, quiescent):
         if meta.get('backend') == 'native-image':

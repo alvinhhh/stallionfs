@@ -249,7 +249,7 @@ def validate(record, workspace, *, complete=False):
         'data_absent', 'cleanup_complete', 'unlink_outcome', 'guard_outcome', 'ownership', 'previous_unresolved'}
     if not complete: required.add('manifest')
     optional = {'format', 'guard', 'first_error', 'last_error', 'error_count', 'failed_guard',
-        'guard_receipt_unavailable', 'descriptor_close_error', 'abandoned_attempt'}
+        'guard_receipt_unavailable', 'descriptor_close_error', 'abandoned_attempt', 'creation', 'creation_binding'}
     if not required <= set(record) or not set(record) <= required | optional: refuse('unknown or missing purge fields')
     if complete and record['stage'] != 'complete': refuse('incomplete completion receipt')
     if not complete and record['stage'] == 'complete': refuse('completion must use its compact receipt')
@@ -458,6 +458,10 @@ def initial(store, workspace, opening, fds, prior):
         'ownership': {'transaction': metadata['transaction'], 'origin_target': metadata['native_image']},
         'previous_unresolved': None if prior is None else {'operation': prior['operation'],
             'id': prior['id'], 'outcome': prior['outcome']}}
+    from ._native_create_authority import installed
+    record['creation'] = installed(path, metadata)
+    record['creation_binding'] = next(row for row in manifest if row['path'] == 'native-create.json')
+    writer_authority(record)
     validate(record, workspace)
     references(store, record)
     return record
@@ -676,11 +680,13 @@ def compact(record):
 
 
 def same_completion(record, journal):
-    for key in ('workspace', 'id', 'target', 'parents', 'object', 'container', 'container_identity', 'marker', 'protection', 'manifest_digest'):
+    for key in ('workspace', 'id', 'target', 'parents', 'object', 'container', 'container_identity', 'marker', 'protection', 'manifest_digest', 'creation', 'creation_binding'):
         if record.get(key) != journal.get(key): refuse('completion and journal disagree')
 
 
 def finish(store, record, opening, fds, *, mutate):
+    if mutate:
+        writer_authority(record)
     workspace = record['workspace']
     check_parents(store, record)
     for parent, name in ((fds['trash'], workspace), (fds['workspaces'], workspace), (fds['staging'], record['container'])):
@@ -732,7 +738,23 @@ def admit_resume_inputs(opening, fds, record):
         opening.close(tombstone)
 
 
+def writer_authority(record):
+    from ._native_create_authority import retained
+    retained(record.get('creation'), record['target'], record['workspace'])
+    binding = record.get('creation_binding')
+    if (type(binding) is not dict or set(binding) != {'path', 'kind', 'identity', 'sha256'}
+            or binding['path'] != 'native-create.json' or binding['kind'] != 'file'
+            or not valid_identity(binding['identity'])):
+        refuse('native creation proof binding is missing')
+    data = (json.dumps({'format': 1, **record['creation']['proof']}, sort_keys=True, indent=2) + '\n').encode()
+    if hashlib.sha256(data).hexdigest() != binding['sha256']:
+        refuse('native creation proof binding changed')
+    if 'manifest' in record and [row for row in record['manifest'] if row['path'] == 'native-create.json'] != [binding]:
+        refuse('native creation proof manifest changed')
+
+
 def execute(store, record, opening, fds, *, resumed):
+    writer_authority(record)
     workspace = record['workspace']
     if record['target']['directory'] != str(store.root / 'trash' / workspace) or record['target']['component'] != 'image.sfs':
         refuse('source target is outside the selected trash resource')
@@ -811,6 +833,7 @@ def _purge_locked(store, workspace, *, yes=False):
                     return response(record, would_delete=True, scope='current filesystem and all in-image snapshots; not secure erasure')
                 save(store, record)
             elif not yes:
+                writer_authority(record)
                 return response(record, would_delete=True, pending=True)
             return execute(store, record, opening, fds, resumed=resumed)
     except BaseException as error:

@@ -321,6 +321,16 @@ def _stable(info):
             info.st_size, info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_flags", None))
 
 
+def _snapshot_change(message, path, before, after):
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+              'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_flags')
+    error = RuntimeError(message)
+    error.add_note(json.dumps({'path': os.fsdecode(path),
+                              'before': {name: getattr(before, name, None) for name in fields},
+                              'after': {name: getattr(after, name, None) for name in fields}}, sort_keys=True))
+    return error
+
+
 def _inventory_signature(info):
     return (_stable(info), info.st_nlink, getattr(info, 'st_birthtime_ns', None), getattr(info, 'st_gen', None))
 
@@ -424,8 +434,9 @@ def _snapshot(root, *, allow_special=False, observe_sharing=False, budget=None, 
         if kind == "file":
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
             with os.fdopen(fd, "rb", buffering=0) as stream:
-                if _stable(os.fstat(stream.fileno())) != _stable(before):
-                    raise RuntimeError("File changed before reading")
+                opened = os.fstat(stream.fileno())
+                if _stable(opened) != _stable(before):
+                    raise _snapshot_change("File changed before reading", path, before, opened)
                 digest = hashlib.sha256()
                 offset = 0
                 while count := stream.readinto(view[:min(len(buffer), before.st_size - offset + 1)]
@@ -441,8 +452,9 @@ def _snapshot(root, *, allow_special=False, observe_sharing=False, budget=None, 
                                   if budget is not None else _holes(stream.fileno(), before.st_size)))
                 if observe_sharing:
                     row["clone_attributes"] = _clone_attributes(stream.fileno())
-                if _stable(os.fstat(stream.fileno())) != _stable(before):
-                    raise RuntimeError("File changed while reading")
+                read = os.fstat(stream.fileno())
+                if _stable(read) != _stable(before):
+                    raise _snapshot_change("File changed while reading", path, before, read)
         elif kind == "symlink":
             if budget is not None: budget.reserve(ticket, 4 * before.st_size)
             row["symlink_bytes"] = os.readlink(path).hex()

@@ -113,9 +113,40 @@ a destination ID in a remnant does not authorize continuation. Candidate
 installation through `creations ID --continue TRANSACTION` requires completed
 verification, an authoritative journal and the exact transaction. Repeating
 continuation for an installed workspace checks its installation proof.
-Incomplete producer proofs, helper/controller death, interrupted Git setup and
-reclamation remain unsupported by this command. Incomplete inspection retains
-its discovered entries and reports the paths it could not finish inspecting.
+New creation requests also support one fresh replacement after a pre-install
+interruption. An immutable request binds the prepared seed, branch, capacity,
+import policy, installation settings, qualified Git payload and controller lock
+identities before any helper, clone or Git effect. Explicit import budgets retain
+all six values. Otherwise the request binds the default policy; the importer
+derives its actual budget after population and records it in the import receipt.
+The seed must remain quiescent under its managed lock. Direct same-user changes
+to a seed, controls or payload are outside managed exclusion and may cause refusal.
+
+The old journal reserves exactly one replacement. Continuation completes an
+exact control-only bootstrap prefix, or reports an already attempted child; it
+never recursively retries that child through the old ID. A completed image uses
+the existing installation proof route. Fresh replacements get new IDs and do not
+read or reuse the old partial input. A qualified Git actor with unresolved output
+may permit a fresh replacement, but never authorizes deletion of the old input.
+Unresolved package/Host helpers retain the attempt. No PID disappearance, free
+controller lease or elapsed time establishes that a lost writer has stopped.
+
+`creations ID --purge TRANSACTION` previews deliberate disposal of an eligible
+pre-install attempt. `--confirm` permanently removes only its bound stage input,
+partial backing and fixed metadata after exact locks, terminal actor receipts,
+ownership and namespace checks. A write-ahead deletion journal supports resumed
+removal; unexpected entries, substituted files and unverified writers refuse.
+The compact completion keeps the original IDs, request and replacement mapping;
+controller lock files remain. This does not reclaim unknown-writer attempts,
+installed workspaces or arbitrary unbound stages. No automatic expiration is used.
+An interrupted disposal remains inspectable from its bound journal after input,
+marker or stage removal. Inspection reports disposal progress instead of claiming
+that files are preserved. Only an exact confirmed purge resumes removal. A partial
+compact completion can be finished only as its expected byte prefix on the bound
+control inode; file and directory fences and exact readback precede journal removal,
+including confirmed retries. Conflicting or substituted completion controls refuse.
+Incomplete inspection retains discovered entries and reports paths it could not
+finish inspecting. Process interruption tests do not qualify physical power loss.
 
 Mount/unmount intents and helper output remain in each workspace's
 `native-operations` directory; the active typed record is also in the existing

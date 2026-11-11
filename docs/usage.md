@@ -246,9 +246,28 @@ mounted repository. Once mounting has been attempted, continuation reports
 `already-installed` with a `mount-state` handoff; follow the mount/unmount
 instructions above.
 
+For an eligible interrupted pre-install request, the same continuation command
+creates one fresh replacement from the original prepared seed and reports both
+IDs. It preserves the interrupted attempt. Repeating the old command follows
+that same replacement; an interrupted replacement requires its own ID for a
+new explicit attempt. Lost or pending helper receipts can block continuation.
+
+To inspect deliberate disposal of an abandoned pre-install attempt:
+
+```sh
+sfs --root PATH creations ID --purge TRANSACTION
+sfs --root PATH creations ID --purge TRANSACTION --confirm
+```
+
+The first command is read-only. Confirmation permanently deletes only the
+eligible attempt's retained files. A process that may still write, unknown
+ownership, changed controls or an installed image prevents disposal. The original
+ID and any replacement mapping remain inspectable after completion.
+
 Place global options before the command: `sfs --root PATH --json creations ID`.
 Complete all-store inspection exits 0, including retained or blocked entries.
-By-ID inspection exits 0 only for a loaded candidate or installed workspace.
+By-ID inspection exits 0 for an authoritatively loaded retained attempt,
+candidate, installed workspace or completed creation purge.
 Busy, unavailable, incomplete inspection and refused continuation exit 1 and
 write the full result to stderr; successful results use stdout. Inspection does
 not initialize or repair a store. For explicit continuation, `--native-host PATH`

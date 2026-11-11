@@ -3,6 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
+from functools import wraps
+import hashlib
 from io import StringIO
 import json
 import os
@@ -19,6 +21,14 @@ import unittest
 from unittest.mock import ANY, patch
 
 from stallionfs.core import Store, StallionError, clone_tree, git, remove_tree, run
+
+
+def native_creation_test(method):
+    @wraps(method)
+    def controlled(self, *args, **kwargs):
+        with self.native_creation_fixture():
+            return method(self, *args, **kwargs)
+    return controlled
 
 
 @unittest.skipUnless(sys.platform == "darwin", "APFS integration tests require macOS")
@@ -45,6 +55,27 @@ class Workspaces(unittest.TestCase):
         return self.store.prepare(self.source, key="test-v1", **kwargs)
 
     @contextmanager
+    def native_creation_fixture(self):
+        """Controlled runtime/verifier seams, never signed-runtime evidence."""
+        from stallionfs import _bundle, _native_create_git
+        configured = os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT')
+        if not configured:
+            self.skipTest('requires explicitly qualified private Git fixture')
+        executable = Path(configured).resolve(strict=True)
+        self.assertTrue(executable.is_file() and os.access(executable, os.X_OK))
+        runtime = {'executable': str(executable),
+                   'exec_path': str(executable.parent.parent / 'libexec/git-core'),
+                   'contract': {**_bundle.GIT_CONTRACT, 'payload_entries': 239,
+                       'payload_sha256': '1' * 64, 'descriptor_sha256': '2' * 64,
+                       'executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+                       'source_build_id': '3' * 64, 'publisher': _bundle.PUBLISHER_TEAM},
+                   'check': lambda: None}
+        # Keep real preflight persistence; only the package verifier is controlled.
+        with patch.object(_native_create_git, 'qualified_runtime', return_value=runtime), \
+             patch('stallionfs._native.verify_package', return_value={'returncode': 0}):
+            yield runtime
+
+    @contextmanager
     def native_clock(self):
         """Elapsed time advances at waits, never because a caller reads it."""
         class Clock:
@@ -66,6 +97,7 @@ class Workspaces(unittest.TestCase):
         from stallionfs.core import read_json
         state = {'rows': {}, 'commands': [], 'observed_fds': set(), 'sequence': 0}
         original_open, original_close = os.open, os.close
+        executor = _native.execute_owned
         def opened(path, flags, *args, **kwargs):
             fd = original_open(path, flags, *args, **kwargs)
             if str(path) in state['rows']:
@@ -81,6 +113,9 @@ class Workspaces(unittest.TestCase):
             return next(dict(row) for path, row in state['rows'].items()
                         if Path(path).stat().st_ino == os.fstat(fd).st_ino)
         def command(argv, record, persist, directory, **kwargs):
+            if argv[0] == runtime['executable']:
+                return executor(argv, record, persist, directory, **kwargs)
+            self.assertIn(argv[0], ('/sbin/mount', '/sbin/umount'))
             state['commands'].append(list(argv))
             record.update(argv=list(argv), child_pending=True, outcome='running', returncode=None,
                           pid=123, reaped=False, stdout=str(directory / 'stdout'), stderr=str(directory / 'stderr'))
@@ -113,7 +148,8 @@ class Workspaces(unittest.TestCase):
                 record['outcome'] = 'unknown'; persist()
                 raise subprocess.TimeoutExpired(argv, 30)
             return record
-        with patch('stallionfs._native.qualify', return_value='stallionfs'), \
+        with self.native_creation_fixture() as runtime, \
+             patch('stallionfs._native.qualify', return_value='stallionfs'), \
              patch('stallionfs._native.execute_owned', side_effect=command), \
              patch('stallionfs._scan.mounts', side_effect=rows), \
              patch('stallionfs._scan.mount_for_descriptor', side_effect=descriptor, create=True), \
@@ -121,6 +157,7 @@ class Workspaces(unittest.TestCase):
              patch('stallionfs._native.os.close', side_effect=closed):
             yield state
 
+    @native_creation_test
     def test_native_preflight_persists_own_transition_before_qualification(self):
         from stallionfs import _native
         from stallionfs.core import read_json
@@ -403,7 +440,7 @@ class Workspaces(unittest.TestCase):
     def test_native_discovery_qualification_complete_inventory_and_refusals(self):
         import copy
         import plistlib
-        from stallionfs import _native
+        from stallionfs import _bundle, _native
         app = self.base / 'StallionFS.app'
         module = app / 'Contents/Extensions/StallionFS.appex'
         host = app / 'Contents/MacOS/StallionFS'
@@ -420,7 +457,7 @@ class Workspaces(unittest.TestCase):
         expected = {'bundle_id': 'com.alvinhhh.stallionfs.module', 'url': str(module), 'enabled': True,
                     'short_name': 'stallionfs', 'version': '9', 'minimum_os': '27.0',
                     'access_policy': 'contextual-writes', 'signature_status': 0,
-                    'signing_identifier': 'com.alvinhhh.stallionfs.module', 'team_identifier': 'FIXTURE'}
+                    'signing_identifier': 'com.alvinhhh.stallionfs.module', 'team_identifier': _bundle.PUBLISHER_TEAM}
         inventory = {'ok': True, 'protocol': 1, 'modules': [expected]}
         output = self.base / 'discovery-output'
         class Operation:
@@ -435,10 +472,13 @@ class Workspaces(unittest.TestCase):
             operation = Operation(inventory)
             self.assertEqual(_native.qualify(operation, metadata), 'stallionfs')
             self.assertEqual(operation.calls, [
-                ('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)]),
+                ('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R',
+                    'anchor apple generic and identifier "com.alvinhhh.stallionfs" '
+                    'and certificate leaf[subject.OU] = "' + _bundle.PUBLISHER_TEAM + '"', str(app)]),
                 ('discover', [str(host), '--discover-json'])])
             variants = [('disabled', {'enabled': False}), ('wrong-url', {'url': '/different/module'}),
                         ('signature', {'signature_status': -1}), ('team', {'team_identifier': None}),
+                        ('wrong-team', {'team_identifier': 'OTHER'}),
                         ('version', {'version': '8'}), ('readonly', {'access_policy': 'read-only'}),
                         ('non-scalar', {'short_name': []}), ('wrong-type', {'short_name': 'sfsro27'})]
             for case, change in variants:
@@ -1595,7 +1635,7 @@ class Workspaces(unittest.TestCase):
             def qualify(operation, metadata):
                 if operation.record['operation'] in _native_recovery.COMPOUND:
                     host = Path(metadata['native_host'])
-                    commands = [('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(host.parent.parent.parent)]),
+                    commands = [('verify-package', _native.package_argv(host)),
                                 ('discover', [str(host), '--discover-json'])]
                     for label, argv in commands:
                         operation.record['helpers'].append({'label': label, **operation.command_context,
@@ -2848,6 +2888,7 @@ class Workspaces(unittest.TestCase):
             self.store.move(workspace, restore=True)
             self.assertTrue(source.exists()); self.assertFalse(trash.exists())
 
+    @native_creation_test
     def test_owned_native_candidate_retained_with_fresh_identity_and_branch(self):
         from stallionfs.core import owned_native_target, read_json
         (self.source / '.env').write_text('source-only secret')
@@ -2872,6 +2913,19 @@ class Workspaces(unittest.TestCase):
             self.assertEqual(journal['operation'], 'native-create')
             self.assertTrue(journal['creation_attempted'])
             self.assertEqual(journal['outcome'], 'candidate-created')
+            self.assertEqual([actor['role'] for actor in journal['actors']],
+                ['00-config', '01-refs', '02-head', '03-head-state', '04-checkout'])
+            for actor in journal['actors']:
+                self.assertEqual(actor['argv'][0], str(Path(os.environ['STALLIONFS_TEST_QUALIFIED_GIT']).resolve()))
+                self.assertGreater(actor['pid'], 0)
+                self.assertTrue(actor['reaped'])
+                self.assertFalse(actor['child_pending'])
+                self.assertTrue(actor['streams_durable'])
+                self.assertTrue(actor['streams_eof'])
+                self.assertEqual(Path(actor['stdout']).parent,
+                    directory.parent / 'actors' / actor['role'])
+                self.assertTrue(Path(actor['stdout']).is_file())
+                self.assertTrue(Path(actor['stderr']).is_file())
             self.assertTrue(candidate['native_image_result']['verified'])
             self.assertEqual(candidate['native_image_result']['verify']['coverage'], 1)
             with self.assertRaises(StallionError):
@@ -2886,6 +2940,7 @@ class Workspaces(unittest.TestCase):
         self.assertEqual(git(seed_repo, 'branch', '--show-current'), '')
         self.assertEqual((self.source / '.env').read_text(), 'source-only secret')
 
+    @native_creation_test
     def test_native_candidate_proof_tampering_and_interruption_holds(self):
         import copy
         from stallionfs import core
@@ -2938,6 +2993,7 @@ class Workspaces(unittest.TestCase):
                 self.assertFalse((self.store.root / 'workspaces' / intent['workspace']).exists())
         self.assertEqual(self.store.list(), [])
 
+    @native_creation_test
     def test_failed_native_preflight_keeps_candidate_without_blocking_unrelated_purge(self):
         from stallionfs import core
         seed = self.prepare()
@@ -2968,6 +3024,7 @@ class Workspaces(unittest.TestCase):
                 self.assertEqual([(path.stat().st_dev, path.stat().st_ino) for path in (stage, candidate)], identities)
         self.assertEqual(list((self.store.root / 'journals').iterdir()), [journal])
 
+    @native_creation_test
     def test_uncertain_native_create_intents_still_block_unrelated_purge(self):
         import copy
         from stallionfs import core
@@ -3028,6 +3085,7 @@ class Workspaces(unittest.TestCase):
                 path.unlink(); held.rename(path)
         self.assertEqual(journal.read_bytes(), original)
 
+    @native_creation_test
     def test_native_candidate_precreate_intent_failure_never_calls_importer(self):
         seed = self.prepare()
         with patch('stallionfs.core.sync_directory', side_effect=OSError(errno.ENOSPC, 'full')), \
@@ -3041,6 +3099,7 @@ class Workspaces(unittest.TestCase):
         self.assertTrue((stages[0] / 'native-create').exists())
         self.assertFalse((stages[0] / 'owned' / 'image.sfs').exists())
 
+    @native_creation_test
     def test_native_candidate_failure_keeps_unknown_output_and_intent(self):
         from stallionfs.core import read_json
         seed = self.prepare()
@@ -3062,6 +3121,7 @@ class Workspaces(unittest.TestCase):
             self.store._reconcile(intent['workspace'])
         self.assertEqual(self.store.list(), [])
 
+    @native_creation_test
     def test_native_prepared_tree_independent_fidelity(self):
         import hashlib
         import stat
@@ -3453,6 +3513,7 @@ os.chflags('file',0x8001)
         _image.with_backing_guard(registration['native_image'], held)
         self.assertEqual((pair(path), pair(backing), backing.read_bytes()), original)
 
+    @native_creation_test
     def test_native_candidate_outer_lock_errors_keep_store_receipt(self):
         from stallionfs.core import native_failure_details
         seed = self.prepare()
@@ -3505,6 +3566,7 @@ os.chflags('file',0x8001)
                     self.assertEqual(Path(receipt['candidate']).parent, Path(receipt['retained_stage']))
                     self.assertEqual(Path(receipt['host_input']).exists(), cleanup_fails)
 
+    @native_creation_test
     def test_native_candidate_receipt_allocation_fallback_and_primary_error(self):
         from stallionfs.core import native_failure_details
         seed = self.prepare()
