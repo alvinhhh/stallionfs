@@ -2,6 +2,17 @@ import Foundation
 @preconcurrency import FSKit
 import SFSImage
 
+enum StallionFileSystemIdentity: String, Sendable {
+    case production = "stallionfs", privateDiagnostic = "sfsro27"
+    init(extensionAttributes: Any?) throws {
+        guard let attributes = extensionAttributes as? [String: Any],
+              let name = attributes["FSShortName"] as? String,
+              let identity = Self(rawValue: name) else { throw POSIXError(.EINVAL) }
+        self = identity
+    }
+}
+private final class StallionModuleBundleAnchor: NSObject {}
+
 // Packaging reads the defined symbol from each executable architecture. Keep
 // the marker and public factory selection in this single compile-time branch.
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
@@ -15,9 +26,22 @@ public func stallionFactoryProfile() -> Int32 { 0 }
 @main
 #endif
 struct StallionExtension: UnaryFileSystemExtension {
-    var fileSystem: StallionFileSystem {
-        StallionFileSystem(accessPolicy: stallionFactoryProfile() == 1 ? .contextualWrites : .readOnly)
+    // Resolve the module's identity once; the containing app is not an authority.
+    private static let identity = Result {
+        try StallionFileSystemIdentity(extensionAttributes:
+            Bundle(for: StallionModuleBundleAnchor.self).object(forInfoDictionaryKey: "EXAppExtensionAttributes"))
     }
+    var fileSystem: StallionFileSystem {
+        Self.makeFileSystem(identity: Self.identity)
+    }
+    private static func makeFileSystem(identity: Result<StallionFileSystemIdentity, Error>) -> StallionFileSystem {
+        StallionFileSystem(identity: identity, accessPolicy: stallionFactoryProfile() == 1 ? .contextualWrites : .readOnly)
+    }
+#if STALLION_ADAPTER_CHECK
+    static func fileSystemForTesting(extensionAttributes: Any?) -> StallionFileSystem {
+        makeFileSystem(identity: Result { try StallionFileSystemIdentity(extensionAttributes: extensionAttributes) })
+    }
+#endif
 }
 // A load keeps the exact core-open access selected before its handle exists.
 // Only this file can construct a production admission after that open succeeds.
@@ -47,8 +71,10 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
     // requires the canonical item's retained write mode from a successful open.
     // Kernel cache/descriptor ordering still requires mounted qualification.
     enum AccessPolicy: Equatable { case readOnly, contextualWrites }
+    private let identity: Result<StallionFileSystemIdentity, Error>
     private let accessPolicy: AccessPolicy
-    init(accessPolicy: AccessPolicy = .readOnly) {
+    init(identity: Result<StallionFileSystemIdentity, Error>, accessPolicy: AccessPolicy = .readOnly) {
+        self.identity = identity
         self.accessPolicy = accessPolicy
         super.init()
     }
@@ -134,6 +160,7 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         }
     }
     func probeResource(resource: FSResource, replyHandler: @escaping (FSProbeResult?, Error?) -> Void) {
+        if case .failure(let error) = identity { replyHandler(nil, error); return }
         guard boundedResource(resource) else { replyHandler(nil, POSIXError(.ENAMETOOLONG)); return }
         enqueue(rejected: { replyHandler(nil, $0) }) {
         guard let path = resource as? FSPathURLResource else { replyHandler(.notRecognized, nil); return }
@@ -164,6 +191,9 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         loadResource(resource: resource, force: force, readOnly: false, replyHandler: replyHandler)
     }
     private func loadResource(resource: FSResource, force: Bool, readOnly: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
+        let identity: StallionFileSystemIdentity
+        do { identity = try self.identity.get() }
+        catch { replyHandler(nil, error); return }
         guard boundedResource(resource) else { replyHandler(nil, POSIXError(.ENAMETOOLONG)); return }
         guard let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
         guard !force else { replyHandler(nil, POSIXError(.ENOTSUP)); return }
@@ -201,7 +231,7 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
 #endif
             } else { access = .readOnly }
             let (opened, scoped) = try self.open(path, access: access, expectedUUID: expected)
-            let loaded = StallionVolume(admission: opened, resource: path, scope: scoped, queue: self.queue)
+            let loaded = StallionVolume(identity: identity, admission: opened, resource: path, scope: scoped, queue: self.queue)
 #if STALLION_ADAPTER_CHECK
             configurationHook?()
 #endif

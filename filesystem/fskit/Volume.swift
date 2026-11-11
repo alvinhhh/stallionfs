@@ -412,9 +412,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var sequence: UInt64 = 0
     private var overflow = false
     private var emitted = false
-    init(admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
+    private let identity: StallionFileSystemIdentity
+    init(identity: StallionFileSystemIdentity, admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
          itemLimit: Int = ReadOnlyLimits.activeItems) {
         precondition(itemLimit > 0 && itemLimit <= ReadOnlyLimits.activeItems)
+        self.identity = identity
         self.itemLimit = itemLimit
         self.handle = admission.handle; self.resource = resource; self.scope = scope; self.anchor = admission.anchor
         selectedAccess = admission.access
@@ -763,7 +765,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return c
     }
     var volumeStatistics: FSStatFSResult {
-        let s = FSStatFSResult(fileSystemTypeName: "sfsro27"); s.blockSize = 4096; s.ioSize = 4096; return s
+        let s = FSStatFSResult(fileSystemTypeName: identity.rawValue); s.blockSize = 4096; s.ioSize = 4096; return s
     }
 #if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
     func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activate(replyHandler: replyHandler) }
