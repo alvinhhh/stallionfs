@@ -107,6 +107,16 @@ or rename. It preserves the previous result. Once mounting has been attempted,
 that first-install recovery route is closed. Installed ownership blocks external
 registration of the backing inode independently of the creation journal.
 
+`creations [ID]` reads an existing store without initializing or repairing it.
+It includes unbound stages and publication remnants as diagnostic evidence;
+a destination ID in a remnant does not authorize continuation. Candidate
+installation through `creations ID --continue TRANSACTION` requires completed
+verification, an authoritative journal and the exact transaction. Repeating
+continuation for an installed workspace checks its installation proof.
+Incomplete producer proofs, helper/controller death, interrupted Git setup and
+reclamation remain unsupported by this command. Incomplete inspection retains
+its discovered entries and reports the paths it could not finish inspecting.
+
 Mount/unmount intents and helper output remain in each workspace's
 `native-operations` directory; the active typed record is also in the existing
 journal directory. The lease spans helper launch, stop/reap and observation.
