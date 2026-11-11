@@ -376,6 +376,14 @@ from .lifecycle import Lifecycle
 
 
 class Store(Lifecycle):
+    @classmethod
+    @contextlib.contextmanager
+    def existing(cls, root, *, shared=True):
+        """Admit an existing store without initializing or repairing its contents."""
+        from ._native_create_recovery import existing
+        with existing(root, shared=shared) as admitted:
+            yield admitted
+
     def __init__(self, root):
         raw = Path(root).expanduser().absolute()
         if raw.is_symlink():
