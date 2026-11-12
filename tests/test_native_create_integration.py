@@ -31,7 +31,8 @@ class CreationIntegration(CreationGit):
     def setUp(self):
         super().setUp()
         self.addCleanup(patch.stopall)
-        patch.object(git, 'qualified_runtime', return_value=self.runtime).start()
+        from qualified_git_fixture import native_creation
+        self.enterContext(native_creation(self.runtime))
         # Keep real preflight journals and owned receipts; only the verifier command is controlled.
         patch.object(_native, 'package_argv', return_value=[sys.executable, '-I', '-B', '-c', 'pass']).start()
         seed, self.commit = self.prepare()
