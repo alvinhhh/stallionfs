@@ -705,8 +705,10 @@ def _inspect_runtime_wheel(files, scripts, extensions, directory):
     return observations
 
 
-def _runtime_admit_git(git, pins):
+def _runtime_admit_git(git, pins, *, architecture):
     """Admit the exact qualified native input independently of app Python ABI."""
+    _runtime_require(type(architecture) is str and architecture in ('arm64', 'x86_64'),
+                     'Git build architecture differs')
     _runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'},
                      'Invalid private Git input')
     git_rows = json.loads(_runtime_pinned(git['inventory'], pins))
@@ -719,7 +721,7 @@ def _runtime_admit_git(git, pins):
                      'Private Git qualification is incomplete')
     bundle = _runtime_bundle()
     git_contract = dict(bundle.GIT_CONTRACT, input_inventory_sha256=git['inventory']['sha256'])
-    bundle.git_contract(git_contract)
+    bundle.git_contract(git_contract, architecture=architecture)
     native_create = qualification.get('native_create')
     _runtime_require(isinstance(native_create, dict) and type(native_create.get('schema')) is int
                      and native_create == git_contract, 'Private Git create contract is missing or unsupported')
@@ -761,7 +763,7 @@ def _prepare_runtime(path, output):
                       'lib/python3.13/encodings/__init__.py'} <= {row['path'] for row in python_rows},
                      'Python runtime support is incomplete')
     git = value['git']
-    admitted_git = _runtime_admit_git(git, pins)
+    admitted_git = _runtime_admit_git(git, pins, architecture='arm64')
     git_rows = admitted_git['inventory']
     git_contract = admitted_git['contract']
     files, scripts, extensions, tag, build_sources, wheel_assets = _runtime_source_wheel(
@@ -1013,7 +1015,7 @@ def finalize_git_payload(app, *, expected_descriptor_sha256, before_rows, signed
             and isinstance(git, dict) and set(git) == set(bundle.GIT_CONTRACT) | {'input_inventory_sha256', 'payload_entries', 'payload_sha256'}
             and type(git.get('schema')) is int and all(git.get(key) == expected for key, expected in bundle.GIT_CONTRACT.items()),
             'Unsupported Git provenance')
-        bundle.git_contract({key: git[key] for key in set(bundle.GIT_CONTRACT) | {'input_inventory_sha256'}})
+        bundle.git_contract({key: git[key] for key in set(bundle.GIT_CONTRACT) | {'input_inventory_sha256'}}, architecture='arm64')
         _runtime_require(type(git['payload_entries']) is int and git['payload_entries'] == len(before_rows)
             and git['payload_sha256'] == _runtime_sha(json.dumps(before_rows, sort_keys=True, separators=(',', ':')).encode()),
             'Assembled Git payload differs')

@@ -239,7 +239,7 @@ def build(checkout, component, output):
         'qualification': {'path': str(component / 'qualification.json'),
             'sha256': digest(bindings.read(component / 'qualification.json'))}}
     bindings.tree(component / 'Git')
-    admitted = package._runtime_admit_git(git, {})
+    admitted = package._runtime_admit_git(git, {}, architecture=platform.machine())
     bindings.check()
     payload = bundle.git_payload(component / 'Git'); bindings.payload(component / 'Git', payload)
     write(output / 'native-input.json', git)

@@ -1,12 +1,20 @@
 {
   "components": {
     "arm64": {
-      "bytes": 20572176,
+      "bytes": 20572568,
       "inventory_sha256": "9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700",
-      "manifest_sha256": "1de9a811fac6f398b7ae967c15e2aeb4760b59ce4b479fef3dfadb16e4da6802",
+      "manifest_sha256": "16430f1059283d3e1030913eab82eefedb500fe6458c633ffbba5873e5fa9836",
       "qualification_sha256": "2c15b8599c27b367696d93fad50546fd907950db2c2e17a33536c63a5302309c",
-      "sha256": "352ef13376d979cd33ae27ece43a3e66dcda4ddda8c77be8ce2928dce318fdd0",
-      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v4/git-runtime-arm64-v4.tar.xz"
+      "sha256": "a89b5f383b180e658947fc484fda928a10e96503feb4336c221b7e7d4dada054",
+      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v5/git-runtime-arm64-v5.tar.xz"
+    },
+    "x86_64": {
+      "bytes": 22241700,
+      "inventory_sha256": "020c08613be10d2d21d46a4defd6c4c98724b0af61426a9a2096e1bee48d546a",
+      "manifest_sha256": "f68018081e7c8dac6ec10bb27ae5081dffe857a7611132b40a34f11786c5eaa2",
+      "qualification_sha256": "aba181b9ce8dc37fad2454a60c60baf6ca6927e4bbe0079c0ab6d524d1d43e0b",
+      "sha256": "540b619cc529849636cfd71dabc69cfd678b2ffea7574e153008702064456aad",
+      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v5/git-runtime-x86_64-v5.tar.xz"
     }
   },
   "schema": 1

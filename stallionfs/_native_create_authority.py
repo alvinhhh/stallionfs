@@ -16,7 +16,7 @@ def current(spec):
             'unverified-writer')
     runtime = spec['runtime']
     try:
-        _bundle.git_contract({key: runtime[key] for key in set(_bundle.GIT_CONTRACT) | {'input_inventory_sha256'}})
+        _bundle.git_contract({key: runtime[key] for key in set(_bundle.GIT_CONTRACT) | {'input_inventory_sha256'}}, architecture='arm64')
     except (ValueError, KeyError):
         require(False, 'unverified-writer')
 

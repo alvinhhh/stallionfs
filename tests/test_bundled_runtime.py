@@ -20,10 +20,15 @@ SOURCE = Path(__file__).resolve().parents[1]
 
 class GitProvenance(unittest.TestCase):
     def test_exact_native_input_registration(self):
-        inventory = '9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700'
-        self.assertEqual(_bundle.QUALIFIED_GIT_INPUTS, frozenset({inventory}))
-        contract = dict(_bundle.GIT_CONTRACT, input_inventory_sha256=inventory)
-        self.assertIs(_bundle.git_contract(contract), contract)
+        profiles = {
+            '9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700': 'arm64',
+            '020c08613be10d2d21d46a4defd6c4c98724b0af61426a9a2096e1bee48d546a': 'x86_64',
+        }
+        self.assertEqual(_bundle.QUALIFIED_GIT_INPUTS, frozenset(profiles))
+        self.assertEqual(_bundle.QUALIFIED_GIT_ARCHITECTURES, profiles)
+        for inventory, architecture in profiles.items():
+            contract = dict(_bundle.GIT_CONTRACT, input_inventory_sha256=inventory)
+            self.assertIs(_bundle.git_contract(contract, architecture=architecture), contract)
 
     def test_registration_keeps_contract_and_inventory_fences(self):
         contract = dict(_bundle.GIT_CONTRACT, input_inventory_sha256=next(iter(_bundle.QUALIFIED_GIT_INPUTS)))

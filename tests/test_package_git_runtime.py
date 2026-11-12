@@ -28,6 +28,7 @@ class GitPayloadFinalization(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.bundle = package._runtime_bundle()
         self.bundle.QUALIFIED_GIT_INPUTS = frozenset({'6' * 64})
+        self.bundle.QUALIFIED_GIT_ARCHITECTURES = {'6' * 64: 'arm64'}
         selected = patch.object(package, '_runtime_bundle', return_value=self.bundle)
         selected.start(); self.addCleanup(selected.stop)
 
