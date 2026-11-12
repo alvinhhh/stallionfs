@@ -14,6 +14,7 @@ import shutil
 import stat
 import sys
 import tarfile
+import time
 import urllib.parse
 import urllib.request
 from unittest.mock import patch
@@ -112,6 +113,9 @@ def extract_component(archive, output):
 
 
 def fetch(lock, output, architecture):
+    started = time.monotonic_ns()
+    def phase(name, **fields):
+        print(json.dumps({"phase": name, "elapsed_ns": time.monotonic_ns() - started, **fields}, sort_keys=True), flush=True)
     output = owned_destination(output)
     require(architecture in ('arm64', 'x86_64'), 'Unsupported component architecture')
     value = json.loads(Path(lock).read_bytes())
@@ -125,6 +129,7 @@ def fetch(lock, output, architecture):
     require(type(row['bytes']) is int and 0 < row['bytes'] <= 64 * 1024 ** 2
             and all(re.fullmatch('[0-9a-f]{64}', row[key]) for key in ('sha256', 'manifest_sha256', 'inventory_sha256', 'qualification_sha256')),
             'Component lock limits or digests differ')
+    phase("input-validated-download-start", architecture=architecture)
     data = bytearray()
     with urllib.request.urlopen(row['url'], timeout=30) as response:
         final = urllib.parse.urlsplit(response.url)
@@ -135,13 +140,17 @@ def fetch(lock, output, architecture):
             if not block:
                 break
             data.extend(block)
+    phase("download-complete", bytes=len(data))
     require(len(data) == row['bytes'] and digest(data) == row['sha256'], 'Component archive differs')
+    phase("archive-accepted-extraction-start")
     output.mkdir(mode=0o700)
     extract_component(data, output)
+    phase("extraction-complete-validation-start")
     validate_component(output, row['manifest_sha256'], architecture)
     require(digest((output / 'input-inventory.json').read_bytes()) == row['inventory_sha256']
             and digest((output / 'qualification.json').read_bytes()) == row['qualification_sha256'], 'Component admission pins differ')
     write(output.parent / 'component-download.json', {'architecture': architecture, **row})
+    phase("admission-complete")
 
 
 def validate_component(root, expected, architecture=None):

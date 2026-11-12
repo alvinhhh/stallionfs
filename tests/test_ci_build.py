@@ -1,5 +1,7 @@
 """Pure routing, archive, backend and current-build receipt boundaries."""
 import hashlib
+import contextlib
+import signal
 import ast
 import importlib.util
 import io
@@ -1293,7 +1295,7 @@ class OwnedCIInterpreter(unittest.TestCase):
         self.assertNotIn('$RUNNER_TEMP/ci-python', ordinary)
         self.assertIn("Path(os.environ['GITHUB_PATH'])", ordinary)
         self.assertIn('fail-fast: false', ordinary)
-        self.assertIn("(matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || 15", ordinary)
+        self.assertIn("(matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15", ordinary)
         for os_name, python in (('macos-15', '3.12'), ('macos-26', '3.11'), ('macos-26', '3.13'),
                                 ('macos-26', '3.14'), ('macos-26-intel', '3.13'), ('xcode-27', '3.13')):
             self.assertIn('{os: ' + os_name + ", python: '" + python + "', images: '", ordinary)
@@ -1316,6 +1318,140 @@ class OwnedCIInterpreter(unittest.TestCase):
             with patch.object(module.os, 'fstat', side_effect=mismatched):
                 with self.assertRaisesRegex(ValueError, 'Directory ownership changed'):
                     module._runtime_directory(path)
+
+
+
+
+
+class FetchPhases(unittest.TestCase):
+
+    def test_workflow_fetch_budget_artifacts_and_sanitizer_coverage(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", text)
+        fetch = text.split('      - name: Fetch exact qualified architecture component\n', 1)[1].split('      - name: Build current wheel', 1)[0]
+        self.assertIn('tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch', fetch)
+        upload = fetch.split('      - name: Upload component fetch failure diagnostics\n', 1)[1]
+        self.assertIn("if: failure() && steps.component-fetch.outcome == 'failure'", upload)
+        self.assertIn('retention-days: 1', upload)
+        paths = upload.split('          path: |\n', 1)[1].split('          if-no-files-found:', 1)[0]
+        self.assertEqual(paths.splitlines(), [
+            '            ${{ runner.temp }}/component-fetch.command.json',
+            '            ${{ runner.temp }}/component-fetch.stdout.bin',
+            '            ${{ runner.temp }}/component-fetch.stderr.bin'])
+        sanitizer = text.split('      - name: Check native code with sanitizers\n', 1)[1].split('      - run: |', 1)[0]
+        self.assertIn("for sanitizers in ('address,undefined', 'thread'):", sanitizer)
+        self.assertIn('if not result.wasSuccessful() or result.skipped:', sanitizer)
+        for selector in ('test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
+                         'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
+                         'test_image.ImageCore'):
+            self.assertIn("'" + selector + "'", sanitizer)
+        self.assertIn('bootstrap.py" check', text.split(sanitizer, 1)[1])
+
+    def test_finite_success_and_refusal_phases(self):
+        m = load('ci_build')
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:xz') as opened:
+            for name in ('input-inventory.json', 'qualification.json'):
+                row = tarfile.TarInfo(name)
+                row.size = 2
+                row.mode = 384
+                opened.addfile(row, io.BytesIO(b'{}'))
+        payload = archive.getvalue()
+        digest = lambda b: hashlib.sha256(b).hexdigest()
+        all_phases = ['input-validated-download-start', 'download-complete', 'archive-accepted-extraction-start', 'extraction-complete-validation-start', 'admission-complete']
+        results = []
+        for case in ('success', 'bad-pin', 'oversized', 'truncated', 'bad-hash', 'extract-failure', 'validation-failure', 'admission-pin'):
+            with tempfile.TemporaryDirectory(prefix='fetch-inert-') as tmp:
+                root = Path(tmp).resolve()
+                lock = root / 'lock.json'
+                out = root / 'component'
+                row = dict(url='https://github.com/alvinhhh/stallionfs/releases/download/inert/component.tar.xz', bytes=len(payload), sha256=digest(payload), manifest_sha256='a' * 64, inventory_sha256=digest(b'{}'), qualification_sha256=digest(b'{}'))
+                if case == 'bad-pin':
+                    row['sha256'] = 'bad'
+                if case == 'admission-pin':
+                    row['qualification_sha256'] = 'b' * 64
+                lock.write_text(json.dumps({'schema': 1, 'components': {'arm64': row}}))
+                body = payload + (b'x' if case == 'oversized' else b'')
+                if case == 'truncated':
+                    body = body[:-1]
+                if case == 'bad-hash':
+                    body = b'x' + body[1:]
+                response = io.BytesIO(body)
+                response.url = 'https://release-assets.githubusercontent.com/inert?token=PRIVATE_REDIRECT'
+                stdout = io.StringIO()
+                prints = []
+                real_print = print
+
+                def checked_print(*args, **kwargs):
+                    self.assertIs(kwargs.get('flush'), True)
+                    prints.append(args[0])
+                    real_print(*args, **kwargs)
+                extractor = m.extract_component
+                with patch.object(m.urllib.request, 'urlopen', return_value=response) as request, patch.object(m, 'extract_component', side_effect=ValueError('extract') if case == 'extract-failure' else extractor), patch.object(m, 'validate_component', side_effect=ValueError('validate') if case == 'validation-failure' else None), patch('builtins.print', side_effect=checked_print), contextlib.redirect_stdout(stdout):
+                    if case == 'success':
+                        m.fetch(lock, out, 'arm64')
+                    else:
+                        with self.assertRaises(ValueError):
+                            m.fetch(lock, out, 'arm64')
+                phases = [json.loads(line) for line in stdout.getvalue().splitlines()]
+                expected = {'success': 5, 'bad-pin': 0, 'oversized': 1, 'truncated': 2, 'bad-hash': 2, 'extract-failure': 3, 'validation-failure': 4, 'admission-pin': 4}[case]
+                self.assertEqual([p['phase'] for p in phases], all_phases[:expected])
+                self.assertEqual(request.call_count, int(case != 'bad-pin'))
+                if request.called:
+                    self.assertEqual(request.call_args.kwargs, {'timeout': 30})
+                self.assertEqual((root / 'component-download.json').exists(), case == 'success')
+                for phase in phases:
+                    self.assertTrue(set(phase) <= {'phase', 'elapsed_ns', 'architecture', 'bytes'})
+                    self.assertIs(type(phase['elapsed_ns']), int)
+                    self.assertGreaterEqual(phase['elapsed_ns'], 0)
+                self.assertNotIn('PRIVATE_REDIRECT', stdout.getvalue())
+                results.append({'case': case, 'phases': phases, 'admitted': case == 'success'})
+
+
+class FetchCollector(unittest.TestCase):
+
+    def test_real_collector_mocked_child_timeout_and_cleanup_receipt(self):
+        results = []
+        for uncertain in (False, True):
+            c = load('_git_capture')
+            with tempfile.TemporaryDirectory(prefix='collector-inert-') as tmp:
+                stem = Path(tmp) / 'component-fetch'
+                pipes = []
+                for data in (b'{"phase":"input-validated-download-start","elapsed_ns":1}\n', b''):
+                    reader, writer = os.pipe()
+                    os.write(writer, data)
+                    os.close(writer)
+                    pipes.append(os.fdopen(reader, 'rb', buffering=0))
+                proc = SimpleNamespace(pid=424242, returncode=None, stdout=pipes[0], stderr=pipes[1])
+                proc.poll = lambda: proc.returncode
+
+                def wait(timeout):
+                    proc.returncode = -9
+                    return -9
+                proc.wait = wait
+                calls = []
+
+                def killpg(pid, number):
+                    self.assertEqual(pid, 424242)
+                    calls.append(number)
+                    if number == signal.SIGKILL:
+                        proc.returncode = -9
+                    elif not uncertain:
+                        raise ProcessLookupError
+                clocks = iter([0, 0.01, 601, 601.01, 601.02, 601.03, 601.04, 601.05, 601.06, 601.07, 601.08, 601.09])
+                with patch.object(c.subprocess, 'Popen', return_value=proc), patch.object(c.os, 'killpg', side_effect=killpg), patch.object(c.time, 'monotonic', side_effect=lambda: next(clocks)), self.assertRaises(subprocess.TimeoutExpired):
+                    c._owned_command([sys.executable, '-I', '-B', 'inert.py'], cwd=Path(tmp), timeout=600, stem=stem)
+                record = json.loads(Path(str(stem) + '.command.json').read_text())
+                self.assertTrue(record['timeout'])
+                self.assertEqual(record['timeout_seconds'], 600)
+                self.assertEqual(record['first_failure'], {'kind': 'timeout', 'detail': 'component-fetch'})
+                self.assertEqual(record['cleanup_uncertain'], uncertain)
+                self.assertIsNone(c._command_state['active'])
+                self.assertEqual(record['returncode'], -9)
+                self.assertEqual(record['kill_attempts'], 1)
+                self.assertIn(b'input-validated', Path(str(stem) + '.stdout.bin').read_bytes())
+                self.assertEqual(calls, [signal.SIGKILL, 0])
+                results.append(record)
 
 
 if __name__ == '__main__': unittest.main()

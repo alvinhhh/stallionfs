@@ -358,6 +358,13 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
         _scope.reset(token)
 
 
+def detach_observation_selection():
+    value = os.environ.get('STALLIONFS_TEST_SNAPSHOT_OBSERVATION', 'initial-unmount')
+    if value not in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach'):
+        raise ValueError('Invalid detach observation selection')
+    return value
+
+
 @contextmanager
 def observe_detach():
     """Observe before validation of the first detach in this test operation."""

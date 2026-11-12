@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from stallionfs.core import StallionError, Store, git, read_json, remove_tree, write_json
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
+    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope, observe_detach, observe_seed_create
+    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 
 
 class ImageFixture:
@@ -365,9 +365,7 @@ class ImageRecoveryTests(unittest.TestCase):
                      "requires macOS disk-image access and explicit test selection")
 class ImageStoreTests(unittest.TestCase):
     def test_snapshot_rollback_and_protected_retirement(self):
-        observation = os.environ.get('STALLIONFS_TEST_SNAPSHOT_OBSERVATION', 'initial-unmount')
-        if observation not in ('initial-unmount', 'closed-snapshot'):
-            raise ValueError('Snapshot observation must be initial-unmount or closed-snapshot')
+        observation = detach_observation_selection()
         from stallionfs import lifecycle
         base = Path(tempfile.mkdtemp(prefix="stallionfs-image-lifecycle-test-")).resolve()
         store = Store(base / "store")
