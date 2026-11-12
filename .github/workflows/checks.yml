@@ -17,7 +17,8 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  test-execution:
+    name: ${{ matrix.phase }} (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})
     if: github.event_name != 'workflow_dispatch'
     timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
     runs-on: ${{ matrix.os }}
@@ -25,12 +26,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-15, python: '3.12', images: '0'}
-          - {os: macos-26, python: '3.11', images: '1'}
-          - {os: macos-26, python: '3.13', images: '1'}
-          - {os: macos-26, python: '3.14', images: '1'}
-          - {os: macos-26-intel, python: '3.13', images: '1'}
-          - {os: xcode-27, python: '3.13', images: '1'}
+          - {os: macos-15, python: '3.12', images: '0', phase: installed}
+          - {os: macos-26, python: '3.11', images: '1', phase: installed}
+          - {os: macos-26, python: '3.13', images: '1', phase: installed}
+          - {os: macos-26, python: '3.14', images: '1', phase: installed}
+          - {os: macos-26-intel, python: '3.13', images: '1', phase: installed}
+          - {os: xcode-27, python: '3.13', images: '1', phase: installed}
+          - {os: macos-26, python: '3.13', images: '1', phase: sanitizer}
+          - {os: macos-26-intel, python: '3.13', images: '1', phase: sanitizer}
+          - {os: xcode-27, python: '3.13', images: '1', phase: sanitizer}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
@@ -216,7 +220,7 @@ jobs:
         if: failure() && steps.component-fetch.outcome == 'failure'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: component-fetch-${{ matrix.os }}-${{ matrix.python }}
+          name: component-fetch-${{ matrix.os }}-${{ matrix.python }}${{ matrix.phase == 'sanitizer' && '-sanitizer' || '' }}
           path: |
             ${{ runner.temp }}/component-fetch.command.json
             ${{ runner.temp }}/component-fetch.stdout.bin
@@ -231,10 +235,11 @@ jobs:
           "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
           "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"
       - name: Test installed wheel with image failure diagnostics
+        if: matrix.phase == 'installed'
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
-          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B - <<'PY'
@@ -327,7 +332,7 @@ jobs:
           sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
           PY
       - name: Check large sparse-seek metadata with default limits
-        if: success() && matrix.os == 'macos-15' && matrix.python == '3.12'
+        if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'
         timeout-minutes: 9
         env:
           STALLION_SEEK_LARGE_METADATA: '1'
@@ -410,7 +415,7 @@ jobs:
                                 and not result.skipped))
           PY
       - name: Validate bounded image diagnostic artifact
-        if: failure() && steps.ci-python.outcome == 'success'
+        if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'
         id: image-diagnostics
         run: |
           cd "$RUNNER_TEMP"
@@ -425,7 +430,7 @@ jobs:
               output.write('available=' + str(available).lower() + '\n')
           PY
       - name: Upload bounded image failure diagnostics
-        if: failure() && steps.image-diagnostics.outputs.available == 'true'
+        if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-failure-${{ matrix.os }}-${{ matrix.python }}
@@ -433,7 +438,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - name: Upload FSKit interface failure diagnostics
-        if: failure()
+        if: failure() && matrix.phase == 'installed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fskit-interface-failure-${{ matrix.os }}-${{ matrix.python }}
@@ -447,7 +452,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
       - name: Check native code with sanitizers
-        if: matrix.python == '3.13'
+        if: matrix.phase == 'sanitizer'
         env:
           ASAN_OPTIONS: halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
@@ -455,29 +460,71 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B - <<'PY'
+          import importlib.util
           import os
           from pathlib import Path
           import sys
+          import sysconfig
           import unittest
 
-          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'))
+          import stallionfs
+          from stallionfs import _scan
+          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
+          assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
+          spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
+          controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
+          admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
+          admitted['check']()
+          native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+          assert native_cli.is_absolute() and native_cli.is_relative_to(Path(sys.prefix).resolve())
+          with Path(os.environ['GITHUB_ENV']).open('a') as output:
+              output.write('CI_STALLIONFS=' + str(native_cli) + '\n')
+          sys.path.insert(0, str(checkout / 'tests'))
           names = (
               'test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
               'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
               'test_image.ImageCore',
           )
-          for sanitizers in ('address,undefined', 'thread'):
-              print('Sanitizers:', sanitizers, flush=True)
-              os.environ['CFLAGS'] = f'-g -fno-omit-frame-pointer -fsanitize={sanitizers} -fno-sanitize-recover=all'
-              suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-              result = unittest.TextTestRunner(verbosity=2).run(suite)
-              if not result.wasSuccessful() or result.skipped:
-                  sys.exit(1)
+          try:
+              for sanitizers in ('address,undefined', 'thread'):
+                  print('Sanitizers:', sanitizers, flush=True)
+                  os.environ['CFLAGS'] = f'-g -fno-omit-frame-pointer -fsanitize={sanitizers} -fno-sanitize-recover=all'
+                  suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+                  assert suite.countTestCases() == 52
+                  result = unittest.TextTestRunner(verbosity=2).run(suite)
+                  if not result.wasSuccessful() or result.skipped or result.testsRun != 52:
+                      sys.exit(1)
+          finally:
+              admitted['check']()
           PY
-      - run: |
+      - name: Check installed runtime and doctor
+        run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"
           "${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})
+    needs: test-execution
+    if: always() && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, python: '3.12', images: '0'}
+          - {os: macos-26, python: '3.11', images: '1'}
+          - {os: macos-26, python: '3.13', images: '1'}
+          - {os: macos-26, python: '3.14', images: '1'}
+          - {os: macos-26-intel, python: '3.13', images: '1'}
+          - {os: xcode-27, python: '3.13', images: '1'}
+    steps:
+      - name: Require all installed and sanitizer jobs
+        env:
+          EXECUTION_RESULT: ${{ needs.test-execution.result }}
+        run: test "${EXECUTION_RESULT:-}" = success
 
   hosted-docs-screen:
     name: Hosted document clone screen

@@ -1,6 +1,7 @@
 """Mocks only: no disk-image commands, mounts, or diagnostic subprocesses."""
+import ast
 import errno
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import Context
 from datetime import datetime, timezone
 import json
@@ -11,7 +12,9 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import textwrap
 import time
 import traceback
 from types import SimpleNamespace
@@ -1071,6 +1074,136 @@ class PassiveValidationTests(unittest.TestCase):
                 path.write_text(''.join(json.dumps(value) + '\n' for value in values))
                 self.assertFalse(diagnostics.artifact_available(self.collector.directory))
         path.write_text(''.join(json.dumps(value) + '\n' for value in original))
+
+
+class WorkflowTests(unittest.TestCase):
+    def workflow(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        worker = text.split('  test-execution:\n', 1)[1].split('\n  test:\n', 1)[0]
+        gate = text.split('\n  test:\n', 1)[1].split('\n  hosted-docs-screen:\n', 1)[0]
+        return worker, gate
+
+    def sanitizer_script(self):
+        worker, _ = self.workflow()
+        step = worker.split('      - name: Check native code with sanitizers\n', 1)[1].split(
+            '      - name: Check installed runtime and doctor\n', 1)[0]
+        return textwrap.dedent(step.split(" <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0])
+
+    def test_phase_coverage_and_legacy_context_convergence(self):
+        worker, gate = self.workflow()
+        expected = [('macos-15', '3.12', '0'), ('macos-26', '3.11', '1'),
+                    ('macos-26', '3.13', '1'), ('macos-26', '3.14', '1'),
+                    ('macos-26-intel', '3.13', '1'), ('xcode-27', '3.13', '1')]
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: (\w+)\}$",
+                          worker, re.MULTILINE)
+        self.assertEqual([row[:3] for row in rows if row[3] == 'installed'], expected)
+        self.assertEqual([row[:3] for row in rows if row[3] == 'sanitizer'], [row for row in expected if row[1] == '3.13'])
+        self.assertEqual(len(rows), 9)
+        legacy = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", gate, re.MULTILINE)
+        self.assertEqual(legacy, expected)
+        self.assertIn('    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})\n', gate)
+        self.assertIn('    needs: test-execution\n', gate)
+        self.assertIn("    if: always() && github.event_name != 'workflow_dispatch'\n", gate)
+        self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
+        self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
+        self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
+        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
+        self.assertIn('      fail-fast: false\n', worker)
+        self.assertNotIn('continue-on-error:', worker + gate)
+        sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]
+        self.assertTrue(sanitizer.startswith("        if: matrix.phase == 'sanitizer'\n"))
+        self.assertIn('          ASAN_OPTIONS: halt_on_error=1\n', sanitizer)
+        self.assertIn('          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1\n', sanitizer)
+        self.assertIn('          TSAN_OPTIONS: halt_on_error=1\n', sanitizer)
+        smoke = sanitizer.split('      - name: Check installed runtime and doctor\n', 1)[1]
+        self.assertTrue(smoke.startswith('        run: |\n'))
+        self.assertIn('bootstrap.py" check "${CI_CONTAINER:?}"', smoke)
+        self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', smoke)
+        tree = ast.parse(self.sanitizer_script())
+        names = next(ast.literal_eval(n.value) for n in ast.walk(tree)
+                     if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'names' for t in n.targets))
+        self.assertEqual(names, ('test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
+                                 'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals', 'test_image.ImageCore'))
+        loop = next(n for n in ast.walk(tree) if isinstance(n, ast.For))
+        self.assertEqual(ast.literal_eval(loop.iter), ('address,undefined', 'thread'))
+        image = ast.parse((Path(__file__).with_name('test_image.py')).read_text())
+        core = next(n for n in image.body if isinstance(n, ast.ClassDef) and n.name == 'ImageCore')
+        methods = [n.name for n in core.body if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')]
+        self.assertEqual(len(methods), 50)
+        coverage = {(os, python, mode, method) for os, python, _, phase in rows if phase == 'sanitizer'
+                    for mode in ast.literal_eval(loop.iter) for method in [*names[:2], *methods]}
+        self.assertEqual(len(coverage), 312)
+
+    def test_legacy_gate_runs_actual_success_only_command(self):
+        _, gate = self.workflow()
+        script = re.search(r'^        run: (.+)$', gate, re.MULTILINE)[1]
+        self.assertEqual(script, 'test "${EXECUTION_RESULT:-}" = success')
+        for outcome in (None, '', 'success', 'failure', 'cancelled', 'skipped', 'unknown', 'success\n', '$(printf success)'):
+            with self.subTest(outcome=outcome):
+                environment = dict(os.environ)
+                environment.pop('EXECUTION_RESULT', None)
+                if outcome is not None:
+                    environment['EXECUTION_RESULT'] = outcome
+                result = subprocess.run(['/bin/sh', '-e', '-c', script], env=environment,
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode == 0, outcome == 'success')
+
+    def test_sanitizer_process_requires_own_admission_both_modes_and_full_results(self):
+        import importlib.util
+        import sysconfig
+        import stallionfs
+        from stallionfs import _scan
+        script = compile(self.sanitizer_script(), '<sanitizer-workflow>', 'exec')
+        for profile in ('success', 'failure', 'skip', 'short-suite', 'short-result', 'initial-admission', 'final-admission', 'checkout-import'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                checkout = base / 'checkout'
+                environment = base / 'environment'; environment.touch()
+                order, modes = [], []
+                def check():
+                    order.append('check')
+                    if (profile == 'initial-admission' and len(order) == 2 or
+                            profile == 'final-admission' and order.count('check') == 2):
+                        raise RuntimeError('Runtime identity differs')
+                def initialize(actual_checkout, wheel):
+                    self.assertEqual((actual_checkout, wheel), (checkout, base / 'qualified-wheel'))
+                    order.append('admit')
+                    return {'check': check}
+                controller = SimpleNamespace(initialize_installed=initialize)
+                spec = SimpleNamespace(loader=Mock())
+                suite = Mock(); suite.countTestCases.return_value = 51 if profile == 'short-suite' else 52
+                def run(actual):
+                    self.assertIs(actual, suite)
+                    flags = os.environ['CFLAGS']
+                    mode = 'thread' if '-fsanitize=thread' in flags else 'address,undefined'
+                    self.assertEqual(flags, f'-g -fno-omit-frame-pointer -fsanitize={mode} -fno-sanitize-recover=all')
+                    modes.append(mode); order.append(mode)
+                    return SimpleNamespace(wasSuccessful=lambda: profile != 'failure',
+                                           skipped=[('required', 'unavailable')] if profile == 'skip' else [],
+                                           testsRun=51 if profile == 'short-result' else 52)
+                with patch.dict(os.environ, GITHUB_WORKSPACE=str(checkout), RUNNER_TEMP=str(base), GITHUB_ENV=str(environment)), \
+                        patch.object(sys, 'path', list(sys.path)), \
+                        patch.object(stallionfs, '__file__', str((checkout if profile == 'checkout-import' else base) / 'site/stallionfs/__init__.py')), \
+                        patch.object(_scan, '__file__', str(base / 'site/stallionfs/_scan.so'), create=True), \
+                        patch.object(importlib.util, 'spec_from_file_location', return_value=spec) as load, \
+                        patch.object(importlib.util, 'module_from_spec', return_value=controller), \
+                        patch.object(sysconfig, 'get_path', return_value=str(Path(sys.prefix).resolve() / 'bin')), \
+                        patch.object(unittest.defaultTestLoader, 'loadTestsFromNames', return_value=suite), \
+                        patch.object(unittest, 'TextTestRunner', return_value=SimpleNamespace(run=run)):
+                    if profile == 'success':
+                        exec(script, {'__name__': '__main__'})
+                    else:
+                        with self.assertRaises((SystemExit, AssertionError, RuntimeError)):
+                            exec(script, {'__name__': '__main__'})
+                if profile == 'checkout-import':
+                    self.assertEqual(order, []); load.assert_not_called()
+                    continue
+                load.assert_called_once_with('ci_build', checkout / 'tools/ci_build.py')
+                spec.loader.exec_module.assert_called_once_with(controller)
+                self.assertEqual(order[:2], ['admit', 'check'])
+                self.assertEqual(order.count('check'), 1 if profile == 'initial-admission' else 2)
+                self.assertEqual(modes, [] if profile in ('initial-admission', 'short-suite') else
+                                 ['address,undefined', 'thread'] if profile in ('success', 'final-admission') else ['address,undefined'])
 
 
 class CleanupTests(unittest.TestCase):
@@ -2184,24 +2317,28 @@ class DiagnosticTests(unittest.TestCase):
                 collector.close()
                 self.image.chmod(0o600)
 
-    def test_workflow_selects_only_the_target_enospc_row(self):
+    def test_workflow_selects_each_installed_observation_row(self):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
-        step = workflow.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
+        worker = workflow.split('  test-execution:\n', 1)[1].split('\n  test:\n', 1)[0]
+        step = worker.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
+        self.assertIn("        if: matrix.phase == 'installed'\n", step)
         expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
-        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
-        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", workflow, re.MULTILINE)
+        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: installed\}$", worker, re.MULTILINE)
         self.assertEqual(len(rows), 6)
-        self.assertEqual(workflow.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
-        choices = ['enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
+        self.assertEqual(worker.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
+        choices = ['restored-cleanup' if (runner, python) == ('macos-26', '3.11') else
+                   'enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
                    'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount'
                    for runner, python, images in rows]
         self.assertEqual(choices.count('enospc-initial-detach'), 1)
         self.assertEqual(choices.count('closed-snapshot'), 1)
-        self.assertEqual(choices.count('initial-unmount'), 4)
+        self.assertEqual(choices.count('restored-cleanup'), 1)
+        self.assertEqual(choices.count('initial-unmount'), 3)
 
     def test_snapshot_observation_selector_validates_once_before_fixture_work(self):
         key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
-        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach')
+        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach', 'restored-cleanup')
         values = (*valid, '', 'unknown', 'INITIAL-UNMOUNT', 'Closed-snapshot',
                   ' initial-unmount', 'closed-snapshot ', 'initial-unmount\n')
         sentinel = OSError('stop before fixture allocation')
@@ -2374,6 +2511,211 @@ class DiagnosticTests(unittest.TestCase):
                     collector.close()
                 self.assertIsNone(diagnostics._scope.get())
                 self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_actual_lifecycle_selects_final_replacement_only(self):
+        for case in ('success', 'final-failure', 'final-interrupt', 'earlier-failure', 'assertion', 'bad-owner', 'unknown'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=self.base) as temporary, patch.dict(os.environ):
+                os.environ['STALLIONFS_TEST_SNAPSHOT_OBSERVATION'] = 'restored-cleanup'
+                base = Path(temporary)
+                identifier = 'b' * 32
+                root = base / 'store'
+                point = root / 'workspaces' / identifier / 'volume'
+                repo = point / 'repo'
+                repo.mkdir(parents=True, mode=0o700); point.parent.chmod(0o700)
+                image = point.parent / 'workspace.sparseimage'
+                image.write_bytes(b'original'); image.chmod(0o600)
+                original_identity = (image.stat().st_dev, image.stat().st_ino)
+                workspace = dict(id=identifier, backend='image', path=str(repo))
+                store = Mock(root=root)
+                store.prepare.return_value = dict(id='seed')
+                store.create.return_value = workspace
+                store.list.return_value = [workspace]
+                store.gc.return_value = []
+                store.close.return_value = dict(closed_at=100000)
+                primary = space.images._error('preserved original eject failure'); primary.returncode = 64
+                interruption = KeyboardInterrupt('preserved cleanup interrupt')
+                state = dict(operation='initial-unmount', attached=True, mounted=True)
+                commands, before_operations, validations, fixtures = [], [], [], []
+                saved = base / 'saved-repo'
+                snapshots = []
+                real_fixture = lifecycle.image_fixture
+
+                @contextmanager
+                def tracked_fixture(*args):
+                    with real_fixture(*args) as fixture:
+                        fixtures.append(fixture)
+                        yield fixture
+
+                def mounted(actual):
+                    self.assertEqual(actual, image)
+                    space.images._attachments(image)
+                    invocation = diagnostics._detach_call.get()
+                    if invocation is not None:
+                        validations.append((state['operation'], image.stat().st_ino, invocation.get('reads')))
+                    return (dict(image=str(image), device='/dev/disk999',
+                                 mountpoint=str(point) if state['mounted'] else None,
+                                 volume_device='/dev/disk999s1' if state['mounted'] else None)
+                            if state['attached'] else None)
+
+                def command(*args):
+                    self.assertEqual(args, ('/usr/sbin/diskutil', 'eject', '/dev/disk999'))
+                    commands.append((state['operation'], diagnostics._detach_observation.get() is not None))
+                    state['mounted'] = False
+                    if case == 'earlier-failure' and state['operation'] == 'initial-unmount':
+                        raise primary
+                    if state['operation'] == 'cleanup':
+                        self.assertEqual(diagnostics._scope.get()['stage'], 'cleanup')
+                        if case == 'final-failure': raise primary
+                        if case == 'final-interrupt': raise interruption
+                    state['attached'] = False
+                    return b''
+
+                def unmount(*args):
+                    if diagnostics._scope.get()['stage'] == 'cleanup': state['operation'] = 'cleanup'
+                    return space.images.detach(image, point)
+
+                def snapshot(*args):
+                    snapshots.append(args)
+                    if len(snapshots) == 1: raise lifecycle.StallionError('external worktree')
+                    if len(snapshots) == 2:
+                        state.update(operation='closed-snapshot', attached=True, mounted=True)
+                        space.images.detach(image, point); repo.rename(saved)
+                    return dict(id='snapshot')
+
+                def mount(*args):
+                    state.update(attached=True, mounted=True)
+                    saved.rename(repo)
+
+                def rollback(*args):
+                    state.update(operation='rollback', attached=True, mounted=True)
+                    space.images.detach(image, point)
+                    recovery = root / 'recovery' / 'saved'; recovery.mkdir(parents=True)
+                    image.rename(recovery / 'workspace.sparseimage')
+                    image.write_bytes(b'replacement'); image.chmod(0o600)
+                    (repo / 'file').write_text('snapshot state\n')
+                    state.update(attached=True, mounted=True)
+                    return dict(recovery='saved')
+
+                def retire(*args, **kwargs):
+                    state['operation'] = 'retirement'
+                    space.images.detach(image, point)
+                    return dict(retired=[identifier])
+
+                def restore(*args, **kwargs):
+                    state.update(operation='restored', attached=True, mounted=True)
+                    if case == 'assertion': (repo / 'file').write_text('wrong restored content')
+                    if case == 'bad-owner': store.list.return_value = [dict(workspace, path='/foreign')]
+                    if case == 'unknown': fixtures[0].unknown = True
+                    return workspace
+
+                store.unmount.side_effect = unmount
+                store.snapshot.side_effect = snapshot
+                store.mount.side_effect = mount
+                store.rollback.side_effect = rollback
+                store.cleanup.side_effect = retire
+                store.move.side_effect = restore
+                def attachments(actual):
+                    entities = [{'dev-entry':'/dev/disk999'}, {'dev-entry':'/dev/disk999s1'}]
+                    if state['mounted']: entities[1]['mount-point'] = str(point)
+                    return [dict(**{'owner-uid':os.getuid(), 'image-path':str(image), 'system-entities':entities})] if state['attached'] else []
+                with patch.object(space.images, '_attachments', side_effect=attachments), \
+                        patch.object(space.images, 'mounted', side_effect=mounted), \
+                        patch.object(space.images.os.path, 'ismount', return_value=False), \
+                        patch.object(space.images, '_command', side_effect=command), \
+                        patch.object(lifecycle, 'Store', return_value=store), \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(base)), \
+                        patch.object(lifecycle, 'image_fixture', side_effect=tracked_fixture), \
+                        patch.object(lifecycle, 'git'), patch.object(lifecycle, 'read_json', return_value=dict(status='open')), \
+                        patch('stallionfs.lifecycle.replace_json'), patch.object(lifecycle, 'remove_tree') as remove:
+                    collector = diagnostics.install(space.images, base / 'diagnostics')
+                    self.addCleanup(collector.close)
+                    def mapping(args, scope, deadline):
+                        self.assertEqual(scope['image'], image)
+                        if collector.phase == 'before': before_operations.append(state['operation'])
+                        return (str(image), ['/dev/disk999', '/dev/disk999s1'],
+                                str(point) if state['mounted'] else None,
+                                '/dev/disk999s1' if state['mounted'] else None,
+                                (image.stat().st_dev, image.stat().st_ino))
+                    with patch.object(collector, '_mapping', side_effect=mapping), \
+                            patch.object(collector, '_capture', side_effect=lambda *a: captured(b'', status=1)):
+                        error_type = {'final-failure': lifecycle.StallionError, 'earlier-failure': lifecycle.StallionError,
+                                      'final-interrupt': KeyboardInterrupt, 'assertion': AssertionError,
+                                      'bad-owner': lifecycle.StallionError, 'unknown': lifecycle.StallionError}.get(case)
+                        if error_type:
+                            with self.assertRaises(error_type) as caught:
+                                lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            if case in ('final-failure', 'earlier-failure'): self.assertIs(caught.exception, primary)
+                            if case == 'final-interrupt': self.assertIs(caught.exception, interruption)
+                            remove.assert_not_called()
+                        else:
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            remove.assert_called_once_with(base)
+                        before_repeat = list(commands)
+                        if case in ('success', 'final-failure', 'earlier-failure', 'bad-owner', 'unknown'):
+                            fixtures[0].cleanup(observe=True)
+                            self.assertEqual(commands, before_repeat)
+                    selected = case in ('success', 'final-failure', 'final-interrupt')
+                    self.assertEqual(before_operations, ['cleanup'] if selected else [])
+                    self.assertEqual([op for op, observed in commands if observed], ['cleanup'] if selected else [])
+                    expected = ['initial-unmount'] if case == 'earlier-failure' else ['initial-unmount', 'closed-snapshot', 'rollback', 'retirement']
+                    if case not in ('earlier-failure', 'bad-owner', 'unknown'): expected += ['cleanup']
+                    self.assertEqual([op for op, observed in commands], expected)
+                    self.assertEqual(collector.before_attempts, int(selected))
+                    report = collector.directory / diagnostics.REPORT
+                    events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
+                    if case == 'final-failure':
+                        failure = next(e for e in events if e['kind'] == 'failure')
+                        self.assertEqual((failure['stage'], failure['workspace'], failure['pre_observation']),
+                                         ('cleanup', identifier, 'attempted'))
+                        mappings = [e for e in events if e['kind'] == 'mapping']
+                        identity = (image.stat().st_dev, image.stat().st_ino)
+                        self.assertNotEqual(identity, original_identity)
+                        self.assertEqual([(e['backing_device'], e['backing_inode']) for e in mappings], [identity, identity])
+                        self.assertEqual({e['operation_id'] for e in mappings}, {failure['operation_id']})
+                        samples = [e for e in events if e['kind'] == 'validation']
+                        self.assertEqual(len(samples), 2)
+                        self.assertEqual({e['operation_id'] for e in samples}, {failure['operation_id']})
+                        self.assertEqual([e['sample_status'] for e in samples], ['validated', 'validated'])
+                        self.assertEqual([e['selected_device'] for e in samples], ['/dev/disk999', '/dev/disk999'])
+                        eject = next(e for e in events if e['kind'] == 'eject_log')
+                        self.assertEqual(eject['operation_id'], failure['operation_id'])
+                        self.assertEqual(eject['target'], '/dev/disk999')
+                        self.assertLessEqual(eject['window_start_ns'], eject['window_end_ns'])
+                    self.assertEqual(image.read_bytes(), b'original' if case == 'earlier-failure' else b'replacement')
+                    self.assertTrue(base.exists())
+                    self.assertLessEqual(collector.events, diagnostics.EVENTS)
+                    self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+                    self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
+                    collector.close()
+                self.assertIsNone(diagnostics._scope.get()); self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_exact_owned_workspace_and_exceptional_arming(self):
+        a, b = 'a' * 32, 'b' * 32
+        for case in ('normal', 'exception', 'interrupt', 'ownership', 'failed-workspace'):
+            with self.subTest(case=case):
+                base = self.base
+                store = Mock(root=base / 'store')
+                store.list.return_value = [dict(id=i, backend='image', path=str(store.root/'workspaces'/i/'volume/repo')) for i in (a,b)]
+                observed = []
+                store.unmount.side_effect = lambda i: observed.append((i, diagnostics._detach_observation.get() is not None))
+                primary = KeyboardInterrupt() if case=='interrupt' else AssertionError('primary')
+                with patch.object(lifecycle, 'remove_tree') as remove:
+                    if case in ('exception','interrupt'):
+                        with self.assertRaises(type(primary)) as caught:
+                            with lifecycle.image_fixture(store, base) as fixture:
+                                fixture.cleanup_observation = b
+                                raise primary
+                        self.assertIs(caught.exception, primary); remove.assert_not_called()
+                        self.assertFalse(any(selected for i,selected in observed))
+                        if case=='interrupt': store.list.assert_not_called(); store.unmount.assert_not_called()
+                    else:
+                        fixture=lifecycle.ImageFixture(store,base); fixture.cleanup_observation=b
+                        if case=='ownership': store.list.return_value[1]['path']='/foreign'
+                        if case=='failed-workspace': fixture.failed.add(b)
+                        fixture.cleanup(observe=True)
+                        self.assertEqual(observed, [] if case=='ownership' else [(a,False)] if case=='failed-workspace' else [(a,False),(b,True)])
+                        fixture.cleanup(observe=True)
+                        self.assertFalse(any(selected for i,selected in observed[len(observed)//2:]))
 
     def test_snapshot_fixture_observes_first_unmount_failure_without_retry(self):
         base = self.base / 'unmount-fixture'

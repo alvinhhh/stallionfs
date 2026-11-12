@@ -360,7 +360,7 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
 
 def detach_observation_selection():
     value = os.environ.get('STALLIONFS_TEST_SNAPSHOT_OBSERVATION', 'initial-unmount')
-    if value not in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach'):
+    if value not in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach', 'restored-cleanup'):
         raise ValueError('Invalid detach observation selection')
     return value
 

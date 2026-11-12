@@ -25,6 +25,7 @@ class ImageFixture:
         self.store, self.base = store, base
         self.failed = set()
         self.unknown = False
+        self.cleanup_observation = None
 
     def call(self, method, *args, workspace=None, expected=False, stage='body', **kwargs):
         kind = 'trash' if kwargs.get('restore') else 'workspaces'
@@ -41,7 +42,8 @@ class ImageFixture:
                         self.unknown = True
                 raise
 
-    def cleanup(self):
+    def cleanup(self, *, observe=False):
+        selected, self.cleanup_observation = (self.cleanup_observation if observe else None), None
         errors = []
         if self.unknown:
             return errors  # No identity for the failed operation: retain without guessing.
@@ -63,7 +65,8 @@ class ImageFixture:
             if item['id'] in self.failed:
                 continue
             try:
-                self.call(self.store.unmount, item['id'], workspace=item['id'], stage='cleanup')
+                with observe_detach() if item['id'] == selected else nullcontext():
+                    self.call(self.store.unmount, item['id'], workspace=item['id'], stage='cleanup')
             except Exception as error:
                 errors.append((error, error.__traceback__))
         return errors
@@ -89,7 +92,7 @@ def image_fixture(store, base):
         _cleanup_notes(primary, errors, base)
         raise
     else:
-        errors = fixture.cleanup()
+        errors = fixture.cleanup(observe=True)
         if errors:
             primary, trace = errors[0]
             _cleanup_notes(primary, errors[1:], base)
@@ -410,6 +413,8 @@ class ImageStoreTests(unittest.TestCase):
             restored = fixture.call(store.move, value, restore=True, workspace=value)
             self.assertEqual((Path(restored["path"]) / "file").read_text(), "snapshot state\n")
             self.assertEqual(read_json(store._state(value))["status"], "open")
+            if observation == 'restored-cleanup':
+                fixture.cleanup_observation = value
 
     def test_lifecycle_and_interrupted_mount(self):
         from stallionfs import images
