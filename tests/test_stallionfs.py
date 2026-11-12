@@ -57,22 +57,15 @@ class Workspaces(unittest.TestCase):
     @contextmanager
     def native_creation_fixture(self):
         """Controlled runtime/verifier seams, never signed-runtime evidence."""
-        from stallionfs import _bundle, _native_create_git
+        from stallionfs import _native_create_git
         configured = os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT')
         if not configured:
             self.skipTest('requires explicitly qualified private Git fixture')
-        executable = Path(configured).resolve(strict=True)
-        self.assertTrue(executable.is_file() and os.access(executable, os.X_OK))
-        runtime = {'executable': str(executable),
-                   'exec_path': str(executable.parent.parent / 'libexec/git-core'),
-                   'contract': {**_bundle.GIT_CONTRACT, 'payload_entries': 239,
-                       'payload_sha256': '1' * 64, 'descriptor_sha256': '2' * 64,
-                       'executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
-                       'source_build_id': '3' * 64, 'publisher': _bundle.PUBLISHER_TEAM},
-                   'check': lambda: None}
-        # Keep real preflight persistence; only the package verifier is controlled.
+        from qualified_git_fixture import runtime as admitted_runtime
+        runtime = admitted_runtime()
+        # Keep real persistence and owned receipts; only the verifier command is controlled.
         with patch.object(_native_create_git, 'qualified_runtime', return_value=runtime), \
-             patch('stallionfs._native.verify_package', return_value={'returncode': 0}):
+             patch('stallionfs._native.package_argv', return_value=[sys.executable, '-I', '-B', '-c', 'pass']):
             yield runtime
 
     @contextmanager

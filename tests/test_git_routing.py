@@ -393,12 +393,33 @@ class GitRoutingTests(unittest.TestCase):
         (physical / 'git').write_bytes(b'inert executable'); (physical / 'git').chmod(0o700)
         link = self.root / 'link'; link.symlink_to(nested, target_is_directory=True)
         selected, _ = runtime._selected(dict(self.environment, PATH=''), cwd=link / '..')
-        self.assertEqual(Path(selected).resolve(), physical / 'git')
+        self.assertEqual(Path(selected).resolve(), (physical / 'git').resolve())
         with patch.object(runtime.os, 'get_exec_path', return_value=[str(physical)]) as paths:
             selected, _ = runtime._selected({}, cwd=self.root)
         paths.assert_called_once_with({}); self.assertEqual(Path(selected), physical / 'git')
         for cwd in ('', self.root / 'missing', physical / 'git'):
             with self.subTest(cwd=cwd), self.assertRaises(OSError): runtime._selected(self.environment, cwd=cwd)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin /var alias semantics')
+    def test_path_selection_preserves_darwin_alias_and_checks_physical_identity(self):
+        temporary = tempfile.TemporaryDirectory(prefix='sfs-routing-alias-', dir='/var/tmp')
+        self.addCleanup(temporary.cleanup)
+        lexical = Path(temporary.name)
+        physical = lexical.resolve(strict=True)
+        self.assertNotEqual(lexical, physical)
+        self.assertEqual(lexical.stat().st_ino, physical.stat().st_ino)
+        actual = physical / 'actual'; nested = actual / 'nested'
+        nested.mkdir(parents=True)
+        executable = actual / 'git'; executable.write_bytes(b'inert executable')
+        executable.chmod(0o700)
+        link = lexical / 'link'; link.symlink_to(nested, target_is_directory=True)
+        selected, check = runtime._selected(dict(self.environment, PATH=''), cwd=link / '..')
+        self.assertEqual(Path(selected), link / '..' / 'git')
+        self.assertEqual(Path(selected).resolve(), executable)
+        check()
+        executable.rename(executable.with_name('git-retained'))
+        executable.write_bytes(b'inert executable'); executable.chmod(0o700)
+        self.assert_reason('git-selection-changed', check)
 
     def test_core_forwards_subprocess_cwd_and_keeps_git_dash_c_separate(self):
         from stallionfs import core

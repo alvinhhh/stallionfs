@@ -76,7 +76,7 @@ class PrivateFixture(unittest.TestCase):
         descriptor = {'schema': 2, 'git': dict(_bundle.GIT_CONTRACT, input_inventory_sha256='6' * 64,
                       payload_entries=payload['entries'], payload_sha256=payload['sha256']),
                       'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
-                      'package_version': '0.6.3', 'source_build_id': 'a' * 64, 'bundle_version': '9',
+                      'package_version': '0.7.0', 'source_build_id': 'a' * 64, 'bundle_version': '9',
                       'paths': dict(_bundle.RELATIVE_PATHS)}
         json_file(app / _bundle.DESCRIPTOR, descriptor)
         app.chmod(0o755)
@@ -310,7 +310,7 @@ class BundlePaths(PrivateFixture):
         app, module = self.bundle()
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
         site = module.parent.parent
-        put(site / 'stallionfs/__init__.py', b'__version__ = "0.6.3"\n')
+        put(site / 'stallionfs/__init__.py', b'__version__ = "0.7.0"\n')
         put(site / 'stallionfs/__main__.py', b'import os, sys\ndef main():\n return {"argv": list(sys.argv), "cwd": os.getcwd(), "origin": __file__}\n')
         helper = app / _bundle.RELATIVE_PATHS['helper']
         before_cwd, before_environment = os.getcwd(), dict(os.environ)
@@ -337,7 +337,7 @@ class BundlePaths(PrivateFixture):
     def test_bootstrap_uses_validated_package_with_hostile_cwd_and_environment(self):
         app, module = self.bundle()
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
-        put(module.parent / '__init__.py', b'__version__ = "0.6.3"\n')
+        put(module.parent / '__init__.py', b'__version__ = "0.7.0"\n')
         put(module.parent / '__main__.py', b'import os\ndef main():\n return os.getcwd()\n')
         marker = self.root / 'hostile-imported'
         locations = [self.root / name for name in ('Caller Cwd', 'Python Path', 'User Site')]
@@ -361,7 +361,7 @@ class BundlePaths(PrivateFixture):
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
         outside = put(self.root / 'outside.py')
         package = ModuleType('stallionfs')
-        package.__file__, package.__version__ = str(outside), '0.6.3'
+        package.__file__, package.__version__ = str(outside), '0.7.0'
         package.__path__ = [str(outside.parent)]
         entry = ModuleType('stallionfs.__main__')
         entry.__file__ = str(outside)

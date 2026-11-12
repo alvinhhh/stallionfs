@@ -1,4 +1,5 @@
 """Package profile refusal cases; actual compiler matrix is in test_fskit."""
+import ast
 import hashlib
 import base64
 import zipfile
@@ -15,6 +16,7 @@ import tempfile
 from pathlib import Path
 import subprocess
 import tarfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +24,22 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('package_fskit', Path(__file__).resolve().parents[1] / 'tools/package_fskit.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+
+
+class ProductVersions(unittest.TestCase):
+    def test_product_declarations_and_package_templates_agree(self):
+        source = Path(__file__).resolve().parents[1]
+        project = tomllib.loads((source / 'pyproject.toml').read_text())
+        module = ast.parse((source / 'stallionfs/__init__.py').read_text())
+        version = next(ast.literal_eval(node.value) for node in module.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == '__version__' for target in node.targets))
+        self.assertEqual(package.PACKAGE_VERSION, '0.7.0')
+        self.assertEqual(project['project']['version'], package.PACKAGE_VERSION)
+        self.assertEqual(version, package.PACKAGE_VERSION)
+        for template in package._load_templates():
+            self.assertEqual(template['CFBundleShortVersionString'], package.PACKAGE_VERSION)
+            self.assertEqual(template['CFBundleVersion'], '__BUNDLE_VERSION__')
 
 
 class PackageProfileTests(unittest.TestCase):
@@ -429,12 +447,12 @@ class RuntimeAssembly(unittest.TestCase):
             'kind': 'build-source provenance', 'build_source_sha256': build_sources, 'resources': resources}).encode(),
             'stallionfs/_scan.cpython-313-darwin.so': b'inert scan',
             'stallionfs/_image.cpython-313-darwin.so': b'inert image',
-            'stallionfs-0.6.3.data/scripts/sfs': b'inert native launcher',
-            'stallionfs-0.6.3.data/scripts/stallionfs': b'inert native launcher',
-            'stallionfs-0.6.3.dist-info/METADATA': b'Name: stallionfs\nVersion: 0.6.3\n',
-            'stallionfs-0.6.3.dist-info/WHEEL': b'Tag: cp313-cp313-macosx_15_0_arm64\n',
-            'stallionfs-0.6.3.dist-info/entry_points.txt': b'stallionfs-python = stallionfs.__main__:main\n'})
-        record = 'stallionfs-0.6.3.dist-info/RECORD'
+            'stallionfs-0.7.0.data/scripts/sfs': b'inert native launcher',
+            'stallionfs-0.7.0.data/scripts/stallionfs': b'inert native launcher',
+            'stallionfs-0.7.0.dist-info/METADATA': b'Name: stallionfs\nVersion: 0.7.0\n',
+            'stallionfs-0.7.0.dist-info/WHEEL': b'Tag: cp313-cp313-macosx_15_0_arm64\n',
+            'stallionfs-0.7.0.dist-info/entry_points.txt': b'stallionfs-python = stallionfs.__main__:main\n'})
+        record = 'stallionfs-0.7.0.dist-info/RECORD'
         files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
                                   + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
         wheel = self.root / 'fixture.whl'
@@ -504,7 +522,7 @@ class RuntimeAssembly(unittest.TestCase):
                        'size': len(data), 'sha256': digest(data)} for name, data in payload.items()]}
         files.update({prefix + name: data for name, data in payload.items()})
         files[prefix + 'manifest.json'] = json.dumps(manifest).encode()
-        record = 'stallionfs-0.6.3.dist-info/RECORD'; files.pop(record)
+        record = 'stallionfs-0.7.0.dist-info/RECORD'; files.pop(record)
         files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
             + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
         stream = io.BytesIO()
@@ -525,6 +543,26 @@ class RuntimeAssembly(unittest.TestCase):
                 value = json.loads(changed[prefix + 'manifest.json']); value['source']['combined_patch_sha256'] = '0' * 64
                 changed[prefix + 'manifest.json'] = json.dumps(value).encode()
             with self.subTest(change=change), self.assertRaises(ValueError): package._runtime_package_git(changed)
+
+    def test_prior_product_wheel_is_not_relabelled_as_current(self):
+        self.inputs()
+        with zipfile.ZipFile(self.value['wheel']['path']) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        metadata_name = 'stallionfs-0.7.0.dist-info/METADATA'
+        files[metadata_name] = files[metadata_name].replace(b'Version: 0.7.0\n', b'Version: 0.6.3\n')
+        record = 'stallionfs-0.7.0.dist-info/RECORD'
+        files.pop(record)
+        files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+                                + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as archive:
+            for name, data in files.items():
+                archive.writestr(name, data)
+        python = json.loads(Path(self.value['python_descriptor']['path']).read_bytes())
+        metadata = json.loads(Path(python['metadata_file']).read_bytes())
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            package._runtime_source_wheel(stream.getvalue(), metadata, {})
+
 
     def inspect(self, argv, directory):
         if argv[0] == '/usr/bin/lipo': return 'arm64'
@@ -706,7 +744,7 @@ class RuntimeAssembly(unittest.TestCase):
                     files['stallionfs/_benchmark_runtime/cli.py'] = b'stale resource with valid self-hash'
                     manifest['resources']['cli.py'] = digest(files['stallionfs/_benchmark_runtime/cli.py'])
                 files[name] = json.dumps(manifest).encode()
-            record = 'stallionfs-0.6.3.dist-info/RECORD'
+            record = 'stallionfs-0.7.0.dist-info/RECORD'
             files.pop(record)
             files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
                                       + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
