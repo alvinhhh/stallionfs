@@ -36,7 +36,7 @@ class ArtifactPackage(unittest.TestCase):
                 member = archive.getmember(name)
                 self.assertTrue(member.isfile())
                 self.assertEqual(archive.extractfile(member).read(), expected[name])
-                self.assertEqual(member.mode, 0o755 if name == 'mount-witness' or '/MacOS/' in name else 0o644)
+                self.assertEqual(member.mode, 0o755 if name == 'mount-witness' or '/MacOS/' in name or name.endswith('/stallionfs-maintenance') else 0o644)
         with self.assertRaises(FileExistsError):
             artifact.archive_payload(self.payload, self.names, output)
 

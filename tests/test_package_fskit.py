@@ -400,6 +400,7 @@ class RuntimeAssembly(unittest.TestCase):
         self.addCleanup(bundle_patch.stop)
 
     def inputs(self):
+        self.native = put(self.root / 'stallionfs-maintenance', b'inert standalone native leaf', 0o755)
         python = self.root / 'python'
         put(python / 'bin/python3.13', b'inert interpreter', 0o755)
         put(python / 'lib/python3.13/encodings/__init__.py', b'# inert stdlib\n')
@@ -577,7 +578,7 @@ class RuntimeAssembly(unittest.TestCase):
     def assemble(self):
         argv = ['package_fskit.py', '--host', str(self.host), '--extension', str(self.extension),
                 '--out', str(self.app), '--bundle-version', '9', '--manifest-out', str(self.manifest),
-                '--runtime-inputs', str(self.descriptor)]
+                '--runtime-inputs', str(self.descriptor), '--maintenance-native', str(self.native)]
         self.stdout = io.StringIO()
         with patch.object(sys, 'argv', argv), patch.object(package, '_tool_output', side_effect=self.inspect), redirect_stdout(self.stdout):
             package.main()
@@ -769,7 +770,7 @@ class RuntimeAssembly(unittest.TestCase):
         for role, name in roles.items():
             data = (self.app / name).read_bytes()
             self.assertEqual([row for row in runtime['inventory'] if row['path'] == name],
-                             [package._runtime_file_row(name, data)])
+                             [package._runtime_file_row(name, data, 0o755 if role == 'native' else 0o644)])
         build = dict(bundle_id='com.alvinhhh.stallionfs', bundle_version='9', package_version=package.PACKAGE_VERSION,
                      source_build_id=runtime['source_build_id'])
         resource = (self.app / roles['compatibility']).read_bytes()

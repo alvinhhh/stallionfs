@@ -22,6 +22,7 @@ import package_fskit as package
 APP_FILES = (
     'StallionFS.app/Contents/Info.plist',
     'StallionFS.app/Contents/MacOS/StallionFS',
+    'StallionFS.app/Contents/Resources/Maintenance/stallionfs-maintenance',
     'StallionFS.app/Contents/Extensions/StallionFS.appex/Contents/Info.plist',
     'StallionFS.app/Contents/Extensions/StallionFS.appex/Contents/MacOS/StallionFS',
 )
@@ -80,7 +81,7 @@ def archive_payload(root, names, output):
             for name, data in sorted(files.items()):
                 member = tarfile.TarInfo(name)
                 member.size = len(data)
-                member.mode = 0o755 if name == 'mount-witness' or '/MacOS/' in name else 0o644
+                member.mode = 0o755 if name == 'mount-witness' or '/MacOS/' in name or name.endswith('/stallionfs-maintenance') else 0o644
                 archive.addfile(member, io.BytesIO(data))
     verify_archive(output, files)
     return digest(output.read_bytes())
@@ -181,9 +182,11 @@ class Build:
             if name == 'module' and not all(word in symbols for word in
                     (' u _nsextensionmain', 'enableadmittedwrites', 'setxattrhandler', 'performwrite')):
                 raise ValueError('Production contextual write symbols missing')
+        maintenance = work / 'stallionfs-maintenance'
+        self.run([*cflags, source / 'filesystem/fskit/maintenance_native.c', '-o', maintenance], 90)
         candidate = payload / 'package-candidate.json'
         self.run([sys.executable, '-I', '-B', source / 'tools/package_fskit.py',
-                  '--host', host, '--extension', module, '--out', payload / 'StallionFS.app',
+                  '--host', host, '--extension', module, '--maintenance-native', maintenance, '--out', payload / 'StallionFS.app',
                   '--bundle-version', '146', '--profile', 'production',
                   '--access-policy', 'contextual-writes', '--manifest-out', candidate], 180)
         package_receipt = json.loads(candidate.read_bytes())

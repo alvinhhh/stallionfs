@@ -742,9 +742,13 @@ def _maintenance_source():
     return path, data, namespace
 
 
-def _prepare_runtime(path, output):
+def _prepare_runtime(path, output, native_path):
     observer_path, observer, maintenance = _maintenance_source()
-    pins = {str(observer_path): _runtime_sha(observer)}
+    native_source = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_native.c'
+    native_source_data = _runtime_read(native_source)
+    native = read_executable(native_path)
+    pins = {str(observer_path): _runtime_sha(observer), str(native_path): _runtime_sha(native),
+            str(native_source): _runtime_sha(native_source_data)}
     parent = _runtime_directory(output.parent)
     try:
         _runtime_require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'Runtime output parent must be private 0700')
@@ -810,7 +814,7 @@ def _prepare_runtime(path, output):
     with tempfile.TemporaryDirectory(prefix='stallionfs-wheel-', dir=output.parent) as temporary:
         directory = Path(temporary)
         observations = _inspect_runtime_wheel(files, scripts, extensions, directory)
-    return {'observer': observer, 'maintenance': maintenance, 'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
+    return {'observer': observer, 'native': native, 'maintenance': maintenance, 'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
             'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources, 'git_contract': dict(git_contract),
             'sidecar': sidecar, 'wheel_tag': tag, 'wheel_observations': observations,
             'source_build_id': _runtime_sha(json.dumps(build_sources, sort_keys=True, separators=(',', ':')).encode())}
@@ -877,9 +881,10 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
         observer = prepared['observer']
         compatibility = maintenance['create_compatibility'](observer, build)
         roles = dict(maintenance['RESOURCE_ROLES'])
-        for role, data in (('observer', observer), ('compatibility', compatibility)):
-            _runtime_write_at(app, roles[role], data)
-            expected.append(_runtime_file_row(roles[role], data))
+        for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
+            mode = 0o755 if role == 'native' else 0o644
+            _runtime_write_at(app, roles[role], data, mode)
+            expected.append(_runtime_file_row(roles[role], data, mode))
         for name, data in prepared['licenses']:
             _runtime_write_at(app, 'Contents/Resources/Licenses/' + name, data)
             expected.append(_runtime_file_row('Contents/Resources/Licenses/' + name, data))
@@ -911,9 +916,10 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
         _runtime_require(observed == observer and resource == compatibility, 'Maintenance resource readback differs')
         contract = maintenance['validate_compatibility'](resource, observer, build)
         _runtime_require(contract['public_upgrade_support'] == [], 'Installed maintenance pairs are not qualified')
-        for role, data in (('observer', observer), ('compatibility', compatibility)):
+        for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
+            _runtime_require(_runtime_read_at(app, roles[role]) == data, 'Maintenance role readback differs')
             _runtime_require([row for row in rows if row['path'] == roles[role]]
-                             == [_runtime_file_row(roles[role], data)], 'Maintenance inventory role differs')
+                             == [_runtime_file_row(roles[role], data, 0o755 if role == 'native' else 0o644)], 'Maintenance inventory role differs')
         return {'kind': 'self-contained-runtime-payload', 'complete_candidate': False,
                 'distribution_signing_performed': False, 'source_build_id': prepared['source_build_id'],
                 'wheel_tag': prepared['wheel_tag'], 'wheel_observations': prepared['wheel_observations'],
@@ -933,6 +939,7 @@ def main():
     parser.add_argument('--extension', required=True, type=Path)
     parser.add_argument('--out', required=True, type=Path, help='Fresh .app path; never an installed app')
     parser.add_argument('--manifest-out', type=Path, help='Fresh external sibling .json candidate receipt')
+    parser.add_argument('--maintenance-native', type=Path, help='Standalone native maintenance leaf from the matching source build')
     parser.add_argument('--runtime-inputs', type=Path, help='Pinned private runtime, wheel, Git and license/source inputs')
     parser.add_argument('--profile', choices=('production', 'private-sfsro27'), default='production')
     parser.add_argument('--access-policy', choices=('read-only', 'contextual-writes'),
@@ -953,7 +960,10 @@ def main():
     values = _load_templates()
     factory, targets = inspect_package_artifacts(host, extension,
         values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy)
-    runtime = _prepare_runtime(args.runtime_inputs.absolute(), output) if args.runtime_inputs is not None else None
+    if args.runtime_inputs is not None and args.maintenance_native is None:
+        parser.error('--runtime-inputs requires --maintenance-native')
+    native = read_executable(args.maintenance_native) if args.maintenance_native is not None else None
+    runtime = _prepare_runtime(args.runtime_inputs.absolute(), output, args.maintenance_native.absolute()) if args.runtime_inputs is not None else None
     plists = []
     for index, value in enumerate(values):
         if value.get('CFBundleVersion') != '__BUNDLE_VERSION__':
@@ -980,6 +990,10 @@ def main():
                  (module / 'Info.plist', plists[1], 0o644),
                  (app / 'MacOS/StallionFS', host, 0o755),
                  (module / 'MacOS/StallionFS', extension, 0o755)]
+        if native is not None and runtime is None:
+            maintenance_path = app / 'Resources/Maintenance'
+            maintenance_path.mkdir(parents=True, mode=0o755)
+            files.append((maintenance_path / 'stallionfs-maintenance', native, 0o755))
         for path, data, mode in files:
             write_new(path, data, mode)
         runtime_manifest = _stage_runtime(output, runtime, args.bundle_version, values[0]['CFBundleIdentifier']) if runtime is not None else None
@@ -1107,6 +1121,138 @@ def _runtime_bundle():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def sign_maintenance_leaf(app, *, expected_unsigned_sha256, identity, expected_publisher):
+    """Sign the fixed standalone role before the containing app is sealed."""
+    _, _, maintenance = _maintenance_source()
+    _runtime_require(expected_publisher == maintenance['PUBLISHER_TEAM'], 'Unexpected maintenance publisher')
+    _runtime_require(type(identity) is str and identity and not identity.startswith('-'), 'Explicit signing identity required')
+    app = Path(app)
+    root = _runtime_directory(app)
+    try:
+        _runtime_unsealed(root)
+        name = maintenance['RESOURCE_ROLES']['native']
+        data = _runtime_read_at(root, name)
+        _runtime_require(_runtime_sha(data) == expected_unsigned_sha256, 'Unsigned maintenance leaf differs')
+        _tool_output(['/usr/bin/codesign','--force','--sign',identity,'--identifier',
+            'com.alvinhhh.stallionfs.maintenance','--options','runtime','--timestamp',str(app/name)], app.parent)
+        requirement = maintenance['publisher_requirement']('com.alvinhhh.stallionfs.maintenance',expected_publisher)
+        _tool_output(['/usr/bin/codesign','--verify','--strict','-R','='+requirement,str(app/name)],app.parent)
+        signed = _runtime_read_at(root,name)
+        return {'path':name,'sha256':_runtime_sha(signed),'size':len(signed),
+                'publisher':expected_publisher,'outer_seal_pending':True}
+    finally:
+        os.close(root)
+
+
+def verify_maintenance_archive(data, rows, app_name):
+    """An exact app-only ZIP; source sidecars are retained separately."""
+    expected = {row['path']: row for row in rows}
+    seen, members, total, root_seen = set(), set(), 0, False
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        _runtime_require(len(archive.infolist()) <= RUNTIME_MAX_FILES + 1, 'Maintenance ZIP entry limit')
+        for member in archive.infolist():
+            name = member.filename.rstrip('/')
+            _runtime_relative(name)
+            _runtime_require(name not in seen and member.flag_bits & 1 == 0, 'Duplicate or encrypted maintenance ZIP member')
+            seen.add(name)
+            if name == app_name:
+                mode = member.external_attr >> 16
+                _runtime_require(member.create_system == 3 and member.is_dir() and stat.S_ISDIR(mode)
+                    and stat.S_IMODE(mode) == 0o755 and member.file_size == 0 and archive.read(member) == b'',
+                    'Maintenance ZIP root type or mode')
+                root_seen = True
+                continue
+            _runtime_require(name.startswith(app_name + '/'), 'Unexpected maintenance ZIP member')
+            relative = name[len(app_name)+1:]
+            row = expected.get(relative)
+            _runtime_require(row is not None, 'Maintenance ZIP member outside signed inventory')
+            mode = member.external_attr >> 16
+            members.add(relative)
+            if member.is_dir():
+                _runtime_require(row['type'] == 'dir' and member.create_system == 3 and stat.S_ISDIR(mode)
+                    and stat.S_IMODE(mode) == int(row['mode'], 8) and member.file_size == 0
+                    and archive.read(member) == b'',
+                                 'Maintenance ZIP directory differs')
+                continue
+            _runtime_require(member.create_system == 3 and row['type'] in ('file','symlink') and member.file_size <= RUNTIME_MAX_FILE,
+                             'Maintenance ZIP file type or size')
+            total += member.file_size
+            _runtime_require(total <= RUNTIME_MAX_TOTAL, 'Maintenance ZIP total byte limit')
+            value = archive.read(member)
+            _runtime_require(len(value) == row['size'] and stat.S_IMODE(mode) == int(row['mode'],8),
+                             'Maintenance ZIP file size or mode differs')
+            if row['type'] == 'symlink':
+                _runtime_require(stat.S_ISLNK(mode) and value == os.fsencode(row['link']), 'Maintenance ZIP link differs')
+            else:
+                _runtime_require(stat.S_ISREG(mode) and _runtime_sha(value) == row['sha256'], 'Maintenance ZIP file differs')
+    _runtime_require(root_seen and members == set(expected),
+                     'Maintenance ZIP is incomplete')
+
+
+def final_maintenance_bindings(app, archive, *, expected_publisher):
+    """External final identities, after Git finalization and every signature.
+
+    The returned mapping must be independently retained/authenticated. It has no
+    installed-history, cooperation or STORE authority.
+    """
+    _, observer, maintenance = _maintenance_source()
+    _runtime_require(expected_publisher == maintenance['PUBLISHER_TEAM'], 'Unexpected maintenance publisher')
+    app, archive = Path(app), Path(archive)
+    root = _runtime_directory(app)
+    try:
+        _runtime_require(stat.S_IMODE(os.fstat(root).st_mode) == 0o755, 'Final app root mode differs')
+        _runtime_require(_runtime_read_at(root,maintenance['RESOURCE_ROLES']['observer']) == observer,
+                         'Final observer differs from source')
+        _runtime_read_at(root,'Contents/_CodeSignature/CodeResources')
+        rows = _runtime_inventory(app,root)
+        roles = maintenance['RESOURCE_ROLES']
+        fixed = {str(app):'com.alvinhhh.stallionfs',
+                 str(app/'Contents/Extensions/StallionFS.appex'):'com.alvinhhh.stallionfs.module',
+                 str(app/roles['native']):'com.alvinhhh.stallionfs.maintenance'}
+        signing_roles = []
+        for path, identifier in fixed.items():
+            requirement = maintenance['publisher_requirement'](identifier,expected_publisher)
+            _tool_output(['/usr/bin/codesign','--verify','--deep','--strict','-R','='+requirement,path],app.parent)
+            signing_roles.append({'path':'.' if Path(path)==app else str(Path(path).relative_to(app)),
+                                  'requirement':'='+requirement})
+        publisher = 'anchor apple generic and certificate leaf[subject.OU] = "'+expected_publisher+'"'
+        magic = {b'\xcf\xfa\xed\xfe',b'\xce\xfa\xed\xfe',b'\xfe\xed\xfa\xcf',b'\xfe\xed\xfa\xce',
+                 b'\xca\xfe\xba\xbe',b'\xbe\xba\xfe\xca',b'\xca\xfe\xba\xbf',b'\xbf\xba\xfe\xca'}
+        for row in rows:
+            if row['type'] != 'file': continue
+            data = _runtime_read_at(root,row['path'])
+            if data[:4] in magic and str(app/row['path']) not in fixed:
+                _tool_output(['/usr/bin/codesign','--verify','--strict','-R','='+publisher,str(app/row['path'])],app.parent)
+                signing_roles.append({'path':row['path'],'requirement':'='+publisher})
+        hashes = {key:_runtime_sha(_runtime_read_at(root,name)) for key,name in
+            (('descriptor_sha256','Contents/Resources/Runtime/runtime.json'),
+             ('observer_sha256',roles['observer']),('native_sha256',roles['native']),
+             ('compatibility_sha256',roles['compatibility']))}
+        _runtime_require(_runtime_inventory(app,root) == rows,'Signed app changed during final binding')
+        metadata = json.loads(_runtime_read_at(root,'Contents/Resources/Runtime/runtime.json'))
+        git = metadata['git']
+        _runtime_require(set(git) == set(maintenance['GIT_CONTRACT']) | {'input_inventory_sha256','payload_entries','payload_sha256'}
+            and all(git[key] == value for key,value in maintenance['GIT_CONTRACT'].items()), 'Final Git runtime contract differs')
+        bundle = _runtime_bundle()
+        bundle.git_contract({key:git[key] for key in set(bundle.GIT_CONTRACT)|{'input_inventory_sha256'}},architecture='arm64')
+        payload = bundle.git_payload(app/'Contents/Resources/Runtime/Git')
+        _runtime_require(payload['entries'] == git['payload_entries'] and payload['sha256'] == git['payload_sha256'],
+                         'Final Git payload differs')
+        store_runtime = dict(git,descriptor_sha256=hashes['descriptor_sha256'],
+            executable_sha256=_runtime_sha(_runtime_read_at(root,'Contents/Resources/Runtime/Git/bin/git')),
+            source_build_id=metadata['source_build_id'],publisher=expected_publisher)
+        archive_data = _runtime_read(archive)
+        verify_maintenance_archive(archive_data, rows, app.name)
+        _runtime_require(_runtime_inventory(app,root) == rows,'Signed app changed while reading archive')
+        return {'schema':1,'kind':'final-maintenance-artifact-bindings','publisher':expected_publisher,
+            'artifact':dict(id=_runtime_sha(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()),**hashes),
+            'archive':{'path':archive.name,'sha256':_runtime_sha(archive_data)},'inventory':rows,
+            'roles':dict(roles),'runtime':dict(maintenance['RUNTIME_CONTRACT']),'store_runtime':store_runtime,
+            'public_upgrade_support':[],'signing_roles':signing_roles}
+    finally:
+        os.close(root)
 
 
 if __name__ == '__main__':

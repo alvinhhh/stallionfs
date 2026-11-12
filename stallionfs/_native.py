@@ -753,7 +753,7 @@ def package_argv(host):
     from ._bundle import PUBLISHER_TEAM
     requirement = ('anchor apple generic and identifier "com.alvinhhh.stallionfs" '
                    'and certificate leaf[subject.OU] = "' + PUBLISHER_TEAM + '"')
-    return ['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', requirement,
+    return ['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', '=' + requirement,
             str(Path(host).parent.parent.parent)]
 
 
