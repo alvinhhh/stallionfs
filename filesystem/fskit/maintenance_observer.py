@@ -79,6 +79,41 @@ def empty_acl(fd, *, ancestor=False):
     finally:
         require(c.acl_free(acl) == 0, 'acl-close-failed')
 
+def merge_cleanup(*histories):
+    """Keep shared failure records once, preserving distinct events and order."""
+    merged = []; seen = set()
+    for history in histories:
+        for record in history:
+            if id(record) not in seen:
+                seen.add(id(record)); merged.append(record)
+    return merged
+
+
+def close_owned(owned, primary=None, *, failures=None, code='close-failed'):
+    """Consume ownership before close; a failed close may have consumed the fd."""
+    failures = failures if failures is not None else []
+    added = []; unexpected = None
+    for path in reversed(list(owned)):
+        fd = owned.pop(path)
+        try:
+            os.close(fd)
+        except BaseException as error:
+            added.append(dict(code='close-failed', path=str(path), fd=fd,
+                              errno=getattr(error, 'errno', None), detail=str(error)))
+            if not isinstance(error, OSError) and unexpected is None:
+                unexpected = error
+    failures.extend(added)
+    if added:
+        error = primary if primary is not None else unexpected
+        if error is None:
+            if code is None: return failures
+            error = Refusal(code)
+        error.cleanup_failures = [*getattr(error, 'cleanup_failures', []), *added]
+        if primary is None:
+            raise error
+    return failures
+
+
 class Existing:
     """Descriptor-relative, no-create observation; all held bindings rechecked."""
     def __init__(self, literal, limits):
@@ -89,6 +124,7 @@ class Existing:
         self.limits, self.fds, self.stamps, self.paths = limits, {}, {}, {}
         self.entries = self.bytes = 0
         self.device = None
+        self.cleanup_failures = []
 
     def admit(self):
         path = Path('/')
@@ -177,27 +213,41 @@ class Existing:
         # Ancestor directory size/times can change due to unrelated siblings.
         current, saved = stamp(info), self.stamps[path]
         held = stamp(os.fstat(self.fds[path]))
-        indexes = range(6) if self.paths.get(path, False) else range(9)
+        indexes = range(5) if self.paths.get(path, False) else range(9)
         require(all(current[i] == saved[i] == held[i] for i in indexes), 'binding-changed', path)
 
     def finish(self):
-        failures = []
-        for path in self.fds:
+        failures = []; primary = None; handled = None
+        try:
+            for path in self.fds:
+                try:
+                    self.check_one(path); empty_acl(self.fds[path], ancestor=self.paths.get(path, False))
+                except (OSError, Refusal) as error:
+                    if handled is None: handled = error
+                    failures.append(dict(code='exit-recheck-failed', path=str(path), detail=str(error)))
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
             try:
-                self.check_one(path); empty_acl(self.fds[path], ancestor=self.paths.get(path, False))
-            except (OSError, Refusal) as error:
-                failures.append(dict(code='exit-recheck-failed', path=str(path), detail=str(error)))
-        for path, fd in reversed(list(self.fds.items())):
-            try:
-                os.close(fd)
-            except OSError as error:
-                failures.append(dict(code='close-failed', path=str(path), detail=str(error)))
-        self.fds.clear()
-        return failures
+                close_owned(self.fds, primary, failures=self.cleanup_failures, code=None)
+            except BaseException as error:
+                if handled is not None: error.primary_error = handled
+                self.cleanup_failures.extend(failures)
+                error.cleanup_failures = list(self.cleanup_failures)
+                raise
+            if primary is not None:
+                self.cleanup_failures.extend(failures)
+                primary.cleanup_failures = list(self.cleanup_failures)
+        return [*failures, *self.cleanup_failures]
 
 def diagnostic(error, path):
-    return dict(code=getattr(error, 'code', type(error).__name__),
-                path=getattr(error, 'path', None) or str(path), detail=str(error))
+    result = dict(code=getattr(error, 'code', type(error).__name__),
+                  path=getattr(error, 'path', None) or str(path), detail=str(error))
+    if getattr(error, 'cleanup_failures', None):
+        result['cleanup_failures'] = error.cleanup_failures
+    return result
+
 
 def pending(a, path, record, runtime):
     """Observe native-create intent; no continuation and no runtime substitution."""
@@ -250,6 +300,7 @@ def pending(a, path, record, runtime):
 def observe_root(item, limits, runtime):
     row = dict(input=item, complete=True, blockers=[], entries=[], coverage=[], omitted=[])
     a = None
+    primary = None; handled = None
     try:
         require(type(item) is dict and set(item) == {'literal','reason'}
                 and item['reason'] in ('default','environment','explicit'), 'invalid-root-input')
@@ -308,12 +359,15 @@ def observe_root(item, limits, runtime):
                         if entry['blocking']:
                             row['blockers'].append(dict(code='pending-or-unqualified', path=str(path)))
                     except (OSError, ValueError, TypeError, RecursionError) as error:
+                        if handled is None: handled = error
                         row['blockers'].append(diagnostic(error, path)); row['complete'] = False
                         row['omitted'].append(str(path))
             except (OSError, ValueError, TypeError, RecursionError) as error:
+                if handled is None: handled = error
                 row['blockers'].append(diagnostic(error, parent)); row['complete'] = False
                 row['omitted'].append(str(parent)+'/*')
     except FileNotFoundError as error:
+        if handled is None: handled = error
         # Missing final default only: all physical parents have already been admitted.
         if item['reason'] == 'default' and a.root not in a.fds and a.root.parent in a.fds:
             row.update(status='absent-default', complete=True)
@@ -321,11 +375,26 @@ def observe_root(item, limits, runtime):
             row['blockers'].append(diagnostic(error, a.root)); row['complete'] = False
             row['omitted'].append(str(a.root)+'/**')
     except (OSError, ValueError, TypeError, RecursionError) as error:
+        if handled is None: handled = error
         row['blockers'].append(diagnostic(error, a.root if a else item)); row['complete'] = False
         row['omitted'].append(str(a.root if a else item)+'/**')
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        failures = a.finish() if a else []
+        try:
+            failures = a.finish() if a else []
+        except BaseException as error:
+            if primary is None:
+                if handled is not None: error.primary_error = handled
+                error.observation_blockers = list(row['blockers'])
+                raise
+            primary.cleanup_failures = [*getattr(primary, 'cleanup_failures', []),
+                                        *getattr(error, 'cleanup_failures', [])]
+            failures = []
         if failures:
+            if primary is not None:
+                primary.cleanup_failures = [*getattr(primary, 'cleanup_failures', []), *failures]
             row['blockers'].extend(failures); row['complete'] = False
     return row
 
@@ -384,6 +453,10 @@ def observe(request, *, limits=None):
     blocked = not report['complete'] or report['blockers'] or any(row['blockers'] for row in report['roots'])
     report['status'] = 'blocked' if blocked else 'no-known-blockers-at-observation'
     report['exit_code'] = 1 if blocked else 0
+    report['cleanup_failures'] = [failure for row in report['roots'] for blocker in row['blockers']
+                                  for failure in ([blocker] if blocker.get('code') == 'close-failed'
+                                                  else blocker.get('cleanup_failures', []))]
+    report['cleanup_complete'] = not bool(report['cleanup_failures'])
     report['finished_ns'] = time.time_ns()
     # Retain findings in the caller's report. Refuse output instead of emitting truncated success.
     if len(json.dumps(report, sort_keys=True).encode()) > limits['output']:
@@ -697,11 +770,11 @@ def json_bytes(value):
     return (json.dumps(value, sort_keys=True, allow_nan=False, separators=(',', ':'))+'\n').encode()
 
 
-def retained_read(path, limit=1024*1024, *, private=False):
+def retained_read(path, limit=1024*1024, *, private=False, expected_stamp=None):
     """Open every component without following links; bind bytes to the fd."""
     path = Path(path)
     require(path.is_absolute() and '..' not in path.parts, 'invalid-retained-path', path)
-    fds = []; bindings = []
+    fds = []; bindings = []; owned = {}; primary = None
     try:
         current = Path('/')
         for index, name in enumerate(path.parts):
@@ -710,7 +783,7 @@ def retained_read(path, limit=1024*1024, *, private=False):
             final = index == len(path.parts)-1
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
                          | (0 if final else os.O_DIRECTORY), dir_fd=fds[-1] if fds else None)
-            fds.append(fd)
+            fds.append(fd); owned[str(current)] = fd
             info = os.fstat(fd); bindings.append((name, stamp(info)))
             require(info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022,
                     'unsafe-retained-owner-mode', current)
@@ -718,6 +791,8 @@ def retained_read(path, limit=1024*1024, *, private=False):
                     'unsafe-retained-type', current)
             empty_acl(fd, ancestor=not final)
         before = os.fstat(fd)
+        require(expected_stamp is None or stamp(before) == expected_stamp,
+                'retained-created-binding', path)
         require(not private or before.st_uid == os.getuid() and not before.st_mode & 0o077,
                 'unsafe-private-control', path)
         require(before.st_size <= limit, 'retained-byte-limit', path)
@@ -728,11 +803,15 @@ def retained_read(path, limit=1024*1024, *, private=False):
         for index, (name, saved) in enumerate(bindings):
             held = stamp(os.fstat(fds[index]))
             named = stamp(os.stat(name, dir_fd=fds[index-1] if index else None, follow_symlinks=False))
-            indexes = range(9) if index == len(bindings)-1 else range(6)
+            indexes = range(9) if index == len(bindings)-1 else range(5)
             require(all(held[i] == saved[i] == named[i] for i in indexes), 'retained-ancestor-changed')
+            empty_acl(fds[index], ancestor=index != len(bindings)-1)
         return data
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        for fd in reversed(fds): os.close(fd)
+        close_owned(owned, primary)
 
 
 class Retention:
@@ -740,19 +819,27 @@ class Retention:
     def __init__(self, directory):
         self.path = Path(directory)
         self.access = Existing(str(self.path), LIMITS)
-        self.access.admit()
-        self.fd = self.access.fds[self.path]
-        self.identity = pair(os.fstat(self.fd))
+        self.cleanup_failures = []
         self.safe_for_failures = False
-        self.check()
+        try:
+            self.access.admit()
+            self.fd = self.access.fds[self.path]
+            self.identity = pair(os.fstat(self.fd))
+            self.check()
+        except BaseException as error:
+            close_owned(self.access.fds, error, failures=self.cleanup_failures)
+            raise
 
     def check(self):
-        require(pair(os.stat(self.path, follow_symlinks=False)) == self.identity
-                == pair(os.fstat(self.fd)), 'retention-directory-changed')
+        for path, fd in self.access.fds.items():
+            parent = None if path == Path('/') else self.access.fds[path.parent]
+            named = os.stat('/' if parent is None else path.name, dir_fd=parent, follow_symlinks=False)
+            require(stamp(named)[:5] == self.access.stamps[path][:5] == stamp(os.fstat(fd))[:5],
+                    'retention-directory-changed', path)
+            empty_acl(fd, ancestor=path != self.path)
         info = os.fstat(self.fd)
         require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
                 'retention-directory-mode')
-        empty_acl(self.fd)
 
     def write(self, name, data, mode=0o600):
         require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,63}', name), 'retention-name')
@@ -760,6 +847,7 @@ class Retention:
         self.check()
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      mode, dir_fd=self.fd)
+        owned = {self.path/name: fd}; primary = None
         try:
             os.fchmod(fd, mode); empty_acl(fd)
             offset = 0
@@ -769,20 +857,42 @@ class Retention:
             info = os.fstat(fd)
             require(info.st_uid == os.getuid() and info.st_nlink == 1
                     and stat.S_IMODE(info.st_mode) == mode and info.st_size == len(data), 'retention-write-binding')
+            saved = stamp(info)
+            os.fsync(self.fd)
+            require(retained_read(self.path/name, len(data), private=True, expected_stamp=saved) == data,
+                    'retention-readback')
+            require(stamp(os.fstat(fd)) == saved == stamp(os.stat(name, dir_fd=self.fd, follow_symlinks=False)),
+                    'retention-write-binding', self.path/name)
+            self.check()
+            return hashlib.sha256(data).hexdigest()
+        except BaseException as error:
+            primary = error
+            self.cleanup_failures = merge_cleanup(self.cleanup_failures,
+                                                  getattr(error, 'cleanup_failures', []))
+            raise
         finally:
-            os.close(fd)
-        os.fsync(self.fd)
-        require(retained_read(self.path/name, len(data), private=True) == data, 'retention-readback')
-        self.check()
-        return hashlib.sha256(data).hexdigest()
+            close_owned(owned, primary, failures=self.cleanup_failures)
 
     def close(self):
-        failures = []
-        for fd in reversed(list(self.access.fds.values())):
-            try: os.close(fd)
-            except OSError as error: failures.append(str(error))
-        self.access.fds.clear()
-        require(not failures, 'retention-close-uncertainty', failures)
+        primary = None
+        try:
+            if self.access.fds: self.check()
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                close_owned(self.access.fds, primary, failures=self.cleanup_failures,
+                            code='retention-close-uncertainty')
+            except BaseException as error:
+                error.cleanup_failures = list(self.cleanup_failures)
+                raise
+            if primary is not None and self.cleanup_failures:
+                primary.cleanup_failures = list(self.cleanup_failures)
+        if self.cleanup_failures:
+            error = Refusal('retention-close-uncertainty')
+            error.cleanup_failures = list(self.cleanup_failures)
+            raise error
 
 
 def original_request(operation, explicit, authorization):
@@ -996,25 +1106,40 @@ def software_plan(authorization, activity, app_state, *, request_retained, leaf_
 def physical_directory(path):
     path = Path(path)
     require(path.is_absolute() and '..' not in path.parts, 'invalid-physical-directory')
-    held = []
+    held = {}; bindings = []; primary = None
     try:
+        current = Path('/')
         for index, name in enumerate(path.parts):
+            if index: current /= name
             fd = os.open('/' if index == 0 else name,
                 os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,
-                dir_fd=held[-1] if held else None)
-            held.append(fd)
-            info = os.fstat(fd)
-            require(info.st_uid in (0,os.getuid()) and not info.st_mode & 0o022, 'physical-directory-owner-mode')
-            empty_acl(fd,ancestor=index != len(path.parts)-1)
-        return os.dup(held[-1])
+                dir_fd=next(reversed(held.values())) if held else None)
+            held[current] = fd
+            info = os.fstat(fd); bindings.append((current, stamp(info)[:5]))
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0,os.getuid())
+                    and not info.st_mode & 0o022, 'physical-directory-owner-mode')
+            empty_acl(fd,ancestor=current != path)
+        for current, saved in bindings:
+            parent = None if current == Path('/') else held[current.parent]
+            named = os.stat('/' if parent is None else current.name, dir_fd=parent, follow_symlinks=False)
+            require(stamp(named)[:5] == saved == stamp(os.fstat(held[current]))[:5],
+                    'physical-directory-changed', current)
+            empty_acl(held[current], ancestor=current != path)
+        ancestors = {key: held.pop(key) for key in list(held) if key != path}
+        close_owned(ancestors)
+        return held.pop(path)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        for fd in reversed(held): os.close(fd)
+        close_owned(held, primary)
 
 
 def app_inventory(app):
     """Inspect fixed paths without traversing symlinks or importing app code."""
     app = Path(app); rows = []; total = 0
     root = physical_directory(app)
+    owned_root = {app: root}; primary = None
     try:
         initial = os.fstat(root)
         require(initial.st_uid in (0, os.getuid()) and not initial.st_mode & 0o022, 'app-owner-mode')
@@ -1038,6 +1163,7 @@ def app_inventory(app):
                             'app-member-type', relative)
                     child = os.open(name, os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK
                                     | (os.O_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0), dir_fd=fd)
+                    owned_child = {relative: child}; child_primary = None
                     try:
                         require(stamp(os.fstat(child)) == stamp(info), 'app-member-binding', relative)
                         empty_acl(child)
@@ -1052,8 +1178,11 @@ def app_inventory(app):
                                 require(block, 'app-short-read', relative); hasher.update(block); offset += len(block)
                             row.update(type='file', size=info.st_size, sha256=hasher.hexdigest())
                         require(stamp(os.fstat(child)) == stamp(info), 'app-member-changed', relative)
+                    except BaseException as error:
+                        child_primary = error
+                        raise
                     finally:
-                        os.close(child)
+                        close_owned(owned_child, child_primary)
                 require(stamp(os.stat(name, dir_fd=fd, follow_symlinks=False)) == stamp(info), 'app-path-changed', relative)
                 rows.append(row)
             require(stamp(os.fstat(fd)) == stamp(before), 'app-directory-changed', prefix)
@@ -1076,8 +1205,11 @@ def app_inventory(app):
                 else:
                     require(not pending or target['type'] == 'dir', 'app-link-nondirectory'); resolved.append(part)
         return sorted(rows, key=lambda row:row['path'])
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        os.close(root)
+        close_owned(owned_root, primary)
 
 
 def acquire_native(retention, leaf, authorization, request):
@@ -1166,6 +1298,7 @@ def acquisition(operation, explicit, authorization, retention):
     # request plus separately retained fresh evidence without replacing its roots.
     retention.write('activity.json', json_bytes(activity))
     report = observe(request)
+    retention.cleanup_failures.extend(report.get('cleanup_failures', []))
     report.update(acquired_runtime=runtime, original_request_sha256=hashlib.sha256(
         retained_read(retention.path/'request.json', LIMITS['output'], private=True)).hexdigest(),
         native_evidence='native/native.json', maintenance_clearance=False,
@@ -1185,7 +1318,7 @@ def main(argv=None):
     parser.add_argument('--publisher', required=True)
     parser.add_argument('--retain', required=True, help='Existing private external 0700 directory')
     args = parser.parse_args(argv)
-    retention = None
+    retention = None; primary = None; pending = False; result = {}
     try:
         authority = validate_authorization(retained_read(args.authorization,4*1024*1024,private=True),
                                            args.authorization_sha256,args.publisher)
@@ -1193,18 +1326,46 @@ def main(argv=None):
         require(not list(os.listdir(retention.fd)), 'retention-not-empty')
         report = acquisition(args.operation,args.root,authority,retention)
         result = dict(status=report['status'],exit_code=report['exit_code'],
-                      maintenance_clearance=False,retained=str(retention.path))
+                      maintenance_clearance=False,retained=str(retention.path),
+                      cleanup_complete=report.get('cleanup_complete', True),
+                      cleanup_failures=report.get('cleanup_failures', []))
     except (OSError,ValueError,KeyError,TypeError) as error:
+        primary = error
         result = dict(status='blocked',exit_code=1,maintenance_clearance=False,error=diagnostic(error,'maintenance'))
         if retention is not None and retention.safe_for_failures:
             try: retention.write('failure.json',json_bytes(result))
-            except (OSError,ValueError): pass
+            except (OSError,ValueError) as failure:
+                result['failure_retention_error'] = diagnostic(failure, 'failure.json')
+            except BaseException as failure:
+                failure.primary_error = primary
+                primary = failure; pending = True
+                raise
+    except BaseException as error:
+        primary = error; pending = True
+        raise
     finally:
         if retention is not None:
             try: retention.close()
-            except (OSError,ValueError) as error:
-                result = dict(status='blocked',exit_code=1,maintenance_clearance=False,
-                              cleanup_complete=False,error=diagnostic(error,'retention-close'))
+            except BaseException as error:
+                if not isinstance(error, (OSError, ValueError)) and not pending:
+                    if primary is not None: error.primary_error = primary
+                    history = [*result.get('cleanup_failures', []),
+                               *getattr(primary, 'cleanup_failures', []),
+                               *getattr(retention, 'cleanup_failures', [])]
+                    error.cleanup_failures = merge_cleanup(getattr(error, 'cleanup_failures', []), history)
+                    raise
+                if primary is not None:
+                    primary.cleanup_failures = merge_cleanup(getattr(primary, 'cleanup_failures', []),
+                                                             getattr(error, 'cleanup_failures', []))
+                result.update(status='blocked', exit_code=1, maintenance_clearance=False)
+                if 'error' not in result: result['error'] = diagnostic(error, 'retention-close')
+                else: result['retention_close_error'] = diagnostic(error, 'retention-close')
+                result['cleanup_complete'] = False
+        failures = merge_cleanup(result.get('cleanup_failures', []),
+                                 getattr(primary, 'cleanup_failures', []),
+                                 getattr(retention, 'cleanup_failures', []))
+        if failures:
+            result.update(status='blocked', exit_code=1, cleanup_complete=False, cleanup_failures=failures)
     result.setdefault('cleanup_complete',not bool(_UNRESOLVED_TOOLS))
     if _UNRESOLVED_TOOLS:
         result.update(status='blocked',exit_code=1,owned_helpers_unresolved=[p.pid for p in _UNRESOLVED_TOOLS])
