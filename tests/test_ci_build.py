@@ -48,7 +48,7 @@ class Routing(unittest.TestCase):
             self.assertIn('"' + mode + '"', docs)
         self.assertNotIn('native-git-qualification', docs)
         self.assertNotIn('unsigned-app-artifact', docs)
-        intel = text.split('  native-git-qualification:', 1)[1]
+        intel = text.split('  native-git-qualification:', 1)[1].split('  registered-git-recheck:', 1)[0]
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.mode == 'native-git-qualification'", intel)
         self.assertIn('runs-on: macos-26-intel', intel)
         self.assertNotIn('strategy:', intel)
@@ -544,6 +544,537 @@ def owned_ci_bootstrap():
     module = SimpleNamespace(__name__='ci_inert', BOOTSTRAP_SOURCE=source)
     exec(compile(source, '<workflow-owned-ci-interpreter>', 'exec'), module.__dict__)
     return module
+
+
+class RegisteredRecheck(unittest.TestCase):
+    def fixture(self, base, architecture='x86_64'):
+        version = '3.11.18' if architecture == 'arm64' else '3.13.18'
+        module = load('ci_native_qualify'); ci = load('ci_build')
+        source = base / 'source'; source.mkdir(); root = base / 'packet'
+        for name in module.CONTROLLERS:
+            path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('fixture controller\n')
+        recipes = ('tools/build_git_runtime.py', 'tools/_git_capture.py', 'stallionfs/_git_sources.py', 'stallionfs/_bundle.py')
+        names = ['setup.py', *recipes, *['stallionfs/f' + str(i) + '.py' for i in range(50)]]
+        for name in names:
+            path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('current ' + name + '\n')
+        ci.source_names = lambda checkout: sorted(names)
+        template = base / 'historical'; template.mkdir()
+        build = {key: module.sha(source / name) for key, name in zip(
+            ('recipe_sha256', 'capture_sha256', 'registry_sha256', 'bundle_sha256'), recipes)}
+        build['compilation_origin'] = {'operation': 'historical compiler provenance'}
+        values = {'input-inventory.json': b'[]', 'qualification.json': b'{"historical":true}',
+            'qualification-source-pins.json': b'[{"path":"setup.py","sha256":"HISTORICAL"}]',
+            'package-manifest.json': json.dumps({'build': build}).encode(), 'provenance.json': b'{"historical":true}',
+            'Git/bin/git': b'inert native marker; never executed'}
+        for name, data in values.items():
+            path = template / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        manifest = {'schema': 1, 'kind': 'portable-git-native-component', 'architecture': architecture,
+            'self_exclusion': 'component-manifest.json',
+            'files': [{'path': name, 'mode': '0o644', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                for name, data in values.items()],
+            'directories': [{'path': name, 'mode': '0o755'} for name in ('Git', 'Git/bin')]}
+        (template / 'component-manifest.json').write_text(json.dumps(manifest))
+        row = {'url': 'https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v6/inert.tar.xz',
+            'bytes': 1, 'sha256': 'a' * 64, 'manifest_sha256': module.sha(template / 'component-manifest.json'),
+            'inventory_sha256': module.sha(template / 'input-inventory.json'),
+            'qualification_sha256': module.sha(template / 'qualification.json')}
+        lock = source / 'tools/ci-git-components.json'; lock.write_text(json.dumps({'schema': 1, 'components': {architecture: row}}))
+        module.REGISTERED_LOCK = module.sha(lock)
+        interpreter = base / ('dependency/python/bin/python' + '.'.join(version.split('.')[:2])); interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b'inert interpreter; never executed')
+        identity = SimpleNamespace(SHA256='b' * 64, URL='https://example.invalid/python', SIZE=1,
+            EXECUTABLE_SHA256=module.sha(interpreter))
+        origin = {'version': version, 'architecture': architecture, 'sha256': identity.SHA256,
+            'url': identity.URL, 'bytes': identity.SIZE, 'executable_sha256': identity.EXECUTABLE_SHA256}
+        identity.PROFILES = {architecture: {key: origin[key] for key in ('url', 'sha256', 'bytes', 'executable_sha256', 'version')}}
+        (base / 'dependency/origin.json').write_text(json.dumps(origin))
+        events = []; clock = [0]; state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+        package = SimpleNamespace(_runtime_admit_git=lambda *a, **k: events.append('native-admission'))
+        ci.initialize_installed = lambda *args: events.append('initialize-installed') or {'check': lambda: events.append('real-check-slot')}
+
+        def build_wheel():
+            producer = root / 'producer'; producer.mkdir()
+            wheel = producer / 'current.whl'; wheel.write_bytes(b'inert wheel with native payload marker')
+            pins = [{'path': name, 'mode': oct((source / name).stat().st_mode & 0o777),
+                'bytes': (source / name).stat().st_size, 'sha256': module.sha(source / name)} for name in sorted(names)]
+            (producer / 'source-pins.json').write_text(json.dumps(pins))
+            native = {'root': str(root / 'component/Git'),
+                'inventory': {'path': str(root / 'component/input-inventory.json'), 'sha256': row['inventory_sha256']},
+                'qualification': {'path': str(root / 'component/qualification.json'), 'sha256': row['qualification_sha256']}}
+            (producer / 'native-input.json').write_text(json.dumps(native))
+            result = {'schema': 1, 'wheel': wheel.name, 'wheel_sha256': module.sha(wheel),
+                'source_pins_sha256': module.sha(producer / 'source-pins.json'),
+                'descriptor_sha256': module.sha(producer / 'native-input.json'), 'original_git_build': build,
+                'interpreter_sha256': module.sha(Path(sys.executable)), 'interpreter_version': sys.version,
+                'architecture': architecture, 'setuptools': ci.SETUPTOOLS,
+                'cache_return': [{'cache_return': True, 'calls': 1}], 'guard_effects': []}
+            (producer / 'build-result.json').write_text(json.dumps(result))
+
+        def simulate(label, argv, timeout, case='clean'):
+            events.append(label)
+            if label == 'fetch':
+                shutil.copytree(template, root / 'component')
+                (root / 'component-download.json').write_text(json.dumps({'architecture': architecture, **row}))
+                if case == 'component-substitution': (root / 'component/Git/bin/git').write_bytes(b'changed')
+                if case == 'manifest-substitution': (root / 'component/component-manifest.json').write_bytes(b'{}')
+                if case == 'inventory-substitution': (root / 'component/input-inventory.json').write_bytes(b'[1]')
+                if case == 'qualification-substitution': (root / 'component/qualification.json').write_bytes(b'{}')
+                if case == 'archive-substitution':
+                    value = {'architecture': architecture, **row, 'sha256': 'f' * 64}
+                    (root / 'component-download.json').write_text(json.dumps(value))
+                if case == 'recipe-substitution': (source / recipes[0]).write_bytes(b'new recipe')
+            if label == 'build':
+                build_wheel()
+                if case == 'wheel-substitution': (root / 'producer/current.whl').write_bytes(b'changed')
+                if case == 'historical-source': (root / 'producer/source-pins.json').write_bytes(values['qualification-source-pins.json'])
+            if label == 'admit' and case != 'missing-admission':
+                if case == 'admission-refusal': raise ValueError('inert installed admission refusal')
+                module.admit_installed(source, root / 'producer')
+                if case.startswith('budget-'): clock[0] = int(case.split('-')[1])
+            if label == 'campaign':
+                self.assertIn('real-check-slot', events)
+                self.assertEqual(argv[argv.index('--packet') + 1], str(root / 'component'))
+                self.assertEqual(argv[argv.index('--wheel-output') + 1], str(root / 'producer'))
+                self.assertIn('--registered-input', argv)
+                campaign = root / 'campaign'; campaign.mkdir()
+                result = {'passed': True, 'input_unchanged': True, 'input_unregistered': False, 'owned_commands': 581,
+                    'successes': list(range(10)), 'strict_native_environment_commands': list(range(92)), 'structural_refusals': list(range(27))}
+                if case == 'false-campaign': result['passed'] = False
+                if case == 'wrong-registration': result['input_unregistered'] = True
+                if case == 'wrong-count': result['owned_commands'] = 580
+                (campaign / 'result.json').write_text(json.dumps(result))
+            return subprocess.CompletedProcess(argv, 0)
+        capture = SimpleNamespace(_COMMAND_ENV=None, _command_state=state, _install_command_handlers=lambda: {},
+            _restore_command_handlers=lambda previous: None)
+        original_load = module.load
+        def resolve(name, path):
+            if name == '_qualification_capture': return capture
+            if name == '_registered_python': return identity
+            if name == '_registered_package': return package
+            if name.startswith('_registered_') or name == '_transfer_ci': return ci
+            return original_load(name, path)
+        return SimpleNamespace(module=module, ci=ci, source=source, root=root, template=template, row=row,
+            interpreter=interpreter, architecture=architecture, version=version, events=events, state=state, capture=capture, simulate=simulate, resolve=resolve, clock=clock)
+
+    def environment(self, architecture='x86_64'):
+        return {'EXPECTED_SOURCE_SHA': 'a' * 40, 'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+            'GITHUB_EVENT_NAME': 'workflow_dispatch', 'QUALIFICATION_MODE': 'registered-git-recheck', 'RUNNER_OS': 'macOS', 'RUNNER_ARCH': {'arm64': 'ARM64', 'x86_64': 'X64'}[architecture], 'EXPECTED_ARCHITECTURE': architecture}
+
+    def execute(self, f, case='clean'):
+        def command(argv, *, cwd, timeout, stem):
+            label = stem.name.removeprefix('stage-')
+            if case in ('timeout', 'nonzero', 'capture-limit', 'incomplete') and label == 'admit':
+                if case == 'timeout':
+                    f.state['failure'] = {'kind': 'timeout'}; raise subprocess.TimeoutExpired(argv, timeout)
+                if case == 'nonzero': return subprocess.CompletedProcess(argv, 7)
+                if case == 'capture-limit': f.state['failure'] = {'kind': 'capture_limit'}
+                if case == 'incomplete': f.state['active'] = {'phase': 'incomplete'}
+            return f.simulate(label, argv, timeout, case)
+        f.capture._owned_command = command
+        if case == 'restore-cancel':
+            f.capture._restore_command_handlers = lambda previous: f.state.update(failure={'kind': 'cancelled'}, first_signal=15, signal_count=1)
+        with patch.object(f.module, 'load', side_effect=f.resolve), patch.object(f.module.time, 'monotonic', side_effect=lambda: f.clock[0]), \
+             patch.object(f.module.platform, 'machine', return_value=f.architecture), patch.object(sys, 'platform', 'darwin'), \
+             patch.object(sys, 'version_info', tuple(map(int, f.version.split('.')))), patch.object(sys, 'executable', str(f.interpreter)), \
+             patch.dict(os.environ, self.environment(f.architecture), clear=True):
+            return f.module.execute(f.source, f.root, registered=True)
+
+    def test_registered_hosted_gate_is_disjoint_and_ordinary_cells_unchanged(self):
+        module = load('ci_native_qualify'); env = self.environment(); module.gate(env, registered=True)
+        for key, value in (('GITHUB_SHA', 'b' * 40), ('GITHUB_RUN_ATTEMPT', '2'), ('RUNNER_ARCH', 'ARM64'),
+                           ('QUALIFICATION_MODE', 'native-git-qualification'), ('GITHUB_EVENT_NAME', 'pull_request')):
+            with self.subTest(key=key), self.assertRaises(ValueError): module.gate({**env, key: value}, registered=True)
+        with self.assertRaises(ValueError): module.gate(env)
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        registered = text.split('  registered-git-recheck:\n', 1)[1]
+        self.assertIn("inputs.mode == 'registered-git-recheck'", registered)
+        self.assertIn('persist-credentials: false', registered)
+        self.assertIn('ref: ${{ github.sha }}', registered)
+        self.assertIn('ci_native_qualify.py execute-registered ', registered)
+        self.assertIn('ci_native_qualify.py registered-transfer-ready ', registered)
+        self.assertIn("if-no-files-found: error", registered)
+        self.assertIn('retention-days: 1', registered)
+        matrix = text.split('      matrix:\n', 1)[1].split('    env:', 1)[0]
+        self.assertEqual(matrix.count('- {os:'), 6)
+
+    def test_registered_flow_checks_historical_component_then_new_producer_admission_and_campaign(self):
+        for case in ('clean', 'archive-substitution', 'manifest-substitution', 'inventory-substitution',
+                     'qualification-substitution', 'component-substitution', 'recipe-substitution', 'wheel-substitution',
+                     'historical-source', 'admission-refusal', 'missing-admission', 'false-campaign', 'wrong-registration', 'wrong-count'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve())
+                if case == 'clean': self.execute(f, case)
+                else:
+                    with self.assertRaises((ValueError, RuntimeError, OSError)): self.execute(f, case)
+                result = json.loads((f.root / 'execution-result.json').read_bytes())
+                self.assertEqual(result['passed'], case == 'clean')
+                self.assertEqual(result['kind'], f.module.REGISTERED_KIND)
+                if case.endswith('substitution') and case != 'wheel-substitution': self.assertNotIn('build', f.events)
+                if case in ('admission-refusal', 'missing-admission'): self.assertNotIn('campaign', f.events)
+                if case == 'clean':
+                    self.assertLess(f.events.index('initialize-installed'), f.events.index('real-check-slot'))
+                    self.assertLess(f.events.index('real-check-slot'), f.events.index('campaign'))
+                    self.assertIn('HISTORICAL', (f.root / 'component/qualification-source-pins.json').read_text())
+                    self.assertNotIn('HISTORICAL', (f.root / 'producer/source-pins.json').read_text())
+                    with tarfile.open(f.root / 'registered-git-recheck-x86_64.tar.xz') as archive:
+                        manifest = json.load(archive.extractfile('transfer-manifest.json'))
+                        self.assertTrue(manifest['runtime_binaries_included'])
+                        self.assertIn('wheel/current.whl', archive.getnames())
+                else:
+                    with tarfile.open(f.root / 'registered-git-recheck-x86_64.failure.tar.xz') as archive:
+                        self.assertFalse(any(n.startswith(('wheel/', 'Git/')) or n.endswith('.whl') for n in archive.getnames()))
+                        self.assertFalse(json.load(archive.extractfile('transfer-manifest.json'))['runtime_binaries_included'])
+
+    def test_registered_deadline_fits_full_stage_at_actual_elapsed_boundary(self):
+        for elapsed in (689, 690, 691):
+            with self.subTest(elapsed=elapsed), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve())
+                if elapsed == 689: self.execute(f, 'budget-' + str(elapsed))
+                else:
+                    with self.assertRaises(ValueError): self.execute(f, 'budget-' + str(elapsed))
+                self.assertEqual('campaign' in f.events, elapsed == 689)
+                result = json.loads((f.root / 'execution-result.json').read_bytes())
+                self.assertEqual(result['passed'], elapsed == 689)
+
+    def test_registered_bootstrap_uses_actual_external_archive_and_finite_native_pins(self):
+        for case in ('clean', 'archive', 'manifest', 'inventory', 'qualification'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve()); buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode='w:xz', format=tarfile.USTAR_FORMAT) as archive:
+                    for path in sorted(f.template.rglob('*')):
+                        if path.is_file():
+                            data = path.read_bytes(); item = tarfile.TarInfo(path.relative_to(f.template).as_posix())
+                            item.mode = 0o644; item.size = len(data); archive.addfile(item, io.BytesIO(data))
+                data = buffer.getvalue(); row = {**f.row, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                key = {'archive': 'sha256', 'manifest': 'manifest_sha256', 'inventory': 'inventory_sha256', 'qualification': 'qualification_sha256'}.get(case)
+                if key: row[key] = '0' * 64
+                lock = f.source / 'tools/ci-git-components.json'; lock.write_text(json.dumps({'schema': 1, 'components': {'x86_64': row}}))
+                response = io.BytesIO(data); response.url = row['url']
+                output = Path(temporary).resolve() / 'downloaded'
+                with patch.object(f.ci.urllib.request, 'urlopen', return_value=response):
+                    if case == 'clean': f.ci.fetch(lock, output, 'x86_64')
+                    else:
+                        with self.assertRaises(ValueError): f.ci.fetch(lock, output, 'x86_64')
+                if case == 'archive': self.assertFalse(output.exists())
+
+    def test_registered_command_failure_closure_origin_and_completion_are_required(self):
+        for case in ('timeout', 'nonzero', 'capture-limit', 'incomplete', 'restore-cancel', 'origin'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve())
+                if case == 'origin':
+                    path = Path(temporary) / 'dependency/origin.json'; value = json.loads(path.read_bytes()); value['sha256'] = '0' * 64; path.write_text(json.dumps(value))
+                with self.assertRaises((ValueError, RuntimeError)): self.execute(f, case)
+                result = json.loads((f.root / 'execution-result.json').read_bytes())
+                self.assertFalse(result['passed'])
+                if case != 'restore-cancel': self.assertNotIn('campaign', f.events)
+
+    def test_registered_actual_host_refuses_before_packet_creation(self):
+        for machine, system in (('arm64', 'darwin'), ('x86_64', 'linux')):
+            with self.subTest(machine=machine, system=system), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve())
+                with patch.dict(os.environ, self.environment(), clear=True), patch.object(f.module.platform, 'machine', return_value=machine), patch.object(sys, 'platform', system):
+                    with self.assertRaisesRegex(ValueError, 'Actual registered host differs'):
+                        f.module.execute(f.source, f.root, registered=True)
+                self.assertFalse(f.root.exists())
+
+    def test_registered_transfer_finalization_faults_and_cross_kind_are_not_upload_authority(self):
+        for case in ('normal-package', 'failure-package', 'completion-link', 'stale-result', 'wrong-outcome', 'raw-kind',
+                     'normal-result-write', 'failure-result-write', 'normal-result-rename', 'failure-result-rename',
+                     'normal-invalidation', 'failure-invalidation', 'pending-completion',
+                     'normal-package-latch', 'failure-package-latch', 'failure-package-exit-zero'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve()); original_package = f.module.package; original_link = f.module.os.link
+                original_write = f.module.write; original_rename = Path.rename; result_writes = []
+                def package(*args, **kwargs):
+                    original_package(*args, **kwargs)
+                    if case == 'normal-package-latch' and not kwargs.get('failed') or case == 'failure-package-latch' and kwargs.get('failed'):
+                        f.state.update(failure={'kind': 'cancelled'}, first_signal=15, signal_count=1)
+                    if case == 'failure-package-exit-zero' and kwargs.get('failed'): raise SystemExit(0)
+                    if ((case.startswith('normal-') and not kwargs.get('failed')) or (case.startswith('failure-') and kwargs.get('failed'))) and not case.endswith('latch'):
+                        raise OSError('inert transfer finalization failure')
+                def link(*args, **kwargs):
+                    if case == 'completion-link': raise OSError('inert exclusive completion failure')
+                    return original_link(*args, **kwargs)
+                def write(path, value):
+                    if path.name == 'execution-result.json':
+                        result_writes.append(value['passed'])
+                        if case.endswith('result-write') and len(result_writes) == 2: raise OSError('inert result rewrite failure')
+                    if case == 'normal-invalidation' and path.name == 'transfer-invalidated.json': raise OSError('inert invalidation failure')
+                    if case == 'failure-invalidation' and path.name == 'failure-transfer-invalidated.json': raise OSError('inert failure invalidation failure')
+                    if case == 'pending-completion' and path.name == 'transfer-completion.pending.json': raise OSError('inert completion pending failure')
+                    original_write(path, value)
+                def rename(path, destination):
+                    if case.endswith('result-rename') and path.name == 'execution-result.json': raise OSError('inert result rename failure')
+                    return original_rename(path, destination)
+                with patch.object(f.module, 'package', side_effect=package), patch.object(f.module.os, 'link', side_effect=link), \
+                     patch.object(f.module, 'write', side_effect=write), patch.object(Path, 'rename', rename):
+                    if case.startswith(('normal-', 'failure-')) or case in ('completion-link', 'pending-completion'):
+                        with self.assertRaises((ValueError, RuntimeError, OSError)):
+                            self.execute(f, 'false-campaign' if case.startswith('failure-') else 'clean')
+                    else: self.execute(f)
+                if case == 'stale-result':
+                    path = f.root / 'execution-result.json'; path.write_bytes(path.read_bytes() + b' ')
+                if case == 'raw-kind':
+                    with patch.dict(os.environ, {**self.environment(), 'GITHUB_OUTPUT': str(Path(temporary) / 'output'), 'QUALIFICATION_STEP_OUTCOME': 'success'}, clear=True):
+                        with self.assertRaises(ValueError): f.module.transfer_ready(f.root)
+                output = Path(temporary) / 'registered-output'
+                with patch.dict(os.environ, {**self.environment(), 'GITHUB_OUTPUT': str(output),
+                        'QUALIFICATION_STEP_OUTCOME': 'failure' if case.startswith(('normal-', 'failure-')) or case == 'wrong-outcome' else 'success'}, clear=True):
+                    if case in ('normal-package', 'normal-package-latch'): f.module.transfer_ready(f.root, registered=True)
+                    elif case == 'raw-kind': f.module.transfer_ready(f.root, registered=True)
+                    else:
+                        with self.assertRaises(ValueError): f.module.transfer_ready(f.root, registered=True)
+                self.assertEqual(output.exists(), case in ('normal-package', 'normal-package-latch', 'raw-kind'))
+                failure_archive = f.root / 'registered-git-recheck-x86_64.failure.tar.xz'
+                if failure_archive.exists():
+                    with tarfile.open(failure_archive) as archive:
+                        self.assertFalse(any(n.startswith(('wheel/', 'Git/')) or n.endswith('.whl') for n in archive.getnames()))
+
+
+    def test_original_registered_tuple_survives_every_late_packaging_boundary(self):
+        cases = ('clean', 'wheel-and-build-result', 'controller', 'source55', 'source-receipt', 'descriptor',
+                 'admission', 'campaign', 'component-reference', 'historical-map', 'controller-pins',
+                 'dependency-origin', 'staged-wheel', 'staged-source', 'staged-manifest', 'staged-extra',
+                 'serialized-wheel', 'after-package-wheel', 'after-package-archive')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix='registered-original-binding-') as temporary:
+                f = self.fixture(Path(temporary).resolve()); original_package = f.module.package
+                original_write = f.module.write; original_addfile = tarfile.TarFile.addfile
+                admitted = {}; mutation = []
+                def replace_wheel():
+                    producer = f.root / 'producer'; wheel = producer / 'current.whl'
+                    admitted.setdefault('wheel', f.module.sha(wheel))
+                    wheel.write_bytes(b'coherently replaced inert wheel; never executed')
+                    path = producer / 'build-result.json'; value = json.loads(path.read_bytes())
+                    value['wheel_sha256'] = f.module.sha(wheel); path.write_text(json.dumps(value))
+                    mutation.append(case)
+                def package(*args, **kwargs):
+                    if not kwargs.get('failed'):
+                        admitted['wheel'] = f.module.sha(f.root / 'producer/current.whl')
+                        if case == 'wheel-and-build-result': replace_wheel()
+                        targets = {'controller': f.source / 'tools/ci_execute.py', 'source55': f.source / 'setup.py',
+                            'source-receipt': f.root / 'producer/source-pins.json', 'descriptor': f.root / 'producer/native-input.json',
+                            'admission': f.root / 'producer/admission-result.json', 'campaign': f.root / 'campaign/result.json',
+                            'component-reference': f.root / 'component-reference.json',
+                            'historical-map': f.root / 'component/qualification-source-pins.json',
+                            'controller-pins': f.root / 'controller-source-pins.json', 'dependency-origin': f.root / 'dependency-origin.json'}
+                        if case in targets:
+                            path = targets[case]; path.write_bytes(path.read_bytes() + b'\n'); mutation.append(case)
+                    result = original_package(*args, **kwargs)
+                    if not kwargs.get('failed') and case == 'after-package-wheel': replace_wheel()
+                    if not kwargs.get('failed') and case == 'after-package-archive':
+                        archive_path = f.root / 'registered-git-recheck-x86_64.tar.xz'; entries = []
+                        with tarfile.open(archive_path) as opened:
+                            for member in opened:
+                                data = opened.extractfile(member).read()
+                                if member.name == 'wheel/current.whl': data = b'replaced actual archive wheel'
+                                entries.append((member.name, member.mode, data))
+                        # Coherently update embedded row and outer receipt; retained original receipt must still refuse.
+                        changed_sha = hashlib.sha256(b'replaced actual archive wheel').hexdigest()
+                        for i, (name, mode, data) in enumerate(entries):
+                            if name == 'transfer-manifest.json':
+                                manifest = json.loads(data)
+                                for row in manifest['files']:
+                                    if row['path'] == 'wheel/current.whl': row.update(size=len(b'replaced actual archive wheel'), sha256=changed_sha)
+                                entries[i] = (name, mode, f.module.json_bytes(manifest))
+                        with tarfile.open(archive_path, 'w:xz', format=tarfile.USTAR_FORMAT) as opened:
+                            for name, mode, data in entries:
+                                member = tarfile.TarInfo(name); member.mode = mode; member.size = len(data); opened.addfile(member, io.BytesIO(data))
+                        path = f.root / 'transfer-result.json'; receipt = json.loads(path.read_bytes())
+                        receipt.update(archive_sha256=f.module.sha(archive_path), bytes=archive_path.stat().st_size,
+                            manifest_sha256=hashlib.sha256(next(data for name, mode, data in entries if name == 'transfer-manifest.json')).hexdigest())
+                        path.write_text(json.dumps(receipt)); mutation.append(case)
+                    return result
+                def write(path, value):
+                    original_write(path, value)
+                    if path.name == 'transfer-manifest.json' and path.parent.name == 'transfer':
+                        targets = {'staged-wheel': path.parent / 'wheel/current.whl',
+                                   'staged-source': path.parent / 'source/tools/ci_execute.py',
+                                   'staged-manifest': path, 'staged-extra': path.parent / 'extra'}
+                        if case in targets: targets[case].write_bytes(b'post-copy substituted inert bytes'); mutation.append(case)
+                def addfile(opened, member, fileobj=None):
+                    if case == 'serialized-wheel' and member.name == 'wheel/current.whl':
+                        replacement = b'substituted serialized body; never executed'
+                        member.size = len(replacement); fileobj = io.BytesIO(replacement); mutation.append(case)
+                    return original_addfile(opened, member, fileobj)
+                with patch.object(f.module, 'package', side_effect=package), patch.object(f.module, 'write', side_effect=write), \
+                     patch.object(tarfile.TarFile, 'addfile', addfile):
+                    if case == 'clean': self.execute(f)
+                    else:
+                        with self.assertRaises((ValueError, RuntimeError)): self.execute(f)
+                outcome = json.loads((f.root / 'execution-result.json').read_bytes())
+                self.assertEqual(outcome['passed'], case == 'clean')
+                if case != 'clean': self.assertTrue(mutation)
+                output = Path(temporary) / 'success-output'
+                with patch.dict(os.environ, {**self.environment(), 'GITHUB_OUTPUT': str(output), 'QUALIFICATION_STEP_OUTCOME': 'success'}, clear=True):
+                    if case == 'clean': f.module.transfer_ready(f.root, registered=True)
+                    else:
+                        with self.assertRaises(ValueError): f.module.transfer_ready(f.root, registered=True)
+                self.assertEqual(output.exists(), case == 'clean')
+                if case == 'clean':
+                    with tarfile.open(f.root / 'registered-git-recheck-x86_64.tar.xz') as archive:
+                        manifest = json.load(archive.extractfile('transfer-manifest.json'))
+                        for row in manifest['files']:
+                            data = archive.extractfile(row['path']).read()
+                            self.assertEqual(hashlib.sha256(data).hexdigest(), row['sha256'])
+                            self.assertEqual(len(data), row['size'])
+                        self.assertEqual(hashlib.sha256(archive.extractfile('wheel/current.whl').read()).hexdigest(), admitted['wheel'])
+                else:
+                    failure = f.root / 'registered-git-recheck-x86_64.failure.tar.xz'
+                    with tarfile.open(failure) as archive:
+                        self.assertFalse(any(n.startswith(('wheel/', 'Git/')) or n.endswith('.whl') for n in archive.getnames()))
+                    with patch.dict(os.environ, {**self.environment(), 'GITHUB_OUTPUT': str(Path(temporary) / 'failure-output'), 'QUALIFICATION_STEP_OUTCOME': 'failure'}, clear=True):
+                        f.module.transfer_ready(f.root, registered=True)
+
+    def test_registered_terminal_selector_rechecks_original_tuple_and_serialized_archive(self):
+        for case in ('controller', 'wheel-and-result', 'archive'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve()); self.execute(f)
+                if case == 'controller': (f.source / 'tools/ci_execute.py').write_bytes(b'late controller')
+                if case == 'wheel-and-result':
+                    wheel = f.root / 'producer/current.whl'; wheel.write_bytes(b'late inert wheel')
+                    path = f.root / 'producer/build-result.json'; value = json.loads(path.read_bytes()); value['wheel_sha256'] = f.module.sha(wheel); path.write_text(json.dumps(value))
+                if case == 'archive':
+                    path = f.root / 'registered-git-recheck-x86_64.tar.xz'; path.write_bytes(b'late outer archive')
+                    receipt_path = f.root / 'transfer-result.json'; value = json.loads(receipt_path.read_bytes())
+                    value.update(archive_sha256=f.module.sha(path), bytes=path.stat().st_size); receipt_path.write_text(json.dumps(value))
+                output = Path(temporary) / 'output'
+                with patch.dict(os.environ, {**self.environment(), 'GITHUB_OUTPUT': str(output), 'QUALIFICATION_STEP_OUTCOME': 'success'}, clear=True):
+                    with self.assertRaises((ValueError, tarfile.TarError)): f.module.transfer_ready(f.root, registered=True)
+                self.assertFalse(output.exists())
+
+
+    def test_registered_both_static_hosts_bind_separate_artifacts_and_completion(self):
+        for architecture in ('arm64', 'x86_64'):
+            for failed in (False, True):
+                with self.subTest(architecture=architecture, failed=failed), tempfile.TemporaryDirectory() as temporary:
+                    f = self.fixture(Path(temporary).resolve(), architecture)
+                    if failed:
+                        with self.assertRaises(ValueError): self.execute(f, 'false-campaign')
+                    else: self.execute(f)
+                    suffix = '.failure' if failed else ''
+                    archive = f.root / ('registered-git-recheck-' + architecture + suffix + '.tar.xz')
+                    self.assertTrue(archive.is_file())
+                    result = json.loads((f.root / 'execution-result.json').read_bytes())
+                    receipt = json.loads((f.root / ('failure-transfer-result.json' if failed else 'transfer-result.json')).read_bytes())
+                    completion = json.loads((f.root / 'transfer-completion.json').read_bytes())
+                    self.assertEqual(result['architecture'], architecture)
+                    self.assertEqual(receipt['architecture'], architecture)
+                    self.assertEqual(completion['architecture'], architecture)
+                    with tarfile.open(archive) as opened:
+                        self.assertEqual(json.load(opened.extractfile('transfer-manifest.json'))['architecture'], architecture)
+                    output = Path(temporary) / 'selected'
+                    with patch.dict(os.environ, {**self.environment(architecture), 'GITHUB_OUTPUT': str(output),
+                            'QUALIFICATION_STEP_OUTCOME': 'failure' if failed else 'success'}, clear=True):
+                        f.module.transfer_ready(f.root, registered=True)
+                    self.assertIn(str(archive), output.read_text())
+                    other = 'x86_64' if architecture == 'arm64' else 'arm64'
+                    cross_output = Path(temporary) / 'cross-output'
+                    with patch.dict(os.environ, {**self.environment(other), 'GITHUB_OUTPUT': str(cross_output),
+                            'QUALIFICATION_STEP_OUTCOME': 'failure' if failed else 'success'}, clear=True):
+                        with self.assertRaises(ValueError): f.module.transfer_ready(f.root, registered=True)
+                    self.assertFalse(cross_output.exists())
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        registered = text.split('  registered-git-recheck:\n', 1)[1]
+        self.assertIn('- {os: macos-26, architecture: arm64, runner_architecture: ARM64}', registered)
+        self.assertIn('- {os: macos-26-intel, architecture: x86_64, runner_architecture: X64}', registered)
+        self.assertEqual(registered.count('- {os:'), 2)
+        self.assertIn('fail-fast: false', registered)
+        self.assertIn('group: registered-git-recheck-${{ inputs.expected-source-sha }}-${{ matrix.architecture }}', registered)
+        self.assertIn('name: registered-git-recheck-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}', registered)
+        self.assertIn('--architecture "${EXPECTED_ARCHITECTURE:?}"', registered)
+        body = registered.split("/usr/bin/python3 -I -B - <<'PYTHON'\n", 1)[1].split('          PYTHON', 1)[0]
+        body = '\n'.join(line[10:] for line in body.splitlines())
+        guard = compile(ast.parse(body), '<registered-workflow-preflight>', 'exec')
+        for architecture in ('arm64', 'x86_64'):
+            with patch.dict(os.environ, self.environment(architecture), clear=True): exec(guard, {})
+            other = 'X64' if architecture == 'arm64' else 'ARM64'
+            with patch.dict(os.environ, {**self.environment(architecture), 'RUNNER_ARCH': other}, clear=True):
+                with self.assertRaises(AssertionError): exec(guard, {})
+
+    def test_registered_profiles_refuse_cross_host_version_origin_and_mode(self):
+        for architecture in ('arm64', 'x86_64'):
+            other = 'x86_64' if architecture == 'arm64' else 'arm64'
+            module = load('ci_native_qualify'); environment = self.environment(architecture)
+            module.gate(environment, registered=True)
+            for changes in ({'RUNNER_ARCH': self.environment(other)['RUNNER_ARCH']}, {'EXPECTED_ARCHITECTURE': ''},
+                            {'QUALIFICATION_MODE': 'native-git-qualification'}):
+                with self.subTest(architecture=architecture, changes=changes), self.assertRaises(ValueError):
+                    module.gate({**environment, **changes}, registered=True)
+            for field, value in (('architecture', other), ('version', '3.13.18' if architecture == 'arm64' else '3.11.18'),
+                                 ('executable_sha256', '0' * 64)):
+                with self.subTest(architecture=architecture, field=field), tempfile.TemporaryDirectory() as temporary:
+                    f = self.fixture(Path(temporary).resolve(), architecture)
+                    path = Path(temporary) / 'dependency/origin.json'; origin = json.loads(path.read_bytes()); origin[field] = value
+                    path.write_text(json.dumps(origin))
+                    with self.assertRaises(ValueError): self.execute(f)
+                    self.assertNotIn('fetch', f.events)
+            for case in ('system-version', 'coherent-origin-and-executable'):
+                with self.subTest(architecture=architecture, case=case), tempfile.TemporaryDirectory() as temporary:
+                    f = self.fixture(Path(temporary).resolve(), architecture)
+                    if case == 'system-version': f.version = '3.13.18' if architecture == 'arm64' else '3.11.18'
+                    else:
+                        f.interpreter.write_bytes(b'replacement inert interpreter; never executed')
+                        path = Path(temporary) / 'dependency/origin.json'; origin = json.loads(path.read_bytes())
+                        origin['executable_sha256'] = f.module.sha(f.interpreter); path.write_text(json.dumps(origin))
+                    with self.assertRaises(ValueError): self.execute(f)
+                    self.assertNotIn('fetch', f.events)
+            with tempfile.TemporaryDirectory() as temporary:
+                f = self.fixture(Path(temporary).resolve(), architecture)
+                with patch.dict(os.environ, self.environment(other), clear=True), patch.object(f.module.platform, 'machine', return_value=architecture), patch.object(sys, 'platform', 'darwin'):
+                    with self.assertRaisesRegex(ValueError, 'Actual registered host differs'):
+                        f.module.execute(f.source, f.root, registered=True)
+                self.assertFalse(f.root.exists())
+        raw = {**self.environment('x86_64'), 'QUALIFICATION_MODE': 'native-git-qualification'}
+        load('ci_native_qualify').gate(raw)
+        with self.assertRaises(ValueError): load('ci_native_qualify').gate({**self.environment('arm64'), 'QUALIFICATION_MODE': 'native-git-qualification'})
+
+
+class InterpreterProfiles(unittest.TestCase):
+    def test_exact_two_profiles_preserve_the_intel_default(self):
+        module = load('ci_native_python')
+        self.assertEqual(set(module.PROFILES), {'arm64', 'x86_64'})
+        self.assertEqual(module.provision.__defaults__, ('x86_64',))
+        self.assertEqual(module.PROFILES['x86_64'], {'url': module.URL, 'sha256': module.SHA256, 'bytes': module.SIZE,
+            'executable_sha256': module.EXECUTABLE_SHA256, 'version': '3.13.18', 'executable': 'python/bin/python3.13'})
+        self.assertEqual(module.PROFILES['arm64'], {
+            'url': 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.11.18%2B20261110-aarch64-apple-darwin-install_only.tar.gz',
+            'sha256': '73f1ed14486aa278d331e95f7d6d452f5cfb69d90b418e26e62fd4846d53557d', 'bytes': 27111938,
+            'executable_sha256': '96362363eae965731b1c9cfde891ee5a56c4da37104a513d0726e27b8564acc4',
+            'version': '3.11.18', 'executable': 'python/bin/python3.11'})
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        raw = text.split('  native-git-qualification:\n', 1)[1].split('  registered-git-recheck:\n', 1)[0]
+        self.assertIn('tools/ci_native_python.py --output', raw)
+        self.assertNotIn('--architecture', raw)
+
+    def test_actual_provision_routes_inert_archives_and_refuses_opposite_hosts(self):
+        for architecture, use_default in (('x86_64', True), ('x86_64', False), ('arm64', False)):
+            with self.subTest(architecture=architecture, default=use_default), tempfile.TemporaryDirectory() as temporary:
+                module = load('ci_native_python'); profile = dict(module.PROFILES[architecture])
+                marker = b'inert interpreter marker; never executed'; buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode='w:gz') as opened:
+                    member = tarfile.TarInfo(profile['executable']); member.size = len(marker); member.mode = 0o755
+                    opened.addfile(member, io.BytesIO(marker))
+                data = buffer.getvalue(); profile.update(bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                    executable_sha256=hashlib.sha256(marker).hexdigest())
+                response = io.BytesIO(data); response.url = profile['url']; output = Path(temporary).resolve() / 'owned'
+                with patch.dict(module.PROFILES, {architecture: profile}), patch.object(module.platform, 'system', return_value='Darwin'), \
+                     patch.object(module.platform, 'machine', return_value=architecture), patch.object(module.urllib.request, 'urlopen', return_value=response) as download:
+                    executable = module.provision(output) if use_default else module.provision(output, architecture)
+                download.assert_called_once_with(profile['url'], timeout=30)
+                self.assertEqual(executable, output / profile['executable'])
+                self.assertEqual(executable.read_bytes(), marker)
+                origin = json.loads((output / 'origin.json').read_bytes())
+                self.assertEqual(origin['architecture'], architecture)
+                self.assertEqual(origin['version'], profile['version'])
+                self.assertEqual(origin['executable_sha256'], profile['executable_sha256'])
+        for architecture in ('arm64', 'x86_64', '', None, ['arm64']):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                module = load('ci_native_python'); output = Path(temporary) / 'refused'
+                actual = 'x86_64' if architecture == 'arm64' else 'arm64'
+                with patch.object(module.platform, 'system', return_value='Darwin'), patch.object(module.platform, 'machine', return_value=actual), patch.object(module.urllib.request, 'urlopen') as download:
+                    with self.assertRaises(ValueError): module.provision(output, architecture)
+                download.assert_not_called(); self.assertFalse(output.exists())
 
 
 class OwnedCIInterpreter(unittest.TestCase):
