@@ -1,3 +1,13 @@
+import os
+import platform as host
+import sys
+
+if sys.platform == 'darwin':
+    architecture = host.machine()
+    if not isinstance(architecture, str) or architecture not in ('arm64', 'x86_64'):
+        raise ValueError('Unsupported Darwin architecture')
+    os.environ['ARCHFLAGS'] = '-arch ' + architecture
+
 from pathlib import Path
 from shutil import copy2
 from setuptools import Extension, setup
@@ -98,15 +108,17 @@ class PayloadWheel(bdist_wheel):
         builder = git_builder()
         build = self.get_finalized_command('build')
         roots = [Path(build.build_lib), Path(self.get_finalized_command('build_scripts').build_dir)]
+        architecture = host.machine()
         minimum, architectures = (0, 0, 0), set()
         for root in roots:
             for path in root.rglob('*'):
                 if not path.is_file() or path.is_symlink():
                     continue
-                for value in builder.macho(path):
+                slices = builder.macho(path)
+                if slices and (len(slices) != 1 or slices[0]['architecture'] != architecture):
+                    raise ValueError('Wheel payload architecture differs: ' + str(path))
+                for value in slices:
                     minimum = max(minimum, value['minimum']); architectures.add(value['architecture'])
-        import platform as host
-        architecture = host.machine()
         if not architectures:
             return python, abi, platform
         if architecture not in architectures:

@@ -8,7 +8,7 @@ on:
       mode:
         description: Hosted action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact, native-git-qualification]
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact, native-git-qualification, registered-git-recheck]
         default: compare
       expected-source-sha:
         description: Reviewed full source SHA for native Git qualification
@@ -892,6 +892,70 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-git-qualification-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ steps.qualification-transfer.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  registered-git-recheck:
+    name: Registered Git recheck (${{ matrix.architecture }})
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'registered-git-recheck'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-26, architecture: arm64, runner_architecture: ARM64}
+          - {os: macos-26-intel, architecture: x86_64, runner_architecture: X64}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: registered-git-recheck-${{ inputs.expected-source-sha }}-${{ matrix.architecture }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      QUALIFICATION_MODE: ${{ inputs.mode }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Require exact manual source and first attempt
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import os, re
+          expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
+          assert re.fullmatch('[0-9a-f]{40}', expected) and expected == os.environ['GITHUB_SHA']
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['QUALIFICATION_MODE'] == 'registered-git-recheck'
+          architecture = os.environ['EXPECTED_ARCHITECTURE']
+          assert architecture in ('arm64', 'x86_64')
+          assert os.environ['RUNNER_OS'] == 'macOS' and os.environ['RUNNER_ARCH'] == {'arm64': 'ARM64', 'x86_64': 'X64'}[architecture]
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Place verified standalone host interpreter in owned directory
+        run: /usr/bin/python3 -I -B tools/ci_native_python.py --architecture "${EXPECTED_ARCHITECTURE:?}" --output "$RUNNER_TEMP/qualification-python"
+      - name: Install exact bounded build dependency
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt'
+      - name: Run current wheel and registered native campaign
+        id: native-qualification
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B tools/ci_native_qualify.py execute-registered --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/registered-git-recheck"'
+      - name: Validate finite qualification transfer
+        id: qualification-transfer
+        if: always()
+        env:
+          QUALIFICATION_STEP_OUTCOME: ${{ steps.native-qualification.outcome }}
+        run: |
+          if test -f "$RUNNER_TEMP/registered-git-recheck/transfer-result.json" || test -f "$RUNNER_TEMP/registered-git-recheck/failure-transfer-result.json"; then
+            /usr/bin/python3 -I -B tools/ci_native_qualify.py registered-transfer-ready --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/registered-git-recheck"
+          fi
+      - name: Transfer finite qualification result
+        if: always() && steps.qualification-transfer.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: registered-git-recheck-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}
           path: ${{ steps.qualification-transfer.outputs.archive }}
           if-no-files-found: error
           retention-days: 1
