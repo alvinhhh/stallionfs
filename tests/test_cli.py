@@ -104,7 +104,7 @@ class NativeImageCLI(unittest.TestCase):
         # The capture expects a clean child; the small adapter records the public
         # command's intentional nonzero status without treating it as a crash.
         script = 'import json,subprocess,sys; p=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=15); print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))'
-        child = self.owned('public-cli', [sys.executable, '-I', '-c', script, self.launcher,
+        child = self.owned('public-cli', [sys.executable, '-I', '-B', '-c', script, self.launcher,
                             '--root', self.store, '--json', *args], 25)
         observed = json.loads(child.stdout)
         self.assertEqual(observed['returncode'], status, observed['stderr'])
@@ -145,7 +145,7 @@ class NativeImageCLI(unittest.TestCase):
                   'print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))')
         for arguments in ([self.fixture, 'describe', directory, 'file', 'missing'],
                           [self.fixture, 'host-times', directory, directory / 'missing']):
-            child = self.owned('checker-missing', [sys.executable, '-I', '-c', script, *arguments], 10)
+            child = self.owned('checker-missing', [sys.executable, '-I', '-B', '-c', script, *arguments], 10)
             observed = json.loads(child.stdout)
             self.assertNotEqual(observed['returncode'], 0)
         self.assertEqual((image.stat().st_ino, hashlib.sha256(image.read_bytes()).hexdigest()), before)
@@ -664,7 +664,7 @@ for line in sys.stdin:
             assert result['resources']['scratch_bytes'] > len(value), result
             print(json.dumps({'directory': str(destination), 'size': len(value), 'sha256': hashlib.sha256(value).hexdigest(), 'result': result}))
         ''')
-        child = self.owned('large-resource-fork', [sys.executable, '-I', '-c', script,
+        child = self.owned('large-resource-fork', [sys.executable, '-I', '-B', '-c', script,
             _image.__file__, self.base / 'large'], 60)
         expected = json.loads(child.stdout)
         actual = self.owned('large-resource-check', [self.fixture, 'describe', expected['directory'], 'repo/file'], 30)
@@ -746,7 +746,7 @@ for line in sys.stdin:
                  ('identity-resize-success', 0, 0, 0)]
         for case, kind, ordinal, flags in cases:
             with self.subTest(case=case):
-                child = self.owned('import-' + case, [sys.executable, '-I', '-c', script,
+                child = self.owned('import-' + case, [sys.executable, '-I', '-B', '-c', script,
                     self.diagnostic, self.base / case, case, kind, ordinal, flags], 30)
                 observed = json.loads(child.stdout); result = observed['result']
                 if case == 'response-allocation':
@@ -863,7 +863,7 @@ for line in sys.stdin:
             with self.subTest(case=case):
                 directory = self.seed(f'case-{index}'); workspace = self.register(directory)
                 self.command('snapshot', workspace, '--name', 'base')
-                child = self.owned('diagnostic-case', [sys.executable, '-I', '-c', script, self.diagnostic,
+                child = self.owned('diagnostic-case', [sys.executable, '-I', '-B', '-c', script, self.diagnostic,
                             self.store, workspace, case, kind, ordinal, flags, deadline])
                 observed = json.loads(child.stdout)['native_image_result']
                 roots = self.command('snapshots', workspace)
@@ -1057,7 +1057,10 @@ class InstalledCLI(unittest.TestCase):
         self.assertFalse((self.base / 'unused-store').exists())
 
     def test_native_exports_load_once_on_first_access(self):
-        result = subprocess.run([sys.executable, '-I', '-c', """
+        if os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT'):
+            from qualified_git_fixture import runtime
+            self.addCleanup(runtime()['check'])
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', """
 import sys, threading, stallionfs
 from concurrent.futures import ThreadPoolExecutor
 names = ('clone', 'copy', 'delete', 'mounts', 'move', 'scan')
@@ -1106,6 +1109,9 @@ for name in names:
                 self.assertFalse(store.exists())
 
     def test_helper_dispatch_from_installed_and_symlinked_launcher(self):
+        if os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT'):
+            from qualified_git_fixture import runtime
+            self.addCleanup(runtime()['check'])
         self.assertEqual(__version__, version('stallionfs'))
         native = self.native_only()
         self.assertEqual(self.command('--version', launcher=native).stdout, __version__ + '\n')

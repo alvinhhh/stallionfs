@@ -437,7 +437,7 @@ class OrdinaryCopy(unittest.TestCase):
         shutil.copy2(installed, launcher)
         self.assertFalse((standalone / 'stallionfs-python').exists())
         environment = {**os.environ, 'PATH': '/usr/bin:/bin'}
-        for name, command in (('native', [str(launcher)]), ('python', [sys.executable, '-I', '-m', 'stallionfs'])):
+        for name, command in (('native', [str(launcher)]), ('python', [sys.executable, '-I', '-B', '-m', 'stallionfs'])):
             with self.subTest(cli=name):
                 source = '--source café 🐎 "\\\t\n\x01'
                 path = self.base / source
