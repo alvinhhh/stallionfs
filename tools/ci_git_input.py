@@ -180,7 +180,7 @@ def initialize(checkout, wheel, wheel_sha256, descriptor, descriptor_sha256, *, 
     package._runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'}, 'Invalid private Git input')
     native = Path(git['root']).absolute()
     retained.tree(native)
-    admitted = package._runtime_admit_git(git, pins)
+    admitted = package._runtime_admit_git(git, pins, architecture=platform.machine())
     retained.check()
     package._runtime_require(admitted['root'].resolve(strict=True) == native, 'Native input path changed')
     configured = os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT')

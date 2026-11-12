@@ -13,6 +13,8 @@ INPUT = '7' * 64
 def qualify(test):
     selected = patch.object(_bundle, 'QUALIFIED_GIT_INPUTS', frozenset({INPUT}))
     selected.start(); test.addCleanup(selected.stop)
+    architecture = patch.object(_bundle, 'QUALIFIED_GIT_ARCHITECTURES', {INPUT: 'arm64'})
+    architecture.start(); test.addCleanup(architecture.stop)
 
 
 def runtime():

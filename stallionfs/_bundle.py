@@ -271,14 +271,16 @@ GIT_CONTRACT = {
     'payload_format': 'git-tree-v1',
 }
 # Exact native command inputs; corresponding source is mapped separately.
-QUALIFIED_GIT_INPUTS = frozenset({
-    '9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700',
-})
+QUALIFIED_GIT_ARCHITECTURES = {
+    '9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700': 'arm64',
+    '020c08613be10d2d21d46a4defd6c4c98724b0af61426a9a2096e1bee48d546a': 'x86_64',
+}
+QUALIFIED_GIT_INPUTS = frozenset(QUALIFIED_GIT_ARCHITECTURES)
 GIT_SOURCE_KEYS = ('source_sha256', 'source_distribution_sha256', 'build_config_sha256', 'combined_patch_sha256', 'notice_patch_sha256',
                    'curl_archive_sha256', 'curl_header_manifest_sha256', 'alias_source_sha256')
 
 
-def git_contract(value, *, qualified=True):
+def git_contract(value, *, qualified=True, architecture=None):
     require(type(value) is dict and set(value) == set(GIT_CONTRACT) | {'input_inventory_sha256'}
             and all(value.get(key) == expected for key, expected in GIT_CONTRACT.items())
             and type(value.get('schema')) is int
@@ -286,6 +288,10 @@ def git_contract(value, *, qualified=True):
             'Unsupported Git provenance')
     require(not qualified or value['input_inventory_sha256'] in QUALIFIED_GIT_INPUTS,
             'Git build has not been qualified')
+    if architecture is not None:
+        require(qualified and architecture in ('arm64', 'x86_64')
+                and QUALIFIED_GIT_ARCHITECTURES.get(value['input_inventory_sha256']) == architecture,
+                'Git build architecture differs')
     return value
 
 PUBLISHER_TEAM = '4CQS5J4848'

@@ -478,6 +478,7 @@ class RuntimeAssembly(unittest.TestCase):
             combined_patch_sha256=pinned(hook_patch)['sha256'], notice_patch_sha256=pinned(notices)['sha256'],
             alias_source_sha256=pinned(alias)['sha256'], curl_header_manifest_sha256=pinned(curl_headers)['sha256'])
         self.bundle.QUALIFIED_GIT_INPUTS = frozenset({pinned(inventory)['sha256']})
+        self.bundle.QUALIFIED_GIT_ARCHITECTURES = {pinned(inventory)['sha256']: 'arm64'}
         qualification_value = json.loads(qualification.read_bytes())
         qualification_value['native_create'] = dict(self.bundle.GIT_CONTRACT)
         json_file(qualification, qualification_value)

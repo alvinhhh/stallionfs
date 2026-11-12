@@ -307,7 +307,7 @@ def qualified_runtime(native_host=None):
             and all(value.get(key) == expected for key, expected in _bundle.GIT_CONTRACT.items())
             and type(value['payload_entries']) is int and 0 < value['payload_entries'] <= 4096
             and re.fullmatch('[0-9a-f]{64}', str(value['payload_sha256'])), 'unqualified-git-runtime')
-    _bundle.git_contract({key: value[key] for key in set(_bundle.GIT_CONTRACT) | {'input_inventory_sha256'}})
+    _bundle.git_contract({key: value[key] for key in set(_bundle.GIT_CONTRACT) | {'input_inventory_sha256'}}, architecture='arm64')
     root = bundle['git'].parent.parent
     payload = _bundle.git_payload(root)
     require(payload['entries'] == value['payload_entries'] and payload['sha256'] == value['payload_sha256'], 'git-payload-mismatch')
