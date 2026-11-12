@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -23,6 +24,77 @@ def load(name):
     spec = importlib.util.spec_from_file_location('test_' + name, path)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     return module
+
+
+INSTALLED = [('macos-15', '3.12', '0'), ('macos-26', '3.11', '1'),
+             ('macos-26', '3.13', '1'), ('macos-26', '3.14', '1'),
+             ('macos-26-intel', '3.13', '1'), ('xcode-27', '3.13', '1')]
+SANITIZERS = [('macos-26', '3.13', '1'), ('macos-26-intel', '3.13', '1'), ('xcode-27', '3.13', '1')]
+SELECTORS = ('test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
+             'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals', 'test_image.ImageCore')
+CONSUMERS = ('Install pinned wheel backend', 'Fetch exact qualified architecture component',
+             'Build current wheel with enforced Git cache reuse', 'Install current owned wheel',
+             'Test installed wheel with image failure diagnostics', 'Check large sparse-seek metadata with default limits',
+             'Validate bounded image diagnostic artifact', 'Check native code with sanitizers', 'Check installed runtime and doctor')
+
+
+def require(value, message):
+    if not value:
+        raise AssertionError(message)
+
+
+def job(text, target):
+    items = list(re.finditer(r'^  ([A-Za-z][\w-]*):[ \t]*$', text, re.M))
+    matches = [index for index, item in enumerate(items) if item.group(1) == target]
+    require(bool(matches), 'missing-job:' + target)
+    require(len(matches) == 1, 'duplicate-job:' + target)
+    index = matches[0]
+    return text[items[index].start():items[index + 1].start() if index + 1 < len(items) else len(text)]
+
+
+def step(block, target):
+    items = list(re.finditer(r'^      - .+$', block, re.M))
+    matches = [index for index, item in enumerate(items) if item.group() == '      - name: ' + target]
+    require(bool(matches), 'missing-step:' + target)
+    require(len(matches) == 1, 'duplicate-step:' + target)
+    index = matches[0]
+    return block[items[index].start():items[index + 1].start() if index + 1 < len(items) else len(block)]
+
+
+def rows(block, phased):
+    raw = re.findall(r'^          - .+$', block, re.M)
+    parsed = []
+    pattern = r"          - \{os: ([^,}]+), python: '([^']+)', images: '([^']+)'" + (r', phase: ([^,}]+)' if phased else '') + r'\}'
+    for row in raw:
+        match = re.fullmatch(pattern, row)
+        require(match is not None, 'unparsed-matrix-row')
+        parsed.append(match.groups())
+    return parsed
+
+
+def sanitizer_nodes(block):
+    body = block.split("<<'PY'\n", 1)[1].rsplit('          PY', 1)[0]
+    tree = ast.parse('\n'.join(line[10:] for line in body.splitlines()))
+    names = [node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'names' for t in node.targets)]
+    require(len(names) == 1 and ast.literal_eval(names[0].value) == SELECTORS, 'sanitizer-selectors')
+    loops = [node for node in ast.walk(tree) if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == 'sanitizers']
+    require(len(loops) == 1 and ast.literal_eval(loops[0].iter) == ('address,undefined', 'thread'), 'sanitizer-iterations')
+    loop = loops[0]
+    loaded = [node for node in loop.body if isinstance(node, ast.Assert) and 'countTestCases' in ast.unparse(node.test)]
+    require(len(loaded) == 1, 'loaded-count-assertion')
+    require(loaded[0].msg is None, 'loaded-count-message')
+    require(ast.dump(loaded[0].test) == ast.dump(ast.parse('suite.countTestCases() == 52', mode='eval').body), 'loaded-count-exact52')
+    guards = [node for node in loop.body if isinstance(node, ast.If) and 'result.' in ast.unparse(node.test)]
+    require(len(guards) == 1, 'sanitizer-result-guard')
+    guard = guards[0]
+    terms = [ast.unparse(node) for node in guard.test.values] if isinstance(guard.test, ast.BoolOp) and isinstance(guard.test.op, ast.Or) else []
+    require('result.skipped' in terms, 'sanitizer-skip-guard')
+    require('result.testsRun != 52' in terms, 'sanitizer-completed-count-guard')
+    require(terms == ['not result.wasSuccessful()', 'result.skipped', 'result.testsRun != 52'], 'sanitizer-result-logic')
+    require(len(guard.body) == 1 and ast.unparse(guard.body[0]) == 'sys.exit(1)' and not guard.orelse, 'sanitizer-refusal')
+    parent = next(node for node in tree.body if isinstance(node, ast.Try) and loop in node.body)
+    require([ast.unparse(node) for node in parent.finalbody] == ["admitted['check']()"], 'sanitizer-final-admission')
+    return loaded[0], guard
 
 
 class Routing(unittest.TestCase):
@@ -688,7 +760,7 @@ class RegisteredRecheck(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError): module.gate({**env, key: value}, registered=True)
         with self.assertRaises(ValueError): module.gate(env)
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
-        registered = text.split('  registered-git-recheck:\n', 1)[1]
+        registered = job(text, 'registered-git-recheck')
         self.assertIn("inputs.mode == 'registered-git-recheck'", registered)
         self.assertIn('persist-credentials: false', registered)
         self.assertIn('ref: ${{ github.sha }}', registered)
@@ -696,8 +768,34 @@ class RegisteredRecheck(unittest.TestCase):
         self.assertIn('ci_native_qualify.py registered-transfer-ready ', registered)
         self.assertIn("if-no-files-found: error", registered)
         self.assertIn('retention-days: 1', registered)
-        matrix = text.split('      matrix:\n', 1)[1].split('    env:', 1)[0]
-        self.assertEqual(matrix.count('- {os:'), 6)
+        execution = job(text, 'test-execution')
+        cells = rows(execution, True)
+        self.assertTrue(all(row[3] in ('installed', 'sanitizer') for row in cells), 'unknown-phase')
+        for phase, expected in (('installed', INSTALLED), ('sanitizer', SANITIZERS)):
+            actual = [row[:3] for row in cells if row[3] == phase]
+            self.assertEqual(len(actual), len(set(actual)), 'duplicate-' + phase + '-cell')
+            self.assertEqual(set(actual), set(expected), phase + '-cell-identities')
+        self.assertIn('    name: ${{ matrix.phase }} (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})\n', execution)
+        self.assertIn("    if: github.event_name != 'workflow_dispatch'\n", execution)
+        convergence = job(text, 'test')
+        self.assertCountEqual(rows(convergence, False), INSTALLED, 'convergence-cell-identities')
+        for line in ('    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})',
+                     '    needs: test-execution', "    if: always() && github.event_name != 'workflow_dispatch'",
+                     '    timeout-minutes: 2', '    runs-on: ubuntu-latest'):
+            self.assertIn(line + '\n', convergence)
+        self.assertEqual(len(re.findall(r'^      - ', convergence, re.M)), 1)
+        aggregate = step(convergence, 'Require all installed and sanitizer jobs')
+        self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', aggregate)
+        self.assertIn('        run: test "${EXECUTION_RESULT:-}" = success\n', aggregate, 'convergence-success-gate')
+        for block in (execution, convergence):
+            self.assertIn('      fail-fast: false\n', block)
+        for mode in ('native-git-qualification', 'registered-git-recheck', 'unsigned-app-artifact'):
+            manual = job(text, mode)
+            self.assertIn("    if: github.event_name == 'workflow_dispatch' && inputs.mode == '" + mode + "'\n", manual)
+            self.assertIn('persist-credentials: false', manual)
+            self.assertIn('ref: ${{ github.sha }}', manual)
+        hosted = job(text, 'hosted-docs-screen')
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && contains(fromJSON('[\"compare\",\"thread-cpu\",\"directory-feasibility\",\"directory-docs-feasibility\",\"delete-thread-cpu\"]'), inputs.mode)", hosted)
 
     def test_registered_flow_checks_historical_component_then_new_producer_admission_and_campaign(self):
         for case in ('clean', 'archive-substitution', 'manifest-substitution', 'inventory-substitution',
@@ -1284,27 +1382,33 @@ class OwnedCIInterpreter(unittest.TestCase):
 
     def test_all_ordinary_consumers_and_diagnostics_use_the_owned_interpreter(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
-        ordinary = text.split('  test:', 1)[1].split('  hosted-docs-screen:', 1)[0]
-        self.assertEqual(ordinary.count('          python -I -B'), 1)
-        self.assertEqual(ordinary.count('"${CI_PYTHON:?}" -I -B'), 10)
-        self.assertLess(ordinary.index('name: Create owned CI interpreter'), ordinary.index('name: Install pinned wheel backend'))
-        self.assertIn("if: failure() && steps.ci-python.outcome == 'success'", ordinary)
-        self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', ordinary)
-        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"', ordinary)
-        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"', ordinary)
+        ordinary = job(text, 'test-execution')
+        bootstrap = step(ordinary, 'Create owned CI interpreter')
+        self.assertEqual(re.findall(r'^          python(?:\d+(?:\.\d+)*)? .+$', ordinary, re.M),
+                         ["          python -I -B - <<'PY'"], 'sole-bootstrap-python')
+        self.assertIn("          python -I -B - <<'PY'", bootstrap)
+        self.assertIn('        timeout-minutes: 2\n', bootstrap)
+        self.assertIn("Path(os.environ['GITHUB_PATH'])", bootstrap)
+        for name in CONSUMERS:
+            consumer = step(ordinary, name)
+            self.assertLess(ordinary.index(bootstrap), ordinary.index(consumer))
+            commands = re.findall(r'^          (?:python\S*|"\$\{CI_PYTHON:\?\}").*$', consumer, re.M)
+            expected_count = 2 if name == 'Install current owned wheel' else 1
+            self.assertTrue(len(commands) == expected_count and all(command.startswith('          "${CI_PYTHON:?}" -I -B ') for command in commands), 'owned-consumer:' + name)
+        diagnostic = step(ordinary, 'Validate bounded image diagnostic artifact')
+        self.assertIn("if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'", diagnostic)
+        install = step(ordinary, 'Install current owned wheel')
+        doctor = step(ordinary, 'Check installed runtime and doctor')
+        self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', doctor)
+        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"', doctor)
+        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"', install)
         self.assertNotIn('$RUNNER_TEMP/ci-python', ordinary)
-        self.assertIn("Path(os.environ['GITHUB_PATH'])", ordinary)
+        self.assertIn("if: matrix.phase == 'installed'", step(ordinary, 'Test installed wheel with image failure diagnostics'))
         self.assertIn('fail-fast: false', ordinary)
-        self.assertIn("(matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15", ordinary)
-        for os_name, python in (('macos-15', '3.12'), ('macos-26', '3.11'), ('macos-26', '3.13'),
-                                ('macos-26', '3.14'), ('macos-26-intel', '3.13'), ('xcode-27', '3.13')):
-            self.assertIn('{os: ' + os_name + ", python: '" + python + "', images: '", ordinary)
-        self.assertEqual(ordinary.count('          - {os:'), 6)
-        self.assertIn('actions/checkout@11d5960a326750d5838078e36cf38b85af677262', ordinary)
-        self.assertIn('actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065', ordinary)
+        for pin in ('actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+                    'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065'):
+            self.assertIn(pin, ordinary)
         self.assertNotIn('cancel-in-progress', ordinary)
-        self.assertIn('--timeout 600', ordinary)
-        self.assertIn('timeout-minutes: 9', ordinary)
 
     def test_build_tool_directory_owner_guard_is_unchanged(self):
         module = load('package_fskit')
@@ -1327,25 +1431,34 @@ class FetchPhases(unittest.TestCase):
 
     def test_workflow_fetch_budget_artifacts_and_sanitizer_coverage(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", text)
-        fetch = text.split('      - name: Fetch exact qualified architecture component\n', 1)[1].split('      - name: Build current wheel', 1)[0]
+        ordinary = job(text, 'test-execution')
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
+        fetch = step(ordinary, 'Fetch exact qualified architecture component')
         self.assertIn('tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch', fetch)
-        upload = fetch.split('      - name: Upload component fetch failure diagnostics\n', 1)[1]
-        self.assertIn("if: failure() && steps.component-fetch.outcome == 'failure'", upload)
-        self.assertIn('retention-days: 1', upload)
+        build = step(ordinary, 'Build current wheel with enforced Git cache reuse')
+        self.assertIn('tools/ci_execute.py --timeout 600 --stem ', build)
+        large = step(ordinary, 'Check large sparse-seek metadata with default limits')
+        self.assertIn('        timeout-minutes: 9\n', large)
+        self.assertIn("if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'", large)
+        for name, condition, missing in (
+                ('Upload component fetch failure diagnostics', "failure() && steps.component-fetch.outcome == 'failure'", 'ignore'),
+                ('Upload bounded image failure diagnostics', "failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'", 'error'),
+                ('Upload FSKit interface failure diagnostics', "failure() && matrix.phase == 'installed'", 'ignore')):
+            artifact = step(ordinary, name)
+            for value in ('if: ' + condition, 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+                          'retention-days: 1', 'if-no-files-found: ' + missing):
+                self.assertIn(value, artifact)
+        upload = step(ordinary, 'Upload component fetch failure diagnostics')
+        self.assertIn("matrix.phase == 'sanitizer' && '-sanitizer' || ''", upload)
         paths = upload.split('          path: |\n', 1)[1].split('          if-no-files-found:', 1)[0]
         self.assertEqual(paths.splitlines(), [
             '            ${{ runner.temp }}/component-fetch.command.json',
             '            ${{ runner.temp }}/component-fetch.stdout.bin',
             '            ${{ runner.temp }}/component-fetch.stderr.bin'])
-        sanitizer = text.split('      - name: Check native code with sanitizers\n', 1)[1].split('      - run: |', 1)[0]
-        self.assertIn("for sanitizers in ('address,undefined', 'thread'):", sanitizer)
-        self.assertIn('if not result.wasSuccessful() or result.skipped:', sanitizer)
-        for selector in ('test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
-                         'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
-                         'test_image.ImageCore'):
-            self.assertIn("'" + selector + "'", sanitizer)
-        self.assertIn('bootstrap.py" check', text.split(sanitizer, 1)[1])
+        sanitizer = step(ordinary, 'Check native code with sanitizers')
+        self.assertIn("        if: matrix.phase == 'sanitizer'\n", sanitizer)
+        sanitizer_nodes(sanitizer)
+        self.assertIn('bootstrap.py" check', step(ordinary, 'Check installed runtime and doctor'))
 
     def test_finite_success_and_refusal_phases(self):
         m = load('ci_build')
@@ -1406,6 +1519,117 @@ class FetchPhases(unittest.TestCase):
                     self.assertGreaterEqual(phase['elapsed_ns'], 0)
                 self.assertNotIn('PRIVATE_REDIRECT', stdout.getvalue())
                 results.append({'case': case, 'phases': phases, 'admitted': case == 'success'})
+
+
+class WorkflowContractRegression(unittest.TestCase):
+    def test_sanitizer_assertion_messages_are_rejected_before_execution(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        assertion = 'assert suite.countTestCases() == 52\n'
+        for message in ('None', "__import__('builtins').print('ASSERT_MESSAGE_EXECUTED')"):
+            changed = text.replace(assertion, assertion.rstrip() + ', ' + message + '\n', 1)
+            with self.subTest(message=message):
+                self.assertNotEqual(changed, text)
+                with patch.object(Path, 'read_text', return_value=changed), patch('builtins.print') as marker:
+                    with self.assertRaisesRegex(AssertionError, '^loaded-count-message$'):
+                        self.test_actual_sanitizer_count_and_exit_guard_truth_table()
+                    marker.assert_not_called()
+
+    def test_every_consumer_invocation_requires_the_owned_interpreter(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        execution = job(text, 'test-execution')
+        prefix = '          "${CI_PYTHON:?}" -I -B '
+        check = OwnedCIInterpreter().test_all_ordinary_consumers_and_diagnostics_use_the_owned_interpreter
+        for name in CONSUMERS:
+            consumer = step(execution, name)
+            commands = [line for line in consumer.splitlines() if line.startswith(prefix)]
+            self.assertEqual(len(commands), 2 if name == 'Install current owned wheel' else 1)
+            for command in commands:
+                for interpreter in ('/usr/bin/python3', '"/usr/bin/python3"', './python3', '"./python3"'):
+                    changed_consumer = consumer.replace(command, command.replace('"${CI_PYTHON:?}"', interpreter, 1), 1)
+                    changed = text.replace(consumer, changed_consumer, 1)
+                    with self.subTest(consumer=name, command=command, interpreter=interpreter):
+                        self.assertNotEqual(changed, text)
+                        with patch.object(Path, 'read_text', return_value=changed):
+                            with self.assertRaisesRegex(AssertionError, 'owned-consumer:' + re.escape(name)):
+                                check()
+
+    def test_named_extraction_refuses_ambiguity_and_stops_at_anonymous_steps(self):
+        for anonymous in ('uses: inert/action', 'run: inert'):
+            target = '      - name: target\n        run: inert\n'
+            block = '  probe:\n    steps:\n' + target + '      - ' + anonymous + '\n        marker: outside\n'
+            with self.subTest(anonymous=anonymous):
+                self.assertEqual(step(job(block, 'probe'), 'target'), target)
+                for changed, message in ((block.replace(target, ''), 'missing-step:target'),
+                                         (block.replace(target, target * 2), 'duplicate-step:target')):
+                    with self.assertRaisesRegex(AssertionError, message): step(changed, 'target')
+                for changed, message in (('', 'missing-job:probe'), (block * 2, 'duplicate-job:probe')):
+                    with self.assertRaisesRegex(AssertionError, message): job(changed, 'probe')
+
+    def test_contract_mutations_fail_the_specific_obligation(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        execution = job(text, 'test-execution')
+        doctor = step(execution, 'Check installed runtime and doctor')
+        backend = step(execution, CONSUMERS[0])
+        install = step(execution, 'Install current owned wheel')
+        convergence_cell = "          - {os: macos-15, python: '3.12', images: '0'}\n"
+        installed = "          - {os: macos-26, python: '3.11', images: '1', phase: installed}\n"
+        sanitizer = "          - {os: macos-26, python: '3.13', images: '1', phase: sanitizer}\n"
+        matrix_check = RegisteredRecheck().test_registered_hosted_gate_is_disjoint_and_ordinary_cells_unchanged
+        owned_check = OwnedCIInterpreter().test_all_ordinary_consumers_and_diagnostics_use_the_owned_interpreter
+        fetch_check = FetchPhases().test_workflow_fetch_budget_artifacts_and_sanitizer_coverage
+        cases = (
+            (execution, '', matrix_check, 'missing-job:test-execution'),
+            (execution, execution * 2, matrix_check, 'duplicate-job:test-execution'),
+            (doctor, '', owned_check, 'missing-step:Check installed runtime and doctor'),
+            (doctor, doctor * 2, owned_check, 'duplicate-step:Check installed runtime and doctor'),
+            (installed, '', matrix_check, 'installed-cell-identities'),
+            (sanitizer, sanitizer * 2, matrix_check, 'duplicate-sanitizer-cell'),
+            (installed, installed.replace('phase: installed', 'phase: unknown'), matrix_check, 'unknown-phase'),
+            (backend, backend.replace('"${CI_PYTHON:?}" -I -B', 'python -I -B'), owned_check, 'sole-bootstrap-python'),
+            (install, install.replace('-I -B "${CI_CONTAINER:?}/bootstrap.py" seal', '-B "${CI_CONTAINER:?}/bootstrap.py" seal'), owned_check, 'owned-consumer:Install current owned wheel'),
+            ("              admitted['check']()\n          PY\n      - name: Check installed runtime", "              pass\n          PY\n      - name: Check installed runtime", fetch_check, 'sanitizer-final-admission'),
+            ("              'test_image.ImageCore',", "              'test_image.ImageCoreMissing',", fetch_check, 'sanitizer-selectors'),
+            (convergence_cell, convergence_cell * 2, matrix_check, 'convergence-cell-identities'),
+            ('run: test "${EXECUTION_RESULT:-}" = success\n', 'run: test "${EXECUTION_RESULT:-}" = success || true\n', matrix_check, 'convergence-success-gate'),
+            ('or result.skipped or result.testsRun != 52:', 'or result.testsRun != 52:', fetch_check, 'sanitizer-skip-guard'),
+            (' or result.testsRun != 52:', ':', fetch_check, 'sanitizer-completed-count-guard'),
+            ('                  assert suite.countTestCases() == 52\n', '', fetch_check, 'loaded-count-assertion'),
+            ('run: test "${EXECUTION_RESULT:-}" = success', 'run: test "${EXECUTION_RESULT:-}" != failure', matrix_check, 'convergence-success-gate'),
+        )
+        for old, new, check, message in cases:
+            changed = text.replace(old, new, 1)
+            if old == doctor and new == '':
+                changed += '\n  decoy:\n    steps:\n' + doctor
+            with self.subTest(obligation=message):
+                self.assertNotEqual(changed, text)
+                with patch.object(Path, 'read_text', return_value=changed):
+                    with self.assertRaisesRegex(AssertionError, message): check()
+
+    def test_actual_sanitizer_count_and_exit_guard_truth_table(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        loaded, guard = sanitizer_nodes(step(job(text, 'test-execution'), 'Check native code with sanitizers'))
+        # Execute only these two existing statements, never imports or workloads.
+        code = compile(ast.Module(body=[loaded, guard], type_ignores=[]), '<sanitizer-count-and-exit>', 'exec')
+        def run(success=True, skipped=False, completed=52, count=52):
+            scope = {'suite': SimpleNamespace(countTestCases=lambda: count),
+                     'result': SimpleNamespace(wasSuccessful=lambda: success,
+                                               skipped=[('inert', 'skip')] if skipped else [], testsRun=completed),
+                     'sys': SimpleNamespace(exit=lambda value: (_ for _ in ()).throw(SystemExit(value)))}
+            exec(code, scope)
+        for success in (True, False):
+            for skipped in (False, True):
+                for completed in (52, 51):
+                    with self.subTest(success=success, skipped=skipped, completed=completed):
+                        if success and not skipped and completed == 52:
+                            run(success, skipped, completed)
+                        else:
+                            with self.assertRaises(SystemExit) as error: run(success, skipped, completed)
+                            self.assertEqual(error.exception.code, 1)
+        for completed in (0, 53):
+            with self.subTest(completed=completed), self.assertRaises(SystemExit) as error: run(completed=completed)
+            self.assertEqual(error.exception.code, 1)
+        for count in (51, 53):
+            with self.subTest(loaded=count), self.assertRaises(AssertionError): run(count=count)
 
 
 class FetchCollector(unittest.TestCase):
