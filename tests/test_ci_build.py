@@ -189,6 +189,75 @@ class CacheAndReceipt(unittest.TestCase):
             self.assertIs(sys.modules['ci_git_input'], fake)
 
 
+class MetadataObservations(unittest.TestCase):
+    observations = []
+
+    def test_single_bounded_observations_preserve_failure_and_global_reserve(self):
+        for case in ('success', 'timeout', 'nonzero', 'capture-failure', 'budget-refusal'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix='ci-inert-metadata-') as temporary:
+                module = load('ci_native_qualify'); base = Path(temporary).resolve(); root = base / 'packet'
+                interpreter = base / 'dependency/python/bin/python3.13'; interpreter.parent.mkdir(parents=True)
+                interpreter.write_bytes(b'inert dependency marker; never executed')
+                (base / 'dependency/origin.json').write_text(json.dumps({'executable_sha256': hashlib.sha256(interpreter.read_bytes()).hexdigest(), 'version': '3.13.18'}))
+                state = {'failure': None, 'active': None, 'first_signal': None, 'signal_count': 0}
+                commands = []
+                def command(argv, *, cwd, timeout, stem):
+                    commands.append((stem.name, timeout))
+                    if stem.name == 'stage-sdk-version':
+                        if case == 'timeout':
+                            state['failure'] = {'kind': 'timeout', 'detail': stem.name}
+                            raise subprocess.TimeoutExpired(argv, timeout)
+                        if case == 'nonzero':
+                            state['failure'] = {'kind': 'exit', 'detail': stem.name}
+                            return subprocess.CompletedProcess(argv, 7, '', '')
+                        if case == 'capture-failure': state['failure'] = {'kind': 'cleanup_uncertain'}
+                    if stem.name == 'stage-build':
+                        wheels = root / 'wheels'; wheels.mkdir(); wheel = wheels / 'inert.whl'; wheel.write_bytes(b'inert wheel')
+                        (root / 'build-result.json').write_text(json.dumps({'wheel': wheel.name, 'wheel_sha256': hashlib.sha256(wheel.read_bytes()).hexdigest()}))
+                    if stem.name == 'stage-campaign':
+                        campaign = root / 'campaign'; campaign.mkdir()
+                        (campaign / 'result.json').write_text(json.dumps({'passed': True, 'input_unchanged': True, 'input_unregistered': True,
+                            'owned_commands': 581, 'successes': list(range(10)), 'strict_native_environment_commands': list(range(92)), 'structural_refusals': list(range(27))}))
+                    return subprocess.CompletedProcess(argv, 0, '', '')
+                capture = SimpleNamespace(_COMMAND_ENV=None, _command_state=state, _install_command_handlers=lambda: {},
+                    _restore_command_handlers=lambda previous: None, _owned_command=command)
+                def package(checkout, packet, *, failed=False):
+                    archive = root / ('native-git-qualification.failure.tar.xz' if failed else 'native-git-qualification.tar.xz')
+                    archive.write_bytes(b'inert completed archive marker')
+                    receipt = root / ('failure-transfer-result.json' if failed else 'transfer-result.json')
+                    receipt.write_text(json.dumps({'archive_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'bytes': archive.stat().st_size}))
+                ticks = iter((0, 1590 if case == 'budget-refusal' else 0))
+                now = lambda: next(ticks, 1590 if case == 'budget-refusal' else 0)
+                environment = {'EXPECTED_SOURCE_SHA': 'a' * 40, 'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+                    'GITHUB_EVENT_NAME': 'workflow_dispatch', 'QUALIFICATION_MODE': 'native-git-qualification', 'RUNNER_OS': 'macOS', 'RUNNER_ARCH': 'X64'}
+                source = Path(__file__).resolve().parents[1]
+                with patch.object(module, 'load', return_value=capture), patch.object(module, 'package', side_effect=package), patch.object(module.time, 'monotonic', side_effect=now), patch.object(module.platform, 'machine', return_value='x86_64'), patch.object(sys, 'platform', 'darwin'), patch.object(sys, 'executable', str(interpreter)), patch.dict(os.environ, environment, clear=True):
+                    if case == 'success': self.assertIsNone(module.execute(source, root))
+                    else:
+                        with self.assertRaises(ValueError): module.execute(source, root)
+                result = json.loads((root / 'execution-result.json').read_bytes())
+                self.assertEqual(result['passed'], case == 'success')
+                self.assertEqual(len(commands), len(set(label for label, timeout in commands)))
+                if case == 'success':
+                    self.assertEqual(commands, [('stage-os-build', 30), ('stage-xcode', 30), ('stage-sdk-version', 30),
+                        ('stage-sdk-path', 30), ('stage-build', 600), ('stage-install', 45), ('stage-campaign', 900)])
+                elif case == 'budget-refusal':
+                    self.assertEqual(commands, [])
+                    self.assertIn('Combined qualification deadline reserve', result['failure']['message'])
+                else:
+                    self.assertEqual(commands, [('stage-os-build', 30), ('stage-xcode', 30), ('stage-sdk-version', 30)])
+                    self.assertEqual(result['failure']['type'], {'timeout': 'TimeoutExpired', 'nonzero': 'CalledProcessError', 'capture-failure': 'ValueError'}[case])
+                    self.assertIsNotNone(result['capture_state']['failure'])
+                with patch.dict(os.environ, GITHUB_SHA='a' * 40, GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1', GITHUB_OUTPUT=str(base / 'github-output'),
+                        QUALIFICATION_STEP_OUTCOME='success' if case == 'success' else 'failure'):
+                    completion = json.loads((root / 'transfer-completion.json').read_bytes())
+                    self.assertEqual(completion['failed'], case != 'success')
+                    module.transfer_ready(root)
+                    selected = root / ('native-git-qualification.tar.xz' if case == 'success' else 'native-git-qualification.failure.tar.xz')
+                    self.assertEqual((base / 'github-output').read_text(), 'available=true\narchive=' + str(selected) + '\n')
+                self.observations.append({'case': case, 'commands': commands, 'passed': result['passed'], 'actual_child_commands': 0})
+
+
 class ProcessOutcomes(unittest.TestCase):
     observations = []
 

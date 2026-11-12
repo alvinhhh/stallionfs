@@ -3,10 +3,10 @@
     "arm64": {
       "bytes": 20572176,
       "inventory_sha256": "9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700",
-      "manifest_sha256": "5dd5ad5a0ac7939fbfa19890f3ffe87ac6ead83e7a6c68693c53d288853300cc",
+      "manifest_sha256": "1de9a811fac6f398b7ae967c15e2aeb4760b59ce4b479fef3dfadb16e4da6802",
       "qualification_sha256": "2c15b8599c27b367696d93fad50546fd907950db2c2e17a33536c63a5302309c",
-      "sha256": "7303e056258335d987b10050973ba4722416d17e65cda572dd869bb415298a7b",
-      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v3/git-runtime-arm64-v3.tar.xz"
+      "sha256": "352ef13376d979cd33ae27ece43a3e66dcda4ddda8c77be8ce2928dce318fdd0",
+      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v4/git-runtime-arm64-v4.tar.xz"
     }
   },
   "schema": 1

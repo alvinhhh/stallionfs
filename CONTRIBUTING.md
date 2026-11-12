@@ -22,6 +22,17 @@ Each built runtime contains `SOURCES.txt`, both component licenses, a sanitized 
 
 The Python package's regular-file runtime is separate from a signed native companion. An app uses its own private Git and corresponding source, and does not copy the wheel's `_git` tree. Keep the complete adjacent `.sources` directory with the app in the same distributed ZIP or disk image. Generic Git inspection does not grant native creation or recovery authority. Native compatibility and installed-runtime qualification remain separate checks.
 
+### CI component publication
+
+CI consumes an exact qualified component for its architecture before building the current wheel. Publish source and component updates in this order:
+
+1. Prepare the source commit with a new immutable component URL and its final archive, manifest and qualification digests. Use a new component tag; preserve existing tags and assets.
+2. Push only that tag, pointing to the prepared commit. The Checks workflow runs ordinary tests on pull requests and pushes to `main` or `stable`; a component tag push does not start that matrix.
+3. Publish the component prerelease at that tag. Verify the public download's bytes, archive digest, finite manifest and corresponding source against the prepared commit.
+4. Fast-forward the pull request branch to that same commit. Its newly triggered tests can now fetch the published component.
+
+Intel qualification requires a separate explicit first-attempt dispatch pinned to the reviewed source SHA. Its metadata queries have a single bounded invocation, and timeout or capture failure stops the job. A failed diagnostic artifact does not qualify a native input. Register an Intel component only after its actual build, campaign and complete evidence pass review; ordinary Intel CI continues to refuse a missing qualified component.
+
 On macOS 26+, include the disk-image tests:
 
 ```sh
