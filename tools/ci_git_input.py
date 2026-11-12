@@ -148,6 +148,63 @@ def _wheel_files(archive):
     return files, modes
 
 
+def _diagnostic_text(value, limit):
+    """Limit escaped JSON payload bytes without hiding the original length."""
+    kept = []; size = 0
+    for character in value[:limit]:
+        width = len(json.dumps(character, ensure_ascii=True)) - 2
+        if size + width > limit:
+            break
+        kept.append(character); size += width
+    return {'value': ''.join(kept), 'characters': len(value), 'truncated': len(kept) != len(value)}
+
+
+def _diagnostic_strings(values, limit):
+    items = [_diagnostic_text(value, 128) for value in values[:limit]]
+    return {'count': len(values), 'items': items,
+            'truncated': len(values) > limit or any(item['truncated'] for item in items)}
+
+
+def _native_failure_record(role, wheel_name, wheel_sha256, architecture, floor, slices):
+    """Describe already parsed refusal values; this never decides admission."""
+    if role not in ('_scan', '_image', 'sfs', 'stallionfs'):
+        raise ValueError('Unknown installed-native role')
+    dimensions = []
+    if len(slices) != 1: dimensions.append('slice_count')
+    if any(value['architecture'] != architecture for value in slices): dimensions.append('architecture')
+    if any(tuple(value['minimum']) > floor for value in slices): dimensions.append('minimum')
+    if any(value['rpaths'] for value in slices): dimensions.append('rpaths')
+    first_dependency = None
+    for slice_index, value in enumerate(slices):
+        for dependency_index, name in enumerate(value['dependencies']):
+            if not name.startswith(('/usr/lib/', '/System/Library/Frameworks/')):
+                first_dependency = {'slice_index': slice_index, 'dependency_index': dependency_index,
+                                    'dependency': _diagnostic_text(name, 512)}
+                break
+        if first_dependency is not None:
+            break
+    if first_dependency is not None: dimensions.append('dependencies')
+    items = []
+    for value in slices[:8]:
+        minimum = value['minimum']
+        items.append({'architecture': _diagnostic_text(value['architecture'], 32),
+                      'minimum': {'count': len(minimum), 'items': list(minimum[:3]), 'truncated': len(minimum) > 3},
+                      'dependencies': _diagnostic_strings(value['dependencies'], 4),
+                      'rpaths': _diagnostic_strings(value['rpaths'], 2)})
+    truncated = len(slices) > 8 or any(
+        item['architecture']['truncated'] or item['minimum']['truncated']
+        or item['dependencies']['truncated'] or item['rpaths']['truncated'] for item in items)
+    record = {'schema': 1, 'kind': 'installed-native-refusal', 'role': role,
+              'wheel': {'filename': _diagnostic_text(wheel_name, 256), 'sha256': wheel_sha256},
+              'expected': {'architecture': architecture, 'floor': list(floor)},
+              'slice_count': len(slices), 'slices': {'count': len(slices), 'items': items, 'truncated': truncated},
+              'failed_dimensions': dimensions, 'first_offending_dependency': first_dependency}
+    encoded = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    if len(encoded.encode('ascii')) + 1 > 16 * 1024:
+        raise ValueError('Installed-native diagnostic exceeds its bound')
+    return encoded
+
+
 def initialize(checkout, wheel, wheel_sha256, descriptor, descriptor_sha256, *, source_pins, source_pins_sha256):
     """Admit before importing tests; every expected digest is caller-pinned."""
     global _state
@@ -309,6 +366,13 @@ def initialize(checkout, wheel, wheel_sha256, descriptor, descriptor_sha256, *, 
                 value['architecture'] != architecture or tuple(value['minimum']) > floor or value['rpaths']
                 or not all(name.startswith(('/usr/lib/', '/System/Library/Frameworks/')) for name in value['dependencies'])
                 for value in slices):
+            try:
+                role = ('_scan', '_image', 'sfs', 'stallionfs')[installed_native_paths.index(path)]
+                record = _native_failure_record(role, wheel.name, wheel_sha256, architecture, floor, slices)
+                print(record, file=sys.stderr, flush=True)
+            except BaseException:
+                # Diagnostic failures cannot replace the admission refusal.
+                pass
             raise ValueError('Installed native architecture, deployment or dependency differs')
     for row in native_rows:
         if row['type'] != 'file':

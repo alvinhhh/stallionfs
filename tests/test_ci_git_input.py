@@ -1,6 +1,9 @@
 """Admission boundaries before controlled real-Git fixture execution."""
+import ast
+import copy
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -91,6 +94,129 @@ class UninitializedInput(unittest.TestCase):
                     with self.assertRaises(ValueError): admission._wheel_files(Archive())
                 self.assertTrue(requests)
                 self.assertTrue(all(0 < count <= 65536 for count in requests))
+
+
+class InstalledNativeDiagnostic(unittest.TestCase):
+    prefix = 'Installed native architecture, deployment or dependency differs'
+    roles = ('_scan', '_image', 'sfs', 'stallionfs')
+
+    def slice(self, **changes):
+        return dict({'architecture': 'arm64', 'minimum': (13, 0, 0),
+                     'dependencies': ['/usr/lib/libSystem.B.dylib'], 'rpaths': []}, **changes)
+
+    def guard(self, module, role, slices, *, writer=None):
+        """Execute the actual installed-native loop with inert parser observations."""
+        tree = ast.parse(Path(module.__file__).read_text())
+        initialize = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'initialize')
+        assignment = next(node for node in initialize.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'installed_native_paths' for target in node.targets))
+        loop = initialize.body[initialize.body.index(assignment) + 1]
+        self.assertIsInstance(loop, ast.For)
+        output = io.StringIO(); parsed = []; discovered = []
+        paths = [Path('/inert/package/_scan.so'), Path('/inert/package/_image.so'),
+                 Path('/inert/bin/sfs'), Path('/inert/bin/stallionfs')]
+        def parse(path):
+            parsed.append(path)
+            return copy.deepcopy(slices if role is not None and path == paths[self.roles.index(role)] else [self.slice()])
+        scope = dict(vars(module), _scan=SimpleNamespace(__file__=str(paths[0])),
+                     _image=SimpleNamespace(__file__=str(paths[1])), scripts_directory=paths[2].parent,
+                     builder=SimpleNamespace(macho=parse), wheel=SimpleNamespace(name='stallionfs-0.7.0-cp311-cp311-macosx_13_0_arm64.whl'),
+                     wheel_sha256='a' * 64, architecture='arm64', floor=(13, 0, 0),
+                     sys=SimpleNamespace(stderr=output), discovered=discovered)
+        if writer is not None: scope['print'] = writer
+        body = [assignment, loop, *ast.parse("discovered.append('after-admission')").body]
+        error = None
+        try: exec(compile(ast.Module(body=body, type_ignores=[]), module.__file__, 'exec'), scope)
+        except BaseException as caught: error = caught
+        return error, output.getvalue(), parsed, discovered
+
+    def test_actual_guard_reports_each_role_and_failed_dimension(self):
+        cases = [([], ['slice_count']), ([self.slice(), self.slice()], ['slice_count']),
+                 ([self.slice(architecture='x86_64')], ['architecture']),
+                 ([self.slice(minimum=(14, 0, 0))], ['minimum']),
+                 ([self.slice(rpaths=['@loader_path'])], ['rpaths']),
+                 ([self.slice(dependencies=['/tmp/external.dylib'])], ['dependencies'])]
+        for role in self.roles:
+            for slices, dimensions in cases:
+                with self.subTest(role=role, dimensions=dimensions):
+                    module = admission_module(); error, text, parsed, discovered = self.guard(module, role, slices)
+                    self.assertIsInstance(error, ValueError); self.assertEqual(str(error), self.prefix)
+                    self.assertEqual(discovered, []); self.assertEqual(len(parsed), self.roles.index(role) + 1)
+                    self.assertEqual(len(text.splitlines()), 1)
+                    record = json.loads(text)
+                    self.assertEqual(record['schema'], 1); self.assertEqual(record['role'], role)
+                    self.assertEqual(record['wheel']['sha256'], 'a' * 64)
+                    self.assertIn('macosx_13_0_arm64.whl', record['wheel']['filename']['value'])
+                    self.assertEqual(record['expected'], {'architecture': 'arm64', 'floor': [13, 0, 0]})
+                    self.assertEqual(record['slice_count'], len(slices))
+                    self.assertEqual(record['failed_dimensions'], dimensions)
+                    self.assertIsNone(module._state)
+
+    def test_below_and_equal_floor_preserve_success_without_diagnostic(self):
+        for minimum in ((11, 0, 0), (13, 0, 0)):
+            for role in self.roles:
+                with self.subTest(minimum=minimum, role=role):
+                    error, text, parsed, discovered = self.guard(admission_module(), role, [self.slice(minimum=minimum)])
+                    self.assertIsNone(error); self.assertEqual(text, ''); self.assertEqual(len(parsed), 4)
+                    self.assertEqual(discovered, ['after-admission'])
+
+    def test_combined_failures_and_late_offending_dependency_are_retained(self):
+        dependencies = ['/usr/lib/allowed.dylib'] * 20 + ['/tmp/first-bad.dylib', '/tmp/later-bad.dylib']
+        bad = self.slice(architecture='x86_64', minimum=(14, 0, 0), rpaths=['@rpath'], dependencies=dependencies)
+        error, text, _, discovered = self.guard(admission_module(), '_image', [self.slice(), bad])
+        self.assertEqual(str(error), self.prefix); self.assertEqual(discovered, [])
+        record = json.loads(text)
+        self.assertEqual(record['failed_dimensions'], ['slice_count', 'architecture', 'minimum', 'rpaths', 'dependencies'])
+        item = record['slices']['items'][1]['dependencies']
+        self.assertEqual(item['count'], 22); self.assertEqual(len(item['items']), 4); self.assertTrue(item['truncated'])
+        first = record['first_offending_dependency']
+        self.assertEqual((first['slice_index'], first['dependency_index']), (1, 20))
+        self.assertEqual(first['dependency']['value'], '/tmp/first-bad.dylib')
+
+    def test_escaped_bounded_record_has_counts_and_explicit_truncation(self):
+        module = admission_module(); huge = '\U0001f40e\n\r\t\x00"\\' * 2000
+        slices = [self.slice(architecture=huge, dependencies=['/usr/lib/' + huge] * 10,
+                             rpaths=[huge] * 5) for _ in range(9)]
+        slices[-1]['dependencies'] += ['/tmp/first-bad-' + huge]
+        encoded = module._native_failure_record('sfs', huge, 'b' * 64, 'arm64', (13, 0, 0), slices)
+        self.assertLessEqual(len(encoded.encode('ascii')) + 1, 16 * 1024)
+        self.assertEqual(len(encoded.splitlines()), 1)
+        self.assertTrue(all(ord(character) >= 32 and ord(character) < 127 for character in encoded))
+        record = json.loads(encoded)
+        self.assertEqual(record['slice_count'], 9); self.assertEqual(len(record['slices']['items']), 8)
+        self.assertTrue(record['slices']['truncated']); self.assertTrue(record['wheel']['filename']['truncated'])
+        self.assertEqual(record['wheel']['filename']['characters'], len(huge))
+        first = record['first_offending_dependency']
+        self.assertEqual((first['slice_index'], first['dependency_index']), (8, 10))
+        self.assertTrue(first['dependency']['value'].startswith('/tmp/first-bad-'))
+        self.assertTrue(first['dependency']['truncated'])
+        for item in record['slices']['items']:
+            self.assertEqual(item['dependencies']['count'], 10); self.assertTrue(item['dependencies']['truncated'])
+            self.assertEqual(item['rpaths']['count'], 5); self.assertTrue(item['rpaths']['truncated'])
+
+    def test_formatter_serialization_and_output_failures_cannot_allow_discovery(self):
+        for failure in (ValueError('formatter'), OSError('formatter'), SystemExit(0), KeyboardInterrupt()):
+            module = admission_module()
+            with self.subTest(failure=type(failure).__name__), patch.object(module, '_native_failure_record', side_effect=failure):
+                error, text, _, discovered = self.guard(module, 'stallionfs', [])
+            self.assertIsInstance(error, ValueError); self.assertEqual(str(error), self.prefix)
+            self.assertEqual(text, ''); self.assertEqual(discovered, [])
+        module = admission_module(); original = module.json.dumps
+        def failed_serialization(value, *args, **kwargs):
+            if isinstance(value, dict) and value.get('kind') == 'installed-native-refusal': raise OSError('serializer')
+            return original(value, *args, **kwargs)
+        with patch.object(module.json, 'dumps', side_effect=failed_serialization):
+            error, text, _, discovered = self.guard(module, '_scan', [])
+        self.assertEqual(str(error), self.prefix); self.assertEqual(text, ''); self.assertEqual(discovered, [])
+        with patch.object(module, '_diagnostic_text', return_value={'value': 'x' * 20000, 'characters': 20000, 'truncated': False}):
+            error, text, _, discovered = self.guard(module, '_scan', [])
+        self.assertEqual(str(error), self.prefix); self.assertEqual(text, ''); self.assertEqual(discovered, [])
+        for failure in (OSError('output'), BrokenPipeError('output'), SystemExit(0)):
+            def failed_output(*args, **kwargs): raise failure
+            with self.subTest(output=type(failure).__name__):
+                error, text, _, discovered = self.guard(admission_module(), '_scan', [], writer=failed_output)
+            self.assertIsInstance(error, ValueError); self.assertEqual(str(error), self.prefix)
+            self.assertEqual(discovered, [])
 
 
 @unittest.skipUnless(os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT'), 'requires explicitly qualified private Git fixture')
