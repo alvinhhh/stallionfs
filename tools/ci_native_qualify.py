@@ -255,7 +255,7 @@ def execute(checkout, root):
             ('xcode', ['/usr/bin/xcodebuild', '-version']),
             ('sdk-version', ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-version']),
             ('sdk-path', ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'])):
-            run(label, argv, 5)
+            run(label, argv, 30)
         run('build', [sys.executable, '-I', '-B', script, 'build', '--checkout', str(checkout), '--root', str(root)], 600)
         result = json.loads((root / 'build-result.json').read_bytes())
         wheel = root / 'wheels' / result['wheel']
