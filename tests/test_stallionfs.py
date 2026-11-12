@@ -58,14 +58,12 @@ class Workspaces(unittest.TestCase):
     @contextmanager
     def native_creation_fixture(self):
         """Controlled runtime/verifier seams, never signed-runtime evidence."""
-        from stallionfs import _native_create_git
         configured = os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT')
         if not configured:
             self.skipTest('requires explicitly qualified private Git fixture')
-        from qualified_git_fixture import runtime as admitted_runtime
-        runtime = admitted_runtime()
+        from qualified_git_fixture import native_creation
         # Keep real persistence and owned receipts; only the verifier command is controlled.
-        with patch.object(_native_create_git, 'qualified_runtime', return_value=runtime), \
+        with native_creation() as runtime, \
              patch('stallionfs._native.package_argv', return_value=[sys.executable, '-I', '-B', '-c', 'pass']):
             yield runtime
 
