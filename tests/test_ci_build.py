@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import subprocess
 import tarfile
@@ -528,6 +529,262 @@ class TransferCompletion(unittest.TestCase):
                 self.assertEqual(output.exists(), clean)
                 if clean: self.assertEqual(output.read_text(), 'available=true\narchive=' + str(archive) + '\n')
                 self.observations.append({'case': case, 'completion_committed': True, 'selected': clean, 'actual_child_commands': 0})
+
+
+def owned_ci_bootstrap():
+    """Load the code that the workflow actually writes and executes."""
+    text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+    step = text.split('      - name: Create owned CI interpreter\n', 1)[1].split('      - name:', 1)[0]
+    body = step.split("          python -I -B - <<'PY'\n", 1)[1].rsplit('          PY', 1)[0]
+    body = '\n'.join(line[10:] for line in body.splitlines())
+    tree = ast.parse(body)
+    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == 'BOOTSTRAP_SOURCE' for target in node.targets))
+    source = ast.literal_eval(assignment.value)
+    module = SimpleNamespace(__name__='ci_inert', BOOTSTRAP_SOURCE=source)
+    exec(compile(source, '<workflow-owned-ci-interpreter>', 'exec'), module.__dict__)
+    return module
+
+
+class OwnedCIInterpreter(unittest.TestCase):
+    def exercise(self, root, case='success', temporary=None):
+        module = owned_ci_bootstrap()
+        base = root / 'trusted-base'; base.mkdir()
+        executable = base / 'python3.13'; executable.write_bytes(b'inert interpreter; never executed'); executable.chmod(0o755)
+        github_env = root / 'github-env'
+        github_path = root / 'github-path'
+        calls = {'create': 0, 'capture': 0, 'probe': 0}
+        state = SimpleNamespace(executable=str(executable), _base_executable=str(executable),
+                                base_prefix=str(base), prefix=str(base), version='inert 3.13', argv=['outer'])
+        module.sys = state
+        module.platform = SimpleNamespace(machine=lambda: 'arm64')
+        paths = {}
+        module.sysconfig = SimpleNamespace(get_path=lambda name: paths[name])
+
+        class Builder:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+            def create(self, destination):
+                calls['create'] += 1
+                self_test.assertEqual(self.kwargs, dict(with_pip=True, symlinks=False, upgrade=False, upgrade_deps=False))
+                if case == 'creation-nonzero': raise subprocess.CalledProcessError(7, ['inert-ensurepip'])
+                environment = Path(destination)
+                scripts = environment / 'bin'; scripts.mkdir()
+                library = environment / 'lib'; library.mkdir()
+                selected = scripts / 'python3.13'
+                if case == 'missing-executable': pass
+                elif case == 'symlink-executable': selected.symlink_to(executable)
+                else:
+                    selected.write_bytes(b'wrong copy' if case == 'wrong-copy' else executable.read_bytes())
+                    selected.chmod(0o644 if case == 'nonexecutable' else 0o755)
+                paths.update(scripts=str(scripts), purelib=str(library), platlib=str(library), data=str(environment),
+                             stdlib=str(base), include=str(base))
+                if case == 'scheme-escape': paths['purelib'] = str(base)
+                if case == 'nul-scripts': paths['scripts'] += '\x00'
+                if case == 'mode-changed': scripts.chmod(0o777)
+                self.post_setup(SimpleNamespace(env_exe=str(selected)))
+
+        self_test = self
+        module.venv = SimpleNamespace(EnvBuilder=Builder)
+        def child(argv, **kwargs):
+            calls['probe'] += 1
+            self.assertEqual(kwargs, {'check': True})
+            self.assertEqual(argv[1:3], ['-I', '-B'])
+            if case == 'probe-timeout': raise subprocess.TimeoutExpired(argv, 90)
+            before = state.executable, state.prefix, state.base_prefix, state.version, module.platform
+            state.executable = argv[0]; state.prefix = argv[6]
+            if case == 'base-prefix-reuse': state.base_prefix = argv[6]
+            if case == 'version-differs': state.version = 'other interpreter'
+            if case == 'architecture-differs': module.platform = SimpleNamespace(machine=lambda: 'x86_64')
+            try: module.probe(*map(Path, argv[5:8]), json.loads(argv[8]), json.loads(argv[9]))
+            finally: state.executable, state.prefix, state.base_prefix, state.version, module.platform = before
+            return subprocess.CompletedProcess(argv, 0)
+        module.subprocess = SimpleNamespace(run=child)
+        def captured():
+            calls['capture'] += 1
+            argv = state.argv
+            self.assertEqual(argv[1:3], ['--timeout', '90'])
+            self.assertEqual(argv[6], 'create')
+            self.assertTrue(Path(argv[5]).is_absolute())
+            module.create(*map(Path, argv[7:11]), json.loads(argv[11]), json.loads(argv[12]))
+            if case in ('output-cap', 'capture-failure', 'finalization-failure'):
+                raise RuntimeError(case)
+            if case == 'zero-early-exit': raise SystemExit(0)
+            if case == 'driver-replaced':
+                driver = Path(argv[5]); data = driver.read_bytes(); driver.unlink(); driver.write_bytes(data)
+            if case == 'environment-replaced':
+                environment = Path(argv[9]); environment.rename(environment.with_name('previous')); environment.mkdir(mode=0o700)
+        runner = SimpleNamespace(main=captured)
+        module.importlib = SimpleNamespace(util=SimpleNamespace(
+            spec_from_file_location=lambda *args: SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None)),
+            module_from_spec=lambda spec: runner))
+        if case == 'wrong-owner':
+            actual = module.identity
+            def refuse_owner(path, directory=False):
+                if Path(path).name == 'venv':
+                    with patch.object(module.os, 'getuid', return_value=os.getuid() + 1):
+                        return actual(path, directory)
+                return actual(path, directory)
+            module.identity = refuse_owner
+        if case.startswith('existing-'):
+            container = root / 'ci-python'
+            if case == 'existing-directory': container.mkdir()
+            elif case == 'existing-file': container.write_bytes(b'preserved')
+            else: container.symlink_to(base, target_is_directory=True)
+        if temporary is None: temporary = root
+        if case == 'success': module.bootstrap(temporary, root, github_env, github_path)
+        else:
+            with self.assertRaises((ValueError, OSError, RuntimeError, subprocess.SubprocessError)):
+                module.bootstrap(temporary, root, github_env, github_path)
+            self.assertFalse(github_env.exists(), 'Failed bootstrap must not publish an interpreter')
+            self.assertFalse(github_path.exists(), 'Failed bootstrap must not publish a PATH prefix')
+        self.assertLessEqual(calls['create'], 1)
+        self.assertLessEqual(calls['capture'], 1)
+        self.assertEqual(state.argv, ['outer'])
+        return module, state, calls, github_env
+
+    def test_fresh_copy_and_base_stdlib_are_accepted_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            module, state, calls, output = self.exercise(root)
+            value = json.loads((root / 'ci-python/origin.json').read_text())
+            self.assertEqual(calls, {'create': 1, 'capture': 1, 'probe': 1})
+            self.assertEqual(output.read_text(), 'CI_PYTHON=' + value['executable'] + '\nCI_CONTAINER=' + str(root / 'ci-python') + '\n')
+            self.assertEqual((root / 'github-path').read_text(), value['paths']['scripts'] + '\n')
+            self.assertNotEqual(value['prefix'], value['base_prefix'])
+            self.assertEqual(set(value['paths']), {'scripts', 'purelib', 'platlib', 'data'})
+            # Directory timestamps and optional interpreter aliases are not copy identities.
+            alias = root / 'ci-python/venv/bin/python'; alias.symlink_to('python3.13')
+            module.validate(value, root / 'ci-python', root / 'ci-python/venv', value['base'])
+
+    def test_creation_identity_scheme_and_collector_failures_never_publish(self):
+        cases = ('existing-directory', 'existing-file', 'existing-symlink', 'wrong-owner',
+                 'mode-changed', 'driver-replaced', 'environment-replaced', 'missing-executable',
+                 'symlink-executable', 'nonexecutable', 'wrong-copy', 'version-differs', 'architecture-differs',
+                 'scheme-escape', 'nul-scripts', 'base-prefix-reuse', 'creation-nonzero',
+                 'probe-timeout', 'output-cap', 'capture-failure', 'finalization-failure', 'zero-early-exit')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                with patch('builtins.print'):
+                    _, _, calls, _ = self.exercise(root, case)
+                self.assertEqual(calls['capture'], 0 if case.startswith('existing-') or case == 'wrong-owner' else 1)
+                self.assertEqual(calls['create'], calls['capture'])
+
+    def test_control_characters_cannot_publish_environment_or_path(self):
+        for character in ('\n', '\r', '\t', '\x7f', '\x85'):
+            with self.subTest(character=repr(character)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve() / ('owned-' + character); root.mkdir(mode=0o700)
+                with patch('builtins.print'):
+                    self.exercise(root, 'control-in-path')
+
+    def test_existing_phase_consumers_find_owned_cli_before_stale_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, _, _, output = self.exercise(root)
+            exports = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            scripts = Path((root / 'github-path').read_text().rstrip('\n'))
+            installed = scripts / 'stallionfs'; installed.write_bytes(b'inert owned native marker'); installed.chmod(0o755)
+            stale = root / 'stale-bin'; stale.mkdir()
+            previous = stale / 'stallionfs'; previous.write_bytes(b'stale unrelated marker'); previous.chmod(0o755)
+            self.assertEqual(shutil.which('stallionfs', path=str(stale)), str(previous))
+            path = os.pathsep.join((str(scripts), str(stale)))
+            with patch.dict(os.environ, dict(exports, PATH=path, GITHUB_ACTIONS='true')):
+                for filename, class_name in (('test_native_phase_probe.py', 'NativePhaseCounters'),
+                                              ('test_native_delete_phase_probe.py', 'NativeDeleteCounters')):
+                    tree = ast.parse((Path(__file__).resolve().parent / filename).read_text())
+                    owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+                    method = next(node for node in owner.body if isinstance(node, ast.FunctionDef))
+                    guard = next(node for node in method.body if isinstance(node, ast.If)
+                                 and 'GITHUB_ACTIONS' in ast.unparse(node.test))
+                    # Execute only the existing installed-CLI lookup/read assertions, never its harness body.
+                    scope = {'shutil': shutil, 'Path': Path, 'self': self, 'probe': SimpleNamespace(MARKER='inert diagnostic marker')}
+                    exec(compile(ast.Module(body=guard.body, type_ignores=[]), filename, 'exec'), scope)
+                    self.assertEqual(scope['installed'], str(installed))
+
+    def test_alias_bootstrap_routes_physical_seal_and_refuses_container_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve(); root = parent / 'physical'; root.mkdir(mode=0o700)
+            alias = parent / 'alias'; alias.symlink_to(root, target_is_directory=True)
+            module, state, _, output = self.exercise(root, temporary=alias)
+            exports = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            container = Path(exports['CI_CONTAINER'])
+            self.assertEqual(container, root / 'ci-python')
+            self.assertNotEqual(container, alias / 'ci-python')
+            state.executable = exports['CI_PYTHON']
+            scripts = Path(state.executable).parent
+            for name in ('sfs', 'stallionfs', 'stallionfs-python'):
+                path = scripts / name
+                path.write_text('#!' + state.executable + '\nfrom stallionfs.__main__ import main\n')
+                path.chmod(0o755)
+            module.check_install(container, True); module.check_install(container, False)
+            # Changing an unused lexical alias cannot redirect the exported physical coordinate.
+            other = parent / 'other'; other.mkdir(); alias.unlink(); alias.symlink_to(other, target_is_directory=True)
+            module.check_install(container, False)
+            original = container.with_name('original'); container.rename(original)
+            shutil.copytree(original, container)
+            with self.assertRaisesRegex(ValueError, 'CI environment replaced'):
+                module.check_install(container, False)
+
+    def test_console_helper_is_bound_to_selected_copy_and_retained(self):
+        for shell, spaces in ((False, False), (True, False), (True, True)):
+            with self.subTest(shell=shell, spaces=spaces), tempfile.TemporaryDirectory(prefix='ci with space-' if spaces else 'ci-inert-') as temporary:
+                root = Path(temporary).resolve()
+                module, state, _, _ = self.exercise(root)
+                container = root / 'ci-python'
+                value = json.loads((container / 'origin.json').read_text())
+                state.executable = value['executable']
+                scripts = Path(value['paths']['scripts'])
+                selected = value['executable']
+                quoted = '"' + selected + '"' if spaces else selected
+                header = ("#!/bin/sh\n'''exec' " + quoted + " \"$0\" \"$@\"\n' '''\n") if shell else '#!' + selected + '\n'
+                helper = scripts / 'stallionfs-python'
+                helper.write_text(header + 'from stallionfs.__main__ import main\n'); helper.chmod(0o755)
+                for name in ('sfs', 'stallionfs'):
+                    path = scripts / name; path.write_bytes(b'inert native launcher'); path.chmod(0o755)
+                module.check_install(container, True); module.check_install(container, False)
+                helper.write_text('#!/different/python\nfrom stallionfs.__main__ import main\n')
+                with self.assertRaisesRegex(ValueError, 'console helper route'): module.check_install(container, False)
+                helper.write_text(header + 'from stallionfs.__main__ import main\n')
+                (scripts / 'stallionfs').write_bytes(b'changed native launcher')
+                with self.assertRaisesRegex(ValueError, 'launcher changed'): module.check_install(container, False)
+
+    def test_all_ordinary_consumers_and_diagnostics_use_the_owned_interpreter(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        ordinary = text.split('  test:', 1)[1].split('  hosted-docs-screen:', 1)[0]
+        self.assertEqual(ordinary.count('          python -I -B'), 1)
+        self.assertEqual(ordinary.count('"${CI_PYTHON:?}" -I -B'), 10)
+        self.assertLess(ordinary.index('name: Create owned CI interpreter'), ordinary.index('name: Install pinned wheel backend'))
+        self.assertIn("if: failure() && steps.ci-python.outcome == 'success'", ordinary)
+        self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', ordinary)
+        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"', ordinary)
+        self.assertIn('"${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"', ordinary)
+        self.assertNotIn('$RUNNER_TEMP/ci-python', ordinary)
+        self.assertIn("Path(os.environ['GITHUB_PATH'])", ordinary)
+        self.assertIn('fail-fast: false', ordinary)
+        self.assertIn("(matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || 15", ordinary)
+        for os_name, python in (('macos-15', '3.12'), ('macos-26', '3.11'), ('macos-26', '3.13'),
+                                ('macos-26', '3.14'), ('macos-26-intel', '3.13'), ('xcode-27', '3.13')):
+            self.assertIn('{os: ' + os_name + ", python: '" + python + "', images: '", ordinary)
+        self.assertEqual(ordinary.count('          - {os:'), 6)
+        self.assertIn('actions/checkout@11d5960a326750d5838078e36cf38b85af677262', ordinary)
+        self.assertIn('actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065', ordinary)
+        self.assertNotIn('cancel-in-progress', ordinary)
+        self.assertIn('--timeout 600', ordinary)
+        self.assertIn('timeout-minutes: 9', ordinary)
+
+    def test_build_tool_directory_owner_guard_is_unchanged(self):
+        module = load('package_fskit')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve()
+            module.os.close(module._runtime_directory(path))
+            actual = module.os.fstat
+            def mismatched(fd):
+                info = actual(fd)
+                return SimpleNamespace(st_uid=info.st_uid + 1)
+            with patch.object(module.os, 'fstat', side_effect=mismatched):
+                with self.assertRaisesRegex(ValueError, 'Directory ownership changed'):
+                    module._runtime_directory(path)
 
 
 if __name__ == '__main__': unittest.main()

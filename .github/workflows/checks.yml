@@ -38,15 +38,185 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '${{ matrix.python }}'
+      - name: Create owned CI interpreter
+        id: ci-python
+        timeout-minutes: 2
+        run: |
+          python -I -B - <<'PY'
+          from pathlib import Path
+          import os
+          BOOTSTRAP_SOURCE = r"""import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import stat
+          import subprocess
+          import sys
+          import sysconfig
+          import venv
+
+          def require(value, message):
+              if not value: raise ValueError(message)
+
+          def identity(path, directory=False):
+              path = Path(path)
+              require(path.is_absolute() and path.resolve(strict=True) == path, 'Physical CI path required')
+              info = path.lstat()
+              require(info.st_uid == os.getuid() and not info.st_mode & 0o022, 'CI path ownership or mode differs')
+              require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                      'CI path type differs')
+              value = [info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode)]
+              return value if directory else value + [info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+          def read(path, limit):
+              before = identity(path)
+              require(before[5] <= limit, 'CI input exceeds bound')
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, 'rb') as stream: data = stream.read(limit + 1)
+              require(len(data) <= limit and identity(path) == before, 'CI input changed')
+              return data
+
+          def write_new(path, data):
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, 'wb') as stream: stream.write(data)
+
+          def facts():
+              executable = Path(getattr(sys, '_base_executable', sys.executable)).resolve(strict=True)
+              return {'version': sys.version, 'architecture': platform.machine(),
+                      'base_prefix': str(Path(sys.base_prefix).resolve(strict=True)),
+                      'base_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
+
+          def validate(value, container, environment, base):
+              require(value['schema'] == 1 and value['base'] == base, 'CI interpreter origin differs')
+              require(value['container_identity'] == identity(container, True)
+                      and value['environment_identity'] == identity(environment, True), 'CI environment replaced')
+              selected = Path(value['executable'])
+              require(selected.is_relative_to(environment) and selected.parent == Path(value['paths']['scripts']), 'CI executable escaped')
+              require(value['executable_identity'] == identity(selected) and os.access(selected, os.X_OK)
+                      and hashlib.sha256(read(selected, 64 * 1024**2)).hexdigest() == base['base_executable_sha256'], 'CI interpreter copy differs')
+              require(value['prefix'] == str(environment) and value['base_prefix'] == base['base_prefix']
+                      and value['prefix'] != value['base_prefix'] and value['version'] == base['version']
+                      and value['architecture'] == base['architecture'] and value['uid'] == os.getuid(), 'CI interpreter context differs')
+              require(set(value['paths']) == {'scripts', 'purelib', 'platlib', 'data'}, 'CI installation scheme differs')
+              for name, destination in value['paths'].items():
+                  path = Path(destination)
+                  require(path.is_relative_to(environment) and path.resolve(strict=True) == path, 'CI installation path escaped')
+                  identity(path, True)
+              require(value['scripts_identity'] == identity(selected.parent, True), 'CI scripts directory replaced')
+              return selected
+
+          def probe(container, environment, receipt, base, environment_identity):
+              require(identity(environment, True) == environment_identity, 'CI environment replaced during creation')
+              selected = Path(sys.executable).absolute()
+              paths = {name: str(Path(sysconfig.get_path(name)).absolute()) for name in ('scripts', 'purelib', 'platlib', 'data')}
+              value = {'schema': 1, 'base': base, 'container_identity': identity(container, True),
+                       'environment_identity': identity(environment, True), 'executable': str(selected),
+                       'executable_identity': identity(selected), 'prefix': str(Path(sys.prefix).resolve(strict=True)),
+                       'base_prefix': str(Path(sys.base_prefix).resolve(strict=True)), 'version': sys.version,
+                       'architecture': platform.machine(), 'uid': os.getuid(), 'paths': paths,
+                       'scripts_identity': identity(Path(paths['scripts']), True)}
+              validate(value, container, environment, base)
+              write_new(receipt, (json.dumps(value, sort_keys=True) + '\n').encode())
+
+          def create(driver, container, environment, receipt, base, environment_identity):
+              require(identity(environment, True) == environment_identity and not list(environment.iterdir()), 'CI environment is not fresh')
+              class Builder(venv.EnvBuilder):
+                  def post_setup(self, context): self.selected = context.env_exe
+              builder = Builder(with_pip=True, symlinks=False, upgrade=False, upgrade_deps=False)
+              builder.create(str(environment))
+              require(identity(environment, True) == environment_identity, 'CI environment replaced during creation')
+              selected = Path(builder.selected).absolute()
+              identity(selected)
+              subprocess.run([str(selected), '-I', '-B', str(driver), 'probe', str(container), str(environment),
+                              str(receipt), json.dumps(base), json.dumps(environment_identity)], check=True)
+
+          def bootstrap(temporary, checkout, github_env, github_path):
+              temporary = temporary.resolve(strict=True)
+              container = temporary / 'ci-python'
+              reserved = False
+              try:
+                  container.mkdir(mode=0o700); reserved = True
+                  container_identity = identity(container, True)
+                  environment = container / 'venv'; environment.mkdir(mode=0o700)
+                  environment_identity = identity(environment, True)
+                  driver = container / 'bootstrap.py'; receipt = container / 'origin.json'
+                  write_new(driver, BOOTSTRAP_SOURCE.encode())
+                  driver_identity = identity(driver); base = facts()
+                  spec = importlib.util.spec_from_file_location('ci_bootstrap_capture', checkout / 'tools/ci_execute.py')
+                  runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+                  previous = sys.argv
+                  try:
+                      sys.argv = ['ci_execute.py', '--timeout', '90', '--stem', str(container / 'create'), str(driver),
+                                  'create', str(driver), str(container), str(environment), str(receipt), json.dumps(base), json.dumps(environment_identity)]
+                      runner.main()
+                  finally: sys.argv = previous
+                  require(identity(container, True) == container_identity and identity(driver) == driver_identity
+                          and read(driver, 65536).decode() == BOOTSTRAP_SOURCE, 'CI bootstrap paths replaced')
+                  value = json.loads(read(receipt, 16384))
+                  selected = validate(value, container, environment, base)
+                  scripts = Path(value['paths']['scripts'])
+                  require(all(character.isprintable() for path in (selected, scripts, container) for character in str(path)),
+                          'Invalid CI interpreter path')
+                  with github_env.open('a') as output, github_path.open('a') as path_output:
+                      output.write('CI_PYTHON=' + str(selected) + '\nCI_CONTAINER=' + str(container) + '\n')
+                      path_output.write(str(scripts) + '\n')
+              except BaseException as error:
+                  print('Owned CI interpreter setup failed:', type(error).__name__, flush=True)
+                  if reserved:
+                      for name in ('create.command.json', 'create.stderr.bin', 'create.stdout.bin', 'origin.json'):
+                          try: data = read(container / name, 1024 * 1024)
+                          except (OSError, ValueError): continue
+                          print(name + ':', data[:8192].decode('utf-8', errors='replace'), flush=True)
+                  if isinstance(error, SystemExit) and error.code in (0, None):
+                      raise RuntimeError('CI bootstrap exited before completion') from error
+                  raise
+
+          def check_install(container, seal):
+              value = json.loads(read(container / 'origin.json', 16384))
+              selected = validate(value, container, container / 'venv', value['base'])
+              require(Path(sys.executable).absolute() == selected, 'Wrong installed CI interpreter')
+              scripts = Path(value['paths']['scripts'])
+              helper = scripts / 'stallionfs-python'; data = read(helper, 65536)
+              direct = ('#!' + str(selected) + '\n').encode()
+              quoted = '"' + str(selected) + '"' if ' ' in str(selected) else str(selected)
+              shell = ("#!/bin/sh\n'''exec' " + quoted + " \"$0\" \"$@\"\n' '''\n").encode()
+              require(os.access(helper, os.X_OK) and (data.startswith(direct) or data.startswith(shell))
+                      and b'from stallionfs.__main__ import main' in data, 'Installed console helper route differs')
+              bound = {}
+              for name in ('stallionfs-python', 'sfs', 'stallionfs'):
+                  path = scripts / name
+                  require(os.access(path, os.X_OK), 'Installed CI launcher is not executable')
+                  bound[name] = {'identity': identity(path), 'sha256': hashlib.sha256(read(path, 64 * 1024**2)).hexdigest()}
+              if seal: write_new(container / 'launchers.json', (json.dumps(bound, sort_keys=True) + '\n').encode())
+              else: require(json.loads(read(container / 'launchers.json', 16384)) == bound, 'Installed CI launcher changed')
+
+          if __name__ == '__main__':
+              mode, *arguments = sys.argv[1:]
+              if mode == 'create': create(*map(Path, arguments[:4]), json.loads(arguments[4]), json.loads(arguments[5]))
+              elif mode == 'probe': probe(*map(Path, arguments[:3]), json.loads(arguments[3]), json.loads(arguments[4]))
+              elif mode in ('seal', 'check'): check_install(Path(arguments[0]), mode == 'seal')
+              else: raise ValueError('Unknown CI environment operation')
+          """
+          scope = {'__name__': 'ci_inline', 'BOOTSTRAP_SOURCE': BOOTSTRAP_SOURCE}
+          exec(compile(BOOTSTRAP_SOURCE, '<owned-ci-interpreter>', 'exec'), scope)
+          scope['bootstrap'](Path(os.environ['RUNNER_TEMP']), Path(os.environ['GITHUB_WORKSPACE']).resolve(),
+                             Path(os.environ['GITHUB_ENV']), Path(os.environ['GITHUB_PATH']))
+          PY
       - name: Install pinned wheel backend
         run: |
-          python -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
+          "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
       - name: Fetch exact qualified architecture component
-        run: python -I -B tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
+        run: |
+          "${CI_PYTHON:?}" -I -B tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
       - name: Build current wheel with enforced Git cache reuse
-        run: python -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/cache-wheel-build" tools/ci_build.py build --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component" --output "$RUNNER_TEMP/qualified-wheel"
+        run: |
+          "${CI_PYTHON:?}" -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/cache-wheel-build" tools/ci_build.py build --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component" --output "$RUNNER_TEMP/qualified-wheel"
       - name: Install current owned wheel
-        run: python -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
+        run: |
+          "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
+          "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"
       - name: Test installed wheel with image failure diagnostics
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
@@ -54,7 +224,7 @@ jobs:
           STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import faulthandler
           import os
           from pathlib import Path
@@ -107,6 +277,11 @@ jobs:
           controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
           admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
           admitted['check']()
+          import sysconfig
+          native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+          assert native_cli.is_absolute() and native_cli.is_relative_to(Path(sys.prefix).resolve())
+          with Path(os.environ['GITHUB_ENV']).open('a') as output:
+              output.write('CI_STALLIONFS=' + str(native_cli) + '\n')
           sys.path.insert(0, str(checkout / 'tests'))
           from image_failure_diagnostics import install
           diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
@@ -150,7 +325,7 @@ jobs:
             exit 2
           fi
           export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import os, re, resource, shutil, subprocess, sys, time, unittest
           from pathlib import Path
 
@@ -221,11 +396,11 @@ jobs:
                                 and not result.skipped))
           PY
       - name: Validate bounded image diagnostic artifact
-        if: failure()
+        if: failure() && steps.ci-python.outcome == 'success'
         id: image-diagnostics
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import os
           from pathlib import Path
           import sys
@@ -265,7 +440,7 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import os
           from pathlib import Path
           import sys
@@ -287,7 +462,8 @@ jobs:
           PY
       - run: |
           cd "$RUNNER_TEMP"
-          stallionfs --root "$RUNNER_TEMP/stallionfs-smoke" doctor
+          "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"
+          "${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor
 
   hosted-docs-screen:
     name: Hosted document clone screen
