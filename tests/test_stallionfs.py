@@ -466,7 +466,7 @@ class Workspaces(unittest.TestCase):
             self.assertEqual(_native.qualify(operation, metadata), 'stallionfs')
             self.assertEqual(operation.calls, [
                 ('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R',
-                    'anchor apple generic and identifier "com.alvinhhh.stallionfs" '
+                    '=anchor apple generic and identifier "com.alvinhhh.stallionfs" '
                     'and certificate leaf[subject.OU] = "' + _bundle.PUBLISHER_TEAM + '"', str(app)]),
                 ('discover', [str(host), '--discover-json'])])
             variants = [('disabled', {'enabled': False}), ('wrong-url', {'url': '/different/module'}),

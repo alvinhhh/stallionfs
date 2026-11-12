@@ -501,7 +501,8 @@ ARM64 wheel, and `tools/mount_witness.c`. The mount witness is compiled without
 being run. This finite job does not sign for distribution, install, register,
 or mount anything. Linker-added ad-hoc signatures may be present.
 
-The artifact contains only the four unsigned app files, wheel, mount witness,
+The artifact contains the unsigned Host/extension files, standalone maintenance
+leaf, wheel, mount witness,
 repository `LICENSE`, and public `provenance.json` in `StallionFS-unsigned-arm64.tar.gz`. The manifest
 records the source commit/tree, source and component hashes, actual tools and
 SDK, command results, production symbol checks, existing packager candidate
@@ -520,7 +521,8 @@ its source and build provenance.
 
 ## Maintenance resources
 
-Runtime assembly includes `Contents/Resources/Maintenance/observer.py` and
+Runtime assembly includes `Contents/Resources/Maintenance/observer.py`, the
+separately signed standalone `stallionfs-maintenance` native leaf, and
 `compatibility.json`. The observer reads existing declared stores without
 initializing them or performing recovery, cleanup, replacement or mounts. It
 retains default, environment and explicit roots in its observation; missing
@@ -536,8 +538,9 @@ external candidate inventory. These checks establish structural consistency.
 The resources are unsigned assembly inputs awaiting the existing app seal.
 
 `public_upgrade_support` is empty. Recognizing a retained request schema does
-not qualify an installed predecessor/candidate pair. There is no maintenance
-launcher or installed upgrade/removal/recovery workflow in these resources.
+not qualify an installed predecessor/candidate pair. The external observer and bounded native retention entry point implement the
+[exact-artifact maintenance procedure](fskit-maintenance.md). Installed
+removal/reinstall/restoration qualification remains outstanding.
 Before an external observer can execute, trusted system static verification
 must admit the candidate seal, its observer resource and an independently
 expected publisher; the old installed runtime must be admitted separately.
