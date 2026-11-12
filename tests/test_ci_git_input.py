@@ -57,6 +57,54 @@ class UninitializedInput(unittest.TestCase):
                 retained.read(path)
             self.assertEqual(len(calls), 1)
 
+    def test_python_children_preserve_admitted_inputs_only_with_bytecode_suppression(self):
+        from stallionfs import _bundle
+        capture_path = Path(__file__).resolve().parents[1] / 'tools/_git_capture.py'
+        cases = (('isolated-control', ['-I'], False), ('isolated-bytecode-disabled', ['-I', '-B'], True),
+                 ('ordinary-environment', [], True), ('console-helper-environment', None, True))
+        for name, flags, preserved in cases:
+            with self.subTest(child=name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                package = base / 'owned_fixture'; package.mkdir(mode=0o700)
+                source = package / '__init__.py'
+                source.write_text("import json, sys\ndef main():\n    print(json.dumps({"
+                                  "'isolated': sys.flags.isolated, 'dont_write_bytecode': sys.dont_write_bytecode}))\n"
+                                  "    return 0\n")
+                helper = base / 'console-helper.py'
+                helper.write_text("import sys\nfrom owned_fixture import main\n"
+                                  "if __name__ == '__main__':\n    sys.exit(main())\n")
+                retained = admission_module()._Bindings(_bundle)
+                retained.reader = lambda path, expected=None: path.read_bytes()
+                retained.tree(package)
+                original = retained.read(source)
+                identities = dict(retained.identities)
+                members = retained.trees[package]
+                spec = importlib.util.spec_from_file_location('bytecode_capture', capture_path)
+                capture = importlib.util.module_from_spec(spec); spec.loader.exec_module(capture)
+                script = "import sys; sys.path.insert(0, sys.argv[1]); from owned_fixture import main; sys.exit(main())"
+                argv = ([sys.executable, str(helper)] if flags is None
+                        else [sys.executable, *flags, '-c', script, str(base)])
+                with patch.object(capture, '_COMMAND_ENV', {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}):
+                    result = capture._owned_command(argv, cwd=base, timeout=10, stem=base / 'child')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                observed = json.loads(result.stdout)
+                self.assertEqual(observed['isolated'], int(flags is not None and '-I' in flags))
+                self.assertEqual(observed['dont_write_bytecode'], preserved)
+                self.assertEqual(source.read_bytes(), original)
+                actual_members = frozenset({package, *package.rglob('*')})
+                if preserved:
+                    retained.check()
+                    self.assertEqual(actual_members, members)
+                    self.assertEqual({path: _bundle._identity(path.lstat()) for path in identities}, identities)
+                else:
+                    self.assertTrue((package / '__pycache__').is_dir())
+                    self.assertNotEqual(actual_members, members)
+                    self.assertNotEqual(_bundle._identity(package.lstat()), identities[package])
+                    with self.assertRaisesRegex(ValueError, '^CI validated input changed$'):
+                        retained.check()
+                self.assertIsNone(capture._command_state['failure'])
+                self.assertIsNone(capture._command_state['active'])
+
     def test_declared_wheel_budget_refuses_before_any_member_body_read(self):
         admission = admission_module()
         members = []

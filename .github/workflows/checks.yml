@@ -32,6 +32,7 @@ jobs:
           - {os: macos-26-intel, python: '3.13', images: '1'}
           - {os: xcode-27, python: '3.13', images: '1'}
     env:
+      PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -295,6 +296,7 @@ jobs:
               except Exception as error:
                   print('Diagnostic close failed:', type(error).__name__, file=sys.stderr)
           faulthandler.cancel_dump_traceback_later()
+          admitted['check']()
           capability_skips = [
               (test, reason) for test, reason in result.skipped
               if test.id() == 'setUpClass (test_fskit.FSKitInterfaces)'
