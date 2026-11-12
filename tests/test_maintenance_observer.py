@@ -509,5 +509,450 @@ class Compatibility(unittest.TestCase):
             o.validate_compatibility(self.data,self.observer,dict(self.build,package_version='0.8.0'))
 
 
+
+
+class CleanupRegression(unittest.TestCase):
+    """Deterministic ownership and propagation checks against the shipped helper."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='observer-cleanup-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve(); self.root.chmod(0o700)
+        self.acl = patch.object(o, 'empty_acl'); self.acl.start(); self.addCleanup(self.acl.stop)
+
+    def consume(self, failures):
+        real = os.close; calls = []
+        def close(fd):
+            self.assertNotIn(fd, calls); calls.append(fd); real(fd)
+            if len(calls) in failures: raise failures[len(calls)]
+        return calls, close
+
+    def retention(self):
+        return o.Retention(self.root)
+
+    def caught(self, call, expected, frame):
+        try:
+            call()
+        except BaseException as error:
+            self.assertIs(error, expected)
+            frames = []; tb = error.__traceback__
+            while tb:
+                frames.append(tb.tb_frame.f_code.co_name); tb = tb.tb_next
+            self.assertIn(frame, frames)
+            return error
+        self.fail('expected exception did not escape')
+
+    def equal_close_records(self):
+        records = []
+        # Separate failures can reuse the same descriptor number and path.
+        for unused in range(2):
+            fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            owned = {self.root: fd}
+            calls, close = self.consume({1: OSError(5, 'consumed')})
+            with patch.object(o.os, 'close', side_effect=close):
+                with self.assertRaises(o.Refusal) as caught: o.close_owned(owned)
+            self.assertEqual(calls, [fd]); self.assertFalse(owned)
+            records.append(caught.exception.cleanup_failures[0])
+        self.assertIsNot(records[0], records[1]); self.assertEqual(*records)
+        return records
+
+    def test_main_returned_final_close_history_once(self):
+        import io
+        r = self.retention(); count = len(r.access.fds)
+        original = o.Refusal('acquisition', '/original')
+        calls, close = self.consume({1: OSError(5, 'final consumed')})
+        output = io.StringIO()
+        args = ['remove', '--authorization', '/inert', '--authorization-sha256', 'a'*64,
+                '--publisher', 'inert', '--retain', str(self.root)]
+        with patch.object(o, 'retained_read', return_value=b'{}'), \
+             patch.object(o, 'validate_authorization', return_value={}), \
+             patch.object(o, 'Retention', return_value=r), \
+             patch.object(o, 'acquisition', side_effect=original), \
+             patch.object(o.os, 'close', side_effect=close), contextlib.redirect_stdout(output):
+            status = o.main(args)
+            with self.assertRaisesRegex(o.Refusal, '^retention-close-uncertainty$'): r.close()
+        result = json.loads(output.getvalue())
+        self.assertEqual(status, 1); self.assertEqual(result['exit_code'], 1)
+        self.assertEqual(result['status'], 'blocked')
+        self.assertFalse(result['cleanup_complete']); self.assertFalse(result['maintenance_clearance'])
+        self.assertEqual((result['error']['code'], result['error']['path']), ('acquisition', '/original'))
+        self.assertEqual(result['retention_close_error']['code'], 'retention-close-uncertainty')
+        self.assertIsNotNone(original.__traceback__)
+        self.assertEqual(len(result['cleanup_failures']), 1)
+        self.assertEqual(result['cleanup_failures'], r.cleanup_failures)
+        self.assertIs(original.cleanup_failures[0], r.cleanup_failures[0])
+        self.assertEqual(len(calls), count); self.assertFalse(r.access.fds)
+
+    def test_main_preserves_distinct_equal_close_records(self):
+        import io
+        first, second = self.equal_close_records()
+        for route in ('primary', 'report', 'unexpected'):
+            with self.subTest(route=route):
+                r = self.retention(); count = len(r.access.fds)
+                r.cleanup_failures.extend([second, first])
+                original = o.Refusal('acquisition', '/original'); original.cleanup_failures = [first]
+                final = RuntimeError('final consumed')
+                calls, close = self.consume({1: final} if route == 'unexpected' else {})
+                output = io.StringIO()
+                args = ['remove', '--authorization', '/inert', '--authorization-sha256', 'a'*64,
+                        '--publisher', 'inert', '--retain', str(self.root)]
+                with patch.object(o, 'retained_read', return_value=b'{}'), \
+                     patch.object(o, 'validate_authorization', return_value={}), \
+                     patch.object(o, 'Retention', return_value=r), \
+                     patch.object(o, 'acquisition', side_effect=None if route == 'report' else original,
+                         return_value=dict(status='blocked', exit_code=1, cleanup_complete=False,
+                                           cleanup_failures=[first, second, first])), \
+                     patch.object(o.os, 'close', side_effect=close), contextlib.redirect_stdout(output):
+                    if route == 'unexpected':
+                        error = self.caught(lambda: o.main(args), final, 'close')
+                        self.assertIs(error.primary_error, original)
+                        self.assertEqual(len(error.cleanup_failures), 3)
+                        self.assertIs(error.cleanup_failures[0], second)
+                        self.assertIs(error.cleanup_failures[1], first)
+                        self.assertIs(error.cleanup_failures[2], r.cleanup_failures[2])
+                        self.assertEqual(output.getvalue(), '')
+                    else:
+                        self.assertEqual(o.main(args), 1)
+                        result = json.loads(output.getvalue())
+                        self.assertEqual(result['cleanup_failures'], [first, second])
+                        self.assertEqual(result['status'], 'blocked')
+                        self.assertEqual(result['exit_code'], 1)
+                        self.assertFalse(result['cleanup_complete']); self.assertFalse(result['maintenance_clearance'])
+                        if route == 'primary':
+                            self.assertEqual((result['error']['code'], result['error']['path']),
+                                             ('acquisition', '/original'))
+                            self.assertEqual(result['retention_close_error']['code'], 'retention-close-uncertainty')
+                            self.assertEqual(len(original.cleanup_failures), 2)
+                            self.assertIs(original.cleanup_failures[0], first)
+                            self.assertIs(original.cleanup_failures[1], second)
+                    with self.assertRaisesRegex(o.Refusal, '^retention-close-uncertainty$'): r.close()
+                self.assertEqual(len(calls), count); self.assertFalse(r.access.fds)
+
+    def test_write_preserves_distinct_equal_readback_close_records(self):
+        first, second = self.equal_close_records()
+        r = self.retention(); r.cleanup_failures.append(first)
+        primary = o.Refusal('readback', '/original'); primary.cleanup_failures = [second, first]
+        with patch.object(o, 'retained_read', side_effect=primary):
+            with self.assertRaises(o.Refusal) as caught: r.write('output', b'bytes')
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(len(r.cleanup_failures), 2)
+        self.assertIs(r.cleanup_failures[0], first); self.assertIs(r.cleanup_failures[1], second)
+        count = len(r.access.fds); calls, close = self.consume({})
+        with patch.object(o.os, 'close', side_effect=close):
+            for unused in range(2):
+                with self.assertRaisesRegex(o.Refusal, '^retention-close-uncertainty$'): r.close()
+        self.assertEqual(len(calls), count); self.assertFalse(r.access.fds)
+
+    def test_failure_retention_interrupt_survives_unexpected_final_close(self):
+        import io
+        r = self.retention(); r.safe_for_failures = True
+        count = len(r.access.fds)
+        original = o.Refusal('acquisition', '/original')
+        interrupt = KeyboardInterrupt('failure readback')
+        final = RuntimeError('final consumed')
+        calls, close = self.consume({1: OSError(5, 'created consumed'), 2: final})
+        def read(path, *args, **kwargs):
+            if str(path) == '/inert': return b'{}'
+            raise interrupt
+        args = ['remove', '--authorization', '/inert', '--authorization-sha256', 'a'*64,
+                '--publisher', 'inert', '--retain', str(self.root)]
+        output = io.StringIO()
+        with patch.object(o, 'retained_read', side_effect=read), patch.object(o, 'validate_authorization', return_value={}), \
+             patch.object(o, 'Retention', return_value=r), patch.object(o, 'acquisition', side_effect=original), \
+             patch.object(o.os, 'close', side_effect=close), contextlib.redirect_stdout(output):
+            error = self.caught(lambda: o.main(args), interrupt, 'read')
+            self.assertIs(error.primary_error, original)
+            self.assertEqual((original.code, original.path), ('acquisition', '/original'))
+            self.assertIs(error.__context__, original)
+            self.assertEqual(len(error.cleanup_failures), 2)
+            with self.assertRaises(o.Refusal): r.close()
+        self.assertEqual(len(calls), count + 1); self.assertFalse(r.access.fds)
+        self.assertEqual(output.getvalue(), '')
+
+    def test_observation_interrupt_receives_returned_finish_failures(self):
+        a = o.Existing(str(self.root), o.LIMITS); a.admit(); count = len(a.fds)
+        primary = KeyboardInterrupt('observation')
+        calls, close = self.consume({1: OSError(5, 'consumed')})
+        with patch.object(o, 'Existing', return_value=a), patch.object(a, 'names', side_effect=primary), \
+             patch.object(o.os, 'close', side_effect=close):
+            error = self.caught(lambda: o.observe_root(dict(literal=str(self.root), reason='explicit'),
+                                                     o.LIMITS, None), primary, 'observe_root')
+            self.assertEqual(error.cleanup_failures, a.cleanup_failures)
+            self.assertEqual(len(error.cleanup_failures), 1)
+            a.finish()
+        self.assertEqual(len(calls), count); self.assertFalse(a.fds)
+
+    def test_handled_observation_refusal_survives_unexpected_finish(self):
+        a = o.Existing(str(self.root), o.LIMITS); a.admit(); count = len(a.fds)
+        primary = o.Refusal('observation', self.root/'store.json')
+        final = RuntimeError('consumed')
+        calls, close = self.consume({1: final})
+        with patch.object(o, 'Existing', return_value=a), patch.object(a, 'names', side_effect=primary), \
+             patch.object(o.os, 'close', side_effect=close):
+            error = self.caught(lambda: o.observe_root(dict(literal=str(self.root), reason='explicit'),
+                                                     o.LIMITS, None), final, 'close')
+            self.assertIs(error.primary_error, primary)
+            self.assertEqual((primary.code, primary.path), ('observation', str(self.root/'store.json')))
+            self.assertIsNotNone(primary.__traceback__)
+            self.assertEqual(error.observation_blockers[0]['code'], primary.code)
+            self.assertEqual(error.cleanup_failures, a.cleanup_failures)
+            a.finish()
+        self.assertEqual(len(calls), count); self.assertFalse(a.fds)
+
+    def test_exit_rechecks_persist_on_unexpected_close_escape(self):
+        a = o.Existing(str(self.root), o.LIMITS); a.admit(); count = len(a.fds)
+        primary = o.Refusal('security-binding-changed', self.root)
+        final = RuntimeError('consumed')
+        calls, close = self.consume({1: final, 2: OSError(5, 'also consumed')})
+        with patch.object(a, 'check_one', side_effect=primary), patch.object(o.os, 'close', side_effect=close):
+            error = self.caught(a.finish, final, 'close')
+            self.assertIs(error.primary_error, primary)
+            self.assertEqual((primary.code, primary.path), ('security-binding-changed', str(self.root)))
+            self.assertIsNotNone(primary.__traceback__)
+            self.assertEqual(error.cleanup_failures, a.cleanup_failures)
+            self.assertEqual(sum(f['code']=='exit-recheck-failed' for f in error.cleanup_failures), count)
+            self.assertEqual(sum(f['code']=='close-failed' for f in error.cleanup_failures), 2)
+            self.assertEqual(a.finish(), error.cleanup_failures)
+        self.assertEqual(len(calls), count); self.assertFalse(a.fds)
+
+    def test_prior_finish_history_survives_unexpected_main_final_close(self, report=False):
+        import io
+        store = self.root/'store'; store.mkdir(mode=0o700)
+        controls = self.root/'controls'; controls.mkdir(mode=0o700)
+        a = o.Existing(str(store), o.LIMITS); a.admit(); count = len(a.fds)
+        calls, close = self.consume({1: OSError(5, 'earlier consumed')})
+        with patch.object(o.os, 'close', side_effect=close):
+            earlier = a.finish(); a.finish()
+        self.assertEqual(len(calls), count); self.assertFalse(a.fds)
+        r = o.Retention(controls); r.cleanup_failures.extend(earlier)
+        count = len(r.access.fds)
+        primary = o.Refusal('acquisition', '/original')
+        final = RuntimeError('final consumed')
+        calls, close = self.consume({1: final, 2: OSError(5, 'also consumed')})
+        args = ['remove', '--authorization', '/inert', '--authorization-sha256', 'a'*64,
+                '--publisher', 'inert', '--retain', str(controls)]
+        output = io.StringIO()
+        with patch.object(o, 'retained_read', return_value=b'{}'), patch.object(o, 'validate_authorization', return_value={}), \
+             patch.object(o, 'Retention', return_value=r), \
+             patch.object(o, 'acquisition', side_effect=None if report else primary,
+                          return_value=dict(status='blocked', exit_code=1, cleanup_complete=False, cleanup_failures=earlier)), \
+             patch.object(r, 'write'), patch.object(o.os, 'close', side_effect=close), contextlib.redirect_stdout(output):
+            error = self.caught(lambda: o.main(args), final, 'close')
+            if not report:
+                self.assertIs(error.primary_error, primary)
+                self.assertEqual((primary.code, primary.path), ('acquisition', '/original'))
+                self.assertIsNotNone(primary.__traceback__)
+            for failure in earlier: self.assertIn(failure, error.cleanup_failures)
+            for failure in r.cleanup_failures: self.assertIn(failure, error.cleanup_failures)
+            self.assertEqual(len(r.cleanup_failures), 3)
+            with self.assertRaises(o.Refusal): r.close()
+        self.assertEqual(len(calls), count); self.assertFalse(r.access.fds)
+        self.assertEqual(output.getvalue(), '')
+
+    def test_blocked_report_history_survives_unexpected_main_final_close(self):
+        self.test_prior_finish_history_survives_unexpected_main_final_close(report=True)
+
+    def test_existing_finish_contract_and_repeated_cleanup(self):
+        a = o.Existing(str(self.root), o.LIMITS); a.admit()
+        calls, close = self.consume({1: OSError(5, 'consumed'), 2: OSError(5, 'consumed')})
+        count = len(a.fds)
+        with patch.object(a, 'check_one', side_effect=o.Refusal('recheck')), patch.object(o.os, 'close', side_effect=close):
+            result = a.finish(); again = a.finish()
+        self.assertEqual(len(calls), count); self.assertFalse(a.fds)
+        self.assertEqual(sum(x['code']=='close-failed' for x in result), 2)
+        self.assertTrue(any(x['code']=='exit-recheck-failed' for x in result))
+        self.assertEqual(len(again), 2)
+
+    def test_existing_interrupt_and_unexpected_close_persist(self):
+        for location in ('recheck', 'close'):
+            with self.subTest(location=location):
+                a = o.Existing(str(self.root), o.LIMITS); a.admit(); count = len(a.fds)
+                primary = KeyboardInterrupt() if location=='recheck' else RuntimeError('close')
+                calls, close = self.consume({1: OSError(5,'consumed')} if location=='recheck' else {1:primary,2:OSError(5,'consumed')})
+                with patch.object(a, 'check_one', side_effect=primary if location=='recheck' else None), patch.object(o.os,'close',side_effect=close):
+                    with self.assertRaises(type(primary)) as caught: a.finish()
+                    self.assertIs(caught.exception, primary); a.finish()
+                self.assertEqual(len(calls),count); self.assertTrue(a.cleanup_failures)
+
+    def test_constructor_failure_drains_partial_ownership(self):
+        primary = o.Refusal('constructor', '/original'); realopen = os.open; opened=[]
+        def opening(*args, **kw):
+            fd=realopen(*args, **kw); opened.append(fd); return fd
+        calls, close=self.consume({1:OSError(5,'consumed'),2:OSError(5,'consumed')})
+        with patch.object(o.os,'open',side_effect=opening), patch.object(o.Retention,'check',side_effect=primary), patch.object(o.os,'close',side_effect=close):
+            with self.assertRaises(o.Refusal) as caught: self.retention()
+        self.assertIs(caught.exception,primary); self.assertEqual(set(opened),set(calls))
+        self.assertEqual(len(primary.cleanup_failures),2)
+
+    def test_retained_read_primary_and_all_closes(self):
+        leaf=self.root/'leaf'; leaf.write_bytes(b'bytes'); leaf.chmod(0o600)
+        primary=o.Refusal('read', leaf)
+        calls,close=self.consume({i:OSError(5,'consumed') for i in range(1,5)})
+        with patch.object(o.os,'pread',side_effect=primary),patch.object(o.os,'close',side_effect=close):
+            try:o.retained_read(leaf)
+            except o.Refusal as caught:
+                self.assertIs(caught,primary)
+                frames=[];tb=caught.__traceback__
+                while tb:frames.append(tb.tb_frame.f_code.co_name);tb=tb.tb_next
+            else:self.fail('read unexpectedly succeeded')
+        self.assertEqual(primary.path,str(leaf))
+        self.assertEqual(len(primary.cleanup_failures),min(4,len(calls)))
+        self.assertIn('retained_read',frames)
+
+    def test_physical_transfer_root_and_no_dup(self):
+        for path in (Path('/'),self.root):
+            with self.subTest(path=path),patch.object(o.os,'dup',side_effect=AssertionError('dup')):
+                fd=o.physical_directory(path)
+                self.assertEqual(o.pair(os.fstat(fd)),o.pair(path.stat()));os.close(fd)
+
+    def test_physical_validation_and_close_failures_drain(self):
+        for case in ('validation','ancestor','both'):
+            with self.subTest(case=case):
+                failures={1:OSError(5,'consumed')}
+                if case=='both':failures[len(self.root.parts)]=OSError(5,'final consumed')
+                calls,close=self.consume(failures)
+                with patch.object(o.os,'close',side_effect=close),patch.object(o,'empty_acl',side_effect=o.Refusal('validation') if case=='validation' else None):
+                    with self.assertRaises(o.Refusal):o.physical_directory(self.root)
+                self.assertEqual(len(calls),1 if case=='validation' else len(self.root.parts))
+
+    def test_inventory_primary_and_cleanup_only(self):
+        (self.root/'file').write_bytes(b'bytes')
+        for primary in (o.Refusal('inventory'),None):
+            calls,close=self.consume({1:OSError(5,'child'),2:OSError(5,'root')})
+            # Bypass ancestor acquisition to isolate the immediate transferred-fd consumer.
+            rootfd=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY)
+            with patch.object(o,'physical_directory',return_value=rootfd),patch.object(o.os,'pread',side_effect=primary),patch.object(o.os,'close',side_effect=close):
+                if primary is None:
+                    # The cleanup-only path must complete the file read first.
+                    o.os.pread.side_effect=None;o.os.pread.return_value=b'bytes'
+                with self.assertRaises(o.Refusal) as caught:o.app_inventory(self.root)
+            if primary is not None:self.assertIs(caught.exception,primary)
+            self.assertEqual(len(calls),2);self.assertEqual(len(caught.exception.cleanup_failures),2)
+
+    def test_write_join_original_and_replacements(self):
+        for case in ('original','readback-replacement','after-readback'):
+            r=self.retention();name=case;realread=o.retained_read
+            def read(path,*args,**kw):
+                def replace():
+                    other=self.root/'replacement';other.write_bytes(b'bytes');other.chmod(0o600);os.replace(other,path)
+                if case=='readback-replacement':replace()
+                data=realread(path,*args,**kw)
+                if case=='after-readback':replace()
+                return data
+            try:
+                with patch.object(o,'retained_read',side_effect=read):
+                    if case=='original':self.assertEqual(r.write(name,b'bytes'),hashlib.sha256(b'bytes').hexdigest())
+                    else:
+                        with self.assertRaises(o.Refusal):r.write(name,b'bytes')
+            finally:r.close()
+
+    def test_write_primary_and_close_persist(self):
+        r=self.retention();primary=o.Refusal('readback');calls,close=self.consume({1:OSError(5,'consumed')})
+        with patch.object(o,'retained_read',side_effect=primary),patch.object(o.os,'close',side_effect=close):
+            with self.assertRaises(o.Refusal) as caught:r.write('output',b'bytes')
+        self.assertIs(caught.exception,primary);self.assertTrue(r.cleanup_failures)
+        with self.assertRaisesRegex(o.Refusal,'retention-close-uncertainty'):r.close()
+        with self.assertRaises(o.Refusal):r.close()
+
+    def test_retention_final_check_drains_and_repeated_uncertainty(self):
+        for unexpected in (False,True):
+            r=self.retention();count=len(r.access.fds)
+            failure=RuntimeError('unexpected') if unexpected else OSError(5,'consumed')
+            calls,close=self.consume({1:failure,2:OSError(5,'consumed')})
+            with patch.object(o.os,'close',side_effect=close):
+                with self.assertRaises(RuntimeError if unexpected else o.Refusal):r.close()
+                with self.assertRaisesRegex(o.Refusal,'retention-close-uncertainty'):r.close()
+            self.assertEqual(len(calls),count)
+        r=self.retention();primary=o.Refusal('final-check')
+        with patch.object(r,'check',side_effect=primary):
+            with self.assertRaises(o.Refusal) as caught:r.close()
+        self.assertIs(caught.exception,primary);self.assertFalse(r.access.fds)
+
+    def test_retention_security_identity_and_acl_rechecks(self):
+        r=self.retention();ancestor=next(p for p in r.access.fds if p!=self.root)
+        # Shared ancestor metadata may change while the security identity stays fixed.
+        r.access.stamps[ancestor][5:]=[-1]*4;r.check()
+        r.access.stamps[self.root][3]+=1
+        with self.assertRaises(o.Refusal):r.write('blocked',b'bytes')
+        with self.assertRaises(o.Refusal):r.close()
+        self.assertFalse(r.access.fds)
+        r=self.retention()
+        with patch.object(o,'empty_acl',side_effect=o.Refusal('unsupported-acl')):
+            with self.assertRaises(o.Refusal):r.close()
+        self.assertFalse(r.access.fds)
+
+    def test_final_read_acl_rechecks(self):
+        leaf=self.root/'acl';leaf.write_bytes(b'bytes');leaf.chmod(0o600)
+        count=len(leaf.parts);calls=[]
+        def acl(fd,*,ancestor=False):
+            calls.append(ancestor)
+            if len(calls)==count+1:raise o.Refusal('unsupported-acl')
+        with patch.object(o,'empty_acl',side_effect=acl),self.assertRaisesRegex(o.Refusal,'unsupported-acl'):
+            o.retained_read(leaf)
+        with patch.object(o,'empty_acl') as allowed:self.assertEqual(o.retained_read(leaf),b'bytes')
+        self.assertEqual(allowed.call_count,2*count)
+
+    def test_main_primary_failure_json_and_final_close(self):
+        import io
+        args=['remove','--authorization','/inert','--authorization-sha256','a'*64,'--publisher','inert','--retain',str(self.root)]
+        for case in ('constructor','success-close','primary-close','failure-json','interrupt','primary-unexpected-close'):
+            r=self.retention();r.safe_for_failures=True;primary=KeyboardInterrupt() if case=='interrupt' else o.Refusal('acquisition','/primary')
+            calls,close=self.consume({1:RuntimeError('final') if case in ('interrupt','primary-unexpected-close') else OSError(5,'consumed')})
+            output=io.StringIO()
+            def write(*args,**kw):
+                error=o.Refusal('failure-json');error.cleanup_failures=[dict(code='close-failed',path='failure.json')]
+                r.cleanup_failures.extend(error.cleanup_failures);raise error
+            with patch.object(o,'retained_read',return_value=b'{}'),patch.object(o,'validate_authorization',return_value={}),patch.object(o,'Retention',side_effect=primary if case=='constructor' else lambda _:r),patch.object(o,'acquisition',side_effect=None if case=='success-close' else primary,return_value=dict(status='clear',exit_code=0)),patch.object(r,'write',side_effect=write),patch.object(o.os,'close',side_effect=close),contextlib.redirect_stdout(output):
+                if case=='interrupt':
+                    with self.assertRaises(KeyboardInterrupt) as caught:o.main(args)
+                    self.assertIs(caught.exception,primary)
+                elif case=='primary-unexpected-close':
+                    with self.assertRaises(RuntimeError) as caught:o.main(args)
+                    self.assertIs(caught.exception.primary_error,primary)
+                    self.assertTrue(r.cleanup_failures)
+                else:
+                    self.assertEqual(o.main(args),1);result=json.loads(output.getvalue())
+                    if case!='constructor':self.assertFalse(result['cleanup_complete'])
+                    if case in ('primary-close','failure-json','constructor'):self.assertEqual(result['error']['code'],'acquisition')
+            if r.access.fds:r.close()
+
+    def test_report_finish_cleanup_reaches_main(self, fail_report=False):
+        import io
+        controls=self.root/'controls';controls.mkdir(mode=0o700)
+        store=self.root/'store';store.mkdir(mode=0o700)
+        r=o.Retention(controls)
+        a=o.Existing(str(store),o.LIMITS);a.admit()
+        realclose=os.close;calls=[];store_fds=set(a.fds.values())
+        def close(fd):
+            realclose(fd)
+            if fd in store_fds:
+                self.assertNotIn(fd,calls);calls.append(fd)
+                if len(calls)==1:raise OSError(5,'consumed')
+        activity=dict(cooperative_downtime=True,mounts=[],helpers=[],descendants=[],uncertainties=[])
+        request=dict(operation='remove',roots=[dict(literal=str(store),reason='default')],
+                     root_contract=dict(default=str(store),environment=None),activity=activity)
+        pin=hashlib.sha256(b'{}').hexdigest()
+        auth=dict(home=str(self.root),publisher=o.PUBLISHER_TEAM,runtime={},inventory=[],
+                  artifact={key:pin for key in ('observer_sha256','descriptor_sha256','compatibility_sha256','native_sha256')})
+        args=['remove','--authorization','/inert','--authorization-sha256',pin,
+              '--publisher',o.PUBLISHER_TEAM,'--retain',str(controls)]
+        output=io.StringIO()
+        def write(name,*args):
+            if fail_report and name == 'observation.json':raise o.Refusal('report-write')
+        with patch.object(o,'Existing',return_value=a),patch.object(a,'names',side_effect=o.Refusal('read')), \
+             patch.object(o.os,'close',side_effect=close),patch.object(o,'Retention',return_value=r), \
+             patch.object(o,'original_request',return_value=request),patch.object(o,'retained_read',return_value=b'{}'), \
+             patch.object(o,'validate_authorization',return_value=auth),patch.object(r,'write',side_effect=write), \
+             patch.object(o,'actual_runtime',return_value={}),patch.object(o,'app_inventory',return_value=[]), \
+             patch.object(o,'static_signature'),patch.object(o,'acquire_native',return_value=activity), \
+             patch.object(o,'software_plan',return_value={}),contextlib.redirect_stdout(output):
+            self.assertEqual(o.main(args),1)
+        result=json.loads(output.getvalue())
+        self.assertFalse(result['cleanup_complete']);self.assertTrue(result['cleanup_failures'])
+        self.assertEqual(len(calls),len(store_fds));self.assertFalse(r.access.fds)
+
+    def test_report_cleanup_survives_later_report_write_failure(self):
+        self.test_report_finish_cleanup_reaches_main(fail_report=True)
+
+
 if __name__ == '__main__':
     unittest.main()

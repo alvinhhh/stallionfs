@@ -76,6 +76,8 @@ class Workflow(unittest.TestCase):
         with self.assertRaises(OSError):o.retained_read(alias/'request.json')
         directory.chmod(0o755)
         with self.assertRaises(o.Refusal):retained.check()
+        with self.assertRaises(o.Refusal):retained.close()
+        self.assertEqual(retained.access.fds,{})
 
     def test_software_only_state_matrix_preserves_store_scope(self):
         for state in ('absent','partial','intact-wrong','intact-exact'):
