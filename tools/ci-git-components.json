@@ -1,20 +1,20 @@
 {
   "components": {
     "arm64": {
-      "bytes": 43840280,
+      "bytes": 20573464,
       "inventory_sha256": "9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700",
-      "manifest_sha256": "25feb3414fda62f2a1774ef89a2ec04f7b935598c5967bfeb44c46b1b327eb76",
+      "manifest_sha256": "beb800094ea7b5316094cb082047cb421517974fc34cc62a50897f26c67505a6",
       "qualification_sha256": "2c15b8599c27b367696d93fad50546fd907950db2c2e17a33536c63a5302309c",
-      "sha256": "d169c1aa66d323dc5dd5e7df9574e90171190722bcc1adb282e29d6c7b37f7bf",
-      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v8/git-runtime-arm64-v8.tar.xz"
+      "sha256": "ec9b85cec6507de2ac9e41a82edcdedd59a34cf3adbf8a2d50c46800b8edd1f2",
+      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v6/git-runtime-arm64-v6.tar.xz"
     },
     "x86_64": {
-      "bytes": 46397136,
+      "bytes": 22242576,
       "inventory_sha256": "020c08613be10d2d21d46a4defd6c4c98724b0af61426a9a2096e1bee48d546a",
-      "manifest_sha256": "7bc0f8b29eb38c434813e0b1c532ed9b5fdb4893bf746d8b1489f5c24b38b922",
+      "manifest_sha256": "f631231099de57692ace2be089dd85632350e8070638d4434dc16beafb3e3201",
       "qualification_sha256": "aba181b9ce8dc37fad2454a60c60baf6ca6927e4bbe0079c0ab6d524d1d43e0b",
-      "sha256": "c7dce7223da3b2e35b3435064e7c6a80024fa903f3d6d6ffacc16f9c2d78db12",
-      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v8/git-runtime-x86_64-v8.tar.xz"
+      "sha256": "93a575b5d297dd64290dfca904eb996e1142ee1292499beb715ad431aa4536e2",
+      "url": "https://github.com/alvinhhh/stallionfs/releases/download/ci-native-git-v6/git-runtime-x86_64-v6.tar.xz"
     }
   },
   "schema": 1
