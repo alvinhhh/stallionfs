@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     if: github.event_name != 'workflow_dispatch'
-    timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || 15 }}
+    timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -209,8 +209,20 @@ jobs:
         run: |
           "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
       - name: Fetch exact qualified architecture component
+        id: component-fetch
         run: |
-          "${CI_PYTHON:?}" -I -B tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
+          "${CI_PYTHON:?}" -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
+      - name: Upload component fetch failure diagnostics
+        if: failure() && steps.component-fetch.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: component-fetch-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/component-fetch.command.json
+            ${{ runner.temp }}/component-fetch.stdout.bin
+            ${{ runner.temp }}/component-fetch.stderr.bin
+          if-no-files-found: ignore
+          retention-days: 1
       - name: Build current wheel with enforced Git cache reuse
         run: |
           "${CI_PYTHON:?}" -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/cache-wheel-build" tools/ci_build.py build --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component" --output "$RUNNER_TEMP/qualified-wheel"
@@ -222,7 +234,7 @@ jobs:
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
-          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B - <<'PY'

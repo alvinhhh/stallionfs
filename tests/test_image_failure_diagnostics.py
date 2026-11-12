@@ -555,6 +555,7 @@ class DirectImageFixtureTests(unittest.TestCase):
             fixture.source = fixture.base / 'source'
             fixture.seed = fixture.base / 'seed.sparseimage'
             fixture.image_points = {}
+            fixture.observation = 'initial-unmount'
             repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
             repo.mkdir(); untouched.mkdir()
             filler = repo / 'filler'
@@ -631,6 +632,7 @@ class SpaceRetentionTests(unittest.TestCase):
         fixture.base = Path(tempfile.mkdtemp(prefix='space-retention-mock-')).resolve()
         self.addCleanup(shutil.rmtree, fixture.base, ignore_errors=True)
         fixture.image_points = {}
+        fixture.observation = 'initial-unmount'
         for name in ('seed.sparseimage', 'sibling.sparseimage', 'sentinel'):
             (fixture.base / name).write_bytes(name.encode())
         return fixture
@@ -709,6 +711,43 @@ class SpaceRetentionTests(unittest.TestCase):
         self.assertIs(caught.exception, error)
         eject.assert_called_once()
         self.assert_retained(fixture)
+
+    def test_enospc_selector_observes_first_detach_before_failure(self):
+        for selection in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach'):
+            with self.subTest(selection=selection):
+                fixture = self.fixture()
+                fixture.observation = selection
+                fixture.seed, fixture.source = fixture.base/'seed.sparseimage', fixture.base/'source'
+                repo = fixture.base/'repo'; repo.mkdir()
+                filler = repo/'filler'; filler.touch()
+                stream = Mock(); stream.write.side_effect = [1, OSError(errno.ENOSPC, 'full')]
+                opened = Mock(); opened.__enter__ = Mock(return_value=stream); opened.__exit__ = Mock(return_value=False)
+                original_open = Path.open
+                def open_path(path, *args, **kwargs):
+                    return opened if path == filler else original_open(path, *args, **kwargs)
+                error = OSError(errno.EBUSY, 'selected eject')
+                def detach(*args):
+                    self.assertEqual(diagnostics._detach_observation.get() is not None,
+                                     selection == 'enospc-initial-detach')
+                    raise error
+                with patch.object(space.images, 'clone'), patch.object(space, 'digest', return_value='same'), \
+                        patch.object(space.images, 'attach', return_value=repo), patch.object(fixture, 'assert_original'), \
+                        patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                        patch.object(Path, 'open', open_path), patch.object(space.images, 'detach', side_effect=detach) as eject, \
+                        self.assertRaises(OSError) as caught:
+                    fixture.test_volume_full_preserves_existing_data_and_other_images()
+                self.assertIs(caught.exception, error)
+                eject.assert_called_once()
+                self.assert_retained(fixture)
+
+    def test_selector_is_validated_before_space_fixture_allocation(self):
+        for value in ('enospc-initial-detach', 'unknown', ''):
+            with self.subTest(value=value), patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION=value), \
+                    patch.object(space.tempfile, 'mkdtemp', side_effect=OSError('stop before allocation')) as allocate:
+                fixture = space.ImageSpace()
+                with self.assertRaises(OSError if value == 'enospc-initial-detach' else ValueError):
+                    fixture.setUp()
+                self.assertEqual(allocate.call_count, int(value == 'enospc-initial-detach'))
 
     def test_headroom_skip_cleans_only_the_empty_owned_directory(self):
         fixture = space.ImageSpace()
@@ -1187,6 +1226,143 @@ class DiagnosticTests(unittest.TestCase):
     def scope(self, **changes):
         return dict(base=self.base, image=self.image, workspace='a' * 32, mountpoint=self.point,
                     stage='body', expected=False) | changes
+
+    def test_discovery_order_reserves_single_before_capture_for_enospc(self):
+        class FinishedLifecycle(Exception):
+            pass
+        state = {'stage': None}
+        attached, repos, points, commands, before_images = set(), {}, {}, [], []
+        primary = space.images._error('ENOSPC first detach failed'); primary.returncode = 64
+
+        def clone(source, destination):
+            if source in attached:
+                raise space.images._error('attached source')
+            shutil.copyfile(source, destination); destination.chmod(0o600)
+
+        def attach(image, point):
+            if image not in repos:
+                point.mkdir(parents=True, mode=0o700)
+                repo = point/'repo'; repo.mkdir()
+                (repo/'file').write_bytes(b'original'); (repo/'file').chmod(0o640)
+                (repo/'link').symlink_to('file'); (repo/'filler').touch()
+                repos[image], points[image] = repo, point
+            attached.add(image)
+            return repos[image]
+
+        def mounted(image):
+            from stallionfs._scan import mounts
+            record = mounts()[0]
+            if record['readonly'] or record['ignore_ownership'] or record['device'] != '/dev/disk998':
+                raise space.images._error('changed mapping')
+            return dict(image=str(image), device='/dev/disk999', mountpoint=str(points[image]),
+                        volume_device='/dev/disk998') if image in attached else None
+
+        def command(*args):
+            scope = diagnostics._scope.get()
+            commands.append((state['stage'], scope['image'], diagnostics._detach_observation.get() is not None))
+            if state['stage'] == 'space':
+                raise primary
+            attached.remove(scope['image'])
+            return b''
+
+        def detach(image, point):
+            if point != points[image] or diagnostics._scope.get()['expected']:
+                raise space.images._error('intentional detach refusal')
+            return space.images._command(*self.args)
+
+        def backing(base):
+            base.mkdir(mode=0o700)
+            seed = base/'seed.sparseimage'; seed.write_bytes(b'owned backing'); seed.chmod(0o600)
+            return seed
+
+        lifecycle_base = self.base/'lifecycle'; backing(lifecycle_base)
+        identifier = 'b'*32
+        image = lifecycle_base/'workspace.sparseimage'; image.write_bytes(b'owned backing'); image.chmod(0o600)
+        point = lifecycle_base/'store/workspaces'/identifier/'volume'
+        repo = attach(image, point)
+        store = Mock(root=lifecycle_base/'store')
+        store.prepare.return_value = {'id': 'seed'}
+        store.create.return_value = {'id': identifier, 'path': str(repo)}
+        def lifecycle_detach():
+            with diagnostics.failure_scope(lifecycle_base, image, mountpoint=point):
+                space.images.detach(image, point)
+        store.unmount.side_effect = lambda *args: lifecycle_detach()
+        snapshots = []
+        def snapshot(*args):
+            snapshots.append(args)
+            if len(snapshots) == 1:
+                raise lifecycle.StallionError('external worktree')
+            attach(image, point); lifecycle_detach()
+            raise FinishedLifecycle()
+        store.snapshot.side_effect = snapshot
+
+        clone_fixture = image_cases.Images('test_clone_ownership_busy_detach_and_recovery')
+        clone_fixture.base = self.base/'images'; clone_fixture.seed = backing(clone_fixture.base)
+        clone_fixture.observation = 'enospc-initial-detach'
+        native = [dict(path=str(clone_fixture.base/'first'), device='/dev/disk998', readonly=False, ignore_ownership=False)]
+        space_fixture = space.ImageSpace()
+        space_fixture.base = self.base/'space'; space_fixture.seed = backing(space_fixture.base)
+        space_fixture.source = space_fixture.base/'source'; space_fixture.image_points = {}
+        space_fixture.observation = 'enospc-initial-detach'
+        space_first = space_fixture.base/'full.sparseimage'
+        stream = Mock(); stream.write.side_effect = [1, OSError(errno.ENOSPC, 'full')]
+        opened = Mock(); opened.__enter__ = Mock(return_value=stream); opened.__exit__ = Mock(return_value=False)
+        original_open = Path.open
+        def open_path(path, *args, **kwargs):
+            return opened if path.name == 'filler' else original_open(path, *args, **kwargs)
+
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='enospc-initial-detach'), \
+                patch.object(space.images, 'clone', side_effect=clone), patch.object(space.images, 'attach', side_effect=attach), \
+                patch.object(space.images, 'mounted', side_effect=mounted), patch.object(space.images, 'detach', side_effect=detach), \
+                patch.object(space.images, '_command', side_effect=command), \
+                patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(lifecycle_base)), \
+                patch.object(lifecycle, 'Store', return_value=store), patch.object(lifecycle, 'git'), \
+                patch.object(lifecycle, 'image_fixture', return_value=nullcontext(SimpleNamespace(call=lambda fn, *args, **kwargs: fn(*args)))), \
+                patch.object(image_cases.subprocess, 'check_output', return_value=b'attribute'), \
+                patch('stallionfs._scan.mounts', return_value=native), \
+                patch.object(space_fixture, 'assert_original'), patch.object(space, 'digest', return_value='same'), \
+                patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), patch.object(Path, 'open', open_path):
+            collector = diagnostics.install(space.images, self.reporter.directory)
+            self.addCleanup(collector.close); self.reporter = collector
+            def mapping(args, scope, deadline):
+                info = scope['image'].stat()
+                if collector.phase == 'before': before_images.append(scope['image'])
+                return str(scope['image']), ['/dev/disk999'], str(scope['mountpoint']), '/dev/disk998', (info.st_dev, info.st_ino)
+            order = sorted((Path(module.__file__).name, name) for module, name in
+                           ((lifecycle, 'lifecycle'), (image_cases, 'images'), (space, 'space')))
+            self.assertEqual([name for _, name in order], ['lifecycle', 'images', 'space'])
+            with patch.object(collector, '_mapping', side_effect=mapping), patch.object(collector, '_capture', side_effect=lambda *args: captured(b'', status=1)):
+                for _, name in order:
+                    state['stage'] = name
+                    if name == 'lifecycle':
+                        with self.assertRaises(FinishedLifecycle):
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                    elif name == 'images':
+                        clone_fixture.test_clone_ownership_busy_detach_and_recovery()
+                    else:
+                        with self.assertRaises(type(primary)) as caught:
+                            space_fixture.test_volume_full_preserves_existing_data_and_other_images()
+                        self.assertIs(caught.exception, primary)
+                    self.assertEqual(collector.before_attempts, int(name == 'space'))
+                    if name != 'space': self.assertEqual(collector.attempts, 0, name)
+            self.assertEqual(before_images, [space_first])
+            self.assertEqual(len(commands), 7)
+            self.assertEqual([selected for _, _, selected in commands], [False]*6+[True])
+            events = self.events()
+            before = next(event for event in events if event['phase'] == 'before')
+            failed = next(event for event in events if event['kind'] == 'failure')
+            self.assertEqual(before['operation_id'], failed['operation_id'])
+            self.assertEqual(failed['pre_observation'], 'attempted')
+            self.assertEqual(collector.attempts, 1, (getattr(primary, '__notes__', []), events))
+
+    def test_clone_fixture_selector_validates_before_allocation(self):
+        for value in ('enospc-initial-detach', '', 'unknown'):
+            with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION=value), \
+                    patch.object(image_cases.tempfile, 'mkdtemp', side_effect=OSError('stop before allocation')) as allocate:
+                fixture = image_cases.Images()
+                with self.assertRaises(OSError if value == 'enospc-initial-detach' else ValueError):
+                    fixture._prepare()
+                self.assertEqual(allocate.call_count, int(value == 'enospc-initial-detach'))
 
     def events(self):
         return [json.loads(s) for s in (self.reporter.directory / diagnostics.REPORT).read_text().splitlines()]
@@ -2008,24 +2184,24 @@ class DiagnosticTests(unittest.TestCase):
                 collector.close()
                 self.image.chmod(0o600)
 
-    def test_snapshot_observation_workflow_selects_intel_closed_snapshot_only(self):
+    def test_workflow_selects_only_the_target_enospc_row(self):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
         step = workflow.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
         expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
-        predicate = re.fullmatch(r"\$\{\{ matrix\.os == '([^']+)' && '([^']+)' \|\| '([^']+)' \}\}", expression)
-        self.assertIsNotNone(predicate)
+        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
         rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", workflow, re.MULTILINE)
         self.assertEqual(len(rows), 6)
         self.assertEqual(workflow.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
-        self.assertEqual(predicate.groups(), ('macos-26-intel', 'closed-snapshot', 'initial-unmount'))
-        for runner, python, images in rows:
-            with self.subTest(runner=runner, python=python, images=images):
-                selected = predicate[2] if runner == predicate[1] else predicate[3]
-                self.assertEqual(selected, 'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount')
+        choices = ['enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
+                   'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount'
+                   for runner, python, images in rows]
+        self.assertEqual(choices.count('enospc-initial-detach'), 1)
+        self.assertEqual(choices.count('closed-snapshot'), 1)
+        self.assertEqual(choices.count('initial-unmount'), 4)
 
     def test_snapshot_observation_selector_validates_once_before_fixture_work(self):
         key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
-        valid = (None, 'initial-unmount', 'closed-snapshot')
+        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach')
         values = (*valid, '', 'unknown', 'INITIAL-UNMOUNT', 'Closed-snapshot',
                   ' initial-unmount', 'closed-snapshot ', 'initial-unmount\n')
         sentinel = OSError('stop before fixture allocation')
@@ -2050,7 +2226,8 @@ class DiagnosticTests(unittest.TestCase):
     def test_snapshot_observation_selects_one_operation_and_preserves_selected_or_earlier_failure(self):
         cases = ((None, None), ('initial-unmount', None), ('closed-snapshot', None),
                  ('initial-unmount', 'initial-unmount'), ('closed-snapshot', 'closed-snapshot'),
-                 ('closed-snapshot', 'initial-unmount'))
+                 ('closed-snapshot', 'initial-unmount'), ('enospc-initial-detach', None),
+                 ('enospc-initial-detach', 'initial-unmount'))
         for selection, failure in cases:
             with self.subTest(selection=selection, failure=failure), \
                     tempfile.TemporaryDirectory(dir=self.base) as temporary, patch.dict(os.environ):
@@ -2163,11 +2340,12 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertEqual([item[0] for item in commands], expected_operations)
                     self.assertEqual([item[1] for item in commands], [self.args] * len(commands))
                     self.assertEqual([item[2] for item in commands], [item == selected for item in expected_operations])
-                    observed = failure != 'initial-unmount' or selected == 'initial-unmount'
+                    observed = selected in expected_operations
                     self.assertEqual(before_operations, [selected] if observed else [])
                     self.assertEqual(collector.before_attempts, int(observed))
                     self.assertEqual(collector.attempts, int(failure is not None))
-                    events = [json.loads(line) for line in (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+                    report = collector.directory / diagnostics.REPORT
+                    events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
                     if failure is not None:
                         remove.assert_not_called()
                         for later in (store.mount, store.rollback, store.enroll, store.close, store.cleanup_config,
@@ -2192,7 +2370,7 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertLessEqual(collector.events, diagnostics.EVENTS)
                     self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
                     self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
-                    self.assertTrue(diagnostics.artifact_available(collector.directory))
+                    self.assertEqual(diagnostics.artifact_available(collector.directory), bool(observed or failure))
                     collector.close()
                 self.assertIsNone(diagnostics._scope.get())
                 self.assertIsNone(diagnostics._detach_observation.get())

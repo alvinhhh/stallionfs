@@ -1,5 +1,6 @@
 """Opt-in, bounded ENOSPC check inside disposable one-GiB APFS images."""
 import errno
+from contextlib import nullcontext
 import fcntl
 from functools import wraps
 import hashlib
@@ -16,9 +17,9 @@ import unittest
 
 from stallionfs import images
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_detach
+    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
 else:
-    from image_failure_diagnostics import failure_scope, observe_detach
+    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
 
 
 def fullsync(path, value):
@@ -60,6 +61,7 @@ def retain_failure(method):
 class ImageSpace(unittest.TestCase):
     @retain_failure
     def setUp(self):
+        self.observation = detach_observation_selection()
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-space-')).resolve()
         self.image_points = {}
         # Registered before setup so a failed build never leaves an unexamined mount.
@@ -159,13 +161,14 @@ class ImageSpace(unittest.TestCase):
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             filler.unlink()
             fullsync(repo / 'recovered', b'write after freeing space')
-            images.detach(first, point)
+            with observe_detach() if self.observation == 'enospc-initial-detach' else nullcontext():
+                images.detach(first, point)
             repo = images.attach(first, point)
             self.assert_original(repo)
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             self.assertEqual((repo / 'recovered').read_bytes(), b'write after freeing space')
             self.assertFalse((repo / 'filler').exists())
-            with observe_detach():
+            with observe_detach() if self.observation != 'enospc-initial-detach' else nullcontext():
                 images.detach(first, point)
         # Compare closed bytes before mounting these untouched images for content checks.
         with failure_scope(self.base, self.seed):
