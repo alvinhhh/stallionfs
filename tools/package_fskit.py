@@ -732,8 +732,19 @@ def _runtime_admit_git(git, pins, *, architecture):
             'contract': git_contract, 'qualification': qualification}
 
 
+def _maintenance_source():
+    # Load only the fixed repository source, from the bytes retained for staging.
+    path = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_observer.py'
+    data = _runtime_read(path)
+    _runtime_require(0 < len(data) <= 128 * 1024, 'Maintenance observer exceeds its limit')
+    namespace = {'__file__': str(path), '__name__': 'maintenance_observer_resource'}
+    exec(compile(data, str(path), 'exec'), namespace)
+    return path, data, namespace
+
+
 def _prepare_runtime(path, output):
-    pins = {}
+    observer_path, observer, maintenance = _maintenance_source()
+    pins = {str(observer_path): _runtime_sha(observer)}
     parent = _runtime_directory(output.parent)
     try:
         _runtime_require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'Runtime output parent must be private 0700')
@@ -799,7 +810,7 @@ def _prepare_runtime(path, output):
     with tempfile.TemporaryDirectory(prefix='stallionfs-wheel-', dir=output.parent) as temporary:
         directory = Path(temporary)
         observations = _inspect_runtime_wheel(files, scripts, extensions, directory)
-    return {'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
+    return {'observer': observer, 'maintenance': maintenance, 'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
             'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources, 'git_contract': dict(git_contract),
             'sidecar': sidecar, 'wheel_tag': tag, 'wheel_observations': observations,
             'source_build_id': _runtime_sha(json.dumps(build_sources, sort_keys=True, separators=(',', ':')).encode())}
@@ -823,7 +834,7 @@ def _runtime_verify_layout(actual, expected):
     _runtime_require(actual == sorted(table.values(), key=lambda row: row['path']), 'Final runtime mapping changed')
 
 
-def _stage_runtime(output, prepared, bundle_version):
+def _stage_runtime(output, prepared, bundle_version, bundle_id):
     parent = _runtime_directory(output.parent)
     app = _runtime_subdir(parent, output.name)
     original = _runtime_identity(os.fstat(app))
@@ -860,6 +871,15 @@ def _stage_runtime(output, prepared, bundle_version):
         descriptor_data = (json.dumps(descriptor, sort_keys=True, indent=2) + '\n').encode()
         _runtime_write_at(app, 'Contents/Resources/Runtime/runtime.json', descriptor_data)
         expected.append(_runtime_file_row('Contents/Resources/Runtime/runtime.json', descriptor_data))
+        maintenance = prepared['maintenance']
+        build = {'bundle_id': bundle_id, 'bundle_version': bundle_version,
+                 'package_version': PACKAGE_VERSION, 'source_build_id': prepared['source_build_id']}
+        observer = prepared['observer']
+        compatibility = maintenance['create_compatibility'](observer, build)
+        roles = dict(maintenance['RESOURCE_ROLES'])
+        for role, data in (('observer', observer), ('compatibility', compatibility)):
+            _runtime_write_at(app, roles[role], data)
+            expected.append(_runtime_file_row(roles[role], data))
         for name, data in prepared['licenses']:
             _runtime_write_at(app, 'Contents/Resources/Licenses/' + name, data)
             expected.append(_runtime_file_row('Contents/Resources/Licenses/' + name, data))
@@ -886,10 +906,19 @@ def _stage_runtime(output, prepared, bundle_version):
         os.fchmod(app, 0o755)
         rows = _runtime_inventory(output, app)
         _runtime_verify_layout(rows, expected)
+        observed = _runtime_read_at(app, roles['observer'])
+        resource = _runtime_read_at(app, roles['compatibility'])
+        _runtime_require(observed == observer and resource == compatibility, 'Maintenance resource readback differs')
+        contract = maintenance['validate_compatibility'](resource, observer, build)
+        _runtime_require(contract['public_upgrade_support'] == [], 'Installed maintenance pairs are not qualified')
+        for role, data in (('observer', observer), ('compatibility', compatibility)):
+            _runtime_require([row for row in rows if row['path'] == roles[role]]
+                             == [_runtime_file_row(roles[role], data)], 'Maintenance inventory role differs')
         return {'kind': 'self-contained-runtime-payload', 'complete_candidate': False,
                 'distribution_signing_performed': False, 'source_build_id': prepared['source_build_id'],
                 'wheel_tag': prepared['wheel_tag'], 'wheel_observations': prepared['wheel_observations'],
                 'git': git_contract, 'descriptor_sha256': _runtime_sha(descriptor_data),
+                'maintenance_roles': roles,
                 'input_file_sha256': sorted(prepared['pins'].values()), 'inventory': rows,
                 'licenses': [{'path': name, 'sha256': _runtime_sha(data)} for name, data in prepared['licenses']],
                 'source_sidecar': {'path': prepared['sidecar'].name, 'inventory': source_rows}}
@@ -953,7 +982,7 @@ def main():
                  (module / 'MacOS/StallionFS', extension, 0o755)]
         for path, data, mode in files:
             write_new(path, data, mode)
-        runtime_manifest = _stage_runtime(output, runtime, args.bundle_version) if runtime is not None else None
+        runtime_manifest = _stage_runtime(output, runtime, args.bundle_version, values[0]['CFBundleIdentifier']) if runtime is not None else None
         if reservation is not None:
             manifest = _candidate_manifest(args, values, targets, factory, files, output)
             if runtime_manifest is not None:

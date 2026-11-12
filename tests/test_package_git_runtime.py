@@ -85,6 +85,36 @@ class GitPayloadFinalization(unittest.TestCase):
         self.assertEqual(self.descriptor.stat().st_mode & 0o777, 0o644)
         self.assert_no_temporary()
 
+    def test_maintenance_identity_survives_existing_finalization_order(self):
+        self.fixture()
+        _, observer, module = package._maintenance_source()
+        build = dict(bundle_id='com.alvinhhh.stallionfs', bundle_version=self.value['bundle_version'],
+            package_version=self.value['package_version'], source_build_id=self.value['source_build_id'])
+        resource = module['create_compatibility'](observer,build)
+        app = package._runtime_directory(self.app)
+        try:
+            package._runtime_write_at(app,module['RESOURCE_ROLES']['observer'],observer)
+            package._runtime_write_at(app,module['RESOURCE_ROLES']['compatibility'],resource)
+        finally:
+            os.close(app)
+        self.sign_fixture()
+        self.finalize()
+        self.assertNotEqual(digest(self.descriptor.read_bytes()),digest(self.original))
+        after = json.loads(self.descriptor.read_bytes())
+        for key in ('source_build_id','bundle_version','package_version','python_version','soabi'):
+            self.assertEqual(after[key],self.value[key])
+        for role,data in (('observer',observer),('compatibility',resource)):
+            self.assertEqual((self.app/module['RESOURCE_ROLES'][role]).read_bytes(),data)
+        self.assertEqual(module['validate_compatibility'](resource,observer,build)['public_upgrade_support'],[])
+        # Final identities belong to a separately retained post-finalization record.
+        retained = dict(descriptor_sha256=digest(self.descriptor.read_bytes()),
+            compatibility_sha256=digest(resource), inventory=package._runtime_inventory(self.app))
+        self.assertEqual(retained['descriptor_sha256'],digest(self.descriptor.read_bytes()))
+        value = json.loads(resource)
+        self.assertEqual(set(value),{'schema','roles','build','observer','runtime_contract',
+                                    'parser_contract','public_upgrade_support'})
+        self.assertNotIn(retained['descriptor_sha256'],resource.decode())
+
     def test_app_only_or_unapproved_changes_cannot_be_promoted(self):
         self.fixture()
         self.sign_fixture()
