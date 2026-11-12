@@ -5,6 +5,7 @@ These do not qualify a signed or installed companion, activation, or mounting.
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -29,15 +30,10 @@ class CreationIntegration(CreationGit):
 
     def setUp(self):
         super().setUp()
-        from stallionfs._bundle import GIT_CONTRACT, PUBLISHER_TEAM
-        self.runtime['contract'] = {**GIT_CONTRACT, 'payload_entries': 239, 'payload_sha256': '1' * 64,
-            'descriptor_sha256': '2' * 64, 'executable_sha256': self.runtime['contract']['executable_sha256'],
-            'source_build_id': '3' * 64, 'publisher': PUBLISHER_TEAM}
-        self.runtime['check'] = lambda: None
         self.addCleanup(patch.stopall)
         patch.object(git, 'qualified_runtime', return_value=self.runtime).start()
-        # Intentionally controlled verifier seam. No codesign/Host invocation.
-        patch.object(_native, 'preflight_create', return_value=None).start()
+        # Keep real preflight journals and owned receipts; only the verifier command is controlled.
+        patch.object(_native, 'package_argv', return_value=[sys.executable, '-I', '-B', '-c', 'pass']).start()
         seed, self.commit = self.prepare()
         self.seed = seed.parent.name
 
@@ -59,6 +55,11 @@ class CreationIntegration(CreationGit):
         self.assertTrue(result['candidate_created'])
         stage = Path(result['retained_stage'])
         record = core.read_json(Path(result['journal'])); record.pop('format')
+        verifier = record['helpers'][0]
+        self.assertEqual(verifier['argv'], [sys.executable, '-I', '-B', '-c', 'pass'])
+        self.assertGreater(verifier['pid'], 0)
+        self.assertTrue(verifier['reaped'] and verifier['streams_eof'] and verifier['streams_durable'])
+        self.assertFalse(verifier['child_pending'])
         spec = core.read_json(stage / 'create-spec.json'); spec.pop('format')
         self.assertEqual(record['phase'], 'complete')
         self.assertEqual(record['spec_digest'], request.digest(spec))

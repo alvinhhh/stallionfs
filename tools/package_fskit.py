@@ -20,6 +20,9 @@ import uuid
 import zipfile
 
 
+PACKAGE_VERSION = '0.7.0'
+
+
 def read_executable(path):
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
         before = os.fstat(stream.fileno())
@@ -501,7 +504,7 @@ def _runtime_wheel_members(data, metadata):
     wheel = files[dist + '/WHEEL'].decode()
     tags = [line[5:] for line in wheel.splitlines() if line.startswith('Tag: ')]
     _runtime_require(len(tags) == 1 and tags[0] == tag + '-' + tag + '-macosx_15_0_arm64', 'Pinned wheel ABI/tag mismatch')
-    _runtime_require(b'Name: stallionfs\n' in files[dist + '/METADATA'] and b'Version: 0.6.3\n' in files[dist + '/METADATA'], 'Wheel _runtime_identity mismatch')
+    _runtime_require(b'Name: stallionfs\n' in files[dist + '/METADATA'] and ('Version: ' + PACKAGE_VERSION + '\n').encode() in files[dist + '/METADATA'], 'Wheel _runtime_identity mismatch')
     _runtime_require(b'stallionfs-python = stallionfs.__main__:main' in files[dist + '/entry_points.txt'], 'Wheel entry point mismatch')
     record_path = dist + '/RECORD'
     record = list(csv.reader(io.StringIO(files[record_path].decode())))
@@ -702,6 +705,31 @@ def _inspect_runtime_wheel(files, scripts, extensions, directory):
     return observations
 
 
+def _runtime_admit_git(git, pins):
+    """Admit the exact qualified native input independently of app Python ABI."""
+    _runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'},
+                     'Invalid private Git input')
+    git_rows = json.loads(_runtime_pinned(git['inventory'], pins))
+    qualification = json.loads(_runtime_pinned(git['qualification'], pins))
+    _runtime_require(isinstance(qualification, dict) and type(qualification.get('schema')) is int
+                     and qualification['schema'] == 1
+                     and qualification.get('inventory_sha256') == git['inventory']['sha256']
+                     and qualification.get('static_closure_accepted') is True
+                     and qualification.get('local_correctness_passed') is True,
+                     'Private Git qualification is incomplete')
+    bundle = _runtime_bundle()
+    git_contract = dict(bundle.GIT_CONTRACT, input_inventory_sha256=git['inventory']['sha256'])
+    bundle.git_contract(git_contract)
+    native_create = qualification.get('native_create')
+    _runtime_require(isinstance(native_create, dict) and type(native_create.get('schema')) is int
+                     and native_create == git_contract, 'Private Git create contract is missing or unsupported')
+    _runtime_require(_runtime_inventory(git['root']) == git_rows, 'Private Git inventory differs')
+    _runtime_require({'bin/git', 'libexec/git-core', 'share/git-core/templates'}
+                     <= {row['path'] for row in git_rows}, 'Private Git support is incomplete')
+    return {'root': Path(git['root']), 'inventory': git_rows,
+            'contract': git_contract, 'qualification': qualification}
+
+
 def _prepare_runtime(path, output):
     pins = {}
     parent = _runtime_directory(output.parent)
@@ -733,25 +761,9 @@ def _prepare_runtime(path, output):
                       'lib/python3.13/encodings/__init__.py'} <= {row['path'] for row in python_rows},
                      'Python runtime support is incomplete')
     git = value['git']
-    _runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'},
-                     'Invalid private Git input')
-    git_rows = json.loads(_runtime_pinned(git['inventory'], pins))
-    qualification = json.loads(_runtime_pinned(git['qualification'], pins))
-    _runtime_require(isinstance(qualification, dict) and type(qualification.get('schema')) is int
-                     and qualification['schema'] == 1
-                     and qualification.get('inventory_sha256') == git['inventory']['sha256']
-                     and qualification.get('static_closure_accepted') is True
-                     and qualification.get('local_correctness_passed') is True,
-                     'Private Git qualification is incomplete')
-    bundle = _runtime_bundle()
-    git_contract = dict(bundle.GIT_CONTRACT, input_inventory_sha256=git['inventory']['sha256'])
-    bundle.git_contract(git_contract)
-    native_create = qualification.get('native_create')
-    _runtime_require(isinstance(native_create, dict) and type(native_create.get('schema')) is int
-                     and native_create == git_contract, 'Private Git create contract is missing or unsupported')
-    _runtime_require(_runtime_inventory(git['root']) == git_rows, 'Private Git inventory differs')
-    _runtime_require({'bin/git', 'libexec/git-core', 'share/git-core/templates'}
-                     <= {row['path'] for row in git_rows}, 'Private Git support is incomplete')
+    admitted_git = _runtime_admit_git(git, pins)
+    git_rows = admitted_git['inventory']
+    git_contract = admitted_git['contract']
     files, scripts, extensions, tag, build_sources, wheel_assets = _runtime_source_wheel(
         _runtime_pinned(value['wheel'], pins), metadata, pins)
     licenses = []
@@ -841,7 +853,7 @@ def _stage_runtime(output, prepared, bundle_version):
         payload = _runtime_bundle().git_payload(output / 'Contents/Resources/Runtime/Git')
         git_contract = {**prepared['git_contract'], 'payload_entries': payload['entries'], 'payload_sha256': payload['sha256']}
         descriptor = {'schema': 2, 'git': git_contract, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
-                      'package_version': '0.6.3', 'source_build_id': prepared['source_build_id'],
+                      'package_version': PACKAGE_VERSION, 'source_build_id': prepared['source_build_id'],
                       'bundle_version': bundle_version, 'paths': paths}
         descriptor_data = (json.dumps(descriptor, sort_keys=True, indent=2) + '\n').encode()
         _runtime_write_at(app, 'Contents/Resources/Runtime/runtime.json', descriptor_data)

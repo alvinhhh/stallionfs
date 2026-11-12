@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import build_fskit_artifact as artifact
 
 SOURCE = Path(__file__).resolve().parents[1]
-WHEEL_NAME = 'stallionfs-0.6.3-cp313-cp313-macosx_15_0_arm64.whl'
+WHEEL_NAME = 'stallionfs-0.7.0-cp313-cp313-macosx_15_0_arm64.whl'
 REVISION = 'f' * 40
 
 
@@ -42,11 +42,11 @@ def source_wheel(with_git=True, corrupt_asset=False):
     files.update({
         'stallionfs/_scan.cpython-313-darwin.so': b'inert scan',
         'stallionfs/_image.cpython-313-darwin.so': b'inert image',
-        'stallionfs-0.6.3.data/scripts/sfs': b'inert launcher',
-        'stallionfs-0.6.3.data/scripts/stallionfs': b'inert launcher',
-        'stallionfs-0.6.3.dist-info/METADATA': b'Name: stallionfs\nVersion: 0.6.3\n',
-        'stallionfs-0.6.3.dist-info/WHEEL': b'Tag: cp313-cp313-macosx_15_0_arm64\n',
-        'stallionfs-0.6.3.dist-info/entry_points.txt': b'stallionfs-python = stallionfs.__main__:main\n'})
+        'stallionfs-0.7.0.data/scripts/sfs': b'inert launcher',
+        'stallionfs-0.7.0.data/scripts/stallionfs': b'inert launcher',
+        'stallionfs-0.7.0.dist-info/METADATA': b'Name: stallionfs\nVersion: 0.7.0\n',
+        'stallionfs-0.7.0.dist-info/WHEEL': b'Tag: cp313-cp313-macosx_15_0_arm64\n',
+        'stallionfs-0.7.0.dist-info/entry_points.txt': b'stallionfs-python = stallionfs.__main__:main\n'})
     assets = {}
     if with_git:
         assets = {'COPYING': b'inert Git license', 'CURL-COPYING': b'inert curl license',
@@ -65,7 +65,7 @@ def source_wheel(with_git=True, corrupt_asset=False):
         if corrupt_asset:
             # RECORD remains valid; the nested package Git manifest must reject this.
             files['stallionfs/_git/COPYING'] = b'substituted license'
-    record = 'stallionfs-0.6.3.dist-info/RECORD'
+    record = 'stallionfs-0.7.0.dist-info/RECORD'
     files[record] = (''.join(name + ',sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
                               + ',' + str(len(data)) + '\n' for name, data in files.items()) + record + ',,\n').encode()
     output = io.BytesIO()

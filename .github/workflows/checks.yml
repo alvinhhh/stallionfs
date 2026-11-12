@@ -8,8 +8,12 @@ on:
       mode:
         description: Hosted action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact]
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact, native-git-qualification]
         default: compare
+      expected-source-sha:
+        description: Reviewed full source SHA for native Git qualification
+        type: string
+        required: false
 permissions:
   contents: read
 jobs:
@@ -30,13 +34,19 @@ jobs:
     env:
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '${{ matrix.python }}'
-      - run: python -m compileall -q stallionfs
-      - run: python -m pip wheel --no-deps --wheel-dir dist .
-      - run: python -m pip install --force-reinstall --no-deps dist/*.whl
+      - name: Install pinned wheel backend
+        run: |
+          python -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
+      - name: Fetch exact qualified architecture component
+        run: python -I -B tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
+      - name: Build current wheel with enforced Git cache reuse
+        run: python -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/cache-wheel-build" tools/ci_build.py build --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component" --output "$RUNNER_TEMP/qualified-wheel"
+      - name: Install current owned wheel
+        run: python -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
       - name: Test installed wheel with image failure diagnostics
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
@@ -92,6 +102,11 @@ jobs:
           checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
           assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
           assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
+          controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
+          admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
+          admitted['check']()
           sys.path.insert(0, str(checkout / 'tests'))
           from image_failure_diagnostics import install
           diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
@@ -222,7 +237,7 @@ jobs:
           PY
       - name: Upload bounded image failure diagnostics
         if: failure() && steps.image-diagnostics.outputs.available == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-failure-${{ matrix.os }}-${{ matrix.python }}
           path: ${{ runner.temp }}/image-failure-diagnostics/image-failures.jsonl
@@ -230,7 +245,7 @@ jobs:
           retention-days: 1
       - name: Upload FSKit interface failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fskit-interface-failure-${{ matrix.os }}-${{ matrix.python }}
           path: |
@@ -276,7 +291,7 @@ jobs:
 
   hosted-docs-screen:
     name: Hosted document clone screen
-    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'unsigned-app-artifact'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["compare","thread-cpu","directory-feasibility","directory-docs-feasibility","delete-thread-cpu"]'), inputs.mode)
     runs-on: xcode-27
     timeout-minutes: 20
     permissions:
@@ -290,11 +305,11 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: '1'
       MAX_JOBS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13'
       - name: Build and install public source wheel
@@ -579,7 +594,7 @@ jobs:
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         if: always() && inputs.mode == 'compare'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -594,7 +609,7 @@ jobs:
           retention-days: 3
       - name: Preserve thread CPU phase status
         if: always() && inputs.mode == 'thread-cpu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/thread-cpu-status.json
@@ -602,7 +617,7 @@ jobs:
           retention-days: 3
       - name: Preserve fixed-cache delete CPU status
         if: always() && inputs.mode == 'delete-thread-cpu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-delete-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/delete-thread-cpu-status.json
@@ -610,7 +625,7 @@ jobs:
           retention-days: 3
       - name: Preserve directory feasibility status
         if: always() && (inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-directory-feasibility-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/directory-feasibility-status.json
@@ -629,11 +644,11 @@ jobs:
       MAKEFLAGS: -j1
       MAX_JOBS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13'
       - name: Check artifact boundaries and existing package validation
@@ -643,9 +658,64 @@ jobs:
       - name: Build and verify unsigned components
         run: python -B tools/build_fskit_artifact.py --out "$RUNNER_TEMP/unsigned-app-components"
       - name: Retain verified unsigned component archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: unsigned-fskit-arm64-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unsigned-app-components/StallionFS-unsigned-arm64.tar.gz
           if-no-files-found: error
           retention-days: 3
+
+  native-git-qualification:
+    name: One-shot Intel native Git qualification
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'native-git-qualification'
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: native-git-qualification-${{ inputs.expected-source-sha }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      QUALIFICATION_MODE: ${{ inputs.mode }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Require exact manual source and first attempt
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import os, re
+          expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
+          assert re.fullmatch('[0-9a-f]{40}', expected) and expected == os.environ['GITHUB_SHA']
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['QUALIFICATION_MODE'] == 'native-git-qualification'
+          assert os.environ['RUNNER_OS'] == 'macOS' and os.environ['RUNNER_ARCH'] == 'X64'
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Place verified standalone Intel interpreter in owned directory
+        run: /usr/bin/python3 -I -B tools/ci_native_python.py --output "$RUNNER_TEMP/qualification-python"
+      - name: Install exact bounded build dependency
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt'
+      - name: Run one bounded raw build and native campaign
+        id: native-qualification
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B tools/ci_native_qualify.py execute --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/native-git-qualification"'
+      - name: Validate finite qualification transfer
+        id: qualification-transfer
+        if: always()
+        env:
+          QUALIFICATION_STEP_OUTCOME: ${{ steps.native-qualification.outcome }}
+        run: |
+          if test -f "$RUNNER_TEMP/native-git-qualification/transfer-result.json" || test -f "$RUNNER_TEMP/native-git-qualification/failure-transfer-result.json"; then
+            /usr/bin/python3 -I -B tools/ci_native_qualify.py transfer-ready --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/native-git-qualification"
+          fi
+      - name: Transfer finite qualification result
+        if: always() && steps.qualification-transfer.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-git-qualification-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ steps.qualification-transfer.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1

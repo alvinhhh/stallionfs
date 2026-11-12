@@ -32,7 +32,7 @@ class NativeRuntime(unittest.TestCase):
             file(self.app / _bundle.RELATIVE_PATHS['site_packages'] / 'stallionfs' / name, mode=0o644)
         self.gitroot = (self.app / _bundle.RELATIVE_PATHS['git']).parent.parent
         self.payload = _bundle.git_payload(self.gitroot)
-        self.metadata = {'schema': 2, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin', 'package_version': '0.6.3',
+        self.metadata = {'schema': 2, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin', 'package_version': '0.7.0',
             'source_build_id': '1' * 64, 'bundle_version': '1', 'paths': _bundle.RELATIVE_PATHS,
             'git': {**_bundle.GIT_CONTRACT, 'input_inventory_sha256': INPUT,
                     'payload_entries': self.payload['entries'], 'payload_sha256': self.payload['sha256']}}
@@ -55,9 +55,17 @@ class NativeRuntime(unittest.TestCase):
         with self.assertRaises(Exception): git.qualified_runtime(self.host)
 
     def test_legacy_descriptor_is_generic_only(self):
-        self.metadata['schema'] = 1; self.metadata.pop('git'); self.save()
-        self.assertEqual(_bundle.from_host(self.host)['metadata']['schema'], 1)
-        with self.assertRaises(Exception): git.qualified_runtime(self.host)
+        self.metadata['schema'] = 1; self.metadata['package_version'] = '0.6.3'
+        self.metadata.pop('git'); self.save()
+        with patch('stallionfs.__version__', '0.6.3'):
+            self.assertEqual(_bundle.from_host(self.host)['metadata']['schema'], 1)
+            with self.assertRaises(Exception): git.qualified_runtime(self.host)
+
+    def test_prior_descriptor_refuses_mixed_current_package(self):
+        self.metadata['schema'] = 1; self.metadata['package_version'] = '0.6.3'
+        self.metadata.pop('git'); self.save()
+        with self.assertRaisesRegex(_bundle.BundleError, 'package version differs'):
+            _bundle.from_host(self.host)
 
     def test_no_real_v3_build_is_implicitly_qualified(self):
         with patch.object(_bundle, 'QUALIFIED_GIT_INPUTS', frozenset()):

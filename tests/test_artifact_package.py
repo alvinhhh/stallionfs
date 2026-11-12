@@ -87,12 +87,18 @@ class ArtifactPackage(unittest.TestCase):
 
 
 class WheelAdmission(unittest.TestCase):
+    def test_filename_selection_retains_prior_product_names_without_relabelling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / 'stallionfs-0.6.3-cp313-cp313-macosx_15_0_arm64.whl'
+            wheel.write_bytes(b'inert historical name; payload admission is separate')
+            self.assertEqual(artifact.select_wheel(wheel.parent), wheel)
+
     def test_requires_exactly_one_cp313_macos15_arm64_wheel(self):
-        expected = 'stallionfs-0.6.3-cp313-cp313-macosx_15_0_arm64.whl'
+        expected = 'stallionfs-0.7.0-cp313-cp313-macosx_15_0_arm64.whl'
         for names in ([], [expected, 'extra.whl'],
-                      ['stallionfs-0.6.3-cp313-cp313-macosx_15_0_universal2.whl'],
-                      ['stallionfs-0.6.3-cp312-cp312-macosx_15_0_arm64.whl'],
-                      ['stallionfs-0.6.3-cp313-cp313-macosx_27_0_arm64.whl']):
+                      ['stallionfs-0.7.0-cp313-cp313-macosx_15_0_universal2.whl'],
+                      ['stallionfs-0.7.0-cp312-cp312-macosx_15_0_arm64.whl'],
+                      ['stallionfs-0.7.0-cp313-cp313-macosx_27_0_arm64.whl']):
             with self.subTest(names=names), tempfile.TemporaryDirectory(prefix='private-wheel-dir-') as directory:
                 root = Path(directory)
                 for name in names: (root / name).write_bytes(b'inert wheel')

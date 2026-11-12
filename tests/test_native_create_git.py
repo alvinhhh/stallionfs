@@ -1,6 +1,5 @@
 """Qualified Git boundary regressions; opt-in executable must be independently pinned."""
 import copy
-import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -19,9 +18,9 @@ class CreationGit(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='sfs-native-git-')
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
-        self.executable = str(Path(os.environ['STALLIONFS_TEST_QUALIFIED_GIT']).resolve())
-        self.runtime = {'executable': self.executable, 'exec_path': str(Path(self.executable).parent.parent / 'libexec/git-core'),
-                        'contract': {'executable_sha256': hashlib.sha256(Path(self.executable).read_bytes()).hexdigest()}}
+        from qualified_git_fixture import runtime
+        self.runtime = runtime()
+        self.executable = self.runtime['executable']
         home = self.base / 'home'; home.mkdir(mode=0o700)
         (home / '.gitconfig').write_text('[user]\n name = Fixture\n email = fixture@example.invalid\n')
         self.environment = {'HOME': str(home), 'PATH': str(Path(self.executable).parent) + ':/usr/bin:/bin',
@@ -36,6 +35,7 @@ class CreationGit(unittest.TestCase):
         self.store = core.Store(self.base / 'store')
 
     def command(self, path, *args):
+        self.runtime['check']()
         result = subprocess.run([self.executable, '-C', str(path), *args], env=self.environment,
                                 capture_output=True, timeout=10)
         if result.returncode:

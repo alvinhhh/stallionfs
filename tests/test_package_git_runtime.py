@@ -46,7 +46,7 @@ class GitPayloadFinalization(unittest.TestCase):
             if directory.is_dir() and not directory.is_symlink(): directory.chmod(0o755)
         payload = self.bundle.git_payload(self.git)
         self.value = {'schema': 2, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
-            'package_version': '0.6.3', 'source_build_id': 'a' * 64, 'bundle_version': '9',
+            'package_version': '0.7.0', 'source_build_id': 'a' * 64, 'bundle_version': '9',
             'paths': dict(self.bundle.RELATIVE_PATHS), 'git': dict(self.bundle.GIT_CONTRACT, input_inventory_sha256='6' * 64,
                 payload_entries=payload['entries'], payload_sha256=payload['sha256'])}
         self.descriptor = self.app / self.bundle.DESCRIPTOR
