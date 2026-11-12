@@ -517,3 +517,35 @@ fixture identities, keys, profiles, or account identifiers are workflow inputs.
 Bundle version 146 identifies this component build; the product version is
 unchanged. A later private assembly must use the matching wheel and preserve
 its source and build provenance.
+
+## Maintenance resources
+
+Runtime assembly includes `Contents/Resources/Maintenance/observer.py` and
+`compatibility.json`. The observer reads existing declared stores without
+initializing them or performing recovery, cleanup, replacement or mounts. It
+retains default, environment and explicit roots in its observation; missing
+required roots, unknown records, pending work and uncertain activity block
+clearance. Results describe one user's declared roots during cooperative
+downtime and do not reserve the stores against later writers.
+
+The bounded schema-1 resource records the observer's bytes, fixed resource
+roles, stable bundle/package/source build fields and exact runtime/parser
+contracts. Assembly checks these against retained input bytes and actual build
+fields, reads both staged resources back and requires their exact rows in the
+external candidate inventory. These checks establish structural consistency.
+The resources are unsigned assembly inputs awaiting the existing app seal.
+
+`public_upgrade_support` is empty. Recognizing a retained request schema does
+not qualify an installed predecessor/candidate pair. There is no maintenance
+launcher or installed upgrade/removal/recovery workflow in these resources.
+Before an external observer can execute, trusted system static verification
+must admit the candidate seal, its observer resource and an independently
+expected publisher; the old installed runtime must be admitted separately.
+Candidate declarations and hash equality provide no publisher authentication.
+
+The compatibility resource does not contain its own hash, a final app/archive
+hash or the unfinished runtime descriptor's hash. Existing Git finalization may
+rewrite `runtime.json` after Git signing and before the outer app seal. Final
+artifact, descriptor and compatibility identities must be bound afterward in an
+independently retained authenticated release/pair record. The build fields in
+this resource remain stable through that ordering.
