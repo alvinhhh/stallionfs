@@ -199,8 +199,8 @@ accepted writable sessions may legitimately change branch and content.
 
 Contextual creation access accepts `addFile` and `addSubdirectory`, separately or
 together, on linked owner directories with write/search mode bits, no special
-mode bits, flags or opaque ACL. This includes the linked root without a namespace
-parent ID. Creation access requires a mounted writable resource; every combined
+mode bits or opaque ACL, and only supported BSD flags. This includes the linked
+root without a namespace parent ID. Creation access requires a mounted writable resource; every combined
 right still passes its original permission checks. On regular files the SDK's
 `addSubdirectory` bit remains `appendData` under the existing file policy.
 Directory construction checks `addSubdirectory` and search through that same
@@ -217,16 +217,17 @@ acknowledged only after both complete SDK result roles and the commit validate.
 
 Creation still requires explicit owner mode/UID/GID and the original parent's
 write/search authority. Restrictive initial child modes do not prevent applying
-supplied times. Flags must be absent or zero; file/directory size must be absent
-or zero, and every explicit symlink size is refused. Computed fields, changeTime,
+supplied times. Flags may be absent or contain only `UF_NODUMP` (0x1) and
+`UF_HIDDEN` (0x8000); file/directory size must be absent or zero, and every explicit
+symlink size is refused. Computed fields, changeTime,
 backupTime, addedTime and capability hints remain unsupported. These callback
 semantics do not establish which attributes Finder or copying utilities supply,
 or qualify installed copy metadata fidelity and close/remount behavior.
 
 Contextual extended-attribute mutation accepts owned regular files, directories
 (including root) and symbolic links. It requires a mounted writable resource,
-owner-write mode, zero flags, no special mode bits and no opaque ACL. Every
-combined access right must independently pass against the original metadata.
+owner-write mode, only supported BSD flags, no special mode bits and no opaque
+ACL. Every combined access right must independently pass against the original metadata.
 Directory search is required only for a separate search or creation right.
 Symlink attributes belong to the link's exact held inode and pin, never its
 target; a dangling or changed target does not redirect an attribute operation.
@@ -273,24 +274,35 @@ start a transaction. Failures preserve the existing rollback or uncertain-outcom
 rules. Direct callback tests do not qualify installed syscall or cache behavior.
 Mounted snapshots and generic stale cleanup remain unsupported.
 
-Contextual attribute setting accepts ordinary owner permission bits and explicit
-access, modification and birth times, including a request combined with regular
-file resize. The original item and caller must pass the owner, ACL, flags and
+Contextual attribute setting accepts ordinary owner permission bits, `UF_NODUMP`
+and `UF_HIDDEN`, and explicit access, modification and birth times, including a
+request combined with regular file resize. The original item and caller must pass the owner, ACL, flags and
 special-mode policy. Metadata and security access checks use that same policy;
 security authorization does not implement ACL or ownership changes. Every other
 requested access right still requires its original permission. Mode cannot grant
-the data permission needed by a resize in the same request.
+the data permission needed by a resize in the same request. Flag setting requires
+WRITE_SECURITY under that original-state owner policy. Explicit zero clears flags;
+omitted flags preserve them. Both requested and existing flags must fit the exact
+core mask `SFS_FLAGS_SUPPORTED` (0x8001); unsupported bits are refused without
+stripping. The two supported flags are dump exclusion and a GUI visibility hint;
+they do not prevent otherwise eligible xattr, execution, create, link, rename or
+remove operations, including flagged parents and replacement victims.
 
 Resize and metadata changes share one transaction. Explicit times are applied
 after resize, even when equal to the original times. Nanoseconds are preserved
 exactly; unsupported date coercions are refused. Full SDK result attributes are
 prepared before commit, and supported fields are acknowledged only after verified
-success. An all-value no-op does not commit. Held detached items retain their
-own token and informational parent relationship; their metadata still does not
-survive the core handle closing. UID/GID, flags and special permission bits remain
-unsupported setters; backup and added times have no on-disk representation and
-remain unconsumed. Installed chmod/fchmod, time-setting and cache behavior require
-separate qualification; direct callback tests do not establish their routing.
+success. Setter and creation results require valid flags even if the SDK result
+mask omits them. An all-value no-op still requires authority and returns and
+acknowledges valid requested fields, without a transaction or ctime change.
+Held detached items retain their own token and informational parent relationship;
+their metadata still does not survive the core handle closing. UID/GID, other BSD flags and special permission
+bits remain unsupported setters; backup and added times have no on-disk
+representation and remain unconsumed. UID/GID changes, ACL evaluation and full
+platform authority semantics remain open. Installed chflags/fchflags, chmod/fchmod, time-setting,
+Finder/copy, cache and unmount/remount behavior require separate qualification
+with a newly built signed artifact; direct callbacks do not establish their routing
+or qualify an existing installed artifact.
 
 Release qualification must bind the final signed artifact to the reviewed
 both-flags build and exercise two complete create/run/write/fsync/unmount/remount
@@ -302,7 +314,8 @@ qualification gates remain open until that intended artifact passes them.
 
 The contextual writable profile authorizes regular-file execution only for the
 volume owner, with owner read and execute bits (`0500`), no special permission
-bits, zero flags and no opaque ACL descriptor. Both contextual build flags,
+bits, only supported BSD flags and no opaque ACL descriptor. Both contextual
+build flags,
 contextual-write admission, enabled writes, mounted readiness and current writable
 resource access are required. Read-only, legacy and diagnostic fixture profiles
 retain their execution refusal. Every combined access right still needs its own
