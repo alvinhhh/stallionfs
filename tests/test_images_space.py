@@ -168,7 +168,7 @@ class ImageSpace(unittest.TestCase):
             self.assertEqual((repo / 'acknowledged').read_bytes(), b'present before volume filled')
             self.assertEqual((repo / 'recovered').read_bytes(), b'write after freeing space')
             self.assertFalse((repo / 'filler').exists())
-            with observe_detach() if self.observation != 'enospc-initial-detach' else nullcontext():
+            with observe_detach() if self.observation not in ('enospc-initial-detach', 'enospc-sibling-detach') else nullcontext():
                 images.detach(first, point)
         # Compare closed bytes before mounting these untouched images for content checks.
         with failure_scope(self.base, self.seed):
@@ -183,7 +183,10 @@ class ImageSpace(unittest.TestCase):
                 self.assert_original(untouched)
                 for extra in ('acknowledged', 'recovered', 'filler'):
                     self.assertFalse((untouched / extra).exists())
-                images.detach(image, mounted)
+                with failure_scope(self.base, image, mountpoint=mounted,
+                                   stage='sibling-detach' if image == sibling else 'body'), \
+                        observe_detach() if image == sibling and self.observation == 'enospc-sibling-detach' else nullcontext():
+                    images.detach(image, mounted)
         print(f'\nAPFS ENOSPC after {written} acknowledged bytes; remount and isolation passed', flush=True)
 
 

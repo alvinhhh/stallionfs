@@ -552,51 +552,56 @@ class DirectImageFixtureTests(unittest.TestCase):
         self.assertIsNone(diagnostics._scope.get())
 
     def test_space_body_scopes_full_sibling_and_seed_separately(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = space.ImageSpace()
-            fixture.base = Path(temporary).resolve()
-            fixture.source = fixture.base / 'source'
-            fixture.seed = fixture.base / 'seed.sparseimage'
-            fixture.image_points = {}
-            fixture.observation = 'initial-unmount'
-            repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
-            repo.mkdir(); untouched.mkdir()
-            filler = repo / 'filler'
-            filler.touch()
-            stream = Mock()
-            stream.write.side_effect = [1, OSError(errno.ENOSPC, 'mock disk full')]
-            opened = Mock()
-            opened.__enter__ = Mock(return_value=stream)
-            opened.__exit__ = Mock(return_value=False)
-            original_open = Path.open
-            def open_path(path, *args, **kwargs):
-                return opened if path == filler else original_open(path, *args, **kwargs)
-            def clone(seed, image):
-                self.assert_scope(fixture.base, image, None, 'preparation')
-            def digest(image):
-                self.assert_scope(fixture.base, image, None, 'body')
-                return 'unchanged'
-            seen, observed_detaches = [], []
-            def attach(image, point):
-                self.assert_scope(fixture.base, image, point, 'body')
-                seen.append(image.name)
-                return repo if image.name == 'full.sparseimage' else untouched
-            def detach(image, point):
-                self.assert_scope(fixture.base, image, point, 'body')
-                observed_detaches.append(diagnostics._detach_observation.get() is not None)
-            with patch.object(space.images, 'clone', side_effect=clone), \
-                    patch.object(space, 'digest', side_effect=digest), \
-                    patch.object(space.images, 'attach', side_effect=attach), \
-                    patch.object(space.images, 'detach', side_effect=detach), \
-                    patch.object(fixture, 'assert_original'), \
-                    patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
-                    patch.object(Path, 'open', open_path), patch('builtins.print'):
-                fixture.test_volume_full_preserves_existing_data_and_other_images()
-            self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
-            self.assertEqual(observed_detaches, [False, True, False, False])
-            self.assertFalse(getattr(fixture, 'retain', False))
-            self.assertIsNone(diagnostics._detach_observation.get())
-            self.assertIsNone(diagnostics._scope.get())
+        for selection in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach',
+                          'enospc-sibling-detach', 'restored-cleanup'):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as temporary:
+                fixture = space.ImageSpace()
+                fixture.base = Path(temporary).resolve()
+                fixture.source = fixture.base / 'source'
+                fixture.seed = fixture.base / 'seed.sparseimage'
+                fixture.image_points = {}
+                fixture.observation = selection
+                repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
+                repo.mkdir(); untouched.mkdir()
+                filler = repo / 'filler'
+                filler.touch()
+                stream = Mock()
+                stream.write.side_effect = [1, OSError(errno.ENOSPC, 'mock disk full')]
+                opened = Mock()
+                opened.__enter__ = Mock(return_value=stream)
+                opened.__exit__ = Mock(return_value=False)
+                original_open = Path.open
+                def open_path(path, *args, **kwargs):
+                    return opened if path == filler else original_open(path, *args, **kwargs)
+                def clone(seed, image):
+                    self.assert_scope(fixture.base, image, None, 'preparation')
+                def digest(image):
+                    self.assert_scope(fixture.base, image, None, 'body')
+                    return 'unchanged'
+                seen, observed_detaches = [], []
+                def attach(image, point):
+                    self.assert_scope(fixture.base, image, point, 'body')
+                    seen.append(image.name)
+                    return repo if image.name == 'full.sparseimage' else untouched
+                def detach(image, point):
+                    self.assert_scope(fixture.base, image, point,
+                                      'sibling-detach' if image.name == 'sibling.sparseimage' else 'body')
+                    observed_detaches.append(diagnostics._detach_observation.get() is not None)
+                with patch.object(space.images, 'clone', side_effect=clone), \
+                        patch.object(space, 'digest', side_effect=digest), \
+                        patch.object(space.images, 'attach', side_effect=attach), \
+                        patch.object(space.images, 'detach', side_effect=detach), \
+                        patch.object(fixture, 'assert_original'), \
+                        patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                        patch.object(Path, 'open', open_path), patch('builtins.print'):
+                    fixture.test_volume_full_preserves_existing_data_and_other_images()
+                self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
+                self.assertEqual(observed_detaches, [selection == 'enospc-initial-detach',
+                                 selection not in ('enospc-initial-detach', 'enospc-sibling-detach'),
+                                 selection == 'enospc-sibling-detach', False])
+                self.assertFalse(getattr(fixture, 'retain', False))
+                self.assertIsNone(diagnostics._detach_observation.get())
+                self.assertIsNone(diagnostics._scope.get())
 
     def test_space_cleanup_scopes_each_image_and_resets_after_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -766,6 +771,51 @@ class SpaceRetentionTests(unittest.TestCase):
 
 
 class InvocationIsolationTests(unittest.TestCase):
+    def test_mocked_detach_suite_preserves_outer_collector_for_later_owned_failure(self):
+        if __package__:
+            from . import test_image_detach
+        else:
+            import test_image_detach
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            collector = diagnostics.install(images, base / 'outer-diagnostics')
+            self.addCleanup(collector.close)
+            wrappers = {name: getattr(images, name)
+                        for name in ('_command', 'detach', 'mounted', '_attachments')}
+            with patch.object(diagnostics.subprocess, 'Popen',
+                              side_effect=AssertionError('unexpected native command')) as spawn:
+                suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_image_detach.DetachContinuationTests)
+                result = unittest.TestResult()
+                suite.run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                self.assertGreater(result.testsRun, diagnostics.ATTEMPTS)
+                self.assertEqual((collector.attempts, collector.before_attempts, collector.events,
+                                  collector.remaining), (0, 0, 0, diagnostics.CAPTURE_BYTES))
+                self.assertFalse(collector.directory.exists())
+                for name, wrapper in wrappers.items():
+                    self.assertIs(getattr(images, name), wrapper)
+                image = base / 'later.sparseimage'
+                image.write_bytes(b'owned mock backing'); image.chmod(0o600)
+                identity = image.stat()
+                mapped = (str(image), ['/dev/disk999'], None, None,
+                          (identity.st_dev, identity.st_ino))
+                with patch.object(images.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 64, b'', b'later owned eject failed')), \
+                        patch.object(collector, '_mapping', return_value=mapped) as mapping, \
+                        patch.object(collector, '_capture', side_effect=lambda *args: captured(status=1)), \
+                        diagnostics.failure_scope(base, image, stage='later-owned'), \
+                        self.assertRaises(images._CommandFailure):
+                    images._command('/usr/sbin/diskutil', 'eject', '/dev/disk999')
+                mapping.assert_called_once()
+                self.assertEqual(collector.attempts, 1)
+                events = [json.loads(line) for line in
+                          (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+                self.assertEqual([e['stage'] for e in events if e['kind'] == 'failure'], ['later-owned'])
+                self.assertEqual([e['image'] for e in events if e['kind'] == 'mapping'], [str(image)])
+                self.assertTrue(diagnostics.artifact_available(collector.directory))
+                spawn.assert_not_called()
+
     def check_later_scope(self, first_fails):
         for missing_scope in (False, True):
             with self.subTest(first_fails=first_fails, missing_scope=missing_scope), tempfile.TemporaryDirectory() as temporary:
@@ -2344,7 +2394,8 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_snapshot_observation_selector_validates_once_before_fixture_work(self):
         key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
-        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach', 'restored-cleanup')
+        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach',
+                 'enospc-sibling-detach', 'restored-cleanup')
         values = (*valid, '', 'unknown', 'INITIAL-UNMOUNT', 'Closed-snapshot',
                   ' initial-unmount', 'closed-snapshot ', 'initial-unmount\n')
         sentinel = OSError('stop before fixture allocation')

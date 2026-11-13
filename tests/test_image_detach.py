@@ -22,6 +22,12 @@ class DetachContinuationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
         self.base.chmod(0o700)
+        # Keep synthetic eject failures out of an enclosing real-image collector.
+        collector = install(images, self.base / 'mock-diagnostics')
+        self.addCleanup(collector.close)
+        self.enterContext(patch.object(collector, '_capture', side_effect=lambda *args: dict(
+            stdout=b'', stderr=b'', returncode=1, timeout=False, truncated=False,
+            reaped=True, capture_error=None, cleanup_error=None)))
         self.image, self.point = self.base / 'owned.sparseimage', self.base / 'volume'
         self.image.write_bytes(b'owned backing'); self.image.chmod(0o600)
         self.point.mkdir(mode=0o700)
