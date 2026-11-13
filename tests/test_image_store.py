@@ -108,6 +108,11 @@ def image_fixture(store, base):
 
 
 class ImageRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        from stallionfs import images
+        # Synthetic device names; real node admission is covered in test_image_detach.
+        self.enterContext(patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
+
     def test_image_command_preserves_machine_status(self):
         from stallionfs import images
         result = subprocess.CompletedProcess(['owned-command'], errno.EBUSY, b'', b'localized busy message')
@@ -117,7 +122,7 @@ class ImageRecoveryTests(unittest.TestCase):
         self.assertEqual(raised.exception.returncode, errno.EBUSY)
         self.assertIn('localized busy message', str(raised.exception))
 
-    def test_detach_uses_one_unchanged_target_and_preserves_every_command_error(self):
+    def test_detach_preserves_ineligible_errors_regardless_of_synthetic_returncode(self):
         from stallionfs import images
         for status in (1, 5, 16, 64, None, 'interrupt'):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
@@ -215,8 +220,10 @@ class ImageRecoveryTests(unittest.TestCase):
                      'system-entities': [{'dev-entry': '/dev/disk999'}]}
             valid = {'images': [entry]}
             with patch.object(images, '_plist', return_value=valid):
-                self.assertEqual(images.mounted(image), dict(image=str(image), device='/dev/disk999',
-                                                            mountpoint=None, volume_device=None))
+                state = images.mounted(image)
+                self.assertEqual({key: state[key] for key in ('image', 'device', 'mountpoint', 'volume_device')},
+                                 dict(image=str(image), device='/dev/disk999', mountpoint=None, volume_device=None))
+                self.assertIsInstance(state['attachment'], bytes)
             missing, loop, denied = base / 'missing.sparseimage', base / 'loop.sparseimage', base / 'denied.sparseimage'
             loop.symlink_to(loop)
             denied.symlink_to(image)

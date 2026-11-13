@@ -326,7 +326,7 @@ class NativeReferenceTests(unittest.TestCase):
 
 
 class ImageRollbackStateTests(unittest.TestCase):
-    def test_unmounted_busy_rollback_preserves_open_state_until_explicit_recovery(self):
+    def test_unmounted_synthetic_error_preserves_open_state_until_explicit_recovery(self):
         from stallionfs import images
         with tempfile.TemporaryDirectory(prefix='image-rollback-state-mock-') as temporary:
             store = Store(Path(temporary).resolve() / 'store')
@@ -365,6 +365,8 @@ class ImageRollbackStateTests(unittest.TestCase):
                 mounted.update(mountpoint=str(point), volume_device='/dev/disk1000s1')
                 return {}
             with patch.object(images, 'mounted', side_effect=inventory), \
+                    patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)), \
+                    patch.object(images, '_no_graph_mounts'), \
                     patch.object(images, '_command', side_effect=command), \
                     patch.object(images, '_plist', side_effect=attach) as attaching, \
                     patch.object(images, '_require_supported'), \
