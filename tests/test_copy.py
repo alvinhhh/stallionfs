@@ -120,7 +120,7 @@ class OrdinaryCopy(unittest.TestCase):
         os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
         source.chmod(0o750)
         before = self.checks.snapshot(source)
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         self.assertEqual(before['entries']['']['mode'], 0o750)
         self.assertEqual(before['entries']['']['flags'], stat.UF_NODUMP)
         self.assertIs(self.public_copy, self.native.copy)
@@ -176,7 +176,7 @@ class OrdinaryCopy(unittest.TestCase):
                 protected.append(path)
             before = self.checks.snapshot(source)
             outside_before = self.checks.snapshot(outside)
-            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
             for jobs in (1, 2, 4):
                 with self.subTest(jobs=jobs):
                     destination = self.base / f'copy-{jobs}'
@@ -250,7 +250,9 @@ class OrdinaryCopy(unittest.TestCase):
                 subprocess.run(['/bin/chmod', '-h', '+a', 'everyone allow read', str(source)],
                                check=True, capture_output=True, timeout=15)
                 os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_987_654_321), follow_symlinks=False)
+                self.assertEqual(source.lstat().st_mtime_ns, 1_700_000_000_987_654_321)
                 before = self.checks.snapshot(source)
+                self.assertEqual(before['entries']['']['mtime_ns'], 1_700_000_000_987_654_321)
                 self.assertTrue(before['entries']['']['xattrs'])
                 self.assertTrue(before['entries']['']['acl']['text_hex'])
                 destination = self.base / (name + '-copy')
@@ -285,7 +287,7 @@ class OrdinaryCopy(unittest.TestCase):
         source.chmod(0o550)
         os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
         before = self.checks.snapshot(source)
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         outside_before = self.checks.snapshot(outside)
         for jobs in range(1, 5):
             with self.subTest(jobs=jobs):
@@ -521,7 +523,7 @@ class OrdinaryCopy(unittest.TestCase):
         self.eligible_child(source)
         before = self.checks.snapshot(source)
         self.assertEqual({row['gid'] for row in before['entries'].values()}, {group})
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         fault_executable = self.compile_native_faults(self.base) if self.copy_strategy == 'auto' else None
         victim = self.base / 'victim'
         victim.mkdir(mode=0o700)

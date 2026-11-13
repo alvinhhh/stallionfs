@@ -150,7 +150,8 @@ class ScannerStatistics(unittest.TestCase):
         self.snapshots = stack.enter_context(mock.patch.object(scan.native_correctness, 'snapshot', side_effect=self.snapshot))
         self.enrich = stack.enter_context(mock.patch.object(scan.native_fixtures, 'enrich_metadata',
             side_effect=lambda path, *, receipt, scan_layout: receipt.update(
-                platform='darwin', path='file', data_size=1, hardlinks=None, sparse=None)))
+                platform='darwin', path='file', data_size=1, hardlinks=None, sparse=None,
+                symlink_precision={'scope': 'scan-only', 'links': []})))
         self.sampler = stack.enter_context(mock.patch.object(scan, 'memory_sample', side_effect=lambda path, method, *_: {
             'rss_bytes': 8192 if method == 'posix' else 4096,
             'footprint_bytes': 2048, 'exit_code': 0, 'counts': {'files': 1}}))
