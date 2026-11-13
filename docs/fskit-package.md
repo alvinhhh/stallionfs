@@ -8,6 +8,12 @@ short name `stallionfs`; `--profile private-sfsro27` explicitly selects the priv
 test type. Packaging is preparation for controlled qualification, not an installer.
 The read-only recipe below does not qualify writable workspace creation.
 
+The module declares `FSActivateOptionSyntax` with `shortOptions` set to `o:`.
+The system mount tool requires this activation syntax before it can activate
+an FSKit volume. The native controller uses `/sbin/mount -F -t stallionfs` to
+select FSKit explicitly and prevent fallback to a legacy filesystem helper.
+This metadata and routing do not establish mounted correctness.
+
 First complete the offline recipe in that document in a Bash session. Keep its
 successful output directory, three fixture files, source hashes and compiler
 logs. Current production extensions accept supported validated format-0.6 images.

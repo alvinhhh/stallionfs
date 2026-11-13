@@ -127,8 +127,9 @@ class Workspaces(unittest.TestCase):
             persist()
             self.assertFalse(state['observed_fds'], 'Controller kept a mounted observation FD open at mutation')
             if argv[0] == '/sbin/mount':
-                self.assertEqual(argv[:3], ['/sbin/mount', '-t', 'stallionfs'])
-                path, volume = Path(argv[3]), Path(argv[4])
+                self.assertEqual(argv[:4], ['/sbin/mount', '-F', '-t', 'stallionfs'])
+                self.assertEqual(len(argv), 6)
+                path, volume = Path(argv[4]), Path(argv[5])
                 metadata = read_json(path / 'meta.json')
                 proof = read_json(path / 'native-install.json')
                 self.assertTrue(proof['complete'])

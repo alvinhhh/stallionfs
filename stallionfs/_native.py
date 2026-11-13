@@ -970,7 +970,7 @@ def mount_locked(store, path, metadata):
             _persist(path / 'native-install.json', proof)
             operation.record['mount_attempted'] = True
             operation.persist()
-            command = operation.command('mount', ['/sbin/mount', '-t', filesystem, str(path), str(volume)])
+            command = operation.command('mount', ['/sbin/mount', '-F', '-t', filesystem, str(path), str(volume)])
             if command['returncode'] != 0:
                 raise failure('Native mount command failed; installed workspace retained', operation.record)
             row = _observe_until(volume, profile, True)
