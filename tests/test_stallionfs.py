@@ -1859,6 +1859,68 @@ class Workspaces(unittest.TestCase):
             self.assertEqual(closed['mount'], 'kept-unmounted')
             self.assertEqual(len(state['commands']), count)
 
+    def test_compound_native_legacy_remount_receipt_resumes_without_replay(self):
+        from stallionfs import core, _native, _native_recovery
+        seed = self.prepare()
+        with self.compound_controller_fixture() as state:
+            created = self.store.create(seed['id'], backend='native-image', capacity_gib=1)
+            workspace = created['id']; path = Path(created['path']).parent.parent
+            journal = self.store.root / 'journals' / (workspace + '.json')
+            for action in ('snapshot', 'rollback'):
+                with self.subTest(action=action):
+                    def command(**kwargs):
+                        if action == 'snapshot':
+                            return self.store.snapshot(workspace, name='legacy-base', quiescent=True, **kwargs)
+                        return self.store.rollback(workspace, 'legacy-base', quiescent=True, **kwargs)
+                    with patch.object(_native_recovery, '_verify_final', side_effect=OSError(errno.EIO, 'finish interrupted')):
+                        with self.assertRaises(OSError): command()
+                    record = core.read_json(journal)
+                    current = ['/sbin/mount', '-F', '-t', 'stallionfs', str(path), str(path / 'volume')]
+                    self.assertEqual(record['helpers'][-1]['argv'], current)
+                    before = journal.read_bytes()
+                    _native_recovery._load_compound(self.store, path, record['id'])
+                    self.assertEqual(journal.read_bytes(), before)
+                    # Model a retained journal from before explicit FSKit routing.
+                    legacy = [current[0], *current[2:]]
+                    record['helpers'][-1]['argv'] = legacy
+                    _native._persist(journal, record)
+                    before = journal.read_bytes()
+                    loaded, pending = _native_recovery._load_compound(self.store, path, record['id'])
+                    self.assertTrue(pending)
+                    self.assertEqual(loaded, record)
+                    self.store.snapshots(workspace, operation_id=record['id'])
+                    self.assertEqual(journal.read_bytes(), before)
+                    count = len(state['commands'])
+                    with patch('stallionfs.core.native_operation') as bridge:
+                        # Neither spelling permits changed flags, profile or resource paths.
+                        for accepted in (current, legacy):
+                            invalid_commands = [
+                                [accepted[0], '-f', *accepted[1:]],
+                                [accepted[0], '-o', 'ro', *accepted[1:]],
+                                ['/usr/bin/mount', *accepted[1:]],
+                                [*accepted[:-2], str(path / 'other'), accepted[-1]],
+                                [*accepted[:-1], str(path / 'other-volume')],
+                                ['apfs' if value == 'stallionfs' else value for value in accepted],
+                                [*accepted, 'extra'],
+                            ]
+                            for argv in invalid_commands:
+                                with self.subTest(argv=argv):
+                                    invalid = copy.deepcopy(record)
+                                    invalid['helpers'][-1]['argv'] = argv
+                                    _native._persist(journal, invalid)
+                                    unchanged = journal.read_bytes()
+                                    with self.assertRaisesRegex(StallionError, 'Malformed mounted recovery intent'):
+                                        command(continue_operation=record['id'])
+                                    self.assertEqual(journal.read_bytes(), unchanged)
+                                    self.assertEqual(len(state['commands']), count)
+                        _native._persist(journal, record)
+                        completed = command(continue_operation=record['id'])
+                        bridge.assert_not_called()
+                    self.assertEqual(len(state['commands']), count)
+                    self.assertEqual(completed['native_operation']['helpers'][-1]['argv'], legacy)
+                    self.assertEqual(completed['native_operation']['outcome'], 'complete')
+                    self.assertFalse(journal.exists())
+
     def test_compound_native_binding_and_opt_in_refuse_before_unmount(self):
         import copy
         from stallionfs import core

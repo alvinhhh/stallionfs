@@ -105,10 +105,14 @@ def validate_compound(workspace, record):
         'verify-package': ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(host.parent.parent.parent)],
         'discover': [str(host), '--discover-json'],
         'unmount': ['/sbin/umount', str(Path(record['target']['directory']) / 'volume')],
-        'mount': ['/sbin/mount', '-t', _native.PROFILES[record['profile']]['type'],
+        'mount': ['/sbin/mount', '-F', '-t', _native.PROFILES[record['profile']]['type'],
                   record['target']['directory'], str(Path(record['target']['directory']) / 'volume')]}
+    # Older journals retain the command actually issued, without explicit FSKit
+    # routing. Admit only that exact spelling; new dispatch always uses -F.
+    legacy_mount = command_paths['mount'][:1] + command_paths['mount'][2:]
     for helper in record['helpers']:
         if 'argv' in helper and helper['argv'] != command_paths[helper['label']]:
+            if helper['label'] == 'mount' and helper['argv'] == legacy_mount: continue
             if helper['label'] != 'verify-package' or helper['argv'] != _native.package_argv(host): bad()
     if record['outcome'] == 'complete' and record['phase'] != 'final-verified': bad()
 
@@ -396,7 +400,7 @@ def _remount_compound(store, path, metadata, operation):
         record['phase'] = 'remount-attempted'
         attempt['launched'] = True
         operation.persist()
-        result = operation.command('mount', ['/sbin/mount', '-t', filesystem, str(path), str(path / 'volume')])
+        result = operation.command('mount', ['/sbin/mount', '-F', '-t', filesystem, str(path), str(path / 'volume')])
         attempt['response'] = {'returncode': result['returncode'], 'outcome': result['outcome']}
         operation.persist()
         if result['returncode'] != 0:
