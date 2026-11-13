@@ -846,6 +846,7 @@ class InvocationIsolationTests(unittest.TestCase):
 
 class PassiveValidationTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(space.images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
         self.temporary = tempfile.TemporaryDirectory(prefix='passive-image-mock-')
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
@@ -1042,7 +1043,8 @@ class PassiveValidationTests(unittest.TestCase):
             self.assertIs(getattr(space.images, name), original)
 
     def test_projection_count_and_report_budget_are_bounded_before_serialization(self):
-        self.record['system-entities'] *= 9
+        self.record['system-entities'].extend({'dev-entry': f'/dev/disk999s{index}'}
+                                             for index in range(2, 35))
         error = self.fail_command()
         with self.assertRaises(type(error)):
             self.invoke()
@@ -1339,6 +1341,10 @@ class CleanupTests(unittest.TestCase):
 
 class DiagnosticTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(space.images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
+        # These legacy observers use projected mappings; full graph mount refusal
+        # and native node identity are exercised by test_image_detach.
+        self.enterContext(patch.object(space.images, '_no_graph_mounts'))
         self.temporary = tempfile.TemporaryDirectory(prefix='image-diagnostic-mock-')
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()

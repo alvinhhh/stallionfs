@@ -33,6 +33,7 @@ _fields = {
 _fields['observation'] = _fields['failure']
 _fields['validation'] = {'read', 'sample_timestamp_ns', 'sample_status', 'reason',
                          'selected_device', 'volume_device', 'mountpoint_state', 'entities'}
+_fields['eject_outcome'] = {'commands', 'first_status', 'continuation_status', 'outcome'}
 _scope = ContextVar("image_failure_scope", default=None)
 _detach_observation = ContextVar("image_detach_observation", default=None)
 _detach_call = ContextVar("image_detach_call", default=None)
@@ -456,6 +457,13 @@ def artifact_available(directory):
                 if value['sample_status'] == 'unavailable' and (entities or value['reason'] is None or
                         any(value[name] is not None for name in ('selected_device', 'volume_device', 'mountpoint_state'))):
                     return False
+            if value['kind'] == 'eject_outcome':
+                if (value['phase'] != 'after' or type(value['commands']) is not int or
+                        value['commands'] not in (1, 2) or
+                        value['outcome'] not in ('recovered', 'failed', 'interrupted', 'refused') or
+                        any(value[name] is not None and type(value[name]) is not int
+                            for name in ('first_status', 'continuation_status'))):
+                    return False
             if value['kind'] == 'lsof' and value['backing_identity_status'] not in (
                     'matched', 'mismatch', 'changed', 'unavailable', 'not_queried'):
                 return False
@@ -600,6 +608,12 @@ class Diagnostics:
             self.operation_id, self.phase = operation_id, 'after'
             for sample in invocation['samples']:
                 self._emit(deadline, 'validation', **sample)
+            if invocation.get('command_error') is not None and invocation.get('outcome') is not None:
+                statuses = invocation.get('command_statuses', [])
+                self._emit(deadline, 'eject_outcome', commands=invocation['command_count'],
+                           first_status=invocation.get('command_status'),
+                           continuation_status=statuses[1] if len(statuses) == 2 else None,
+                           outcome=invocation['outcome'])
         finally:
             self.operation_id, self.phase = 0, 'standalone'
             self.lock.release()
@@ -804,7 +818,7 @@ class Diagnostics:
         return 'matched' if all(value == identity for value in matches) else 'mismatch'
 
     def eject_log(self, observation):
-        """Query once after the public detach operation has failed, never between attempts."""
+        """Query once after public detach unwinds, retaining a recovered first failure."""
         deadline = observation.get('deadline')
         if deadline is None:
             return
@@ -1137,6 +1151,7 @@ def install(images, directory):
             if invocation is not None:
                 invocation['command_started'] = True
                 invocation['command_count'] += 1
+                invocation['command_targets'].append(args[2])
         if observation is not None:
             observation['diagnostics'] = diagnostics
             observation.setdefault('scope', _scope.get())
@@ -1144,16 +1159,22 @@ def install(images, directory):
             observation['target_changed'] = (observation.get('target_changed', False) or
                                              observation['target'] != args[2] or
                                              observation.get('observed_target') != args[2])
-            diagnostics.eject_contexts.pop(observation['operation_id'], None)
+            if invocation is None or invocation['command_count'] == 1:
+                diagnostics.eject_contexts.pop(observation['operation_id'], None)
             if 'start_ns' not in observation:
                 observation['start_ns'], observation['start_mono'] = record['start_ns'], record['start_mono']
         try:
             if creating:
                 return _observed_create(original, args)
-            return original(*args)
+            result = original(*args)
+            if invocation is not None:
+                invocation['command_statuses'].append(0)
+            return result
         except Exception as error:
             if diagnostics.closed:
                 raise
+            if invocation is not None:
+                invocation['command_statuses'].append(getattr(error, 'returncode', None))
             if record is not None and 'command_error' not in record:
                 record['command_error'] = error
                 record['command_status'] = getattr(error, 'returncode', None)
@@ -1218,12 +1239,29 @@ def install(images, directory):
             owned_scope = (scope if scope is not None and scope['image'] == Path(image) and
                            scope['mountpoint'] == Path(mountpoint) else None)
             invocation = dict(diagnostics=diagnostics, scope=owned_scope, reads=0, samples=[], targets=[],
-                              command_started=False, command_count=0, pre_observation='not-selected', observation=observation)
+                              command_started=False, command_count=0, command_targets=[], command_statuses=[],
+                              pre_observation='not-selected', observation=observation)
             token = _detach_call.set(invocation if owned_scope is not None else None)
             selected_token = _detach_observation.set(observation)
             try:
-                return original_detach(image, mountpoint)
+                result = original_detach(image, mountpoint)
+                if invocation.get('command_error') is not None:
+                    invocation['outcome'] = 'recovered'
+                    try:
+                        diagnostics.validation(invocation)
+                        invocation['target_changed'] = (invocation['reads'] != 2 or
+                            invocation['command_count'] != 2 or
+                            invocation['targets'] != [invocation.get('target')] * 2 or
+                            invocation['command_targets'] != [invocation.get('target')] * 2)
+                        _finish_eject(invocation, invocation['command_error'])
+                        if observation is not None:
+                            observation['finalized'] = True
+                    except BaseException:
+                        pass  # Successful recovery cannot be replaced by diagnostics.
+                return result
             except BaseException as error:
+                invocation['outcome'] = ('interrupted' if not isinstance(error, Exception) else
+                                         'failed' if invocation['command_count'] == 2 else 'refused')
                 try:
                     diagnostics.validation(invocation)
                 except BaseException:
@@ -1234,7 +1272,9 @@ def install(images, directory):
                         observation['finalized'] = True
                     else:
                         invocation['target_changed'] = (invocation['reads'] != 2 or
-                            invocation['command_count'] != 1 or invocation['targets'] != [invocation.get('target')] * 2)
+                            invocation['command_count'] not in (1, 2) or
+                            invocation['targets'] != [invocation.get('target')] * 2 or
+                            invocation['command_targets'] != [invocation.get('target')] * invocation['command_count'])
                     _finish_eject(invocation, error)
                 except BaseException:
                     pass  # A collector cannot replace the original failure or interrupt.

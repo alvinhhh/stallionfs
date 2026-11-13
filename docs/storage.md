@@ -31,6 +31,18 @@ Folder cloning pins files with open descriptors and uses `fclonefileat`, preserv
 
 The prepared image is detached and fully flushed before publication. Each copy mounts with file ownership enabled. Attachment checks use the backing image path, current device and mountpoint; copied volume UUIDs are never used as identity. Managed workspace cleanup retains busy or uncertain attachments and never force-detaches a volume or deletes an attached image.
 
+If a completed normal eject reports `Volume failed to eject` with exit status 1,
+StallionFS can continue once on the same device only when that attempt fully
+unmounted the original volume. Two fresh inventory reads must retain the same
+private backing file, attachment owner, complete ordered device graph and
+selected block-device identity, allowing only removal of the expected mountpoint.
+The mount table must independently show every original graph device unmounted.
+Success requires the attachment to disappear and the backing file to remain
+unchanged. Other command errors, uncertain inventories and still-mounted volumes
+retain the image and the first error. A failed continuation retains both errors.
+These checks narrow device-name reuse races; they cannot make `diskutil eject`
+atomic with external detach or attach operations.
+
 Folder clones still create metadata for each file. Image clones share the backing file's blocks, including the filesystem metadata, until changed. Each workspace has its own Git repository. `du` and file block counts do not reliably identify unique physical space shared by APFS clones, so performance results do not infer a physical-space percentage from them.
 
 The store assumes one trusted operating-system user. Do not edit internal metadata, replace store directories with links, or modify prepared seeds while creating workspaces. Agents run as that same user and are not isolated from the rest of the account.
