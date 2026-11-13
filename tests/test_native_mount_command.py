@@ -6,11 +6,41 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from stallionfs import _native
+from stallionfs import _native, _native_recovery
 from stallionfs.core import StallionError
 
 
 class NativeMountCommand(unittest.TestCase):
+    def test_failed_compound_remount_uses_fskit_without_legacy_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / 'workspaces/owned-image'
+            for profile, settings in _native.PROFILES.items():
+                with self.subTest(profile=profile):
+                    metadata = {'controller_profile': profile}
+                    target = {'directory': str(workspace)}
+                    operation = Mock(record={'target': target, 'profile': profile,
+                                             'host': 'fixture-host', 'remount_attempts': []})
+                    operation.command.return_value = {'returncode': 72, 'outcome': 'error'}
+                    check = Mock()
+                    with patch.object(_native, 'qualify', return_value=settings['type']), \
+                            patch.object(_native, 'resource_binding', return_value=nullcontext(check)), \
+                            patch.object(_native_recovery, 'absent') as absent, \
+                            patch.object(_native_recovery, '_anchor_guard', return_value={}), \
+                            patch.object(_native, '_observe_until') as observe, \
+                            patch.object(_native, '_persist') as persist:
+                        with self.assertRaisesRegex(StallionError, 'committed; remount failed'):
+                            _native_recovery._remount_compound(None, workspace, metadata, operation)
+                    operation.command.assert_called_once_with('mount', [
+                        '/sbin/mount', '-F', '-t', settings['type'], str(workspace), str(workspace / 'volume')])
+                    self.assertEqual(operation.record['phase'], 'remount-attempted')
+                    self.assertEqual(operation.record['remount_attempts'][-1]['response'],
+                                     {'returncode': 72, 'outcome': 'error'})
+                    self.assertTrue(operation.record['remount_attempts'][-1]['launched'])
+                    self.assertEqual(absent.call_count, 2)
+                    check.assert_called_once_with()
+                    observe.assert_not_called()
+                    persist.assert_not_called()
+
     def test_failed_fskit_mount_is_retained_without_legacy_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
