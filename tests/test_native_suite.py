@@ -124,7 +124,8 @@ class NativeSuite(unittest.TestCase):
         self.scan_expected[str(root)] = expected
         return expected
 
-    def enrich_metadata(self, root, *, receipt, scan_layout=None):
+    def enrich_metadata(self, root, *, receipt, scan_layout=None, precision_links=()):
+        self.assertEqual(tuple(precision_links), suite.native_fixtures.precision_link_paths(root.name))
         self.metadata_calls.append((root, scan_layout, len(self.snapshot_calls)))
         current = list(self.journal.iter_latest('metadata_preparation'))
         self.assertEqual(current[-1]['status'], 'preparing')
@@ -132,7 +133,10 @@ class NativeSuite(unittest.TestCase):
         receipt.update(path='', test_receipt=len(self.metadata_calls))
         return receipt
 
-    def verify_metadata_coverage(self, observed, receipt):
+    def verify_metadata_coverage(self, observed, receipt, *, precision_links, precision_scope):
+        root, scan_layout, _ = self.metadata_calls[-1]
+        self.assertEqual(tuple(precision_links), suite.native_fixtures.precision_link_paths(root.name))
+        self.assertEqual(precision_scope, "scan-only" if scan_layout else "copy-clone")
         self.assertIs(observed, self.snapshot_results[-1])
         self.assertEqual(receipt['test_receipt'], len(self.metadata_calls))
         self.assertEqual(len(self.snapshot_calls), self.metadata_calls[-1][2] + 1)
@@ -511,7 +515,7 @@ class NativeSuite(unittest.TestCase):
         self.assertIsNone(report['comparisons'][0]['metrics']['wall_s'])
 
     def test_linux_qualification_failure_retains_fixture_before_measurement(self):
-        def unavailable(*_args): raise RuntimeError('POSIX ACL or sparse hole unavailable')
+        def unavailable(*_args, **_kwargs): raise RuntimeError('POSIX ACL or sparse hole unavailable')
         with self.assertRaisesRegex(RuntimeError, 'POSIX ACL or sparse hole unavailable'):
             self.run_suite(system='Linux', operations=('copy',), copy_tools=('cp',), fixture='dependencies_100k', coverage=unavailable)
         report = json.loads(self.output.read_text())
@@ -798,14 +802,14 @@ class NativeSuite(unittest.TestCase):
 
     def test_unpopulated_coverage_is_rejected_before_measurement(self):
         with self.assertRaisesRegex(RuntimeError, 'Metadata coverage incomplete'):
-            self.run_suite(coverage=lambda *args: {'populated': False})
+            self.run_suite(coverage=lambda *args, **kwargs: {'populated': False})
         report = json.loads(self.output.read_text())
         self.assertTrue(Path(report['retained_fixture']).is_dir())
         self.assertFalse(report['metadata_preparation'][0]['coverage']['populated'])
         self.assertEqual(self.measured, [])
 
     def test_coverage_exception_preserves_seed_receipt_and_fixture(self):
-        def coverage(*args): raise RuntimeError('Seeded ACL entry missing')
+        def coverage(*args, **kwargs): raise RuntimeError('Seeded ACL entry missing')
         with self.assertRaisesRegex(RuntimeError, 'Seeded ACL entry missing'):
             self.run_suite(coverage=coverage)
         report = json.loads(self.output.read_text())

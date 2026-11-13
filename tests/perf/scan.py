@@ -192,7 +192,8 @@ def main():
                         json.dump(expected_source, stream, sort_keys=True)
                         stream.write('\n')
                 metadata['snapshot_sha256'] = f.digest(baseline)
-                metadata['coverage'] = native_fixtures.verify_metadata_coverage(expected_source, metadata['seed'])
+                metadata['coverage'] = native_fixtures.verify_metadata_coverage(
+                    expected_source, metadata['seed'], precision_links=(), precision_scope='scan-only')
                 f.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
                 metadata['status'] = 'prepared'
                 prepared_sources[path] = expected_source

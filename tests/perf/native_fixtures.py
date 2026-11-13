@@ -144,7 +144,22 @@ METADATA_XATTRS = {b'user.stallionfs-test': b'user attribute\x00\xff',
                   b'com.apple.ResourceFork': b'resource\x00fork\xff'}
 
 
-def enrich_metadata(root, *, receipt, scan_layout=None):
+SYMLINK_MTIME_NS = 1_700_000_000_987_654_321
+
+
+def precision_link_paths(name):
+    """Explicit allowlist of links owned by the synthetic fixture generators."""
+    if name in ('flat_2000', 'nested_10000'):
+        return ('dangling-link', 'outside-link')
+    if name == 'deep_20000':
+        return ('dangling-link', '/'.join(['d'] * 40 + ['relative-link']))
+    if name in SCAN_PROFILES:
+        prefix = 'd/' * 40 if SCAN_PROFILES[name] == 'deep40' else ''
+        return tuple(prefix + leaf for leaf in ('directory-link', 'dangling-link', 'outside-link'))
+    return ()
+
+
+def enrich_metadata(root, *, receipt, scan_layout=None, precision_links=()):
     """Enrich an owned disposable fixture; return the coverage contract to verify."""
     import ctypes
     import fcntl
@@ -157,6 +172,24 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
     xattrs = {name: value for name, value in METADATA_XATTRS.items()
               if not linux or name.startswith(b'user.')}
     info = root.lstat()
+    receipt['symlink_precision'] = {'scope': 'scan-only' if scan_layout else 'copy-clone', 'links': []}
+    for relative_link in precision_links:
+        link = root / relative_link
+        before = link.lstat()
+        fileops.require(stat.S_ISLNK(before.st_mode), 'Precision fixture must be a symlink')
+        target = os.readlink(os.fsencode(link))
+        row = {'path': relative_link, 'requested_ns': SYMLINK_MTIME_NS,
+               'observed_ns': None, 'target_hex': target.hex(),
+               'device_inode': [before.st_dev, before.st_ino]}
+        receipt['symlink_precision']['links'].append(row)
+        os.utime(link, ns=(1_600_000_000_000_000_000, SYMLINK_MTIME_NS), follow_symlinks=False)
+        after = link.lstat()
+        row['observed_ns'] = after.st_mtime_ns
+        fileops.require(after.st_mtime_ns == SYMLINK_MTIME_NS,
+                        f'Symlink fixture admission failed: {sys.platform} requested={SYMLINK_MTIME_NS} observed={after.st_mtime_ns}')
+        fileops.require((after.st_dev, after.st_ino, after.st_mode) ==
+                        (before.st_dev, before.st_ino, before.st_mode)
+                        and os.readlink(os.fsencode(link)) == target, 'Precision link identity changed')
     receipt.update(platform=sys.platform, added_directories=0, added_regular_entries=0, added_logical_bytes=0,
                    added_unique_data_bytes=0, added_xattr_value_bytes=sum(map(len, xattrs.values())),
                    resource_fork_bytes=None if linux else len(METADATA_XATTRS[b'com.apple.ResourceFork']))
@@ -230,7 +263,7 @@ def enrich_metadata(root, *, receipt, scan_layout=None):
     return receipt
 
 
-def verify_metadata_coverage(observed, receipt):
+def verify_metadata_coverage(observed, receipt, *, precision_links, precision_scope):
     """Reject unavailable or vacuous feature coverage before any measurement."""
     import hashlib
     import fileops
@@ -239,6 +272,22 @@ def verify_metadata_coverage(observed, receipt):
     linux = receipt.get('platform') == 'linux'
     fileops.require(observed.get('metadata_capabilities', {}).get('platform') == receipt.get('platform'),
                     'Metadata platform differs from preparation')
+    required = set(precision_links)
+    fileops.require(precision_scope in ('copy-clone', 'scan-only'), 'Unknown symlink precision scope')
+    precision = receipt.get('symlink_precision')
+    fileops.require(isinstance(precision, dict) and isinstance(precision.get('links'), list),
+                    'Symlink precision receipt missing')
+    paths = [link['path'] for link in precision['links']]
+    fileops.require(len(paths) == len(set(paths)) and set(paths) == required,
+                    'Symlink precision paths differ from required fixture links')
+    fileops.require(precision.get('scope') == precision_scope, 'Symlink precision scope differs from fixture')
+    for link in precision['links']:
+        entry = observed['entries'].get(link['path'], {})
+        fileops.require(link['requested_ns'] == link['observed_ns'] == SYMLINK_MTIME_NS
+                        and entry.get('mtime_ns') == SYMLINK_MTIME_NS
+                        and entry.get('kind') == 'symlink'
+                        and entry.get('device_inode') == link['device_inode']
+                        and entry.get('symlink_bytes') == link['target_hex'], 'Seeded symlink precision missing')
     entry = observed['entries'][receipt['path']]
     fileops.require(entry['kind'] == 'file' and entry['size'] == receipt['data_size'], 'Metadata file size changed')
     acl = entry['acl']
@@ -267,7 +316,9 @@ def verify_metadata_coverage(observed, receipt):
         payload = (b'x' + bytes(sparse['size']-2) + b'y') if sparse['endpoints'] else bytes(sparse['size'])
         fileops.require(entry['sha256'] == hashlib.sha256(payload).hexdigest(), 'Sparse payload changed')
     entries = observed['entries'].values()
-    return {'populated': True, 'seeded_acl_text_bytes': len(text),
+    return {'populated': True, 'precision_symlinks': len(precision['links']),
+            'symlink_precision_scope': precision['scope'] if precision['links'] else 'not-applicable',
+            'seeded_acl_text_bytes': len(text),
             'seeded_posix_acl_bytes': len(bytes.fromhex(receipt['posix_acl_access_hex'])) if linux else None,
             'metadata_capabilities': observed['metadata_capabilities'],
             'sparse_file': ({'logical_bytes': entry['size'], 'allocated_bytes': entry['allocated_bytes'],
