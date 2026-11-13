@@ -20,6 +20,11 @@
 	<dict>
 		<key>EXExtensionPointIdentifier</key>
 		<string>com.apple.fskit.fsmodule</string>
+		<key>FSActivateOptionSyntax</key>
+		<dict>
+			<key>shortOptions</key>
+			<string>o:</string>
+		</dict>
 		<key>FSMediaTypes</key>
 		<dict/>
 		<key>FSPersonalities</key>

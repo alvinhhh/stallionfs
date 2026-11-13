@@ -366,6 +366,7 @@ class FSKitInterfaces(unittest.TestCase):
             attributes = module_info['EXAppExtensionAttributes']
             self.assertEqual(attributes['EXExtensionPointIdentifier'], 'com.apple.fskit.fsmodule')
             self.assertEqual(attributes['FSShortName'], 'stallionfs')
+            self.assertEqual(attributes['FSActivateOptionSyntax'], {'shortOptions': 'o:'})
             self.assertTrue(attributes['FSSupportsPathURLs'])
             self.assertTrue(attributes['FSRequiresSecurityScopedPathURLResources'])
             self.assertFalse(attributes['FSSupportsBlockResources'])

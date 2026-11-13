@@ -44,6 +44,10 @@ class ProductVersions(unittest.TestCase):
 
 
 class PackageProfileTests(unittest.TestCase):
+    def test_module_template_declares_mount_activation_options(self):
+        attributes = package._load_templates()[1]['EXAppExtensionAttributes']
+        self.assertEqual(attributes['FSActivateOptionSyntax'], {'shortOptions': 'o:'})
+
     def test_complete_uniform_architecture_profiles_and_requested_policy(self):
         data = b'exact executable bytes for tool-boundary fixture'
         for policy, marker in (('read-only', '_stallionfs_factory_read_only_v1'),
@@ -226,6 +230,9 @@ class PackageCompatibilityTests(unittest.TestCase):
         self.assertFalse(self.manifest.exists())
         self.app = self.base / 'WithManifest.app'
         self.assemble()
+        module_info = plistlib.loads((self.app / 'Contents/Extensions/StallionFS.appex/Contents/Info.plist').read_bytes())
+        self.assertEqual(module_info['EXAppExtensionAttributes']['FSActivateOptionSyntax'],
+                         {'shortOptions': 'o:'})
         first = self.manifest.read_bytes()
         value = json.loads(first)
         self.assertEqual(value['kind'], 'fskit-unsigned-assembly-candidate')
