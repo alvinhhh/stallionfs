@@ -323,8 +323,8 @@ struct LastKnownParent {
 }
 final class StallionItem: FSItem {
     let inode: UInt64
-#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var retainedModes: FSVolume.OpenModes = []
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var pin: sfs_pin?
     var reclaimed = false
     var lastKnownParent: LastKnownParent?
@@ -841,13 +841,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         let e = status == SFS_OK ? POSIXError(.ESTALE) as Error : sfsError(status, r)
         latch(e); rememberDelivery(e, r); return e
     }
+#endif
     private func closeModes(_ item: FSItem, modes: FSVolume.OpenModes) throws {
         let own = try ownedItem(item)
-        guard own.pin != nil, modes.subtracting([.read, .write]).isEmpty,
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { guard own.pin != nil else { throw POSIXError(.EINVAL) } }
+#endif
+        guard modes.subtracting([.read, .write]).isEmpty,
               modes.subtracting(own.retainedModes).isEmpty else { throw POSIXError(.EINVAL) }
         own.retainedModes = modes
     }
-#endif
     private func readTarget(_ h: OpaquePointer, inode: UInt64, offset: UInt64,
                             data: UnsafeMutableRawPointer?, length: Int, count: inout Int,
                             receipt: inout sfs_result) throws -> sfs_status {
@@ -1607,7 +1610,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard caller.uid == Int(self.owner) else { throw POSIXError(.EACCES) }
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             if self.writesEnabled {
-                guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+                guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
+                guard m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.EINVAL) }
+                if m.entry.kind == SFS_DIRECTORY && modes.contains(.write) { throw POSIXError(.EISDIR) }
                 if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, caller: caller) }
                 if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, caller: caller) }
                 (item as! StallionItem).retainedModes.formUnion(modes)
@@ -1615,8 +1620,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
 #endif
             if modes.contains(.write) { throw POSIXError(.EROFS) }
-            guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+            guard modes == .read && (m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY) else { throw POSIXError(.EINVAL) }
             try self.ownerAccess(m, inode: inode, access: .readData, caller: caller)
+            (item as! StallionItem).retainedModes.formUnion(modes)
             self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
         } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(caller.uid), error: error); reply(error) }
     } }
@@ -1644,6 +1650,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
 #endif
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
+            try self.closeModes(item, modes: modes)
             self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
         } catch { self.record(16, uid: Int64(caller.uid), error: error); reply(error) }
     } }

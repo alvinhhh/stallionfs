@@ -5982,8 +5982,92 @@ func mountTraceChecks(_ parent: URL) throws {
 }
 #endif
 
+#if STALLION_WRITE_DIAGNOSTIC && STALLION_CONTEXT_HANDLERS
+func directoryOpenChecks(_ parent: URL, baseline: Bool) throws {
+    let owner = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    let foreign = CallerIdentity(uid: owner.uid + 1, gid: owner.gid)
+    for writable in [true, false] {
+        for policy in 0..<(baseline ? 1 : 3) {
+            let f = try Fixture(parent, "directory-open-\(writable)-\(policy)", mode: policy == 1 ? 0o100 : 0o700,
+                                acl: policy == 2, directory: true, xattrProfile: true)
+            let m = try Mounted(f, writable: writable), v = m.volume
+            let nested = namespaceLookup(m, "dir")
+            func open(_ item: FSItem, _ modes: FSVolume.OpenModes, _ caller: CallerIdentity = owner) -> Int {
+                code(wait { v.openForTesting(item, modes: modes, caller: caller, reply: $0) })
+            }
+            func close(_ item: FSItem, _ modes: FSVolume.OpenModes) -> Int {
+                code(wait { v.closeForTesting(item, modes: modes, caller: owner, reply: $0) })
+            }
+            func retained(_ item: FSItem) -> FSVolume.OpenModes {
+                wait { done in v.enqueue { done((item as! StallionItem).retainedModes) } }
+            }
+            for (name, item) in [("root", m.root), ("nested", nested)] {
+                let result = open(item, .read)
+                if baseline {
+                    need(result == Int(EINVAL), "baseline directory read must reproduce EINVAL")
+                    need(retained(item).isEmpty, "failed baseline does not grant modes")
+                    print("BASELINE \(name) writable=\(writable) read errno=\(result)")
+                    continue
+                }
+                if policy != 0 {
+                    need(result == Int(policy == 1 ? EACCES : ENOTSUP), "directory owner mode or ACL denial")
+                    need(retained(item).isEmpty, "denied policy does not grant modes")
+                    continue
+                }
+                need(result == 0 && retained(item) == .read, "directory read grants retained read")
+                need(close(item, .read) == 0 && retained(item) == .read, "partial close retains read")
+                for modes: FSVolume.OpenModes in [.write, [.read, .write]] {
+                    need(open(item, modes) == Int(writable ? EISDIR : EROFS), "directory writes refused")
+                    need(retained(item) == .read, "failed open preserves retained read")
+                }
+                for modes: FSVolume.OpenModes in [[], FSVolume.OpenModes(rawValue: 128)] {
+                    need(open(item, modes) == Int(EINVAL) && retained(item) == .read, "invalid modes preserve grant")
+                }
+                need(open(item, .read, foreign) == Int(EACCES) && retained(item) == .read, "nonowner cannot open")
+                need(close(item, .write) != 0 && retained(item) == .read, "invalid close preserves grant")
+                need(close(item, []) == 0 && retained(item).isEmpty, "close to empty removes grant")
+                need(close(item, .read) == Int(EINVAL) && retained(item).isEmpty, "close cannot invent read grant")
+            }
+            if !baseline && policy == 0 {
+                need(open(m.file, .read) == 0, "regular read preserved")
+                need(open(m.file, [.read, .write]) == (writable ? 0 : Int(EROFS)), "regular write policy preserved")
+                need(close(m.file, []) == 0, "regular close preserved")
+                need(open(FSItem(), .read) == Int(EINVAL), "foreign item refused")
+                need(open(StallionItem((nested as! StallionItem).inode), .read) == Int(EINVAL), "noncanonical item refused")
+                if writable {
+                    let own = nested as! StallionItem, pin = own.pin
+                    m.serial { own.pin = nil }
+                    need(open(nested, .read) == Int(EINVAL) && retained(nested).isEmpty, "missing pin refuses grant")
+                    m.serial { own.pin = pin }
+                    let e: Error? = wait { v.reclaimForTesting(nested, eligible: true, replyHandler: $0) }
+                    need(e == nil && open(nested, .read) == Int(EINVAL), "forgotten item refused")
+                }
+                need(open(m.root, .read) == 0, "read grant before revocation")
+                m.resource.revoke()
+                need(open(m.root, .read) != 0 && retained(m.root) == .read, "revoked resource preserves existing grant")
+                need(close(m.root, []) == 0 && retained(m.root).isEmpty, "revoked close drains retained read")
+            }
+            if writable && (baseline || policy != 0) {
+                let e: Error? = wait { v.reclaimForTesting(nested, eligible: true, replyHandler: $0) }
+                need(e == nil, "nested pin released")
+            }
+            m.close()
+            need(f.contents() == Data("original".utf8), "open and close preserve file bytes")
+        }
+    }
+    print(baseline ? "PASS directory rejection baseline" : "PASS directory open/close policy and lifetime regressions")
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
+#if STALLION_WRITE_DIAGNOSTIC && STALLION_CONTEXT_HANDLERS
+        if CommandLine.arguments.count == 3 && ["--directory-open", "--directory-open-baseline"].contains(CommandLine.arguments[1]) {
+            try directoryOpenChecks(URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true),
+                                    baseline: CommandLine.arguments[1] == "--directory-open-baseline")
+            return
+        }
+#endif
 #if STALLION_MOUNT_TRACE && STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--mount-trace" {
             try mountTraceChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true));return
