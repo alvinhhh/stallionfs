@@ -42,7 +42,7 @@ class OrdinaryChains(unittest.TestCase):
             failed = label == 'mount' and fixture.fail_mount or label == 'unmount' and fixture.fail_unmount
             if not failed and label in ('mount', 'unmount'):
                 fixture.mounted = label == 'mount'
-            result = dict(label=label, argv=argv, child_pending=False, pid=123, reaped=True,
+            result = dict(getattr(operation, 'command_context', {}), label=label, argv=argv, child_pending=False, pid=123, reaped=True,
                           returncode=1 if failed else 0, outcome='error' if failed else 'success',
                           stdout='/owned/stdout', stderr='/owned/stderr')
             operation.record['helpers'].append(result)

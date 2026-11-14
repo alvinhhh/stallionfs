@@ -137,8 +137,10 @@ class Workspaces(unittest.TestCase):
             self.assertFalse(state['observed_fds'], 'Controller kept a mounted observation FD open at mutation')
             if argv[0] == '/sbin/mount':
                 self.assertEqual(argv[:4], ['/sbin/mount', '-F', '-t', 'stallionfs'])
-                self.assertEqual(len(argv), 6)
-                path, volume = Path(argv[4]), Path(argv[5])
+                self.assertEqual(len(argv), 8)
+                self.assertEqual(argv[4], '-o')
+                self.assertRegex(argv[5], r'^rw,owners,sfs_activation=[0-9a-f]{32}\.[0-9a-f]{32}$')
+                path, volume = Path(argv[6]), Path(argv[7])
                 metadata = read_json(path / 'meta.json')
                 proof = read_json(path / 'native-install.json')
                 self.assertTrue(proof['complete'])
@@ -1882,7 +1884,7 @@ class Workspaces(unittest.TestCase):
                 restored = self.store.rollback(workspace, 'mounted-base', quiescent=True)
             for result in (saved, restored):
                 record = result['native_operation']
-                _native_recovery.validate_compound(workspace, record)
+                _native_recovery.validate_compound(workspace, record, core.read_json(path / 'meta.json')['transaction'])
                 self.assertIn(record['id'], owners)
                 self.assertEqual(record['phase'], 'final-verified')
                 self.assertEqual(record['outcome'], 'complete')
@@ -1920,12 +1922,18 @@ class Workspaces(unittest.TestCase):
                     with patch.object(_native_recovery, '_verify_final', side_effect=OSError(errno.EIO, 'finish interrupted')):
                         with self.assertRaises(OSError): command()
                     record = core.read_json(journal)
+                    from stallionfs import _native_activation
+                    self.assertEqual(record['helpers'][-1]['argv'], _native_activation.argv(
+                        record['helpers'][-1]['activation'], 'stallionfs', path))
                     current = ['/sbin/mount', '-F', '-t', 'stallionfs', str(path), str(path / 'volume')]
-                    self.assertEqual(record['helpers'][-1]['argv'], current)
                     before = journal.read_bytes()
                     _native_recovery._load_compound(self.store, path, record['id'])
                     self.assertEqual(journal.read_bytes(), before)
-                    # Model a retained journal from before explicit FSKit routing.
+                    # Model the complete historical protocol, not a downgrade
+                    # of a versioned current attempt.
+                    record['remount_attempts'][-1].pop('activation_protocol')
+                    record['helpers'][-1].pop('activation')
+                    record['helpers'][-1].pop('activation_version')
                     legacy = [current[0], *current[2:]]
                     record['helpers'][-1]['argv'] = legacy
                     _native._persist(journal, record)
@@ -2073,7 +2081,7 @@ class Workspaces(unittest.TestCase):
             state['interrupt'] = False
             result = self.store.snapshot(workspace, name='lost-unmount', quiescent=True, continue_operation=op)
             self.assertEqual(sum(argv[0] == '/sbin/umount' for argv in state['commands']), count)
-            _native_recovery.validate_compound(workspace, result['native_operation'])
+            _native_recovery.validate_compound(workspace, result['native_operation'], core.read_json(path / 'meta.json')['transaction'])
 
     def test_compound_native_commit_continuation_anchor_and_intent_checks(self):
         from stallionfs import core, _native, _native_recovery
@@ -2108,7 +2116,7 @@ class Workspaces(unittest.TestCase):
                 bridge.assert_not_called()
             self.assertEqual(result['native_operation']['committed_anchor'], record['committed_anchor'])
             self.assertEqual(result['mount'], 'verified')
-            _native_recovery.validate_compound(workspace, result['native_operation'])
+            _native_recovery.validate_compound(workspace, result['native_operation'], core.read_json(path / 'meta.json')['transaction'])
 
     def test_compound_native_lost_mount_response_requires_durable_evidence(self):
         from stallionfs import core, _native, _native_recovery
@@ -2148,7 +2156,7 @@ class Workspaces(unittest.TestCase):
                 bridge.assert_not_called()
             self.assertEqual(len(state['commands']), count)
             self.assertIsNone(result['native_operation']['remount_attempts'][-1]['response'])
-            _native_recovery.validate_compound(workspace, result['native_operation'])
+            _native_recovery.validate_compound(workspace, result['native_operation'], core.read_json(path / 'meta.json')['transaction'])
 
     def test_compound_native_busy_close_failure_and_unresolved_child_stop(self):
         from stallionfs import core, _native
@@ -2286,7 +2294,7 @@ class Workspaces(unittest.TestCase):
                 _native._persist(path / 'meta.json', metadata)
             self.assertEqual(len(state['commands']), before)
             result = self.store.snapshot(workspace, name='qualification', quiescent=True, continue_operation=op)
-            _native_recovery.validate_compound(workspace, result['native_operation'])
+            _native_recovery.validate_compound(workspace, result['native_operation'], core.read_json(path / 'meta.json')['transaction'])
 
     def test_compound_native_failed_catalog_mutation_keeps_image_unmounted(self):
         from stallionfs import core

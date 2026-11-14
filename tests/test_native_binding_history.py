@@ -244,17 +244,19 @@ class BindingHistory(unittest.TestCase):
 
     def test_real_bridge_receipts_validate_against_each_historical_target(self):
         from stallionfs import _image
-        with tempfile.TemporaryDirectory(prefix='sfs-history-') as name:
+        from native_activation_runner import owned_directory
+        with owned_directory() as name:
             root = Path(name).resolve(); directory = root / 'workspaces' / self.path.name
             directory.mkdir(parents=True, mode=0o700)
             fixture = root / 'fixture'
             repository = Path(__file__).resolve().parents[1]
-            compiled = subprocess.run(['xcrun', 'clang', '-O1', '-I' + str(repository / 'filesystem'),
-                            str(repository / 'tests/native_image_fixture.c'),
-                            str(repository / 'filesystem/image.c'), '-o', str(fixture)],
-                            cwd=root, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-            subprocess.run([str(fixture), 'seed', str(directory)], check=True, capture_output=True)
+            from native_activation_runner import run
+            compiler = os.environ.get('STALLIONFS_TEST_CLANG', '/usr/bin/clang')
+            options = ['-isysroot', os.environ['STALLIONFS_TEST_SDK']] if 'STALLIONFS_TEST_SDK' in os.environ else []
+            run([compiler, *options, '-O1', '-I' + str(repository / 'filesystem'),
+                 str(repository / 'tests/native_image_fixture.c'),
+                 str(repository / 'filesystem/image.c'), '-o', str(fixture)], root, timeout=60)
+            run([str(fixture), 'seed', str(directory)], root)
             target = dict(directory=str(directory), component='image.sfs',
                           parent=base.recovery.pair(directory.stat()), file=None)
             target.update(_image.inspect(target)['identity'])

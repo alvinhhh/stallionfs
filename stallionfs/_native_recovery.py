@@ -40,7 +40,7 @@ def pending_message(record):
     return f"Operation {record['id']} is retained. Inspect it with {command}; use its matching --continue command."
 
 
-def validate_compound(workspace, record):
+def validate_compound(workspace, record, transaction=None):
     """Validate intent/phase structure separately from terminal child evidence."""
     def bad():
         raise core.StallionError('Malformed mounted recovery intent; retained unchanged')
@@ -111,6 +111,15 @@ def validate_compound(workspace, record):
     # routing. Admit only that exact spelling; new dispatch always uses -F.
     legacy_mount = command_paths['mount'][:1] + command_paths['mount'][2:]
     for helper in record['helpers']:
+        if helper.get('label') == 'mount' and 'argv' in helper:
+            from ._native_activation import validate_helper
+            try:
+                validate_helper(record, helper, _native.PROFILES[record['profile']]['type'], Path(record['target']['directory']),
+                                transaction, record['remount_attempts'][helper['attempt']].get('guard'),
+                                attempt=record['remount_attempts'][helper['attempt']])
+            except core.StallionError:
+                bad()
+            continue
         if 'argv' in helper and helper['argv'] != command_paths[helper['label']]:
             if helper['label'] == 'mount' and helper['argv'] == legacy_mount: continue
             if helper['label'] != 'verify-package' or helper['argv'] != _native.package_argv(host): bad()
@@ -169,7 +178,7 @@ def _matching_mount(store, path, metadata, target, *, expected=None):
     return state, row
 
 
-def _load_compound(store, path, operation_id):
+def _read_compound(store, path, operation_id):
     core.identifier(operation_id, 32)
     journal = store.root / 'journals' / (path.name + '.json')
     if journal.exists():
@@ -180,11 +189,18 @@ def _load_compound(store, path, operation_id):
         record = core.read_json(path / 'native-operations' / operation_id / 'record.json')
         if record.get('outcome') != 'complete':
             raise core.StallionError('Incomplete operation has no matching journal; retained unchanged')
-    validate_compound(path.name, record)
-    if (record['id'] != operation_id or record['target']['directory'] != str(path)
-            or record['target']['component'] != 'image.sfs'):
+    core.native_target({'ownership': 'external-reference', 'native_image': record.get('target')})
+    if (record.get('id') != operation_id or record.get('workspace') != path.name
+            or record.get('operation') not in COMPOUND or record.get('phase') not in PHASES
+            or record['target']['directory'] != str(path) or record['target']['component'] != 'image.sfs'):
         raise core.StallionError('Operation identity or workspace path changed; retained unchanged')
     return record, journal.exists()
+
+
+def _load_compound(store, path, operation_id):
+    record, pending = _read_compound(store, path, operation_id)
+    validate_compound(path.name, record, core.read_json(path / 'meta.json').get('transaction'))
+    return record, pending
 
 
 def _terminal(record):
@@ -254,7 +270,7 @@ def format_compound_status(status):
 
 
 def compound_status(store, path, metadata, operation_id):
-    record, pending = _load_compound(store, path, operation_id)
+    record, pending = _read_compound(store, path, operation_id)
     status = {'workspace': path.name, 'operation': operation_id, 'phase': record['phase'],
               'pending': pending, 'path': str(path / 'volume'), 'native_operation': record, 'next_action': None}
     try:
@@ -262,6 +278,14 @@ def compound_status(store, path, metadata, operation_id):
     except core.StallionError:
         status['message'] = (f'Operation {operation_id} still has unresolved process ownership. '
                              'Keep its controller running; no continuation was started.')
+        return status
+    try:
+        validate_compound(path.name, record, metadata.get('transaction'))
+    except core.StallionError:
+        # Report the retained owner without interpreting contradictory history
+        # as completion, continuation authority, or a reason to inspect backing.
+        status['message'] = 'Operation evidence is inconsistent; retained unchanged. No continuation is available.'
+        status['validation_failed'] = True
         return status
     phase = record['phase']
     messages = {
@@ -326,6 +350,7 @@ def compound_status(store, path, metadata, operation_id):
 def _attempt(operation, kind):
     attempts = operation.record[kind + '_attempts']
     attempt = {'launched': False, 'response': None}
+    if kind == 'remount': attempt['activation_protocol'] = 1
     attempts.append(attempt)
     operation.command_context = {'stage': kind, 'attempt': len(attempts) - 1}
     operation.persist()
@@ -447,7 +472,8 @@ def _remount_compound(store, path, metadata, operation):
         record['phase'] = 'remount-attempted'
         attempt['launched'] = True
         operation.persist()
-        result = operation.command('mount', ['/sbin/mount', '-F', '-t', filesystem, str(path), str(path / 'volume')])
+        from ._native_activation import mount
+        result = mount(operation, metadata, filesystem, attempt['guard'])
         attempt['response'] = {'returncode': result['returncode'], 'outcome': result['outcome']}
         operation.persist()
         if result['returncode'] != 0:

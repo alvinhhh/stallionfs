@@ -64,9 +64,10 @@ struct pin_table {
     uint32_t count, hash_count, free_head, changed;
     pin_slot *slots; uint32_t *hash;
 };
-enum image_policy { ORDINARY_WRITABLE, ORDINARY_READONLY, RECOVERY };
+enum image_policy { ORDINARY_WRITABLE, ORDINARY_READONLY, PENDING_ACTIVATION, RECOVERY };
 struct sfs_image {
-    int fd, aux_parent, selected, poisoned, transaction;
+    int fd, aux_parent, lock_fd, selected, poisoned, transaction;
+    char component[SFS_NAME_MAX + 1];
     enum image_policy policy;
     struct stat identity, parent_identity;
     uint64_t eof, epoch, token;
@@ -239,7 +240,7 @@ static enum sfs_status access_image(const char *directory, const char *name, int
     if (fd < 0) { code = errno == EEXIST ? SFS_EXISTS : (errno == ELOOP ? SFS_INVALID : SFS_IO); goto fail; }
     sfs_image *h = calloc(1, sizeof(*h));
     if (!h) { error = ENOMEM; code = SFS_NOMEM; if (close(fd)) error = errno; goto fail_saved; }
-    h->fd = fd; h->aux_parent = -1; h->policy = policy; h->parent_identity = ps;
+    h->fd = fd; h->lock_fd = -1; memcpy(h->component, name, strlen(name) + 1); h->aux_parent = -1; h->policy = policy; h->parent_identity = ps;
     phase = SFS_PHASE_LOCK;
     if (flock(fd, LOCK_EX | LOCK_NB)) { code = errno == EWOULDBLOCK ? SFS_BUSY : SFS_IO; goto fail_handle; }
     phase = SFS_PHASE_VALIDATE;
@@ -1124,6 +1125,7 @@ static enum sfs_status close_failed(sfs_image *h, int parent, enum sfs_status co
     if (parent >= 0 && close(parent)) { error = errno; phase = SFS_PHASE_CLOSE; if (code != SFS_OUTCOME_UNKNOWN) code = SFS_IO; }
     if (h->aux_parent >= 0 && close(h->aux_parent)) { error = errno; phase = SFS_PHASE_CLOSE; if (code != SFS_OUTCOME_UNKNOWN) code = SFS_IO; }
     if (close(h->fd)) { error = errno; phase = SFS_PHASE_CLOSE; if (code != SFS_OUTCOME_UNKNOWN) code = SFS_IO; }
+    if (h->lock_fd >= 0 && close(h->lock_fd)) { if (!error) error = errno; phase = SFS_PHASE_CLOSE; if (code != SFS_OUTCOME_UNKNOWN) code = SFS_IO; }
     discard(h); cache_clear(h); free(h); if (out) { out->status = code; out->phase = phase; out->system_errno = error; } return code;
 }
 
@@ -1201,6 +1203,60 @@ static enum sfs_status open_common(const char *directory, const char *name, enum
 }
 enum sfs_status sfs_image_open(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_WRITABLE, out, NULL, NULL, r); }
 enum sfs_status sfs_image_open_readonly(const char *directory, const char *name, sfs_image **out, sfs_result *r) { return open_common(directory, name, ORDINARY_READONLY, out, NULL, NULL, r); }
+/* Pending load retains the original readonly file description and its flock. */
+enum sfs_status sfs_image_open_pending(const char *directory, const char *name, sfs_image **out, sfs_result *r) {
+    return open_common(directory, name, PENDING_ACTIVATION, out, NULL, NULL, r);
+}
+static int activation_binding(sfs_image *h, int parent, int fd) {
+    struct stat ps, oldps, named, st; struct statfs pf, fs;
+    if (fstat(parent, &ps) || fstat(h->aux_parent, &oldps) || file_stat(fd, &st)) return -1;
+    if (!same_identity(&ps, &h->parent_identity) || !same_identity(&oldps, &ps) ||
+        !S_ISDIR(ps.st_mode) || ps.st_uid != geteuid() || (ps.st_mode & 0777) != 0700 ||
+        !same_identity(&st, &h->identity) || (uint64_t)st.st_size != h->eof) { errno = ESTALE; return -1; }
+    if (backing(parent, &pf) || backing(fd, &fs)) return -1;
+    if (memcmp(&pf.f_fsid, &fs.f_fsid, sizeof(fs.f_fsid)) || st.st_dev != ps.st_dev) { errno = EXDEV; return -1; }
+    if (fstatat(parent, h->component, &named, AT_SYMLINK_NOFOLLOW)) return -1;
+    if (!same_identity(&named, &st)) { errno = ESTALE; return -1; }
+    return 0;
+}
+enum sfs_status sfs_image_activate_pending(sfs_image *h, int parent, int borrowed_rw,
+                                          const sfs_result *expected, int *cleanup_errno, sfs_result *out) {
+    if (cleanup_errno) *cleanup_errno = 0;
+    enum sfs_status e = ready(h, 0, 0, out); if (e) return e;
+    if (h->policy != PENDING_ACTIVATION || h->transaction || h->batch || h->pins || h->lock_fd != -1)
+        return result(h, SFS_STATE, SFS_PHASE_ADMISSION, 0, out);
+    if (!expected || expected->status != SFS_OK || expected->device != (uint64_t)h->identity.st_dev ||
+        expected->inode != (uint64_t)h->identity.st_ino || expected->generation != h->current.generation ||
+        expected->committed_end != h->current.end || expected->physical_end != h->eof ||
+        memcmp(expected->uuid, h->current.uuid, 16) || memcmp(expected->root_digest, h->current.root.digest, 32))
+        return result(h, SFS_INVALID, SFS_PHASE_ADMISSION, 0, out);
+    int flags = fcntl(borrowed_rw, F_GETFL);
+    if (flags < 0) return result(h, SFS_IO, SFS_PHASE_ADMISSION, errno, out);
+    if ((flags & O_ACCMODE) != O_RDWR || (flags & O_APPEND))
+        return result(h, SFS_INVALID, SFS_PHASE_ADMISSION, 0, out);
+    if (stable(h) || activation_binding(h, parent, h->fd) || activation_binding(h, parent, borrowed_rw))
+        return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
+    int owned = fcntl(borrowed_rw, F_DUPFD_CLOEXEC, 0);
+    if (owned < 0) return result(h, SFS_IO, SFS_PHASE_ADMISSION, errno, out);
+    /* A separate temporary reader validates the new description itself. No
+     * pending state or cached page is transferred until every check succeeds. */
+    sfs_image candidate = *h; candidate.fd = owned; candidate.cache = NULL;
+    reader r = current_reader(&candidate, 0); state fresh;
+    e = reconcile(&r, &fresh);
+    if (!e && (stable(h) || activation_binding(h, parent, owned))) { e = SFS_IO; r.error = errno; r.phase = SFS_PHASE_IDENTITY; }
+    cache_clear(&candidate);
+    if (e) {
+        int closing = close(owned) ? errno : 0;
+        read_result(h, e, r.phase, e == SFS_NOMEM ? ENOMEM : r.error, out);
+        /* Preserve the primary admission failure; uncertain close poisons the handle. */
+        if (closing) { h->poisoned = 1; h->phase = SFS_PHASE_CLOSE; if (cleanup_errno) *cleanup_errno = closing; }
+        if (out) out->poisoned = h->poisoned;
+        return e;
+    }
+    cache_clear(h); h->live = fresh; h->lock_fd = h->fd; h->fd = owned;
+    h->policy = ORDINARY_WRITABLE;
+    return result(h, SFS_OK, SFS_PHASE_ADMISSION, 0, out);
+}
 enum sfs_status sfs_image_get_information(sfs_image *h, sfs_image_information *out, sfs_result *r) {
     enum sfs_status e = ready(h, 0, 0, r); if (e) return e;
     if (!out) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, r);
@@ -1230,10 +1286,19 @@ enum sfs_status sfs_image_select(sfs_image *h, unsigned slot, const sfs_verify_b
 enum sfs_status sfs_image_close(sfs_image *h, sfs_result *out) {
     if (!h) return result(NULL, SFS_INVALID, SFS_PHASE_CLOSE, 0, out);
     h->limit_reason = SFS_LIMIT_UNSPECIFIED; h->fence_attempted = h->fence_succeeded = 0;
-    int error = 0; if (close(h->fd)) error = errno; if (close(h->aux_parent) && !error) error = errno;
+    int error = 0;
+    if (h->policy == PENDING_ACTIVATION) {
+        if (close(h->aux_parent)) error = errno;
+        if (close(h->fd) && !error) error = errno;
+    } else {
+        if (close(h->fd)) error = errno;
+        if (close(h->aux_parent) && !error) error = errno;
+        if (h->lock_fd >= 0 && close(h->lock_fd) && !error) error = errno;
+    }
     enum sfs_status e = result(h, error ? SFS_IO : SFS_OK, SFS_PHASE_CLOSE, error, out); discard(h); pins_free(h); cache_clear(h); free(h); return e;
 }
 enum sfs_status sfs_image_verify(sfs_image *h, const sfs_verify_budget *budget, sfs_result *out) {
+    if (h && h->policy == PENDING_ACTIVATION) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
     enum sfs_status e = ready(h, 0, 0, out); if (e) return e; if (!valid_budget(budget)) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
     if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
     sfs_verify_budget remaining = *budget; reader r = current_reader(h, 0); r.budget = &remaining; cache_clear(h);
@@ -1249,6 +1314,7 @@ static enum sfs_status selected_namespace(reader *r, sfs_view view, namespace *o
 }
 static enum sfs_status touched_result(reader *r, enum sfs_status e, sfs_result *out) { read_result(r->h, e, r->phase, e == SFS_IO ? r->error : e == SFS_NOMEM ? ENOMEM : 0, out); if (!e && out) out->coverage = SFS_COVERAGE_TOUCHED; return e; }
 enum sfs_status sfs_image_pin_configure(sfs_image *h, uint32_t count, uint64_t max_bytes, sfs_result *out) {
+    if (h && h->policy == PENDING_ACTIVATION) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
     enum sfs_status e = pin_gate(h, 0, 0, out); if (e) return e;
     if (!count || !max_bytes || count > UINT32_MAX / 4) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
     if (h->transaction || h->pins || h->policy == RECOVERY) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);

@@ -469,7 +469,10 @@ class Intervals(unittest.TestCase):
                     with patch.object(_native, '_guard_current', side_effect=OSError('owned close fault')) if point == 'guard' else contextlib.nullcontext():
                         with self.assertRaises(OSError): t.unmount()
                 if point == 'guard':
-                    with self.assertRaises(core.StallionError): t.unmount()
+                    with self.assertRaises(core.StallionError): t.mount()
+                    with self.assertRaises(core.StallionError): t.validate()
+                    t.unmount()
+                    t.public_result('current-image-adopted')
                 else:
                     self.assertTrue(fired)
                     t.unmount()
@@ -640,3 +643,91 @@ class Intervals(unittest.TestCase):
                 t.unmount()
                 self.assertEqual(close, t.rows()[close['id']])
                 t.public_result('current-image-adopted')
+
+
+class GuardRetry(unittest.TestCase):
+    def test_unresolved_absence_repeats_then_owns_fresh_close(self):
+        with owned() as t:
+            t.mount(True); t.mount()
+            origin = t.f.read(t.path/'native-mount.json')['operation']
+            for number in range(3):
+                with patch.object(_native, '_guard_current', side_effect=OSError('owned unavailable guard')):
+                    with self.assertRaises(OSError): t.unmount()
+                rows = t.rows(); pending = t.f.read(t.store.root/'journals'/(t.path.name+'.json'))
+                self.assertNotIn('current_guard', pending)
+                self.assertEqual(len(pending['helpers']), 1 if number == 0 else 0)
+                index = interval.Index(rows, t.path, t.meta)
+                self.assertEqual(index.open, {origin}); self.assertFalse(index.closes)
+                with patch.object(_native.Operation, 'command') as helper:
+                    with self.assertRaises(core.StallionError): t.mount()
+                    with self.assertRaises(core.StallionError): t.validate()
+                    helper.assert_not_called()
+            failed = {p:p.read_bytes() for p in (t.path/'native-operations').glob('*/record.json')}
+            # A current guard can advance only on the proved fresh resolution.
+            t.f.guard_anchor = dict(t.f.anchor, generation=3, root_digest='c'*64)
+            with patch.object(_native.Operation, 'command') as helper:
+                t.unmount(); helper.assert_not_called()
+            self.assertEqual(failed, {p:p.read_bytes() for p in failed})
+            rows = t.rows(); marker = t.f.read(t.path/'native-mount.json')
+            index = interval.Index(rows, t.path, t.meta)
+            self.assertEqual(index.closes, {origin:marker['operation']})
+            self.assertEqual(index.fresh_resolutions, {marker['operation']})
+            self.assertEqual(marker['current_guard']['generation'], 3)
+            t.validate(); t.preserve_admit()
+            for change in ('older', 'conflicting'):
+                damaged = copy.deepcopy(rows)
+                guard = damaged[marker['operation']]['current_guard']
+                guard['generation'] = 0 if change == 'older' else t.f.anchor['generation']
+                with self.assertRaises(core.StallionError): interval.Index(damaged,t.path,t.meta)
+            t.mount(); t.unmount(); t.validate()
+
+    def test_unresolved_absence_refuses_forgery_and_changed_capture(self):
+        with owned() as t:
+            t.mount()
+            with patch.object(_native, '_guard_current', side_effect=OSError('owned unavailable guard')):
+                with self.assertRaises(OSError): t.unmount()
+            journal = t.store.root/'journals'/(t.path.name+'.json')
+            pending = t.f.read(journal)
+            archive = t.path/'native-operations'/pending['id']/'record.json'
+            original = archive.read_bytes(); original_journal = journal.read_bytes()
+            for change in ('helper-error','unreaped','unknown','observation-error','receipt-error',
+                           'complete','origin','target','marker','fork'):
+                with self.subTest(change=change):
+                    value = copy.deepcopy(pending); extra = None
+                    marker_path = t.path/'native-mount.json'; marker_bytes = marker_path.read_bytes()
+                    if change == 'helper-error': value['helpers'][0].update(outcome='error',returncode=1)
+                    elif change == 'unreaped': value['helpers'][0]['reaped'] = False
+                    elif change == 'unknown': value['helpers'][0]['outcome'] = 'unknown'
+                    elif change == 'observation-error': value['observation_error'] = {}
+                    elif change == 'receipt-error': value['receipt_error'] = 'owned'
+                    elif change == 'complete': value['outcome'] = 'complete'
+                    elif change == 'origin': value['ordinary_interval']['mount_operation'] = '0'*32
+                    elif change == 'target': value['target']['file'][1] += 1
+                    elif change == 'marker':
+                        t.f.save(marker_path,dict(state='absent',operation=value['id'],target=value['target'],
+                            lifecycle_version=1,ordinary_interval=value['ordinary_interval']))
+                    else:
+                        # Even a terminal helper-free child prevents the old
+                        # journal from being reused as a terminal predecessor.
+                        branch = dict(value,id='0'*32,before_mount=None,already_absent=True,helpers=[],
+                            previous_unresolved=dict(id=value['id'],operation=value['operation'],
+                                outcome=value['outcome'],record=str(archive)))
+                        extra = t.path/'native-operations'/branch['id']/'record.json'
+                        extra.parent.mkdir(mode=0o700); t.f.save(extra,branch)
+                    t.f.save(archive,value); t.f.save(journal,value)
+                    before = {p:p.read_bytes() for p in t.store.root.rglob('*') if p.is_file()}
+                    with patch.object(_native,'_guard_current') as guard, patch.object(_native.Operation,'command') as helper:
+                        with self.assertRaises(core.StallionError): t.unmount()
+                        guard.assert_not_called(); helper.assert_not_called()
+                    self.assertEqual(before,{p:p.read_bytes() for p in t.store.root.rglob('*') if p.is_file()})
+                    archive.write_bytes(original); journal.write_bytes(original_journal); marker_path.write_bytes(marker_bytes)
+                    if extra is not None: extra.unlink(); extra.parent.rmdir()
+            capture = interval.capture
+            def changed(*args,**kwargs):
+                result = capture(*args,**kwargs)
+                value = copy.deepcopy(pending); value['error'] = 'changed after capture'
+                t.f.save(archive,value); t.f.save(journal,value)
+                return result
+            with patch.object(interval,'capture',side_effect=changed), patch.object(_native,'_guard_current') as guard:
+                with self.assertRaises(core.StallionError): t.unmount()
+                guard.assert_not_called()

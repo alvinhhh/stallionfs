@@ -122,6 +122,39 @@ class FSKitInterfaces(unittest.TestCase):
         self.assertEqual(child.stderr, '')
         cls.failed = False
 
+    def test_managed_activation_and_pending_lock_lifetime(self):
+        cls = type(self)
+        cls.failed = True
+        directory = self.base / 'managed-activation'
+        directory.mkdir(mode=0o700)
+        images = directory / 'images'; images.mkdir(mode=0o700)
+        filesystem = self.source / 'filesystem'
+        tests = self.source / 'tests'
+        cflags = [self.tools['clang'], '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                  '-Wno-deprecated-declarations', '-isysroot', self.sdk]
+        core = directory / 'image.o'
+        self.command('activation-core', [*cflags, '-c', filesystem / 'image.c', '-o', core], 90)
+        lifetime = directory / 'lifetime'
+        self.command('activation-sanitizer-build', [*cflags, '-fsanitize=address,undefined',
+                     '-fno-omit-frame-pointer', tests / 'image_activation.c', '-o', lifetime], 90)
+        self.command('activation-sanitizer-run', [lifetime, images], 30)
+        driver = directory / 'activation'
+        self.command('activation-adapter-build', [self.tools['swiftc'], '-D', 'STALLION_ADAPTER_CHECK',
+                     '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                     '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors',
+                     '-target', 'arm64-apple-macos27.0', '-sdk', self.sdk, '-I', filesystem / 'fskit',
+                     '-Onone', '-parse-as-library', '-module-cache-path', directory / 'cache',
+                     filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift',
+                     tests / 'fskit_activation_driver.swift', core, '-o', driver], 180, swift='context')
+        from test_native_activation import ActivationAdapter
+        case = ActivationAdapter('test_producer_consumer_and_terminal_callback_drain')
+        result = unittest.TestResult()
+        with mock.patch.dict(os.environ, STALLIONFS_ACTIVATION_DRIVER=str(driver)):
+            case.run(result)
+        self.assertFalse(result.failures + result.errors + result.skipped)
+        self.assertEqual(result.testsRun, 1)
+        cls.failed = False
+
     def test_admission_ownership_and_legacy_callbacks(self):
         cls = type(self)
         cls.failed = True

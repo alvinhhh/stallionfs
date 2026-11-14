@@ -132,7 +132,7 @@ def completed_operation(record, path, metadata, name):
             and all(row.get(k) == v for k, v in anchor.items()) for row in (receipt, closed)),
             'binding-operation-incomplete')
     elif action in recovery.COMPOUND:
-        recovery.validate_compound(path.name, record)
+        recovery.validate_compound(path.name, record, metadata.get('transaction'))
         _native.check_helpers(record, {'verify-package', 'discover', 'unmount', 'mount'})
         require(all(h.get('outcome') in ('success', 'error', 'not-launched') for h in record['helpers']),
                 'binding-operation-incomplete')
@@ -279,9 +279,9 @@ def _chain_member(record, path, metadata, name):
                 and [h['label'] for h in helpers] == labels[:len(helpers)], 'binding-operation-incomplete')
         for h in helpers:
             if h['label'] == 'mount':
-                argv = ['/sbin/mount', '-t', _native.PROFILES[profile]['type'], str(path), str(path / 'volume')]
-                require(record.get('mount_attempted') is True
-                        and h['argv'] in (argv, argv[:1] + ['-F'] + argv[1:]), 'binding-mount-argv')
+                require(record.get('mount_attempted') is True, 'binding-mount-argv')
+                from ._native_activation import validate_helper
+                validate_helper(record, h, _native.PROFILES[profile]['type'], path, metadata.get('transaction'), guard)
             elif h['label'] == 'discover':
                 require(len(h['argv']) == 2 and h['argv'][1] == '--discover-json'
                         and Path(h['argv'][0]).is_absolute()
@@ -311,16 +311,22 @@ def _chain_member(record, path, metadata, name):
     before = _chain_observation(record['before_mount'], path, metadata)
     if before is None:
         require(record.get('already_absent') is True and helpers == []
-                and after is None and guard is not None, 'binding-operation-incomplete')
+                and after is None, 'binding-operation-incomplete')
     else:
         require(len(helpers) == 1 and helpers[0]['label'] == 'unmount'
                 and helpers[0]['argv'] == ['/sbin/umount', str(path / 'volume')], 'binding-operation-incomplete')
         if helpers[0]['outcome'] == 'success':
-            require(after is None and guard is not None, 'binding-operation-incomplete')
+            require(after is None, 'binding-operation-incomplete')
         else:
             require(record['outcome'] == 'incomplete' and guard is None
                     and _same_evidence(before, after), 'binding-operation-incomplete')
-    return before, after, guard, after is None
+    if after is None and guard is None:
+        # Absence is not a consumed close. Only versioned incomplete evidence
+        # may await a fresh guard; Index validates its exact interval ancestry.
+        from ._native_interval import versioned
+        require(record['outcome'] == 'incomplete' and versioned(record),
+                'binding-operation-incomplete')
+    return before, after, guard, after is None and guard is not None
 
 
 def _mount_acceptance(record, proof, path):
@@ -466,7 +472,7 @@ def archive_anchor(records, path, metadata, mounted, proof=None, *, reconciliati
             if not first:
                 require(_same_evidence(previous_after, before), 'binding-resolution-observation')
             if guard is not None and last_guard is not None:
-                if before is None:
+                if before is None and current not in intervals.fresh_resolutions:
                     require(_same_evidence(guard, last_guard), 'binding-resolution-guard')
                 else:
                     require(guard['generation'] >= last_guard['generation'], 'binding-resolution-guard')
