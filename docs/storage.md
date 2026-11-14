@@ -256,3 +256,51 @@ and excluded from generic removal. A bound replacement or any changed original
 still refuses; no such restart is allowed after relocation authorization.
 Installed writable persistence and ordinary distribution qualification remain
 separate from source/core fixture validation.
+
+### Native hosting identity after restart
+
+New native installations record `native-binding.json` after successful exclusive
+backing admission and consumed close. It binds the original workspace and
+creation transaction to the hosting APFS volume UUID and 64-bit file IDs of the
+workspaces collection, workspace directory, and backing file. Runtime targets
+use freshly observed device numbers. Creation, installation, mount, and close
+receipts retain their original identities; their evidence is validated against
+those historical targets.
+
+A legacy installation with unchanged devices can enroll during ordinary offline
+admission. If its device numbers have already changed and no hosting binding
+exists, select the current closed image explicitly:
+
+```sh
+sfs --root STORE creations WORKSPACE_ID --adopt-current ORIGINAL_TRANSACTION
+```
+
+This publishes a separate current-image adoption epoch. It does not establish
+which volume hosted the original installation, import another image, or recreate
+prepared-tree verification. It requires the original creation and installation
+proofs, unchanged file IDs, private physical paths, an owned single-link backing,
+the image UUID, and a successful exclusive guard against a recorded closed
+committed anchor. The anchor check compares generation, committed end, and root
+digest; it does not authenticate every byte in the image.
+
+Adoption refuses pending or uncertain operations, mounted images, unresolved
+owned processes, moved/retired objects, and purge recovery. Resolve those states
+through their existing explicit workflows. Do not edit recorded identity pins.
+A successful exact retry preserves the existing adoption epoch. Interrupted
+publication leaves either no binding (temporary files remain diagnostic) or a
+complete binding whose guard already closed successfully. An exact creation
+continuation also completes missing guarded enrollment if installation already
+removed its journal; it cannot report installed-unmounted success without it.
+
+Completed catalog, snapshot, restore, mount and unmount history is validated
+against each operation's recorded target and terminal evidence. Catalog commits
+can advance the closed anchor used for enrollment; the newest recorded generation
+must match the fresh guard. Unknown, incomplete or conflicting history refuses
+admission. Historical receipts and cleanup timestamps are not renewed.
+
+A binding grants no cleanup authority. Old mount observations and cleanup
+baselines do not acquire new credit after device renumbering. A new ordinary
+close must establish a current lifecycle baseline. Permanent purge still
+requires the original exact device and inode pairs: translated destructive
+authority after device renumbering is not supported, including after explicit
+current-image adoption. A stored hosting UUID alone cannot grant it.

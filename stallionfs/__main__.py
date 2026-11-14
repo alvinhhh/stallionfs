@@ -115,6 +115,7 @@ def main(argv=None):
     creation_action = creations.add_mutually_exclusive_group()
     creation_action.add_argument('--continue', dest='continue_operation', metavar='TRANSACTION', help='Continue the matching retained creation')
     creation_action.add_argument('--purge', dest='purge_creation', metavar='TRANSACTION')
+    creation_action.add_argument('--adopt-current', dest='adopt_current', metavar='TRANSACTION', help='Adopt the selected current closed image')
     creations.add_argument('--confirm', action='store_true')
     creations.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     for action in ("mount", "unmount"):
@@ -189,13 +190,15 @@ def main(argv=None):
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
     if args.action == 'creations':
+        if args.adopt_current is not None and args.id is None:
+            parser.error('creations --adopt-current requires ID')
         if args.purge_creation is not None and args.id is None:
             parser.error('creations --purge requires ID')
         if args.confirm and args.purge_creation is None:
             parser.error('--confirm requires --purge')
         if args.continue_operation is not None and args.id is None:
             parser.error('creations --continue requires ID')
-        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation), ('TRANSACTION', args.purge_creation)):
+        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation), ('TRANSACTION', args.purge_creation), ('TRANSACTION', args.adopt_current)):
             if value is not None and re.fullmatch('[0-9a-f]{32}', value) is None:
                 parser.error(label + ' must contain 32 lowercase hexadecimal characters')
         if args.native_host is not None and args.continue_operation is None:
@@ -222,7 +225,12 @@ def main(argv=None):
             from ._native_create_recovery import inventory, continue_creation
             root = Path(args.root).expanduser().absolute()
             continuing = args.continue_operation is not None
-            if args.purge_creation is not None:
+            if args.adopt_current is not None:
+                from ._native_binding import adopt_current
+                result = adopt_current(root, args.id, args.adopt_current)
+                success = result['status'] == 'current-image-adopted'
+                text = json.dumps(result, sort_keys=True)
+            elif args.purge_creation is not None:
                 from ._native_creation_purge import purge_creation
                 result = purge_creation(root, args.id, args.purge_creation, confirm=args.confirm)
                 success, text = _creation_purge_output(result, root)

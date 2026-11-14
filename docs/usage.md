@@ -322,24 +322,28 @@ sfs snapshot ID --name before-change --quiescent --continue OP
 sfs rollback ID before-change --quiescent --continue OP
 ```
 
-Continuation requires the same workspace, action and name. It never repeats an
+Continuation requires the same workspace, action, name, backing target and
+controller. Pending changed-device restart recovery remains unsupported. It never repeats an
 attempted catalog mutation or creates a new recovery name. Ordinary commands
 preserve a pending compound journal and print its status command.
 
 | Retained phase | Permitted continuation |
 | --- | --- |
-| Prepared | Revalidate the accepted mount, then start the first unmount and mutation. |
+| Prepared | A present accepted matching mount follows normal unmount. With no launched lifecycle or catalog attempt, complete workspace absence plus fresh exclusive backing admission and successful consumed close permits the first mutation. Absence and resource binding are checked again after the guard. |
 | Unmount response missing | Only terminal helper evidence plus fresh absence and backing admission can allow the first mutation. A present mount is not automatically unmounted again. |
 | Bridge response missing, failed, uncertain or close incomplete | Stop. A matching current catalog cannot repair the original result. |
 | Confirmed commit and successful consumed close | Remount only, checking the saved anchor; or finalize an originally unmounted workspace. |
 | Remount response missing | A present mount requires the same operation's durable qualified observation/usability evidence and terminal helper evidence for finish-only continuation. Otherwise stop. Once separately withdrawn and absent, terminal helper evidence permits a new recorded remount attempt. |
-| Final state verified, completion interrupted | Verify retained final evidence and current state, finish the durable record, then remove the matching journal. |
+| Final state verified, completion interrupted | A matching present mount is verified and finalized. For an originally mounted workspace now completely absent, validate historical completion against its exact remount attempt, durably preserve that evidence and reset to committed/incomplete, then qualify a distinct remount against the original committed anchor. The bridge is never replayed. Completed archives remain historical and never trigger this restoration. |
 | Child pending, unreaped or ownership uncertain | Keep its controller running. A new invocation never signals or waits on a saved PID or infers termination from mount absence. |
 
 Before mutation only, `sfs unmount ID --continue OP` permits explicit normal
 withdrawal of the still-present accepted matching mount, retaining the same
-operation without authorizing a catalog mutation. It refuses an unbound or changed
-mount. For an unresolved present remount without durable evidence, arrange normal
+operation without authorizing a catalog mutation. A prepared workspace already
+completely absent follows the same fresh backing admission checks and stops
+offline, reporting `already_absent` without inventing an unmount attempt. It
+refuses an unbound or changed mount. For an unresolved present remount without
+durable evidence, arrange normal
 withdrawal separately after checking the displayed path; the controller does not
 infer authority from that observation. Completed-operation status preserves its
 historical result and reports current mount drift separately.

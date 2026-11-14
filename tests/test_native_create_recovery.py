@@ -129,7 +129,7 @@ class CreateRecovery(unittest.TestCase):
             callback(token)
         finally:
             token.close_result = dict(self.guard_anchor, status=0, core_consumed=True, parent_close_errno=0,
-                poisoned=False, transaction_active=False, device=target['file'][0], inode=target['file'][1], uuid=target['uuid'])
+                poisoned=False, transaction_active=False, physical_end=self.guard_anchor['committed_end'], device=target['file'][0], inode=target['file'][1], uuid=target['uuid'])
             self.guard_active = False
 
     @staticmethod
@@ -481,6 +481,7 @@ class CreateRecovery(unittest.TestCase):
         self.owned.rename(self.final); (self.final / 'volume').mkdir(mode=0o700)
         self.save(self.final / 'meta.json', installed)
         guard = dict(self.anchor, status=0, core_consumed=True, parent_close_errno=0, poisoned=False,
+                     physical_end=self.anchor['committed_end'],
                      transaction_active=False, device=self.target['file'][0], inode=self.target['file'][1], uuid=self.target['uuid'])
         proof = {'operation': 'native-install', 'id': self.workspace, 'transaction': self.transaction,
                  'target': installed['native_image'], 'complete': True, 'guard': guard,

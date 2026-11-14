@@ -18,7 +18,7 @@ STAGES = ('prepared', 'container-ready', 'relocation-authorized', 'relocated',
           'image-unlink-authorized', 'image-absent', 'metadata-removal-authorized',
           'resource-removal-authorized', 'container-removal-authorized', 'complete')
 PARENTS = ('trash', 'workspaces', 'staging', 'protected', 'journals', 'lifecycle')
-PROOFS = {'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'native-mount.json'}
+PROOFS = {'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'native-mount.json', 'native-binding.json'}
 REQUIRED = {'image.sfs', 'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'volume', 'native-operations'}
 
 
@@ -160,7 +160,7 @@ def scan(opening, resource, workspace):
         if len(result) > MAX_ENTRIES: refuse('manifest exceeds 16384 entries')
         return data
     present = set(names(resource))
-    if not REQUIRED <= present or not present <= REQUIRED | {'native-mount.json'}:
+    if not REQUIRED <= present or not present <= REQUIRED | {'native-mount.json', 'native-binding.json'}:
         refuse('unexpected or missing resource entries')
     for name in sorted(present):
         if name in ('volume', 'native-operations'):
@@ -216,7 +216,7 @@ def manifest_valid(rows):
         path = row['path']; kind = row['kind']
         if not isinstance(path, str) or path in seen or kind not in ('file', 'directory'): refuse('invalid manifest path')
         parts = path.split('/')
-        permitted = ((len(parts) == 1 and path in REQUIRED | {'native-mount.json'})
+        permitted = ((len(parts) == 1 and path in REQUIRED | {'native-mount.json', 'native-binding.json'})
             or (parts[0] == 'native-operations' and 2 <= len(parts) <= 4
                 and re.fullmatch('[0-9a-f]{32}', parts[1])
                 and (len(parts) == 2 or (len(parts) == 3 and parts[2] == 'record.json')

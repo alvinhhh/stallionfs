@@ -83,12 +83,38 @@ def installed(path, metadata):
     require(type(origin) is dict, 'unverified-writer')
     created = core.read_json(Path(path) / 'native-create.json')
     proof(origin, created)
-    return {'origin': copy.deepcopy(origin), 'proof': copy.deepcopy(created)}
+    value = {'origin': copy.deepcopy(origin), 'proof': copy.deepcopy(created)}
+    from ._native_binding import NAME
+    if (Path(path) / NAME).exists():
+        from ._native_create_recovery import semantic
+        value['hosting'] = {'binding': semantic(core.read_json(Path(path) / NAME)),
+                            'installation': semantic(core.read_json(Path(path) / 'native-install.json'))}
+    return value
 
 
 def retained(value, target, workspace):
-    require(type(value) is dict and set(value) == {'origin', 'proof'}, 'unverified-writer')
+    require(type(value) is dict and set(value) in ({'origin', 'proof'}, {'origin', 'proof', 'hosting'}), 'unverified-writer')
+    core.native_target({'ownership': 'external-reference', 'native_image': target})
     origin = value['origin']; proof(origin, value['proof'])
+    if 'hosting' in value:
+        from . import _native_binding as binding
+        from ._native_create_recovery import semantic
+        hosting = value['hosting']
+        require(type(hosting) is dict and set(hosting) == {'binding', 'installation'}, 'unverified-writer')
+        epoch = hosting['binding']
+        require(type(epoch) is dict and type(epoch.get('origin_target')) is dict, 'unverified-writer')
+        metadata = {'id': workspace, 'transaction': origin['transaction'], 'native_image': epoch['origin_target']}
+        binding.validate(epoch, metadata, binding.fingerprint(origin, semantic(value['proof']), hosting['installation']))
+        installation = hosting['installation']
+        require(installation.get('operation') == 'native-install' and installation.get('complete') is True
+                and installation.get('id') == workspace and installation.get('transaction') == origin['transaction']
+                and installation.get('target') == epoch['origin_target']
+                and _native._consumed(installation.get('guard'),
+                    binding.historical_target(Path(epoch['admitted_target']['directory']), metadata),
+                    origin['native_image']['anchor']), 'unverified-writer')
+        # Hosting identity permits current read/write admission, but this packet
+        # carries no descriptor-validated current destructive authority.
+        # Retention therefore still requires the original exact object pairs.
     require(origin['id'] == workspace
             and all(origin['native_image'][key] == target[key] for key in ('component', 'object', 'file', 'uuid') if key in target),
             'unverified-writer')
