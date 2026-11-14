@@ -125,6 +125,14 @@ a destination ID in a remnant does not authorize continuation. Candidate
 installation through `creations ID --continue TRANSACTION` requires completed
 verification, an authoritative journal and the exact transaction. Repeating
 continuation for an installed workspace checks its installation proof.
+Normal installation durably records one lifecycle generation in its installation
+intent before rename and carries that generation into the installation proof.
+Continuation publishes or validates that exact generation before removing the
+journal; repeating continuation never creates a replacement generation.
+Older interrupted installations with an unattributed lifecycle file, or a removed
+journal and no lifecycle binding in the proof, remain unqualified for offline
+continuation. This does not authorize adopting an arbitrary legacy generation.
+
 New creation requests also support one fresh replacement after a pre-install
 interruption. An immutable request binds the prepared seed, branch, capacity,
 import policy, installation settings, qualified Git payload and controller lock
