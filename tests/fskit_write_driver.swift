@@ -189,11 +189,36 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
 #endif
 }
 
+// Permission regressions use an explicit scope/intent fixture double. The
+// producer-to-consumer suite separately exercises the Python request producer.
+func activateManagedFixture(_ volume: StallionVolume, _ directory: URL) throws -> (FSItem?, Error?) {
+    let operation = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    let attempt = directory.appendingPathComponent("native-operations/" + operation + "/activation-" + nonce)
+    try FileManager.default.createDirectory(at: attempt, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    var st = stat(); need(stat(directory.path, &st) == 0, "request parent identity")
+    let r = volume.anchor
+    let fields = ["stallionfs-activation-v1", "native-mount", operation, operation, directory.lastPathComponent, nonce,
+                  String(st.st_dev), String(st.st_ino), String(r.device), String(r.inode),
+                  rawBytes(r.uuid).map { String(format:"%02x",$0) }.joined(), String(r.generation),
+                  rawBytes(r.root_digest).map { String(format:"%02x",$0) }.joined(),
+                  String(r.committed_end), String(r.physical_end), "rw", "owners", "pending"]
+    let data = Data((fields.joined(separator:"\n") + "\n").utf8)
+    let request = attempt.appendingPathComponent("request")
+    try data.write(to:request); need(chmod(request.path,0o600) == 0,"private request")
+    let gate = open(attempt.appendingPathComponent("gate").path,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0o600)
+    let lease = open(attempt.appendingPathComponent("lease").path,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0o600)
+    need(gate >= 0 && lease >= 0 && flock(lease,LOCK_EX|LOCK_NB) == 0,"owned fixture lease")
+    defer { need(Darwin.close(lease) == 0 && Darwin.close(gate) == 0,"fixture lease checked close") }
+    let _: Bool = wait { done in volume.enqueue { volume.managedScopeForTesting = true; done(true) } }
+    return wait { done in volume.activateArgumentsForTesting(["-o","rw,owners,sfs_activation=" + operation + "." + nonce]) { done(($0,$1)) } }
+}
+
 @MainActor func accessPolicyChecks(_ parent: URL, factory: Bool = false, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) throws {
     func makeFileSystem() -> StallionFileSystem {
         factory ? StallionExtension.fileSystemForTesting(extensionAttributes: ["FSShortName": identity.rawValue]) : fixtureFileSystem(accessPolicy:.contextualWrites)
     }
-    let f = try Fixture(parent,"access-policy"), resource = FSPathURLResource(url: f.url,writable: true)
+    let f = try Fixture(parent,UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()), resource = FSPathURLResource(url: f.url,writable: true)
     let image = f.url.appendingPathComponent("image.sfs"), before = try Data(contentsOf:image)
     func load(_ fs: StallionFileSystem, _ args: [String] = []) -> (FSVolume?,Error?) {
         wait { done in fs.loadResource(resource:resource,arguments:args) { done(($0,$1)) } }
@@ -281,13 +306,16 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
 #if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
     need(reply.1 == nil && reply.0 != nil,"explicit contextual mutation admission")
     let v = reply.0 as! StallionVolume
-    need(v.volumeID.uuid==f.identity && !v.requestedMountOptions.contains(.readOnly),"stored volume identity and admitted mode")
+    need(v.volumeID.uuid==f.identity && v.requestedMountOptions.contains(.readOnly),"stored volume identity and pending readonly mode")
     let _: Bool = wait { done in v.enqueue { checkVolumeStatistics(v, identity: factory ? identity : fixtureFileSystemIdentity); done(true) } }
     let coreRO: Bool = wait { done in v.enqueue { done(v.coreReadOnlyForTesting()) } }
-    need(!coreRO,"mutation admission uses actual writable core")
+    need(coreRO,"pending admission uses actual readonly core")
     var competing: OpaquePointer?, receipt = sfs_result()
     need(sfs_image_open(f.url.path,"image.sfs",&competing,&receipt)==SFS_BUSY && competing == nil,"same-inode exclusive ownership retained")
-    let active: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } };need(active.1 == nil,"mutation activation")
+    let active = try activateManagedFixture(v,f.url);need(active.1 == nil,"mutation activation")
+    need(!v.requestedMountOptions.contains(.readOnly),"managed activation selects writable mount")
+    let admittedRO: Bool = wait { done in v.enqueue { done(v.coreReadOnlyForTesting()) } }
+    need(!admittedRO,"managed activation uses actual writable core")
     let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"mutation mount")
     let found: (FSItem?,FSFileName?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$1,$2)) } }
     need(found.2 == nil,"mutation file lookup")
@@ -368,12 +396,12 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     need(persisted.0 != nil && persisted.2 == nil,"created entry persists through unload and reopen")
     close(reopened,rv,reopenedRoot.0,persisted.0)
     need(f.contents()==Data("changed!".utf8),"retained write persists through unload and reopen")
-    let deniedFixture=try Fixture(parent,"access-policy-denied",mode:0o400)
+    let deniedFixture=try Fixture(parent,UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(),mode:0o400)
     let deniedFS=makeFileSystem(), deniedResource=FSPathURLResource(url:deniedFixture.url,writable:true)
     let deniedLoad: (FSVolume?,Error?)=wait { done in deniedFS.loadResource(resource:deniedResource,arguments:[]) { done(($0,$1)) } }
     need(deniedLoad.1 == nil,"readonly inode in writable volume admitted")
     let deniedVolume=deniedLoad.0 as! StallionVolume
-    let deniedRoot: (FSItem?,Error?)=wait { done in deniedVolume.activate { done(($0,$1)) } }
+    let deniedRoot = try activateManagedFixture(deniedVolume,deniedFixture.url)
     let deniedMount: Error?=wait { deniedVolume.mount(arguments:[],replyHandler:$0) };need(deniedMount == nil,"denied-open model mount")
     let deniedFile: (FSItem?,FSFileName?,Error?)=wait { done in deniedVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:deniedRoot.0!) { done(($0,$1,$2)) } }
     let readGranted: Error?=wait { deniedVolume.openForTesting(deniedFile.0!,modes:.read,caller:caller,reply:$0) };need(readGranted == nil,"read acquisition authorized")
@@ -386,11 +414,11 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     let deactivated: Error?=wait { deniedVolume.deactivate(options:[],replyHandler:$0) };need(deactivated == nil,"denied-open model deactivated")
     let deniedUnload: Error?=wait { deniedFS.unloadResource(resource:deniedResource,replyHandler:$0) };need(deniedUnload == nil,"denied-open model consumed")
     need(deniedFixture.contents()==Data("original".utf8),"denied opens preserve file bytes")
-    let partial=try Fixture(parent,"access-policy-partial",mode:0o200)
+    let partial=try Fixture(parent,UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(),mode:0o200)
     let partialFS=makeFileSystem(), partialResource=FSPathURLResource(url:partial.url,writable:true)
     let partialLoad: (FSVolume?,Error?)=wait { done in partialFS.loadResource(resource:partialResource,arguments:[]) { done(($0,$1)) } };need(partialLoad.1 == nil,"partly authorized fixture load")
     let partialVolume=partialLoad.0 as! StallionVolume
-    let partialRoot: (FSItem?,Error?)=wait { done in partialVolume.activate { done(($0,$1)) } }
+    let partialRoot = try activateManagedFixture(partialVolume,partial.url)
     let partialMount: Error?=wait { partialVolume.mount(arguments:[],replyHandler:$0) };need(partialMount == nil,"partly authorized model mount")
     let partialFile: (FSItem?,FSFileName?,Error?)=wait { done in partialVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:partialRoot.0!) { done(($0,$1,$2)) } }
     let writeCheck: (FSCheckAccessResult?,Error?)=wait { done in partialVolume.accessForTesting(partialFile.0!,access:.writeData,caller:caller) { done(($0,$1)) } }
@@ -403,13 +431,13 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     let partialDeactivate: Error?=wait { partialVolume.deactivate(options:[],replyHandler:$0) };need(partialDeactivate == nil,"partly authorized model deactivated")
     let partialClose: Error?=wait { partialFS.unloadResource(resource:partialResource,replyHandler:$0) };need(partialClose == nil,"partly authorized model consumed")
     need(partial.contents()==Data("original".utf8),"partly authorized open preserves bytes")
-    let other = try Fixture(parent,"access-policy-other")
+    let other = try Fixture(parent,UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased())
     need(other.identity != f.identity,"independent image has its own stored identity")
     let otherFS=makeFileSystem(), otherResource=FSPathURLResource(url:other.url,writable:true)
     let otherReply: (FSVolume?,Error?)=wait { done in otherFS.loadResource(resource:otherResource,arguments:[]) { done(($0,$1)) } }
     need(otherReply.1 == nil && (otherReply.0 as! StallionVolume).volumeID.uuid==other.identity,"second image needs no fixture-specific rebuild")
     let otherVolume=otherReply.0 as! StallionVolume
-    let otherRoot: (FSItem?,Error?)=wait { done in otherVolume.activate { done(($0,$1)) } }
+    let otherRoot = try activateManagedFixture(otherVolume,other.url)
     let otherMount: Error?=wait { otherVolume.mount(arguments:[],replyHandler:$0) };need(otherMount == nil,"second image model mount")
     let otherFile: (FSItem?,FSFileName?,Error?)=wait { done in otherVolume.lookupItem(named:FSFileName(string:"file"),inDirectory:otherRoot.0!) { done(($0,$1,$2)) } }
     let otherBefore=otherVolume.anchor
@@ -456,13 +484,13 @@ func executionAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolum
     func exercise(_ name: String, mode: UInt32 = 0o700, acl: Bool = false, flags: UInt32 = 0,
                   owner: uid_t = geteuid(), writable: Bool = true, endError: Int32 = 0, persistedMode: UInt32? = nil,
                   body: (StallionVolume,FSItem,StallionItem,ExecutionResource,([StallionItem]) -> Void) throws -> Void) throws {
-        let f = try Fixture(parent,"execute-"+name,mode:mode,acl:acl,owner:owner,extra:true,sourceFlags:flags)
+        let f = try Fixture(parent,UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(),mode:mode,acl:acl,owner:owner,extra:true,sourceFlags:flags)
         let fs = factory ? StallionExtension.fileSystemForTesting(extensionAttributes: ["FSShortName": identity.rawValue]) : fixtureFileSystem(accessPolicy:.contextualWrites)
         let resource = ExecutionResource(url:f.url,writable:writable)
         let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:[]) { done(($0,$1)) } }
         need(loaded.1 == nil && loaded.0 != nil,"execution uses actual contextual resource admission")
         let v = loaded.0 as! StallionVolume
-        let active: (FSItem?,Error?) = wait { done in v.activate { done(($0,$1)) } }
+        let active: (FSItem?,Error?) = writable ? try activateManagedFixture(v,f.url) : wait { done in v.activate { done(($0,$1)) } }
         need(active.1 == nil && active.0 != nil,"execution activation")
         need(wait { v.mount(arguments:[],replyHandler:$0) } == nil,"execution mount callback")
         let found: (FSItem?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$2)) } }
@@ -522,7 +550,9 @@ func executionAccess(_ volume: StallionVolume, _ item: FSItem, _ rights: FSVolum
         let _: Bool = wait { done in v.enqueue { v.rejectResultForTesting = nil; done(true) } }
         executionAccess(v,file); need(anchorMatches(before,v.anchor),"access result construction failure is recoverable and observational")
         let _: Bool = wait { done in v.enqueue { resource.permitsWrites = false; done(true) } }
-        executionAccess(v,file,expected:EACCES); executionAccess(v,file,.readData); executionAccess(v,root,.search)
+        executionAccess(v,file); executionAccess(v,file,.readData); executionAccess(v,root,.search)
+        // Getter changes do not revoke an admitted managed mode; actual resource
+        // revocation remains covered by the revoked-resource cases.
         let _: Bool = wait { done in v.enqueue { resource.permitsWrites = true; done(true) } }
         executionAccess(v,file)
         let _: Bool = wait { done in v.unmount { done(true) } }
@@ -5884,6 +5914,16 @@ func mountTraceChecks(_ parent: URL) throws {
     let resource = FSPathURLResource(url:af.url,writable:false)
     let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:[]) { done(($0,$1)) } }
     need(loaded.1 == nil,"activation fixture load");let av = loaded.0 as! StallionVolume
+    for arguments in [["-o"], ["--rdonly"], ["-o","rw,noowners"], Array(repeating:"x",count:65)] {
+        trace.resetForTesting(); var count = 0
+        av.activateArgumentsForTesting(arguments) { result,error in
+            need(result == nil && error != nil,"malformed activation options refused"); count += 1
+        }
+        let rows = trace.recordsForTesting()
+        let entry = rows.filter { $0.contains(" e=1 o=2 ") }, reply = rows.filter { $0.contains(" e=3 o=2 ") }
+        need(count == 1 && entry.count == 1 && reply.count == 1,"malformed activation paired callback and reply")
+        need(reply[0].contains(" s=9 ") && entry[0].split(separator:" ")[7] == reply[0].split(separator:" ")[7],"activation arguments stage and callback identity")
+    }
     let _: Bool = wait { done in av.enqueue { av.rejectResultForTesting = { $0 == "FSActivateResult" };done(true) } }
     trace.resetForTesting()
     let active: (FSActivateResult?,Error?) = wait { done in av.activateResultForTesting { done(($0,$1)) } }

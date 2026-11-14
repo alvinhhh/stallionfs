@@ -926,7 +926,41 @@ def _usable(store, path, metadata, *, initial=False, operation=None):
     return str(repo)
 
 
+def _mount_diagnostic(candidate, volume):
+    """Copy bounded observation fields only; never recovery authority."""
+    if type(candidate) is not dict:
+        return None
+    def row(value):
+        if type(value) is not dict or value.get('path') != str(volume):
+            return None
+        result = {'path': str(volume)}
+        for key in ('owner', 'flags'):
+            n = value.get(key)
+            if type(n) is int and 0 <= n < 1 << 64: result[key] = n
+        fsid = value.get('fsid')
+        if type(fsid) in (list, tuple) and len(fsid) == 2 and all(type(n) is int and -(1 << 63) <= n < 1 << 64 for n in fsid):
+            result['fsid'] = list(fsid)
+        filesystem = value.get('filesystem')
+        if type(filesystem) is str and len(filesystem) <= 64 and filesystem.isascii(): result['filesystem'] = filesystem
+        for key in ('readonly', 'ignore_ownership'):
+            if type(value.get(key)) is bool: result[key] = value[key]
+        return result
+    copied = {}
+    for key in ('mount_row', 'descriptor', 'before'):
+        value = row(candidate.get(key))
+        if value is not None: copied[key] = value
+    for key in ('mount_rows', 'after'):
+        values = candidate.get(key)
+        if type(values) is list and len(values) <= 4:
+            copied[key] = [entry for value in values if (entry := row(value)) is not None]
+    return copied or None
+
+
 def _record_failure(error, operation, volume, profile):
+    original = getattr(error, 'native_candidate_result', None)
+    diagnostic = _mount_diagnostic(original, volume) if original is not operation.record else None
+    if diagnostic is not None:
+        operation.record.setdefault('original_mount_failure', diagnostic)
     operation.record['outcome'] = 'incomplete'
     current_guard = getattr(error, 'native_current_guard', None)
     if current_guard is not None:
@@ -941,7 +975,9 @@ def _record_failure(error, operation, volume, profile):
             operation.record['ordinary_interval'] = token(operation.record['id'], operation.path,
                 {'controller_profile': profile}, operation.record['target'], operation.record['observed_mount'])
     except BaseException as observed_error:
-        operation.record['observation_error'] = {'type': type(observed_error).__name__, 'message': str(observed_error)}
+        operation.record['observation_error'] = {'type': type(observed_error).__name__, 'message': str(observed_error)[:256]}
+        later = _mount_diagnostic(getattr(observed_error, 'native_candidate_result', None), volume)
+        if later is not None: operation.record.setdefault('later_mount_failure', later)
     try:
         operation.persist()
     except BaseException as saving_error:
@@ -1009,7 +1045,8 @@ def mount_locked(store, path, metadata):
         from ._native_interval import capture
         capture(store, path, metadata, target, None)
         private_directory(volume)
-        operation = Operation(store, path, 'native-mount', target, details={'lifecycle_version': 1})
+        operation = Operation(store, path, 'native-mount', target,
+                              details={'lifecycle_version': 1, 'activation_protocol': 1})
         transport['native_operation'] = operation.record
         try:
             operation.record['current_guard'] = _guard_current(target)
@@ -1022,7 +1059,8 @@ def mount_locked(store, path, metadata):
             _persist(path / 'native-install.json', proof)
             operation.record['mount_attempted'] = True
             operation.persist()
-            command = operation.command('mount', ['/sbin/mount', '-F', '-t', filesystem, str(path), str(volume)])
+            from ._native_activation import mount
+            command = mount(operation, metadata, filesystem, operation.record['current_guard'])
             if command['returncode'] != 0:
                 raise failure('Native mount command failed; installed workspace retained', operation.record)
             row = _observe_until(volume, profile, True)
@@ -1059,7 +1097,8 @@ def unmount_locked(store, path, metadata):
         # observe closes its mounted descriptor before umount is launched.
         row = observe(volume, profile)
         from ._native_interval import capture
-        interval = capture(store, path, metadata, target, row)
+        captured = {}
+        interval = capture(store, path, metadata, target, row, unmount_recovery=True, captured=captured)
         details = {'lifecycle_version': 1, 'before_mount': row}
         if interval is not None:
             details['ordinary_interval'] = interval
@@ -1068,7 +1107,7 @@ def unmount_locked(store, path, metadata):
         try:
             operation.record['before_mount'] = row
             from ._native_interval import recheck_capture
-            recheck_capture(store, path, metadata, operation)
+            recheck_capture(store, path, metadata, operation, expected_predecessor=captured['predecessor'])
             check()
             if row is not None:
                 command = operation.command('unmount', ['/sbin/umount', str(volume)])

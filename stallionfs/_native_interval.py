@@ -134,7 +134,7 @@ def correlate_marker(records, marker, path, metadata, pending=None):
         completed_operation(owner, path, metadata, name)
     if owner.get('operation') in COMPOUND:
         require(not FIELDS.intersection(marker) and not FIELDS.intersection(owner), 'interval-operation')
-        validate_compound(path.name, owner)
+        validate_compound(path.name, owner, metadata.get('transaction'))
         _native.check_helpers(owner, {'verify-package', 'discover', 'mount', 'unmount'})
         if marker.get('state') == 'mounted':
             require(owner['originally_mounted'] is True
@@ -207,7 +207,7 @@ class Index:
                 require(name == active_compound and record.get('operation') in COMPOUND
                         and record.get('phase') in ('prepared', 'unmount-attempted')
                         and record.get('bridge_attempted') is False, 'interval-unresolved-action')
-                validate_compound(path.name, record)
+                validate_compound(path.name, record, metadata.get('transaction'))
                 _native.check_helpers(record, {'verify-package', 'discover', 'mount', 'unmount'})
             if not versioned(record):
                 continue
@@ -246,8 +246,12 @@ class Index:
                 require(current not in visiting, 'interval-reference-cycle')
                 visiting.add(current); trail.append(current); current = predecessors[current]
             checked.update(trail)
-        carries = {}
-        roots = {}
+        # Absence without a consumed guard leaves the origin open. A later
+        # helper-free operation can obtain its own guard along this unique
+        # linear chain; it never repairs or supplies a guard to an old record.
+        absent_links, states, members, absence_roots = {}, {}, {}, {}
+        self.unresolved_absence, self.fresh_resolutions = set(), set()
+        self.incoming = incoming
         for name, value in self.tokens.items():
             record = records[name]
             origin = value['mount_operation']
@@ -256,32 +260,52 @@ class Index:
             if record['operation'] == 'native-mount':
                 continue
             before, after, guard, closed = _chain_member(record, path, metadata, name)
+            members[name] = (before, after, guard, closed)
             require(before is None or _same_evidence(before, value['observation']), 'interval-observation')
-            if not closed:
+            if after is not None:
                 continue
             if before is not None:
-                require(origin not in roots, 'interval-competing-close')
-                roots[origin] = name
-                self.closes[origin] = name
-                self.closed_guards.append(guard)
+                require(origin not in absence_roots, 'interval-competing-close')
+                absence_roots[origin] = name
+                if closed:
+                    require(origin not in self.closes, 'interval-competing-close')
+                    self.closes[origin] = name
+                    self.closed_guards.append(guard)
+                    states[name] = 'closed'
+                else:
+                    states[name] = 'unresolved'
+                    self.unresolved_absence.add(name)
             else:
-                ref = record.get('previous_unresolved')
-                require(type(ref) is dict and type(ref.get('id')) is str and ref['id'] in records, 'interval-carry')
-                prior = records[ref['id']]
-                require(_same_evidence(ref, dict(id=prior['id'], operation=prior['operation'], outcome=prior['outcome'],
-                            record=str(path / 'native-operations' / prior['id'] / 'record.json')))
-                        and _same_evidence(prior.get('ordinary_interval'), value)
-                        and _same_evidence(prior.get('current_guard'), guard)
-                        and prior.get('observed_mount', False) is None, 'interval-carry')
-                carries[name] = prior['id']
-        # Memoize carry ancestry once. No recursive or per-origin traversal.
-        resolved = set(roots.values())
-        for start in carries:
+                previous = predecessors.get(name)
+                require(previous in self.tokens
+                        and records[previous].get('operation') == 'native-unmount'
+                        and _same_evidence(self.tokens[previous], value)
+                        and records[previous].get('observed_mount', False) is None,
+                        'interval-carry')
+                absent_links[name] = previous
+        # Each suffix is resolved once; graph size is already Admission-bounded.
+        for start in absent_links:
             chain, visiting, current = [], set(), start
-            while current not in resolved:
-                require(current not in visiting and current in carries, 'interval-carry')
-                visiting.add(current); chain.append(current); current = carries[current]
-            resolved.update(chain)
+            while current not in states:
+                require(current not in visiting and current in absent_links, 'interval-carry')
+                visiting.add(current); chain.append(current); current = absent_links[current]
+            for name in reversed(chain):
+                previous = absent_links[name]
+                guard = members[name][2]
+                if states[previous] == 'unresolved':
+                    if guard is None:
+                        states[name] = 'unresolved'
+                        self.unresolved_absence.add(name)
+                    else:
+                        origin = self.tokens[name]['mount_operation']
+                        require(origin not in self.closes, 'interval-competing-close')
+                        self.closes[origin] = name
+                        self.closed_guards.append(guard)
+                        self.fresh_resolutions.add(name)
+                        states[name] = 'closed'
+                else:
+                    require(guard is not None and _same_evidence(guard, members[previous][2]), 'interval-carry')
+                    states[name] = 'closed'
         from . import _native_recovery as recovery
         from ._native_binding import _pair_guard, _chain_observation
         for name, record in records.items():
@@ -325,7 +349,24 @@ class Index:
         self.open = set(self.origins) - set(self.closes)
 
 
-def capture(store, path, metadata, target, observation):
+def absent_owner(index, pending, value, *, allow_unresolved=False):
+    """Check a terminal absent owner; unresolved evidence grants only a retry."""
+    from ._native_binding import _same_evidence
+    require(type(pending) is dict and pending.get('operation') == 'native-unmount'
+            and pending.get('observed_mount', False) is None
+            and pending.get('id') in index.records
+            and _same_evidence(index.records[pending['id']], pending)
+            and _same_evidence(pending.get('ordinary_interval'), value)
+            and not index.incoming.get(pending['id']), 'interval-carry')
+    origin = value['mount_operation']
+    if pending['id'] in index.unresolved_absence:
+        require(allow_unresolved and index.open == {origin}, 'interval-carry')
+    else:
+        require(origin in index.closes and not index.open
+                and pending.get('current_guard') is not None, 'interval-carry')
+
+
+def capture(store, path, metadata, target, observation, *, unmount_recovery=False, captured=None):
     """Read one admitted inventory before allocating an ordinary unmount owner."""
     from ._native_binding import _same_evidence, _chain_observation
     a = Admission(store.root)
@@ -355,14 +396,14 @@ def capture(store, path, metadata, target, observation):
                             and versioned(marker) and _same_evidence(marker.get('target'), target)
                             and _same_evidence(_chain_observation(marker.get('observation'), path, metadata), value['observation']), 'interval-marker')
             else:
-                require(pending is not None and pending.get('operation') == 'native-unmount'
-                        and pending.get('observed_mount', False) is None and origin in index.closes
-                        and not index.open, 'interval-carry')
+                absent_owner(index, pending, value, allow_unresolved=unmount_recovery)
         else:
             require(not index.open, 'interval-missing')
             if observation is not None and FIELDS.intersection(marker):
                 require(versioned(marker) and 'ordinary_interval' not in marker and pending is not None, 'interval-marker')
         a.check()
+        if captured is not None:
+            captured['predecessor'] = pending
         return value
     finally:
         a.close()
@@ -383,7 +424,7 @@ def check_input(store, path, metadata, target, observation, value, *, owner):
         a.close()
 
 
-def recheck_capture(store, path, metadata, operation):
+def recheck_capture(store, path, metadata, operation, *, expected_predecessor):
     from ._native_binding import _same_evidence
     a = Admission(store.root)
     try:
@@ -392,12 +433,24 @@ def recheck_capture(store, path, metadata, operation):
         require(_same_evidence(own, operation.record) and own.get('outcome') == 'prepared'
                 and own.get('helpers') == [] and own.get('child_pending') is False
                 and _same_evidence(a.read(operation.journal), own), 'interval-owner-conflict')
+        reference = own.get('previous_unresolved')
+        if expected_predecessor is None:
+            require(reference is None, 'interval-owner-conflict')
+        else:
+            previous = expected_predecessor['id']
+            require(_same_evidence(records.get(previous), expected_predecessor)
+                    and _same_evidence(reference, dict(id=previous,
+                        operation=expected_predecessor['operation'], outcome=expected_predecessor['outcome'],
+                        record=str(path / 'native-operations' / previous / 'record.json'))), 'interval-owner-conflict')
         index = Index(records, path, metadata)
         value = own.get('ordinary_interval')
         if value is not None and own['before_mount'] is not None:
             origin = value['mount_operation']
             require(index.open == {origin} and _same_evidence(index.origins[origin], value), 'interval-open-conflict')
-        elif value is None:
+        elif value is not None:
+            require(own['operation'] == 'native-unmount', 'interval-operation')
+            absent_owner(index, expected_predecessor, value, allow_unresolved=True)
+        else:
             require(not index.open, 'interval-missing')
         a.check()
     finally:

@@ -335,3 +335,44 @@ root for further lifecycle use. It does not prove historical unmount order, reco
 missing content, or prove that earlier acknowledged writes survived. Prepared or
 unknown children, missing guard evidence and incomplete compound operations remain
 subject to their own recovery requirements.
+
+Managed native activation uses a versioned, one-use `rw,owners` request in the
+already granted resource directory. Probe and load hold an ordinary ROOT_ONLY,
+read-only core admission. They do not obtain a writable descriptor or create
+scratch files. Activation requires the complete supported option stream, a
+current controller lease and request bound to the operation, transaction,
+workspace, backing identity and exact selected anchor, plus a successfully
+activated, non-revoked original resource scope. An absent request stays read-only;
+malformed, stale, conflicting and replayed requests do not authorize promotion.
+
+The consumer validates under a shared gate. Observing the controller's held
+lease at that point transfers one bounded activation attempt; a later controller
+exit cannot retroactively cancel that transfer. Exclusive claim creation prevents
+reuse. A claim can remain after a subsequent write-open or admission failure;
+it is consumption evidence, never fresh recovery authority. These records provide
+cooperative same-account authority, not cryptographic authentication.
+
+Activation opens a separate writable descriptor through the unchanged resource,
+revalidates its identity and ROOT_ONLY anchor, and retains the original read-only
+file description as the exclusive lock owner until all I/O stops. The adapter
+admits contextual writes only after this transition, retaining that mode rather
+than relying on the resource's writable getter. Owner, ACL, caller-context and
+revocation checks still apply. A failed promoted activation blocks new callbacks,
+drains already admitted callbacks and consumes the handle before returning its
+failure. Final OS writable and owner-enforcing mount checks remain mandatory;
+offline activation tests do not establish mounted flag or grant behavior.
+
+New ordinary operations and each new compound remount attempt record activation
+protocol 1 before dispatch. History validation uses that exact operation or
+attempt's version and guard. Historical attempts without this protocol retain
+only their exact historical command forms, without rewriting their receipts.
+Bounded original and later mount observations are retained separately for
+diagnostics; neither can authorize recovery or writable activation.
+
+If an ordinary unmount helper succeeds but the current image guard remains busy,
+the absent observation does not close its lifecycle interval. An explicit unmount
+retry can acquire a fresh guard without launching another helper. The new
+operation owns that closure; earlier incomplete records remain unchanged.
+Mounting and offline archive authority remain blocked until this guarded
+resolution completes. Ambiguous helper ownership, changed predecessors, and
+competing interval histories remain refusals.

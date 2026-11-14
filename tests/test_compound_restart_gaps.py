@@ -46,7 +46,7 @@ class CompoundRestartGaps(unittest.TestCase):
         anchor = {'generation': 2, 'root_digest': '4' * 64, 'committed_end': 16384}
         receipt = dict(status=0, poisoned=False, transaction_active=False,
                        device=target['file'][0], inode=target['file'][1], uuid=target['uuid'], **anchor)
-        guard_receipt = dict(receipt, core_consumed=True, parent_close_errno=0)
+        guard_receipt = dict(receipt, physical_end=anchor['committed_end'], core_consumed=True, parent_close_errno=0)
         # Explicit doubles: these receipts describe the simulated guard/bridge,
         # never an actual image transaction or close.
         catalog = ['base'] if action == 'rollback' else []
@@ -66,6 +66,7 @@ class CompoundRestartGaps(unittest.TestCase):
                         receipt=copy.deepcopy(receipt), close_receipt=copy.deepcopy(receipt))
         with self.compound_controller_fixture() as state:
             metadata = {'id': workspace, 'backend': 'native-image', 'ownership': 'store-created',
+                        'transaction': uuid.uuid4().hex,
                         'state': 'installed', 'controller_profile': 'production', 'native_host': str(_native.HOST)}
             _native._persist(path / 'meta.json', metadata)
             _native._persist(path / 'native-install.json', {'complete': True, 'first_mount_attempted': True})
@@ -128,7 +129,7 @@ class CompoundRestartGaps(unittest.TestCase):
         self.assertEqual(record['outcome'], 'complete')
         self.assertEqual(case['bridge'].call_count, 1)
         self.assertFalse(case['journal'].exists())
-        recovery.validate_compound(case['workspace'], record)
+        recovery.validate_compound(case['workspace'], record, core.read_json(case['path'] / 'meta.json')['transaction'])
 
     def status(self, case, before):
         journal = case['journal'].read_bytes()
@@ -457,7 +458,14 @@ class CompoundRestartGaps(unittest.TestCase):
                     self.assertEqual(case['bridge'].call_count, 1)
                     self.assertEqual(case['state']['commands'], commands)
                     if failure in ('nested', 'incompatible', 'child', 'missing-terminal', 'missing-qualification', 'missing-usability', 'missing-guard'):
-                        self.assertIsNone(self.status(case, record)['next_action'])
+                        if failure in ('nested', 'incompatible'):
+                            self.assertIsNone(self.status(case, record)['next_action'])
+                        else:
+                            unchanged = {p:p.read_bytes() for p in self.store.root.rglob('*') if p.is_file()}
+                            with patch.object(recovery, 'ready') as ready, patch.object(_native, 'observe') as observe:
+                                self.assertIsNone(self.status(case, record)['next_action'])
+                                ready.assert_not_called(); observe.assert_not_called()
+                            self.assertEqual(unchanged, {p:p.read_bytes() for p in self.store.root.rglob('*') if p.is_file()})
 
     def test_completed_archives_never_restore_access(self):
         for action in ('snapshot', 'rollback'):
