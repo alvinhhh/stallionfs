@@ -544,13 +544,14 @@ class Workspaces(unittest.TestCase):
         seed = self.prepare()
         original_guard = _image.with_backing_guard
         consumed = []
-        def guarded(target, callback):
+        def guarded(target, callback, expected_anchor=None):
             tokens = []
             def held(token):
                 tokens.append(token)
                 return callback(token)
             try:
-                return original_guard(target, held)
+                return (original_guard(target, held) if expected_anchor is None
+                        else original_guard(target, held, expected_anchor))
             finally:
                 if tokens: consumed.append(tokens[0].close_result)
         with self.native_controller_fixture(), patch('stallionfs._image.with_backing_guard', side_effect=guarded), \
@@ -572,6 +573,12 @@ class Workspaces(unittest.TestCase):
         proof = read_json(path / 'native-install.json')
         self.assertEqual(proof['previous_installation']['guard'], consumed[0])
         self.assertTrue(proof['complete'])
+        target = _native.installed_target(self.store, path, read_json(path / 'meta.json'))
+        observed = _native.guarded(target)
+        wrong = {key: observed[key] for key in ('generation', 'committed_end', 'root_digest')}
+        wrong['generation'] += 1
+        with patch('stallionfs._image.with_backing_guard', side_effect=guarded):
+            with self.assertRaises(OSError): _native.guarded(target, expected_anchor=wrong)
 
     def test_native_unmount_error_and_busy_guard_never_grant_closure(self):
         from stallionfs import _native
@@ -1215,7 +1222,7 @@ class Workspaces(unittest.TestCase):
             core.write_json(reference / 'meta.json', {'backend': 'fixture'})
             cases = [('selected-journal', journal), ('completion', self.store._state(workspace)),
                 ('neighbor', neighbor), ('reference-metadata', reference / 'meta.json'),
-                ('metadata', path / 'meta.json'),
+                ('metadata', path / 'meta.json'), ('binding', path / 'native-binding.json'),
                 ('creation-proof', path / 'native-create.json'), ('installation-proof', path / 'native-install.json'),
                 ('location-proof', path / 'native-location.json'),
                 ('protection', self.store.root / 'protected' / (workspace + '.json')),
@@ -1248,7 +1255,7 @@ class Workspaces(unittest.TestCase):
             # With no pending purge, these same proof reads are delegated through
             # installed_target/ready; they still refuse before any progress write.
             journal.unlink()
-            for name in ('native-create.json', 'native-install.json', 'native-location.json'):
+            for name in ('native-create.json', 'native-install.json', 'native-location.json', 'native-binding.json'):
                 target = path / name; saved = target.read_bytes()
                 target.write_bytes(saved + b' ' * (limit + 1 - len(saved)))
                 with patch('stallionfs.core.json.loads', side_effect=decoding), \
@@ -1267,6 +1274,33 @@ class Workspaces(unittest.TestCase):
             self.assertIsNone(core._json_read_limit.get())
             self.assertEqual(core.read_json(target)['id'], workspace)
             self.assertTrue(self.store.purge('trash', workspace, yes=True)['cleanup_complete'])
+
+    def test_native_purge_admission_aggregate_budgets_never_write_failure(self):
+        from stallionfs import core, _native, _native_purge, _native_create_recovery as recovery
+        seed = self.prepare()
+        with self.native_controller_fixture(), self.native_wall_clock() as now:
+            workspace, path = self.native_purge_fixture(seed, now)
+            record = self.store.purge('trash', workspace)['native_operation']
+            _native._persist(self.store.root / 'journals' / (workspace + '.json'), record)
+            before = {str(p): p.read_bytes() for p in self.store.root.rglob('*.json')}
+            for setting in ('MAX_TOTAL_BYTES', 'MAX_ENTRIES'):
+                # Exercise real bounded admission after the pending record has been
+                # loaded, so the public failure handler must suppress its receipt.
+                def admit(*args, **kwargs):
+                    admission = recovery.Admission(self.store.root)
+                    try:
+                        if setting == 'MAX_ENTRIES': admission.names(self.store.root)
+                        else: admission.read(self.store.root / 'store.json')
+                    finally: admission.close()
+                    self.fail('budget did not refuse')
+                with self.subTest(setting=setting), patch.object(recovery, setting, 0), \
+                     patch.object(_native_purge, 'parents', side_effect=admit), \
+                     patch.object(_native_purge, 'failure', side_effect=AssertionError('failure receipt')), \
+                     patch('stallionfs._native._persist', side_effect=AssertionError('failure write')):
+                    with self.assertRaises(core.MetadataLimitError):
+                        self.store.purge('trash', workspace, yes=True)
+                self.assertEqual(before, {str(p): p.read_bytes() for p in self.store.root.rglob('*.json')})
+                self.assertTrue((path / 'image.sfs').exists())
 
     def test_native_purge_pending_move_bounds_future_proofs_before_recovery(self):
         from stallionfs import _native, _native_purge, core

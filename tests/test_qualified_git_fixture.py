@@ -218,7 +218,7 @@ class TypedFeasibility(unittest.TestCase):
                 fixture.save(fixture.owned / 'native-create.json', created)
                 authority.installed(fixture.owned, {'origin': fixture.meta})
                 authority.retained({'origin': fixture.meta, 'proof': created},
-                                   dict(fixture.target, parent=fixture.target['object']), fixture.workspace)
+                                   dict(fixture.target, directory=str(fixture.owned), parent=fixture.target['object']), fixture.workspace)
                 for key in ('runtime', 'executable', 'argv', 'environment', 'reaped', 'streams_durable'):
                     bad = copy.deepcopy(created)
                     if key == 'runtime': bad['writer']['actors'][0][key]['input_inventory_sha256'] = ARM

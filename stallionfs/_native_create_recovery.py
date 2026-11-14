@@ -32,6 +32,15 @@ class Refusal(core.StallionError):
         self.code, self.path = code, str(path) if path is not None else None
 
 
+class BudgetRefusal(Refusal, core.MetadataLimitError):
+    """Admission exhaustion with structured diagnostics and public no-write semantics."""
+
+
+def budget_require(condition, code, path):
+    if not condition:
+        raise BudgetRefusal(code, path)
+
+
 def require(condition, code, path=None):
     if not condition:
         raise Refusal(code, path)
@@ -115,7 +124,7 @@ class Admission:
         with os.scandir(fd) as entries:
             for item in entries:
                 self.entries += 1
-                require(self.entries <= MAX_ENTRIES, 'entry-budget', path)
+                budget_require(self.entries <= MAX_ENTRIES, 'entry-budget', path)
                 result.append(item.name)
         self.check(path)
         return sorted(result)
@@ -126,17 +135,19 @@ class Admission:
         try:
             before = os.fstat(fd)
             require(safe(before), 'unsafe-metadata', path)
-            require(before.st_size <= MAX_DOCUMENT_BYTES, 'document-budget', path)
+            scoped_limit = core._json_read_limit.get()
+            limit = MAX_DOCUMENT_BYTES if scoped_limit is None else min(MAX_DOCUMENT_BYTES, scoped_limit)
+            budget_require(before.st_size <= limit, 'document-budget', path)
             data = bytearray()
             while True:
-                allowance = min(MAX_DOCUMENT_BYTES - len(data), MAX_TOTAL_BYTES - self.bytes)
+                allowance = min(limit - len(data), MAX_TOTAL_BYTES - self.bytes)
                 block = os.read(fd, min(65536, allowance + 1))
                 if not block:
                     break
                 data.extend(block)
                 self.bytes += len(block)
-                require(len(data) <= MAX_DOCUMENT_BYTES, 'document-budget', path)
-                require(self.bytes <= MAX_TOTAL_BYTES, 'read-budget', path)
+                budget_require(len(data) <= limit, 'document-budget', path)
+                budget_require(self.bytes <= MAX_TOTAL_BYTES, 'read-budget', path)
             after = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
             require(safe(after) and (pair(before), before.st_size, before.st_mtime_ns, before.st_ctime_ns)
                     == (pair(after), after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'metadata-changed', path)
@@ -169,7 +180,7 @@ class Admission:
         if self.exists(path):
             self.read(path)  # Refuse aliases and hardlinked metadata before replacement.
         data = json.dumps({'format': 1, **value}, sort_keys=True, allow_nan=False).encode() + b'\n'
-        require(len(data) <= MAX_DOCUMENT_BYTES, 'document-budget', path)
+        budget_require(len(data) <= MAX_DOCUMENT_BYTES, 'document-budget', path)
         temporary = '.' + path.name + '.' + uuid.uuid4().hex
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=parent)

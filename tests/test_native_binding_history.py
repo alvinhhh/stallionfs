@@ -244,8 +244,12 @@ class BindingHistory(unittest.TestCase):
             root = Path(name).resolve(); directory = root / 'workspaces' / self.path.name
             directory.mkdir(parents=True, mode=0o700)
             fixture = root / 'fixture'
-            subprocess.run(['xcrun', 'clang', '-O1', '-Ifilesystem', 'tests/native_image_fixture.c',
-                            'filesystem/image.c', '-o', str(fixture)], check=True, capture_output=True)
+            repository = Path(__file__).resolve().parents[1]
+            compiled = subprocess.run(['xcrun', 'clang', '-O1', '-I' + str(repository / 'filesystem'),
+                            str(repository / 'tests/native_image_fixture.c'),
+                            str(repository / 'filesystem/image.c'), '-o', str(fixture)],
+                            cwd=root, capture_output=True, text=True, timeout=60)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
             subprocess.run([str(fixture), 'seed', str(directory)], check=True, capture_output=True)
             target = dict(directory=str(directory), component='image.sfs',
                           parent=base.recovery.pair(directory.stat()), file=None)
@@ -316,3 +320,410 @@ class BindingPublicationRecovery(unittest.TestCase):
         self.assertTrue((f.final / binding.NAME).exists())
 
 if __name__ == '__main__': unittest.main()
+
+class ResolvedMountHistory(unittest.TestCase):
+    def setUp(self):
+        import json
+        self.wire = json.loads((Path(__file__).parent / 'fixtures/native-resolved-mount-history.json').read_text())
+        self.path = Path(self.wire['mount']['target']['directory'])
+        target = self.wire['mount']['target']
+        self.meta = {'controller_profile': 'production', 'native_image': {
+            'uuid': target['uuid'], 'object': target['parent'], 'file': target['file']}}
+
+    def validate(self, wire=None):
+        wire = wire or self.wire
+        return binding.archive_anchor({wire[k]['id']: wire[k] for k in ('mount', 'unmount')},
+                                      self.path, self.meta, wire['marker'])
+
+    def test_full_legacy_shape_and_both_mount_spellings(self):
+        for flag in (False, True):
+            wire = copy.deepcopy(self.wire)
+            if flag: wire['mount']['helpers'][-1]['argv'].insert(1, '-F')
+            before = copy.deepcopy(wire)
+            self.assertEqual(self.validate(wire), wire['unmount']['current_guard'])
+            self.assertEqual(wire, before)
+            with self.assertRaises(core.StallionError):
+                binding.completed_operation(wire['mount'], self.path, self.meta, wire['mount']['id'])
+
+    def test_protocol_gate_and_modern_transport(self):
+        for member in ('mount', 'unmount'):
+            for version in (1, 4, None, True, '2', '3', 2.0):
+                wire = copy.deepcopy(self.wire); wire[member]['protocol'] = version
+                with self.subTest(member=member, version=version), self.assertRaises(core.StallionError):
+                    self.validate(wire)
+        for version in (2, 3):
+            wire = copy.deepcopy(self.wire)
+            for member in ('mount', 'unmount'): wire[member]['protocol'] = version
+            for h in wire['mount']['helpers']:
+                h.update(streams_eof=True, streams_durable=True, output_bytes=0)
+            self.validate(wire)
+            for index in range(3):
+                for field, values in {'streams_eof': [None, False], 'streams_durable': [None, False],
+                    'output_bytes': [None, True, 1.0, -1, 2097153], 'interrupted': [False, True],
+                    'stop_errors': [[]], 'collector_error': [None], 'stream_close_errors': [[]],
+                    'receipt_error': [None]}.items():
+                    for value in values:
+                        bad = copy.deepcopy(wire)
+                        if value is None and field in ('streams_eof', 'streams_durable', 'output_bytes'):
+                            bad['mount']['helpers'][index].pop(field)
+                        else: bad['mount']['helpers'][index][field] = value
+                        with self.subTest(version=version, index=index, field=field, value=value), self.assertRaises(core.StallionError):
+                            self.validate(bad)
+
+    def test_invalid_pair_fields_and_edges(self):
+        cases = {
+            'mount': {'workspace': ['9'*32], 'id': ['9'*32], 'operation': ['native-unmount','native-purge'],
+                'outcome': ['unknown','prepared'], 'previous_unresolved': [{}, {'id':'3'*32}],
+                'mount_attempted': [False, None], 'observed_mount': [{}, 'missing'], 'child_pending': [True]},
+            'unmount': {'operation': ['native-mount','native-purge'], 'outcome': ['incomplete','unknown'],
+                'already_absent': [False], 'before_mount': [{}, 'missing'], 'observed_mount': [{}, 'missing'],
+                'child_pending': [True], 'previous_unresolved': [None, {}, {'id':'3'*32}]}}
+        for member, fields in cases.items():
+            for field, values in fields.items():
+                for value in values:
+                    wire = copy.deepcopy(self.wire)
+                    if value == 'missing': wire[member].pop(field)
+                    else: wire[member][field] = value
+                    with self.subTest(member=member, field=field, value=value), self.assertRaises(core.StallionError):
+                        self.validate(wire)
+        for field, value in [('id','9'*32), ('operation','native-unmount'), ('outcome','complete'),
+                             ('record','/other/record.json'), ('extra',True)]:
+            wire = copy.deepcopy(self.wire); wire['unmount']['previous_unresolved'][field] = value
+            with self.subTest(reference=field), self.assertRaises(core.StallionError): self.validate(wire)
+        for member in ('mount','unmount'):
+            for field in ('target','current_guard'):
+                for key, value in ({'directory':'/other', 'component':'other', 'uuid':'9'*32,
+                                     'file':[101,300], 'parent':[101,200]} if field == 'target' else
+                                    {'device':101,'inode':301,'uuid':'9'*32,'core_consumed':False,
+                                     'parent_close_errno':5,'poisoned':True,'transaction_active':True,
+                                     'root_digest':'6'*64,'generation':3}).items():
+                    wire = copy.deepcopy(self.wire); wire[member][field][key] = value
+                    with self.subTest(member=member, field=field, key=key), self.assertRaises(core.StallionError): self.validate(wire)
+
+    def test_helpers_argv_and_ambiguous_incoming_edges(self):
+        for index in range(3):
+            for field,value in [('reaped',False),('child_pending',True),('outcome','unknown'),
+                                ('outcome','not-launched'),('pid',None),('returncode',0 if index==2 else 72)]:
+                wire=copy.deepcopy(self.wire); wire['mount']['helpers'][index][field]=value
+                with self.subTest(index=index,field=field), self.assertRaises(core.StallionError):self.validate(wire)
+        argv=self.wire['mount']['helpers'][-1]['argv']
+        for bad in [[],argv[:-1],argv+['extra']] + [argv[:i]+['wrong']+argv[i+1:] for i in range(len(argv))]:
+            wire=copy.deepcopy(self.wire);wire['mount']['helpers'][-1]['argv']=bad
+            with self.subTest(argv=bad), self.assertRaises(core.StallionError):self.validate(wire)
+        for ref in ({'id':'2'*32}, {'record':self.wire['unmount']['previous_unresolved']['record']}):
+            extra=copy.deepcopy(self.wire['unmount']);extra.update(id='8'*32,previous_unresolved=ref)
+            records={self.wire[k]['id']:self.wire[k] for k in ('mount','unmount')};records[extra['id']]=extra
+            with self.assertRaises(core.StallionError):binding.archive_anchor(records,self.path,self.meta,self.wire['marker'])
+        wire=copy.deepcopy(self.wire);wire['mount']['helpers'].reverse()
+        with self.assertRaises(core.StallionError):self.validate(wire)
+
+    def test_marker_replacement_keeps_successor_anchor_in_conflicts(self):
+        for key,value in [('root_digest','6'*64),('committed_end',40000000)]:
+            wire=copy.deepcopy(self.wire);wire['marker']['operation']='8'*32
+            wire['marker']['current_guard'][key]=value
+            with self.assertRaisesRegex(core.StallionError,'conflicting-anchors'):self.validate(wire)
+        wire=copy.deepcopy(self.wire);wire['marker']['operation']='8'*32
+        self.validate(wire)
+        wire['marker']['current_guard'].update(generation=3,root_digest='6'*64)
+        self.assertEqual(self.validate(wire)['generation'],3)
+        wire['marker']['operation']=wire['unmount']['id']
+        with self.assertRaises(core.StallionError):self.validate(wire)
+
+    def owned(self):
+        h=BindingHistory();h.setUp();self.addCleanup(h.doCleanups)
+        target=binding.historical_target(h.path,h.meta)
+        guard=_native.guarded(target)
+        wire=copy.deepcopy(self.wire)
+        old=str(self.path)
+        def translate(value):
+            if type(value) is str:return value.replace(old,str(h.path)).replace(self.path.name,h.path.name)
+            if type(value) is dict:return {k:translate(v) for k,v in value.items()}
+            if type(value) is list:return [translate(v) for v in value]
+            return value
+        wire=translate(wire)
+        for member in wire:
+            wire[member]['target']=copy.deepcopy(target);wire[member]['current_guard']=copy.deepcopy(guard)
+        (h.path/'native-operations').mkdir(mode=0o700)
+        for member in ('mount','unmount'):
+            directory=h.path/'native-operations'/wire[member]['id'];directory.mkdir(parents=True,mode=0o700)
+            h.f.save(directory/'record.json',wire[member])
+        h.f.save(h.path/'native-mount.json',wire['marker'])
+        return h
+
+    def test_owned_enrollment_translation_adoption_and_byte_preservation(self):
+        for mode in ('legacy','bound','adopt'):
+            h=self.owned()
+            if mode!='bound':h.h.sidecar.unlink()
+            paths=[h.path/n for n in ('meta.json','native-create.json','native-install.json','native-mount.json')]
+            paths+=list((h.path/'native-operations').glob('*/record.json'))
+            before={p:p.read_bytes() for p in paths}
+            with self.subTest(mode=mode), h.h.renumber() if mode!='legacy' else contextlib.nullcontext():
+                if mode=='adopt':
+                    self.assertEqual(h.h.adopt()['status'],'current-image-adopted')
+                    sidecar=h.h.sidecar.read_bytes()
+                    self.assertTrue(h.h.adopt()['already_adopted'])
+                    self.assertEqual(sidecar,h.h.sidecar.read_bytes())
+                else:_native.recover_install(h.store,h.path,h.meta)
+            self.assertEqual(before,{p:p.read_bytes() for p in paths})
+
+    def test_owned_pending_mount_and_fresh_guard_failure_prevent_publication(self):
+        for mode in ('journal','mounted','unknown','guard','interrupt','unrelated'):
+            h=self.owned();h.h.sidecar.unlink()
+            if mode=='journal':h.f.save(h.f.journal,{'operation':'native-unmount'})
+            if mode in ('mounted','unknown'):
+                marker=h.f.read(h.path/'native-mount.json');marker['state']=mode;h.f.save(h.path/'native-mount.json',marker)
+            if mode=='unrelated':
+                row=copy.deepcopy(self.wire['unmount']);row.update(id='8'*32,outcome='incomplete')
+                directory=h.path/'native-operations'/row['id'];directory.mkdir(mode=0o700);h.f.save(directory/'record.json',row)
+            error=KeyboardInterrupt if mode=='interrupt' else core.StallionError('guard failed')
+            ctx=patch.object(_native,'guarded',side_effect=error) if mode in ('guard','interrupt') else contextlib.nullcontext()
+            with self.subTest(mode=mode),ctx:
+                if mode=='interrupt':
+                    with self.assertRaises(KeyboardInterrupt):h.h.adopt()
+                else:self.assertEqual(h.h.adopt()['status'],'blocked')
+            self.assertFalse(h.h.sidecar.exists())
+
+    def test_common_bad_close_anchor_and_marker_target_refuse(self):
+        for field,value in [('core_consumed',False),('status',5),('parent_close_errno',5),
+                            ('generation',-1),('root_digest','invalid'),('transaction_active',True)]:
+            wire=copy.deepcopy(self.wire)
+            for member in wire:wire[member]['current_guard'][field]=value
+            with self.subTest(field=field),self.assertRaises(core.StallionError):self.validate(wire)
+        for field,value in [('parent',[101,200]),('directory','/other'),('component','other.sfs')]:
+            wire=copy.deepcopy(self.wire);wire['marker']['target'][field]=value
+            with self.subTest(field=field),self.assertRaises(core.StallionError):self.validate(wire)
+
+    def test_later_completed_catalog_selects_newer_close(self):
+        h=self.owned()
+        op=h.completed('native-snapshot')
+        newer=dict(h.f.anchor,generation=3,committed_end=32768,root_digest='a'*64)
+        for key in ('receipt','close_receipt'):
+            op.record['native_image_result'][key].update(newer,physical_end=32768)
+        h.f.save(op.directory/'record.json',op.record)
+        h.f.guard_anchor=newer
+        h.h.sidecar.unlink()
+        _native.recover_install(h.store,h.path,h.meta)
+        self.assertEqual(h.f.read(h.h.sidecar)['anchor'],newer)
+
+    def test_owned_later_unmount_marker_still_admits_original_pair(self):
+        h=self.owned()
+        original={p:p.read_bytes() for p in (h.path/'native-operations').glob('*/record.json')}
+        # Exercise the public already-absent unmount, which replaces the marker.
+        _native.unmount_locked(h.store,h.path,h.meta)
+        self.assertNotEqual(h.f.read(h.path/'native-mount.json')['operation'],self.wire['unmount']['id'])
+        h.h.sidecar.unlink()
+        _native.recover_install(h.store,h.path,h.meta)
+        self.assertEqual(original,{p:p.read_bytes() for p in original})
+
+    def test_exceptional_guard_scalar_schema_on_each_witness_and_shared(self):
+        scopes = [('mount',), ('unmount',), ('marker',), ('mount', 'unmount', 'marker')]
+        for members in scopes:
+            for field in ('status', 'parent_close_errno', 'device', 'inode', 'generation',
+                          'committed_end', 'physical_end', 'core_consumed', 'poisoned', 'transaction_active'):
+                original = self.wire['mount']['current_guard'][field]
+                values = [None, str(original), float(original), True, False, -1, 1 << 64, 0.5]
+                if field in ('status', 'parent_close_errno'): values += [1, 5]
+                for value in values:
+                    if type(value) is type(original) and value == original: continue
+                    wire = copy.deepcopy(self.wire)
+                    for member in members: wire[member]['current_guard'][field] = value
+                    with self.subTest(members=members, field=field, value=value, kind=type(value).__name__):
+                        with self.assertRaises(core.StallionError): self.validate(wire)
+                wire = copy.deepcopy(self.wire)
+                for member in members: wire[member]['current_guard'].pop(field)
+                if field != 'physical_end':
+                    with self.subTest(members=members, missing=field), self.assertRaises(core.StallionError):
+                        self.validate(wire)
+
+    def test_exceptional_target_scalar_schema_on_each_witness_and_shared(self):
+        for members in [('mount',), ('unmount',), ('marker',), ('mount', 'unmount', 'marker')]:
+            for field in ('parent', 'file'):
+                for index in (0, 1):
+                    original = self.wire['mount']['target'][field][index]
+                    for value in (float(original), True, False, str(original), -1, None, 0.5):
+                        wire = copy.deepcopy(self.wire)
+                        for member in members: wire[member]['target'][field][index] = value
+                        with self.subTest(members=members, field=field, index=index, value=value):
+                            with self.assertRaises(core.StallionError): self.validate(wire)
+
+    def test_full_evidence_comparison_preserves_nested_scalar_types(self):
+        for field in ('target', 'current_guard'):
+            wire = copy.deepcopy(self.wire)
+            for member in wire: wire[member][field]['extra'] = {'nested': [0, {'value': 1}]}
+            self.validate(wire)
+            for member in ('mount', 'unmount', 'marker'):
+                for value in (True, 1.0):
+                    bad = copy.deepcopy(wire)
+                    bad[member][field]['extra']['nested'][1]['value'] = value
+                    with self.subTest(field=field, member=member, value=value):
+                        with self.assertRaises(core.StallionError): self.validate(bad)
+
+    def test_malformed_evidence_refuses_before_owned_binding_publication(self):
+        cases = [('mount', 'target', 'file'), ('mount', 'current_guard', 'generation'),
+                 ('all', 'current_guard', 'status'), ('all', 'current_guard', 'parent_close_errno'),
+                 ('all', 'current_guard', 'device'), ('all', 'current_guard', 'inode'),
+                 ('marker', 'target', 'parent')]
+        for member, section, field in cases:
+            h = self.owned(); h.h.sidecar.unlink()
+            paths = {k: h.path/'native-operations'/self.wire[k]['id']/'record.json'
+                     for k in ('mount', 'unmount')}
+            paths['marker'] = h.path/'native-mount.json'
+            for key in paths if member == 'all' else (member,):
+                row = h.f.read(paths[key])
+                if section == 'target': row[section][field][0] = float(row[section][field][0])
+                else: row[section][field] = False if field == 'status' else float(row[section][field])
+                h.f.save(paths[key], row)
+            before = {p: p.read_bytes() for p in paths.values()}
+            with self.subTest(member=member, section=section, field=field):
+                with patch.object(binding, 'publish', wraps=binding.publish) as publish:
+                    self.assertEqual(h.h.adopt()['status'], 'blocked')
+                    publish.assert_not_called()
+                self.assertFalse(h.h.sidecar.exists())
+                self.assertEqual(before, {p: p.read_bytes() for p in paths.values()})
+
+    def test_guard_string_schema_and_anchor_boundaries(self):
+        for members in [('mount',), ('unmount',), ('marker',), ('mount', 'unmount', 'marker')]:
+            for field in ('uuid', 'root_digest'):
+                for value in (None, False, 0, 1.0, [], {}, 'invalid'):
+                    wire = copy.deepcopy(self.wire)
+                    for member in members: wire[member]['current_guard'][field] = value
+                    with self.subTest(members=members, field=field, value=value):
+                        with self.assertRaises(core.StallionError): self.validate(wire)
+        for generation in (0, (1 << 64) - 1):
+            wire = copy.deepcopy(self.wire)
+            for member in wire: wire[member]['current_guard']['generation'] = generation
+            self.assertEqual(self.validate(wire)['generation'], generation)
+
+class ResolvedHistoryBudgets(unittest.TestCase):
+    def fixture(self):
+        source = ResolvedMountHistory()
+        source.setUp()
+        self.addCleanup(source.doCleanups)
+        h = source.owned()
+        h.h.sidecar.unlink()
+        return h, source
+
+    def test_history_budget_boundaries_and_publication_order(self):
+        from stallionfs import _native_create_recovery as admission
+        for member in ('mount', 'unmount', 'marker', 'additional'):
+            for budget in ('document', 'scoped', 'aggregate'):
+                with self.subTest(member=member, budget=budget):
+                    h, source = self.fixture()
+                    if member == 'additional':
+                        op = h.completed('native-snapshot')
+                        selected = op.directory / 'record.json'
+                    elif member == 'marker': selected = h.path / 'native-mount.json'
+                    else: selected = h.path / 'native-operations' / source.wire[member]['id'] / 'record.json'
+                    # Valid JSON whitespace makes the selected evidence the largest
+                    # document without changing its schema or archive eligibility.
+                    selected.write_bytes(selected.read_bytes() + b' ' * 32768)
+                    before = {p: p.read_bytes() for p in h.f.root.rglob('*.json')}
+                    a = admission.Admission(h.store.root)
+                    try:
+                        reads = []
+                        original_read = a.read
+                        def observed_read(path):
+                            value = original_read(path)
+                            reads.append((path, a.bytes))
+                            return value
+                        with patch.object(a, 'read', side_effect=observed_read):
+                            binding.exclusions(h.store, a, h.path, h.meta)
+                        total = a.bytes
+                    finally: a.close()
+                    size = selected.stat().st_size
+                    limit = total if budget == 'aggregate' else size
+                    def scope(value):
+                        if budget == 'scoped': return core.json_read_limit(value)
+                        return patch.object(admission, 'MAX_TOTAL_BYTES' if budget == 'aggregate' else 'MAX_DOCUMENT_BYTES', value)
+                    # Exact limits admit the complete archive set.
+                    a = admission.Admission(h.store.root)
+                    try:
+                        with scope(limit): binding.exclusions(h.store, a, h.path, h.meta)
+                    finally: a.close()
+                    # Enrollment shares evidence reads with exclusions; for the
+                    # aggregate case measure that prefix without bypassing reads.
+                    a = admission.Admission(h.store.root)
+                    try:
+                        binding.evidence(a, h.path, h.meta)
+                        prefix = a.bytes
+                    finally: a.close()
+                    exhausted = next(count for path, count in reads if path == selected) - 1 + prefix if budget == 'aggregate' else limit - 1
+                    with scope(exhausted), \
+                         patch.object(_native, 'guarded', side_effect=AssertionError('guard reached')), \
+                         patch.object(binding, 'publish', side_effect=AssertionError('publication reached')), \
+                         patch.object(_native, '_persist', side_effect=AssertionError('history write')):
+                        a = admission.Admission(h.store.root)
+                        try:
+                            with self.assertRaises(admission.Refusal) as caught:
+                                binding.enroll(h.store, a, h.path, h.meta, adopt=True)
+                            self.assertIsInstance(caught.exception, core.MetadataLimitError)
+                            self.assertEqual(caught.exception.code, 'read-budget' if budget == 'aggregate' else 'document-budget')
+                            self.assertIn(caught.exception.path, [str(p) for p in before])
+                            self.assertEqual(caught.exception.path, str(selected))
+                            diagnostic = admission.diagnostic(caught.exception)
+                            self.assertEqual(diagnostic['code'], caught.exception.code)
+                            self.assertEqual(diagnostic['path'], str(selected))
+                        finally: a.close()
+                        if budget != 'aggregate':
+                            result = h.h.adopt()
+                            self.assertEqual(result['status'], 'blocked')
+                            self.assertEqual(result['code'], 'document-budget')
+                            self.assertEqual(result['path'], str(selected))
+                    self.assertFalse(h.h.sidecar.exists())
+                    self.assertEqual(before, {p: p.read_bytes() for p in h.f.root.rglob('*.json')})
+
+    def test_malformed_history_remains_nonbudget_refusal(self):
+        from stallionfs import _native_create_recovery as admission
+        for members in (('mount',), ('marker',), ('mount', 'unmount', 'marker')):
+            h, source = self.fixture()
+            for member in members:
+                path = h.path / 'native-mount.json' if member == 'marker' else h.path / 'native-operations' / source.wire[member]['id'] / 'record.json'
+                row = h.f.read(path); row['current_guard']['status'] = False; h.f.save(path, row)
+            before = {p: p.read_bytes() for p in h.f.root.rglob('*.json')}
+            with self.subTest(members=members), patch.object(_native, 'guarded', side_effect=AssertionError('guard')), patch.object(binding, 'publish', side_effect=AssertionError('publish')):
+                a = admission.Admission(h.store.root)
+                try:
+                    with self.assertRaises(admission.Refusal) as caught:
+                        binding.enroll(h.store, a, h.path, h.meta, adopt=True)
+                    self.assertNotIsInstance(caught.exception, core.MetadataLimitError)
+                    self.assertEqual(caught.exception.code, 'binding-resolution-guard')
+                finally: a.close()
+            self.assertEqual(before, {p: p.read_bytes() for p in h.f.root.rglob('*.json')})
+
+    def test_public_pending_purge_history_budget_never_writes_failure(self):
+        import test_stallionfs
+        from stallionfs import _native_purge as purge, _native_create_recovery as admission
+        case = test_stallionfs.Workspaces()
+        case.setUp(); self.addCleanup(case.doCleanups)
+        seed = case.prepare()
+        with case.native_controller_fixture(), case.native_wall_clock() as now:
+            workspace, path = case.native_purge_fixture(seed, now)
+            record = case.store.purge('trash', workspace)['native_operation']
+            _native._persist(case.store.root / 'journals' / (workspace + '.json'), record)
+        h, source = self.fixture()
+        a = admission.Admission(h.store.root)
+        try:
+            binding.exclusions(h.store, a, h.path, h.meta)
+            total = a.bytes
+        finally: a.close()
+        before = {p: p.read_bytes() for root in (h.f.root, case.store.root) for p in root.rglob('*.json')}
+        # Inject at the pending-purge ingress seam. The admission
+        # itself loads and validates complete real-shaped owned history.
+        def history(*args):
+            a = admission.Admission(h.store.root)
+            try: binding.exclusions(h.store, a, h.path, h.meta)
+            finally: a.close()
+            self.fail('history budget did not refuse')
+        with patch.object(admission, 'MAX_TOTAL_BYTES', total - 1), \
+             patch.object(purge, 'parents', side_effect=history), \
+             patch.object(purge, 'failure', side_effect=AssertionError('failure write')), \
+             patch.object(_native, '_persist', side_effect=AssertionError('history write')), \
+             patch.object(_native, 'guarded', side_effect=AssertionError('guard')), \
+             patch.object(binding, 'publish', side_effect=AssertionError('publication')):
+            with self.assertRaises(admission.Refusal) as caught:
+                case.store.purge('trash', workspace, yes=True)
+            self.assertIsInstance(caught.exception, core.MetadataLimitError)
+            self.assertEqual(caught.exception.code, 'read-budget')
+            self.assertTrue(hasattr(caught.exception, 'native_candidate_result'))
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertTrue((path / 'image.sfs').exists())
