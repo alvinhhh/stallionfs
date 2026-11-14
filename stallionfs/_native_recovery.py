@@ -54,6 +54,7 @@ def validate_compound(workspace, record, transaction=None):
             or type(record.get('bridge_returned')) is not bool
             or type(record.get('child_pending')) is not bool
             or not isinstance(record.get('helpers'), list)
+            or not isinstance(record.get('profile'), str)
             or record.get('profile') not in _native.PROFILES
             or not isinstance(record.get('host'), str)):
         bad()
@@ -642,11 +643,13 @@ def _verify_final(store, path, metadata, operation):
 
 
 def compound_locked(store, path, metadata, action, name, *, operation_id=None, withdrawal=False):
-    target = ready(store, path, metadata)
-    if metadata.get('controller_profile') not in _native.PROFILES:
+    if (not isinstance(metadata.get('controller_profile'), str)
+            or metadata['controller_profile'] not in _native.PROFILES):
         raise core.StallionError('Unknown native controller profile')
     if operation_id is not None:
         record, pending = _load_compound(store, path, operation_id)
+    target = ready(store, path, metadata)
+    if operation_id is not None:
         expected = 'native-mounted-' + action
         if (record['operation'] != expected or record['name'] != name or record['target'] != target
                 or metadata['controller_profile'] != record['profile'] or metadata['native_host'] != record['host']):

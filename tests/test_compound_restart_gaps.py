@@ -1,5 +1,5 @@
 """Compound restart control flow with an owned fake namespace; no real mounts."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 import copy
 import errno
 import json
@@ -7,12 +7,114 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
 
 from stallionfs import core, _native, _native_recovery as recovery
 import test_stallionfs as fixtures
+
+
+class CompoundProfileAdmission(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='compound-profile-test-')
+        self.addCleanup(temporary.cleanup)
+        self.store = SimpleNamespace(root=Path(temporary.name))
+        self.workspace, self.operation = 'a' * 32, 'b' * 32
+        self.path = self.store.root / 'workspaces' / self.workspace
+        self.path.mkdir(parents=True)
+        self.journal = self.store.root / 'journals' / (self.workspace + '.json')
+        self.journal.parent.mkdir()
+        self.archive = self.path / 'native-operations' / self.operation / 'record.json'
+        self.archive.parent.mkdir(parents=True)
+        self.metadata = {'transaction': 'c' * 32, 'controller_profile': 'production'}
+        self.write(self.path / 'meta.json', self.metadata)
+
+    def write(self, path, value):
+        path.write_text(json.dumps({'format': 1, **value}))
+
+    def retained(self, pending, profile='production'):
+        target = {'directory': str(self.path), 'component': 'image.sfs',
+                  'parent': [1, 2], 'file': [3, 4], 'uuid': 'd' * 32}
+        record = dict(format=1, id=self.operation, workspace=self.workspace, operation=recovery.COMPOUND[0],
+                      phase='prepared', outcome='prepared', originally_mounted=False,
+                      bridge_attempted=False, bridge_returned=False, child_pending=False,
+                      helpers=[], profile=profile, host='/unvisited/Host', name='base',
+                      unmount_attempts=[], remount_attempts=[], target=target)
+        if not pending:
+            anchor = dict(generation=2, root_digest='4' * 64, committed_end=16384)
+            receipt = dict(status=0, poisoned=False, transaction_active=False,
+                           device=3, inode=4, uuid=target['uuid'], **anchor)
+            result = dict(ok=True, committed=True, commit_attempted=True, outcome='committed',
+                          close_attempted=True, guard_close_errno=0, path_errno=0,
+                          interrupted=False, deadline_expired=False, operation='snapshot',
+                          snapshot='base', receipt=receipt, close_receipt=copy.deepcopy(receipt))
+            record.update(phase='final-verified', outcome='complete', bridge_attempted=True,
+                          bridge_returned=True, committed_anchor=anchor, native_image_result=result,
+                          final_evidence={'observation': None})
+        if self.journal.exists(): self.journal.unlink()
+        self.write(self.journal if pending else self.archive, record)
+        return record
+
+    @contextmanager
+    def rejecting_io(self):
+        before = {p: p.read_bytes() for p in self.store.root.rglob('*') if p.is_file()}
+        with ExitStack() as stack:
+            for module, name in ((recovery, 'ready'), (_native, 'observe'),
+                                 (recovery, '_mounts_only_at'), (_native, 'guarded'),
+                                 (_native, 'installed_target'), (_native, 'resource_binding'),
+                                 (_native.Operation, 'command'), (core, 'native_operation'),
+                                 (_native.Operation, 'resume'), (_native, '_persist')):
+                spy = stack.enter_context(patch.object(module, name, side_effect=AssertionError(name)))
+                stack.callback(spy.assert_not_called)
+            yield
+        self.assertEqual(before, {p: p.read_bytes() for p in self.store.root.rglob('*') if p.is_file()})
+
+    def test_retained_unhashable_profiles_fail_closed(self):
+        for pending in (True, False):
+            for profile in ([], {}):
+                with self.subTest(pending=pending, profile=profile):
+                    record = self.retained(pending, profile)
+                    with self.rejecting_io():
+                        status = recovery.compound_status(self.store, self.path, self.metadata, self.operation)
+                        self.assertTrue(status['validation_failed'])
+                        self.assertEqual(status['native_operation'], record)
+                        self.assertEqual(status['pending'], pending)
+                        self.assertIsNone(status['next_action'])
+                        self.assertNotIn('disposition', status)
+                        self.assertNotIn('current_observation', status)
+                        with self.assertRaises(core.StallionError):
+                            recovery._load_compound(self.store, self.path, self.operation)
+                        for withdrawal in (False, True):
+                            with self.assertRaises(core.StallionError):
+                                recovery.compound_locked(self.store, self.path, self.metadata,
+                                    'snapshot', 'base', operation_id=self.operation, withdrawal=withdrawal)
+
+    def test_metadata_unhashable_profiles_fail_before_readiness(self):
+        self.retained(True)
+        for profile in ([], {}):
+            for operation_id, withdrawal in ((None, False), (self.operation, False), (self.operation, True)):
+                with self.subTest(profile=profile, operation=operation_id, withdrawal=withdrawal):
+                    metadata = dict(self.metadata, controller_profile=profile)
+                    with self.rejecting_io(), self.assertRaisesRegex(core.StallionError, 'controller profile'):
+                        recovery.compound_locked(self.store, self.path, metadata, 'snapshot', 'base',
+                                                 operation_id=operation_id, withdrawal=withdrawal)
+
+    def test_valid_profiles_preserve_strict_admission(self):
+        for profile in _native.PROFILES:
+            for pending in (True, False):
+                with self.subTest(profile=profile, pending=pending):
+                    record = self.retained(pending, profile)
+                    with self.rejecting_io():
+                        self.assertEqual(recovery._load_compound(self.store, self.path, self.operation),
+                                         (record, pending))
+                    with patch.object(recovery, 'ready', side_effect=RuntimeError('admitted readiness')) as ready:
+                        with self.assertRaisesRegex(RuntimeError, 'admitted readiness'):
+                            recovery.compound_locked(self.store, self.path,
+                                dict(self.metadata, controller_profile=profile), 'snapshot', 'base',
+                                operation_id=self.operation)
+                        ready.assert_called_once()
 
 
 class CompoundRestartGaps(unittest.TestCase):
