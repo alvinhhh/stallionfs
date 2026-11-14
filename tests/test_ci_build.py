@@ -1432,7 +1432,7 @@ class FetchPhases(unittest.TestCase):
     def test_workflow_fetch_budget_artifacts_and_sanitizer_coverage(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
         ordinary = job(text, 'test-execution')
-        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
+        self.assertIn("timeout-minutes: ${{ matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
         fetch = step(ordinary, 'Fetch exact qualified architecture component')
         self.assertIn('tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch', fetch)
         build = step(ordinary, 'Build current wheel with enforced Git cache reuse')

@@ -41,6 +41,21 @@ STALLIONFS_TEST_IMAGES=1 python3 -m unittest discover -s tests -v
 
 They create disposable APFS images, exercise mount recovery and fill a 1 GiB test volume. Allow at least 3 GiB of free space.
 
+### Hosted ImageSpace diagnostic
+
+The Checks `image-space-repeat` manual mode builds and admits the current installed wheel with the ordinary CI setup on macOS 26 ARM64 and Python 3.11. After pushing the reviewed commit to a branch, dispatch it with its full SHA:
+
+```sh
+gh workflow run checks.yml --repo alvinhhh/stallionfs --ref BRANCH \
+  -f mode=image-space-repeat -f expected-source-sha=FULL_COMMIT_SHA -f repeat-count=20
+```
+
+This repeats only `test_images_space.ImageSpace.test_volume_full_preserves_existing_data_and_other_images`, selecting `STALLIONFS_TEST_SNAPSHOT_OBSERVATION=enospc-sibling-detach`. The count accepts integers 1–20. Each invocation has a fresh Python child, temporary directory and existing diagnostic collector. Each child has a 180-second outer limit; the job has 90 minutes for at most 20 children, existing setup limits and evidence transfer. Existing test commands and collector limits (four failure attempts, 12 seconds, existing byte caps) remain unchanged.
+
+The run stops on the first test failure, skip, incomplete mapping/holder observation, unaccounted direct child, or uncertain fixture cleanup. Incomplete observations retain the fixture before normal test cleanup; the runner never retries, forces an eject, signals an observed helper, or assumes a shared helper belongs exclusively to the test. Failed fixtures remain on the ephemeral worker until it is reclaimed. The artifact contains raw command streams/receipts, bounded observations and result summaries, not disk images. Download it before the one-day retention expires.
+
+A passing diagnostic reports only the requested exact-case invocations. It cannot replace the six installed jobs, three sanitizer jobs, or their six required aggregate checks. Ordinary pull request and push discovery, assertions and per-command limits are unchanged. Intel installed qualification has a 45-minute whole-job budget: run 43531158583 reached its previous 30-minute limit while tests were still completing after about 41 seconds of setup. The additional 15 minutes provides bounded suite and transfer headroom; it is not evidence of a performance improvement or a guaranteed pass. Other job budgets are unchanged.
+
 On macOS 27+ ARM64 with a selected macOS SDK 27+, discovery also compiles and runs the direct FSKit callback suite with and without `STALLION_CONTEXT_HANDLERS`, then checks both ordinary read-only extension builds. Select the required Xcode through `DEVELOPER_DIR` or `xcode-select` before invoking tests. To run only this suite:
 
 ```sh
