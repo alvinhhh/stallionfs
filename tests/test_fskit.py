@@ -271,6 +271,13 @@ class FSKitInterfaces(unittest.TestCase):
                              '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
                              *mutation_defines, *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', executable],
                              180, swift=variant)
+                if variant == 'context':
+                    directory_images = directory / 'directory-open-images'
+                    directory_images.mkdir(mode=0o700)
+                    directory_child = self.command('directory-open-run',
+                                                   [executable, '--directory-open', directory_images], 180)
+                    self.assertEqual(directory_child.stdout.strip(),
+                                     'PASS directory open/close policy and lifetime regressions')
                 child = self.command(variant + '-write-run', [executable, images], 180)
                 lines = child.stdout.splitlines()
                 self.assertEqual(lines[:2], [
