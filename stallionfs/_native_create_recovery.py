@@ -389,6 +389,27 @@ def lifecycle(a, workspace, origin, expected=None):
     return state
 
 
+def lifecycle_intent(installation, origin):
+    """Select once; callers persist this intent before publishing installation."""
+    if 'lifecycle' not in installation:
+        installation['lifecycle'] = {'id': origin['id'], 'generation': uuid.uuid4().hex,
+            'status': 'open', 'enrolled': False, 'object': origin['native_image']['object'],
+            'payload': origin['native_image']['file']}
+    require(valid_lifecycle(installation['lifecycle'], origin['id'], origin), 'invalid-lifecycle-intent')
+    return installation['lifecycle']
+
+
+def publish_lifecycle(a, origin, expected):
+    """Publish a missing generation, or validate the exact durable generation."""
+    if lifecycle(a, origin['id'], origin, expected) is None:
+        a.publish(a.root / 'lifecycle' / (origin['id'] + '.json'), expected)
+    a.check()
+    require(lifecycle(a, origin['id'], origin, expected) == expected, 'missing-lifecycle')
+    # A prior attempt may have replaced the file before syncing its directory.
+    # Revalidation alone cannot complete that durability boundary on retry.
+    os.fsync(a.directory(a.root / 'lifecycle'))
+
+
 def preflight_archive(a, record, stage):
     archive = stage / 'discovery'
     if 'helpers' in record or 'child_pending' in record:
@@ -693,9 +714,7 @@ def finalize(a, loaded):
             installation = {'metadata': metadata, 'first_mount_attempted': False, 'rename_attempted': False,
                             'guard': None, 'outcome': 'prepared'}
             record['installation'] = installation
-        if 'lifecycle' not in installation:
-            installation['lifecycle'] = {'id': origin['id'], 'generation': uuid.uuid4().hex, 'status': 'open',
-                'enrolled': False, 'object': origin['native_image']['object'], 'payload': origin['native_image']['file']}
+        lifecycle_intent(installation, origin)
         attempts = installation.setdefault('continuation_receipts', [])
         attempts.append({'attempt': uuid.uuid4().hex, 'outcome': 'guard-pending'})
         a.publish(journal, record)
@@ -767,9 +786,7 @@ def finalize(a, loaded):
     if a.read(final / 'meta.json') != installed:
         a.publish(final / 'meta.json', installed)
     state_path = a.root / 'lifecycle' / (origin['id'] + '.json')
-    state = lifecycle(a, origin['id'], origin, installation['lifecycle'])
-    if state is None:
-        a.publish(state_path, installation['lifecycle'])
+    publish_lifecycle(a, origin, installation['lifecycle'])
     a.check()
     completed_proof = a.read(final / 'native-install.json')
     install_proof(completed_proof, installed, dict(target, directory=str(final)))

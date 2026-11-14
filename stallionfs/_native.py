@@ -458,6 +458,8 @@ def install_candidate(store, response, intent, metadata, profile, host):
     response.update(installed=False, installation_confirmed=False, workspace=metadata['id'])
     intent['installation'] = {'metadata': installed, 'first_mount_attempted': False,
                               'rename_attempted': False, 'guard': None, 'outcome': 'prepared'}
+    from ._native_create_recovery import lifecycle_intent
+    lifecycle_intent(intent['installation'], metadata)
     _persist(journal, intent)
     _persist(source / 'meta.json', installed)
     tokens = []
@@ -507,14 +509,31 @@ def _complete_install(store, path, metadata, intent, journal, receipt):
     target = installed_target(store, path, metadata, confirmed=False)
     if not _consumed(receipt, target, metadata['origin']['native_image']['anchor']):
         raise failure('First-install anchor differs from verified import', {'current_guard': receipt})
+    from ._native_create_recovery import Admission, lifecycle, lifecycle_intent, publish_lifecycle, require
+    origin = metadata['origin']
+    with_lifecycle = 'lifecycle' in intent['installation']
+    a = Admission(store.root)
+    try:
+        # An old producer's unattributed state is never adopted on retry.
+        existing = lifecycle(a, metadata['id'], origin, intent['installation'].get('lifecycle'))
+        require(existing is None or with_lifecycle, 'unattributed-lifecycle')
+        expected = lifecycle_intent(intent['installation'], origin)
+        if not with_lifecycle:
+            _persist(journal, intent)
+    finally:
+        a.close()
     proof = {'operation': 'native-install', 'id': metadata['id'], 'transaction': metadata['transaction'],
              'target': metadata['native_image'], 'complete': True, 'guard': receipt,
              'previous_installation': intent['installation'], 'first_mount_attempted': False,
-             'first_use': {'accepted': False}}
+             'first_use': {'accepted': False}, 'lifecycle': expected}
     _persist(path / 'native-install.json', proof)
     installed = {**metadata, 'state': 'installed'}
     _persist(path / 'meta.json', installed)
-    store._open(metadata['id'], path, installed, enrolled=False)
+    a = Admission(store.root)
+    try:
+        publish_lifecycle(a, origin, expected)
+    finally:
+        a.close()
     # Installed ownership is independently durable before the intent disappears.
     installed_target(store, path, installed)
     sync_directory(path)
