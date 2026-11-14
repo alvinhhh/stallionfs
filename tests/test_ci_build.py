@@ -128,9 +128,10 @@ class Routing(unittest.TestCase):
         self.assertNotIn('strategy:', intel)
         self.assertIn('cancel-in-progress: false', intel)
         self.assertIn('persist-credentials: false', intel)
-        self.assertIn("required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1'", text)
-        self.assertIn('not result.wasSuccessful() or bool(required_skips) or missing_contextual', text)
-        test = text.split('      - name: Test installed wheel', 1)[1].split('      - name: Check large', 1)[0]
+        test = (Path(__file__).resolve().parents[1] / 'tools/ci_test_entry.py').read_text()
+        self.assertIn("required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1'", test)
+        self.assertIn('not result.wasSuccessful() or bool(required_skips) or missing_contextual', test)
+        self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
         self.assertLess(test.index('controller.initialize_installed'), test.index("sys.path.insert(0, str(checkout / 'tests'))"))
         self.assertLess(test.index('controller.initialize_installed'), test.index('defaultTestLoader.discover'))
 

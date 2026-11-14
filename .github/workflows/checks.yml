@@ -41,9 +41,28 @@ jobs:
           - {os: macos-26-intel, python: '3.13', images: '1', phase: sanitizer}
           - {os: xcode-27, python: '3.13', images: '1', phase: sanitizer}
     env:
+      CI_WORKER: ${{ matrix.os }}-${{ matrix.python }}-${{ matrix.images }}-${{ matrix.phase }}
+      CI_SPARSE_REQUIRED: ${{ matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.phase == 'installed' && '1' || '0' }}
       PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
+      - name: Anchor worker allocation
+        env:
+          CI_JOB_MINUTES: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import hashlib, json, os, time, uuid
+          from pathlib import Path
+          record = dict(start=time.monotonic(), minutes=int(os.environ['CI_JOB_MINUTES']),
+                        identity={k: os.environ[k] for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB', 'CI_WORKER')},
+                        token=uuid.uuid4().hex)
+          data = json.dumps(record, sort_keys=True).encode()
+          path = Path(os.environ['RUNNER_TEMP']) / 'ci-allocation.json'
+          with path.open('xb') as stream:
+              stream.write(data); stream.flush(); os.fsync(stream.fileno())
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('CI_ALLOCATION_SHA256=' + hashlib.sha256(data).hexdigest() + '\n')
+          PYTHON
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
@@ -239,103 +258,6 @@ jobs:
         run: &ci-wheel-install |
           "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
           "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"
-      - name: Test installed wheel with image failure diagnostics
-        if: matrix.phase == 'installed'
-        env:
-          STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
-          STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
-          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
-        run: |
-          cd "$RUNNER_TEMP"
-          "${CI_PYTHON:?}" -I -B - <<'PY'
-          import faulthandler
-          import os
-          from pathlib import Path
-          import platform
-          import re
-          import subprocess
-          import sys
-          import unittest
-          import stallionfs
-          from stallionfs import images, _scan
-
-          require_contextual = os.environ.get('STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT') == '1'
-          contextual_test = 'test_fskit.FSKitInterfaces.test_contextual_and_legacy_callbacks_and_production_builds'
-
-          def require_contextual_environment():
-              host = (sys.platform, platform.mac_ver()[0], platform.machine())
-              print('Contextual FSKit host:', host, flush=True)
-              def version(label, argv):
-                  child = subprocess.run(argv, capture_output=True, text=True, timeout=15)
-                  print(f'{label}: {child.stdout.strip()!r}; stderr: {child.stderr.strip()!r}', flush=True)
-                  child.check_returncode()
-                  return child.stdout.strip()
-              build = version('macOS build', ['/usr/bin/sw_vers', '-buildVersion'])
-              xcode = version('Selected Xcode', ['/usr/bin/xcodebuild', '-version'])
-              sdk = version('Selected macOS SDK', ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-version'])
-              if (host[0] != 'darwin' or not re.fullmatch(r'\d+(?:\.\d+)*', host[1])
-                      or int(host[1].split('.')[0]) < 27 or host[2] != 'arm64'
-                      or not re.fullmatch(r'\d+[A-Z]\d+[a-z]?', build)
-                      or not re.fullmatch(r'Xcode 27\.1\nBuild version [A-Za-z0-9]+', xcode)
-                      or sdk != '27.0'):
-                  raise RuntimeError('Contextual FSKit requires macOS 27+ ARM64 with selected Xcode 27.1 and SDK 27.0')
-
-          class ContextualResult(unittest.TextTestResult):
-              def __init__(self, *args, **kwargs):
-                  super().__init__(*args, **kwargs)
-                  self.contextual_successes = 0
-              def addSuccess(self, test):
-                  super().addSuccess(test)
-                  if test.id() == contextual_test:
-                      self.contextual_successes += 1
-
-          if require_contextual:
-              require_contextual_environment()
-
-          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
-          assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
-          import importlib.util
-          spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
-          controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
-          admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
-          admitted['check']()
-          import sysconfig
-          native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
-          assert native_cli.is_absolute() and native_cli.is_relative_to(Path(sys.prefix).resolve())
-          with Path(os.environ['GITHUB_ENV']).open('a') as output:
-              output.write('CI_STALLIONFS=' + str(native_cli) + '\n')
-          sys.path.insert(0, str(checkout / 'tests'))
-          from image_failure_diagnostics import install
-          diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
-          faulthandler.dump_traceback_later(300, repeat=True)
-          suite = unittest.defaultTestLoader.discover(str(checkout / 'tests'))
-          try:
-              result = unittest.TextTestRunner(verbosity=2, resultclass=ContextualResult).run(suite)
-          finally:
-              try:
-                  diagnostics.close()
-              except Exception as error:
-                  print('Diagnostic close failed:', type(error).__name__, file=sys.stderr)
-          faulthandler.cancel_dump_traceback_later()
-          admitted['check']()
-          capability_skips = [
-              (test, reason) for test, reason in result.skipped
-              if test.id() == 'setUpClass (test_fskit.FSKitInterfaces)'
-              and reason.startswith('FSKit capability unavailable: ')
-          ]
-          for _, reason in capability_skips:
-              print(reason, file=sys.stderr)
-          required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
-              entry for entry in result.skipped if entry not in capability_skips
-          ]
-          if required_skips:
-              print('Required filesystem tests were skipped.', file=sys.stderr)
-          missing_contextual = require_contextual and result.contextual_successes != 1
-          if missing_contextual:
-              print(f'Required {contextual_test} successes: expected 1, observed {result.contextual_successes}', file=sys.stderr)
-          sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
-          PY
       - name: Check large sparse-seek metadata with default limits
         if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'
         timeout-minutes: 9
@@ -349,7 +271,7 @@ jobs:
             exit 2
           fi
           export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
-          "${CI_PYTHON:?}" -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" sparse <<'PY'
           import os, re, resource, shutil, subprocess, sys, time, unittest
           from pathlib import Path
 
@@ -419,8 +341,30 @@ jobs:
           raise SystemExit(not (result.testsRun == 1 and result.wasSuccessful()
                                 and not result.skipped))
           PY
-      - name: Validate bounded image diagnostic artifact
+      - name: Test installed wheel with image failure diagnostics
+        if: matrix.phase == 'installed'
+        env:
+          STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
+          STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
+        run: |
+          cd "$RUNNER_TEMP"
+          "${CI_PYTHON:?}" -I -B - <<'PY'
+          import importlib.util, os
+          from pathlib import Path
+          path = Path(os.environ['GITHUB_WORKSPACE']) / 'tools/ci_test_entry.py'
+          spec = importlib.util.spec_from_file_location('ci_test_entry', path)
+          entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
+          raise SystemExit(entry.main())
+          PY
+      - name: Admit validation
+        id: tail-validation
         if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'
+        run: |
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail validation
+      - name: Validate bounded image diagnostic artifact
+        timeout-minutes: 1
+        if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success' && steps.tail-validation.outputs.admitted == 'true'
         id: image-diagnostics
         run: |
           cd "$RUNNER_TEMP"
@@ -434,16 +378,45 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('available=' + str(available).lower() + '\n')
           PY
-      - name: Upload bounded image failure diagnostics
+      - name: Admit suite-upload
+        id: tail-suite-upload
+        if: always() && matrix.phase == 'installed'
+        run: |
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail suite-upload
+      - name: Upload suite closure receipts
+        timeout-minutes: 1
+        if: always() && matrix.phase == 'installed' && steps.tail-suite-upload.outputs.admitted == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: suite-closure-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/suite-closure/*.json
+            ${{ runner.temp }}/suite-closure-refusal-*.json
+            ${{ runner.temp }}/sparse-closure/*.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Admit image-upload
+        id: tail-image-upload
         if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'
+        run: |
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail image-upload
+      - name: Upload bounded image failure diagnostics
+        timeout-minutes: 1
+        if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true' && steps.tail-image-upload.outputs.admitted == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-failure-${{ matrix.os }}-${{ matrix.python }}
           path: ${{ runner.temp }}/image-failure-diagnostics/image-failures.jsonl
           if-no-files-found: error
           retention-days: 1
-      - name: Upload FSKit interface failure diagnostics
+      - name: Admit interface-upload
+        id: tail-interface-upload
         if: failure() && matrix.phase == 'installed'
+        run: |
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail interface-upload
+      - name: Upload FSKit interface failure diagnostics
+        timeout-minutes: 1
+        if: failure() && matrix.phase == 'installed' && steps.tail-interface-upload.outputs.admitted == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fskit-interface-failure-${{ matrix.os }}-${{ matrix.python }}
@@ -504,6 +477,7 @@ jobs:
               admitted['check']()
           PY
       - name: Check installed runtime and doctor
+        if: matrix.phase == 'sanitizer'
         run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"
