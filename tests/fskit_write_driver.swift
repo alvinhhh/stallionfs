@@ -5807,6 +5807,93 @@ func accessBranchChecks(_ parent: URL) throws {
     }
     } }
 }
+func deliveryTraceChecks(_ parent: URL) throws {
+    let trace = DeliveryTrace.shared
+    trace.resetForTesting()
+    let secret = NSError(domain: "PRIVATE PATH NAME", code: Int.min,
+                         userInfo: [NSLocalizedDescriptionKey: "PRIVATE DATA"])
+    DispatchQueue.concurrentPerform(iterations: 100) { _ in
+        trace.first(volume: .max, site: .max, origin: .max, error: secret, result: sfs_result())
+        trace.sync(volume: .max, stage: .max, flags: .max, validation: secret, admission: secret,
+                   retained: secret, volumeError: secret, core: secret, recheck: secret, outcome: secret)
+        trace.sync(stage: 2, flags: 1, outcome: nil)
+    }
+    let rows = trace.recordsForTesting()
+    need(rows.count == 32 && rows.filter { $0.contains("cap=1") }.count == 3, "independent concurrent caps")
+    need(rows.allSatisfy { $0.utf8.count <= 512 && $0.allSatisfy { $0.isASCII } && !$0.contains("PRIVATE") }, "bounded scalar privacy")
+    for row in rows {
+        let fields = row.split(separator: " ").dropFirst()
+        var keys = Set<String>()
+        for field in fields {
+            let parts = field.split(separator: "=", omittingEmptySubsequences: false)
+            need(parts.count == 2 && keys.insert(String(parts[0])).inserted, "unique scalar fields")
+            let values = parts[1].split(separator: ",", omittingEmptySubsequences: false)
+            need(values.count == 1 || values.count == 2, "scalar or error pair")
+            need(values.allSatisfy { value in
+                let digits = value.first == "-" ? value.dropFirst() : value[...]
+                return !digits.isEmpty && digits.allSatisfy { parts[0] == "f" ? $0.isHexDigit : $0.isNumber }
+            }, "numeric schema")
+        }
+    }
+    need(rows.filter { $0.hasPrefix("SMD1 l=1 ") }.count == 8, "reserved first-failure budget")
+    let f = try Fixture(parent, "delivery-trace"), m = try Mounted(f)
+    trace.resetForTesting()
+    need(m.sync() == nil, "successful sync unchanged")
+    need(trace.recordsForTesting().last!.contains("c=0,0 h=0,0 out=0,0"), "no invented error")
+    need(code(m.sync(FSSyncFlags(rawValue: 0)!)) == Int(EINVAL), "zero flags unchanged")
+    need(trace.recordsForTesting().last!.contains("v=1,22 a=1,22 r=0,0"), "invalid flags attributed")
+    for _ in 0..<100 { MountTrace.shared.emit(4, 5) }
+    need(MountTrace.shared.id() == 0, "old channel saturated")
+    need(code(m.write(Data(), at: -1).1) == Int(EINVAL), "first write validation")
+    let first = trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") }
+    need(first.count == 1 && first[0].contains("err=1,22"), "first delivery captured")
+    need(code(m.write(Data([1]), at: off_t.max).1) == Int(EFBIG), "second validation reply preserved")
+    need(code(m.sync()) == Int(EINVAL), "sticky first delivery preserved")
+    need(trace.recordsForTesting().last!.contains("v=0,0 a=0,0 r=1,22"), "valid flags sticky attribution")
+    need(code(m.sync(FSSyncFlags(rawValue: 3)!)) == Int(EINVAL), "combined flags unchanged")
+    need(trace.recordsForTesting().last!.contains("v=1,22 a=1,22 r=1,22"), "invalid flags and sticky both visible")
+    need(trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") } == first, "first failure remains sticky")
+    m.close()
+    let queued = try Mounted(Fixture(parent, "delivery-queued"))
+    trace.resetForTesting()
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+    queued.volume.enqueue { held.signal(); need(release.wait(timeout: .now()+20) == .success, "release queued sync") }
+    need(held.wait(timeout: .now()+20) == .success, "hold queued sync")
+    queued.volume.synchronize(flags: .wait) { need(code($0) == Int(EINVAL), "admitted sync retained error"); done.signal() }
+    let _: (Int, Error?) = wait { callback in
+        queued.volume.writeCountForTesting(contents: Data(), to: queued.file, at: -1) { callback(($0, $1)) }
+    }
+    release.signal(); need(done.wait(timeout: .now()+20) == .success, "queued sync reply")
+    need(trace.recordsForTesting().last!.contains("s=2 k=0 f=1 v=0,0 a=0,0 r=1,22 b=0,0 c=0,0 h=1,22 out=1,22"), "admitted retained attribution")
+    queued.close()
+    let active = try Mounted(Fixture(parent, "delivery-active"))
+    trace.resetForTesting()
+    let missing: Error? = wait { done in
+        active.volume.lookupItem(named: FSFileName(string: "absent"), inDirectory: active.root) { _, _, error in done(error) }
+    }
+    need(code(missing) == Int(ENOENT), "prior benign lookup failure")
+    need(active.volume.diagnosticSnapshot().2 == nil && trace.recordsForTesting().isEmpty,
+         "prior lookup creates no delivery failure")
+    active.serial { var r = sfs_result(); need(sfs_image_begin(active.coreHandle, &r) == SFS_OK, "owned synthetic transaction") }
+    need(code(active.sync()) == Int(EIO), "active transaction sync outcome unchanged")
+    let suppliedRows = trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") }
+    need(suppliedRows.count == 1 && suppliedRows[0].contains("err=1,5 x=10 p=5 e=0"),
+         "supplied retained receipt predates first delivery error")
+    need(trace.recordsForTesting().last!.contains("s=2 k=3 f=1 v=0,0 a=0,0 r=0,0 b=0,0 c=1,5 h=1,5 out=1,5"), "current own sync guard and final recheck despite prior receipt")
+    active.serial { var r = sfs_result(); need(sfs_image_abort(active.coreHandle, &r) == SFS_OK, "abort owned transaction") }
+    active.close()
+    let failedWrite = try Mounted(Fixture(parent, "delivery-core-write"))
+    trace.resetForTesting()
+    fault(1, 1)
+    need(code(failedWrite.write(Data([1])).1) == Int(ENOSPC) && hits() > 0, "synthetic first core write failure")
+    fault(0, 0)
+    let failureRows = trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") }
+    need(failureRows.count == 1 && !failureRows[0].contains("origin=0 ") &&
+         failureRows[0].contains("err=1,28 x=\(SFS_IO.rawValue) p=\(SFS_PHASE_RECORDS.rawValue) e=28"), "first write callsite and supplied receipt in controlled fault case")
+    need(code(failedWrite.sync()) == Int(ENOSPC), "first core write error sticky")
+    failedWrite.close()
+    print("PASS delivery trace privacy, caps, concurrency, sync attribution and sticky errors")
+}
 func mountTraceChecks(_ parent: URL) throws {
     try accessBranchChecks(parent)
     let trace = MountTrace.shared
@@ -5931,11 +6018,13 @@ func mountTraceChecks(_ parent: URL) throws {
     need(trace.recordsForTesting().last!.contains(" s=7 z=0 "),"activation rollback precedes reply")
     let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(unloaded == nil,"activation fixture closed")
     // Every synchronous load exit and deferred open/configuration failure.
-    func loadFailure(_ fs: StallionFileSystem, _ resource: FSResource, _ arguments: [String], _ expected: Int, _ stage: Int, synchronous: Bool) {
+    func loadFailure(_ fs: StallionFileSystem, _ resource: FSResource, _ arguments: [String], _ expected: Int, _ stage: Int, synchronous: Bool, caseLine: UInt = #line) {
         trace.resetForTesting();var count = 0
         let done = DispatchSemaphore(value:0)
         fs.loadResource(resource:resource,arguments:arguments) { volume, error in
-            need(volume == nil && code(error)==expected,"load original outcome"); count += 1;done.signal()
+            let actual = error as NSError?
+            need(volume == nil && code(error)==expected,
+                 "load original outcome case_line=\(caseLine) expected_stage=\(stage) expected_errno=\(expected) volume_nil=\(volume == nil) actual_domain=\(actual?.domain ?? "none") actual_errno=\(code(error))"); count += 1;done.signal()
         }
         if synchronous { need(count == 1,"load early reply synchronous") }
         need(done.wait(timeout:.now()+20) == .success,"load failure reply")
@@ -5955,6 +6044,28 @@ func mountTraceChecks(_ parent: URL) throws {
     let writable = FSPathURLResource(url:af.url,writable:true), configuring = fixtureFileSystem(accessPolicy:.contextualWrites)
     configuring.setLoadConfigurationHookForTesting { writable.revoke() }
     loadFailure(configuring,writable,[],Int(EACCES),16,synchronous:false)
+    func recoverLoad(_ fs: StallionFileSystem) {
+        fs.setLoadConfigurationHookForTesting(nil)
+        let fresh = FSPathURLResource(url:af.url,writable:true)
+        var replies = 0
+        let recovered: (FSVolume?,Error?) = wait { done in
+            fs.loadResource(resource:fresh,arguments:[]) { replies += 1;done(($0,$1)) }
+        }
+        need(recovered.0 != nil && recovered.1 == nil,"revoked load releases routing and image lock")
+        let drained: Bool = wait { fs.drainResourceWorkForTesting($0) }
+        need(drained && replies == 1,"recovered load replies once and releases budget")
+        let closed: Error? = wait { fs.unloadResource(resource:fresh,replyHandler:$0) }
+        need(closed == nil,"recovered load closes owned handle")
+    }
+    recoverLoad(configuring)
+    // Ordinary read-only, explicit read-only overriding a binding, and fixture writes.
+    for mode in 0..<3 {
+        let denied = FSPathURLResource(url:af.url,writable:true), fs = fixtureFileSystem()
+        if mode != 0 { fs.diagnosticUUID = af.identity }
+        fs.setLoadConfigurationHookForTesting { denied.revoke() }
+        loadFailure(fs,denied,mode == 1 ? ["--rdonly"] : [],Int(EACCES),16,synchronous:false)
+        recoverLoad(fs)
+    }
     // One held load permits deterministic routing and callback-budget refusals.
     let busyFS = fixtureFileSystem(), entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), loadedDone = DispatchSemaphore(value:0)
     busyFS.setLoadConfigurationHookForTesting { entered.signal();need(resume.wait(timeout:.now()+20) == .success,"release load") }
@@ -6069,6 +6180,9 @@ func directoryOpenChecks(_ parent: URL, baseline: Bool) throws {
         }
 #endif
 #if STALLION_MOUNT_TRACE && STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--delivery-trace" {
+            try deliveryTraceChecks(URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)); return
+        }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--mount-trace" {
             try mountTraceChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true));return
         }

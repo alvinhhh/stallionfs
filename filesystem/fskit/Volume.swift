@@ -133,6 +133,59 @@ final class MountTrace: @unchecked Sendable {
 }
 #endif
 
+#if STALLION_MOUNT_TRACE
+// SMD1 is independent of SMT1/SMA1. No caller identities or arbitrary strings.
+// Three reserved budgets: first failure 7+cap, sync success 7+cap,
+// sync error 15+cap; at most 32 rows/process, each <=512 UTF-8 bytes.
+final class DeliveryTrace: @unchecked Sendable {
+    static let shared = DeliveryTrace()
+    private let lock = NSLock()
+    private var failures = 0, successes = 0, errors = 0
+    private var identifier: UInt64 = 0
+    func id() -> UInt64 { lock.lock(); defer { lock.unlock() }; if identifier < UInt64.max { identifier += 1 }; return identifier }
+    private let logger = Logger(subsystem: "com.alvinhhh.stallionfs.delivery", category: "delivery-v1")
+#if STALLION_ADAPTER_CHECK
+    private var rows: [String] = []
+    func resetForTesting() { lock.lock(); defer { lock.unlock() }; failures = 0; successes = 0; errors = 0; rows = [] }
+    func recordsForTesting() -> [String] { lock.lock(); defer { lock.unlock() }; return rows }
+#endif
+    static func pair(_ error: Error?) -> String {
+        let ns = error as NSError?
+        return "\(ns == nil ? 0 : ns!.domain == NSPOSIXErrorDomain ? 1 : 2),\(ns?.code ?? 0)"
+    }
+    // No acquisition of submissionLock or MountTrace.lock, and no callbacks.
+    // Callers may hold submissionLock; the only lock edge is toward this lock.
+    private func emit(_ lane: Int, _ payload: String) {
+        lock.lock(); defer { lock.unlock() }
+        let count: Int, limit: Int
+        switch lane {
+        case 1: count = failures; limit = 8; if count < limit { failures += 1 }
+        case 2: count = successes; limit = 8; if count < limit { successes += 1 }
+        default: count = errors; limit = 16; if count < limit { errors += 1 }
+        }
+        guard count < limit else { return }
+        let text = "SMD1 l=\(lane) q=\(count + 1) " + (count == limit - 1 ? "cap=1" : payload)
+        guard text.utf8.count <= 512 else { return }
+#if STALLION_ADAPTER_CHECK
+        rows.append(text)
+#else
+        logger.notice("\(text, privacy: .public)")
+#endif
+    }
+    // x/p/e describe the SUPPLIED retained receipt, which may come from an
+    // earlier operation or be zero/default. Nonzero fields never establish
+    // freshness or causation for this first delivery error.
+    func first(volume: UInt64 = 0, site: UInt, origin: UInt, error: Error, result: sfs_result) {
+        emit(1, "vol=\(volume) site=\(site) origin=\(origin) err=\(Self.pair(error)) x=\(result.status.rawValue) p=\(result.phase.rawValue) e=\(result.system_errno)")
+    }
+    func sync(volume: UInt64 = 0, stage: UInt8, check: UInt8 = 0, flags: UInt64, validation: Error? = nil, admission: Error? = nil,
+              retained: Error? = nil, volumeError: Error? = nil, core: Error? = nil,
+              recheck: Error? = nil, outcome: Error?) {
+        emit(outcome == nil ? 2 : 3, "vol=\(volume) s=\(stage) k=\(check) f=\(String(flags, radix: 16)) v=\(Self.pair(validation)) a=\(Self.pair(admission)) r=\(Self.pair(retained)) b=\(Self.pair(volumeError)) c=\(Self.pair(core)) h=\(Self.pair(recheck)) out=\(Self.pair(outcome))")
+    }
+}
+#endif
+
 func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOENT) -> Error {
     let code: Int32
     switch status {
@@ -425,6 +478,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         var recordFences: UInt64 = 0, recordSuccess: UInt64 = 0, commitFences: UInt64 = 0, commitSuccess: UInt64 = 0
         var refused: UInt64 = 0, syncs: UInt64 = 0, overflow = false
     }
+    #if STALLION_MOUNT_TRACE
+    private let deliveryTraceVolume = DeliveryTrace.shared.id()
+    #endif
     private var deliveryFailure: DeliveryFailure?
     private var lastCoreFailure: sfs_result?
     private var diagnosticSequence: UInt64 = 0
@@ -457,8 +513,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func deliveryError() -> Error? {
         submissionLock.lock(); defer { submissionLock.unlock() }; return deliveryFailure?.error
     }
-    private func rememberDeliveryLocked(_ error: Error, _ result: sfs_result = sfs_result()) {
+    private func rememberDeliveryLocked(_ error: Error, _ result: sfs_result = sfs_result(), site: UInt = #line, origin: UInt = 0) {
         if deliveryFailure == nil {
+#if STALLION_MOUNT_TRACE
+            DeliveryTrace.shared.first(volume: deliveryTraceVolume, site: site, origin: origin, error: error, result: result)
+#endif
             // A first-error observation has its own sequence, independent of
             // how many later callbacks were already admitted while it ran.
             saturated(&diagnosticSequence)
@@ -466,8 +525,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 durableGeneration: diagnosticDurable, result: result)
         }
     }
-    private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result()) {
-        submissionLock.lock(); rememberDeliveryLocked(error, result); submissionLock.unlock()
+    private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result(), site: UInt = #line, origin: UInt = 0) {
+        submissionLock.lock(); rememberDeliveryLocked(error, result, site: site, origin: origin); submissionLock.unlock()
     }
     func enableAdmittedWrites() throws {
         guard selectedAccess != .readOnly, state == .inactive,
@@ -630,7 +689,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
     func enqueue(retainedBytes: Int = 0, maintenance: Bool = false,
                  dataOperation: Bool = false, writeOperation: Bool = false, namespaceOperation: Bool = false,
-                 syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil,
+                 syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil, site: UInt = #line,
                  rejected: (Error) -> Void, _ block: @escaping () -> Void) {
         submissionLock.lock()
         var error: Error?
@@ -639,6 +698,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         else if !maintenance && admission != .open { error = POSIXError(admission == .draining ? .EAGAIN : .ENXIO) }
         else if !callbacks.acquire(retainedBytes) { error = POSIXError(.EAGAIN) }
         else { error = nil }
+#if STALLION_MOUNT_TRACE
+        let enqueueError = error
+#endif
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
             if syncOperation && tracingEnabled {
@@ -662,13 +724,19 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
             if let rejectedError = error, dataOperation {
                 if tracingEnabled { saturated(&writeCounters.refused) }
-                rememberDeliveryLocked(rejectedError)
+                rememberDeliveryLocked(rejectedError, origin: site)
             }
             if syncOperation, let first = deliveryFailure {
                 if error == nil { callbacks.release(retainedBytes) }
                 error = first.error
             }
             if syncOperation, let error { controlRecordLocked(5, mask: syncFlags, error: error) }
+#if STALLION_MOUNT_TRACE
+            if syncOperation, error != nil {
+                DeliveryTrace.shared.sync(volume: deliveryTraceVolume, stage: 1, flags: syncFlags, validation: validationError,
+                    admission: enqueueError, retained: deliveryFailure?.error, outcome: error)
+            }
+#endif
         }
 #endif
         guard error == nil else { submissionLock.unlock(); rejected(error!); return }
@@ -1228,16 +1296,41 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         if writesEnabled {
             let invalid: Error? = [FSSyncFlags.wait, .dWait, .noWait].contains(flags) ? nil : POSIXError(.EINVAL)
             enqueue(maintenance: true, syncOperation: true, syncFlags: UInt64(bitPattern: Int64(flags.rawValue)), validationError: invalid, rejected: { replyHandler($0) }) {
-                var error = self.deliveryError() ?? self.failure
+                let retained = self.deliveryError()
+                var error = retained ?? self.failure
+#if STALLION_MOUNT_TRACE
+                let volumeError = self.failure
+                var ownError: Error?
+                var ownCheck: UInt8 = 0
+#endif
                 if error == nil {
                     do {
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 1
+#endif
                         let h = try self.ready(); var info = sfs_image_information(), r = sfs_result()
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 2
+#endif
                         try self.check(sfs_image_get_information(h, &info, &r), r)
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 3
+#endif
                         guard r.transaction_active == 0 else { throw POSIXError(.EIO) }
-                    } catch let caught { self.latch(caught); self.rememberDelivery(caught, self.lastCoreFailure ?? sfs_result()); error = caught }
+                    } catch let caught {
+#if STALLION_MOUNT_TRACE
+                        ownError = caught
+#endif
+                        self.latch(caught); self.rememberDelivery(caught, self.lastCoreFailure ?? sfs_result()); error = caught
+                    }
                 }
                 // Recheck under the same lock used by prequeue rejection.
-                error = self.deliveryError() ?? error
+                let recheck = self.deliveryError()
+                error = recheck ?? error
+#if STALLION_MOUNT_TRACE
+                DeliveryTrace.shared.sync(volume: self.deliveryTraceVolume, stage: 2, check: ownCheck, flags: UInt64(bitPattern: Int64(flags.rawValue)),
+                    retained: retained, volumeError: volumeError, core: ownError, recheck: recheck, outcome: error)
+#endif
                 self.record(5, mask: UInt64(bitPattern: Int64(flags.rawValue)), error: error); replyHandler(error)
             }
             return
@@ -2916,7 +3009,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     // is staged. The original receipt survives abort/verification failures.
     private func mutate<T>(_ body: (OpaquePointer, inout sfs_result) throws -> Void,
                            prepare: (OpaquePointer, inout sfs_result) throws -> T,
-                           receipt: inout sfs_result) throws -> T {
+                           receipt: inout sfs_result, origin: UInt = #line) throws -> T {
         let h = try ready(mounted: true), before = anchor
         var began = false, committed = false
         do {
@@ -3033,7 +3126,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     if checked != SFS_OK || cleanup.transaction_active != 0 || !anchorMatches(cleanup, before) { latch(POSIXError(.EIO)) }
                 }
             }
-            receipt = original; rememberDelivery(error, original); throw error
+            receipt = original; rememberDelivery(error, original, origin: origin); throw error
         }
     }
     private func performWrite<T>(_ contents: Data, item: FSItem, offset: off_t,

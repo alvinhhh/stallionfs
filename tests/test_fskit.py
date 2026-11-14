@@ -200,6 +200,45 @@ class FSKitInterfaces(unittest.TestCase):
             capture._latch_command('fskit_resource_admission', repr(error))
             raise
 
+    def test_delivery_trace_focused(self):
+        filesystem = self.source / 'filesystem'
+        tests = self.source / 'tests'
+        target = 'arm64-apple-macos27.0'
+        cflags = [self.tools['clang'], '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1',
+                  '-target', target, '-isysroot', self.sdk, '-I', filesystem]
+        diagnostic, hooks, normal = (self.base / name for name in ('diagnostic.o', 'hooks.o', 'normal.o'))
+        self.command('core', [*cflags, *(f'-D{name}=sfs_diag_{name}' for name in
+                     ('pread', 'pwrite', 'fcntl', 'clock_gettime', 'malloc', 'calloc')),
+                     '-include', tests / 'fskit_write_hooks.h', '-c', filesystem / 'image.c', '-o', diagnostic], 90)
+        self.command('hooks', [*cflags, '-c', tests / 'fskit_write_hooks.c', '-o', hooks], 90)
+        self.command('normal', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
+        swift = [self.tools['swiftc'], '-swift-version', '6', '-strict-concurrency=complete',
+                 '-warnings-as-errors', '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit',
+                 '-Onone', '-parse-as-library', '-module-cache-path', self.base / 'cache',
+                 '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES']
+        sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
+        executable = self.base / 'trace-check'
+        self.command('trace-build', [*swift, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                     '-D', 'STALLION_MOUNT_TRACE', *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks,
+                     '-o', executable], 180, swift='context')
+        for mode in ('delivery-trace',):
+            fixtures = self.base / mode
+            fixtures.mkdir(mode=0o700)
+            result = self.command(mode, [executable, '--' + mode, fixtures], 90)
+            self.assertTrue(result.stdout.startswith('PASS '))
+            self.assertEqual(result.stderr, '')
+        for trace in (True, False):
+            name = 'production-trace' if trace else 'production'
+            binary = self.base / name
+            self.command(name, [*swift, *(['-D', 'STALLION_MOUNT_TRACE'] if trace else []),
+                         '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
+                         *sources, normal, '-o', binary], 180, swift='context')
+            symbols = self.command(name + '-symbols', [self.tools['nm'], binary], 30).stdout
+            self.assertEqual('DeliveryTrace' in symbols, trace)
+            self.assertNotIn('sfs_diag_', symbols)
+            self.assertNotIn('recordsForTesting', symbols)
+        # Keep this bounded run's receipts for independent review.
+
     def test_contextual_and_legacy_callbacks_and_production_builds(self):
         cls = type(self)
         try:

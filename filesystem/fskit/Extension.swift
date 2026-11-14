@@ -461,19 +461,20 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
 #if STALLION_ADAPTER_CHECK
             configurationHook?()
 #endif
+            do {
+                // Revocation disconnects the resource even when writes are deferred or disabled.
+                guard !path.isRevoked else { throw POSIXError(.EACCES) }
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
-            if access == .fixtureWritable {
-                do { try loaded.enableAdmittedWrites() }
-                catch {
-                    let cleanup = loaded.unload()
-                    if let closeFailure = cleanup.error {
-                        let first = error as NSError
-                        throw NSError(domain: first.domain, code: first.code, userInfo: [NSUnderlyingErrorKey: closeFailure])
-                    }
-                    throw error
-                }
-            }
+                if access == .fixtureWritable { try loaded.enableAdmittedWrites() }
 #endif
+            } catch {
+                let cleanup = loaded.unload()
+                if let closeFailure = cleanup.error {
+                    let first = error as NSError
+                    throw NSError(domain: first.domain, code: first.code, userInfo: [NSUnderlyingErrorKey: closeFailure])
+                }
+                throw error
+            }
             context.volume = loaded
             self.finishOpening(context, live: true)
 #if STALLION_MOUNT_TRACE
