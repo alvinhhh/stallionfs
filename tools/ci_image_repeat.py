@@ -112,7 +112,7 @@ def observation_complete(diagnostics, directory):
             'Sibling mapping incomplete')
     for index, row in enumerate(holders):
         require(type(row['returncode']) is int and row['returncode'] in (0, 1)
-                and row['stderr'] == '' and (row['returncode'] == 0 or row['stdout'] == '')
+                and row['stderr'] == '' and isinstance(row['stdout'], str)
                 and row['reaped'] is True and row['timeout'] is False and row['truncated'] is False
                 and row['display_truncated'] is False and row['capture_error'] is None
                 and row['cleanup_error'] is None
@@ -120,6 +120,13 @@ def observation_complete(diagnostics, directory):
                     (mapping['backing_device'], mapping['backing_inode']), 'Holder observation incomplete')
         require(row['backing_identity_status'] == ('matched' if index == 0 else 'not_queried'),
                 'Backing holder identity incomplete')
+        # Exit 1 can mean one of the requested selections had no match. Validate
+        # the structured records independently of the exit status, using the
+        # same parser that established the collector's backing identity.
+        require(module.Diagnostics._holder_identity(row['stdout'].splitlines(),
+                    mapping['image'] if index == 0 else None,
+                    (mapping['backing_device'], mapping['backing_inode'])) == row['backing_identity_status'],
+                'Holder records incomplete')
 
 
 def run_suite(suite, fixture_class, diagnostics, directory, children):

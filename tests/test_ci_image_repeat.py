@@ -36,10 +36,12 @@ def events():
         mountpoint_matches=True, mountpoint='/fixture/sibling', expected_mountpoint='/fixture/sibling',
         volume_device='/dev/disk9s1', devices=['/dev/disk8', '/dev/disk9s1'],
         backing_identity_matches_first=True, backing_device=1, backing_inode=2)
-    holder = dict(common, kind='lsof', returncode=0, stdout='', stderr='', reaped=True, timeout=False, truncated=False,
+    holder = dict(common, kind='lsof', returncode=0,
+        stdout='p10\ncworker\nf3\ntREG\nD0x1\ni2\nn/fixture/sibling.sparseimage',
+        stderr='', reaped=True, timeout=False, truncated=False,
         display_truncated=False, capture_error=None, cleanup_error=None, backing_device_after=1,
         backing_inode_after=2, backing_identity_status='matched')
-    return [observation, mapping, holder, dict(holder, backing_identity_status='not_queried')]
+    return [observation, mapping, holder, dict(holder, stdout='', backing_identity_status='not_queried')]
 
 
 class Requests(unittest.TestCase):
@@ -156,7 +158,9 @@ class Observations(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / 'image-failures.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-            module = SimpleNamespace(REPORT='image-failures.jsonl', artifact_available=Mock(return_value=available))
+            parser = runner.load('inert_image_parser', ROOT / 'tests/image_failure_diagnostics.py')
+            module = SimpleNamespace(REPORT='image-failures.jsonl', artifact_available=Mock(return_value=available),
+                                     Diagnostics=parser.Diagnostics)
             diagnostic = SimpleNamespace(capture_disabled=False, before_attempts=1, attempts=0)
             diagnostic.__dict__.update(kwargs)
             with patch.dict(sys.modules, image_failure_diagnostics=module):
@@ -166,7 +170,7 @@ class Observations(unittest.TestCase):
         self.validate(events())
 
     @contextmanager
-    def collected(self, overrides=None):
+    def collected(self, overrides=None, observed=None):
         module = runner.load('inert_image_diagnostics', ROOT / 'tests/image_failure_diagnostics.py')
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -179,20 +183,37 @@ class Observations(unittest.TestCase):
                             reaped=True, capture_error=None, cleanup_error=None)
             holder = f'p10\ncworker\nf3\ntREG\nD{info.st_dev:#x}\ni{info.st_ino}\nn{image}\n'.encode()
             captures = [dict(captured, stdout=holder), dict(captured, stdout=b'')]
+            devices, volume = ['/dev/disk8', '/dev/disk9s1'], '/dev/disk9s1'
+            if observed:
+                mapping = observed[1]
+                devices, volume = mapping['devices'], mapping['volume_device']
+                for index, row in enumerate(observed[2:]):
+                    captures[index] = {key: row[key] for key in captured}
+                    captures[index]['stderr'] = row['stderr'].encode()
+                    captures[index]['stdout'] = row['stdout'].replace(mapping['image'], str(image)).replace(
+                        f"D{mapping['backing_device']:#x}", f'D{info.st_dev:#x}').replace(
+                        f"i{mapping['backing_inode']}\n", f'i{info.st_ino}\n').encode()
             for index, values in (overrides or {}).items():
                 captures[index].update(values)
+                if callable(captures[index]['stdout']):
+                    captures[index]['stdout'] = captures[index]['stdout'](holder)
             real_stat = os.stat
             def device_stat(path, *args, **kwargs):
-                if str(path) == '/dev/disk9s1': return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=42)
+                if str(path) == volume: return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=42)
                 if str(path) == str(point): return SimpleNamespace(st_dev=42)
                 return real_stat(path, *args, **kwargs)
-            with patch.object(collector, '_mapping', return_value=(str(image), ['/dev/disk8', '/dev/disk9s1'],
-                    str(point), '/dev/disk9s1', (info.st_dev, info.st_ino))), \
-                    patch.object(collector, '_capture', side_effect=captures), \
+            with patch.object(collector, '_mapping', return_value=(str(image), devices,
+                    str(point), volume, (info.st_dev, info.st_ino))), \
+                    patch.object(collector, '_capture', side_effect=captures) as capture, \
                     patch.object(module.os.path, 'ismount', return_value=True), patch.object(module.os, 'stat', side_effect=device_stat):
-                collector.before(('/usr/bin/hdiutil', 'eject', '/dev/disk8'),
+                collector.before(('/usr/bin/hdiutil', 'eject', devices[0]),
                     dict(base=base, image=image, mountpoint=point, stage='sibling-detach', workspace=None, expected=False),
                     observation={})
+                if observed:
+                    self.assertEqual([call.args[0] for call in capture.call_args_list], [
+                        ['/usr/sbin/lsof', '-nP', '-F', 'pcftDin', '--', str(image), *devices,
+                         *['/dev/r' + device.removeprefix('/dev/') for device in devices]],
+                        ['/usr/sbin/lsof', '-nP', '-F', 'pcftDin', '+f', '--', str(point)]])
             try:
                 with patch.dict(sys.modules, image_failure_diagnostics=module):
                     yield module, collector, image
@@ -207,6 +228,29 @@ class Observations(unittest.TestCase):
         with self.collected({1: dict(returncode=1, stdout=b'')}) as (module, collector, _):
             self.assertTrue(module.artifact_available(collector.directory))
             runner.observation_complete(collector, collector.directory)
+
+    def test_exact_sanitized_mixed_selection_receipt_and_collector_replay(self):
+        # Preserve the observed structured stdout and both exit-1 results. The
+        # collector replay binds only paths and inode identity to an inert file.
+        raw = (ROOT / 'tests/fixtures/image-space-mixed-selection.jsonl').read_bytes()
+        rows = [json.loads(line) for line in raw.splitlines()]
+        self.assertEqual([row['returncode'] for row in rows[2:]], [1, 1])
+        module = runner.load('inert_image_diagnostics', ROOT / 'tests/image_failure_diagnostics.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            report = directory / module.REPORT
+            report.write_bytes(raw); report.chmod(0o600)
+            diagnostic = SimpleNamespace(capture_disabled=False, before_attempts=1, attempts=0)
+            with patch.dict(sys.modules, image_failure_diagnostics=module):
+                runner.observation_complete(diagnostic, directory)
+            self.assertEqual(report.read_bytes(), raw)
+        with self.collected(observed=rows) as (module, collector, _):
+            self.assertTrue(module.artifact_available(collector.directory))
+            runner.observation_complete(collector, collector.directory)
+            replay = [json.loads(line) for line in (collector.directory / module.REPORT).read_bytes().splitlines()]
+            self.assertEqual([row['returncode'] for row in replay[2:]], [1, 1])
+            self.assertTrue(replay[2]['stdout'].startswith('p2993\ncdiskimages-helper\nf3\ntREG\n'))
+            self.assertEqual(replay[3]['stdout'], '')
 
     def assert_refused_and_retained(self, module, collector, image):
         report = collector.directory / module.REPORT
@@ -240,12 +284,45 @@ class Observations(unittest.TestCase):
 
     def test_collector_partial_queries_fail_and_retain_fixture(self):
         for index in (0, 1):
-            for values in (dict(returncode=1), dict(truncated=True), dict(timeout=True),
+            for values in (dict(returncode=2), dict(truncated=True), dict(timeout=True),
                            dict(reaped=False), dict(capture_error='read'), dict(cleanup_error='reap')):
                 overrides = dict(values)
-                if index == 1: overrides['stdout'] = b'p10\ncworker\nf3\n'
+                if index == 1: overrides['stdout'] = lambda holder: holder
                 with self.subTest(query=index, values=values), self.collected({index: overrides}) as (module, collector, image):
                     self.assert_refused_and_retained(module, collector, image)
+
+    def test_collector_malformed_stdout_in_either_query_fails_and_retains(self):
+        for index in (0, 1):
+            for returncode in (0, 1):
+                for malformed in (b'garbage\n', b'p10\ncworker\nf3\n', b'f3\ntREG\nn/name\n',
+                                  b'p10\ncworker\nf3\ntREG\nDnot-device\ni2\nn/name\n'):
+                    with self.subTest(query=index, status=returncode, stdout=malformed), self.collected({index:
+                            dict(returncode=returncode, stdout=malformed)}) as (module, collector, image):
+                        self.assert_refused_and_retained(module, collector, image)
+        for index in (0, 1):
+            # A matched backing record must not hide malformed trailing output.
+            for suffix in (b'garbage\n', b'f4\n', b'p20\ncother\n', b'i2\n'):
+                with self.subTest(query=index, suffix=suffix), self.collected({index:
+                        dict(returncode=1, stdout=lambda holder: holder + suffix)}) as (module, collector, image):
+                    self.assert_refused_and_retained(module, collector, image)
+
+    def test_valid_nonempty_filesystem_output_with_exit_one_is_accepted(self):
+        def records(holder):
+            return holder + b'f4\ntCHR\nn/dev/rdisk8\np20\ncother\nf5' + holder.split(b'f3', 1)[1]
+        with self.collected({0: dict(returncode=1), 1: dict(returncode=1,
+                stdout=records)}) as (_, collector, _):
+            runner.observation_complete(collector, collector.directory)
+
+    def test_empty_backing_query_cannot_establish_identity(self):
+        with self.collected({0: dict(returncode=1, stdout=b'')}) as (module, collector, image):
+            self.assert_refused_and_retained(module, collector, image)
+
+    def test_malformed_retained_stdout_cannot_claim_a_valid_identity(self):
+        for index in (2, 3):
+            for stdout in ('garbage', 'p10\ncworker\nf3', 'f3\ntREG\nn/name'):
+                rows = events(); rows[index]['stdout'] = stdout
+                with self.subTest(query=index, stdout=stdout), self.assertRaises(ValueError):
+                    self.validate(rows)
 
     def test_malformed_holder_errors_fail_and_retain_fixture(self):
         for index in (2, 3):

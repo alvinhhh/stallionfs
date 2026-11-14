@@ -1159,7 +1159,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
         self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
         self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
-        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
+        self.assertIn("    timeout-minutes: ${{ matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
         self.assertIn('      fail-fast: false\n', worker)
         self.assertNotIn('continue-on-error:', worker + gate)
         sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]

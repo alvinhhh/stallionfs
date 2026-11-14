@@ -802,18 +802,35 @@ class Diagnostics:
     def _holder_identity(lines, image, identity):
         # lsof's D is hexadecimal st_dev; i is the decimal inode number.
         # A pathname without both fields cannot establish the held backing inode.
-        matches, record = [], {}
-        for line in [*lines, 'f']:
-            if line.startswith(('p', 'f')):
-                if record.get('n') == image:
-                    matches.append((record.get('D'), record.get('i')))
-                record = {}
-            elif re.fullmatch(r'D0x[0-9a-fA-F]{1,16}', line):
-                record['D'] = int(line[1:], 16)
-            elif re.fullmatch(r'i[0-9]{1,20}', line):
-                record['i'] = int(line[1:])
-            elif line.startswith('n'):
-                record['n'] = line[1:]
+        matches, process, record = [], {}, {}
+        files = 0
+        for line in [*lines, None]:
+            if line is None or line.startswith(('p', 'f')):
+                if record:
+                    if not {'f', 't', 'n'} <= record.keys():
+                        return 'unavailable'
+                    if record['n'] == image:
+                        matches.append((record.get('D'), record.get('i')))
+                    files += 1
+                    record = {}
+                if line is None or line.startswith('p'):
+                    if process and (set(process) != {'p', 'c'} or not files):
+                        return 'unavailable'
+                    process, files = {}, 0
+                elif set(process) != {'p', 'c'}:
+                    return 'unavailable'
+            if line is None:
+                break
+            if not re.fullmatch(r'(?:p[1-9][0-9]*|[cft][A-Za-z0-9 ._+-]{1,64}|D0x[0-9a-fA-F]{1,16}|i[0-9]{1,20}|n[^\x00\r\n]+)', line):
+                return 'unavailable'
+            field, value = line[0], line[1:]
+            target = process if field in ('p', 'c') else record
+            if field in target or (field == 'c' and ('p' not in process or record or files)) or (
+                    field not in ('p', 'c', 'f') and 'f' not in record):
+                return 'unavailable'
+            target[field] = int(value, 16) if field == 'D' else int(value) if field == 'i' else value
+        if image is None:
+            return 'not_queried'  # Empty no-match or valid filesystem records.
         if not matches or any(None in value for value in matches):
             return 'unavailable'
         return 'matched' if all(value == identity for value in matches) else 'mismatch'
@@ -1037,7 +1054,7 @@ class Diagnostics:
                     after_identity = (after.st_dev, after.st_ino)
                 except (OSError, ValueError):
                     after_identity = (None, None)
-                identity_status = 'not_queried' if options else self._holder_identity(raw_lines, image, identity)
+                identity_status = self._holder_identity(raw_lines, None if options else image, identity)
                 if after_identity == (None, None):
                     identity_status = 'unavailable'
                 elif after_identity != identity:
