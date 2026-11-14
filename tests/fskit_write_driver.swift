@@ -212,6 +212,25 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
         need(code(unloaded) == expectedError,"admission unload consumes handle and preserves outcome")
         checkVolumeStatistics(volume, identity: factory ? identity : fixtureFileSystemIdentity)
     }
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+    func privilegedAdmission(_ volume: StallionVolume, _ item: FSItem) {
+        need(volume.owner == 501, "admitted handler captured owner501")
+        let principal = CallerIdentity(uid: 0, gid: 80), before = volume.anchor
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = .type
+        let result: (FSGetAttributesResult?, Error?) = wait { done in
+            volume.attributesResultForTesting(request, item: item, caller: principal) { done(($0,$1)) }
+        }
+        need(result.0 != nil && result.1 == nil, "actual selected admission permits privileged metadata")
+        for rights: FSVolume.AccessMask in [.readAttributes, [.readAttributes,.writeData], [.readAttributes,.writeAttributes], [.readAttributes,.writeXattr], [.readAttributes,.writeSecurity]] {
+            let check: (FSCheckAccessResult?, Error?) = wait { done in
+                volume.accessForTesting(item, access: rights, caller: principal) { done(($0,$1)) }
+            }
+            let expected = rights == .readAttributes ? 0 : Int(EACCES)
+            need(code(check.1) == expected && (check.0 != nil) == (expected == 0), "selected admission mixed rights refusal")
+        }
+        need(anchorMatches(volume.anchor, before), "admission policy never mutates anchor")
+    }
+#endif
     // SDK FSTaskOptions.init is unavailable. Exercise its exact shared decoder;
     // installed task delivery is a separate qualification requirement.
     for mode in 0..<3 {
@@ -232,6 +251,9 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
         let activated: (FSItem?,Error?) = wait { done in volume.activate { done(($0,$1)) } }
         need(activated.1 == nil,"readonly activation")
         let mounted: Error? = wait { volume.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"readonly mount")
+#if STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        privilegedAdmission(volume, activated.0!)
+#endif
         let write: Error? = wait { done in
 #if STALLION_CONTEXT_HANDLERS
             volume.write(contents:Data([1]),to:activated.0!,at:0) { done($1) }
@@ -269,6 +291,9 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
     let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"mutation mount")
     let found: (FSItem?,FSFileName?,Error?) = wait { done in v.lookupItem(named:FSFileName(string:"file"),inDirectory:active.0!) { done(($0,$1,$2)) } }
     need(found.2 == nil,"mutation file lookup")
+#if STALLION_WRITE_DIAGNOSTIC
+    privilegedAdmission(v, found.0!)
+#endif
     let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
     let newAttributes=FSItem.SetAttributesRequest();newAttributes.mode=UInt32(S_IFREG)|0o600;newAttributes.uid=geteuid();newAttributes.gid=getegid()
     let created: (FSCreateItemResult?,Error?)=wait { done in v.createResultForTesting(FSFileName(string:"created-no-grant"),directory:active.0!,attributes:newAttributes,caller:caller) { done(($0,$1)) } }
@@ -1785,9 +1810,134 @@ func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, re
     if a.isValid(.supportsLimitedXAttrs) { need(!a.supportsLimitedXAttrs, "xattr capability") }
     if a.isValid(.inhibitKernelOffloadedIO) { need(a.inhibitKernelOffloadedIO, "I/O routing attribute") }
 }
+// Fixed identities keep the policy matrix independent of the test process UID.
+func privilegedMetadataPolicyValues() throws {
+    var m = sfs_metadata_entry(); m.uid = 501; m.gid = 20
+    func policy(_ uid: Int, _ gid: Int, _ rights: FSVolume.AccessMask = .readAttributes,
+                writable: Bool = false, owner: uid_t = 501, expected: Int32 = 0) {
+        do {
+            try checkOwnerPolicy(m, owner: owner, caller: CallerIdentity(uid: uid, gid: gid),
+                                 access: rights, writable: writable, hasACL: false, allowFileExecution: true)
+            need(expected == 0, "privileged metadata unexpected grant")
+        } catch { need(code(error) == Int(expected) && expected != 0, "privileged metadata policy errno") }
+    }
+    for kind in [SFS_FILE, SFS_DIRECTORY, SFS_SYMLINK] { for mode: UInt32 in [0, 0o777] {
+        m.entry.kind = kind; m.mode = mode
+        for writable in [false, true] {
+            for uid in [0, 501] { for gid in [0, 20, 80, Int(UInt32.max)] { policy(uid, gid, writable: writable) } }
+            for uid in [502, Int(UInt32.max), -1, Int.min, Int(UInt32.max) + 1, Int.max] {
+                for gid in [0, 20, 80] { policy(uid, gid, writable: writable, expected: EACCES) }
+            }
+            for gid in [-1, Int.min, Int(UInt32.max) + 1, Int.max] {
+                for uid in [0, 501] { policy(uid, gid, writable: writable, expected: EACCES) }
+            }
+            for bit in [0,1,2,3,4,5,6,8,9,10,11,12,13,31,63] {
+                let right = FSVolume.AccessMask(rawValue: UInt(1) << bit)
+                for rights in [right, right.union(.readAttributes)] {
+                    policy(0, 0, rights, writable: writable, expected: EACCES)
+                }
+            }
+            for rights: FSVolume.AccessMask in [[], [.readAttributes,.readData,.writeData], [.readAttributes,.writeAttributes,.writeXattr,.writeSecurity], .init(rawValue: .max)] {
+                policy(0, 0, rights, writable: writable, expected: EACCES)
+            }
+        }
+    } }
+    for metadataOwner: UInt32 in [0, 502] {
+        m.uid = metadataOwner
+        for uid in [0, 501] { policy(uid, 20, expected: EACCES) }
+    }
+    m.uid = 0; m.entry.kind = SFS_FILE; m.mode = 0o600
+    policy(0, 0, [.readData,.writeData], writable: true, owner: 0)
+    policy(501, 0, owner: 0, expected: EACCES)
+}
+
+func privilegedMetadataHandlers(_ parent: URL) throws {
+    // These are injected identities through shared handlers, not real FSContexts.
+    need(geteuid() == 501, "handler matrix requires captured owner501; pure policy is host independent")
+    let root = CallerIdentity(uid: 0, gid: 0)
+    for writable in [false, true] {
+        let f = try Fixture(parent, "metadata-principal-\(writable)", directory: true)
+        let m = try Mounted(f, writable: writable), v = m.volume, before = m.volume.anchor
+        let other = try Mounted(Fixture(parent, "metadata-other-\(writable)"), writable: writable)
+        need(v.owner == 501, "actual captured owner retained")
+        var constructors = 0
+        m.serial { v.rejectResultForTesting = { _ in constructors += 1; return false } }
+        func get(_ item: FSItem, expected: Int32 = 0) {
+            constructors = 0
+            let request = FSItem.GetAttributesRequest(); request.wantedAttributes = .type
+            let result: (FSGetAttributesResult?, Error?) = wait { done in
+                v.attributesResultForTesting(request, item: item, caller: root) { done(($0,$1)) }
+            }
+            m.serial {}
+            need(code(result.1) == Int(expected) && (result.0 != nil) == (expected == 0), "privileged canonical GET")
+            need(constructors == (expected == 0 ? 1 : 0), "canonical refusal before constructor")
+        }
+        func access(_ item: FSItem, _ rights: FSVolume.AccessMask, expected: Int32) {
+            let result: (FSCheckAccessResult?, Error?) = wait { done in
+                v.accessForTesting(item, access: rights, caller: root) { done(($0,$1)) }
+            }
+            need(code(result.1) == Int(expected) && (result.0 != nil) == (expected == 0), "explicit privileged access exact rights")
+        }
+        for item in [m.file, m.root, m.link] {
+            get(item); access(item, .readAttributes, expected: 0)
+            for bit in [1,2,3,4,5,6,8,9,10,11,12,13,31,63] {
+                let right = FSVolume.AccessMask(rawValue: UInt(1) << bit)
+                access(item, right, expected: EACCES)
+                access(item, right.union(.readAttributes), expected: EACCES)
+            }
+            access(item, [], expected: EACCES)
+        }
+        get(FSItem(), expected: EINVAL)
+        get(StallionItem((m.file as! StallionItem).inode), expected: EINVAL)
+        need((m.file as! StallionItem).inode == (other.file as! StallionItem).inode, "cross-volume equal inode fixture")
+        get(other.file, expected: EINVAL)
+        if writable {
+            let file = m.file as! StallionItem
+            let pin = file.pin
+            m.serial { file.pin = nil }; get(file, expected: EINVAL)
+            m.serial { file.pin = pin; file.reclaimed = true }; get(file, expected: EINVAL)
+            m.serial { file.reclaimed = false }
+            // Remove the pin after metadata to exercise the existing access token guard.
+            m.serial { v.getAccessBoundaryForTesting = { file.pin = nil; return nil } }
+            get(file, expected: EINVAL)
+            m.serial { file.pin = pin; v.getAccessBoundaryForTesting = { file.pin = sfs_pin(); return nil } }
+            get(file, expected: EINVAL)
+            m.serial { file.pin = pin; v.getAccessBoundaryForTesting = nil }
+            get(file)
+        }
+        for modes: FSVolume.OpenModes in [.read, .write, [.read,.write]] {
+            let error: Error? = wait { v.openForTesting(m.file, modes: modes, caller: root, reply: $0) }
+            need(code(error) == Int(EACCES), "privileged open has no data grant")
+        }
+        let link: (FSReadSymlinkResult?, Error?) = wait { done in v.readlinkResultForTesting(m.link, caller: root) { done(($0,$1)) } }
+        let xattr: (FSGetXattrResult?, Error?) = wait { done in v.xattrResultForTesting(m.file, caller: root) { done(($0,$1)) } }
+        let names: (FSListXattrsResult?, Error?) = wait { done in v.xattrsResultForTesting(m.file, caller: root) { done(($0,$1)) } }
+        let listing: (FSEnumerateDirectoryResult?, Error?) = wait { done in v.enumerationResultForTesting(m.root, caller: root, pack: { _,_,_,_,_ in need(false,"privileged enumeration packed"); return false }) { done(($0,$1)) } }
+        need(link.0 == nil && xattr.0 == nil && names.0 == nil && listing.0 == nil &&
+             [link.1,xattr.1,names.1,listing.1].allSatisfy { code($0) == Int(EACCES) }, "metadata does not authorize content or listing")
+        if writable {
+            need(code(namespaceLink(m, caller: root).1) == Int(EACCES), "privileged namespace remains denied")
+            need(code(setXattr(m, value: Data([1]), caller: root).1) == Int(EACCES), "privileged xattr write denied")
+            let request = FSItem.SetAttributesRequest(); request.mode = 0o777
+            let changed: (FSItem.Attributes?, Error?) = wait { done in v.setAttributesValueForTesting(request, on: m.file, caller: root) { done(($0,$1)) } }
+            need(changed.0 == nil && code(changed.1) == Int(EACCES), "privileged metadata write denied")
+            m.serial { need((try! v.retainedModesForTesting(m.file)).isEmpty, "no retained data grant") }
+        }
+        m.serial { need(anchorMatches(v.anchor, before) && v.diagnosticSnapshot().0.commits == 0, "policy checks never mutate anchor") }
+        m.serial { v.rejectResultForTesting = nil }
+        other.close(); m.close()
+        let closed: (FSGetAttributesResult?, Error?) = wait { done in
+            let request = FSItem.GetAttributesRequest(); request.wantedAttributes = .type
+            v.attributesResultForTesting(request, item: m.file, caller: root) { done(($0,$1)) }
+        }
+        need(closed.0 == nil && code(closed.1) == Int(ENXIO), "terminal privileged GET denied")
+        need(f.contents() == Data("original".utf8), "denied operations preserve data")
+    }
+}
+
 // Exercise the shared SDK GET handler with literal expectations for SDK 27.
-func contextualGetBoundary(_ m: Mounted) {
-    let v = m.volume, caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+func contextualGetBoundary(_ m: Mounted, principal: CallerIdentity? = nil) {
+    let v = m.volume, caller = principal ?? CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
     let sdk = FSGetAttributesResult.requestedAttributes.wantedAttributes
     let full = FSItem.Attribute(rawValue: 0x3fff)
     func bit(_ n: Int) -> FSItem.Attribute { FSItem.Attribute(rawValue: Int(bitPattern: UInt(1) << n)) }
@@ -1855,6 +2005,8 @@ func contextualGetBoundary(_ m: Mounted) {
         let access = MountTrace.shared.accessRecordsForTesting()
         need(access.count == (stage >= 5 ? 1 : 0), "one access observation only after access reached")
         if let a = access.first {
+            let effective = who ?? caller
+            need(a.contains(" u=\(effective.uid) g=\(effective.gid) w=\(v.owner) m=\(v.owner) "), "trace preserves actual principal and owners")
             need(a.hasPrefix("SMA1 ") && a.utf8.count <= 256, "separate bounded access schema")
             need(a.contains(" l=\(rows[0].split(separator: " ")[6].dropFirst(2)) ") &&
                  a.contains(" c=\(rows[0].split(separator: " ")[7].dropFirst(2)) "), "access association")
@@ -1882,7 +2034,7 @@ func contextualGetBoundary(_ m: Mounted) {
                 CallerIdentity(uid: caller.uid, gid: Int(UInt32.max) + 1)] {
         get(full, expected: Int(EACCES), stage: 5, who: who)
     }
-    if geteuid() != 0 { get(full, expected: Int(EACCES), stage: 5, who: CallerIdentity(uid: 0, gid: caller.gid)) }
+    get(full, who: CallerIdentity(uid: 0, gid: caller.gid))
     get(bit(18).union(.backupTime), expected: Int(ENOTSUP), stage: 2, item: FSItem())
     get(bit(18).union(.backupTime), expected: Int(ENOTSUP), stage: 2, who: foreign)
     get(recorded, mutate: true)
@@ -1916,6 +2068,7 @@ func contextualResults(_ parent: URL) throws {
     let f = try Fixture(parent, "handler-results"), m = try Mounted(f), v = m.volume
     let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
     contextualGetBoundary(m)
+    contextualGetBoundary(m, principal: CallerIdentity(uid: 0, gid: 0))
     let resultTypes: [FSVolumeHandlerResult.Type] = [FSLookupItemResult.self, FSGetAttributesResult.self,
         FSReadSymlinkResult.self, FSReadFileResult.self, FSWriteFileResult.self, FSSetAttributesResult.self]
     let resultMasks = resultTypes.map { ($0, $0.requestedAttributes.wantedAttributes) }
@@ -2870,6 +3023,11 @@ func contextualCreates(_ parent: URL) throws {
     m.serial {
         v.createStageForTesting = { stage,item in if stage == "inserted" {
             need(item != nil && v.createVisibilityForTesting(item!),"pending item hidden from both canonical return paths")
+            do {
+                try v.linkAccessForTesting(item!, access: .readAttributes, caller: CallerIdentity(uid: 0, gid: 0))
+                need(false, "privileged pending item escaped identity guard")
+            } catch { need(code(error) == Int(EINVAL), "pending item denies privileged metadata before policy") }
+
         } }
         v.preparedAttributesForTesting = { name,a in if name == "FSCreateItemResult" { need(!committed,"create snapshot precommit"); snapshots.append(a) } }
         v.rejectResultForTesting = { name in if name == "FSCreateItemResult" { need(snapshots.count == 2 && !committed,"real create constructor precommit"); constructors += 1 }; return false }
@@ -5573,12 +5731,14 @@ func contextualXattrQueue(_ parent: URL) throws {
 #endif
 #if STALLION_MOUNT_TRACE && STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
 func accessBranchChecks(_ parent: URL) throws {
-    let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    for writable in [false, true] { for privileged in [false, true] {
+    let caller = CallerIdentity(uid: privileged ? 0 : Int(geteuid()), gid: privileged ? 0 : Int(getegid()))
     for scenario in 0..<6 {
-        let f = try Fixture(parent, "access-branch-\(scenario)", mode: 0,
+        let f = try Fixture(parent, "access-branch-\(writable)-\(privileged)-\(scenario)", mode: 0,
                             acl: scenario == 2, owner: scenario == 1 ? geteuid() + 1 : geteuid())
         let resource = SeekResource(url: f.url, writable: true)
-        let m = try Mounted(f, suppliedResource: resource), v = m.volume
+        let m = try Mounted(f, writable: writable, suppliedResource: resource), v = m.volume
+        need(v.owner == geteuid(), "actual captured volume owner")
         var constructors = 0
         m.serial {
             v.rejectResultForTesting = { _ in constructors += 1; return false }
@@ -5603,6 +5763,7 @@ func accessBranchChecks(_ parent: URL) throws {
         need(a.contains(" n=\(expected)") && a.contains(" u=\(caller.uid) g=\(caller.gid) "), "copied identity and access outcome")
         let branch = [" s=4 r=0 p=1 ", " s=1 r=0 p=0 ", " s=5 r=0 p=1 ", " s=2 r=2 p=0 ", " s=4 r=0 p=1 ", " s=2 r=1 p=0 "][scenario]
         need(a.contains(branch), "actual branch observation")
+        if scenario == 0 { need(a.contains(" x=10 f=5 e=0 d=0 n=0"), "actual absent ACL receipt") }
         if scenario == 4 { need(hits() == 1 && a.contains(" x=2 ") && a.contains(" e=5 "), "actual core IO receipt") }
         need(MountTrace.shared.recordsForTesting().last!.contains(" s=\(expected == 0 ? 8 : 5) "), "unchanged outer stage")
         // A latched failure at metadata on the next GET never reaches ownerAccess.
@@ -5614,6 +5775,7 @@ func accessBranchChecks(_ parent: URL) throws {
         m.serial { v.getAccessBoundaryForTesting = nil; resource.observationsBeforeRevocation = nil; fault(0, 0) }
         m.close()
     }
+    } }
 }
 func mountTraceChecks(_ parent: URL) throws {
     try accessBranchChecks(parent)
@@ -5801,6 +5963,7 @@ func mountTraceChecks(_ parent: URL) throws {
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--get-boundary" {
             let parent = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
+            try privilegedMetadataPolicyValues(); try privilegedMetadataHandlers(parent)
             try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent)
 #endif
             _ = try attributes(parent)
@@ -5808,6 +5971,13 @@ func mountTraceChecks(_ parent: URL) throws {
             return
         }
 #if STALLION_CONTEXT_HANDLERS
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--metadata-isolation" {
+            let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
+            try contextualLinks(parent); try contextualCreates(parent); try contextualRemovals(parent)
+            try contextualXattrRefusals(parent)
+            print("PASS existing namespace and xattr mutation denial regressions")
+            return
+        }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-unhooked" {
             let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
             try contextualXattrValues(parent); try contextualXattrKinds(parent)

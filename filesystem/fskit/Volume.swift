@@ -213,7 +213,7 @@ func checkedXattrListTotal(_ total: Int, count: Int, next: Int) throws -> Int {
 }
 func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSVolume.AccessMask,
                     allowFileExecution: Bool = false) throws {
-    guard uid == Int(owner) && m.uid == owner else { throw POSIXError(.EACCES) }
+    guard m.uid == owner, uid == Int(owner) || (uid == 0 && access == .readAttributes) else { throw POSIXError(.EACCES) }
     var allowed: FSVolume.AccessMask = [.readAttributes]
     if m.mode & 0o400 != 0 { allowed.formUnion([.readData, .readXattr]) }
     if m.entry.kind == SFS_DIRECTORY && m.mode & 0o100 != 0 { allowed.insert(.search) }
@@ -233,7 +233,7 @@ struct CallerIdentity {
     init(uid: Int, gid: Int) { self.uid = uid; self.gid = gid }
     init(_ context: FSContext) { uid = context.effectiveUserID; gid = context.effectiveGroupID }
 }
-// Owner-only profile: a group or root identity never grants an exception.
+// Owner access plus exact metadata reads by effective UID 0; groups grant no exception.
 func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity,
                       access: FSVolume.AccessMask, writable: Bool, hasACL: Bool,
                       allowFileExecution: Bool = false) throws {
