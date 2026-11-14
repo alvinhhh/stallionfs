@@ -404,18 +404,23 @@ def installed_target(store, path, metadata, *, confirmed=True, _location=None):
     created = validate_native_creation_proof(origin, read_json(path / 'native-create.json'))
     target = metadata.get('native_image')
     if (not isinstance(target, dict) or set(target) != {'component', 'parent', 'object', 'file', 'uuid'}
-            or target['component'] != 'image.sfs' or target['parent'] != identity(store.root / 'workspaces')
-            or target['object'] != identity(path) or target['object'] != created['object']
+            or target['component'] != 'image.sfs'
+            or target['object'] != created['object']
             or target['file'] != created['file']
             or target['uuid'] != created['uuid'] or metadata.get('transaction') != origin.get('transaction')
             or any(metadata.get(key) != origin.get(key) for key in
                    ('id', 'seed', 'commit', 'branch', 'name', 'created', 'capacity_gib'))):
         raise failure('Installed native lineage or location changed', {'workspace': path.name})
+    from ._native_binding import resolve
+    current = resolve(store, path, metadata)
+    if current is None and (target['parent'] != identity(store.root / 'workspaces')
+                            or target['object'] != identity(path)):
+        raise failure('Legacy hosting device changed; use creations --adopt-current with the original transaction', {'workspace': path.name})
     from ._native_recovery import location
-    location(store, path, metadata, override=_location)
+    location(store, path, metadata, override=_location, current=current)
     backing = (path / 'image.sfs').lstat()
     if (not stat.S_ISREG(backing.st_mode) or backing.st_nlink != 1 or backing.st_uid != os.getuid()
-            or _same(backing) != target['file']):
+            or _same(backing) != (current['file'] if current else target['file'])):
         raise failure('Installed native backing changed', {'workspace': path.name})
     resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
                 'file': target['file'], 'uuid': target['uuid']}
@@ -427,7 +432,7 @@ def installed_target(store, path, metadata, *, confirmed=True, _location=None):
                 or proof.get('target') != target or proof.get('complete') is not True
                 or not _consumed(proof.get('guard'), resolved, created['anchor'])):
             raise failure('Native installation needs current first-install recovery', {'workspace': path.name})
-    return resolved
+    return current or resolved
 
 
 def install_candidate(store, response, intent, metadata, profile, host):
@@ -515,6 +520,16 @@ def _complete_install(store, path, metadata, intent, journal, receipt):
     sync_directory(path)
     journal.unlink()
     sync_directory(journal.parent)
+    _enroll_current(store, path, installed)
+
+
+def _enroll_current(store, path, metadata):
+    from ._native_binding import Admission, enroll
+    a = Admission(store.root)
+    try:
+        enroll(store, a, path, metadata)
+    finally:
+        a.close()
 
 
 def recover_install(store, path, metadata):
@@ -524,7 +539,11 @@ def recover_install(store, path, metadata):
     installed(path, metadata)
     journal = store.root / 'journals' / (metadata['id'] + '.json')
     if not journal.exists():
-        return installed_target(store, path, metadata)
+        target = installed_target(store, path, metadata)
+        from ._native_binding import NAME
+        if not os.path.lexists(path / NAME) and observe(path / 'volume', metadata['controller_profile']) is None:
+            _enroll_current(store, path, metadata)
+        return target
     intent = read_json(journal)
     if intent.get('operation') != 'native-create':
         return installed_target(store, path, metadata)

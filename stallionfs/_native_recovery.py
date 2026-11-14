@@ -286,6 +286,16 @@ def compound_status(store, path, metadata, operation_id):
         _mounts_only_at(store, path)
         row = _native.observe(path / 'volume', record['profile'])
         status['current_observation'] = row
+        if pending and phase == 'prepared':
+            if row is None:
+                _prepared_absent(record)
+                with _native.resource_binding(path, target, record):
+                    absent(store, path)
+                status['message'] += ' Currently absent; continuation requires fresh exclusive backing admission.'
+            elif record['originally_mounted']:
+                _matching_mount(store, path, metadata, target, expected=record['accepted_mount'])
+            else:
+                status['next_action'] = None
         if pending and phase == 'unmount-attempted' and row is not None:
             try:
                 _matching_mount(store, path, metadata, target, expected=record['accepted_mount'])
@@ -298,7 +308,13 @@ def compound_status(store, path, metadata, operation_id):
         if phase == 'final-verified':
             expected = record['final_evidence']['observation']
             status['current_mount_matches_completion'] = row == expected
-            if row != expected: status['next_action'] = None
+            if pending and record['originally_mounted'] and row is None:
+                _historical_final_attempt(record)
+                with _native.resource_binding(path, target, record):
+                    absent(store, path)
+                status['message'] += ' Previously verified; currently absent. Continuation requires a fresh qualified remount and exclusive check of the committed anchor.'
+            elif row != expected:
+                status['next_action'] = None
     except (core.StallionError, OSError, KeyError) as error:
         status['current_observation_error'] = str(error)
         status['next_action'] = None
@@ -345,20 +361,33 @@ def _unmount_compound(store, path, metadata, operation):
 
 
 def _offline_admission(store, path, operation):
-    absent(store, path)
-    receipt = _native.guarded(operation.record['target'])
-    operation.record['offline_admission'] = receipt
-    operation.record['phase'] = 'offline'
-    operation.persist()
-    _native._persist(path / 'native-mount.json', {'state': 'absent', 'target': operation.record['target'],
-        'operation': operation.record['id'], 'current_guard': receipt})
+    record, target = operation.record, operation.record['target']
+    with _native.resource_binding(path, target, record) as check:
+        absent(store, path)
+        receipt = _native.guarded(target)
+        if not _native._consumed(receipt, target):
+            raise core.StallionError('Native backing admission or consumed close is incomplete')
+        absent(store, path)
+        check()
+        record['offline_admission'] = receipt
+        record['phase'] = 'offline'
+        operation.persist()
+        _native._persist(path / 'native-mount.json', {'state': 'absent', 'target': target,
+            'operation': record['id'], 'current_guard': receipt})
 
 
-def _terminal_attempt(record, kind):
+def _prepared_absent(record):
+    if (record['phase'] != 'prepared' or record['bridge_attempted'] or record['bridge_returned']
+            or 'native_image_result' in record
+            or any(attempt['launched'] for kind in ('unmount', 'remount')
+                   for attempt in record[kind + '_attempts'])):
+        raise core.StallionError('Prepared absence requires an operation with no launched lifecycle or catalog attempt')
+
+
+def _terminal_attempt(record, kind, index=None):
     attempts = record[kind + '_attempts']
-    launched = [index for index, attempt in enumerate(attempts) if attempt['launched']]
-    if not launched: return False
-    index = launched[-1]
+    if index is None: index = len(attempts) - 1
+    if not 0 <= index < len(attempts) or not attempts[index]['launched']: return False
     label = 'unmount' if kind == 'unmount' else 'mount'
     helpers = [item for item in record['helpers'] if item.get('stage') == kind
                and item.get('attempt') == index and item.get('label') == label]
@@ -417,9 +446,10 @@ def _remount_compound(store, path, metadata, operation):
     return row
 
 
-def _mount_completion_evidence(record, row):
-    if not _terminal_attempt(record, 'remount'): return False
-    attempt = record['remount_attempts'][-1]
+def _mount_completion_evidence(record, row, index=None):
+    if index is None: index = len(record['remount_attempts']) - 1
+    if not _terminal_attempt(record, 'remount', index): return False
+    attempt = record['remount_attempts'][index]
     evidence, qualified = attempt.get('evidence'), attempt.get('qualified')
     return (isinstance(evidence, dict) and evidence.get('usable') is True
             and evidence.get('repo') == str(Path(record['target']['directory']) / 'volume/repo')
@@ -428,6 +458,35 @@ def _mount_completion_evidence(record, row):
             and qualified.get('host') == record['host']
             and qualified.get('filesystem') == _native.PROFILES[record['profile']]['type']
             and _native._consumed(attempt.get('guard'), record['target'], record['committed_anchor']))
+
+
+def _historical_final_attempt(record):
+    # Top-level evidence is authoritative only in final-verified. Bind every
+    # part of its proof to the same attempt, including terminal child ownership.
+    index = len(record['remount_attempts']) - 1
+    if (record['phase'] != 'final-verified' or not record['originally_mounted']
+            or not _confirmed_bridge(record)
+            or record.get('committed_anchor') != anchor(record['native_image_result']['receipt'])
+            or not _mount_completion_evidence(record, record['final_evidence']['observation'], index)):
+        raise core.StallionError('Historical final mount completion is incomplete; no remount was started')
+    return index
+
+
+def _reset_final_absence(store, path, operation):
+    record = operation.record
+    index = _historical_final_attempt(record)
+    with _native.resource_binding(path, record['target'], record) as check:
+        absent(store, path)
+        attempt = record['remount_attempts'][index]
+        saved = copy.deepcopy(record['final_evidence'])
+        if 'final_evidence' in attempt and attempt['final_evidence'] != saved:
+            raise core.StallionError('Historical final mount evidence changed; no remount was started')
+        attempt['final_evidence'] = saved
+        record.update(phase='committed', outcome='incomplete')
+        # The authoritative journal atomically records history and the reset
+        # before any new attempt or qualification, even if its archive fails.
+        check()
+        operation.persist()
 
 
 def _verify_final(store, path, metadata, operation):
@@ -481,16 +540,22 @@ def compound_locked(store, path, metadata, action, name, *, operation_id=None, w
         operation = _native.Operation(store, path, 'native-mounted-' + action, target, details=details)
         record = operation.record
     try:
+        already_absent = False
         if withdrawal and (record['bridge_attempted'] or not record['originally_mounted']):
             raise core.StallionError('Explicit withdrawal is permitted only before catalog mutation of an originally mounted workspace')
         if withdrawal and record['phase'] == 'offline':
             _offline_admission(store, path, operation)
+            already_absent = True
         if record['phase'] == 'bridge-attempted' and _confirmed_bridge(record):
             # The original call returned affirmatively and its receipt was
             # durable; only the following phase-marker write was interrupted.
             record.update(phase='committed', committed_anchor=anchor(record['native_image_result']['receipt']))
             operation.persist()
         if record['phase'] == 'final-verified':
+            _mounts_only_at(store, path)
+            if record['originally_mounted'] and _native.observe(path / 'volume', record['profile']) is None:
+                _reset_final_absence(store, path, operation)
+                _remount_compound(store, path, metadata, operation)
             _verify_final(store, path, metadata, operation)
         else:
             if record['phase'] in ('prepared', 'unmount-attempted'):
@@ -501,11 +566,19 @@ def compound_locked(store, path, metadata, action, name, *, operation_id=None, w
                     # it does not claim the lost unmount response was successful.
                     _offline_admission(store, path, operation)
                 elif record['originally_mounted']:
-                    _unmount_compound(store, path, metadata, operation)
+                    _mounts_only_at(store, path)
+                    if (operation_id is not None and record['phase'] == 'prepared'
+                            and _native.observe(path / 'volume', record['profile']) is None):
+                        _prepared_absent(record)
+                        _offline_admission(store, path, operation)
+                        already_absent = True
+                    else:
+                        _unmount_compound(store, path, metadata, operation)
                 else:
                     _offline_admission(store, path, operation)
             if withdrawal:
-                return {'unmounted': path.name, 'native_operation': record, 'mutation_started': False}
+                return {'unmounted': path.name, 'native_operation': record, 'mutation_started': False,
+                        'already_absent': already_absent}
             if record['phase'] == 'offline':
                 absent(store, path)
                 store._open(path.name, path, metadata)
@@ -646,13 +719,18 @@ def validate_intent(workspace, record, *, moving=False):
         core.Store._native_name(record.get('recovery_name'))
 
 
-def location(store, path, metadata, *, override=None):
+def location(store, path, metadata, *, override=None, current=None):
     """Validate current location separately from immutable installation evidence."""
     original = metadata['native_image']
+    if current is None:
+        from ._native_binding import resolve
+        current = resolve(store, path, metadata)
+    live_object = current['parent'] if current else original['object']
+    live_file = current['file'] if current else original['file']
     record_path = path / 'native-location.json'
     record = override if override is not None else core.read_json(record_path) if record_path.exists() else None
     if record is None:
-        if path.parent != store.root / 'workspaces' or original['parent'] != identity(path.parent):
+        if path.parent != store.root / 'workspaces' or (current is None and original['parent'] != identity(path.parent)):
             raise core.StallionError('Native object has no confirmed current location')
         proof = core.read_json(path / 'native-install.json') if (path / 'native-install.json').exists() else {}
         return {'schema': 1, 'workspace': path.name, 'transaction': metadata['transaction'],
@@ -664,11 +742,11 @@ def location(store, path, metadata, *, override=None):
             or record.get('collection') not in ('workspaces', 'trash')
             or path != store.root / record['collection'] / metadata['id']
             or record.get('parent') != identity(path.parent)
-            or any(record.get(key) != original[key] for key in ('object', 'file', 'uuid'))
+            or record.get('object') != live_object or record.get('file') != live_file or record.get('uuid') != original['uuid']
             or not isinstance(record.get('operation'), str) or not re.fullmatch('[0-9a-f]{32}', record['operation'])):
         raise core.StallionError('Native current-location provenance changed')
-    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': original['object'],
-                'file': original['file'], 'uuid': original['uuid']}
+    resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': live_object,
+                'file': live_file, 'uuid': original['uuid']}
     if override is None and (record.get('complete') is not True or not _native._consumed(record.get('guard'), resolved)):
         raise core.StallionError('Native current location needs explicit restore recovery')
     return record
@@ -952,6 +1030,7 @@ def move_locked(store, workspace, *, restore=False, selected=None):
             operation_id = uuid.uuid4().hex
             old_location = location(store, path, metadata)
             new_location = dict(old_location, collection=destination, parent=identity(final.parent),
+                                object=target['parent'], file=target['file'], uuid=target['uuid'],
                                 operation=operation_id, complete=False, guard=None)
             operation = _native.Operation(store, path, 'native-return' if restore else 'native-retire', target,
                 operation_id=operation_id, details={'metadata': metadata, 'source_location': old_location,

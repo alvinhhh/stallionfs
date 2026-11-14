@@ -58,6 +58,8 @@ class WriterAuthority(unittest.TestCase):
     def test_old_installed_proof_without_journal_remains_inspectable(self):
         f = self.fixture
         f.assert_installed(f.continuation())
+        # This case models a legacy install predating hosting bindings.
+        (f.final / 'native-binding.json').unlink()
         value = f.read(f.final / 'native-create.json'); value.pop('writer')
         f.save(f.final / 'native-create.json', value)
         before = f.snapshot(); f.guard_calls.clear()

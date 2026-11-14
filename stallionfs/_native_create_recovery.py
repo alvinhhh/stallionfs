@@ -413,14 +413,19 @@ def load(a, workspace, transaction=None, *, profile=None, host=None):
         origin = metadata.get('origin')
         require(type(origin) is dict, 'no-installed-lineage')
         origin_metadata(origin, a.read(final / 'native-create.json'))
-        require(metadata == dict(installed_metadata(origin, a.bindings[final.parent], metadata.get('controller_profile'),
+        require(metadata == dict(installed_metadata(origin, metadata['native_image']['parent'], metadata.get('controller_profile'),
                                                    metadata.get('native_host')), state='installed'), 'installed-metadata-mismatch')
         require(origin['id'] == workspace and (transaction is None or origin['transaction'] == transaction), 'transaction-mismatch')
         require((profile is None or profile == metadata['controller_profile']) and (host is None or str(host) == metadata['native_host']),
                 'settings-frozen')
-        target = backing(a, final, origin)
+        from ._native_binding import resolve, historical_target
+        store = core.Store.__new__(core.Store); store.root = a.root
+        current = resolve(store, final, metadata, admission=a)
+        require(current is not None or metadata['native_image']['parent'] == a.bindings[final.parent],
+                'installed-collection-changed')
+        target = current or backing(a, final, origin)
         proof = a.read(final / 'native-install.json')
-        install_proof(proof, metadata, target)
+        install_proof(proof, metadata, historical_target(final, metadata))
         if not proof['first_mount_attempted']:
             expected_state = proof.get('lifecycle', proof.get('previous_installation', {}).get('lifecycle'))
             require(valid_lifecycle(expected_state, workspace, origin), 'missing-lifecycle-binding')
@@ -763,6 +768,9 @@ def finalize(a, loaded):
     a.check()
     os.unlink(journal.name, dir_fd=a.directory(journal.parent))
     os.fsync(a.directory(journal.parent))
+    from ._native_binding import enroll
+    store = core.Store.__new__(core.Store); store.root = a.root
+    enroll(store, a, final, installed)
     return {'status': 'installed-unmounted', 'workspace': origin['id'], 'transaction': origin['transaction'], 'path': str(final)}
 
 
@@ -774,8 +782,15 @@ def installed_result(a, loaded):
     from ._native_create_authority import proof
     proof(loaded['origin'], a.read(loaded['path'] / 'native-create.json'))
     require(not a.names(loaded['path'] / 'volume'), 'occupied-volume')
-    anchor = loaded['origin']['native_image']['anchor']
-    _native.guarded(loaded['target'], lambda token: a.check(), anchor=anchor, expected_anchor=anchor)
+    from ._native_binding import NAME, enroll
+    if not a.exists(loaded['path'] / NAME):
+        # Installation may have finished and removed its journal before binding
+        # publication. An exact retry must finish that guarded enrollment too.
+        store = core.Store.__new__(core.Store); store.root = a.root
+        enroll(store, a, loaded['path'], a.read(loaded['path'] / 'meta.json'))
+    else:
+        anchor = loaded['origin']['native_image']['anchor']
+        _native.guarded(loaded['target'], lambda token: a.check(), anchor=anchor, expected_anchor=anchor)
     a.check()
     os.fsync(a.directory(loaded['journal'].parent))
     return {**response, 'status': 'installed-unmounted', 'already_installed': True}
