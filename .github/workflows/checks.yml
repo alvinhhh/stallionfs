@@ -8,42 +8,246 @@ on:
       mode:
         description: Hosted action
         type: choice
-        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact]
+        options: [compare, thread-cpu, directory-feasibility, directory-docs-feasibility, delete-thread-cpu, unsigned-app-artifact, native-git-qualification, registered-git-recheck, image-space-repeat]
         default: compare
+      expected-source-sha:
+        description: Reviewed full source SHA for manual qualification or image diagnostic
+        type: string
+        required: false
+      repeat-count:
+        description: ImageSpace diagnostic invocations (1 through 20)
+        type: string
+        default: '1'
+        required: false
 permissions:
   contents: read
 jobs:
-  test:
+  test-execution:
+    name: ${{ matrix.phase }} (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})
     if: github.event_name != 'workflow_dispatch'
-    timeout-minutes: ${{ matrix.os == 'macos-26-intel' && 30 || 15 }}
+    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-15, python: '3.12', images: '0'}
-          - {os: macos-26, python: '3.11', images: '1'}
-          - {os: macos-26, python: '3.13', images: '1'}
-          - {os: macos-26, python: '3.14', images: '1'}
-          - {os: macos-26-intel, python: '3.13', images: '1'}
-          - {os: xcode-27, python: '3.13', images: '1'}
+          - {os: macos-15, python: '3.12', images: '0', phase: installed}
+          - {os: macos-26, python: '3.11', images: '1', phase: installed}
+          - {os: macos-26, python: '3.13', images: '1', phase: installed}
+          - {os: macos-26, python: '3.14', images: '1', phase: installed}
+          - {os: macos-26-intel, python: '3.13', images: '1', phase: installed}
+          - {os: xcode-27, python: '3.13', images: '1', phase: installed}
+          - {os: macos-26, python: '3.13', images: '1', phase: sanitizer}
+          - {os: macos-26-intel, python: '3.13', images: '1', phase: sanitizer}
+          - {os: xcode-27, python: '3.13', images: '1', phase: sanitizer}
     env:
+      PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '${{ matrix.python }}'
-      - run: python -m compileall -q stallionfs
-      - run: python -m pip wheel --no-deps --wheel-dir dist .
-      - run: python -m pip install --force-reinstall --no-deps dist/*.whl
+      - name: Create owned CI interpreter
+        id: ci-python
+        timeout-minutes: 2
+        run: &ci-owned-python |
+          python -I -B - <<'PY'
+          from pathlib import Path
+          import os
+          BOOTSTRAP_SOURCE = r"""import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import stat
+          import subprocess
+          import sys
+          import sysconfig
+          import venv
+
+          def require(value, message):
+              if not value: raise ValueError(message)
+
+          def identity(path, directory=False):
+              path = Path(path)
+              require(path.is_absolute() and path.resolve(strict=True) == path, 'Physical CI path required')
+              info = path.lstat()
+              require(info.st_uid == os.getuid() and not info.st_mode & 0o022, 'CI path ownership or mode differs')
+              require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                      'CI path type differs')
+              value = [info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode)]
+              return value if directory else value + [info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+          def read(path, limit):
+              before = identity(path)
+              require(before[5] <= limit, 'CI input exceeds bound')
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, 'rb') as stream: data = stream.read(limit + 1)
+              require(len(data) <= limit and identity(path) == before, 'CI input changed')
+              return data
+
+          def write_new(path, data):
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, 'wb') as stream: stream.write(data)
+
+          def facts():
+              executable = Path(getattr(sys, '_base_executable', sys.executable)).resolve(strict=True)
+              return {'version': sys.version, 'architecture': platform.machine(),
+                      'base_prefix': str(Path(sys.base_prefix).resolve(strict=True)),
+                      'base_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
+
+          def validate(value, container, environment, base):
+              require(value['schema'] == 1 and value['base'] == base, 'CI interpreter origin differs')
+              require(value['container_identity'] == identity(container, True)
+                      and value['environment_identity'] == identity(environment, True), 'CI environment replaced')
+              selected = Path(value['executable'])
+              require(selected.is_relative_to(environment) and selected.parent == Path(value['paths']['scripts']), 'CI executable escaped')
+              require(value['executable_identity'] == identity(selected) and os.access(selected, os.X_OK)
+                      and hashlib.sha256(read(selected, 64 * 1024**2)).hexdigest() == base['base_executable_sha256'], 'CI interpreter copy differs')
+              require(value['prefix'] == str(environment) and value['base_prefix'] == base['base_prefix']
+                      and value['prefix'] != value['base_prefix'] and value['version'] == base['version']
+                      and value['architecture'] == base['architecture'] and value['uid'] == os.getuid(), 'CI interpreter context differs')
+              require(set(value['paths']) == {'scripts', 'purelib', 'platlib', 'data'}, 'CI installation scheme differs')
+              for name, destination in value['paths'].items():
+                  path = Path(destination)
+                  require(path.is_relative_to(environment) and path.resolve(strict=True) == path, 'CI installation path escaped')
+                  identity(path, True)
+              require(value['scripts_identity'] == identity(selected.parent, True), 'CI scripts directory replaced')
+              return selected
+
+          def probe(container, environment, receipt, base, environment_identity):
+              require(identity(environment, True) == environment_identity, 'CI environment replaced during creation')
+              selected = Path(sys.executable).absolute()
+              paths = {name: str(Path(sysconfig.get_path(name)).absolute()) for name in ('scripts', 'purelib', 'platlib', 'data')}
+              value = {'schema': 1, 'base': base, 'container_identity': identity(container, True),
+                       'environment_identity': identity(environment, True), 'executable': str(selected),
+                       'executable_identity': identity(selected), 'prefix': str(Path(sys.prefix).resolve(strict=True)),
+                       'base_prefix': str(Path(sys.base_prefix).resolve(strict=True)), 'version': sys.version,
+                       'architecture': platform.machine(), 'uid': os.getuid(), 'paths': paths,
+                       'scripts_identity': identity(Path(paths['scripts']), True)}
+              validate(value, container, environment, base)
+              write_new(receipt, (json.dumps(value, sort_keys=True) + '\n').encode())
+
+          def create(driver, container, environment, receipt, base, environment_identity):
+              require(identity(environment, True) == environment_identity and not list(environment.iterdir()), 'CI environment is not fresh')
+              class Builder(venv.EnvBuilder):
+                  def post_setup(self, context): self.selected = context.env_exe
+              builder = Builder(with_pip=True, symlinks=False, upgrade=False, upgrade_deps=False)
+              builder.create(str(environment))
+              require(identity(environment, True) == environment_identity, 'CI environment replaced during creation')
+              selected = Path(builder.selected).absolute()
+              identity(selected)
+              subprocess.run([str(selected), '-I', '-B', str(driver), 'probe', str(container), str(environment),
+                              str(receipt), json.dumps(base), json.dumps(environment_identity)], check=True)
+
+          def bootstrap(temporary, checkout, github_env, github_path):
+              temporary = temporary.resolve(strict=True)
+              container = temporary / 'ci-python'
+              reserved = False
+              try:
+                  container.mkdir(mode=0o700); reserved = True
+                  container_identity = identity(container, True)
+                  environment = container / 'venv'; environment.mkdir(mode=0o700)
+                  environment_identity = identity(environment, True)
+                  driver = container / 'bootstrap.py'; receipt = container / 'origin.json'
+                  write_new(driver, BOOTSTRAP_SOURCE.encode())
+                  driver_identity = identity(driver); base = facts()
+                  spec = importlib.util.spec_from_file_location('ci_bootstrap_capture', checkout / 'tools/ci_execute.py')
+                  runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+                  previous = sys.argv
+                  try:
+                      sys.argv = ['ci_execute.py', '--timeout', '90', '--stem', str(container / 'create'), str(driver),
+                                  'create', str(driver), str(container), str(environment), str(receipt), json.dumps(base), json.dumps(environment_identity)]
+                      runner.main()
+                  finally: sys.argv = previous
+                  require(identity(container, True) == container_identity and identity(driver) == driver_identity
+                          and read(driver, 65536).decode() == BOOTSTRAP_SOURCE, 'CI bootstrap paths replaced')
+                  value = json.loads(read(receipt, 16384))
+                  selected = validate(value, container, environment, base)
+                  scripts = Path(value['paths']['scripts'])
+                  require(all(character.isprintable() for path in (selected, scripts, container) for character in str(path)),
+                          'Invalid CI interpreter path')
+                  with github_env.open('a') as output, github_path.open('a') as path_output:
+                      output.write('CI_PYTHON=' + str(selected) + '\nCI_CONTAINER=' + str(container) + '\n')
+                      path_output.write(str(scripts) + '\n')
+              except BaseException as error:
+                  print('Owned CI interpreter setup failed:', type(error).__name__, flush=True)
+                  if reserved:
+                      for name in ('create.command.json', 'create.stderr.bin', 'create.stdout.bin', 'origin.json'):
+                          try: data = read(container / name, 1024 * 1024)
+                          except (OSError, ValueError): continue
+                          print(name + ':', data[:8192].decode('utf-8', errors='replace'), flush=True)
+                  if isinstance(error, SystemExit) and error.code in (0, None):
+                      raise RuntimeError('CI bootstrap exited before completion') from error
+                  raise
+
+          def check_install(container, seal):
+              value = json.loads(read(container / 'origin.json', 16384))
+              selected = validate(value, container, container / 'venv', value['base'])
+              require(Path(sys.executable).absolute() == selected, 'Wrong installed CI interpreter')
+              scripts = Path(value['paths']['scripts'])
+              helper = scripts / 'stallionfs-python'; data = read(helper, 65536)
+              direct = ('#!' + str(selected) + '\n').encode()
+              quoted = '"' + str(selected) + '"' if ' ' in str(selected) else str(selected)
+              shell = ("#!/bin/sh\n'''exec' " + quoted + " \"$0\" \"$@\"\n' '''\n").encode()
+              require(os.access(helper, os.X_OK) and (data.startswith(direct) or data.startswith(shell))
+                      and b'from stallionfs.__main__ import main' in data, 'Installed console helper route differs')
+              bound = {}
+              for name in ('stallionfs-python', 'sfs', 'stallionfs'):
+                  path = scripts / name
+                  require(os.access(path, os.X_OK), 'Installed CI launcher is not executable')
+                  bound[name] = {'identity': identity(path), 'sha256': hashlib.sha256(read(path, 64 * 1024**2)).hexdigest()}
+              if seal: write_new(container / 'launchers.json', (json.dumps(bound, sort_keys=True) + '\n').encode())
+              else: require(json.loads(read(container / 'launchers.json', 16384)) == bound, 'Installed CI launcher changed')
+
+          if __name__ == '__main__':
+              mode, *arguments = sys.argv[1:]
+              if mode == 'create': create(*map(Path, arguments[:4]), json.loads(arguments[4]), json.loads(arguments[5]))
+              elif mode == 'probe': probe(*map(Path, arguments[:3]), json.loads(arguments[3]), json.loads(arguments[4]))
+              elif mode in ('seal', 'check'): check_install(Path(arguments[0]), mode == 'seal')
+              else: raise ValueError('Unknown CI environment operation')
+          """
+          scope = {'__name__': 'ci_inline', 'BOOTSTRAP_SOURCE': BOOTSTRAP_SOURCE}
+          exec(compile(BOOTSTRAP_SOURCE, '<owned-ci-interpreter>', 'exec'), scope)
+          scope['bootstrap'](Path(os.environ['RUNNER_TEMP']), Path(os.environ['GITHUB_WORKSPACE']).resolve(),
+                             Path(os.environ['GITHUB_ENV']), Path(os.environ['GITHUB_PATH']))
+          PY
+      - name: Install pinned wheel backend
+        run: &ci-wheel-backend |
+          "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
+      - name: Fetch exact qualified architecture component
+        id: component-fetch
+        run: &ci-component-fetch |
+          "${CI_PYTHON:?}" -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component"
+      - name: Upload component fetch failure diagnostics
+        if: failure() && steps.component-fetch.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: component-fetch-${{ matrix.os }}-${{ matrix.python }}${{ matrix.phase == 'sanitizer' && '-sanitizer' || '' }}
+          path: |
+            ${{ runner.temp }}/component-fetch.command.json
+            ${{ runner.temp }}/component-fetch.stdout.bin
+            ${{ runner.temp }}/component-fetch.stderr.bin
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Build current wheel with enforced Git cache reuse
+        run: &ci-wheel-build |
+          "${CI_PYTHON:?}" -I -B tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/cache-wheel-build" tools/ci_build.py build --checkout "$GITHUB_WORKSPACE" --component "$RUNNER_TEMP/qualified-git-component" --output "$RUNNER_TEMP/qualified-wheel"
+      - name: Install current owned wheel
+        run: &ci-wheel-install |
+          "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-index --force-reinstall --no-deps --no-compile "$RUNNER_TEMP"/qualified-wheel/*.whl
+          "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" seal "${CI_CONTAINER:?}"
       - name: Test installed wheel with image failure diagnostics
+        if: matrix.phase == 'installed'
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import faulthandler
           import os
           from pathlib import Path
@@ -91,6 +295,16 @@ jobs:
           checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
           assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
           assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
+          controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
+          admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
+          admitted['check']()
+          import sysconfig
+          native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+          assert native_cli.is_absolute() and native_cli.is_relative_to(Path(sys.prefix).resolve())
+          with Path(os.environ['GITHUB_ENV']).open('a') as output:
+              output.write('CI_STALLIONFS=' + str(native_cli) + '\n')
           sys.path.insert(0, str(checkout / 'tests'))
           from image_failure_diagnostics import install
           diagnostics = install(images, Path(os.environ['RUNNER_TEMP']).resolve() / 'image-failure-diagnostics')
@@ -104,6 +318,7 @@ jobs:
               except Exception as error:
                   print('Diagnostic close failed:', type(error).__name__, file=sys.stderr)
           faulthandler.cancel_dump_traceback_later()
+          admitted['check']()
           capability_skips = [
               (test, reason) for test, reason in result.skipped
               if test.id() == 'setUpClass (test_fskit.FSKitInterfaces)'
@@ -122,7 +337,7 @@ jobs:
           sys.exit(not result.wasSuccessful() or bool(required_skips) or missing_contextual)
           PY
       - name: Check large sparse-seek metadata with default limits
-        if: success() && matrix.os == 'macos-15' && matrix.python == '3.12'
+        if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'
         timeout-minutes: 9
         env:
           STALLION_SEEK_LARGE_METADATA: '1'
@@ -134,7 +349,7 @@ jobs:
             exit 2
           fi
           export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import os, re, resource, shutil, subprocess, sys, time, unittest
           from pathlib import Path
 
@@ -205,11 +420,11 @@ jobs:
                                 and not result.skipped))
           PY
       - name: Validate bounded image diagnostic artifact
-        if: failure()
+        if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'
         id: image-diagnostics
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
           import os
           from pathlib import Path
           import sys
@@ -220,16 +435,16 @@ jobs:
               output.write('available=' + str(available).lower() + '\n')
           PY
       - name: Upload bounded image failure diagnostics
-        if: failure() && steps.image-diagnostics.outputs.available == 'true'
-        uses: actions/upload-artifact@v4
+        if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-failure-${{ matrix.os }}-${{ matrix.python }}
           path: ${{ runner.temp }}/image-failure-diagnostics/image-failures.jsonl
           if-no-files-found: error
           retention-days: 1
       - name: Upload FSKit interface failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
+        if: failure() && matrix.phase == 'installed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fskit-interface-failure-${{ matrix.os }}-${{ matrix.python }}
           path: |
@@ -242,40 +457,148 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
       - name: Check native code with sanitizers
-        if: matrix.python == '3.13'
+        if: matrix.phase == 'sanitizer'
         env:
           ASAN_OPTIONS: halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           TSAN_OPTIONS: halt_on_error=1
         run: |
           cd "$RUNNER_TEMP"
-          python -I -B - <<'PY'
+          "${CI_PYTHON:?}" -I -B - <<'PY'
+          import importlib.util
           import os
           from pathlib import Path
           import sys
+          import sysconfig
           import unittest
 
-          sys.path.insert(0, str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'))
+          import stallionfs
+          from stallionfs import _scan
+          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          assert not Path(stallionfs.__file__).resolve().is_relative_to(checkout)
+          assert not Path(_scan.__file__).resolve().is_relative_to(checkout)
+          spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
+          controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
+          admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
+          admitted['check']()
+          native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
+          assert native_cli.is_absolute() and native_cli.is_relative_to(Path(sys.prefix).resolve())
+          with Path(os.environ['GITHUB_ENV']).open('a') as output:
+              output.write('CI_STALLIONFS=' + str(native_cli) + '\n')
+          sys.path.insert(0, str(checkout / 'tests'))
           names = (
               'test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
               'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals',
               'test_image.ImageCore',
           )
-          for sanitizers in ('address,undefined', 'thread'):
-              print('Sanitizers:', sanitizers, flush=True)
-              os.environ['CFLAGS'] = f'-g -fno-omit-frame-pointer -fsanitize={sanitizers} -fno-sanitize-recover=all'
-              suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-              result = unittest.TextTestRunner(verbosity=2).run(suite)
-              if not result.wasSuccessful() or result.skipped:
-                  sys.exit(1)
+          try:
+              for sanitizers in ('address,undefined', 'thread'):
+                  print('Sanitizers:', sanitizers, flush=True)
+                  os.environ['CFLAGS'] = f'-g -fno-omit-frame-pointer -fsanitize={sanitizers} -fno-sanitize-recover=all'
+                  suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+                  assert suite.countTestCases() == 52
+                  result = unittest.TextTestRunner(verbosity=2).run(suite)
+                  if not result.wasSuccessful() or result.skipped or result.testsRun != 52:
+                      sys.exit(1)
+          finally:
+              admitted['check']()
           PY
-      - run: |
+      - name: Check installed runtime and doctor
+        run: |
           cd "$RUNNER_TEMP"
-          stallionfs --root "$RUNNER_TEMP/stallionfs-smoke" doctor
+          "${CI_PYTHON:?}" -I -B "${CI_CONTAINER:?}/bootstrap.py" check "${CI_CONTAINER:?}"
+          "${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})
+    needs: test-execution
+    if: always() && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, python: '3.12', images: '0'}
+          - {os: macos-26, python: '3.11', images: '1'}
+          - {os: macos-26, python: '3.13', images: '1'}
+          - {os: macos-26, python: '3.14', images: '1'}
+          - {os: macos-26-intel, python: '3.13', images: '1'}
+          - {os: xcode-27, python: '3.13', images: '1'}
+    steps:
+      - name: Require all installed and sanitizer jobs
+        env:
+          EXECUTION_RESULT: ${{ needs.test-execution.result }}
+        run: test "${EXECUTION_RESULT:-}" = success
+
+  image-space-repeat:
+    name: ImageSpace diagnostic only (macos-26, 3.11)
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'image-space-repeat'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      STALLIONFS_TEST_IMAGES: '1'
+      STALLIONFS_TEST_SNAPSHOT_OBSERVATION: enospc-sibling-detach
+      IMAGE_REPEAT_MODE: ${{ inputs.mode }}
+      IMAGE_REPEAT_COUNT: ${{ inputs.repeat-count }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Validate diagnostic request before wheel setup
+        run: |
+          python -I -B - <<'PY'
+          import importlib.util, os
+          from pathlib import Path
+          path = Path(os.environ['GITHUB_WORKSPACE']) / 'tools/ci_image_repeat.py'
+          spec = importlib.util.spec_from_file_location('ci_image_repeat', path)
+          module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+          module.gate(os.environ)
+          PY
+      - name: Create diagnostic owned CI interpreter
+        timeout-minutes: 2
+        run: *ci-owned-python
+      - name: Install diagnostic pinned wheel backend
+        run: *ci-wheel-backend
+      - name: Fetch diagnostic qualified architecture component
+        run: *ci-component-fetch
+      - name: Build diagnostic current wheel with enforced Git cache reuse
+        run: *ci-wheel-build
+      - name: Install diagnostic current owned wheel
+        run: *ci-wheel-install
+      - name: Repeat exact installed ImageSpace test
+        run: |
+          cd "$RUNNER_TEMP"
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_image_repeat.py" repeat --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/image-space-repeat"
+      - name: Retain raw diagnostic results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-space-diagnostic-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/image-space-repeat/summary.json
+            ${{ runner.temp }}/image-space-repeat/iteration-*/result.json
+            ${{ runner.temp }}/image-space-repeat/iteration-*/diagnostics/image-failures.jsonl
+            ${{ runner.temp }}/image-space-repeat/iteration-*/child.*.json
+            ${{ runner.temp }}/image-space-repeat/iteration-*/child.*.bin
+            ${{ runner.temp }}/component-fetch.command.json
+            ${{ runner.temp }}/component-fetch.stdout.bin
+            ${{ runner.temp }}/component-fetch.stderr.bin
+            ${{ runner.temp }}/cache-wheel-build.command.json
+            ${{ runner.temp }}/cache-wheel-build.stdout.bin
+            ${{ runner.temp }}/cache-wheel-build.stderr.bin
+          if-no-files-found: warn
+          retention-days: 1
 
   hosted-docs-screen:
     name: Hosted document clone screen
-    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'unsigned-app-artifact'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["compare","thread-cpu","directory-feasibility","directory-docs-feasibility","delete-thread-cpu"]'), inputs.mode)
     runs-on: xcode-27
     timeout-minutes: 20
     permissions:
@@ -289,11 +612,11 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: '1'
       MAX_JOBS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13'
       - name: Build and install public source wheel
@@ -578,7 +901,7 @@ jobs:
         env:
           SCREEN_ROOT: ${{ runner.temp }}/hosted-docs-clone-screen
         if: always() && inputs.mode == 'compare'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-docs-clone-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -593,7 +916,7 @@ jobs:
           retention-days: 3
       - name: Preserve thread CPU phase status
         if: always() && inputs.mode == 'thread-cpu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/thread-cpu-status.json
@@ -601,7 +924,7 @@ jobs:
           retention-days: 3
       - name: Preserve fixed-cache delete CPU status
         if: always() && inputs.mode == 'delete-thread-cpu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-delete-thread-cpu-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/delete-thread-cpu-status.json
@@ -609,7 +932,7 @@ jobs:
           retention-days: 3
       - name: Preserve directory feasibility status
         if: always() && (inputs.mode == 'directory-feasibility' || inputs.mode == 'directory-docs-feasibility')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hosted-directory-feasibility-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hosted-docs-clone-screen/evidence/directory-feasibility-status.json
@@ -628,11 +951,11 @@ jobs:
       MAKEFLAGS: -j1
       MAX_JOBS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13'
       - name: Check artifact boundaries and existing package validation
@@ -642,9 +965,128 @@ jobs:
       - name: Build and verify unsigned components
         run: python -B tools/build_fskit_artifact.py --out "$RUNNER_TEMP/unsigned-app-components"
       - name: Retain verified unsigned component archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: unsigned-fskit-arm64-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unsigned-app-components/StallionFS-unsigned-arm64.tar.gz
           if-no-files-found: error
           retention-days: 3
+
+  native-git-qualification:
+    name: One-shot Intel native Git qualification
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'native-git-qualification'
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: native-git-qualification-${{ inputs.expected-source-sha }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      QUALIFICATION_MODE: ${{ inputs.mode }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Require exact manual source and first attempt
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import os, re
+          expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
+          assert re.fullmatch('[0-9a-f]{40}', expected) and expected == os.environ['GITHUB_SHA']
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['QUALIFICATION_MODE'] == 'native-git-qualification'
+          assert os.environ['RUNNER_OS'] == 'macOS' and os.environ['RUNNER_ARCH'] == 'X64'
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Place verified standalone Intel interpreter in owned directory
+        run: /usr/bin/python3 -I -B tools/ci_native_python.py --output "$RUNNER_TEMP/qualification-python"
+      - name: Install exact bounded build dependency
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt'
+      - name: Run one bounded raw build and native campaign
+        id: native-qualification
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B tools/ci_native_qualify.py execute --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/native-git-qualification"'
+      - name: Validate finite qualification transfer
+        id: qualification-transfer
+        if: always()
+        env:
+          QUALIFICATION_STEP_OUTCOME: ${{ steps.native-qualification.outcome }}
+        run: |
+          if test -f "$RUNNER_TEMP/native-git-qualification/transfer-result.json" || test -f "$RUNNER_TEMP/native-git-qualification/failure-transfer-result.json"; then
+            /usr/bin/python3 -I -B tools/ci_native_qualify.py transfer-ready --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/native-git-qualification"
+          fi
+      - name: Transfer finite qualification result
+        if: always() && steps.qualification-transfer.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-git-qualification-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ steps.qualification-transfer.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  registered-git-recheck:
+    name: Registered Git recheck (${{ matrix.architecture }})
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'registered-git-recheck'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-26, architecture: arm64, runner_architecture: ARM64}
+          - {os: macos-26-intel, architecture: x86_64, runner_architecture: X64}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: registered-git-recheck-${{ inputs.expected-source-sha }}-${{ matrix.architecture }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      QUALIFICATION_MODE: ${{ inputs.mode }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Require exact manual source and first attempt
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import os, re
+          expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
+          assert re.fullmatch('[0-9a-f]{40}', expected) and expected == os.environ['GITHUB_SHA']
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['QUALIFICATION_MODE'] == 'registered-git-recheck'
+          architecture = os.environ['EXPECTED_ARCHITECTURE']
+          assert architecture in ('arm64', 'x86_64')
+          assert os.environ['RUNNER_OS'] == 'macOS' and os.environ['RUNNER_ARCH'] == {'arm64': 'ARM64', 'x86_64': 'X64'}[architecture]
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Place verified standalone host interpreter in owned directory
+        run: /usr/bin/python3 -I -B tools/ci_native_python.py --architecture "${EXPECTED_ARCHITECTURE:?}" --output "$RUNNER_TEMP/qualification-python"
+      - name: Install exact bounded build dependency
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt'
+      - name: Run current wheel and registered native campaign
+        id: native-qualification
+        run: '"$CI_QUALIFICATION_PYTHON" -I -B tools/ci_native_qualify.py execute-registered --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/registered-git-recheck"'
+      - name: Validate finite qualification transfer
+        id: qualification-transfer
+        if: always()
+        env:
+          QUALIFICATION_STEP_OUTCOME: ${{ steps.native-qualification.outcome }}
+        run: |
+          if test -f "$RUNNER_TEMP/registered-git-recheck/transfer-result.json" || test -f "$RUNNER_TEMP/registered-git-recheck/failure-transfer-result.json"; then
+            /usr/bin/python3 -I -B tools/ci_native_qualify.py registered-transfer-ready --checkout "$GITHUB_WORKSPACE" --root "$RUNNER_TEMP/registered-git-recheck"
+          fi
+      - name: Transfer finite qualification result
+        if: always() && steps.qualification-transfer.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: registered-git-recheck-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ steps.qualification-transfer.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1

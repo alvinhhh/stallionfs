@@ -122,7 +122,8 @@ class Lifecycle:
         if any(Path(row['path']).is_relative_to(root) for row in mounts()):
             raise core.StallionError(f'Workspace contains a mounted volume: {path}')
 
-    def _standalone_git(self, repo):
+    def _standalone_git(self, repo, *, runtime=None):
+        from ._native_create_git import inspect_standalone
         gitdir = repo / '.git'
         if (not gitdir.is_dir() or gitdir.is_symlink() or
                 any(os.path.lexists(gitdir / name) for name in
@@ -130,16 +131,7 @@ class Lifecycle:
                 any(gitdir.rglob('*.lock'))):
             raise core.StallionError('Workspace requires standalone Git storage without active Git locks')
         core.validate_tree(gitdir)
-        if Path(core.git(repo, 'rev-parse', '--absolute-git-dir')).resolve() != gitdir.resolve():
-            raise core.StallionError('Workspace uses external Git storage')
-        for config in (gitdir / 'config', gitdir / 'config.worktree'):
-            if not config.exists():
-                continue
-            values = core.git(repo, 'config', '--file', config, '--no-includes', '--list').splitlines()
-            for line in values:
-                key = line.partition('=')[0].lower()
-                if key == 'core.worktree' or key == 'include.path' or key.startswith('includeif.'):
-                    raise core.StallionError('Workspace Git configuration contains external worktree or include references')
+        inspect_standalone(repo, branch=True, structure_required=False, runtime=runtime)
 
     def _closed_payload(self, path, meta, *, quiescent):
         if meta.get('backend') == 'native-image':
@@ -592,9 +584,12 @@ class Lifecycle:
                                     raise core.StallionError('Existing protection requires explicit restore or purge')
                                 core.write_json(protection, {'id': workspace, 'object': identity(path),
                                                             'generation': state['generation'], 'retired_at': now})
-                                # Protection precedes rename, including when rename succeeds then raises.
+                                # Persist protection before a rename can expose the object to GC.
+                                core.sync_directory(protection.parent)
                                 from ._scan import move
                                 move(path, self.root / 'trash' / workspace)
+                                core.sync_directory(path.parent)
+                                core.sync_directory(self.root / 'trash')
                         result['retired' if apply else 'would_retire'].append(workspace)
             except (core.StallionError, OSError, ValueError, TypeError) as error:
                 result['skipped'].append({'id': workspace, 'reason': str(error)})
@@ -611,6 +606,31 @@ class Lifecycle:
     def retained(self):
         return {kind: [p.name for p in (self.root / kind).iterdir()]
                 for kind in ('snapshots', 'recovery', 'protected')}
+
+    def _check_purge_journals(self):
+        from ._native import check_pending
+        for journal in (self.root / 'journals').iterdir():
+            try:
+                record = core.read_json(journal)
+                if record.get('operation') != 'native-create':
+                    raise core.StallionError('Journal may protect retained data')
+                check_pending(journal.stem, record)
+                stage = Path(record['stage'])
+                candidate = stage / 'owned'
+                final = self.root / 'workspaces' / journal.stem
+                if (str(stage) != record['stage'] or '..' in stage.parts
+                        or stage.parent != self.root / 'staging'
+                        or record['candidate'] != str(candidate)
+                        or record['final'] != str(final) or os.path.lexists(final)):
+                    raise core.StallionError('Native creation locations are uncertain')
+                core.private_directory(stage)
+                core.private_directory(candidate)
+                if identity(stage) != record['stage_identity'] or identity(candidate) != record['object']:
+                    raise core.StallionError('Native creation identities changed')
+                # This unpublished candidate is confined to staging. Keep its
+                # intent and data while allowing unrelated retained data to be purged.
+            except (core.StallionError, OSError, ValueError, KeyError, TypeError) as error:
+                raise core.StallionError('Resolve pending rollback or uncertain native creation before purging retained data') from error
 
     def purge(self, kind, value, *, yes=False):
         if kind not in ('snapshots', 'recovery', 'trash'):
@@ -641,8 +661,7 @@ class Lifecycle:
                     raise core.StallionError('Retained object not found: ' + value)
                 core.private_directory(path)
                 self._guard_native_tree(path)
-                if next((self.root / 'journals').iterdir(), None) is not None:
-                    raise core.StallionError('Resolve pending rollback before purging retained data')
+                self._check_purge_journals()
                 self._no_mounts(path)
                 image = path / 'workspace.sparseimage'
                 if os.path.lexists(image):

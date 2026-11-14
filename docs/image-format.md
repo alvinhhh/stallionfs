@@ -976,7 +976,14 @@ Mac attributes, ordinary FSKit installation and mounting remain later work.
 ## Internal prepared-tree candidates
 
 `Store._build_owned_native_candidate` accepts a prepared folder seed and an
-explicit integer capacity of 1–65536 GiB. It clones that seed into private
+explicit integer capacity of 1–65536 GiB. Candidate-only production now requires
+the selected companion app's qualified bundled Git payload and a successful
+package verification receipt before cloning or launching Git. It does not run
+Host discovery when installation is not requested. Source/wheel callers use the
+same selected Host's containing app; an arbitrary PATH Git is not mutation
+authority. Direct closed-image APIs and continuation of already verified images
+retain their existing contracts and do not acquire this new Git prerequisite.
+The producer clones the seed into private
 staging, initializes a standalone workspace branch, and calls the ordinary
 `_image.create_from_tree` extension. Each call exclusively creates format 0.6
 with a new core UUID and imports the complete supported tree at `/repo`.

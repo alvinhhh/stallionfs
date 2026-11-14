@@ -1,0 +1,101 @@
+--- a/hook.c
++++ b/hook.c
+@@ -1,3 +1,4 @@
++#define USE_THE_REPOSITORY_VARIABLE
+ #include "git-compat-util.h"
+ #include "abspath.h"
+ #include "advice.h"
+@@ -536,12 +537,20 @@
+ 			       struct run_hooks_opt *options)
+ {
+ 	struct string_list *hook_head;
++	char *hooks_path = NULL;
++	int hooks_disabled;
+ 
+ 	if (!hookname)
+ 		BUG("null hookname was provided to hook_list()!");
+ 
+ 	CALLOC_ARRAY(hook_head, 1);
+ 	string_list_init_dup(hook_head);
++
++	repo_config_get_pathname(r ? r : the_repository, "core.hookspath", &hooks_path);
++	hooks_disabled = hooks_path && !strcmp(hooks_path, "/dev/null");
++	free(hooks_path);
++	if (hooks_disabled)
++		return hook_head;
+ 
+ 	/* Add hooks from the config, e.g. hook.myhook.event = pre-commit */
+ 	list_hooks_add_configured(r, hookname, hook_head, options);
+--- a/attr.c
++++ b/attr.c
+@@ -10,6 +10,7 @@
+ #define DISABLE_SIGN_COMPARE_WARNINGS
+ 
+ #include "git-compat-util.h"
++#include "abspath.h"
+ #include "config.h"
+ #include "environment.h"
+ #include "exec-cmd.h"
+@@ -874,8 +875,16 @@
+ const char *git_attr_system_file(void)
+ {
+ 	static const char *system_wide;
+-	if (!system_wide)
+-		system_wide = system_path(ETC_GITATTRIBUTES);
++	if (!system_wide) {
++		const char *path = getenv("GIT_STALLIONFS_ATTR_SYSTEM");
++		if (path) {
++			if (!is_absolute_path(path) || strchr(path, '\n') || strchr(path, '\r'))
++				die("invalid internal system attributes path");
++			system_wide = xstrdup(path);
++		} else {
++			system_wide = system_path(ETC_GITATTRIBUTES);
++		}
++	}
+ 	return system_wide;
+ }
+ 
+@@ -923,6 +932,13 @@
+ 
+ 	/* system-wide frame */
+ 	if (git_attr_system_is_enabled()) {
++		const char *provider_attributes = getenv("GIT_STALLIONFS_ATTR_PROVIDER");
++		if (provider_attributes) {
++			if (!is_absolute_path(provider_attributes) || strchr(provider_attributes, '\n') || strchr(provider_attributes, '\r'))
++				die("invalid internal provider attributes path");
++			e = read_attr_from_file(provider_attributes, flags);
++			push_stack(stack, e, NULL, 0);
++		}
+ 		e = read_attr_from_file(git_attr_system_file(), flags);
+ 		push_stack(stack, e, NULL, 0);
+ 	}
+--- a/config.c
++++ b/config.c
+@@ -1578,6 +1578,17 @@
+ 	} else {
+ 		repo_config = NULL;
+ 		worktree_config = NULL;
++	}
++
++	if (git_config_system()) {
++		const char *provider_config = getenv("GIT_STALLIONFS_CONFIG_PROVIDER");
++		if (provider_config) {
++			if (!is_absolute_path(provider_config) || strchr(provider_config, '\n') || strchr(provider_config, '\r'))
++				die("invalid internal provider config path");
++			if (!access_or_die(provider_config, R_OK, 0))
++				ret += git_config_from_file_with_options(fn, provider_config,
++								 data, CONFIG_SCOPE_XCODE, NULL);
++		}
+ 	}
+ 
+ 	if (git_config_system() && system_config &&
+--- a/config.h
++++ b/config.h
+@@ -44,6 +44,7 @@
+ 	CONFIG_SCOPE_WORKTREE,
+ 	CONFIG_SCOPE_COMMAND,
+ 	CONFIG_SCOPE_SUBMODULE,
++	CONFIG_SCOPE_XCODE,
+ };
+ const char *config_scope_name(enum config_scope scope);
+ 

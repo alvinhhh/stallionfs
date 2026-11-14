@@ -2,11 +2,64 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 
 from . import __version__
+
+
+def _creation_output(result, root, continuing):
+    complete = result.get('status') == 'observed' and result.get('inventory_complete') is True
+    loaded = {'candidate', 'installed-unconfirmed', 'already-installed'}
+    def retained(row):
+        return row.get('status') in {'candidate', 'installed-unconfirmed'} or (
+            row.get('status') == 'retained' and row.get('authoritative') is True)
+    success = ((result.get('status') == 'installed-unmounted' or
+                (result.get('status') == 'already-installed' and result.get('handoff') == 'mount-state') or
+                result.get('status') in {'replacement-created', 'purged'}) if continuing else
+               complete and (result.get('scope') == 'store' or
+                             any(row.get('status') in loaded or retained(row) or
+                                 row.get('status') == 'purged' and row.get('authoritative') is True
+                                 for row in result['entries'])))
+    command = ['sfs']
+    default_root = (Path.home() / 'Library/Application Support/stallionfs').absolute()
+    ambient_root = Path(os.environ.get('STALLIONFS_HOME', str(default_root))).expanduser().absolute()
+    if root != default_root or root != ambient_root:
+        command += ['--root', str(root)]
+    lines = [f'{key}: {json.dumps(value, sort_keys=True)}' for key, value in result.items() if key != 'entries']
+    for row in result.get('entries', ()):
+        lines.append('entry: ' + json.dumps(row, sort_keys=True))
+        if complete and retained(row):
+            inspect = shlex.join([*command, 'creations', row['workspace']])
+            lines.append(f'Creation retained. Files preserved. Workspace unavailable. Run {inspect} to inspect.')
+        if row.get('status') == 'purge-interrupted':
+            inspect = shlex.join([*command, 'creations', row['workspace']])
+            lines.append(f'Creation purge interrupted. Some files may have been removed. Run {inspect} to inspect.')
+    if continuing and result.get('status') == 'purge-interrupted':
+        inspect = shlex.join([*command, 'creations', result['workspace']])
+        lines.append(f'Creation purge interrupted. Some files may have been removed. Run {inspect} to inspect.')
+    if continuing and result.get('status') == 'installed-unmounted':
+        mount = shlex.join([*command, 'mount', result['workspace']])
+        lines.append(f'Workspace installed and unmounted. Run {mount}.')
+    return success, '\n'.join(lines)
+
+
+def _creation_purge_output(result, root):
+    command = ['sfs', '--root', str(root), 'creations', result['workspace']]
+    inspect = shlex.join(command)
+    status = result['status']
+    messages = {
+        'preview': 'No files removed. Add --confirm to permanently remove this creation’s retained files.',
+        'purged': 'Creation purge complete.',
+        'writer-unverified': 'Creation retained. A process may still be writing.',
+        'interrupted': f'Creation purge interrupted. Some files may have been removed. Run {inspect} to inspect.',
+    }
+    lines = [f'{key}: {json.dumps(value, sort_keys=True)}' for key, value in result.items()]
+    lines.append(messages.get(status, f'Creation retained. Run {inspect} to inspect.'))
+    return status in {'preview', 'purged'}, '\n'.join(lines)
 
 
 def main(argv=None):
@@ -57,6 +110,14 @@ def main(argv=None):
     create.add_argument('--native-profile', choices=('production', 'private-sfsro27'), default='production')
     create.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     create.add_argument("--jobs", type=int, choices=range(1, 5), default=4, help="Folder clone workers; use 1 for lower CPU use")
+    creations = commands.add_parser('creations', help='Inspect retained native creations or continue an exact transaction')
+    creations.add_argument('id', nargs='?', metavar='ID')
+    creation_action = creations.add_mutually_exclusive_group()
+    creation_action.add_argument('--continue', dest='continue_operation', metavar='TRANSACTION', help='Continue the matching retained creation')
+    creation_action.add_argument('--purge', dest='purge_creation', metavar='TRANSACTION')
+    creation_action.add_argument('--adopt-current', dest='adopt_current', metavar='TRANSACTION', help='Adopt the selected current closed image')
+    creations.add_argument('--confirm', action='store_true')
+    creations.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     for action in ("mount", "unmount"):
         command = commands.add_parser(action, help="Mount an image workspace" if action == "mount" else "Unmount an image workspace")
         command.add_argument("id")
@@ -128,6 +189,20 @@ def main(argv=None):
     args = parser.parse_args(raw)
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
+    if args.action == 'creations':
+        if args.adopt_current is not None and args.id is None:
+            parser.error('creations --adopt-current requires ID')
+        if args.purge_creation is not None and args.id is None:
+            parser.error('creations --purge requires ID')
+        if args.confirm and args.purge_creation is None:
+            parser.error('--confirm requires --purge')
+        if args.continue_operation is not None and args.id is None:
+            parser.error('creations --continue requires ID')
+        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation), ('TRANSACTION', args.purge_creation), ('TRANSACTION', args.adopt_current)):
+            if value is not None and re.fullmatch('[0-9a-f]{32}', value) is None:
+                parser.error(label + ' must contain 32 lowercase hexadecimal characters')
+        if args.native_host is not None and args.continue_operation is None:
+            parser.error('--native-host requires --continue')
     if args.action == 'command':
         if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
             parser.error('--root applies to workspace commands')
@@ -145,8 +220,30 @@ def main(argv=None):
         return benchmark.run(args)
     from .core import StallionError, Store, native_failure_details
     try:
-        store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes"} else Store(args.root)
-        if args.action == "scan":
+        store = None if args.action in {"scan", "clone", "copy", "delete", "move", "volumes", "creations"} else Store(args.root)
+        if args.action == 'creations':
+            from ._native_create_recovery import inventory, continue_creation
+            root = Path(args.root).expanduser().absolute()
+            continuing = args.continue_operation is not None
+            if args.adopt_current is not None:
+                from ._native_binding import adopt_current
+                result = adopt_current(root, args.id, args.adopt_current)
+                success = result['status'] == 'current-image-adopted'
+                text = json.dumps(result, sort_keys=True)
+            elif args.purge_creation is not None:
+                from ._native_creation_purge import purge_creation
+                result = purge_creation(root, args.id, args.purge_creation, confirm=args.confirm)
+                success, text = _creation_purge_output(result, root)
+            else:
+                result = (continue_creation(root, args.id, args.continue_operation, host=args.native_host)
+                          if continuing else inventory(root, args.id))
+                success, text = _creation_output(result, root, continuing)
+            if args.json:
+                output = result if success else {**result, 'error': result.get('code', result['status'])}
+                text = json.dumps(output, sort_keys=True)
+            print(text, file=sys.stdout if success else sys.stderr)
+            return 0 if success else 1
+        elif args.action == "scan":
             try:
                 from ._scan import scan
             except ImportError as exc:
@@ -198,7 +295,7 @@ def main(argv=None):
             text = "\n".join(f"{item['id']}\t{item.get('name', '')}\t{item['path']}" for item in result)
         elif args.action in ("remove", "restore"):
             result = store.move(args.id, restore=args.action == "restore")
-            text = result["path"]
+            text = result["path"] if "path" in result else result["restored" if args.action == "restore" else "retired"]
         elif args.action == "gc":
             items = store.gc(older_than=args.older_than * 3600, yes=args.yes, jobs=args.jobs)
             result = {"deleted" if args.yes else "would_delete": items}

@@ -118,6 +118,7 @@ class LinuxMetadataCoverage(unittest.TestCase):
         import hashlib
         size = 8*1024*1024
         receipt = {'platform': 'linux', 'path': 'sparse', 'data_size': size,
+                   'symlink_precision': {'scope': 'copy-clone', 'links': []},
                    'posix_acl_access_hex': '0200000002000400feff0000', 'hardlinks': ['alias', 'sparse'],
                    'sparse': {'size': size, 'interior': [1024*1024, 7*1024*1024], 'endpoints': True}}
         entry = {'kind': 'file', 'size': size, 'device_inode': [1, 2], 'allocated_bytes': 8192,
@@ -127,7 +128,7 @@ class LinuxMetadataCoverage(unittest.TestCase):
                  'sha256': hashlib.sha256(b'x' + bytes(size-2) + b'y').hexdigest()}
         observed = {'entries': {'sparse': entry, 'alias': copy.deepcopy(entry)}, 'unavailable_fields': [],
                     'metadata_capabilities': {'platform': 'linux'}, 'hardlink_groups': [['alias', 'sparse']]}
-        self.assertTrue(fixtures.verify_metadata_coverage(observed, receipt)['populated'])
+        self.assertTrue(fixtures.verify_metadata_coverage(observed, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         for defect in ('acl', 'xattr', 'links', 'inode', 'holes', 'unknown_holes', 'allocation', 'payload', 'unavailable'):
             changed = copy.deepcopy(observed); row = changed['entries']['sparse']
             if defect == 'acl': row['acl']['access_hex'] = None
@@ -140,7 +141,7 @@ class LinuxMetadataCoverage(unittest.TestCase):
             elif defect == 'payload': row['sha256'] = '0'*64
             elif defect == 'unavailable': changed['unavailable_fields'] = ['acl']
             with self.subTest(defect=defect), self.assertRaises(RuntimeError):
-                fixtures.verify_metadata_coverage(changed, receipt)
+                fixtures.verify_metadata_coverage(changed, receipt, precision_links=(), precision_scope='copy-clone')
 
 
 class MetadataCoverage(unittest.TestCase):
@@ -160,10 +161,12 @@ class MetadataCoverage(unittest.TestCase):
             root.write_bytes(payload)
             receipt = fixtures.enrich_metadata(root, receipt={})
             observed = self.checks.snapshot(root)
-            coverage = fixtures.verify_metadata_coverage(observed, receipt)
+            coverage = fixtures.verify_metadata_coverage(observed, receipt, precision_links=(), precision_scope='copy-clone')
             self.assertTrue(coverage['populated'])
             self.assertGreater(coverage['seeded_acl_text_bytes'], 0)
             self.assertEqual(coverage['regular_files'], 1)
+            self.assertEqual(coverage['precision_symlinks'], 0)
+            self.assertEqual(coverage['symlink_precision_scope'], 'not-applicable')
             self.assertEqual(coverage['logical_bytes'], 4096)
             self.assertEqual(root.read_bytes(), payload)
             self.assertEqual(observed['entries']['']['sha256'], hashlib.sha256(payload).hexdigest())
@@ -179,7 +182,7 @@ class MetadataCoverage(unittest.TestCase):
             (root/'original').write_bytes(b'unchanged')
             receipt = fixtures.enrich_metadata(root, receipt={})
             observed = self.checks.snapshot(root)
-            self.assertTrue(fixtures.verify_metadata_coverage(observed, receipt))
+            self.assertTrue(fixtures.verify_metadata_coverage(observed, receipt, precision_links=(), precision_scope='copy-clone'))
             self.assertEqual((root/'original').read_bytes(), b'unchanged')
             self.assertEqual(receipt['added_regular_entries'], 2)
             self.assertEqual(receipt['added_directories'], 2)
@@ -201,7 +204,7 @@ class MetadataCoverage(unittest.TestCase):
                     elif defect == 'holes_unknown': entry['holes']['ranges'] = None
                     elif defect == 'allocated': entry['allocated_bytes'] = entry['size']
                     elif defect == 'payload': entry['sha256'] = '0'*64
-                    with self.assertRaises(RuntimeError): fixtures.verify_metadata_coverage(changed, receipt)
+                    with self.assertRaises(RuntimeError): fixtures.verify_metadata_coverage(changed, receipt, precision_links=(), precision_scope='copy-clone')
 
     def test_scan_enrichment_preserves_entries_sizes_and_counters(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -210,20 +213,137 @@ class MetadataCoverage(unittest.TestCase):
                     root = Path(directory)/layout
                     expected = fixtures.scan_fixture(root, 103, layout)
                     before = self.checks.snapshot(root, allow_special=True)
-                    receipt = fixtures.enrich_metadata(root, receipt={}, scan_layout=layout)
+                    links = fixtures.precision_link_paths('scan_' + layout + '_20k')
+                    receipt = fixtures.enrich_metadata(root, receipt={}, scan_layout=layout, precision_links=links)
                     after = self.checks.snapshot(root, allow_special=True)
-                    coverage = fixtures.verify_metadata_coverage(after, receipt)
+                    coverage = fixtures.verify_metadata_coverage(
+                        after, receipt, precision_links=links, precision_scope='scan-only')
                     self.assertTrue(coverage['populated'])
                     self.assertEqual(coverage['regular_files'], expected['files'])
                     self.assertEqual(coverage['directories'], expected['directories'] + 1)
                     self.assertEqual(coverage['symlinks'], expected['symlinks'])
                     self.assertEqual(coverage['special_entries'], expected['other'])
+                    self.assertEqual(coverage['precision_symlinks'], 3)
+                    self.assertEqual(coverage['symlink_precision_scope'], 'scan-only')
+                    with self.assertRaisesRegex(RuntimeError, 'scope differs'):
+                        fixtures.verify_metadata_coverage(
+                            after, receipt, precision_links=links, precision_scope='copy-clone')
                     projection = lambda snap: {path: (row['kind'], row.get('size'), row['device_inode'])
                                                for path, row in snap['entries'].items()}
                     self.assertEqual(projection(before), projection(after))
                     self.assertEqual(receipt['added_directories'], 0)
                     self.assertEqual(receipt['added_regular_entries'], 0)
                     self.assertEqual(sum(row.get('size', 0) for row in after['entries'].values()), expected['logical_bytes'])
+
+    def test_owned_precision_links_admission_and_snapshot_contract(self):
+        import copy
+        import fileops
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            outside = base / 'outside-sentinel'
+            outside.write_bytes(b'keep outside linked trees\n')
+            outside_before = self.checks.snapshot(outside)
+            root = fileops.fixtures(base, names=('flat_2000',))['flat_2000']
+            before = self.checks.snapshot(root)
+            links = fixtures.precision_link_paths('flat_2000')
+            receipt = fixtures.enrich_metadata(root, receipt={}, precision_links=links)
+            after = self.checks.snapshot(root)
+            coverage = fixtures.verify_metadata_coverage(
+                after, receipt, precision_links=links, precision_scope='copy-clone')
+            self.assertEqual(coverage['precision_symlinks'], 2)
+            for path, row in before['entries'].items():
+                current = after['entries'][path]
+                for field in ('kind', 'size', 'device_inode', 'sha256', 'symlink_bytes'):
+                    self.assertEqual(row.get(field), current.get(field))
+            self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+            for defect in ('missing', 'rounded', 'target', 'inode', 'receipt'):
+                changed = copy.deepcopy(after)
+                seed = copy.deepcopy(receipt)
+                path = seed['symlink_precision']['links'][0]['path']
+                if defect == 'missing': del changed['entries'][path]
+                elif defect == 'rounded': changed['entries'][path]['mtime_ns'] -= 321
+                elif defect == 'target': changed['entries'][path]['symlink_bytes'] = '00'
+                elif defect == 'inode': changed['entries'][path]['device_inode'] = [-1, -1]
+                else: seed['symlink_precision']['links'][0]['observed_ns'] -= 321
+                with self.subTest(defect=defect), self.assertRaises(RuntimeError):
+                    fixtures.verify_metadata_coverage(
+                        changed, seed, precision_links=links, precision_scope='copy-clone')
+            self.assertEqual(fixtures.precision_link_paths('installed_dependencies'), ())
+
+    def test_precision_receipt_requires_complete_unique_paths_and_scope(self):
+        import copy
+        with tempfile.TemporaryDirectory() as directory:
+            root = fixtures.deep_tree(Path(directory) / 'deep', files=12, depth=40)
+            links = fixtures.precision_link_paths('deep_20000')
+            receipt = fixtures.enrich_metadata(root, receipt={}, precision_links=links)
+            observed = self.checks.snapshot(root)
+            # Receipt order is irrelevant; the fixture contract is independent of it.
+            receipt['symlink_precision']['links'].reverse()
+            coverage = fixtures.verify_metadata_coverage(
+                observed, receipt, precision_links=links, precision_scope='copy-clone')
+            self.assertEqual(coverage['precision_symlinks'], 2)
+            self.assertEqual(coverage['symlink_precision_scope'], 'copy-clone')
+            with self.assertRaisesRegex(RuntimeError, 'paths differ'):
+                fixtures.verify_metadata_coverage(
+                    observed, receipt, precision_links=(), precision_scope='copy-clone')
+            for defect in ('omitted_row', 'empty_rows', 'missing_rows', 'missing_section',
+                           'duplicate', 'substitution', 'extra', 'wrong_scope', 'missing_scope',
+                           'rounded_request', 'rounded_readback', 'rounded_snapshot'):
+                seed, changed = copy.deepcopy(receipt), copy.deepcopy(observed)
+                precision = seed['symlink_precision']
+                rows = precision['links']
+                message = 'paths differ'
+                if defect == 'omitted_row':
+                    omitted = rows.pop()
+                    changed['entries'][omitted['path']]['mtime_ns'] -= 321
+                elif defect in ('empty_rows', 'missing_rows', 'missing_section'):
+                    for path in links:
+                        changed['entries'][path]['mtime_ns'] -= 321
+                    if defect == 'empty_rows': precision['links'] = []
+                    elif defect == 'missing_rows': del precision['links']
+                    else: del seed['symlink_precision']
+                    if defect != 'empty_rows': message = 'receipt missing'
+                elif defect == 'duplicate': rows.append(copy.deepcopy(rows[0]))
+                elif defect == 'substitution': rows[1] = copy.deepcopy(rows[0])
+                elif defect == 'extra': rows.append(rows[0] | {'path': 'unrequired-link'})
+                elif defect in ('wrong_scope', 'missing_scope'):
+                    if defect == 'wrong_scope': precision['scope'] = 'scan-only'
+                    else: del precision['scope']
+                    message = 'scope differs'
+                else:
+                    if defect == 'rounded_request': rows[0]['requested_ns'] -= 321
+                    elif defect == 'rounded_readback': rows[0]['observed_ns'] -= 321
+                    else: changed['entries'][rows[0]['path']]['mtime_ns'] -= 321
+                    message = 'precision missing'
+                with self.subTest(defect=defect), self.assertRaisesRegex(RuntimeError, message):
+                    fixtures.verify_metadata_coverage(
+                        changed, seed, precision_links=links, precision_scope='copy-clone')
+
+    def test_precision_admission_rejects_rounded_setter_before_enrichment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            link = root / 'dangling-link'
+            link.symlink_to('absent')
+            requested = fixtures.SYMLINK_MTIME_NS
+            os.utime(link, ns=(requested, requested - 321), follow_symlinks=False)
+            receipt = {}
+            with mock.patch.object(fixtures.os, 'utime'), self.assertRaisesRegex(RuntimeError, 'admission failed'):
+                fixtures.enrich_metadata(root, receipt=receipt, precision_links=('dangling-link',))
+            self.assertEqual(receipt['symlink_precision']['links'][0]['observed_ns'], requested - 321)
+            self.assertFalse((root / 'metadata-fixture').exists())
+
+    def test_deep_precision_receipt_keeps_internal_target_payload_and_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = fixtures.deep_tree(Path(directory) / 'deep', files=12, depth=40)
+            before = self.checks.snapshot(root)
+            links = fixtures.precision_link_paths('deep_20000')
+            receipt = fixtures.enrich_metadata(root, receipt={}, precision_links=links)
+            after = self.checks.snapshot(root)
+            self.assertEqual(fixtures.verify_metadata_coverage(
+                after, receipt, precision_links=links, precision_scope='copy-clone')['precision_symlinks'], 2)
+            for path, row in before['entries'].items():
+                for field in ('kind', 'size', 'device_inode', 'sha256', 'symlink_bytes'):
+                    self.assertEqual(row.get(field), after['entries'][path].get(field))
 
     def test_failed_or_interrupted_acl_setup_keeps_partial_receipt(self):
         import fileops

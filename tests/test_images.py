@@ -1,5 +1,6 @@
 """Real APFS image lifecycle checks; never touch an existing volume."""
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import platform
 import shutil
@@ -12,9 +13,9 @@ from unittest.mock import patch
 
 from stallionfs import images
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_detach
+    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
 else:
-    from image_failure_diagnostics import failure_scope, observe_detach
+    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
 from stallionfs.core import StallionError
 
 
@@ -25,6 +26,7 @@ class Images(unittest.TestCase):
         super().__init__(*args, **kwargs)
         self.failed_images = set()
         self.retain = False
+        self.observation = 'initial-unmount'
 
     def _detach(self, image, point, *, stage='body', expected=False, command=None):
         with failure_scope(self.base, image, mountpoint=point, stage=stage, expected=expected):
@@ -54,6 +56,7 @@ class Images(unittest.TestCase):
             raise
 
     def _prepare(self):
+        self.observation = detach_observation_selection()
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-images-')).resolve()
         self.source = self.base / 'source'
         self.source.mkdir(mode=0o700)
@@ -125,7 +128,7 @@ class Images(unittest.TestCase):
         self.assertIsNone(images.mounted(first))
         repo = images.attach(first, first_mount)
         self.assertEqual((repo / 'file').read_bytes(), b'changed')
-        with observe_detach():
+        with observe_detach() if self.observation != 'enospc-initial-detach' else nullcontext():
             self._detach(first, first_mount)
         self._detach(second, second_mount)
         seed_repo = images.attach(self.seed, self.base / 'seed')

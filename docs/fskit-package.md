@@ -8,6 +8,12 @@ short name `stallionfs`; `--profile private-sfsro27` explicitly selects the priv
 test type. Packaging is preparation for controlled qualification, not an installer.
 The read-only recipe below does not qualify writable workspace creation.
 
+The module declares `FSActivateOptionSyntax` with `shortOptions` set to `o:`.
+The system mount tool requires this activation syntax before it can activate
+an FSKit volume. The native controller uses `/sbin/mount -F -t stallionfs` to
+select FSKit explicitly and prevent fallback to a legacy filesystem helper.
+This metadata and routing do not establish mounted correctness.
+
 First complete the offline recipe in that document in a Bash session. Keep its
 successful output directory, three fixture files, source hashes and compiler
 logs. Current production extensions accept supported validated format-0.6 images.
@@ -199,8 +205,8 @@ accepted writable sessions may legitimately change branch and content.
 
 Contextual creation access accepts `addFile` and `addSubdirectory`, separately or
 together, on linked owner directories with write/search mode bits, no special
-mode bits, flags or opaque ACL. This includes the linked root without a namespace
-parent ID. Creation access requires a mounted writable resource; every combined
+mode bits or opaque ACL, and only supported BSD flags. This includes the linked
+root without a namespace parent ID. Creation access requires a mounted writable resource; every combined
 right still passes its original permission checks. On regular files the SDK's
 `addSubdirectory` bit remains `appendData` under the existing file policy.
 Directory construction checks `addSubdirectory` and search through that same
@@ -217,16 +223,17 @@ acknowledged only after both complete SDK result roles and the commit validate.
 
 Creation still requires explicit owner mode/UID/GID and the original parent's
 write/search authority. Restrictive initial child modes do not prevent applying
-supplied times. Flags must be absent or zero; file/directory size must be absent
-or zero, and every explicit symlink size is refused. Computed fields, changeTime,
+supplied times. Flags may be absent or contain only `UF_NODUMP` (0x1) and
+`UF_HIDDEN` (0x8000); file/directory size must be absent or zero, and every explicit
+symlink size is refused. Computed fields, changeTime,
 backupTime, addedTime and capability hints remain unsupported. These callback
 semantics do not establish which attributes Finder or copying utilities supply,
 or qualify installed copy metadata fidelity and close/remount behavior.
 
 Contextual extended-attribute mutation accepts owned regular files, directories
 (including root) and symbolic links. It requires a mounted writable resource,
-owner-write mode, zero flags, no special mode bits and no opaque ACL. Every
-combined access right must independently pass against the original metadata.
+owner-write mode, only supported BSD flags, no special mode bits and no opaque
+ACL. Every combined access right must independently pass against the original metadata.
 Directory search is required only for a separate search or creation right.
 Symlink attributes belong to the link's exact held inode and pin, never its
 target; a dangling or changed target does not redirect an attribute operation.
@@ -273,24 +280,35 @@ start a transaction. Failures preserve the existing rollback or uncertain-outcom
 rules. Direct callback tests do not qualify installed syscall or cache behavior.
 Mounted snapshots and generic stale cleanup remain unsupported.
 
-Contextual attribute setting accepts ordinary owner permission bits and explicit
-access, modification and birth times, including a request combined with regular
-file resize. The original item and caller must pass the owner, ACL, flags and
+Contextual attribute setting accepts ordinary owner permission bits, `UF_NODUMP`
+and `UF_HIDDEN`, and explicit access, modification and birth times, including a
+request combined with regular file resize. The original item and caller must pass the owner, ACL, flags and
 special-mode policy. Metadata and security access checks use that same policy;
 security authorization does not implement ACL or ownership changes. Every other
 requested access right still requires its original permission. Mode cannot grant
-the data permission needed by a resize in the same request.
+the data permission needed by a resize in the same request. Flag setting requires
+WRITE_SECURITY under that original-state owner policy. Explicit zero clears flags;
+omitted flags preserve them. Both requested and existing flags must fit the exact
+core mask `SFS_FLAGS_SUPPORTED` (0x8001); unsupported bits are refused without
+stripping. The two supported flags are dump exclusion and a GUI visibility hint;
+they do not prevent otherwise eligible xattr, execution, create, link, rename or
+remove operations, including flagged parents and replacement victims.
 
 Resize and metadata changes share one transaction. Explicit times are applied
 after resize, even when equal to the original times. Nanoseconds are preserved
 exactly; unsupported date coercions are refused. Full SDK result attributes are
 prepared before commit, and supported fields are acknowledged only after verified
-success. An all-value no-op does not commit. Held detached items retain their
-own token and informational parent relationship; their metadata still does not
-survive the core handle closing. UID/GID, flags and special permission bits remain
-unsupported setters; backup and added times have no on-disk representation and
-remain unconsumed. Installed chmod/fchmod, time-setting and cache behavior require
-separate qualification; direct callback tests do not establish their routing.
+success. Setter and creation results require valid flags even if the SDK result
+mask omits them. An all-value no-op still requires authority and returns and
+acknowledges valid requested fields, without a transaction or ctime change.
+Held detached items retain their own token and informational parent relationship;
+their metadata still does not survive the core handle closing. UID/GID, other BSD flags and special permission
+bits remain unsupported setters; backup and added times have no on-disk
+representation and remain unconsumed. UID/GID changes, ACL evaluation and full
+platform authority semantics remain open. Installed chflags/fchflags, chmod/fchmod, time-setting,
+Finder/copy, cache and unmount/remount behavior require separate qualification
+with a newly built signed artifact; direct callbacks do not establish their routing
+or qualify an existing installed artifact.
 
 Release qualification must bind the final signed artifact to the reviewed
 both-flags build and exercise two complete create/run/write/fsync/unmount/remount
@@ -302,7 +320,8 @@ qualification gates remain open until that intended artifact passes them.
 
 The contextual writable profile authorizes regular-file execution only for the
 volume owner, with owner read and execute bits (`0500`), no special permission
-bits, zero flags and no opaque ACL descriptor. Both contextual build flags,
+bits, only supported BSD flags and no opaque ACL descriptor. Both contextual
+build flags,
 contextual-write admission, enabled writes, mounted readiness and current writable
 resource access are required. Read-only, legacy and diagnostic fixture profiles
 retain their execution refusal. Every combined access right still needs its own
@@ -417,6 +436,22 @@ preparation and user workspace commands retain their existing PATH behavior.
 Caller-selected external tools/configuration remain outside the private Git
 closure; no network, credential or keychain qualification is implied.
 
+The schema-2 runtime descriptor adds a compact native-creation Git contract:
+source, build-config and input-inventory hashes plus the assembled payload's
+canonical tree hash and entry count. Native creation selects it from the same
+companion Host used for package verification, including source/wheel callers.
+Schema-1 descriptors remain usable by generic/bootstrap paths but do not grant
+native branch-mutation authority. Package verification must accept that same
+app under the expected publisher requirement before the first creation effect.
+
+Signing changes Mach-O bytes. The signing controller must finalize the Git
+payload descriptor after nested Git signing and before the outer app seal.
+The internal finalizer requires the assembled descriptor hash, original payload
+rows and exact resulting hashes of independently verified signature transforms;
+it refuses other byte, namespace, link or mode changes. It does not sign or
+verify signatures itself. Controlled verifier fixtures do not qualify a signed
+companion, installed package or mounted filesystem.
+
 With this option only, app directories become `0755`, executable inputs/helper
 `0755` and ordinary resources `0644`; the receipt remains `0600`. Licenses are
 inside `Contents/Resources/Licenses`; a fresh sibling `APP.app.sources`
@@ -442,6 +477,11 @@ one per-user `~/.local/bin/sfs` link. The target must be the admitted physical
 translocated, symlinked and mounted-volume candidates are refused. These actions
 manage a command link; they do not install, replace or remove the app or prepare
 an FSKit module for an update.
+
+`Extension Settings` opens the macOS File System Extensions pane for manual
+module enablement and any macOS authorization. `Quit StallionFS` (Command-Q)
+uses normal app termination. Command setup must finish before the app can quit
+or its panel can close.
 
 The corresponding bundled CLI actions are `sfs command status`, `sfs command
 install` and `sfs command remove`; place `--json` before `command` for structured
@@ -480,7 +520,8 @@ ARM64 wheel, and `tools/mount_witness.c`. The mount witness is compiled without
 being run. This finite job does not sign for distribution, install, register,
 or mount anything. Linker-added ad-hoc signatures may be present.
 
-The artifact contains only the four unsigned app files, wheel, mount witness,
+The artifact contains the unsigned Host/extension files, standalone maintenance
+leaf, wheel, mount witness,
 repository `LICENSE`, and public `provenance.json` in `StallionFS-unsigned-arm64.tar.gz`. The manifest
 records the source commit/tree, source and component hashes, actual tools and
 SDK, command results, production symbol checks, existing packager candidate
@@ -496,3 +537,37 @@ fixture identities, keys, profiles, or account identifiers are workflow inputs.
 Bundle version 146 identifies this component build; the product version is
 unchanged. A later private assembly must use the matching wheel and preserve
 its source and build provenance.
+
+## Maintenance resources
+
+Runtime assembly includes `Contents/Resources/Maintenance/observer.py`, the
+separately signed standalone `stallionfs-maintenance` native leaf, and
+`compatibility.json`. The observer reads existing declared stores without
+initializing them or performing recovery, cleanup, replacement or mounts. It
+retains default, environment and explicit roots in its observation; missing
+required roots, unknown records, pending work and uncertain activity block
+clearance. Results describe one user's declared roots during cooperative
+downtime and do not reserve the stores against later writers.
+
+The bounded schema-1 resource records the observer's bytes, fixed resource
+roles, stable bundle/package/source build fields and exact runtime/parser
+contracts. Assembly checks these against retained input bytes and actual build
+fields, reads both staged resources back and requires their exact rows in the
+external candidate inventory. These checks establish structural consistency.
+The resources are unsigned assembly inputs awaiting the existing app seal.
+
+`public_upgrade_support` is empty. Recognizing a retained request schema does
+not qualify an installed predecessor/candidate pair. The external observer and bounded native retention entry point implement the
+[exact-artifact maintenance procedure](fskit-maintenance.md). Installed
+removal/reinstall/restoration qualification remains outstanding.
+Before an external observer can execute, trusted system static verification
+must admit the candidate seal, its observer resource and an independently
+expected publisher; the old installed runtime must be admitted separately.
+Candidate declarations and hash equality provide no publisher authentication.
+
+The compatibility resource does not contain its own hash, a final app/archive
+hash or the unfinished runtime descriptor's hash. Existing Git finalization may
+rewrite `runtime.json` after Git signing and before the outer app seal. Final
+artifact, descriptor and compatibility identities must be bound afterward in an
+independently retained authenticated release/pair record. The build fields in
+this resource remain stable through that ordering.

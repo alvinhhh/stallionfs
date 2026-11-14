@@ -1,6 +1,6 @@
 """Native filesystem operations and prepared Git workspaces for macOS."""
 
-__version__ = "0.6.3"
+__version__ = "0.7.0"
 
 __all__ = ["clone", "copy", "delete", "mounts", "move", "scan"]
 

@@ -31,12 +31,69 @@ _fields = {
                   'returncode', 'timeout', 'truncated', 'reaped', 'capture_error', 'cleanup_error', 'reason'},
 }
 _fields['observation'] = _fields['failure']
+_fields['validation'] = {'read', 'sample_timestamp_ns', 'sample_status', 'reason',
+                         'selected_device', 'volume_device', 'mountpoint_state', 'entities'}
+_fields['eject_outcome'] = {'commands', 'first_status', 'continuation_status', 'outcome'}
 _scope = ContextVar("image_failure_scope", default=None)
 _detach_observation = ContextVar("image_detach_observation", default=None)
+_detach_call = ContextVar("image_detach_call", default=None)
+_validation_read = ContextVar("image_validation_read", default=None)
 _create_scope = ContextVar("image_create_observation", default=None)
 _create_patch_lock = threading.Lock()
 _active_create = None
 _device = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
+_hints = {'', 'GUID_partition_scheme', 'Apple_partition_scheme', 'FDisk_partition_scheme',
+          'Apple_APFS', 'Apple_APFS_ISC', 'Apple_APFS_Recovery', 'Apple_HFS', 'Apple_Boot',
+          'Apple_Free', 'EFI', '[unrecognized]'}
+
+
+def _entities(entries):
+    """Project a bounded inventory without retaining free-form native fields."""
+    if not isinstance(entries, list) or not 0 < len(entries) <= 32:
+        raise ValueError('invalid entity count')
+    result, size = [], 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError('invalid entity')
+        device = entry.get('dev-entry')
+        if not isinstance(device, str) or len(device) > 64 or not _device.fullmatch(device):
+            raise ValueError('invalid entity device')
+        hints = []
+        for name in ('content-hint', 'unmapped-content-hint'):
+            value = entry.get(name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError('invalid entity hint')
+            hints.append(value if value is None or len(value) <= 64 and value in _hints else '[unrecognized]')
+        mountable = entry.get('potentially-mountable')
+        if mountable is not None and type(mountable) is not bool:
+            raise ValueError('invalid entity flag')
+        size += 160 + len(device) + sum(len(value or '') for value in hints)
+        if size > 4096:
+            raise ValueError('entity projection limit')
+        result.append(dict(device=device, content_hint=hints[0], unmapped_content_hint=hints[1],
+                           potentially_mountable=mountable))
+    return result
+
+
+def _finish_eject(observation, error):
+    if not observation or observation.get('finalized'):
+        return
+    reporter, status = observation.get('diagnostics'), observation.get('command_status')
+    if (reporter is None or reporter.closed or observation.get('command_error') is not error or
+            type(status) is not int or status == 0 or
+            (observation.get('scope') or {}).get('expected', False)):
+        return
+    observation['finalized'] = True
+    if reporter.eject_failure_claimed:
+        return
+    reporter.eject_failure_claimed = True
+    try:
+        reporter.eject_log(observation)
+    except BaseException as unavailable:
+        try:
+            error.add_note('Eject log unavailable: ' + type(unavailable).__name__)
+        except BaseException:
+            pass
 
 
 @contextmanager
@@ -302,26 +359,23 @@ def failure_scope(base, image=None, *, workspace=None, mountpoint=None, stage='b
         _scope.reset(token)
 
 
+def detach_observation_selection():
+    value = os.environ.get('STALLIONFS_TEST_SNAPSHOT_OBSERVATION', 'initial-unmount')
+    if value not in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach',
+                     'enospc-sibling-detach', 'restored-cleanup'):
+        raise ValueError('Invalid detach observation selection')
+    return value
+
+
 @contextmanager
 def observe_detach():
-    """Observe only the first detach command in this explicit test operation."""
+    """Observe before validation of the first detach in this test operation."""
     observation = dict(started=False, operation_id=None, pre_observation='unavailable')
     token = _detach_observation.set(observation)
     try:
         yield
     except Exception as error:
-        reporter = observation.get('diagnostics')
-        status = observation.get('command_status')
-        if (reporter is not None and observation.get('command_error') is error and
-                type(status) is int and status != 0 and
-                not (observation.get('scope') or {}).get('expected', False)):
-            try:
-                reporter.eject_log(observation)
-            except Exception as unavailable:
-                try:
-                    error.add_note('Eject log unavailable: ' + type(unavailable).__name__)
-                except Exception:
-                    pass
+        _finish_eject(observation, error)
         raise
     finally:
         _detach_observation.reset(token)
@@ -374,8 +428,43 @@ def artifact_available(directory):
                 if name in value and (value[name] is None and value['kind'] == 'mapping' or
                         value[name] is not None and (type(value[name]) is not int or value[name] < 0)):
                     return False
-            if value['kind'] == 'mapping' and type(value['backing_identity_matches_first']) is not bool:
+            if (value['kind'] == 'mapping' and value['backing_identity_matches_first'] is not None and
+                    type(value['backing_identity_matches_first']) is not bool):
                 return False
+            if value['kind'] == 'validation':
+                if (value['phase'] != 'after' or value['read'] not in ('current', 'confirmed') or
+                        type(value['sample_timestamp_ns']) is not int or value['sample_timestamp_ns'] <= 0 or
+                        value['sample_status'] not in ('validated', 'unavailable') or
+                        value['mountpoint_state'] not in (None, 'expected', 'unmounted', 'other') or
+                        value['reason'] not in (None, 'normal_inventory_unavailable', 'normal_validation_failed',
+                                                'invalid_validation_metadata')):
+                    return False
+                for name in ('selected_device', 'volume_device'):
+                    item = value[name]
+                    if item is not None and (not isinstance(item, str) or len(item) > 64 or not _device.fullmatch(item)):
+                        return False
+                entities = value['entities']
+                if not isinstance(entities, list) or len(entities) > 32:
+                    return False
+                for entry in entities:
+                    if not isinstance(entry, dict) or set(entry) != {'device', 'content_hint', 'unmapped_content_hint', 'potentially_mountable'}:
+                        return False
+                    if (not isinstance(entry['device'], str) or len(entry['device']) > 64 or not _device.fullmatch(entry['device']) or
+                            any(entry[name] is not None and entry[name] not in _hints for name in ('content_hint', 'unmapped_content_hint')) or
+                            entry['potentially_mountable'] is not None and type(entry['potentially_mountable']) is not bool):
+                        return False
+                if value['sample_status'] == 'validated' and (not entities or value['reason'] is not None):
+                    return False
+                if value['sample_status'] == 'unavailable' and (entities or value['reason'] is None or
+                        any(value[name] is not None for name in ('selected_device', 'volume_device', 'mountpoint_state'))):
+                    return False
+            if value['kind'] == 'eject_outcome':
+                if (value['phase'] != 'after' or type(value['commands']) is not int or
+                        value['commands'] not in (1, 2) or
+                        value['outcome'] not in ('recovered', 'failed', 'interrupted', 'refused') or
+                        any(value[name] is not None and type(value[name]) is not int
+                            for name in ('first_status', 'continuation_status'))):
+                    return False
             if value['kind'] == 'lsof' and value['backing_identity_status'] not in (
                     'matched', 'mismatch', 'changed', 'unavailable', 'not_queried'):
                 return False
@@ -398,6 +487,8 @@ def artifact_available(directory):
             if len(line) > 8192:
                 return False
             for name, item in value.items():
+                if name == 'entities' and value['kind'] == 'validation':
+                    continue
                 if name == 'devices':
                     if not isinstance(item, list) or len(item) > 32 or not all(isinstance(d, str) and _device.fullmatch(d) for d in item):
                         return False
@@ -481,11 +572,52 @@ class Diagnostics:
         self.backing_identities = {}
         self.eject_contexts = {}
         self.eject_log_attempted = False
+        self.eject_failure_claimed = False
+        self.patches = []
+        self.closed = False
 
     def close(self):
+        self.closed = True
+        for target, name, original, wrapper in reversed(self.patches):
+            if getattr(target, name, None) is wrapper:
+                previous = getattr(original, '__dict__', {}).get('_image_diagnostics')
+                while previous is not None and previous[0].closed:
+                    original = previous[1]
+                    previous = getattr(original, '__dict__', {}).get('_image_diagnostics')
+                setattr(target, name, original)
+        self.patches.clear()
         if self.fd is not None:
             fd, self.fd = self.fd, None
             os.close(fd)
+
+    def validation(self, invocation):
+        """Flush only the failed call's cached normal reads, after public unwind."""
+        scope = invocation['scope']
+        if self.closed or not scope or scope['expected']:
+            return
+        deadline = invocation.get('deadline', time.monotonic() + SECONDS)
+        if not self.lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            return
+        try:
+            operation_id = invocation.get('operation_id')
+            if operation_id is None:
+                if self.attempts >= ATTEMPTS:
+                    return
+                self.attempts += 1
+                self.operations += 1
+                operation_id = self.operations
+            self.operation_id, self.phase = operation_id, 'after'
+            for sample in invocation['samples']:
+                self._emit(deadline, 'validation', **sample)
+            if invocation.get('command_error') is not None and invocation.get('outcome') is not None:
+                statuses = invocation.get('command_statuses', [])
+                self._emit(deadline, 'eject_outcome', commands=invocation['command_count'],
+                           first_status=invocation.get('command_status'),
+                           continuation_status=statuses[1] if len(statuses) == 2 else None,
+                           outcome=invocation['outcome'])
+        finally:
+            self.operation_id, self.phase = 0, 'standalone'
+            self.lock.release()
 
     def _emit(self, deadline, kind, **values):
         metadata = dict(operation_id=self.operation_id, phase=self.phase, timestamp_ns=time.time_ns())
@@ -600,8 +732,9 @@ class Diagnostics:
             raise ValueError("unknown fixture scope")
         _private(base, True)
         creating = args[1] == "create"
+        selecting = not creating and args[2] is None
         target = str(args[-1] if creating else args[2])
-        if not creating and not _device.fullmatch(target):
+        if not creating and not selecting and not _device.fullmatch(target):
             raise ValueError("invalid failed device")
         image = Path(target) if creating else expected_image
         if image is not None and (not image.is_absolute() or image.resolve() != image or not image.is_relative_to(base)):
@@ -613,7 +746,8 @@ class Diagnostics:
         matches = []
         for record in records:
             entities = record.get('system-entities', [])
-            if (creating and record.get('image-path') == str(image)) or (not creating and any(e.get('dev-entry') == target for e in entities)):
+            if (((creating or selecting) and record.get('image-path') == str(image)) or
+                    (not creating and not selecting and any(e.get('dev-entry') == target for e in entities))):
                 matches.append(record)
         if len(matches) != 1:
             raise ValueError("missing or ambiguous attachment")
@@ -668,24 +802,41 @@ class Diagnostics:
     def _holder_identity(lines, image, identity):
         # lsof's D is hexadecimal st_dev; i is the decimal inode number.
         # A pathname without both fields cannot establish the held backing inode.
-        matches, record = [], {}
-        for line in [*lines, 'f']:
-            if line.startswith(('p', 'f')):
-                if record.get('n') == image:
-                    matches.append((record.get('D'), record.get('i')))
-                record = {}
-            elif re.fullmatch(r'D0x[0-9a-fA-F]{1,16}', line):
-                record['D'] = int(line[1:], 16)
-            elif re.fullmatch(r'i[0-9]{1,20}', line):
-                record['i'] = int(line[1:])
-            elif line.startswith('n'):
-                record['n'] = line[1:]
+        matches, process, record = [], {}, {}
+        files = 0
+        for line in [*lines, None]:
+            if line is None or line.startswith(('p', 'f')):
+                if record:
+                    if not {'f', 't', 'n'} <= record.keys():
+                        return 'unavailable'
+                    if record['n'] == image:
+                        matches.append((record.get('D'), record.get('i')))
+                    files += 1
+                    record = {}
+                if line is None or line.startswith('p'):
+                    if process and (set(process) != {'p', 'c'} or not files):
+                        return 'unavailable'
+                    process, files = {}, 0
+                elif set(process) != {'p', 'c'}:
+                    return 'unavailable'
+            if line is None:
+                break
+            if not re.fullmatch(r'(?:p[1-9][0-9]*|[cft][A-Za-z0-9 ._+-]{1,64}|D0x[0-9a-fA-F]{1,16}|i[0-9]{1,20}|n[^\x00\r\n]+)', line):
+                return 'unavailable'
+            field, value = line[0], line[1:]
+            target = process if field in ('p', 'c') else record
+            if field in target or (field == 'c' and ('p' not in process or record or files)) or (
+                    field not in ('p', 'c', 'f') and 'f' not in record):
+                return 'unavailable'
+            target[field] = int(value, 16) if field == 'D' else int(value) if field == 'i' else value
+        if image is None:
+            return 'not_queried'  # Empty no-match or valid filesystem records.
         if not matches or any(None in value for value in matches):
             return 'unavailable'
         return 'matched' if all(value == identity for value in matches) else 'mismatch'
 
     def eject_log(self, observation):
-        """Query once after the public detach operation has failed, never between attempts."""
+        """Query once after public detach unwinds, retaining a recovered first failure."""
         deadline = observation.get('deadline')
         if deadline is None:
             return
@@ -828,11 +979,11 @@ class Diagnostics:
                        message=None if before else _message(error),
                        expected_busy=bool(scope and scope['expected']),
                        stage=scope['stage'] if scope else None, workspace=scope['workspace'] if scope else None,
-                       failed_device=args[2] if args[1] == 'eject' and _device.fullmatch(args[2]) else None,
+                       failed_device=args[2] if args[1] == 'eject' and isinstance(args[2], str) and _device.fullmatch(args[2]) else None,
                        expected_mountpoint=str(scope['mountpoint']) if scope and scope['mountpoint'] else None,
                        pre_observation=(observation.get('pre_observation', 'unavailable')
                                         if observation is not None else 'not-selected'),
-                       observation='immediately before detach command' if before else 'post-failure observation')
+                       observation='before detach validation' if before else 'post-failure observation')
             if scope is None:
                 self._emit(deadline, 'unavailable', reason='no explicit owned fixture context')
                 return operation_id
@@ -843,16 +994,21 @@ class Diagnostics:
                 return operation_id
             expected_point = str(scope['mountpoint']) if scope['mountpoint'] else None
             matches = point is not None and point == expected_point
-            first_identity = self.backing_identities.setdefault(operation_id, identity)
-            same_backing = first_identity == identity
-            if not before and same_backing:
+            if before:
+                self.backing_identities.setdefault(operation_id, identity)
+            first_identity = self.backing_identities.get(operation_id)
+            same_backing = first_identity == identity if first_identity is not None else None
+            if before and observation is not None:
+                targets = [device for device in devices if re.fullmatch(r'/dev/disk[0-9]+', device)]
+                observation['observed_target'] = targets[0] if targets else None
+            if not before and same_backing is not False:
                 self.eject_contexts[operation_id] = dict(image=image, target=args[2],
                                                         identity=identity, deadline=deadline)
             self._emit(deadline, 'mapping', image=image, devices=devices, mountpoint=point, volume_device=volume,
                        expected_mountpoint=expected_point, mountpoint_matches=matches,
                        backing_device=identity[0], backing_inode=identity[1],
                        backing_identity_matches_first=same_backing)
-            if not same_backing:
+            if same_backing is False:
                 self._emit(deadline, 'unavailable', reason='backing identity changed between operation observations')
             if point != expected_point:
                 self._emit(deadline, 'unavailable', reason='expected/observed mountpoint mismatch; filesystem lsof omitted')
@@ -898,7 +1054,7 @@ class Diagnostics:
                     after_identity = (after.st_dev, after.st_ino)
                 except (OSError, ValueError):
                     after_identity = (None, None)
-                identity_status = 'not_queried' if options else self._holder_identity(raw_lines, image, identity)
+                identity_status = self._holder_identity(raw_lines, None if options else image, identity)
                 if after_identity == (None, None):
                     identity_status = 'unavailable'
                 elif after_identity != identity:
@@ -920,48 +1076,232 @@ class Diagnostics:
 
 def install(images, directory):
     diagnostics = Diagnostics(directory)
-    original = images._command
+
+    def validation_wrapper(name, original):
+        def wrapped(image):
+            invocation = _detach_call.get()
+            if (diagnostics.closed or getattr(images, name) is not wrapped or not invocation or
+                    invocation['diagnostics'] is not diagnostics or invocation['command_started'] or
+                    image != invocation['scope']['image']):
+                return original(image)
+            if name == '_attachments':
+                result = original(image)
+                reading = _validation_read.get()
+                if reading is not None and reading['invocation'] is invocation:
+                    try:
+                        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
+                            raise ValueError('normal inventory unavailable')
+                        reading['entities'] = _entities(result[0].get('system-entities'))
+                    except Exception:
+                        reading['entities'] = None
+                return result
+            index = invocation['reads']
+            invocation['reads'] += 1
+            if index >= 2:
+                return original(image)
+            sample = dict(read=('current', 'confirmed')[index], sample_timestamp_ns=time.time_ns(),
+                          sample_status='unavailable', reason='normal_inventory_unavailable',
+                          selected_device=None, volume_device=None, mountpoint_state=None, entities=[])
+            reading = dict(invocation=invocation, entities=None)
+            token = _validation_read.set(reading)
+            try:
+                try:
+                    result = original(image)
+                except BaseException:
+                    sample['reason'] = 'normal_validation_failed'
+                    raise
+                try:
+                    if not isinstance(result, dict) or result.get('image') != str(invocation['scope']['image']):
+                        raise ValueError('normal mapping unavailable')
+                    device, volume = result.get('device'), result.get('volume_device')
+                    if (not isinstance(device, str) or len(device) > 64 or not _device.fullmatch(device) or
+                            volume is not None and (not isinstance(volume, str) or len(volume) > 64 or not _device.fullmatch(volume))):
+                        raise ValueError('invalid normal mapping')
+                    invocation['targets'].append(device)
+                    if reading['entities'] is not None:
+                        point = result.get('mountpoint')
+                        sample.update(sample_status='validated', reason=None, selected_device=device,
+                                      volume_device=volume, entities=reading['entities'],
+                                      mountpoint_state='unmounted' if point is None else
+                                      'expected' if point == str(invocation['scope']['mountpoint']) else 'other')
+                except Exception:
+                    sample['reason'] = 'invalid_validation_metadata'
+                return result
+            finally:
+                sample['sample_timestamp_ns'] = time.time_ns()
+                invocation['samples'].append(sample)
+                _validation_read.reset(token)
+        return wrapped
+
+    for name in ('_attachments', 'mounted'):
+        previous_function = getattr(images, name, None)
+        if previous_function is not None:
+            previous = getattr(previous_function, '__dict__', {}).get('_image_diagnostics')
+            original_function = previous[2] if previous is not None else previous_function
+            wrapper = validation_wrapper(name, original_function)
+            wrapper._image_diagnostics = (diagnostics, previous_function, original_function)
+            diagnostics.patches.append((images, name, previous_function, wrapper))
+            setattr(images, name, wrapper)
+    # Preserve surrounding installations without executing nested collectors.
+    previous_command = images._command
+    previous = getattr(previous_command, '__dict__', {}).get('_image_diagnostics')
+    original = previous[2] if previous is not None else previous_command
 
     def command(*args):
+        if diagnostics.closed or images._command is not command:
+            return original(*args)
         creating = len(args) >= 3 and args[:2] == ('/usr/bin/hdiutil', 'create')
         ejecting = (len(args) == 3 and args[:2] == ('/usr/sbin/diskutil', 'eject')
                     and isinstance(args[2], str) and re.fullmatch(r'/dev/disk[0-9]+', args[2]))
         if not (creating or ejecting):
             return original(*args)
-        observation = _detach_observation.get() if ejecting else None
-        if observation is not None and not observation['started']:
-            observation['started'] = True
-            try:
-                diagnostics.before(args, _scope.get(), observation)
-            except Exception:
-                pass  # Observation failure cannot prevent the requested detach.
+        invocation = _detach_call.get() if ejecting else None
+        if invocation is not None and invocation['diagnostics'] is not diagnostics:
+            invocation = None
+        observation = invocation['observation'] if invocation is not None else _detach_observation.get() if ejecting else None
+        record = invocation or observation
+        if record is not None:
+            record.setdefault('diagnostics', diagnostics)
+            record.setdefault('scope', _scope.get())
+            record.setdefault('target', args[2])
+            record.setdefault('start_ns', time.time_ns())
+            record.setdefault('start_mono', time.monotonic())
+            if invocation is not None:
+                invocation['command_started'] = True
+                invocation['command_count'] += 1
+                invocation['command_targets'].append(args[2])
         if observation is not None:
             observation['diagnostics'] = diagnostics
             observation.setdefault('scope', _scope.get())
             observation.setdefault('target', args[2])
-            observation['target_changed'] = observation.get('target_changed', False) or observation['target'] != args[2]
-            diagnostics.eject_contexts.pop(observation['operation_id'], None)
+            observation['target_changed'] = (observation.get('target_changed', False) or
+                                             observation['target'] != args[2] or
+                                             observation.get('observed_target') != args[2])
+            if invocation is None or invocation['command_count'] == 1:
+                diagnostics.eject_contexts.pop(observation['operation_id'], None)
             if 'start_ns' not in observation:
-                observation['start_ns'], observation['start_mono'] = time.time_ns(), time.monotonic()
+                observation['start_ns'], observation['start_mono'] = record['start_ns'], record['start_mono']
         try:
             if creating:
                 return _observed_create(original, args)
-            return original(*args)
+            result = original(*args)
+            if invocation is not None:
+                invocation['command_statuses'].append(0)
+            return result
         except Exception as error:
-            if observation is not None:
-                observation['command_error'] = error
-                observation['command_status'] = getattr(error, 'returncode', None)
-                observation['end_ns'], observation['end_mono'] = time.time_ns(), time.monotonic()
+            if diagnostics.closed:
+                raise
+            if invocation is not None:
+                invocation['command_statuses'].append(getattr(error, 'returncode', None))
+            if record is not None and 'command_error' not in record:
+                record['command_error'] = error
+                record['command_status'] = getattr(error, 'returncode', None)
+                record['end_ns'], record['end_mono'] = time.time_ns(), time.monotonic()
+                record['deadline'] = record['end_mono'] + SECONDS
+            if observation is not None and record is not observation:
+                for key in ('command_error', 'command_status', 'start_ns', 'start_mono', 'end_ns', 'end_mono'):
+                    observation.setdefault(key, record[key])
+            reporting = observation or record
             try:
-                diagnostics.report(args, error, _scope.get(),
-                                   operation_id=observation['operation_id'] if observation else None,
-                                   observation=observation)
-            except Exception as unavailable:
+                operation_id = diagnostics.report(args, error, _scope.get(),
+                                                  operation_id=reporting.get('operation_id') if reporting else None,
+                                                  observation=reporting)
+                if invocation is not None:
+                    invocation['operation_id'] = operation_id or (reporting or {}).get('operation_id')
+                    if reporting and 'deadline' in reporting:
+                        invocation['deadline'] = min(invocation['deadline'], reporting['deadline'])
+            except BaseException as unavailable:
                 try:
                     error.add_note('Image diagnostics unavailable: ' + type(unavailable).__name__)
-                except Exception:
+                except BaseException:
                     pass
             raise
 
+    command._image_diagnostics = (diagnostics, previous_command, original)
+    diagnostics.patches.append((images, '_command', previous_command, command))
     images._command = command
+    previous_detach = getattr(images, 'detach', None)
+    if previous_detach is not None:
+        previous = getattr(previous_detach, '__dict__', {}).get('_image_diagnostics')
+        original_detach = previous[2] if previous is not None else previous_detach
+        def detach(image, mountpoint):
+            if diagnostics.closed or images.detach is not detach:
+                return original_detach(image, mountpoint)
+            observation, scope = _detach_observation.get(), _scope.get()
+            if observation is not None and observation['started']:
+                observation = None  # A surrounding selection belongs only to its first public call.
+            if observation is not None and not observation['started']:
+                observation['started'] = True
+                identity = None
+                try:
+                    if (scope is not None and scope['image'] == Path(image) and
+                            scope['mountpoint'] == Path(mountpoint) and
+                            scope['base'].is_absolute() and scope['base'].resolve() == scope['base'] and
+                            scope['image'].is_absolute() and scope['image'].resolve() == scope['image'] and
+                            scope['image'].is_relative_to(scope['base'])):
+                        _private(scope['base'], True)
+                        info = _private(scope['image'])
+                        identity = (info.st_dev, info.st_ino)
+                        diagnostics.before(('/usr/sbin/diskutil', 'eject', None), scope, observation)
+                except Exception:
+                    pass  # Observation failure cannot prevent ordinary validation.
+                if identity is not None:
+                    try:
+                        info = _private(scope['image'])
+                        unchanged = identity == (info.st_dev, info.st_ino)
+                    except Exception:
+                        unchanged = False
+                    if not unchanged:
+                        from stallionfs.images import _error
+                        raise _error('Owned backing identity changed during detach observation')
+            owned_scope = (scope if scope is not None and scope['image'] == Path(image) and
+                           scope['mountpoint'] == Path(mountpoint) else None)
+            invocation = dict(diagnostics=diagnostics, scope=owned_scope, reads=0, samples=[], targets=[],
+                              command_started=False, command_count=0, command_targets=[], command_statuses=[],
+                              pre_observation='not-selected', observation=observation)
+            token = _detach_call.set(invocation if owned_scope is not None else None)
+            selected_token = _detach_observation.set(observation)
+            try:
+                result = original_detach(image, mountpoint)
+                if invocation.get('command_error') is not None:
+                    invocation['outcome'] = 'recovered'
+                    try:
+                        diagnostics.validation(invocation)
+                        invocation['target_changed'] = (invocation['reads'] != 2 or
+                            invocation['command_count'] != 2 or
+                            invocation['targets'] != [invocation.get('target')] * 2 or
+                            invocation['command_targets'] != [invocation.get('target')] * 2)
+                        _finish_eject(invocation, invocation['command_error'])
+                        if observation is not None:
+                            observation['finalized'] = True
+                    except BaseException:
+                        pass  # Successful recovery cannot be replaced by diagnostics.
+                return result
+            except BaseException as error:
+                invocation['outcome'] = ('interrupted' if not isinstance(error, Exception) else
+                                         'failed' if invocation['command_count'] == 2 else 'refused')
+                try:
+                    diagnostics.validation(invocation)
+                except BaseException:
+                    pass
+                try:
+                    if observation is not None and invocation.get('command_error') is error:
+                        invocation['target_changed'] = observation.get('target_changed', False)
+                        observation['finalized'] = True
+                    else:
+                        invocation['target_changed'] = (invocation['reads'] != 2 or
+                            invocation['command_count'] not in (1, 2) or
+                            invocation['targets'] != [invocation.get('target')] * 2 or
+                            invocation['command_targets'] != [invocation.get('target')] * invocation['command_count'])
+                    _finish_eject(invocation, error)
+                except BaseException:
+                    pass  # A collector cannot replace the original failure or interrupt.
+                raise
+            finally:
+                _detach_observation.reset(selected_token)
+                _detach_call.reset(token)
+
+        detach._image_diagnostics = (diagnostics, previous_detach, original_detach)
+        diagnostics.patches.append((images, 'detach', previous_detach, detach))
+        images.detach = detach
     return diagnostics

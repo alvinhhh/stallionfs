@@ -104,7 +104,7 @@ class NativeImageCLI(unittest.TestCase):
         # The capture expects a clean child; the small adapter records the public
         # command's intentional nonzero status without treating it as a crash.
         script = 'import json,subprocess,sys; p=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=15); print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))'
-        child = self.owned('public-cli', [sys.executable, '-I', '-c', script, self.launcher,
+        child = self.owned('public-cli', [sys.executable, '-I', '-B', '-c', script, self.launcher,
                             '--root', self.store, '--json', *args], 25)
         observed = json.loads(child.stdout)
         self.assertEqual(observed['returncode'], status, observed['stderr'])
@@ -118,6 +118,37 @@ class NativeImageCLI(unittest.TestCase):
 
     def register(self, directory):
         return self.command('register-native-image', directory / 'image.sfs')['id']
+
+    def test_native_fixture_describe_batch_matches_single_paths_and_refuses_missing(self):
+        directory = self.seed()
+        image = directory / 'image.sfs'
+        before = (image.stat().st_ino, hashlib.sha256(image.read_bytes()).hexdigest())
+        paths = ('.', 'file', 'alias', 'link')
+        singles = [json.loads(self.owned('describe-single', [self.fixture, 'describe', directory, path]).stdout)
+                   for path in paths]
+        batch = self.owned('describe-batch', [self.fixture, 'describe', directory, *paths])
+        rows = [json.loads(line) for line in batch.stdout.splitlines()]
+        self.assertEqual(len(rows), len(paths))
+        self.assertEqual(rows, singles)
+        host_paths = (directory, image)
+        host_singles = [json.loads(self.owned('host-time-single', [self.fixture, 'host-times', path]).stdout)
+                        for path in host_paths]
+        host_batch = self.owned('host-time-batch', [self.fixture, 'host-times', *host_paths])
+        host_rows = [json.loads(line) for line in host_batch.stdout.splitlines()]
+        self.assertEqual(len(host_rows), len(host_paths))
+        self.assertEqual(host_rows, host_singles)
+        # The checker intentionally refuses an absent path. Keep that expected
+        # nonzero result inside a clean capture, never accept partial rows.
+        script = ('import json,resource,subprocess,sys; '
+                  'resource.setrlimit(resource.RLIMIT_CORE,(0,0)); '
+                  'p=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=5); '
+                  'print(json.dumps(dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)))')
+        for arguments in ([self.fixture, 'describe', directory, 'file', 'missing'],
+                          [self.fixture, 'host-times', directory, directory / 'missing']):
+            child = self.owned('checker-missing', [sys.executable, '-I', '-B', '-c', script, *arguments], 10)
+            observed = json.loads(child.stdout)
+            self.assertNotEqual(observed['returncode'], 0)
+        self.assertEqual((image.stat().st_ino, hashlib.sha256(image.read_bytes()).hexdigest()), before)
 
     def test_installed_registration_snapshot_rollback_exact_state_and_recovery(self):
         directory = self.seed()
@@ -145,6 +176,72 @@ class NativeImageCLI(unittest.TestCase):
         from stallionfs import _image
         symbols = self.owned('production-symbols', ['/usr/bin/nm', _image.__file__]).stdout.lower()
         self.assertFalse(any(word in symbols for word in ('sfs_diag_', 'sfs_bridge_test_', 'sfs_image_diagnostic_')))
+
+    def test_rollback_process_death_preserves_commit_recovery_and_releases_lease(self):
+        import selectors
+        import signal
+        directory = self.seed()
+        workspace = self.register(directory)
+        self.command('snapshot', workspace, '--name', 'before')
+        newer = self.owned('edit', [self.fixture, 'edit', directory]).stdout.strip()
+        # Pause after the ordinary bridge has committed and consumed its core
+        # handle, before the Store releases its lease or the CLI prints success.
+        script = textwrap.dedent('''
+            import json, os, signal, sys
+            from stallionfs import core
+            from stallionfs.__main__ import main
+            root, workspace, ready = sys.argv[1:]
+            original = core.native_operation
+            def operation(target, action, *names):
+                result = original(target, action, *names)
+                if action == 'restore':
+                    observed = {key: result[key] for key in
+                        ('ok', 'committed', 'outcome', 'recovery')}
+                    observed['fence_succeeded'] = result['receipt']['fence_succeeded']
+                    observed['close_status'] = result['close_receipt']['status']
+                    with os.fdopen(int(ready), 'w') as stream:
+                        stream.write(json.dumps(observed) + '\\n')
+                        stream.flush()
+                    while True:
+                        signal.pause()
+                return result
+            core.native_operation = operation
+            raise SystemExit(main(['--root', root, '--json', 'rollback', workspace, 'before']))
+        ''')
+        reader, writer = os.pipe()
+        child = None
+        try:
+            child = subprocess.Popen([sys.executable, '-I', '-B', '-c', script,
+                                      str(self.store), workspace, str(writer)],
+                                     pass_fds=(writer,), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            os.close(writer); writer = None
+            with selectors.DefaultSelector() as selector:
+                selector.register(reader, selectors.EVENT_READ)
+                self.assertTrue(selector.select(15), 'rollback commit acknowledgement timed out')
+            observed = json.loads(os.read(reader, 4096))
+            self.assertEqual({key: observed[key] for key in
+                              ('ok', 'committed', 'outcome', 'fence_succeeded', 'close_status')},
+                             dict(ok=True, committed=True, outcome='committed', fence_succeeded=3, close_status=0))
+            blocked = self.command('snapshot', workspace, '--name', 'blocked', status=1)
+            self.assertIn('managed use', blocked['error'])
+            child.kill()
+            stdout, stderr = child.communicate(timeout=10)
+            self.assertEqual((child.returncode, stdout, stderr), (-signal.SIGKILL, '', ''))
+        finally:
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+            if child is not None and child.poll() is None:
+                child.kill(); child.communicate(timeout=10)
+        # Discover the lost response's recovery name from a new public CLI
+        # process, without replaying rollback or manufacturing a success result.
+        snapshots = self.command('snapshots', workspace)
+        self.assertEqual([row['id'] for row in snapshots], ['before', observed['recovery']])
+        self.owned('verify-killed-target', [self.fixture, 'verify', directory, 'before', newer])
+        self.owned('verify-killed-recovery', [self.fixture, 'verify-edited', directory, observed['recovery']])
+        self.assertEqual(self.command('snapshot', workspace, '--name', 'after-kill')['id'], 'after-kill')
+        self.assertEqual(list((self.store / 'journals').iterdir()), [])
 
     def test_scoped_backing_guard_retains_exact_inode_and_consumes_after_exceptions(self):
         from stallionfs import _image
@@ -567,7 +664,7 @@ for line in sys.stdin:
             assert result['resources']['scratch_bytes'] > len(value), result
             print(json.dumps({'directory': str(destination), 'size': len(value), 'sha256': hashlib.sha256(value).hexdigest(), 'result': result}))
         ''')
-        child = self.owned('large-resource-fork', [sys.executable, '-I', '-c', script,
+        child = self.owned('large-resource-fork', [sys.executable, '-I', '-B', '-c', script,
             _image.__file__, self.base / 'large'], 60)
         expected = json.loads(child.stdout)
         actual = self.owned('large-resource-check', [self.fixture, 'describe', expected['directory'], 'repo/file'], 30)
@@ -588,6 +685,33 @@ for line in sys.stdin:
             destination = base / 'owned'; destination.mkdir(mode=0o700)
             (source / 'file').write_bytes(b'imported bytes')
             (source / 'second').write_bytes(b'second file')
+            if case in ('identity-resize', 'identity-resize-signal', 'identity-resize-success'):
+                for index in range(7):
+                    (source / f'extra-{index}').write_bytes(b'extra')
+                if case == 'identity-resize-success':
+                    os.link(source / 'file', source / 'a-link')
+                    os.link(source / 'file', source / 'b-link')
+            if case == 'identity-collision':
+                # Select two distinct real inodes colliding in the initial
+                # table; move them into the source without external aliases.
+                pool = base / 'collision-inputs'; pool.mkdir(mode=0o700)
+                buckets = {}
+                mask = (1 << 64) - 1
+                for index in range(17):
+                    path = pool / str(index); path.write_bytes(f'collision-{index}'.encode())
+                    info = path.stat()
+                    device = ctypes.c_int32(info.st_dev).value & mask
+                    key = info.st_ino ^ ((device + 0x9e3779b97f4a7c15) & mask)
+                    key = ((key ^ (key >> 30)) * 0xbf58476d1ce4e5b9) & mask
+                    key = ((key ^ (key >> 27)) * 0x94d049bb133111eb) & mask
+                    bucket = (key ^ (key >> 31)) & 15
+                    if bucket in buckets:
+                        buckets[bucket].rename(source / 'collision-a')
+                        path.rename(source / 'collision-b')
+                        break
+                    buckets[bucket] = path
+                else:
+                    raise AssertionError('seventeen identities must collide in sixteen slots')
             os.environ['SFS_TEST_MUTATE_PATH'] = str(source / ('added' if case == 'directory-change' else 'file'))
             if case == 'source-allocation':
                 libc = ctypes.CDLL(None, use_errno=True)
@@ -616,10 +740,13 @@ for line in sys.stdin:
                  ('reopen-read', 0, 0, 512), ('reopen-close', 0, 0, 2048),
                  ('response-allocation', 0, 0, 4096), ('creation-signal', 0, 0, 2),
                  ('import-signal', 0, 0, 8192), ('read-change', 0, 0, 16384),
-                 ('directory-change', 0, 0, 32768), ('source-allocation', 0, 0, 65536), ('scratch-full', 0, 0, 131072)]
+                 ('directory-change', 0, 0, 32768), ('source-allocation', 0, 0, 65536), ('scratch-full', 0, 0, 131072),
+                 ('identity-allocation', 0, 0, 2097152), ('identity-resize', 0, 0, 4194304),
+                 ('identity-resize-signal', 0, 0, 8388608), ('identity-collision', 0, 0, 0),
+                 ('identity-resize-success', 0, 0, 0)]
         for case, kind, ordinal, flags in cases:
             with self.subTest(case=case):
-                child = self.owned('import-' + case, [sys.executable, '-I', '-c', script,
+                child = self.owned('import-' + case, [sys.executable, '-I', '-B', '-c', script,
                     self.diagnostic, self.base / case, case, kind, ordinal, flags], 30)
                 observed = json.loads(child.stdout); result = observed['result']
                 if case == 'response-allocation':
@@ -627,12 +754,23 @@ for line in sys.stdin:
                     self.assertTrue(result['candidate_complete'])
                     self.assertTrue(result['verified'])
                     self.assertEqual(result['reopen_close']['status'], 0)
+                elif case in ('identity-collision', 'identity-resize-success'):
+                    self.assertTrue(result['candidate_complete'], observed)
+                    self.assertTrue(result['verified'], result)
+                    self.assertEqual(result['resources']['entries'], 5 if case == 'identity-collision' else 12)
                 else:
                     self.assertFalse(result['candidate_complete'], observed)
-                if case in ('precreate-signal', 'source-allocation', 'scratch-full'):
-                    if case == 'precreate-signal': self.assertEqual(observed['exception'], 'KeyboardInterrupt')
+                if case in ('precreate-signal', 'source-allocation', 'scratch-full',
+                            'identity-allocation', 'identity-resize', 'identity-resize-signal'):
+                    if case in ('precreate-signal', 'identity-resize-signal'):
+                        self.assertEqual(observed['exception'], 'KeyboardInterrupt')
                     self.assertFalse(observed['exists'])
                     self.assertFalse(result['creation_attempted'])
+                    if case in ('source-allocation', 'identity-allocation', 'identity-resize'):
+                        self.assertEqual(result['reason'], 'io')
+                        self.assertEqual(result['local_error'], __import__('errno').ENOMEM)
+                    if case == 'identity-resize-signal':
+                        self.assertEqual(result['reason'], 'verification-incomplete')
                 else:
                     self.assertTrue(observed['exists'], observed)
                     self.assertTrue(result['creation_attempted'])
@@ -725,7 +863,7 @@ for line in sys.stdin:
             with self.subTest(case=case):
                 directory = self.seed(f'case-{index}'); workspace = self.register(directory)
                 self.command('snapshot', workspace, '--name', 'base')
-                child = self.owned('diagnostic-case', [sys.executable, '-I', '-c', script, self.diagnostic,
+                child = self.owned('diagnostic-case', [sys.executable, '-I', '-B', '-c', script, self.diagnostic,
                             self.store, workspace, case, kind, ordinal, flags, deadline])
                 observed = json.loads(child.stdout)['native_image_result']
                 roots = self.command('snapshots', workspace)
@@ -919,7 +1057,10 @@ class InstalledCLI(unittest.TestCase):
         self.assertFalse((self.base / 'unused-store').exists())
 
     def test_native_exports_load_once_on_first_access(self):
-        result = subprocess.run([sys.executable, '-I', '-c', """
+        if os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT'):
+            from qualified_git_fixture import runtime
+            self.addCleanup(runtime()['check'])
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', """
 import sys, threading, stallionfs
 from concurrent.futures import ThreadPoolExecutor
 names = ('clone', 'copy', 'delete', 'mounts', 'move', 'scan')
@@ -968,6 +1109,9 @@ for name in names:
                 self.assertFalse(store.exists())
 
     def test_helper_dispatch_from_installed_and_symlinked_launcher(self):
+        if os.environ.get('STALLIONFS_TEST_QUALIFIED_GIT'):
+            from qualified_git_fixture import runtime
+            self.addCleanup(runtime()['check'])
         self.assertEqual(__version__, version('stallionfs'))
         native = self.native_only()
         self.assertEqual(self.command('--version', launcher=native).stdout, __version__ + '\n')
@@ -996,6 +1140,27 @@ for name in names:
 
 class MountedOperationArguments(unittest.TestCase):
     """Parser/dispatch checks; these do not exercise a mounted filesystem."""
+    def test_remove_restore_render_native_ids_and_ordinary_paths(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        workspace = 'a' * 32
+        for action, key in (('remove', 'retired'), ('restore', 'restored')):
+            native = {key: workspace, 'mounted': False, 'next': 'sfs mount ' + workspace,
+                      'native_operation': {'outcome': 'complete'}}
+            for result, plain in ((native, workspace), ({'id': workspace, 'path': '/ordinary/repo'}, '/ordinary/repo')):
+                for json_output in (False, True):
+                    with self.subTest(action=action, native='path' not in result, json=json_output), \
+                         patch('stallionfs.core.Store') as store, redirect_stdout(StringIO()) as output:
+                        store.return_value.move.return_value = result
+                        self.assertEqual(main([*(['--json'] if json_output else []), action, workspace]), 0)
+                        store.return_value.move.assert_called_once_with(workspace, restore=action == 'restore')
+                        if json_output:
+                            self.assertEqual(json.loads(output.getvalue()), result)
+                        else:
+                            self.assertEqual(output.getvalue(), plain + '\n')
+
     def test_status_and_exact_continuation_arguments(self):
         from contextlib import redirect_stdout
         from io import StringIO

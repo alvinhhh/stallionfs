@@ -102,7 +102,7 @@ def _bin(home, *, create):
 
 def _target():
     bundle = _bundle.paths()
-    require(bundle is not None and bundle['app'] == APP, 'Move StallionFS.app to Applications before command setup')
+    require(bundle is not None and bundle['app'] == APP, 'Move the app to /Applications/StallionFS.app before command setup')
     target = bundle['helper'].with_name(LINK)
     _bundle._file(target, executable=True)
     app, parent, binary = APP.lstat(), APP.parent.lstat(), target.lstat()

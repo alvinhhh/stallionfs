@@ -326,7 +326,7 @@ class NativeReferenceTests(unittest.TestCase):
 
 
 class ImageRollbackStateTests(unittest.TestCase):
-    def test_unmounted_busy_rollback_preserves_open_state_until_explicit_recovery(self):
+    def test_unmounted_synthetic_error_preserves_open_state_until_explicit_recovery(self):
         from stallionfs import images
         with tempfile.TemporaryDirectory(prefix='image-rollback-state-mock-') as temporary:
             store = Store(Path(temporary).resolve() / 'store')
@@ -365,6 +365,8 @@ class ImageRollbackStateTests(unittest.TestCase):
                 mounted.update(mountpoint=str(point), volume_device='/dev/disk1000s1')
                 return {}
             with patch.object(images, 'mounted', side_effect=inventory), \
+                    patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)), \
+                    patch.object(images, '_no_graph_mounts'), \
                     patch.object(images, '_command', side_effect=command), \
                     patch.object(images, '_plist', side_effect=attach) as attaching, \
                     patch.object(images, '_require_supported'), \
@@ -535,6 +537,98 @@ class LifecycleTests(unittest.TestCase):
         slot = next((self.store.root / 'recovery').iterdir())
         self.assertEqual((slot / 'repo/file').read_text(), 'current\n')
 
+    def test_recovery_metadata_fsync_enospc_reconciles_before_next_mutation(self):
+        self._check_real_writer_rollback_fault('fsync')
+
+    def test_recovery_metadata_replace_interrupt_reconciles_before_next_mutation(self):
+        self._check_real_writer_rollback_fault('replace')
+
+    def _check_real_writer_rollback_fault(self, boundary):
+        snapshot = self.snapshot()
+        (self.repo / 'file').write_text('current\n')
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        captured = {}
+        native_move = _scan.move
+        real_fsync, real_replace = os.fsync, os.replace
+        faults = []
+
+        def exchange(current, candidate, **kwargs):
+            self.assertEqual(current, self.repo)
+            self.assertEqual(kwargs, {'exchange': True})
+            captured.update(slot=candidate.parent,
+                            old=lifecycle.identity(current),
+                            candidate=lifecycle.identity(candidate),
+                            current_contents=(current / 'file').read_bytes(),
+                            candidate_contents=(candidate / 'file').read_bytes(),
+                            intent=(candidate.parent / 'meta.json').read_bytes(),
+                            journal=journal.read_bytes())
+            self.assertNotEqual(captured['old'], captured['candidate'])
+            self.assertEqual(captured['current_contents'], b'current\n')
+            self.assertEqual(captured['candidate_contents'], b'original\n')
+            native_move(current, candidate, **kwargs)
+
+        def fail_fsync(fd):
+            if 'slot' in captured:
+                info = os.fstat(fd)
+                for temporary in captured['slot'].glob('.meta.json.*'):
+                    if lifecycle.identity(temporary) == [info.st_dev, info.st_ino]:
+                        self.assertEqual(journal.read_bytes(), captured['journal'])
+                        faults.append(boundary)
+                        raise OSError(errno.ENOSPC, 'recovery metadata full')
+            return real_fsync(fd)
+
+        def interrupt_replace(source, destination):
+            real_replace(source, destination)
+            if 'slot' in captured and destination == captured['slot'] / 'meta.json':
+                self.assertEqual(journal.read_bytes(), captured['journal'])
+                faults.append(boundary)
+                raise KeyboardInterrupt('recovery metadata published')
+
+        fault = (patch.object(lifecycle.os, 'fsync', side_effect=fail_fsync)
+                 if boundary == 'fsync' else
+                 patch.object(lifecycle.os, 'replace', side_effect=interrupt_replace))
+        with patch.object(_scan, 'move', side_effect=exchange) as move:
+            # Keep the fault active through rollback's automatic reconciliation retry.
+            with fault:
+                with self.assertRaises(OSError if boundary == 'fsync' else KeyboardInterrupt) as raised:
+                    self.store.rollback(self.workspace, snapshot, quiescent=True)
+                if boundary == 'fsync':
+                    self.assertEqual(raised.exception.errno, errno.ENOSPC)
+                self.assertEqual(faults, [boundary, boundary])
+                slot = captured['slot']
+                intent = json.loads(captured['intent'])
+                self.assertEqual(json.loads(captured['journal']), intent)
+                self.assertEqual(intent['backend'], 'folder')
+                self.assertEqual(intent['outcome'], 'intent')
+                self.assertEqual(intent['id'], slot.name)
+                self.assertEqual(intent['recovery'], slot.name)
+                self.assertEqual(intent['workspace'], self.workspace)
+                self.assertEqual(intent['snapshot'], snapshot)
+                self.assertEqual(intent['old'], captured['old'])
+                self.assertEqual(intent['candidate'], captured['candidate'])
+                completed = {**intent, 'outcome': 'exchanged'}
+                self.assertEqual(journal.read_bytes(), captured['journal'])
+                if boundary == 'fsync':
+                    self.assertEqual((slot / 'meta.json').read_bytes(), captured['intent'])
+                else:
+                    self.assertEqual(read_json(slot / 'meta.json'), completed)
+                self.assertEqual(lifecycle.identity(self.repo), captured['candidate'])
+                self.assertEqual(lifecycle.identity(slot / 'repo'), captured['old'])
+                self.assertEqual((self.repo / 'file').read_bytes(), captured['candidate_contents'])
+                self.assertEqual((slot / 'repo/file').read_bytes(), captured['current_contents'])
+                self.assertEqual(list((self.store.root / 'recovery').iterdir()), [slot])
+                self.assertEqual(list((self.store.root / 'journals').iterdir()), [journal])
+                move.assert_called_once_with(self.repo, slot / 'repo', exchange=True)
+            self.store.enroll(self.workspace)
+            move.assert_called_once_with(self.repo, slot / 'repo', exchange=True)
+            self.assertEqual(read_json(slot / 'meta.json'), completed)
+            self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+            self.assertEqual(lifecycle.identity(self.repo), captured['candidate'])
+            self.assertEqual(lifecycle.identity(slot / 'repo'), captured['old'])
+            self.assertEqual((self.repo / 'file').read_bytes(), captured['candidate_contents'])
+            self.assertEqual((slot / 'repo/file').read_bytes(), captured['current_contents'])
+            self.assertEqual(list((self.store.root / 'recovery').iterdir()), [slot])
+
     def test_missing_or_changed_identity_blocks_reconciliation(self):
         snapshot = self.snapshot()
         replace = lifecycle.replace_json
@@ -612,6 +706,71 @@ class LifecycleTests(unittest.TestCase):
                 self.store.cleanup(apply=True)
         self.assertEqual(self.store.gc(older_than=0, yes=True), [])
         self.assertTrue((self.store.root / 'trash' / self.workspace / 'repo/file').exists())
+
+    def test_retirement_protection_sync_failure_stops_before_move(self):
+        self.stale()
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        with patch.object(core, 'sync_directory', side_effect=OSError('protection sync failed')) as sync:
+            with patch.object(_scan, 'move') as move:
+                result = self.store.cleanup(apply=True)
+        self.assertEqual(result['retired'], [])
+        self.assertEqual(result['skipped'], [{'id': self.workspace, 'reason': 'protection sync failed'}])
+        sync.assert_called_once_with(protection.parent)
+        move.assert_not_called()
+        self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+        self.assertTrue(protection.exists())
+        self.assertFalse((self.store.root / 'trash' / self.workspace).exists())
+
+    def test_retirement_syncs_protection_before_move_and_collections_before_success(self):
+        self.stale()
+        events = []
+        sync = core.sync_directory
+        move = _scan.move
+
+        def record_sync(path):
+            sync(path)
+            events.append(('sync', path))
+
+        def record_move(source, destination):
+            self.assertEqual(events, [('sync', self.store.root / 'protected')])
+            move(source, destination)
+            events.append(('move', source, destination))
+
+        with patch.object(core, 'sync_directory', side_effect=record_sync):
+            with patch.object(_scan, 'move', side_effect=record_move):
+                result = self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        self.assertEqual(result['retired'], [self.workspace])
+        self.assertEqual(events, [('sync', self.store.root / 'protected'),
+                                  ('move', self.path, trash),
+                                  ('sync', self.store.root / 'workspaces'),
+                                  ('sync', self.store.root / 'trash')])
+        self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+        self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+
+    def test_retirement_collection_sync_failure_keeps_protected_restorable_trash(self):
+        for failed_collection in ('workspaces', 'trash'):
+            with self.subTest(collection=failed_collection):
+                self.stale()
+                sync = core.sync_directory
+
+                def fail_sync(path):
+                    if path == self.store.root / failed_collection:
+                        raise OSError('collection sync failed')
+                    sync(path)
+
+                with patch.object(core, 'sync_directory', side_effect=fail_sync):
+                    result = self.store.cleanup(apply=True)
+                self.assertEqual(result['retired'], [])
+                self.assertEqual(result['skipped'], [{'id': self.workspace, 'reason': 'collection sync failed'}])
+                self.assertFalse(self.path.exists())
+                self.assertTrue((self.store.root / 'protected' / f'{self.workspace}.json').exists())
+                self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+                trash = self.store.root / 'trash' / self.workspace
+                self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+                self.store.move(self.workspace, restore=True)
+                self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+                self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
 
     def test_failed_retirement_rename_preserves_current_and_protection(self):
         self.stale()

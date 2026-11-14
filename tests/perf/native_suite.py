@@ -434,11 +434,14 @@ def main():
                 uncertain = True
                 checkpoint()
                 native_fixtures.enrich_metadata(
-                    source, receipt=metadata['seed'], scan_layout=native_fixtures.SCAN_PROFILES.get(name))
+                    source, receipt=metadata['seed'], scan_layout=native_fixtures.SCAN_PROFILES.get(name),
+                    precision_links=native_fixtures.precision_link_paths(name))
                 checkpoint()
                 snapshot_options = {'allow_special': True} if scan_mode else {}
                 expected = native_correctness.snapshot(source, **snapshot_options)
-                metadata['coverage'] = native_fixtures.verify_metadata_coverage(expected, metadata['seed'])
+                metadata['coverage'] = native_fixtures.verify_metadata_coverage(
+                    expected, metadata['seed'], precision_links=native_fixtures.precision_link_paths(name),
+                    precision_scope='scan-only' if scan_mode else 'copy-clone')
                 fileops.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
                 metadata['status'] = 'prepared'
                 checkpoint()

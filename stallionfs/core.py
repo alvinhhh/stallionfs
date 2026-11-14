@@ -119,6 +119,8 @@ def native_retention_reason(path):
     path = Path(path)
     if path.name.startswith('native-purge-'):
         return 'reserved native purge tombstone'
+    if path.name.startswith('native-create-'):
+        return 'reserved native creation stage'
     def failed(error):
         raise error
     for parent, directories, files in os.walk(path, followlinks=False, onerror=failed):
@@ -206,10 +208,21 @@ def run(args, cwd=None, *, capture=True, internal_git=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     if internal_git:
+        # Preserve authentication and clone defaults, while overriding early
+        # system/global Trace2 destinations before Git reads a repository.
+        env = {key: value for key, value in env.items() if not key.startswith('DYLD_')}
+        env.update(GIT_TRACE2='0', GIT_TRACE2_EVENT='0', GIT_TRACE2_PERF='0')
+        if 'GIT_EXEC_PATH' in os.environ:
+            env['GIT_EXEC_PATH'] = os.environ['GIT_EXEC_PATH']
         from . import _bundle
         try:
-            executable, env = _bundle.git_environment(env)
+            executable, env = _bundle.git_environment(env, cwd=cwd)
         except (ValueError, OSError) as error:
+            from ._git_runtime import GitError
+            if isinstance(error, GitError):
+                failure = StallionError(str(error))
+                failure.git_reason = error.reason
+                raise failure from error
             raise StallionError('Invalid bundled Git: ' + str(error)) from error
         args = [executable, *args[1:]]
     if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
@@ -238,6 +251,7 @@ def run(args, cwd=None, *, capture=True, internal_git=False):
 
 def git(repo, *args):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                "-c", "hook.post-checkout.enabled=false", "-c", "hook.reference-transaction.enabled=false",
                 "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
                 "-C", repo, *args], internal_git=True)
 
@@ -331,7 +345,7 @@ def lock(path, *, shared=False, blocking=True):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise StallionError(f"Unsafe lock file: {path}")
         fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | (0 if blocking else fcntl.LOCK_NB))
-        yield
+        yield fd
     finally:
         os.close(fd)
 
@@ -376,6 +390,14 @@ from .lifecycle import Lifecycle
 
 
 class Store(Lifecycle):
+    @classmethod
+    @contextlib.contextmanager
+    def existing(cls, root, *, shared=True):
+        """Admit an existing store without initializing or repairing its contents."""
+        from ._native_create_recovery import existing
+        with existing(root, shared=shared) as admitted:
+            yield admitted
+
     def __init__(self, root):
         raw = Path(root).expanduser().absolute()
         if raw.is_symlink():
@@ -566,12 +588,15 @@ class Store(Lifecycle):
         return {**metadata, 'path': str(parent / raw.name)}
 
     @contextlib.contextmanager
-    def _native_creation_scope(self, seed, result, carrier):
+    def _native_creation_scope(self, seed, result, carrier, held=None):
         primary = None
         try:
-            with lock(self.root / '.lock'), lock(self.root / 'locks' / f'seed-{seed}', shared=True):
+            with contextlib.ExitStack() as stack:
+                if held is None:
+                    held = (stack.enter_context(lock(self.root / '.lock')),
+                            stack.enter_context(lock(self.root / 'locks' / f'seed-{seed}', shared=True)))
                 try:
-                    yield
+                    yield held
                 except BaseException as error:
                     primary = error
                     raise
@@ -597,10 +622,10 @@ class Store(Lifecycle):
                 raise error from closing_error
             raise
 
-    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None, install_profile=None, native_host=None):
+    def _build_owned_native_candidate(self, seed, *, name='', jobs=4, native_capacity_gib, native_verification_budget=None, install_profile=None, native_host=None, _held=None, _attempt=None, _resume=False):
         """Produce a retained verified image; optionally continue into guarded installation."""
         import uuid
-        from . import _image
+        from . import _image, _native_create_request as request, _native_create_git as native_git
         from .lifecycle import identity, replace_json
         identifier(seed, 64)
         if type(native_capacity_gib) is not int or not 1 <= native_capacity_gib <= 65536:
@@ -615,22 +640,24 @@ class Store(Lifecycle):
                     any(type(value) is not int or not 0 < value < 1 << 64 for value in native_verification_budget.values())):
                 raise StallionError('Verification budget requires six positive uint64 dimensions')
             native_verification_budget = native_verification_budget.copy()
+        workspace, transaction = ((_attempt['workspace'], _attempt['transaction']) if _attempt else (uuid.uuid4().hex, uuid.uuid4().hex))
+        branch = request.branch_name(name, workspace)
+        runtime = native_git.qualified_runtime(native_host)
         native_result, carrier = [None], [None, None]
-        with self._native_creation_scope(seed, native_result, carrier):
+        with self._native_creation_scope(seed, native_result, carrier, held=_held) as held:
             base, seed_meta = self.object('seeds', seed)
             if seed_meta.get('backend', 'folder') != 'folder':
                 error = StallionError('Native candidate creation requires a folder seed')
                 error.native_reason = 'source-backend'
                 raise error
-            workspace, transaction = uuid.uuid4().hex, uuid.uuid4().hex
             final = self.root / 'workspaces' / workspace
             journal = self.root / 'journals' / f'{workspace}.json'
-            if os.path.lexists(final) or os.path.lexists(journal):
-                raise StallionError('Native candidate destination is already reserved')
-            with self.staging(retain_native=True) as stage:
+            with request.prepare_controller(self.root, held, base, seed_meta, workspace=workspace, transaction=transaction,
+                    name=name, jobs=jobs, capacity=native_capacity_gib, budget=native_verification_budget,
+                    install_profile=install_profile, host=native_host, runtime=runtime['contract'],
+                    parent=_attempt.get('parent') if _attempt else None, resume=_resume) as (admission, spec, intent):
+                stage = Path(spec['stage'])
                 host, owned = stage / 'input', stage / 'owned'
-                host.mkdir(mode=0o700)
-                owned.mkdir(mode=0o700)
                 response = {'candidate_created': False, 'image_verified': False,
                             'candidate': str(owned), 'retained_stage': str(stage), 'journal': str(journal),
                             'host_input': str(host), 'host_cleanup_complete': None, 'host_cleanup_error': None,
@@ -639,108 +666,104 @@ class Store(Lifecycle):
                 fallback = StallionError(f'Native creation receipt retained; stage {stage}; intent {journal}')
                 fallback.native_candidate_result = response
                 carrier[:] = [response, fallback]
-                intent = {'operation': 'native-create', 'transaction': transaction, 'workspace': workspace,
-                          'seed': seed, 'stage': str(stage), 'stage_identity': identity(stage),
-                          'candidate': str(owned), 'object': identity(owned), 'final': str(final),
-                          'creation_attempted': False, 'outcome': 'preparing',
-                          'native_image': {'component': 'image.sfs', 'file': None, 'uuid': None, 'anchor': None}}
-                write_json(stage / 'native-create', intent)
-                sync_directory(stage)
-                write_json(journal, intent)
-                sync_directory(journal.parent)
-                sync_directory(stage.parent)
-                if read_json(journal).get('transaction') != transaction:
-                    raise StallionError('Native candidate intent ownership changed')
-                with self._workspace_lock(workspace, reconcile=False, native_result=native_result):
-                    if install_profile is not None:
-                        from ._native import preflight_create
-                        preflight_create(self, response, intent, stage, journal, install_profile, native_host)
-                    repo = host / 'repo'
-                    clone_tree(base / 'repo', repo, jobs=jobs)
-                    branch = f"stallionfs/{name + '-' if name else ''}{workspace}"
-                    git(repo, 'checkout', '-b', branch)
-                    self._standalone_git(repo)
-                    validate_tree(repo)
+                from ._native import preflight_create
+                request.phase(admission, journal, intent, 'preflight')
+                preflight_create(self, response, intent, stage, journal, install_profile or 'production', native_host,
+                                 discover=install_profile is not None)
+                admission.files.pop(journal, None)
+                request.require(admission.read(journal) == intent, 'preflight-journal-disagreement')
+                runtime['check']()
+                repo = host / 'repo'
+                request.phase(admission, journal, intent, 'clone')
+                clone_tree(base / 'repo', repo, jobs=jobs)
+                request.phase(admission, journal, intent, 'branch')
+                native_git.checkout(repo, seed_meta['commit'], branch, stage, intent,
+                                    lambda: request.publish(admission, journal, intent), runtime)
+                validate_tree(repo)
+                request.phase(admission, journal, intent, 'import')
 
-                    def before_create():
-                        current = read_json(journal)
-                        if (current != {'format': 1, **intent} or current.get('transaction') != transaction or
-                                identity(stage) != intent['stage_identity'] or identity(owned) != intent['object'] or
-                                os.path.lexists(final)):
-                            raise StallionError('Native candidate intent or directory changed')
-                        intent.update(creation_attempted=True, outcome='creation-attempted')
-                        replace_json(journal, intent)
-                        sync_directory(journal.parent)
-                        replace_json(stage / 'native-create', intent)
-                        sync_directory(stage)
+                def before_create():
+                    current = read_json(journal)
+                    if (current != {'format': 1, **intent} or current.get('transaction') != transaction or
+                            identity(stage) != intent['stage_identity'] or identity(owned) != intent['object'] or
+                            os.path.lexists(final)):
+                        raise StallionError('Native candidate intent or directory changed')
+                    intent.update(creation_attempted=True, outcome='creation-attempted')
+                    request.publish(admission, journal, intent)
 
-                    source = {'directory': str(repo), 'root': identity(repo)}
-                    destination = {'directory': str(owned), 'parent': identity(owned), 'component': 'image.sfs',
-                                   'before_create': before_create}
-                    try:
-                        result = _image.create_from_tree(source, destination, native_capacity_gib * (1 << 30),
-                            *((native_verification_budget,) if native_verification_budget is not None else ()))
-                    except BaseException as error:
-                        details = native_failure_details(error)
-                        if details is not None:
-                            native_result[0] = details
-                            response['native_image_result'] = details
-                            response['outcome'] = details.get('outcome', 'unknown')
-                            try:
-                                error.native_image_result = details
-                            except (AttributeError, MemoryError):
-                                pass  # The preallocated Store receipt owns the same details.
+                source = {'directory': str(repo), 'root': identity(repo)}
+                destination = {'directory': str(owned), 'parent': identity(owned), 'component': 'image.sfs',
+                               'before_create': before_create}
+                try:
+                    result = _image.create_from_tree(source, destination, native_capacity_gib * (1 << 30),
+                        *((native_verification_budget,) if native_verification_budget is not None else ()))
+                except BaseException as error:
+                    details = native_failure_details(error)
+                    if details is not None:
+                        native_result[0] = details
+                        response['native_image_result'] = details
+                        response['outcome'] = details.get('outcome', 'unknown')
                         try:
-                            error.add_note(f'Native candidate and host input retained at {stage}; intent {journal}')
+                            error.native_image_result = details
                         except (AttributeError, MemoryError):
-                            pass
-                        raise
-                    native_result[0] = result
-                    response['native_image_result'] = result
-                    response['image_verified'] = result.get('candidate_complete') is True
-                    response['outcome'] = 'image-verified' if response['image_verified'] else result['outcome']
-                    intent.update(outcome=result['outcome'], result=result)
-                    if result.get('identity') is not None:
-                        intent['native_image'].update(result['identity'])
-                    intent['native_image']['anchor'] = result.get('anchor')
-                    replace_json(journal, intent)
-                    sync_directory(journal.parent)
-                    replace_json(stage / 'native-create', intent)
-                    sync_directory(stage)
-                    if not result.get('candidate_complete'):
-                        error = StallionError(f"Native candidate creation failed: {result.get('reason', 'publication-unknown')}; retained at {stage}")
-                        error.native_image_result = result
-                        raise error
-                    target = {'component': 'image.sfs', 'parent': identity(stage), 'object': identity(owned),
-                              'file': result['identity']['file'], 'uuid': result['identity']['uuid'], 'anchor': result['anchor']}
-                    metadata = {'id': workspace, 'seed': seed, 'transaction': transaction, 'name': name,
-                                'branch': branch, 'commit': seed_meta['commit'], 'created': time.time(),
-                                'backend': 'native-image', 'ownership': 'store-created', 'state': 'candidate',
-                                'capacity_gib': native_capacity_gib, 'native_image': target, 'creation_proof': 'native-create.json'}
-                    write_json(owned / 'native-create.json', {'operation': 'native-create', 'id': workspace,
-                               'transaction': transaction, 'seed': seed, 'native_image': target,
-                               'import_contract': 'prepared-tree-v1', 'result': result})
-                    write_json(owned / 'meta.json', metadata)
-                    sync_directory(owned)
-                    owned_native_target(owned, metadata)
-                    response['candidate_created'] = True
-                    response['metadata'] = metadata
-                    response['outcome'] = 'candidate-created'
-                    response['host_cleanup_complete'] = False
+                            pass  # The preallocated Store receipt owns the same details.
                     try:
-                        remove_tree(host, jobs=jobs)
-                        sync_directory(stage)
-                    except (OSError, StallionError) as error:
-                        response['host_cleanup_errno'] = getattr(error, 'errno', None)
-                        response['host_cleanup_error'] = str(error)
-                    else:
-                        response['host_cleanup_complete'] = True
-                    if install_profile is not None:
-                        from ._native import install_candidate
-                        return install_candidate(self, response, intent, metadata, install_profile, native_host)
-                    # The intent remains an observational hold, never an exchange journal.
-                    return response
-
+                        error.add_note(f'Native candidate and host input retained at {stage}; intent {journal}')
+                    except (AttributeError, MemoryError):
+                        pass
+                    raise
+                native_result[0] = result
+                response['native_image_result'] = result
+                response['image_verified'] = result.get('candidate_complete') is True
+                response['outcome'] = 'image-verified' if response['image_verified'] else result['outcome']
+                intent.update(outcome=result['outcome'], result=result)
+                if result.get('identity') is not None:
+                    intent['native_image'].update(result['identity'])
+                intent['native_image']['anchor'] = result.get('anchor')
+                request.publish(admission, journal, intent)
+                if not result.get('candidate_complete'):
+                    error = StallionError(f"Native candidate creation failed: {result.get('reason', 'publication-unknown')}; retained at {stage}")
+                    error.native_image_result = result
+                    raise error
+                target = {'component': 'image.sfs', 'parent': identity(stage), 'object': identity(owned),
+                          'file': result['identity']['file'], 'uuid': result['identity']['uuid'], 'anchor': result['anchor']}
+                metadata = {'id': workspace, 'seed': seed, 'transaction': transaction, 'name': name,
+                            'branch': branch, 'commit': seed_meta['commit'], 'created': time.time(),
+                            'backend': 'native-image', 'ownership': 'store-created', 'state': 'candidate',
+                            'capacity_gib': native_capacity_gib, 'native_image': target, 'creation_proof': 'native-create.json'}
+                created = {'operation': 'native-create', 'id': workspace,
+                           'transaction': transaction, 'seed': seed, 'native_image': target,
+                           'import_contract': 'prepared-tree-v1', 'result': result}
+                from . import _native_create_authority as authority
+                created['writer'] = authority.packet(spec, intent)
+                authority.proof(metadata, created)
+                write_json(owned / 'native-create.json', created)
+                write_json(owned / 'meta.json', metadata)
+                sync_directory(owned)
+                owned_native_target(owned, metadata)
+                request.phase(admission, journal, intent, 'complete')
+                response['candidate_created'] = True
+                response['metadata'] = metadata
+                response['outcome'] = 'candidate-created'
+                response['host_cleanup_complete'] = False
+                try:
+                    remove_tree(host, jobs=jobs)
+                    admission.bindings.pop(host)
+                    os.close(admission.fds.pop(host))
+                    sync_directory(stage)
+                except (OSError, StallionError) as error:
+                    response['host_cleanup_errno'] = getattr(error, 'errno', None)
+                    response['host_cleanup_error'] = str(error)
+                else:
+                    response['host_cleanup_complete'] = True
+                if install_profile is not None:
+                    from ._native import install_candidate
+                    request.phase(admission, journal, intent, 'install')
+                    admission.bindings.pop(owned)
+                    os.close(admission.fds.pop(owned))
+                    return install_candidate(self, response, intent, metadata, install_profile, native_host)
+                # The intent remains an observational hold, never an exchange journal.
+                return response
     def prepare(self, source, *, ref="HEAD", key, command=(), image_size=None):
         import hashlib
         import platform
@@ -787,6 +810,10 @@ class Store(Lifecycle):
                     run(command, repo, capture=False)
                 if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
                     raise StallionError("Preparation replaced the standalone Git directory")
+                from ._native_create_git import inspect_refs, PSEUDO
+                roots = inspect_refs(repo)
+                if any(name in PSEUDO or name.startswith("refs/bisect/") for name in roots):
+                    raise StallionError("Preparation left transient Git state")
                 if any((repo / ".git" / name).exists() for name in ("commondir", "objects/info/alternates", "worktrees")):
                     raise StallionError("Preparation created shared Git storage or linked worktrees")
                 if any(line.lower().startswith("core.worktree=") for line in git(repo, "config", "--local", "--list").splitlines()):

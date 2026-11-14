@@ -1,6 +1,8 @@
 """Mocks only: no disk-image commands, mounts, or diagnostic subprocesses."""
+import ast
 import errno
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import Context
 from datetime import datetime, timezone
 import json
 import os
@@ -10,7 +12,9 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import textwrap
 import time
 import traceback
 from types import SimpleNamespace
@@ -548,49 +552,56 @@ class DirectImageFixtureTests(unittest.TestCase):
         self.assertIsNone(diagnostics._scope.get())
 
     def test_space_body_scopes_full_sibling_and_seed_separately(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = space.ImageSpace()
-            fixture.base = Path(temporary).resolve()
-            fixture.source = fixture.base / 'source'
-            fixture.seed = fixture.base / 'seed.sparseimage'
-            fixture.image_points = {}
-            repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
-            repo.mkdir(); untouched.mkdir()
-            filler = repo / 'filler'
-            filler.touch()
-            stream = Mock()
-            stream.write.side_effect = [1, OSError(errno.ENOSPC, 'mock disk full')]
-            opened = Mock()
-            opened.__enter__ = Mock(return_value=stream)
-            opened.__exit__ = Mock(return_value=False)
-            original_open = Path.open
-            def open_path(path, *args, **kwargs):
-                return opened if path == filler else original_open(path, *args, **kwargs)
-            def clone(seed, image):
-                self.assert_scope(fixture.base, image, None, 'preparation')
-            def digest(image):
-                self.assert_scope(fixture.base, image, None, 'body')
-                return 'unchanged'
-            seen, observed_detaches = [], []
-            def attach(image, point):
-                self.assert_scope(fixture.base, image, point, 'body')
-                seen.append(image.name)
-                return repo if image.name == 'full.sparseimage' else untouched
-            def detach(image, point):
-                self.assert_scope(fixture.base, image, point, 'body')
-                observed_detaches.append(diagnostics._detach_observation.get() is not None)
-            with patch.object(space.images, 'clone', side_effect=clone), \
-                    patch.object(space, 'digest', side_effect=digest), \
-                    patch.object(space.images, 'attach', side_effect=attach), \
-                    patch.object(space.images, 'detach', side_effect=detach), \
-                    patch.object(fixture, 'assert_original'), \
-                    patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
-                    patch.object(Path, 'open', open_path), patch('builtins.print'):
-                fixture.test_volume_full_preserves_existing_data_and_other_images()
-            self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
-            self.assertEqual(observed_detaches, [False, True, False, False])
-            self.assertIsNone(diagnostics._detach_observation.get())
-            self.assertIsNone(diagnostics._scope.get())
+        for selection in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach',
+                          'enospc-sibling-detach', 'restored-cleanup'):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as temporary:
+                fixture = space.ImageSpace()
+                fixture.base = Path(temporary).resolve()
+                fixture.source = fixture.base / 'source'
+                fixture.seed = fixture.base / 'seed.sparseimage'
+                fixture.image_points = {}
+                fixture.observation = selection
+                repo, untouched = fixture.base / 'repo', fixture.base / 'untouched'
+                repo.mkdir(); untouched.mkdir()
+                filler = repo / 'filler'
+                filler.touch()
+                stream = Mock()
+                stream.write.side_effect = [1, OSError(errno.ENOSPC, 'mock disk full')]
+                opened = Mock()
+                opened.__enter__ = Mock(return_value=stream)
+                opened.__exit__ = Mock(return_value=False)
+                original_open = Path.open
+                def open_path(path, *args, **kwargs):
+                    return opened if path == filler else original_open(path, *args, **kwargs)
+                def clone(seed, image):
+                    self.assert_scope(fixture.base, image, None, 'preparation')
+                def digest(image):
+                    self.assert_scope(fixture.base, image, None, 'body')
+                    return 'unchanged'
+                seen, observed_detaches = [], []
+                def attach(image, point):
+                    self.assert_scope(fixture.base, image, point, 'body')
+                    seen.append(image.name)
+                    return repo if image.name == 'full.sparseimage' else untouched
+                def detach(image, point):
+                    self.assert_scope(fixture.base, image, point,
+                                      'sibling-detach' if image.name == 'sibling.sparseimage' else 'body')
+                    observed_detaches.append(diagnostics._detach_observation.get() is not None)
+                with patch.object(space.images, 'clone', side_effect=clone), \
+                        patch.object(space, 'digest', side_effect=digest), \
+                        patch.object(space.images, 'attach', side_effect=attach), \
+                        patch.object(space.images, 'detach', side_effect=detach), \
+                        patch.object(fixture, 'assert_original'), \
+                        patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                        patch.object(Path, 'open', open_path), patch('builtins.print'):
+                    fixture.test_volume_full_preserves_existing_data_and_other_images()
+                self.assertEqual(seen, ['full.sparseimage', 'full.sparseimage', 'sibling.sparseimage', 'seed.sparseimage'])
+                self.assertEqual(observed_detaches, [selection == 'enospc-initial-detach',
+                                 selection not in ('enospc-initial-detach', 'enospc-sibling-detach'),
+                                 selection == 'enospc-sibling-detach', False])
+                self.assertFalse(getattr(fixture, 'retain', False))
+                self.assertIsNone(diagnostics._detach_observation.get())
+                self.assertIsNone(diagnostics._scope.get())
 
     def test_space_cleanup_scopes_each_image_and_resets_after_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -621,6 +632,630 @@ class DirectImageFixtureTests(unittest.TestCase):
                         fixture.clean()
                 remove.assert_not_called()
             self.assertIsNone(diagnostics._scope.get())
+
+
+class SpaceRetentionTests(unittest.TestCase):
+    def fixture(self):
+        fixture = space.ImageSpace()
+        fixture.base = Path(tempfile.mkdtemp(prefix='space-retention-mock-')).resolve()
+        self.addCleanup(shutil.rmtree, fixture.base, ignore_errors=True)
+        fixture.image_points = {}
+        fixture.observation = 'initial-unmount'
+        for name in ('seed.sparseimage', 'sibling.sparseimage', 'sentinel'):
+            (fixture.base / name).write_bytes(name.encode())
+        return fixture
+
+    def assert_retained(self, fixture):
+        before = {p.name: p.read_bytes() for p in fixture.base.iterdir() if p.is_file()}
+        with patch.object(space.images, 'mounted') as inspect, patch.object(space.images, 'detach') as detach, \
+                patch.object(space.os, 'walk') as walk, patch.object(space.shutil, 'rmtree') as remove:
+            fixture.clean()
+        for operation in (inspect, detach, walk, remove):
+            operation.assert_not_called()
+        self.assertEqual({p.name: p.read_bytes() for p in fixture.base.iterdir() if p.is_file()}, before)
+
+    def test_setup_errors_before_and_after_image_creation_keep_original_and_all_files(self):
+        for stage in ('write', 'xattr', 'build', 'interrupt', 'exit'):
+            with self.subTest(stage=stage):
+                fixture = space.ImageSpace()
+                error = KeyboardInterrupt() if stage == 'interrupt' else SystemExit(7) if stage == 'exit' else OSError(stage)
+                def write(path, value):
+                    self.addCleanup(shutil.rmtree, fixture.base, ignore_errors=True)
+                    if stage in ('write', 'interrupt', 'exit'):
+                        raise error
+                    path.write_bytes(value)
+                def build(source, image, capacity):
+                    image.write_bytes(b'unknown attached image')
+                    raise error
+                with patch.object(space.shutil, 'disk_usage', return_value=SimpleNamespace(free=4 * 1024**3)), \
+                        patch.object(space, 'fullsync', side_effect=write), \
+                        patch.object(space.subprocess, 'run', side_effect=error if stage == 'xattr' else None), \
+                        patch.object(space.images, 'build', side_effect=build), self.assertRaises(type(error)) as caught:
+                    fixture.setUp()
+                self.assertIs(caught.exception, error)
+                self.assertIn(str(fixture.base), '\n'.join(error.__notes__))
+                self.assert_retained(fixture)
+
+    def test_body_failures_and_late_skip_retain_without_cleanup_probes(self):
+        for error in (AssertionError('body'), OSError(errno.ENOSPC, 'unexpected full'), KeyboardInterrupt(), SystemExit(3), unittest.SkipTest('late')):
+            with self.subTest(error=type(error).__name__):
+                fixture = self.fixture()
+                fixture.seed = fixture.base / 'seed.sparseimage'
+                with patch.object(space.images, 'clone', side_effect=error), self.assertRaises(type(error)) as caught:
+                    fixture.test_volume_full_preserves_existing_data_and_other_images()
+                self.assertIs(caught.exception, error)
+                self.assert_retained(fixture)
+
+    def test_retained_path_note_failure_cannot_replace_base_exception(self):
+        class NoteFailure(KeyboardInterrupt):
+            def add_note(self, text):
+                raise SystemExit(9)
+        fixture, error = self.fixture(), NoteFailure()
+        @space.retain_failure
+        def body(value):
+            raise error
+        with self.assertRaises(NoteFailure) as caught:
+            body(fixture)
+        self.assertIs(caught.exception, error)
+        self.assert_retained(fixture)
+
+    def test_body_eject_failure_is_not_repeated_by_registered_cleanup(self):
+        fixture = self.fixture()
+        fixture.seed, fixture.source = fixture.base / 'seed.sparseimage', fixture.base / 'source'
+        repo = fixture.base / 'repo'; repo.mkdir()
+        filler = repo / 'filler'; filler.touch()
+        stream = Mock(); stream.write.side_effect = [1, OSError(errno.ENOSPC, 'expected full')]
+        opened = Mock(); opened.__enter__ = Mock(return_value=stream); opened.__exit__ = Mock(return_value=False)
+        original_open = Path.open
+        def open_path(path, *args, **kwargs):
+            return opened if path == filler else original_open(path, *args, **kwargs)
+        error = OSError(errno.EBUSY, 'body eject')
+        with patch.object(space.images, 'clone'), patch.object(space, 'digest', return_value='same'), \
+                patch.object(space.images, 'attach', return_value=repo), patch.object(fixture, 'assert_original'), \
+                patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                patch.object(Path, 'open', open_path), patch.object(space.images, 'detach', side_effect=error) as eject, \
+                self.assertRaises(type(error)) as caught:
+            fixture.test_volume_full_preserves_existing_data_and_other_images()
+        self.assertIs(caught.exception, error)
+        eject.assert_called_once()
+        self.assert_retained(fixture)
+
+    def test_enospc_selector_observes_first_detach_before_failure(self):
+        for selection in ('initial-unmount', 'closed-snapshot', 'enospc-initial-detach'):
+            with self.subTest(selection=selection):
+                fixture = self.fixture()
+                fixture.observation = selection
+                fixture.seed, fixture.source = fixture.base/'seed.sparseimage', fixture.base/'source'
+                repo = fixture.base/'repo'; repo.mkdir()
+                filler = repo/'filler'; filler.touch()
+                stream = Mock(); stream.write.side_effect = [1, OSError(errno.ENOSPC, 'full')]
+                opened = Mock(); opened.__enter__ = Mock(return_value=stream); opened.__exit__ = Mock(return_value=False)
+                original_open = Path.open
+                def open_path(path, *args, **kwargs):
+                    return opened if path == filler else original_open(path, *args, **kwargs)
+                error = OSError(errno.EBUSY, 'selected eject')
+                def detach(*args):
+                    self.assertEqual(diagnostics._detach_observation.get() is not None,
+                                     selection == 'enospc-initial-detach')
+                    raise error
+                with patch.object(space.images, 'clone'), patch.object(space, 'digest', return_value='same'), \
+                        patch.object(space.images, 'attach', return_value=repo), patch.object(fixture, 'assert_original'), \
+                        patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), \
+                        patch.object(Path, 'open', open_path), patch.object(space.images, 'detach', side_effect=detach) as eject, \
+                        self.assertRaises(OSError) as caught:
+                    fixture.test_volume_full_preserves_existing_data_and_other_images()
+                self.assertIs(caught.exception, error)
+                eject.assert_called_once()
+                self.assert_retained(fixture)
+
+    def test_selector_is_validated_before_space_fixture_allocation(self):
+        for value in ('enospc-initial-detach', 'unknown', ''):
+            with self.subTest(value=value), patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION=value), \
+                    patch.object(space.tempfile, 'mkdtemp', side_effect=OSError('stop before allocation')) as allocate:
+                fixture = space.ImageSpace()
+                with self.assertRaises(OSError if value == 'enospc-initial-detach' else ValueError):
+                    fixture.setUp()
+                self.assertEqual(allocate.call_count, int(value == 'enospc-initial-detach'))
+
+    def test_headroom_skip_cleans_only_the_empty_owned_directory(self):
+        fixture = space.ImageSpace()
+        with patch.object(space.shutil, 'disk_usage', return_value=SimpleNamespace(free=0)), \
+                patch.object(space.images, 'build') as build, patch.object(space.subprocess, 'run') as command, \
+                self.assertRaises(unittest.SkipTest):
+            fixture.setUp()
+        self.assertFalse(getattr(fixture, 'retain', False))
+        self.assertEqual(list(fixture.base.iterdir()), [])
+        fixture.clean()
+        self.assertFalse(fixture.base.exists())
+        build.assert_not_called(); command.assert_not_called()
+
+
+class InvocationIsolationTests(unittest.TestCase):
+    def test_mocked_detach_suite_preserves_outer_collector_for_later_owned_failure(self):
+        if __package__:
+            from . import test_image_detach
+        else:
+            import test_image_detach
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            collector = diagnostics.install(images, base / 'outer-diagnostics')
+            self.addCleanup(collector.close)
+            wrappers = {name: getattr(images, name)
+                        for name in ('_command', 'detach', 'mounted', '_attachments')}
+            with patch.object(diagnostics.subprocess, 'Popen',
+                              side_effect=AssertionError('unexpected native command')) as spawn:
+                suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_image_detach.DetachContinuationTests)
+                result = unittest.TestResult()
+                suite.run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                self.assertGreater(result.testsRun, diagnostics.ATTEMPTS)
+                self.assertEqual((collector.attempts, collector.before_attempts, collector.events,
+                                  collector.remaining), (0, 0, 0, diagnostics.CAPTURE_BYTES))
+                self.assertFalse(collector.directory.exists())
+                for name, wrapper in wrappers.items():
+                    self.assertIs(getattr(images, name), wrapper)
+                image = base / 'later.sparseimage'
+                image.write_bytes(b'owned mock backing'); image.chmod(0o600)
+                identity = image.stat()
+                mapped = (str(image), ['/dev/disk999'], None, None,
+                          (identity.st_dev, identity.st_ino))
+                with patch.object(images.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 64, b'', b'later owned eject failed')), \
+                        patch.object(collector, '_mapping', return_value=mapped) as mapping, \
+                        patch.object(collector, '_capture', side_effect=lambda *args: captured(status=1)), \
+                        diagnostics.failure_scope(base, image, stage='later-owned'), \
+                        self.assertRaises(images._CommandFailure):
+                    images._command('/usr/sbin/diskutil', 'eject', '/dev/disk999')
+                mapping.assert_called_once()
+                self.assertEqual(collector.attempts, 1)
+                events = [json.loads(line) for line in
+                          (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+                self.assertEqual([e['stage'] for e in events if e['kind'] == 'failure'], ['later-owned'])
+                self.assertEqual([e['image'] for e in events if e['kind'] == 'mapping'], [str(image)])
+                self.assertTrue(diagnostics.artifact_available(collector.directory))
+                spawn.assert_not_called()
+
+    def check_later_scope(self, first_fails):
+        for missing_scope in (False, True):
+            with self.subTest(first_fails=first_fails, missing_scope=missing_scope), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                first, second = base / 'first.sparseimage', base / 'second.sparseimage'
+                for image in (first, second):
+                    image.write_bytes(b'owned ordinary fixture'); image.chmod(0o600)
+                point = base / 'volume'; point.mkdir(mode=0o700)
+                errors = [OSError('selected command'), OSError('later command')]
+                for error in errors:
+                    error.returncode = errno.EBUSY
+                images, inside, commands = SimpleNamespace(), [], []
+                def command(*args):
+                    commands.append(args)
+                    if len(commands) == 2 or first_fails:
+                        raise errors[len(commands) - 1]
+                    return b'original return'
+                images._command = command
+                def detach(image, mountpoint):
+                    inside.append(True)
+                    try:
+                        return images._command('/usr/sbin/diskutil', 'eject', '/dev/disk999')
+                    finally:
+                        inside.pop()
+                images.detach = detach
+                collector = diagnostics.install(images, base / 'diagnostics')
+                self.addCleanup(collector.close)
+                def before(args, scope, observation):
+                    collector.operations += 1
+                    observation.update(operation_id=collector.operations, observed_target='/dev/disk999')
+                def mapping(args, scope, deadline):
+                    image = scope['image']; info = image.stat()
+                    return str(image), ['/dev/disk999'], None, None, (info.st_dev, info.st_ino)
+                report, seen = collector.report, []
+                def recorded(args, error, scope, operation_id=None, observation=None):
+                    seen.append((operation_id, observation))
+                    return report(args, error, scope, operation_id, observation)
+                def query(observation):
+                    self.assertFalse(inside)
+                    self.assertIs(observation['command_error'], errors[0])
+                with patch.object(collector, 'before', side_effect=before) as observed, \
+                        patch.object(collector, '_mapping', side_effect=mapping), \
+                        patch.object(collector, '_capture', return_value=captured(status=1)), \
+                        patch.object(collector, 'report', side_effect=recorded), \
+                        patch.object(collector, 'eject_log', side_effect=query) as queried:
+                    with diagnostics.observe_detach():
+                        selected = diagnostics._detach_observation.get()
+                        with diagnostics.failure_scope(base, first, mountpoint=point):
+                            if first_fails:
+                                with self.assertRaises(OSError) as caught:
+                                    images.detach(first, point)
+                                self.assertIs(caught.exception, errors[0])
+                            else:
+                                self.assertEqual(images.detach(first, point), b'original return')
+                        later = nullcontext() if missing_scope else diagnostics.failure_scope(base, second)
+                        with later, self.assertRaises(OSError) as caught:
+                            images.detach(second, point)
+                        self.assertIs(caught.exception, errors[1])
+                        self.assertIs(diagnostics._detach_observation.get(), selected)
+                        self.assertIsNone(diagnostics._detach_call.get())
+                    observed.assert_called_once()
+                    self.assertEqual(queried.call_count, int(first_fails))
+                self.assertEqual(seen[-1], (None, None))
+                events = [json.loads(line) for line in (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+                failures = [event for event in events if event['kind'] == 'failure']
+                self.assertEqual(failures[-1]['operation_id'], 2)
+                self.assertEqual(failures[-1]['pre_observation'], 'not-selected')
+                self.assertEqual(commands, [('/usr/sbin/diskutil', 'eject', '/dev/disk999')] * 2)
+                self.assertIsNone(diagnostics._detach_observation.get())
+                self.assertIsNone(diagnostics._validation_read.get())
+
+    def test_selected_success_then_missing_or_inexact_scope_is_fresh(self):
+        self.check_later_scope(False)
+
+    def test_selected_failure_then_missing_or_inexact_scope_is_fresh(self):
+        self.check_later_scope(True)
+
+
+class PassiveValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(space.images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
+        self.temporary = tempfile.TemporaryDirectory(prefix='passive-image-mock-')
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.image, self.point = self.base / 'owned.sparseimage', self.base / 'volume'
+        self.image.write_bytes(b'ordinary synthetic file'); self.image.chmod(0o600)
+        self.point.mkdir(mode=0o700)
+        self.record = {'image-path': str(self.image), 'owner-uid': os.getuid(), 'system-entities': [
+            {'dev-entry': '/dev/disk999', 'content-hint': 'GUID_partition_scheme'},
+            {'dev-entry': '/dev/disk999s1', 'content-hint': 'Apple_APFS'},
+            {'dev-entry': '/dev/disk998', 'content-hint': 'Apple_APFS'},
+            {'dev-entry': '/dev/disk998s1', 'potentially-mountable': True}]}
+        self.identity = (self.image.stat().st_dev, self.image.stat().st_ino)
+        self.inventory = {'images': [self.record]}
+        self.inside = False
+        real_detach = space.images.detach
+        def detach(image, point):
+            self.inside = True
+            try:
+                return real_detach(image, point)
+            finally:
+                self.inside = False
+        self.enterContext(patch.object(space.images, 'detach', detach))
+        self.plist = self.enterContext(patch.object(space.images, '_plist', side_effect=lambda *args: self.inventory))
+        self.command = self.enterContext(patch.object(space.images, '_command'))
+        self.collector = diagnostics.install(space.images, self.base / 'diagnostics')
+        self.addCleanup(self.collector.close)
+        self.enterContext(patch.object(self.collector, '_mapping', return_value=(str(self.image),
+            ['/dev/disk999', '/dev/disk999s1', '/dev/disk998', '/dev/disk998s1'], None, None, self.identity)))
+        def capture(argv, deadline):
+            if argv[0] == '/usr/bin/log':
+                self.assertFalse(self.inside, 'status lookup occurred before public unwind')
+            return captured(status=0 if argv[0] == '/usr/bin/log' else 1)
+        self.capture = self.enterContext(patch.object(self.collector, '_capture', side_effect=capture))
+
+    def invoke(self):
+        with diagnostics.failure_scope(self.base, self.image, mountpoint=self.point):
+            return space.images.detach(self.image, self.point)
+
+    def events(self):
+        return [json.loads(line) for line in (self.collector.directory / diagnostics.REPORT).read_text().splitlines()]
+
+    def fail_command(self):
+        error = space.images._error('normal eject failed'); error.returncode = errno.EBUSY
+        self.command.side_effect = error
+        return error
+
+    def test_current_confirmed_inventory_flushes_only_failed_call_after_unwind(self):
+        error = self.fail_command()
+        emitted = self.collector._emit
+        def emit(deadline, kind, **fields):
+            if kind == 'validation':
+                self.assertFalse(self.inside)
+            return emitted(deadline, kind, **fields)
+        with patch.object(self.collector, '_emit', side_effect=emit), self.assertRaises(type(error)) as caught:
+            self.invoke()
+        self.assertIs(caught.exception, error)
+        self.command.assert_called_once_with('/usr/sbin/diskutil', 'eject', '/dev/disk999')
+        self.assertEqual(self.plist.call_count, 2)
+        events = self.events()
+        samples = [event for event in events if event['kind'] == 'validation']
+        self.assertEqual([event['read'] for event in samples], ['current', 'confirmed'])
+        self.assertEqual({event['sample_status'] for event in samples}, {'validated'})
+        self.assertEqual(samples[0]['entities'][0]['content_hint'], 'GUID_partition_scheme')
+        self.assertEqual({event['operation_id'] for event in samples}, {events[0]['operation_id']})
+        self.assertEqual({event['pre_observation'] for event in events if event['kind'] == 'failure'}, {'not-selected'})
+        self.assertIsNone(next(event for event in events if event['kind'] == 'mapping')['backing_identity_matches_first'])
+        self.assertEqual(sum(event['kind'] == 'eject_log' for event in events), 1)
+        self.assertEqual(self.collector.before_attempts, 0)
+        self.assertTrue(diagnostics.artifact_available(self.collector.directory))
+        self.assertIsNone(diagnostics._detach_call.get()); self.assertIsNone(diagnostics._validation_read.get())
+
+    def test_success_post_eject_read_cannot_overwrite_or_publish_validation_cache(self):
+        def command(*args):
+            self.inventory = {'images': []}
+            return b'normal output'
+        self.command.side_effect = command
+        self.assertIsNone(self.invoke())
+        self.assertEqual(self.plist.call_count, 3)
+        self.capture.assert_not_called()
+        self.assertFalse(self.collector.directory.exists())
+        self.assertIsNone(diagnostics._detach_call.get())
+
+    def test_post_eject_refusal_cannot_be_mislabeled_as_confirmed(self):
+        def command(*args):
+            self.inventory = {'images': [dict(self.record, **{'system-entities': [
+                {'dev-entry': '/dev/disk997', 'content-hint': 'EFI'}]})]}
+        self.command.side_effect = command
+        with self.assertRaises(lifecycle.StallionError):
+            self.invoke()
+        samples = [event for event in self.events() if event['kind'] == 'validation']
+        self.assertEqual([event['read'] for event in samples], ['current', 'confirmed'])
+        self.assertEqual([event['entities'][0]['content_hint'] for event in samples],
+                         ['GUID_partition_scheme', 'GUID_partition_scheme'])
+        self.assertEqual(self.plist.call_count, 3)
+        self.capture.assert_not_called()
+        self.command.assert_called_once()
+
+    def test_unknown_and_oversized_metadata_cannot_change_eject_or_expose_text(self):
+        for value in ('/private/unrelated ' * 10000, ['invalid']):
+            with self.subTest(value=type(value).__name__):
+                self.record['system-entities'][0]['content-hint'] = value
+                error = self.fail_command()
+                with self.assertRaises(type(error)) as caught:
+                    self.invoke()
+                self.assertIs(caught.exception, error)
+        samples = [event for event in self.events() if event['kind'] == 'validation']
+        self.assertEqual(samples[0]['entities'][0]['content_hint'], '[unrecognized]')
+        self.assertEqual(samples[-1]['sample_status'], 'unavailable')
+        self.assertNotIn('/private/unrelated', (self.collector.directory / diagnostics.REPORT).read_text())
+        self.assertEqual(self.plist.call_count, 4)
+        self.assertEqual(self.command.call_count, 2)
+        self.assertEqual(sum(event['kind'] == 'eject_log' for event in self.events()), 1)
+
+    def test_validation_refusal_never_replays_or_queries_a_command(self):
+        self.record['owner-uid'] += 1
+        with self.assertRaises(lifecycle.StallionError):
+            self.invoke()
+        self.command.assert_not_called(); self.capture.assert_not_called()
+        self.assertEqual(self.plist.call_count, 1)
+        sample = next(event for event in self.events() if event['kind'] == 'validation')
+        self.assertEqual((sample['sample_status'], sample['reason']), ('unavailable', 'normal_validation_failed'))
+
+    def test_collector_interrupt_cannot_replace_command_failure(self):
+        error = self.fail_command()
+        with patch.object(self.collector, 'validation', side_effect=KeyboardInterrupt()), self.assertRaises(type(error)) as caught:
+            self.invoke()
+        self.assertIs(caught.exception, error)
+        self.assertEqual(self.plist.call_count, 2)
+        self.command.assert_called_once()
+
+    def test_mounted_volume_uses_only_normal_validation_probes(self):
+        self.record['system-entities'][-1]['mount-point'] = str(self.point)
+        real_stat = os.stat
+        def device_stat(path, *args, **kwargs):
+            if kwargs.get('follow_symlinks') is not False:
+                if str(path) == '/dev/disk998s1':
+                    return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=42)
+                if str(path) == str(self.point):
+                    return SimpleNamespace(st_dev=42)
+            return real_stat(path, *args, **kwargs)
+        error = self.fail_command()
+        with patch('stallionfs._scan.mounts', return_value=[dict(path=str(self.point), device='/dev/disk998s1',
+                filesystem='apfs', readonly=False, ignore_ownership=False)]) as mounts, \
+                patch.object(space.images.os, 'stat', side_effect=device_stat), \
+                patch.object(space.images.os.path, 'ismount', return_value=True), self.assertRaises(type(error)):
+            self.invoke()
+        self.assertEqual(mounts.call_count, 2)
+        self.assertEqual(self.plist.call_count, 2)
+        self.assertEqual({event['mountpoint_state'] for event in self.events() if event['kind'] == 'validation'}, {'expected'})
+
+    def test_success_then_reused_device_and_report_reentrancy_never_reuse_cache(self):
+        self.enterContext(diagnostics.observe_detach())
+        def success(*args):
+            self.inventory = {'images': []}
+        self.command.side_effect = success
+        self.invoke()
+        other = self.base / 'other.sparseimage'
+        other.write_bytes(b'other identity'); other.chmod(0o600)
+        self.image = other
+        self.record = dict(self.record, **{'image-path': str(other), 'system-entities': [
+            {'dev-entry': '/dev/disk999', 'content-hint': 'EFI'}]})
+        self.inventory = {'images': [self.record]}
+        identity = (other.stat().st_dev, other.stat().st_ino)
+        self.collector._mapping.return_value = str(other), ['/dev/disk999'], None, None, identity
+        error = self.fail_command()
+        report = self.collector.report
+        def reentrant(*args, **kwargs):
+            Context().run(space.images.mounted, other)
+            return report(*args, **kwargs)
+        with patch.object(self.collector, 'report', side_effect=reentrant), self.assertRaises(type(error)):
+            self.invoke()
+        samples = [event for event in self.events() if event['kind'] == 'validation']
+        self.assertEqual([event['read'] for event in samples], ['current', 'confirmed'])
+        self.assertEqual([event['entities'][0]['content_hint'] for event in samples], ['EFI', 'EFI'])
+        self.assertEqual(self.plist.call_count, 6)
+        after = [event for event in self.events() if event['kind'] == 'mapping' and event['phase'] == 'after']
+        self.assertEqual({event['image'] for event in after}, {str(other)})
+        before_id = next(event['operation_id'] for event in self.events() if event['kind'] == 'observation')
+        self.assertNotEqual(after[0]['operation_id'], before_id)
+        self.assertIsNone(after[0]['backing_identity_matches_first'])
+
+    def test_nested_install_close_restores_every_validation_slot(self):
+        saved = {name: original for _, name, original, _ in self.collector.patches}
+        outer_slots = {name: getattr(space.images, name) for name in saved}
+        inner = diagnostics.install(space.images, self.base / 'inner')
+        self.addCleanup(inner.close)
+        inner.close()
+        for name, wrapper in outer_slots.items():
+            self.assertIs(getattr(space.images, name), wrapper)
+        inner = diagnostics.install(space.images, self.base / 'inner-again')
+        self.collector.close()
+        inner.close()
+        for name, original in saved.items():
+            self.assertIs(getattr(space.images, name), original)
+
+    def test_projection_count_and_report_budget_are_bounded_before_serialization(self):
+        self.record['system-entities'].extend({'dev-entry': f'/dev/disk999s{index}'}
+                                             for index in range(2, 35))
+        error = self.fail_command()
+        with self.assertRaises(type(error)):
+            self.invoke()
+        samples = [event for event in self.events() if event['kind'] == 'validation']
+        self.assertEqual({event['sample_status'] for event in samples}, {'unavailable'})
+        self.assertTrue(all(not event['entities'] for event in samples))
+        self.assertTrue(diagnostics.artifact_available(self.collector.directory))
+        self.collector.written = diagnostics.FILE_BYTES
+        before = self.capture.call_count
+        with self.assertRaises(type(error)) as caught:
+            self.invoke()
+        self.assertIs(caught.exception, error)
+        self.assertEqual(self.capture.call_count, before)
+        self.assertEqual(self.command.call_count, 2)
+
+    def test_artifact_rejects_invalid_validation_fields_and_raw_hints(self):
+        error = self.fail_command()
+        with self.assertRaises(type(error)):
+            self.invoke()
+        path = self.collector.directory / diagnostics.REPORT
+        original = self.events()
+        index = next(i for i, value in enumerate(original) if value['kind'] == 'validation')
+        for change in ({'phase': 'before'}, {'read': 'post-eject'}, {'sample_timestamp_ns': True},
+                       {'entities': [{'device': '/dev/disk999', 'content_hint': '/private/secret',
+                        'unmapped_content_hint': None, 'potentially_mountable': None}]}):
+            with self.subTest(change=change):
+                values = [dict(value) for value in original]
+                values[index].update(change)
+                path.write_text(''.join(json.dumps(value) + '\n' for value in values))
+                self.assertFalse(diagnostics.artifact_available(self.collector.directory))
+        path.write_text(''.join(json.dumps(value) + '\n' for value in original))
+
+
+class WorkflowTests(unittest.TestCase):
+    def workflow(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        worker = text.split('  test-execution:\n', 1)[1].split('\n  test:\n', 1)[0]
+        gate = text.split('\n  test:\n', 1)[1].split('\n  hosted-docs-screen:\n', 1)[0]
+        return worker, gate
+
+    def sanitizer_script(self):
+        worker, _ = self.workflow()
+        step = worker.split('      - name: Check native code with sanitizers\n', 1)[1].split(
+            '      - name: Check installed runtime and doctor\n', 1)[0]
+        return textwrap.dedent(step.split(" <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0])
+
+    def test_phase_coverage_and_legacy_context_convergence(self):
+        worker, gate = self.workflow()
+        expected = [('macos-15', '3.12', '0'), ('macos-26', '3.11', '1'),
+                    ('macos-26', '3.13', '1'), ('macos-26', '3.14', '1'),
+                    ('macos-26-intel', '3.13', '1'), ('xcode-27', '3.13', '1')]
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: (\w+)\}$",
+                          worker, re.MULTILINE)
+        self.assertEqual([row[:3] for row in rows if row[3] == 'installed'], expected)
+        self.assertEqual([row[:3] for row in rows if row[3] == 'sanitizer'], [row for row in expected if row[1] == '3.13'])
+        self.assertEqual(len(rows), 9)
+        legacy = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", gate, re.MULTILINE)
+        self.assertEqual(legacy, expected)
+        self.assertIn('    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})\n', gate)
+        self.assertIn('    needs: test-execution\n', gate)
+        self.assertIn("    if: always() && github.event_name != 'workflow_dispatch'\n", gate)
+        self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
+        self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
+        self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
+        self.assertIn("    timeout-minutes: ${{ matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
+        self.assertIn('      fail-fast: false\n', worker)
+        self.assertNotIn('continue-on-error:', worker + gate)
+        sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]
+        self.assertTrue(sanitizer.startswith("        if: matrix.phase == 'sanitizer'\n"))
+        self.assertIn('          ASAN_OPTIONS: halt_on_error=1\n', sanitizer)
+        self.assertIn('          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1\n', sanitizer)
+        self.assertIn('          TSAN_OPTIONS: halt_on_error=1\n', sanitizer)
+        smoke = sanitizer.split('      - name: Check installed runtime and doctor\n', 1)[1]
+        self.assertTrue(smoke.startswith('        run: |\n'))
+        self.assertIn('bootstrap.py" check "${CI_CONTAINER:?}"', smoke)
+        self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', smoke)
+        tree = ast.parse(self.sanitizer_script())
+        names = next(ast.literal_eval(n.value) for n in ast.walk(tree)
+                     if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'names' for t in n.targets))
+        self.assertEqual(names, ('test_fileops.FileOperations.test_native_swaps_enospc_no_fallback_cancellation_and_fd_cleanup',
+                                 'test_scan.Scan.test_native_cancellation_close_errors_and_no_partial_cli_totals', 'test_image.ImageCore'))
+        loop = next(n for n in ast.walk(tree) if isinstance(n, ast.For))
+        self.assertEqual(ast.literal_eval(loop.iter), ('address,undefined', 'thread'))
+        image = ast.parse((Path(__file__).with_name('test_image.py')).read_text())
+        core = next(n for n in image.body if isinstance(n, ast.ClassDef) and n.name == 'ImageCore')
+        methods = [n.name for n in core.body if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')]
+        self.assertEqual(len(methods), 50)
+        coverage = {(os, python, mode, method) for os, python, _, phase in rows if phase == 'sanitizer'
+                    for mode in ast.literal_eval(loop.iter) for method in [*names[:2], *methods]}
+        self.assertEqual(len(coverage), 312)
+
+    def test_legacy_gate_runs_actual_success_only_command(self):
+        _, gate = self.workflow()
+        script = re.search(r'^        run: (.+)$', gate, re.MULTILINE)[1]
+        self.assertEqual(script, 'test "${EXECUTION_RESULT:-}" = success')
+        for outcome in (None, '', 'success', 'failure', 'cancelled', 'skipped', 'unknown', 'success\n', '$(printf success)'):
+            with self.subTest(outcome=outcome):
+                environment = dict(os.environ)
+                environment.pop('EXECUTION_RESULT', None)
+                if outcome is not None:
+                    environment['EXECUTION_RESULT'] = outcome
+                result = subprocess.run(['/bin/sh', '-e', '-c', script], env=environment,
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode == 0, outcome == 'success')
+
+    def test_sanitizer_process_requires_own_admission_both_modes_and_full_results(self):
+        import importlib.util
+        import sysconfig
+        import stallionfs
+        from stallionfs import _scan
+        script = compile(self.sanitizer_script(), '<sanitizer-workflow>', 'exec')
+        for profile in ('success', 'failure', 'skip', 'short-suite', 'short-result', 'initial-admission', 'final-admission', 'checkout-import'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                checkout = base / 'checkout'
+                environment = base / 'environment'; environment.touch()
+                order, modes = [], []
+                def check():
+                    order.append('check')
+                    if (profile == 'initial-admission' and len(order) == 2 or
+                            profile == 'final-admission' and order.count('check') == 2):
+                        raise RuntimeError('Runtime identity differs')
+                def initialize(actual_checkout, wheel):
+                    self.assertEqual((actual_checkout, wheel), (checkout, base / 'qualified-wheel'))
+                    order.append('admit')
+                    return {'check': check}
+                controller = SimpleNamespace(initialize_installed=initialize)
+                spec = SimpleNamespace(loader=Mock())
+                suite = Mock(); suite.countTestCases.return_value = 51 if profile == 'short-suite' else 52
+                def run(actual):
+                    self.assertIs(actual, suite)
+                    flags = os.environ['CFLAGS']
+                    mode = 'thread' if '-fsanitize=thread' in flags else 'address,undefined'
+                    self.assertEqual(flags, f'-g -fno-omit-frame-pointer -fsanitize={mode} -fno-sanitize-recover=all')
+                    modes.append(mode); order.append(mode)
+                    return SimpleNamespace(wasSuccessful=lambda: profile != 'failure',
+                                           skipped=[('required', 'unavailable')] if profile == 'skip' else [],
+                                           testsRun=51 if profile == 'short-result' else 52)
+                with patch.dict(os.environ, GITHUB_WORKSPACE=str(checkout), RUNNER_TEMP=str(base), GITHUB_ENV=str(environment)), \
+                        patch.object(sys, 'path', list(sys.path)), \
+                        patch.object(stallionfs, '__file__', str((checkout if profile == 'checkout-import' else base) / 'site/stallionfs/__init__.py')), \
+                        patch.object(_scan, '__file__', str(base / 'site/stallionfs/_scan.so'), create=True), \
+                        patch.object(importlib.util, 'spec_from_file_location', return_value=spec) as load, \
+                        patch.object(importlib.util, 'module_from_spec', return_value=controller), \
+                        patch.object(sysconfig, 'get_path', return_value=str(Path(sys.prefix).resolve() / 'bin')), \
+                        patch.object(unittest.defaultTestLoader, 'loadTestsFromNames', return_value=suite), \
+                        patch.object(unittest, 'TextTestRunner', return_value=SimpleNamespace(run=run)):
+                    if profile == 'success':
+                        exec(script, {'__name__': '__main__'})
+                    else:
+                        with self.assertRaises((SystemExit, AssertionError, RuntimeError)):
+                            exec(script, {'__name__': '__main__'})
+                if profile == 'checkout-import':
+                    self.assertEqual(order, []); load.assert_not_called()
+                    continue
+                load.assert_called_once_with('ci_build', checkout / 'tools/ci_build.py')
+                spec.loader.exec_module.assert_called_once_with(controller)
+                self.assertEqual(order[:2], ['admit', 'check'])
+                self.assertEqual(order.count('check'), 1 if profile == 'initial-admission' else 2)
+                self.assertEqual(modes, [] if profile in ('initial-admission', 'short-suite') else
+                                 ['address,undefined', 'thread'] if profile in ('success', 'final-admission') else ['address,undefined'])
 
 
 class CleanupTests(unittest.TestCase):
@@ -756,6 +1391,10 @@ class CleanupTests(unittest.TestCase):
 
 class DiagnosticTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(space.images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
+        # These legacy observers use projected mappings; full graph mount refusal
+        # and native node identity are exercised by test_image_detach.
+        self.enterContext(patch.object(space.images, '_no_graph_mounts'))
         self.temporary = tempfile.TemporaryDirectory(prefix='image-diagnostic-mock-')
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
@@ -776,6 +1415,143 @@ class DiagnosticTests(unittest.TestCase):
     def scope(self, **changes):
         return dict(base=self.base, image=self.image, workspace='a' * 32, mountpoint=self.point,
                     stage='body', expected=False) | changes
+
+    def test_discovery_order_reserves_single_before_capture_for_enospc(self):
+        class FinishedLifecycle(Exception):
+            pass
+        state = {'stage': None}
+        attached, repos, points, commands, before_images = set(), {}, {}, [], []
+        primary = space.images._error('ENOSPC first detach failed'); primary.returncode = 64
+
+        def clone(source, destination):
+            if source in attached:
+                raise space.images._error('attached source')
+            shutil.copyfile(source, destination); destination.chmod(0o600)
+
+        def attach(image, point):
+            if image not in repos:
+                point.mkdir(parents=True, mode=0o700)
+                repo = point/'repo'; repo.mkdir()
+                (repo/'file').write_bytes(b'original'); (repo/'file').chmod(0o640)
+                (repo/'link').symlink_to('file'); (repo/'filler').touch()
+                repos[image], points[image] = repo, point
+            attached.add(image)
+            return repos[image]
+
+        def mounted(image):
+            from stallionfs._scan import mounts
+            record = mounts()[0]
+            if record['readonly'] or record['ignore_ownership'] or record['device'] != '/dev/disk998':
+                raise space.images._error('changed mapping')
+            return dict(image=str(image), device='/dev/disk999', mountpoint=str(points[image]),
+                        volume_device='/dev/disk998') if image in attached else None
+
+        def command(*args):
+            scope = diagnostics._scope.get()
+            commands.append((state['stage'], scope['image'], diagnostics._detach_observation.get() is not None))
+            if state['stage'] == 'space':
+                raise primary
+            attached.remove(scope['image'])
+            return b''
+
+        def detach(image, point):
+            if point != points[image] or diagnostics._scope.get()['expected']:
+                raise space.images._error('intentional detach refusal')
+            return space.images._command(*self.args)
+
+        def backing(base):
+            base.mkdir(mode=0o700)
+            seed = base/'seed.sparseimage'; seed.write_bytes(b'owned backing'); seed.chmod(0o600)
+            return seed
+
+        lifecycle_base = self.base/'lifecycle'; backing(lifecycle_base)
+        identifier = 'b'*32
+        image = lifecycle_base/'workspace.sparseimage'; image.write_bytes(b'owned backing'); image.chmod(0o600)
+        point = lifecycle_base/'store/workspaces'/identifier/'volume'
+        repo = attach(image, point)
+        store = Mock(root=lifecycle_base/'store')
+        store.prepare.return_value = {'id': 'seed'}
+        store.create.return_value = {'id': identifier, 'path': str(repo)}
+        def lifecycle_detach():
+            with diagnostics.failure_scope(lifecycle_base, image, mountpoint=point):
+                space.images.detach(image, point)
+        store.unmount.side_effect = lambda *args: lifecycle_detach()
+        snapshots = []
+        def snapshot(*args):
+            snapshots.append(args)
+            if len(snapshots) == 1:
+                raise lifecycle.StallionError('external worktree')
+            attach(image, point); lifecycle_detach()
+            raise FinishedLifecycle()
+        store.snapshot.side_effect = snapshot
+
+        clone_fixture = image_cases.Images('test_clone_ownership_busy_detach_and_recovery')
+        clone_fixture.base = self.base/'images'; clone_fixture.seed = backing(clone_fixture.base)
+        clone_fixture.observation = 'enospc-initial-detach'
+        native = [dict(path=str(clone_fixture.base/'first'), device='/dev/disk998', readonly=False, ignore_ownership=False)]
+        space_fixture = space.ImageSpace()
+        space_fixture.base = self.base/'space'; space_fixture.seed = backing(space_fixture.base)
+        space_fixture.source = space_fixture.base/'source'; space_fixture.image_points = {}
+        space_fixture.observation = 'enospc-initial-detach'
+        space_first = space_fixture.base/'full.sparseimage'
+        stream = Mock(); stream.write.side_effect = [1, OSError(errno.ENOSPC, 'full')]
+        opened = Mock(); opened.__enter__ = Mock(return_value=stream); opened.__exit__ = Mock(return_value=False)
+        original_open = Path.open
+        def open_path(path, *args, **kwargs):
+            return opened if path.name == 'filler' else original_open(path, *args, **kwargs)
+
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='enospc-initial-detach'), \
+                patch.object(space.images, 'clone', side_effect=clone), patch.object(space.images, 'attach', side_effect=attach), \
+                patch.object(space.images, 'mounted', side_effect=mounted), patch.object(space.images, 'detach', side_effect=detach), \
+                patch.object(space.images, '_command', side_effect=command), \
+                patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(lifecycle_base)), \
+                patch.object(lifecycle, 'Store', return_value=store), patch.object(lifecycle, 'git'), \
+                patch.object(lifecycle, 'image_fixture', return_value=nullcontext(SimpleNamespace(call=lambda fn, *args, **kwargs: fn(*args)))), \
+                patch.object(image_cases.subprocess, 'check_output', return_value=b'attribute'), \
+                patch('stallionfs._scan.mounts', return_value=native), \
+                patch.object(space_fixture, 'assert_original'), patch.object(space, 'digest', return_value='same'), \
+                patch.object(space, 'fullsync', side_effect=lambda path, value: path.write_bytes(value)), patch.object(Path, 'open', open_path):
+            collector = diagnostics.install(space.images, self.reporter.directory)
+            self.addCleanup(collector.close); self.reporter = collector
+            def mapping(args, scope, deadline):
+                info = scope['image'].stat()
+                if collector.phase == 'before': before_images.append(scope['image'])
+                return str(scope['image']), ['/dev/disk999'], str(scope['mountpoint']), '/dev/disk998', (info.st_dev, info.st_ino)
+            order = sorted((Path(module.__file__).name, name) for module, name in
+                           ((lifecycle, 'lifecycle'), (image_cases, 'images'), (space, 'space')))
+            self.assertEqual([name for _, name in order], ['lifecycle', 'images', 'space'])
+            with patch.object(collector, '_mapping', side_effect=mapping), patch.object(collector, '_capture', side_effect=lambda *args: captured(b'', status=1)):
+                for _, name in order:
+                    state['stage'] = name
+                    if name == 'lifecycle':
+                        with self.assertRaises(FinishedLifecycle):
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                    elif name == 'images':
+                        clone_fixture.test_clone_ownership_busy_detach_and_recovery()
+                    else:
+                        with self.assertRaises(type(primary)) as caught:
+                            space_fixture.test_volume_full_preserves_existing_data_and_other_images()
+                        self.assertIs(caught.exception, primary)
+                    self.assertEqual(collector.before_attempts, int(name == 'space'))
+                    if name != 'space': self.assertEqual(collector.attempts, 0, name)
+            self.assertEqual(before_images, [space_first])
+            self.assertEqual(len(commands), 7)
+            self.assertEqual([selected for _, _, selected in commands], [False]*6+[True])
+            events = self.events()
+            before = next(event for event in events if event['phase'] == 'before')
+            failed = next(event for event in events if event['kind'] == 'failure')
+            self.assertEqual(before['operation_id'], failed['operation_id'])
+            self.assertEqual(failed['pre_observation'], 'attempted')
+            self.assertEqual(collector.attempts, 1, (getattr(primary, '__notes__', []), events))
+
+    def test_clone_fixture_selector_validates_before_allocation(self):
+        for value in ('enospc-initial-detach', '', 'unknown'):
+            with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION=value), \
+                    patch.object(image_cases.tempfile, 'mkdtemp', side_effect=OSError('stop before allocation')) as allocate:
+                fixture = image_cases.Images()
+                with self.assertRaises(OSError if value == 'enospc-initial-detach' else ValueError):
+                    fixture._prepare()
+                self.assertEqual(allocate.call_count, int(value == 'enospc-initial-detach'))
 
     def events(self):
         return [json.loads(s) for s in (self.reporter.directory / diagnostics.REPORT).read_text().splitlines()]
@@ -1193,6 +1969,7 @@ class DiagnosticTests(unittest.TestCase):
                     if source in attached:
                         raise image_cases.StallionError('attached source')
                     shutil.copyfile(source, destination)
+                    destination.chmod(0o600)
                 def attach(image, point):
                     if image not in repos:
                         point.mkdir(mode=0o700)
@@ -1258,7 +2035,7 @@ class DiagnosticTests(unittest.TestCase):
                         before_cleanup = list(calls)
                         fixture.tearDown()
                         self.assertEqual(calls, before_cleanup)
-                        self.assertEqual(query.call_count, int(failure == 'selected'))
+                        self.assertEqual(query.call_count, int(failure in ('release', 'selected')))
                     if failure == 'none':
                         remove.assert_called_once_with(fixture.base)
                         self.assertFalse(attached)
@@ -1330,6 +2107,796 @@ class DiagnosticTests(unittest.TestCase):
                     space.images.detach(self.image, self.point)
         self.assertIs(caught.exception, primary)
         self.assertEqual(order, ['before', 'eject', 'report', 'log'])
+        self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_real_detach_observes_before_validation_and_refuses_changed_owned_backing(self):
+        cases = ('stable', 'observer_error', 'observer_timeout', 'exhausted', 'missing',
+                 'replaced', 'symlink', 'private', 'error_replaced', 'disappeared',
+                 'reused', 'owner', 'mountpoint', 'between_device', 'between_backing')
+        for change in cases:
+            with self.subTest(change=change), tempfile.TemporaryDirectory(dir=self.base) as temporary:
+                base = Path(temporary)
+                image, point = base / 'workspace.sparseimage', base / 'volume'
+                image.write_bytes(b'owned backing'); image.chmod(0o600)
+                point.mkdir(mode=0o700)
+                current = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
+                               volume_device='/dev/disk999s1')
+                primary = space.images._error('original eject failed'); primary.returncode = 64
+                order, validation_calls = [], []
+                fixture = image_cases.Images()
+                fixture.base = base
+
+                def replace():
+                    image.rename(base / 'retained-original')
+                    image.write_bytes(b'replacement'); image.chmod(0o600)
+
+                def before(args, scope, observation):
+                    self.assertEqual(args, ('/usr/sbin/diskutil', 'eject', None))
+                    order.append('before')
+                    observation['observed_target'] = '/dev/disk999'
+                    if change in ('replaced', 'error_replaced'):
+                        replace()
+                    elif change == 'missing':
+                        image.rename(base / 'retained-original')
+                    elif change == 'symlink':
+                        image.rename(base / 'retained-original')
+                        image.symlink_to(base / 'retained-original')
+                    elif change == 'private':
+                        image.chmod(0o644)
+                    if change in ('observer_error', 'error_replaced'):
+                        raise OSError('observation failed')
+                    if change == 'observer_timeout':
+                        raise TimeoutError('observation deadline')
+
+                def mounted(actual):
+                    self.assertEqual(actual, image)
+                    validation_calls.append(actual)
+                    order.append('validation')
+                    if change == 'disappeared':
+                        return None
+                    if change == 'owner':
+                        raise space.images._error('attachment owner changed')
+                    if change == 'reused':
+                        return dict(current, image=str(base / 'another-image'))
+                    if change == 'mountpoint':
+                        return dict(current, mountpoint=str(base / 'another-volume'))
+                    if len(validation_calls) == 2:
+                        if change == 'between_device':
+                            return dict(current, device='/dev/disk998')
+                        if change == 'between_backing':
+                            replace()
+                    return current
+
+                def command(*args):
+                    order.append('eject')
+                    self.assertEqual(order[-3:], ['validation', 'validation', 'eject'])
+                    raise primary
+
+                with patch.object(space.images, 'mounted', side_effect=mounted), \
+                        patch.object(space.images.os.path, 'ismount', return_value=True), \
+                        patch.object(space.images, '_command', side_effect=command) as eject:
+                    collector = diagnostics.install(space.images, base / 'diagnostics')
+                    self.addCleanup(collector.close)
+                    if change == 'exhausted':
+                        collector.remaining = 0
+                    observer = collector.before if change == 'exhausted' else before
+                    with patch.object(collector, 'before', side_effect=observer), \
+                            patch.object(collector, 'report') as report, \
+                            patch.object(collector, 'eject_log') as query, \
+                            patch.object(collector, '_capture') as capture, \
+                            self.assertRaises(lifecycle.StallionError) as caught:
+                        with diagnostics.observe_detach():
+                            observation = diagnostics._detach_observation.get()
+                            fixture._detach(image, point)
+                    capture.assert_not_called()
+                    refused = change in ('missing', 'replaced', 'symlink', 'private', 'error_replaced')
+                    if refused:
+                        self.assertIn('Owned backing identity changed', str(caught.exception))
+                        self.assertEqual(validation_calls, [])
+                    else:
+                        self.assertGreaterEqual(len(validation_calls), 1)
+                    commanded = change in ('stable', 'observer_error', 'observer_timeout', 'exhausted')
+                    self.assertEqual(eject.call_count, int(commanded))
+                    self.assertEqual(report.call_count, int(commanded))
+                    self.assertEqual(query.call_count, int(commanded))
+                    if commanded:
+                        self.assertIs(caught.exception, primary)
+                        self.assertEqual(caught.exception.returncode, 64)
+                        eject.assert_called_once_with(*self.args)
+                    else:
+                        self.assertNotIn('start_ns', observation)
+                        self.assertNotIn('command_status', observation)
+                    if change != 'exhausted':
+                        self.assertEqual(order[0], 'before')
+                    self.assertTrue(fixture.retain)
+                    self.assertEqual(fixture.failed_images, {image})
+                    with patch.object(image_cases.shutil, 'rmtree') as remove:
+                        fixture.tearDown()
+                    remove.assert_not_called()
+                    self.assertTrue(base.exists())
+                    retained = base / 'retained-original'
+                    self.assertEqual((retained if retained.exists() else image).read_bytes(), b'owned backing')
+                    collector.close()
+                self.assertIsNone(diagnostics._scope.get())
+                self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_pre_mapping_selects_owned_image_and_changed_target_cannot_authorize_log(self):
+        unrelated = dict(self.record, **{'image-path': str(self.base / 'unrelated'),
+                                        'system-entities': [{'dev-entry': '/dev/disk998'}]})
+        with patch.object(self.reporter, '_capture', side_effect=self.mapping_capture([unrelated, self.record])):
+            observation = {}
+            self.reporter.before(('/usr/sbin/diskutil', 'eject', None), self.scope(), observation)
+        self.assertEqual(observation['observed_target'], '/dev/disk999')
+        self.assertEqual(next(e for e in self.events() if e['kind'] == 'mapping')['image'], str(self.image))
+        self.assertEqual(self.events()[0]['observation'], 'before detach validation')
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+
+        primary = space.images._error('fresh target failed'); primary.returncode = 64
+        current = dict(image=str(self.image), device='/dev/disk998', mountpoint=str(self.point),
+                       volume_device='/dev/disk998s1')
+        with patch.object(space.images, 'mounted', return_value=current), \
+                patch.object(space.images, '_command', side_effect=primary) as command:
+            collector = diagnostics.install(space.images, self.base / 'changed-target')
+            self.addCleanup(collector.close)
+            def before(args, scope, selected):
+                selected['observed_target'] = '/dev/disk999'
+            with patch.object(collector, 'before', side_effect=before), \
+                    patch.object(collector, '_capture', side_effect=self.mapping_capture([
+                        dict(self.record, **{'system-entities': [{'dev-entry': '/dev/disk998'}]})])), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                    self.assertRaises(type(primary)) as caught:
+                with diagnostics.observe_detach():
+                    selected = diagnostics._detach_observation.get()
+                    space.images.detach(self.image, self.point)
+            self.assertIs(caught.exception, primary)
+            command.assert_called_once_with('/usr/sbin/diskutil', 'eject', '/dev/disk998')
+            self.assertTrue(selected['target_changed'])
+            events = [json.loads(line) for line in (collector.directory / diagnostics.REPORT).read_text().splitlines()]
+            log = next(event for event in events if event['kind'] == 'eject_log')
+            self.assertEqual((log['query_status'], log['records'], log['reason']),
+                             ('unavailable', '', 'no_verified_attachment_mapping'))
+            self.assertTrue(diagnostics.artifact_available(collector.directory))
+            collector.close()
+
+    def test_real_detach_success_keeps_one_command_after_both_validations(self):
+        current = dict(image=str(self.image), device='/dev/disk999', mountpoint=str(self.point),
+                       volume_device='/dev/disk999s1')
+        order = []
+        def mounted(image):
+            order.append('validation')
+            return current if order.count('validation') <= 2 else None
+        def before(args, scope, observation):
+            order.append('before')
+            observation['observed_target'] = '/dev/disk999'
+        def eject(*args):
+            order.append('eject')
+            return b'ok'
+        with patch.object(space.images, 'mounted', side_effect=mounted), \
+                patch.object(space.images.os.path, 'ismount', return_value=False), \
+                patch.object(space.images, '_command', side_effect=eject) as command:
+            collector = diagnostics.install(space.images, self.base / 'unused')
+            self.addCleanup(collector.close)
+            with patch.object(collector, 'before', side_effect=before), \
+                    patch.object(collector, 'report') as report, \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+                self.assertIsNone(space.images.detach(self.image, self.point))
+            self.assertEqual(order, ['before', 'validation', 'validation', 'eject', 'validation'])
+            command.assert_called_once_with(*self.args)
+            report.assert_not_called()
+            collector.close()
+
+    def test_direct_command_never_takes_pre_observation(self):
+        original = Mock(return_value=b'ok')
+        images = SimpleNamespace(_command=original)
+        collector = diagnostics.install(images, self.base / 'unused')
+        self.addCleanup(collector.close)
+        with patch.object(collector, 'before') as before, diagnostics.observe_detach():
+            self.assertEqual(images._command(*self.args), b'ok')
+        before.assert_not_called()
+        original.assert_called_once_with(*self.args)
+
+    def test_install_close_preserves_slot_ownership_and_disables_stale_collectors(self):
+        command, detach = Mock(return_value=b'command'), Mock(return_value='detached')
+        images = SimpleNamespace(_command=command, detach=detach)
+        first = diagnostics.install(images, self.base / 'first')
+        stale_command, stale_detach = images._command, images.detach
+        second = diagnostics.install(images, self.base / 'second')
+        self.assertFalse(first.closed)
+        self.assertIsNot(images._command, stale_command)
+        with patch.object(first, 'before') as before, patch.object(first, 'report') as report, \
+                patch.object(second, 'before') as active_before, \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+            self.assertEqual(stale_detach(self.image, self.point), 'detached')
+            self.assertEqual(stale_command(*self.args), b'command')
+            self.assertFalse(diagnostics._detach_observation.get()['started'])
+            self.assertEqual(images.detach(self.image, self.point), 'detached')
+            self.assertEqual(images._command(*self.args), b'command')
+        before.assert_not_called(); report.assert_not_called()
+        active_before.assert_called_once()
+        second.close(); second.close()
+        self.assertIs(images._command, stale_command)
+        self.assertIs(images.detach, stale_detach)
+        with patch.object(first, 'before') as resumed, \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+            self.assertEqual(images.detach(self.image, self.point), 'detached')
+        resumed.assert_called_once()
+        first.close()
+        with patch.object(first, 'before') as before, patch.object(first, 'report') as report, \
+                diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
+            self.assertEqual(stale_detach(self.image, self.point), 'detached')
+            self.assertEqual(stale_command(*self.args), b'command')
+        before.assert_not_called(); report.assert_not_called()
+        first.close()
+        self.assertIs(images._command, command)
+        self.assertIs(images.detach, detach)
+        outer = diagnostics.install(images, self.base / 'outer')
+        outer_slots = images._command, images.detach
+        middle = diagnostics.install(images, self.base / 'middle')
+        inner = diagnostics.install(images, self.base / 'inner')
+        middle.close()
+        inner.close()
+        self.assertEqual((images._command, images.detach), outer_slots)
+        outer.close()
+        self.assertIs(images._command, command)
+        self.assertIs(images.detach, detach)
+        third = diagnostics.install(images, self.base / 'third')
+        foreign_command, foreign_detach = Mock(), Mock()
+        images._command, images.detach = foreign_command, foreign_detach
+        third.close()
+        self.assertIs(images._command, foreign_command)
+        self.assertIs(images.detach, foreign_detach)
+        images._command, images.detach = command, detach
+        fourth = diagnostics.install(images, self.base / 'fourth')
+        with patch.object(images, 'detach', foreign_detach):
+            fourth.close()
+        with patch.object(fourth, 'before') as before, diagnostics.observe_detach():
+            self.assertEqual(images.detach(self.image, self.point), 'detached')
+        before.assert_not_called()
+
+    def test_unavailable_or_mismatched_owned_scope_skips_observation_and_keeps_original(self):
+        for invalid in ('missing', 'nonprivate', 'image', 'mountpoint', 'no_scope'):
+            with self.subTest(invalid=invalid):
+                original = Mock(return_value='original result')
+                images = SimpleNamespace(_command=Mock(), detach=original)
+                collector = diagnostics.install(images, self.base / 'unused')
+                image = self.base / 'missing' if invalid == 'missing' else self.image
+                scope_image = self.base / 'other' if invalid == 'image' else image
+                scope_point = self.base / 'other' if invalid == 'mountpoint' else self.point
+                if invalid == 'nonprivate':
+                    self.image.chmod(0o644)
+                scope = (nullcontext() if invalid == 'no_scope' else
+                         diagnostics.failure_scope(self.base, scope_image, mountpoint=scope_point))
+                with scope, diagnostics.observe_detach(), patch.object(collector, 'before') as before:
+                    self.assertEqual(images.detach(image, self.point), 'original result')
+                before.assert_not_called()
+                original.assert_called_once_with(image, self.point)
+                collector.close()
+                self.image.chmod(0o600)
+
+    def test_workflow_selects_each_installed_observation_row(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        worker = workflow.split('  test-execution:\n', 1)[1].split('\n  test:\n', 1)[0]
+        step = worker.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
+        self.assertIn("        if: matrix.phase == 'installed'\n", step)
+        expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
+        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: installed\}$", worker, re.MULTILINE)
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(worker.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
+        choices = ['restored-cleanup' if (runner, python) == ('macos-26', '3.11') else
+                   'enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
+                   'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount'
+                   for runner, python, images in rows]
+        self.assertEqual(choices.count('enospc-initial-detach'), 1)
+        self.assertEqual(choices.count('closed-snapshot'), 1)
+        self.assertEqual(choices.count('restored-cleanup'), 1)
+        self.assertEqual(choices.count('initial-unmount'), 3)
+
+    def test_snapshot_observation_selector_validates_once_before_fixture_work(self):
+        key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
+        valid = (None, 'initial-unmount', 'closed-snapshot', 'enospc-initial-detach',
+                 'enospc-sibling-detach', 'restored-cleanup')
+        values = (*valid, '', 'unknown', 'INITIAL-UNMOUNT', 'Closed-snapshot',
+                  ' initial-unmount', 'closed-snapshot ', 'initial-unmount\n')
+        sentinel = OSError('stop before fixture allocation')
+        for value in values:
+            with self.subTest(value=value), patch.dict(os.environ):
+                os.environ.pop(key, None)
+                if value is not None:
+                    os.environ[key] = value
+                with patch.object(os.environ, 'get', wraps=os.environ.get) as read, \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', side_effect=sentinel) as allocate, \
+                        patch.object(lifecycle, 'Store') as store, patch.object(lifecycle, 'git') as git, \
+                        patch.object(lifecycle, 'image_fixture') as fixture, \
+                        self.assertRaises(OSError if value in valid else ValueError) as caught:
+                    lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                self.assertEqual([entry for entry in read.call_args_list if entry.args[0] == key],
+                                 [call(key, 'initial-unmount')])
+                self.assertEqual(allocate.call_count, int(value in valid))
+                if value in valid:
+                    self.assertIs(caught.exception, sentinel)
+                store.assert_not_called(); git.assert_not_called(); fixture.assert_not_called()
+
+    def test_snapshot_observation_selects_one_operation_and_preserves_selected_or_earlier_failure(self):
+        cases = ((None, None), ('initial-unmount', None), ('closed-snapshot', None),
+                 ('initial-unmount', 'initial-unmount'), ('closed-snapshot', 'closed-snapshot'),
+                 ('closed-snapshot', 'initial-unmount'), ('enospc-initial-detach', None),
+                 ('enospc-initial-detach', 'initial-unmount'))
+        for selection, failure in cases:
+            with self.subTest(selection=selection, failure=failure), \
+                    tempfile.TemporaryDirectory(dir=self.base) as temporary, patch.dict(os.environ):
+                key = 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION'
+                os.environ.pop(key, None)
+                if selection is not None:
+                    os.environ[key] = selection
+                selected = selection or 'initial-unmount'
+                base = Path(temporary)
+                identifier = 'b' * 32
+                root = base / 'store'
+                point = root / 'workspaces' / identifier / 'volume'
+                repo = point / 'repo'
+                repo.mkdir(parents=True, mode=0o700)
+                point.parent.chmod(0o700)
+                image = point.parent / 'workspace.sparseimage'
+                image.write_bytes(b'owned retained backing'); image.chmod(0o600)
+                identity = (image.stat().st_dev, image.stat().st_ino)
+                workspace = dict(id=identifier, backend='image', path=str(repo))
+                store = Mock(root=root)
+                store.prepare.return_value = dict(id='seed')
+                store.create.return_value = workspace
+                store.list.return_value = [workspace]
+                store.cleanup.return_value = dict(retired=[identifier])
+                store.gc.return_value = []
+                store.close.return_value = dict(closed_at=100000)
+                primary = space.images._error('original selected or earlier eject failure'); primary.returncode = 64
+                state = dict(operation='initial-unmount', attached=True, mounted=True)
+                commands, before_operations, log_windows = [], [], []
+                saved = base / 'saved-repo'
+                snapshot_calls = []
+
+                def mounted(actual):
+                    self.assertEqual(actual, image)
+                    return (dict(image=str(image), device='/dev/disk999',
+                                 mountpoint=str(point) if state['mounted'] else None,
+                                 volume_device='/dev/disk999s1' if state['mounted'] else None)
+                            if state['attached'] else None)
+
+                def command(*args):
+                    commands.append((state['operation'], args, diagnostics._detach_observation.get() is not None))
+                    state['mounted'] = False
+                    if state['operation'] == failure:
+                        raise primary
+                    state['attached'] = False
+                    # Selection was read once before any fixture work.
+                    os.environ[key] = 'invalid-after-initial-unmount'
+                    return b''
+
+                def snapshot(*args):
+                    snapshot_calls.append(args)
+                    if len(snapshot_calls) == 1:
+                        raise lifecycle.StallionError('external worktree')
+                    if len(snapshot_calls) == 2:
+                        state.update(operation='closed-snapshot', attached=True, mounted=True)
+                        space.images.detach(image, point)
+                        repo.rename(saved)
+                    return dict(id='snapshot')
+
+                def rollback(*args):
+                    (repo / 'file').write_text('snapshot state\n')
+                    recovery = root / 'recovery' / 'saved'
+                    recovery.mkdir(parents=True)
+                    (recovery / 'workspace.sparseimage').write_bytes(b'recovery')
+                    return dict(recovery='saved')
+
+                def restore(*args, **kwargs):
+                    store.list.return_value = []
+                    return workspace
+
+                store.unmount.side_effect = lambda *args: space.images.detach(image, point)
+                store.snapshot.side_effect = snapshot
+                store.mount.side_effect = lambda *args: saved.rename(repo)
+                store.rollback.side_effect = rollback
+                store.move.side_effect = restore
+                with patch.object(space.images, 'mounted', side_effect=mounted), \
+                        patch.object(space.images.os.path, 'ismount', return_value=False), \
+                        patch.object(space.images, '_command', side_effect=command), \
+                        patch.object(lifecycle, 'Store', return_value=store), \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(base)), \
+                        patch.object(lifecycle, 'git'), patch.object(lifecycle, 'read_json', return_value=dict(status='open')), \
+                        patch('stallionfs.lifecycle.replace_json'), patch.object(lifecycle, 'remove_tree') as remove:
+                    collector = diagnostics.install(space.images, base / 'diagnostics')
+                    self.addCleanup(collector.close)
+
+                    def mapping(args, scope, deadline):
+                        if collector.phase == 'before':
+                            before_operations.append(state['operation'])
+                        return (str(image), ['/dev/disk999', '/dev/disk999s1'],
+                                str(point) if state['mounted'] else None,
+                                '/dev/disk999s1' if state['mounted'] else None, identity)
+
+                    def capture(argv, deadline):
+                        if argv[0] == '/usr/bin/log':
+                            observed = diagnostics._detach_observation.get() or diagnostics._detach_call.get()
+                            log_windows.append((observed['start_ns'], observed['end_ns']))
+                        return captured(b'', status=0 if argv[0] == '/usr/bin/log' else 1)
+
+                    with patch.object(collector, '_mapping', side_effect=mapping), \
+                            patch.object(collector, '_capture', side_effect=capture):
+                        if failure is None:
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                        else:
+                            with self.assertRaises(type(primary)) as caught:
+                                lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            self.assertIs(caught.exception, primary)
+                            self.assertEqual(caught.exception.returncode, 64)
+                    store.unmount.assert_called_once_with(identifier)
+                    expected_operations = ['initial-unmount'] if failure == 'initial-unmount' else ['initial-unmount', 'closed-snapshot']
+                    self.assertEqual([item[0] for item in commands], expected_operations)
+                    self.assertEqual([item[1] for item in commands], [self.args] * len(commands))
+                    self.assertEqual([item[2] for item in commands], [item == selected for item in expected_operations])
+                    observed = selected in expected_operations
+                    self.assertEqual(before_operations, [selected] if observed else [])
+                    self.assertEqual(collector.before_attempts, int(observed))
+                    self.assertEqual(collector.attempts, int(failure is not None))
+                    report = collector.directory / diagnostics.REPORT
+                    events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
+                    if failure is not None:
+                        remove.assert_not_called()
+                        for later in (store.mount, store.rollback, store.enroll, store.close, store.cleanup_config,
+                                      store.cleanup, store.gc, store.move):
+                            later.assert_not_called()
+                        self.assertEqual(len(snapshot_calls), 1 if failure == 'initial-unmount' else 2)
+                        failed = next(event for event in events if event['kind'] == 'failure')
+                        self.assertEqual((failed['pre_observation'], failed['failed_device'], failed['workspace']),
+                                         ('attempted' if observed else 'not-selected', '/dev/disk999', identifier))
+                        mappings = [event for event in events if event['kind'] == 'mapping']
+                        self.assertEqual([event['phase'] for event in mappings], ['before', 'after'] if observed else ['after'])
+                        self.assertEqual({event['operation_id'] for event in mappings}, {failed['operation_id']})
+                        logs = [event for event in events if event['kind'] == 'eject_log']
+                        self.assertEqual(len(logs), 1)
+                        self.assertEqual((logs[0]['operation_id'], logs[0]['target']), (failed['operation_id'], '/dev/disk999'))
+                        self.assertEqual((logs[0]['window_start_ns'], logs[0]['window_end_ns']), log_windows[0])
+                        self.assertEqual(logs[0]['query_status'], 'empty')
+                    else:
+                        self.assertEqual(len(snapshot_calls), 3)
+                        remove.assert_called_once_with(base)
+                    self.assertEqual(image.read_bytes(), b'owned retained backing')
+                    self.assertLessEqual(collector.events, diagnostics.EVENTS)
+                    self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+                    self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
+                    self.assertEqual(diagnostics.artifact_available(collector.directory), bool(observed or failure))
+                    collector.close()
+                self.assertIsNone(diagnostics._scope.get())
+                self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_actual_lifecycle_selects_final_replacement_only(self):
+        for case in ('success', 'final-failure', 'final-interrupt', 'earlier-failure', 'assertion', 'bad-owner', 'unknown'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=self.base) as temporary, patch.dict(os.environ):
+                os.environ['STALLIONFS_TEST_SNAPSHOT_OBSERVATION'] = 'restored-cleanup'
+                base = Path(temporary)
+                identifier = 'b' * 32
+                root = base / 'store'
+                point = root / 'workspaces' / identifier / 'volume'
+                repo = point / 'repo'
+                repo.mkdir(parents=True, mode=0o700); point.parent.chmod(0o700)
+                image = point.parent / 'workspace.sparseimage'
+                image.write_bytes(b'original'); image.chmod(0o600)
+                original_identity = (image.stat().st_dev, image.stat().st_ino)
+                workspace = dict(id=identifier, backend='image', path=str(repo))
+                store = Mock(root=root)
+                store.prepare.return_value = dict(id='seed')
+                store.create.return_value = workspace
+                store.list.return_value = [workspace]
+                store.gc.return_value = []
+                store.close.return_value = dict(closed_at=100000)
+                primary = space.images._error('preserved original eject failure'); primary.returncode = 64
+                interruption = KeyboardInterrupt('preserved cleanup interrupt')
+                state = dict(operation='initial-unmount', attached=True, mounted=True)
+                commands, before_operations, validations, fixtures = [], [], [], []
+                saved = base / 'saved-repo'
+                snapshots = []
+                real_fixture = lifecycle.image_fixture
+
+                @contextmanager
+                def tracked_fixture(*args):
+                    with real_fixture(*args) as fixture:
+                        fixtures.append(fixture)
+                        yield fixture
+
+                def mounted(actual):
+                    self.assertEqual(actual, image)
+                    space.images._attachments(image)
+                    invocation = diagnostics._detach_call.get()
+                    if invocation is not None:
+                        validations.append((state['operation'], image.stat().st_ino, invocation.get('reads')))
+                    return (dict(image=str(image), device='/dev/disk999',
+                                 mountpoint=str(point) if state['mounted'] else None,
+                                 volume_device='/dev/disk999s1' if state['mounted'] else None)
+                            if state['attached'] else None)
+
+                def command(*args):
+                    self.assertEqual(args, ('/usr/sbin/diskutil', 'eject', '/dev/disk999'))
+                    commands.append((state['operation'], diagnostics._detach_observation.get() is not None))
+                    state['mounted'] = False
+                    if case == 'earlier-failure' and state['operation'] == 'initial-unmount':
+                        raise primary
+                    if state['operation'] == 'cleanup':
+                        self.assertEqual(diagnostics._scope.get()['stage'], 'cleanup')
+                        if case == 'final-failure': raise primary
+                        if case == 'final-interrupt': raise interruption
+                    state['attached'] = False
+                    return b''
+
+                def unmount(*args):
+                    if diagnostics._scope.get()['stage'] == 'cleanup': state['operation'] = 'cleanup'
+                    return space.images.detach(image, point)
+
+                def snapshot(*args):
+                    snapshots.append(args)
+                    if len(snapshots) == 1: raise lifecycle.StallionError('external worktree')
+                    if len(snapshots) == 2:
+                        state.update(operation='closed-snapshot', attached=True, mounted=True)
+                        space.images.detach(image, point); repo.rename(saved)
+                    return dict(id='snapshot')
+
+                def mount(*args):
+                    state.update(attached=True, mounted=True)
+                    saved.rename(repo)
+
+                def rollback(*args):
+                    state.update(operation='rollback', attached=True, mounted=True)
+                    space.images.detach(image, point)
+                    recovery = root / 'recovery' / 'saved'; recovery.mkdir(parents=True)
+                    image.rename(recovery / 'workspace.sparseimage')
+                    image.write_bytes(b'replacement'); image.chmod(0o600)
+                    (repo / 'file').write_text('snapshot state\n')
+                    state.update(attached=True, mounted=True)
+                    return dict(recovery='saved')
+
+                def retire(*args, **kwargs):
+                    state['operation'] = 'retirement'
+                    space.images.detach(image, point)
+                    return dict(retired=[identifier])
+
+                def restore(*args, **kwargs):
+                    state.update(operation='restored', attached=True, mounted=True)
+                    if case == 'assertion': (repo / 'file').write_text('wrong restored content')
+                    if case == 'bad-owner': store.list.return_value = [dict(workspace, path='/foreign')]
+                    if case == 'unknown': fixtures[0].unknown = True
+                    return workspace
+
+                store.unmount.side_effect = unmount
+                store.snapshot.side_effect = snapshot
+                store.mount.side_effect = mount
+                store.rollback.side_effect = rollback
+                store.cleanup.side_effect = retire
+                store.move.side_effect = restore
+                def attachments(actual):
+                    entities = [{'dev-entry':'/dev/disk999'}, {'dev-entry':'/dev/disk999s1'}]
+                    if state['mounted']: entities[1]['mount-point'] = str(point)
+                    return [dict(**{'owner-uid':os.getuid(), 'image-path':str(image), 'system-entities':entities})] if state['attached'] else []
+                with patch.object(space.images, '_attachments', side_effect=attachments), \
+                        patch.object(space.images, 'mounted', side_effect=mounted), \
+                        patch.object(space.images.os.path, 'ismount', return_value=False), \
+                        patch.object(space.images, '_command', side_effect=command), \
+                        patch.object(lifecycle, 'Store', return_value=store), \
+                        patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(base)), \
+                        patch.object(lifecycle, 'image_fixture', side_effect=tracked_fixture), \
+                        patch.object(lifecycle, 'git'), patch.object(lifecycle, 'read_json', return_value=dict(status='open')), \
+                        patch('stallionfs.lifecycle.replace_json'), patch.object(lifecycle, 'remove_tree') as remove:
+                    collector = diagnostics.install(space.images, base / 'diagnostics')
+                    self.addCleanup(collector.close)
+                    def mapping(args, scope, deadline):
+                        self.assertEqual(scope['image'], image)
+                        if collector.phase == 'before': before_operations.append(state['operation'])
+                        return (str(image), ['/dev/disk999', '/dev/disk999s1'],
+                                str(point) if state['mounted'] else None,
+                                '/dev/disk999s1' if state['mounted'] else None,
+                                (image.stat().st_dev, image.stat().st_ino))
+                    with patch.object(collector, '_mapping', side_effect=mapping), \
+                            patch.object(collector, '_capture', side_effect=lambda *a: captured(b'', status=1)):
+                        error_type = {'final-failure': lifecycle.StallionError, 'earlier-failure': lifecycle.StallionError,
+                                      'final-interrupt': KeyboardInterrupt, 'assertion': AssertionError,
+                                      'bad-owner': lifecycle.StallionError, 'unknown': lifecycle.StallionError}.get(case)
+                        if error_type:
+                            with self.assertRaises(error_type) as caught:
+                                lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            if case in ('final-failure', 'earlier-failure'): self.assertIs(caught.exception, primary)
+                            if case == 'final-interrupt': self.assertIs(caught.exception, interruption)
+                            remove.assert_not_called()
+                        else:
+                            lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+                            remove.assert_called_once_with(base)
+                        before_repeat = list(commands)
+                        if case in ('success', 'final-failure', 'earlier-failure', 'bad-owner', 'unknown'):
+                            fixtures[0].cleanup(observe=True)
+                            self.assertEqual(commands, before_repeat)
+                    selected = case in ('success', 'final-failure', 'final-interrupt')
+                    self.assertEqual(before_operations, ['cleanup'] if selected else [])
+                    self.assertEqual([op for op, observed in commands if observed], ['cleanup'] if selected else [])
+                    expected = ['initial-unmount'] if case == 'earlier-failure' else ['initial-unmount', 'closed-snapshot', 'rollback', 'retirement']
+                    if case not in ('earlier-failure', 'bad-owner', 'unknown'): expected += ['cleanup']
+                    self.assertEqual([op for op, observed in commands], expected)
+                    self.assertEqual(collector.before_attempts, int(selected))
+                    report = collector.directory / diagnostics.REPORT
+                    events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
+                    if case == 'final-failure':
+                        failure = next(e for e in events if e['kind'] == 'failure')
+                        self.assertEqual((failure['stage'], failure['workspace'], failure['pre_observation']),
+                                         ('cleanup', identifier, 'attempted'))
+                        mappings = [e for e in events if e['kind'] == 'mapping']
+                        identity = (image.stat().st_dev, image.stat().st_ino)
+                        self.assertNotEqual(identity, original_identity)
+                        self.assertEqual([(e['backing_device'], e['backing_inode']) for e in mappings], [identity, identity])
+                        self.assertEqual({e['operation_id'] for e in mappings}, {failure['operation_id']})
+                        samples = [e for e in events if e['kind'] == 'validation']
+                        self.assertEqual(len(samples), 2)
+                        self.assertEqual({e['operation_id'] for e in samples}, {failure['operation_id']})
+                        self.assertEqual([e['sample_status'] for e in samples], ['validated', 'validated'])
+                        self.assertEqual([e['selected_device'] for e in samples], ['/dev/disk999', '/dev/disk999'])
+                        eject = next(e for e in events if e['kind'] == 'eject_log')
+                        self.assertEqual(eject['operation_id'], failure['operation_id'])
+                        self.assertEqual(eject['target'], '/dev/disk999')
+                        self.assertLessEqual(eject['window_start_ns'], eject['window_end_ns'])
+                    self.assertEqual(image.read_bytes(), b'original' if case == 'earlier-failure' else b'replacement')
+                    self.assertTrue(base.exists())
+                    self.assertLessEqual(collector.events, diagnostics.EVENTS)
+                    self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+                    self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
+                    collector.close()
+                self.assertIsNone(diagnostics._scope.get()); self.assertIsNone(diagnostics._detach_observation.get())
+
+    def test_exact_owned_workspace_and_exceptional_arming(self):
+        a, b = 'a' * 32, 'b' * 32
+        for case in ('normal', 'exception', 'interrupt', 'ownership', 'failed-workspace'):
+            with self.subTest(case=case):
+                base = self.base
+                store = Mock(root=base / 'store')
+                store.list.return_value = [dict(id=i, backend='image', path=str(store.root/'workspaces'/i/'volume/repo')) for i in (a,b)]
+                observed = []
+                store.unmount.side_effect = lambda i: observed.append((i, diagnostics._detach_observation.get() is not None))
+                primary = KeyboardInterrupt() if case=='interrupt' else AssertionError('primary')
+                with patch.object(lifecycle, 'remove_tree') as remove:
+                    if case in ('exception','interrupt'):
+                        with self.assertRaises(type(primary)) as caught:
+                            with lifecycle.image_fixture(store, base) as fixture:
+                                fixture.cleanup_observation = b
+                                raise primary
+                        self.assertIs(caught.exception, primary); remove.assert_not_called()
+                        self.assertFalse(any(selected for i,selected in observed))
+                        if case=='interrupt': store.list.assert_not_called(); store.unmount.assert_not_called()
+                    else:
+                        fixture=lifecycle.ImageFixture(store,base); fixture.cleanup_observation=b
+                        if case=='ownership': store.list.return_value[1]['path']='/foreign'
+                        if case=='failed-workspace': fixture.failed.add(b)
+                        fixture.cleanup(observe=True)
+                        self.assertEqual(observed, [] if case=='ownership' else [(a,False)] if case=='failed-workspace' else [(a,False),(b,True)])
+                        fixture.cleanup(observe=True)
+                        self.assertFalse(any(selected for i,selected in observed[len(observed)//2:]))
+
+    def test_snapshot_fixture_observes_first_unmount_failure_without_retry(self):
+        base = self.base / 'unmount-fixture'
+        base.mkdir(mode=0o700)
+        identifier = 'a' * 32
+        root = base / 'store'
+        point = root / 'workspaces' / identifier / 'volume'
+        repo = point / 'repo'
+        repo.mkdir(parents=True, mode=0o700)
+        point.parent.chmod(0o700)
+        image = point.parent / 'workspace.sparseimage'
+        image.write_bytes(b'retained backing'); image.chmod(0o600)
+        identity = (image.stat().st_dev, image.stat().st_ino)
+        workspace = dict(id=identifier, path=str(repo), backend='image')
+        store = Mock(root=root)
+        store.prepare.return_value = dict(id='seed')
+        store.create.return_value = workspace
+        store.list.return_value = [workspace]
+        store.snapshot.side_effect = lifecycle.StallionError('external worktree')
+        store.unmount.side_effect = lambda *args: space.images.detach(image, point)
+        primary = space.images._error('unmount primary busy'); primary.returncode = 1
+        state = dict(mounted=True)
+        commands, log_windows = [], []
+        current = dict(image=str(image), device='/dev/disk999', mountpoint=str(point),
+                       volume_device='/dev/disk999s1')
+
+        def command(*args):
+            commands.append(args)
+            state['mounted'] = False
+            raise primary
+
+        def mapping(args, scope, deadline):
+            actual = scope['image']
+            info = actual.stat()
+            return (str(actual), ['/dev/disk999', '/dev/disk999s1'],
+                    str(point) if actual == image and state['mounted'] else None,
+                    '/dev/disk999s1' if actual == image and state['mounted'] else None,
+                    (info.st_dev, info.st_ino))
+
+        def capture(argv, deadline):
+            if argv[0] == '/usr/bin/log':
+                observation = diagnostics._detach_observation.get()
+                log_windows.append((observation['start_ns'], observation['end_ns']))
+            return captured(b'', status=0 if argv[0] == '/usr/bin/log' else 1)
+
+        real_stat = os.stat
+        def device_stat(path, *args, **kwargs):
+            if kwargs.get('follow_symlinks') is not False:
+                if str(path) == '/dev/disk999s1':
+                    return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=42)
+                if str(path) == str(point):
+                    return SimpleNamespace(st_dev=42)
+            return real_stat(path, *args, **kwargs)
+
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='initial-unmount'), \
+                patch.object(space.images, '_command', side_effect=command), \
+                patch.object(space.images, 'mounted', return_value=current), \
+                patch.object(space.images.os.path, 'ismount', side_effect=lambda path: state['mounted']), \
+                patch.object(diagnostics.os, 'stat', side_effect=device_stat), \
+                patch.object(lifecycle, 'Store', return_value=store), \
+                patch.object(lifecycle.tempfile, 'mkdtemp', return_value=str(base)), \
+                patch.object(lifecycle, 'git'), patch.object(lifecycle, 'remove_tree') as remove:
+            collector = diagnostics.install(space.images, self.reporter.directory)
+            self.addCleanup(collector.close)
+            self.reporter = collector
+            with patch.object(collector, '_mapping', side_effect=mapping), \
+                    patch.object(collector, '_capture', side_effect=capture), \
+                    self.assertRaises(type(primary)) as caught:
+                lifecycle.ImageStoreTests.test_snapshot_rollback_and_protected_retirement(self)
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(caught.exception.returncode, 1)
+            store.unmount.assert_called_once_with(identifier)
+            store.snapshot.assert_called_once_with(identifier)
+            for operation in (store.mount, store.rollback, store.enroll, store.close,
+                              store.cleanup_config, store.cleanup, store.gc, store.move, remove):
+                operation.assert_not_called()
+
+            # A later selection cannot borrow this operation's prestate or budget.
+            later_error = space.images._error('later failure'); later_error.returncode = 1
+            later_command = Mock(side_effect=later_error)
+            later = SimpleNamespace(_command=later_command)
+            with patch.object(diagnostics, 'Diagnostics', return_value=collector):
+                diagnostics.install(later, collector.directory)
+            with patch.object(collector, '_mapping', side_effect=mapping), \
+                    patch.object(collector, '_capture', side_effect=capture), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                    self.assertRaises(type(later_error)) as later_caught:
+                with diagnostics.observe_detach():
+                    later._command(*self.args)
+            self.assertIs(later_caught.exception, later_error)
+            later_command.assert_called_once_with(*self.args)
+
+        self.assertEqual(commands, [self.args])
+        self.assertEqual(collector.before_attempts, 1)
+        self.assertEqual(collector.attempts, 2)
+        self.assertTrue(base.exists() and image.exists())
+        self.assertEqual(image.read_bytes(), b'retained backing')
+        events = self.events()
+        mappings = [event for event in events if event['kind'] == 'mapping']
+        first = mappings[0]['operation_id']
+        paired = [event for event in mappings if event['operation_id'] == first]
+        self.assertEqual([event['phase'] for event in paired], ['before', 'after'])
+        self.assertEqual([event['mountpoint'] for event in paired], [str(point), None])
+        self.assertEqual({(event['backing_device'], event['backing_inode']) for event in paired}, {identity})
+        failures = [event for event in events if event['kind'] == 'failure']
+        self.assertEqual([event['pre_observation'] for event in failures], ['attempted', 'unavailable'])
+        self.assertEqual([event['workspace'] for event in failures], [identifier, None])
+        later_id = failures[1]['operation_id']
+        self.assertNotEqual(first, later_id)
+        later_mappings = [event for event in mappings if event['operation_id'] == later_id]
+        later_identity = (self.image.stat().st_dev, self.image.stat().st_ino)
+        self.assertNotEqual(identity, later_identity)
+        self.assertEqual([event['phase'] for event in later_mappings], ['after'])
+        self.assertEqual({(event['backing_device'], event['backing_inode']) for event in later_mappings}, {later_identity})
+        eject = [event for event in events if event['kind'] == 'eject_log']
+        self.assertEqual(len(eject), 1)
+        self.assertEqual(len(log_windows), 1)
+        self.assertEqual((eject[0]['operation_id'], eject[0]['target']), (first, '/dev/disk999'))
+        self.assertEqual((eject[0]['window_start_ns'], eject[0]['window_end_ns']), log_windows[0])
+        self.assertLessEqual(collector.events, diagnostics.EVENTS)
+        self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
+        self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
+        self.assertTrue(diagnostics.artifact_available(collector.directory))
+        self.assertIsNone(diagnostics._scope.get())
         self.assertIsNone(diagnostics._detach_observation.get())
 
     def test_snapshot_fixture_preserves_preallowance_and_retains_original_failure(self):
@@ -1410,7 +2977,8 @@ class DiagnosticTests(unittest.TestCase):
         store._state.return_value = state_file
         store._closed_payload.side_effect = lambda *args, **kwargs: store_lifecycle.Lifecycle._closed_payload(store, *args, **kwargs)
         store.close.side_effect = lambda *args, **kwargs: store_lifecycle.Lifecycle.close(store, *args, **kwargs)
-        with patch.object(space.images, '_command', side_effect=original), \
+        with patch.dict(os.environ, STALLIONFS_TEST_SNAPSHOT_OBSERVATION='initial-unmount'), \
+                patch.object(space.images, '_command', side_effect=original), \
                 patch.object(space.images, 'mounted', side_effect=mounted), \
                 patch.object(space.images.os.path, 'ismount', return_value=False), \
                 patch('stallionfs._scan.mounts', return_value=[]), \
@@ -1457,7 +3025,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(open_state, dict(status='open', generation='unchanged'))
         self.assertEqual(state_file.read_bytes(), original_state)
         self.assertTrue(base.exists() and image.exists())
-        self.assertEqual(log_windows, [])
+        self.assertEqual(len(log_windows), 1)
         events = self.events()
         mappings = [event for event in events if event['kind'] == 'mapping']
         self.assertEqual([event['mountpoint'] for event in mappings], [None])
@@ -1466,7 +3034,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual([event['message'] for event in failures], ['close primary busy'])
         self.assertEqual({event['pre_observation'] for event in failures}, {'not-selected'})
         self.assertEqual(len({event['operation_id'] for event in events}), 1)
-        self.assertFalse(any(event['kind'] == 'eject_log' for event in events))
+        self.assertEqual(sum(event['kind'] == 'eject_log' for event in events), 1)
         self.assertLessEqual(collector.events, diagnostics.EVENTS)
         self.assertLessEqual(collector.written, diagnostics.FILE_BYTES)
         self.assertLessEqual(collector.remaining, diagnostics.CAPTURE_BYTES)
@@ -1476,6 +3044,7 @@ class DiagnosticTests(unittest.TestCase):
 
         # The same suite-wide collector still admits the later selected lifetime.
         later = SimpleNamespace(_command=Mock(side_effect=first))
+        later.detach = lambda image, point: later._command(*self.args)
         with patch.object(diagnostics, 'Diagnostics', return_value=collector):
             diagnostics.install(later, collector.directory)
         info = self.image.stat()
@@ -1485,7 +3054,7 @@ class DiagnosticTests(unittest.TestCase):
                 diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
                 self.assertRaises(type(first)) as caught:
             with diagnostics.observe_detach():
-                later._command(*self.args)
+                later.detach(self.image, self.point)
         self.assertIs(caught.exception, first)
         self.assertEqual(collector.before_attempts, 1)
         before = [event for event in self.events() if event['kind'] == 'mapping' and event['phase'] == 'before']
@@ -1529,7 +3098,7 @@ class DiagnosticTests(unittest.TestCase):
             self.addCleanup(collector.close)
             self.reporter = collector
             def mapping(args, scope, deadline):
-                self.assertEqual((args[2], scope['image']), ('/dev/disk999', self.image))
+                self.assertEqual((args[2], scope['image']), (None if collector.phase == 'before' else '/dev/disk999', self.image))
                 return (str(self.image), ['/dev/disk999', '/dev/disk999s1'],
                         str(self.point) if state['mounted'] else None,
                         '/dev/disk999s1' if state['mounted'] else None, identity)
@@ -1593,6 +3162,7 @@ class DiagnosticTests(unittest.TestCase):
         busy = space.images._error('selected eject busy')
         busy.returncode = errno.EBUSY
         images = SimpleNamespace(_command=Mock(side_effect=busy))
+        images.detach = lambda image, point: images._command(*self.args)
         collector = diagnostics.install(images, self.reporter.directory)
         self.addCleanup(collector.close)
         self.reporter = collector
@@ -1608,17 +3178,17 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertRaises(type(busy)) as caught:
                 with diagnostics.observe_detach():
                     try:
-                        images._command(*self.args)
+                        images.detach(self.image, self.point)
                     except type(busy):
-                        images._command(*self.args)
+                        images.detach(self.image, self.point)
         self.assertIs(caught.exception, busy)
         events = self.events()
         failures = [event for event in events if event['kind'] == 'failure']
         self.assertEqual(len(failures), 2)
         selected_ids = {event['operation_id'] for event in failures}
-        self.assertEqual(len(selected_ids), 1)
+        self.assertEqual(len(selected_ids), 2)
         self.assertNotIn(earlier_operation, selected_ids)
-        self.assertEqual({event['pre_observation'] for event in failures}, {'unavailable'})
+        self.assertEqual([event['pre_observation'] for event in failures], ['unavailable', 'not-selected'])
         selected_mappings = [event for event in events if event['kind'] == 'mapping' and event['operation_id'] in selected_ids]
         self.assertEqual({event['phase'] for event in selected_mappings}, {'after'})
         self.assertEqual({(event['backing_device'], event['backing_inode']) for event in selected_mappings}, {current_identity})
@@ -1946,13 +3516,14 @@ class DiagnosticTests(unittest.TestCase):
         self.assertFalse(self.events()[0]['expected_busy'])
         self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
 
-    def test_pre_detach_and_failure_records_share_operation_and_timestamps(self):
+    def test_pre_detach_pairs_first_call_and_later_call_has_fresh_identity(self):
         error = OSError('actual detach failure')
         order = []
         def original(*args):
             order.append('detach')
             raise error
         images = SimpleNamespace(_command=original)
+        images.detach = lambda image, point: images._command(*self.args)
         collector = diagnostics.install(images, self.reporter.directory)
         self.addCleanup(collector.close)
         self.reporter = collector
@@ -1967,13 +3538,15 @@ class DiagnosticTests(unittest.TestCase):
                 diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
             for _ in range(2):
                 with self.assertRaises(OSError) as caught:
-                    images._command(*self.args)
+                    images.detach(self.image, self.point)
                 self.assertIs(caught.exception, error)
         events = self.events()
         self.assertEqual(order[:4], ['observe', 'observe', 'observe', 'detach'])
         self.assertEqual(collector.before_attempts, 1)
         self.assertEqual(collector.attempts, 2)
-        self.assertEqual(len({e['operation_id'] for e in events}), 1)
+        failures = [event for event in events if event['kind'] == 'failure']
+        self.assertEqual(failures[0]['operation_id'], events[0]['operation_id'])
+        self.assertNotEqual(failures[1]['operation_id'], failures[0]['operation_id'])
         self.assertEqual([e['phase'] for e in events[:4]], ['before'] * 4)
         self.assertTrue(all(e['phase'] == 'after' for e in events[4:]))
         self.assertEqual([e['timestamp_ns'] for e in events], sorted(e['timestamp_ns'] for e in events))
@@ -2068,6 +3641,7 @@ class DiagnosticTests(unittest.TestCase):
     def test_partial_before_event_and_actual_failure_keep_operation_association(self):
         primary = OSError('actual detach failure')
         images = SimpleNamespace(_command=Mock(side_effect=primary))
+        images.detach = lambda image, point: images._command(*self.args)
         collector = diagnostics.install(images, self.reporter.directory)
         self.addCleanup(collector.close)
         self.reporter = collector
@@ -2081,7 +3655,7 @@ class DiagnosticTests(unittest.TestCase):
                 patch.object(collector, '_capture', side_effect=captures), \
                 diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
             with self.assertRaises(OSError) as caught:
-                images._command(*self.args)
+                images.detach(self.image, self.point)
         self.assertIs(caught.exception, primary)
         events = self.events()
         self.assertEqual(events[0]['kind'], 'observation')
@@ -2145,15 +3719,17 @@ class DiagnosticTests(unittest.TestCase):
         for error in (None, OSError('actual detach failure')):
             with self.subTest(error=error):
                 images = SimpleNamespace(_command=Mock(return_value=b'ok', side_effect=error))
+                images.detach = lambda image, point: images._command(*self.args)
                 collector = diagnostics.install(images, self.base / 'unused')
                 with patch.object(collector, 'before', side_effect=TimeoutError('observation deadline')), \
-                        patch.object(collector, 'report') as report, diagnostics.observe_detach():
+                        patch.object(collector, 'report') as report, \
+                        diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), diagnostics.observe_detach():
                     if error is None:
-                        self.assertEqual(images._command(*self.args), b'ok')
+                        self.assertEqual(images.detach(self.image, self.point), b'ok')
                         report.assert_not_called()
                     else:
                         with self.assertRaises(OSError) as caught:
-                            images._command(*self.args)
+                            images.detach(self.image, self.point)
                         self.assertIs(caught.exception, error)
                         report.assert_called_once()
                 self.assertIsNone(diagnostics._detach_observation.get())

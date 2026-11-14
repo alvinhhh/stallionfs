@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 dist/
 build/
+stallionfs/_git/
+tools/git-inputs/git-2.56.0.tar.xz
+tools/git-inputs/curl-source.tar.gz
 .DS_Store
 .env
 .env.*

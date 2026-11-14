@@ -240,7 +240,7 @@ class FSKitInterfaces(unittest.TestCase):
                     self.assertRegex(lines[4], r'^RENAME requested mask: 0x[0-9a-f]+; replacement and same-inode '
                                                r'branches: actual-result success$')
                     print(lines[4], flush=True)
-                    self.assertRegex(lines[5], r'^METADATA requested mask: 0x[0-9a-f]+; mode and timestamp '
+                    self.assertRegex(lines[5], r'^METADATA requested mask: 0x[0-9a-f]+; mode, flags and timestamp '
                                                r'branches: actual-result success$')
                     print(lines[5], flush=True)
                     self.assertEqual(lines[6], 'XATTR supported kinds: file, root, directory, symlink; '
@@ -366,6 +366,7 @@ class FSKitInterfaces(unittest.TestCase):
             attributes = module_info['EXAppExtensionAttributes']
             self.assertEqual(attributes['EXExtensionPointIdentifier'], 'com.apple.fskit.fsmodule')
             self.assertEqual(attributes['FSShortName'], 'stallionfs')
+            self.assertEqual(attributes['FSActivateOptionSyntax'], {'shortOptions': 'o:'})
             self.assertTrue(attributes['FSSupportsPathURLs'])
             self.assertTrue(attributes['FSRequiresSecurityScopedPathURLResources'])
             self.assertFalse(attributes['FSSupportsBlockResources'])

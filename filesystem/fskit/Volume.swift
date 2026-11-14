@@ -94,11 +94,13 @@ func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSV
     // opts into readable owner execution. Other reads/searches keep their policy.
     if allowFileExecution && m.entry.kind == SFS_FILE && access.contains(.execute) {
         guard m.mode & 0o500 == 0o500, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
-        guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+        guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
         allowed.insert(.execute)
     }
     guard access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
 }
+// SFS_FLAGS_SUPPORTED is a UINT32_C macro that Swift cannot import.
+let supportedBSDFlags = UInt32(UF_NODUMP | UF_HIDDEN)
 struct CallerIdentity {
     let uid: Int, gid: Int
     init(uid: Int, gid: Int) { self.uid = uid; self.gid = gid }
@@ -124,7 +126,7 @@ func checkMetadataOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Cal
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
     guard m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY || m.entry.kind == SFS_SYMLINK,
-          m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+          m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func metadataTime(_ value: timespec) throws -> sfs_timestamp {
@@ -139,7 +141,7 @@ func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Caller
     case SFS_FILE, SFS_DIRECTORY, SFS_SYMLINK: break
     default: throw POSIXError(.ENOTSUP)
     }
-    guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o200 != 0, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func writableXattrName(_ bytes: Data) throws {
@@ -155,7 +157,7 @@ func checkLinkParentPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Caller
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
     guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
     guard m.link_count > 0 else { throw POSIXError(.ENOENT) }
-    guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o300 == 0o300, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func checkLinkCount(_ count: UInt64) throws {
@@ -412,9 +414,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var sequence: UInt64 = 0
     private var overflow = false
     private var emitted = false
-    init(admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
+    private let identity: StallionFileSystemIdentity
+    init(identity: StallionFileSystemIdentity, admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
          itemLimit: Int = ReadOnlyLimits.activeItems) {
         precondition(itemLimit > 0 && itemLimit <= ReadOnlyLimits.activeItems)
+        self.identity = identity
         self.itemLimit = itemLimit
         self.handle = admission.handle; self.resource = resource; self.scope = scope; self.anchor = admission.anchor
         selectedAccess = admission.access
@@ -763,7 +767,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return c
     }
     var volumeStatistics: FSStatFSResult {
-        let s = FSStatFSResult(fileSystemTypeName: "sfsro27"); s.blockSize = 4096; s.ioSize = 4096; return s
+        let s = FSStatFSResult(fileSystemTypeName: identity.rawValue); s.blockSize = 4096; s.ioSize = 4096; return s
     }
 #if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
     func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activate(replyHandler: replyHandler) }
@@ -1680,7 +1684,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         attributes.consumedAttributes = []
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
-            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.mode, .size, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime, .fileID])
+            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.mode, .flags, .size, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime, .fileID])
             setWritableAttributes(attributes, item: item, caller: caller, requirements: requirements,
                 request: { try requirements.request() }, prepare: { a in
                     return try self.handlerResult(FSSetAttributesResult.self) { FSSetAttributesResult(attributes: a, freeSpace: nil) }
@@ -1728,10 +1732,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard kind == 0 || kind == modeKind else { throw POSIXError(.EINVAL) }
             guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
             var used: FSItem.Attribute = [.mode, .uid, .gid]
-            if attributes.isValid(.flags) { guard attributes.flags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
+            if attributes.isValid(.flags) { guard attributes.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
             if attributes.isValid(.size) { guard self.kind != SFS_SYMLINK, attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
             var value = sfs_metadata_initial()
             value.mode = modeKind | (mode & 0o777); value.uid = uid; value.gid = gid
+            if attributes.isValid(.flags) { value.flags = attributes.flags }
             if attributes.isValid(.accessTime) {
                 value.access = try metadataTime(attributes.accessTime)
                 value.restore |= UInt32(SFS_RESTORE_ACCESS.rawValue); used.insert(.accessTime)
@@ -1840,7 +1845,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
                 guard anchorMatches(receipt, self.anchor) else { let e = POSIXError(.ESTALE); self.latch(e); throw e }
-                let requirements = ResultRequirements(resultType), request = try requirements.request()
+                let requirements = ResultRequirements(resultType, explicit: [.flags]), request = try requirements.request()
                 guard self.pendingCreate == nil, self.items.count < self.itemLimit else { throw POSIXError(.ENFILE) }
                 self.pendingCreate = PendingCreate(); ownsPending = true
                 var pin = sfs_pin()
@@ -1957,7 +1962,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, parentMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
@@ -2029,7 +2034,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard source != 1, sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK || sourceMetadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, parentMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
@@ -2129,7 +2134,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 guard source != 1,
                       sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
                 if sourceMetadata.entry.kind == SFS_DIRECTORY && sourceMetadata.link_count != 1 { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, oldMetadata.flags == 0, newMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, oldMetadata.flags & ~supportedBSDFlags == 0, newMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(oldMetadata, owner: self.owner, caller: caller)
@@ -2178,7 +2183,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     let metadata = try self.metadata(suppliedVictim.inode)
                     guard metadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                     guard suppliedVictim.inode != 1, metadata.entry.kind == SFS_FILE || metadata.entry.kind == SFS_SYMLINK || metadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
-                    guard metadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                    guard metadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                     guard metadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                     try self.ownerAccess(metadata, inode: suppliedVictim.inode, access: .readAttributes, caller: caller)
                     if sourceMetadata.entry.kind == SFS_DIRECTORY && metadata.entry.kind != SFS_DIRECTORY { throw POSIXError(.ENOTDIR) }
@@ -2606,7 +2611,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     static func sizeRequestError(valid: [FSItem.Attribute], metadata: Bool = false) -> Error? {
         let computed: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID, .changeTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
-        let disabled: [FSItem.Attribute] = metadata ? [.uid, .gid, .flags] : [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
+        let disabled: [FSItem.Attribute] = metadata ? [.uid, .gid] : [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
         if computed.contains(where: { valid.contains($0) }) { return POSIXError(.EINVAL) }
         if disabled.contains(where: { valid.contains($0) }) { return POSIXError(.ENOTSUP) }
         // addedTime and backupTime have no representation and stay unconsumed.
@@ -2625,7 +2630,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         a.consumedAttributes = []
         let hasSize = a.isValid(.size), size = hasSize ? a.size : 0
         let mode: UInt32? = a.isValid(.mode) ? a.mode : nil
-        let metadataFields: [FSItem.Attribute] = [.mode, .accessTime, .modifyTime, .birthTime]
+        let metadataFields: [FSItem.Attribute] = [.mode, .flags, .accessTime, .modifyTime, .birthTime]
         let usedMetadata = metadataFields.filter { a.isValid($0) }.reduce(FSItem.Attribute()) { $0.union($1) }
         let hasMutation = hasSize || !usedMetadata.isEmpty
         var update = sfs_metadata_update(), validation = Self.sizeRequestError(a, metadata: true)
@@ -2634,6 +2639,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 if let mode {
                     guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
                     update.fields |= UInt32(SFS_META_MODE.rawValue); update.mode = mode
+                }
+                if a.isValid(.flags) {
+                    guard a.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
+                    update.fields |= UInt32(SFS_META_FLAGS.rawValue); update.flags = a.flags
                 }
                 if a.isValid(.accessTime) { update.fields |= UInt32(SFS_META_ACCESS.rawValue); update.access = try metadataTime(a.accessTime) }
                 if a.isValid(.modifyTime) { update.fields |= UInt32(SFS_META_MODIFICATION.rawValue); update.modification = try metadataTime(a.modifyTime) }
@@ -2650,7 +2659,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
                 let regularSize = hasSize && m.entry.kind == SFS_FILE
                 var access: FSVolume.AccessMask = regularSize ? .writeData : .readAttributes
-                if usedMetadata.contains(.mode) { access.insert(.writeSecurity) }
+                if !usedMetadata.intersection([.mode, .flags]).isEmpty { access.insert(.writeSecurity) }
                 if !usedMetadata.intersection([.accessTime, .modifyTime, .birthTime]).isEmpty { access.insert(.writeAttributes) }
                 try self.ownerAccess(m, inode: inode, access: access, caller: caller)
                 var pendingUpdate = requestedUpdate
@@ -2665,6 +2674,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 }
                 let changedSize = regularSize && size != m.entry.size
                 let changedMetadata = (mode != nil && pendingUpdate.mode != m.mode) ||
+                    (usedMetadata.contains(.flags) && pendingUpdate.flags != m.flags) ||
                     changedTime(.accessTime, pendingUpdate.access, m.access) ||
                     changedTime(.modifyTime, pendingUpdate.modification, m.modification) ||
                     changedTime(.birthTime, pendingUpdate.birth, m.birth)

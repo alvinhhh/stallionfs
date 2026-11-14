@@ -228,7 +228,7 @@ def prepare(base, name, native_fixtures, correct, run):
             os.chflags(path, tracked | flag); protected.append(path.relative_to(source))
         (source / 'a').chmod(0o500); source.chmod(0o550)
         observed = correct.snapshot(source)
-        require(native_fixtures.verify_metadata_coverage(observed, seed)['populated'] is True, 'coverage_incomplete')
+        require(native_fixtures.verify_metadata_coverage(observed, seed, precision_links=(), precision_scope='copy-clone')['populated'] is True, 'coverage_incomplete')
         require(len(observed['hardlink_groups']) == 3 and all(
             observed['entries'][entry]['flags'] & tracked for entry in ('', 'a', 'a/file', 'a/link')),
             'coverage_incomplete')
@@ -504,14 +504,14 @@ def probe(binary, wheel, helper, scratch, output, revision, *, first_recipe_only
                 seed = {}; native_fixtures.enrich_metadata(source, receipt=seed)
                 expected_error, protected, coverage = None, [], {}
                 if not restore_docs_only:
-                    require(native_fixtures.verify_metadata_coverage(correct.snapshot(source), seed)['populated'] is True,
+                    require(native_fixtures.verify_metadata_coverage(correct.snapshot(source), seed, precision_links=(), precision_scope='copy-clone')['populated'] is True,
                             'coverage_incomplete')
             else:
                 source, parent, outside, expected_error, protected, coverage = prepare(base, name, native_fixtures, correct, run)
             destination = parent / 'output'
             expected = observe(source, allow_special=name == 'special')
             if restore_docs_only:
-                require(native_fixtures.verify_metadata_coverage(expected, seed)['populated'] is True, 'coverage_incomplete')
+                require(native_fixtures.verify_metadata_coverage(expected, seed, precision_links=(), precision_scope='copy-clone')['populated'] is True, 'coverage_incomplete')
             outside_before = observe(outside)
             existing = observe(destination) if os.path.lexists(destination) else None
             source_info, parent_info, base_info = source.stat(), parent.stat(), base.stat()
