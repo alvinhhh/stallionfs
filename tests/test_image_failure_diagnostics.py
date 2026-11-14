@@ -1159,7 +1159,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
         self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
         self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
-        self.assertIn("    timeout-minutes: ${{ matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
+        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
         self.assertIn('      fail-fast: false\n', worker)
         self.assertNotIn('continue-on-error:', worker + gate)
         sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]
@@ -1167,8 +1167,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('          ASAN_OPTIONS: halt_on_error=1\n', sanitizer)
         self.assertIn('          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1\n', sanitizer)
         self.assertIn('          TSAN_OPTIONS: halt_on_error=1\n', sanitizer)
-        smoke = sanitizer.split('      - name: Check installed runtime and doctor\n', 1)[1]
-        self.assertTrue(smoke.startswith('        run: |\n'))
+        smoke = worker.split('      - name: Check installed runtime and doctor\n', 1)[1]
+        self.assertTrue(smoke.startswith("        if: matrix.phase == 'sanitizer'\n        run: |\n"))
         self.assertIn('bootstrap.py" check "${CI_CONTAINER:?}"', smoke)
         self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', smoke)
         tree = ast.parse(self.sanitizer_script())

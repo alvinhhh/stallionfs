@@ -69,3 +69,45 @@ Keep changes focused. Add a regression check for behavior that can lose or share
 Performance checks live in `tests/perf`. Keep locked fixtures and raw samples when changing published performance numbers. Count seed preparation and complete deletion separately from workspace startup. Report regressions as well as improvements.
 
 Contributions are licensed under the project's MIT license.
+
+### Installed suite closure
+
+The ordinary installed suite runs through `tools/ci_test_entry.py`. Its supervisor
+uses the existing matrix job allocation, anchored before checkout, less a
+130-second reserve for cleanup, receipt finalization and bounded collection/upload. Setup, sparse metadata
+work and the two synthetic probes consume that same allocation. Sparse metadata
+runs before the suite with its existing nine-minute and 300-second CPU caps.
+Only its actual elapsed time is deducted. The allocation file is exclusively
+created before checkout, bound to the job, worker and attempt, and retained with
+a digest; ordered phase receipts reject replay, mixed state and reset anchors.
+This detects accidental inconsistent CI evidence, not a malicious runner that
+can rewrite all retained evidence. The build helper's 600-second cap
+is unchanged and does not govern the full suite.
+
+A passing probe and an expected assertion-failure probe use the same installed
+admission, diagnostics close, final admission, accounting and exit path as the
+suite. Probe receipts are separate from qualification. The suite retains required
+skip and contextual-success gates. Any close or admission exception fails it.
+
+The `suite-closure-*` artifact records bounded phase events, direct-child status,
+per-stream EOF, capture limits and uncertainty. Three delayed post-suite snapshots
+include at most 64 threads and 64 frames per thread, with all paths and source text
+redacted. The original 300-second during-suite watchdog remains enabled. Additional
+diagnostic records are capped at 1 MiB; suite console capture is capped at 16 MiB.
+A valid exit request alone is insufficient: success requires actual reaping and
+EOF on both streams. Direct-child closure does not establish escaped-descendant or
+shared-service closure. Deadline, cancellation, invalid markers and incomplete
+capture remain failures. These observations do not identify the cause of a prior
+hosted stall or substitute for supported-platform qualification.
+
+Suite totals are recorded before close/admission and must match final accounting.
+Records use exact typed schemas, reject duplicate JSON keys, and bind invocation,
+mode, direct child identity and monotonic launch interval. Durable failure receipts
+retain malformed collection and allocation refusals. No probe certifies the suite.
+
+Runtime seal verification and doctor retain their post-test ordering inside the
+installed child admission phase; failures prevent qualification. Sanitizer workers
+retain their separate post-test runtime/doctor step. Failure diagnostics retain their separate artifact names and validators. Each tail
+action has a one-minute cap and is admitted only if its full cap fits the original
+job deadline with cleanup space. Slow actions consume the shared tail; exhaustion
+refuses subsequent actions and retains failure receipts rather than extending it.

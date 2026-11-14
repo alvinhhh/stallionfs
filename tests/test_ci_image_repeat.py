@@ -451,7 +451,8 @@ class Workflow(unittest.TestCase):
         aggregate = job(text, 'test')
         self.assertIn('needs: test-execution', aggregate)
         self.assertIn('run: test "${EXECUTION_RESULT:-}" = success', aggregate)
-        self.assertIn('defaultTestLoader.discover', step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
+        self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
+        self.assertIn('defaultTestLoader.discover', (ROOT / 'tools/ci_test_entry.py').read_text())
 
 
 if __name__ == '__main__':
