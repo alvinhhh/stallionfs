@@ -37,11 +37,13 @@ class HostingBinding(unittest.TestCase):
 
     @contextlib.contextmanager
     def renumber(self):
-        real_stat, real_fstat = os.stat, os.fstat
+        real_stat, real_lstat, real_fstat = os.stat, os.lstat, os.fstat
         device = real_stat(self.path).st_dev + 17
         def stat(*args, **kwargs): return Renumbered(real_stat(*args, **kwargs), device)
+        def lstat(*args, **kwargs): return Renumbered(real_lstat(*args, **kwargs), device)
         def fstat(*args, **kwargs): return Renumbered(real_fstat(*args, **kwargs), device)
-        with patch.object(os, 'stat', side_effect=stat), patch.object(os, 'fstat', side_effect=fstat):
+        with patch.object(os, 'stat', side_effect=stat), patch.object(os, 'lstat', side_effect=lstat), \
+             patch.object(os, 'fstat', side_effect=fstat):
             yield
 
     def historical_bytes(self):
@@ -80,7 +82,7 @@ class HostingBinding(unittest.TestCase):
         self.assertEqual(before, self.historical_bytes())
 
     def test_file_ids_above_32_bits_survive_enrollment_and_resolution(self):
-        real_stat, real_fstat = os.stat, os.fstat
+        real_stat, real_lstat, real_fstat = os.stat, os.lstat, os.fstat
         real_identity = binding._scan.hosting_identity
         def wide(info):
             row = Renumbered(info, info.st_dev); row.st_ino += 1 << 40
@@ -89,6 +91,7 @@ class HostingBinding(unittest.TestCase):
             row = real_identity(fd); row['file_id'] += 1 << 40
             return row
         with patch.object(os, 'stat', side_effect=lambda *a, **kw: wide(real_stat(*a, **kw))), \
+             patch.object(os, 'lstat', side_effect=lambda *a, **kw: wide(real_lstat(*a, **kw))), \
              patch.object(os, 'fstat', side_effect=lambda *a, **kw: wide(real_fstat(*a, **kw))), \
              patch.object(binding._scan, 'hosting_identity', side_effect=identity):
             f = fixtures.CreateRecovery('test_success_repeated_calls_and_guarded_rename_syncs')
@@ -100,6 +103,23 @@ class HostingBinding(unittest.TestCase):
                 target = _native.recover_install(store, f.final, f.read(f.final / 'meta.json'))
                 self.assertEqual(target['file'], f.ident(f.final / 'image.sfs'))
             finally: f.doCleanups()
+
+    def test_budget_adoption_diagnostics_and_resolution_do_not_publish(self):
+        before = {str(p): p.read_bytes() for p in self.f.root.rglob('*.json')}
+        for setting, value, code in (('MAX_DOCUMENT_BYTES', 1, 'document-budget'),
+                                     ('MAX_TOTAL_BYTES', 1, 'read-budget'),
+                                     ('MAX_ENTRIES', 0, 'entry-budget')):
+            with self.subTest(setting=setting), patch.object(recovery, setting, value):
+                result = self.adopt()
+                self.assertEqual(result['status'], 'blocked')
+                # Enumeration failures are summarized as incomplete inventory by adoption.
+                self.assertEqual(result['code'], 'inventory-incomplete' if code == 'entry-budget' else code)
+                inventory = recovery.inventory(self.f.root)
+                self.assertFalse(inventory['inventory_complete'])
+                if code != 'entry-budget':
+                    with self.assertRaises(core.MetadataLimitError):
+                        _native.recover_install(self.store, self.path, self.meta)
+            self.assertEqual(before, {str(p): p.read_bytes() for p in self.f.root.rglob('*.json')})
 
     def test_wrong_volume_malformed_missing_and_wide_file_ids(self):
         real = binding._scan.hosting_identity
@@ -311,8 +331,12 @@ class DescriptorAccessor(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='sfs-closed-binding-') as name:
             root = Path(name).resolve(); image_dir = root / 'image'; image_dir.mkdir(mode=0o700)
             fixture = root / 'fixture'
-            subprocess.run(['xcrun', 'clang', '-O1', '-Ifilesystem', 'tests/native_image_fixture.c',
-                            'filesystem/image.c', '-o', str(fixture)], check=True, capture_output=True)
+            repository = Path(__file__).resolve().parents[1]
+            compiled = subprocess.run(['xcrun', 'clang', '-O1', '-I' + str(repository / 'filesystem'),
+                            str(repository / 'tests/native_image_fixture.c'),
+                            str(repository / 'filesystem/image.c'), '-o', str(fixture)],
+                            cwd=root, capture_output=True, text=True, timeout=60)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
             subprocess.run([str(fixture), 'seed', str(image_dir)], check=True, capture_output=True)
             target = {'directory': str(image_dir), 'component': 'image.sfs',
                       'parent': recovery.pair(image_dir.stat()), 'file': None}

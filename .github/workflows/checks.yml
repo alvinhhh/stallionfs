@@ -25,7 +25,7 @@ jobs:
   test-execution:
     name: ${{ matrix.phase }} (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})
     if: github.event_name != 'workflow_dispatch'
-    timeout-minutes: ${{ matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
+    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

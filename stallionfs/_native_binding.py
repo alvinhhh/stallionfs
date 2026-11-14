@@ -181,25 +181,120 @@ def exclusions(store, a, path, metadata):
                 'binding-retirement')
     store._no_mounts(path)
     require(not a.names(path / 'volume'), 'occupied-volume')
-    closed = []
+    records = {}
     if a.exists(path / 'native-operations'):
         for name in a.names(path / 'native-operations'):
             require(re.fullmatch('[0-9a-f]{32}', name), 'binding-operation-schema')
-            record = a.read(path / 'native-operations' / name / 'record.json')
+            records[name] = a.read(path / 'native-operations' / name / 'record.json')
+    mounted = a.read(path / 'native-mount.json') if a.exists(path / 'native-mount.json') else None
+    proof = a.read(path / 'native-install.json') if mounted is None else None
+    return archive_anchor(records, path, metadata, mounted, proof)
+
+
+def _same_evidence(left, right):
+    """Compare full JSON evidence without Python's numeric type coercion."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return left.keys() == right.keys() and all(_same_evidence(left[k], right[k]) for k in left)
+    if type(left) is list:
+        return len(left) == len(right) and all(_same_evidence(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _pair_guard(receipt, target):
+    """Validate each exceptional close independently before comparing witnesses."""
+    from ._native_recovery import _valid_anchor
+    require(type(receipt) is dict, 'binding-resolution-guard')
+    anchor = {k: receipt.get(k) for k in ('generation', 'committed_end', 'root_digest')}
+    require(_valid_anchor(anchor) and type(receipt.get('uuid')) is str
+            and all(type(receipt.get(k)) is int and receipt[k] == 0
+                    for k in ('status', 'parent_close_errno'))
+            and all(type(receipt.get(k)) is int and 0 <= receipt[k] < 1 << 64
+                    for k in ('device', 'inode'))
+            and ('physical_end' not in receipt or type(receipt['physical_end']) is int
+                 and receipt['committed_end'] <= receipt['physical_end'] < 1 << 64)
+            and _native._consumed(receipt, target), 'binding-resolution-guard')
+
+
+def archive_anchor(records, path, metadata, mounted, proof=None):
+    """Validate an Admission-bounded archive map without following any stored paths."""
+    closed = []
+    incoming = {}
+    paths = {str(path / 'native-operations' / name / 'record.json'): name for name in records}
+    for name, record in records.items():
+        require(type(name) is str and re.fullmatch('[0-9a-f]{32}', name)
+                and type(record) is dict, 'binding-operation-schema')
+        reference = record.get('previous_unresolved')
+        if type(reference) is dict:
+            # Count malformed incoming edges too, before judging their authority.
+            targets = set()
+            if type(reference.get('id')) is str and reference['id'] in records:
+                targets.add(reference['id'])
+            if type(reference.get('record')) is str and reference['record'] in paths:
+                targets.add(paths[reference['record']])
+            for target in targets:
+                incoming.setdefault(target, []).append(name)
+    for name, record in records.items():
+        if record.get('outcome') == 'complete':
             completed_operation(record, path, metadata, name)
             if record['operation'] in ('native-snapshot', 'native-restore', 'native-catalog-observe',
                                        'native-mounted-snapshot', 'native-mounted-restore'):
                 closed.append(record['native_image_result']['close_receipt'])
-    if a.exists(path / 'native-mount.json'):
-        mounted = a.read(path / 'native-mount.json')
+            continue
+        require(record.get('operation') == 'native-mount' and record.get('outcome') == 'incomplete'
+                and record.get('id') == name and record.get('workspace') == path.name
+                and 'previous_unresolved' in record and record['previous_unresolved'] is None
+                and record.get('mount_attempted') is True
+                and 'observed_mount' in record and record['observed_mount'] is None,
+                'binding-unresolved-resources')
+        successors = incoming.get(name, [])
+        require(len(successors) == 1 and successors[0] != name, 'binding-resolution-edge')
+        successor = records[successors[0]]
+        reference = dict(operation='native-mount', id=name, outcome='incomplete',
+                         record=str(path / 'native-operations' / name / 'record.json'))
+        require(successor.get('previous_unresolved') == reference
+                and successor.get('operation') == 'native-unmount'
+                and successor.get('already_absent') is True
+                and 'before_mount' in successor and successor['before_mount'] is None
+                and 'observed_mount' in successor and successor['observed_mount'] is None
+                and successor.get('helpers') == [], 'binding-resolution-edge')
+        for row in (record, successor):
+            require('protocol' not in row or type(row['protocol']) is int and row['protocol'] in (2, 3),
+                    'binding-operation-protocol')
+        completed_operation(successor, path, metadata, successors[0])
+        _native.check_pending(path.name, record)
+        for row in (record, successor):
+            target = core.native_target({'ownership': 'external-reference', 'native_image': row.get('target')})
+            _pair_guard(row.get('current_guard'), target)
+        require(_same_evidence(record.get('target'), successor['target'])
+                and _same_evidence(record.get('current_guard'), successor.get('current_guard')),
+                'binding-resolution-target')
+        helpers = record['helpers']
+        require([h['label'] for h in helpers] == ['verify-package', 'discover', 'mount']
+                and all(h['outcome'] == 'success' and h['returncode'] == 0 for h in helpers[:2])
+                and helpers[-1]['outcome'] == 'error' and helpers[-1]['returncode'] != 0,
+                'binding-operation-incomplete')
+        profile = metadata.get('controller_profile')
+        require(type(profile) is str and profile in _native.PROFILES, 'binding-operation-profile')
+        argv = ['/sbin/mount', '-t', _native.PROFILES[profile]['type'], str(path), str(path / 'volume')]
+        require(helpers[-1]['argv'] in (argv, argv[:1] + ['-F'] + argv[1:]), 'binding-mount-argv')
+        if mounted is not None and mounted.get('operation') == successors[0]:
+            target = core.native_target({'ownership': 'external-reference', 'native_image': mounted.get('target')})
+            _pair_guard(mounted.get('current_guard'), target)
+            require(_same_evidence(mounted.get('target'), successor['target'])
+                    and _same_evidence(mounted.get('current_guard'), successor['current_guard']),
+                    'binding-resolution-marker')
+        closed.append(successor['current_guard'])
+    if mounted is not None:
         require(mounted.get('state') == 'absent' and type(mounted.get('target')) is dict
                 and mounted['target']['uuid'] == metadata['native_image']['uuid']
                 and mounted['target']['file'][1] == metadata['native_image']['file'][1]
                 and _native._consumed(mounted.get('current_guard'), mounted['target']), 'binding-mount-uncertain')
         closed.append(mounted['current_guard'])
     else:
-        proof = a.read(path / 'native-install.json')
-        require(proof.get('first_mount_attempted') is False, 'binding-missing-closed-anchor')
+        require(type(proof) is dict and proof.get('first_mount_attempted') is False,
+                'binding-missing-closed-anchor')
         closed.append(proof['guard'])
     # Catalog commits advance the generation after an ordinary unmount. Use
     # affirmative close evidence for the newest generation without rewriting

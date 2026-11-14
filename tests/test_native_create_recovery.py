@@ -744,5 +744,73 @@ finally:
             self.assertEqual(result.stdout.strip(), 'admitted')
 
 
+
+class AdmissionBudgets(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='sfs-budget-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.path = self.root / 'record.json'
+        self.data = b'{"format":1,"value":2}'
+        self.path.write_bytes(self.data); self.path.chmod(0o600)
+        self.admission = recovery.Admission(self.root)
+        self.addCleanup(self.admission.close)
+
+    def refusal(self, code, operation):
+        with self.assertRaises(core.MetadataLimitError) as caught:
+            operation()
+        self.assertIsInstance(caught.exception, recovery.Refusal)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.path, str(self.path if code != 'entry-budget' else self.root))
+
+    def test_document_scope_predecode_and_restoration(self):
+        with core.json_read_limit(len(self.data)):
+            self.assertEqual(self.admission.read(self.path), {'value': 2})
+            with core.json_read_limit(len(self.data) - 1), patch.object(recovery.json, 'loads', side_effect=AssertionError('decode')):
+                self.refusal('document-budget', lambda: self.admission.read(self.path))
+            self.assertEqual(core._json_read_limit.get(), len(self.data))
+            with core.json_read_limit(len(self.data) + 10):
+                self.assertEqual(core._json_read_limit.get(), len(self.data))
+        self.assertIsNone(core._json_read_limit.get())
+        with patch.object(recovery, 'MAX_DOCUMENT_BYTES', len(self.data) - 1), core.json_read_limit(100):
+            self.refusal('document-budget', lambda: self.admission.read(self.path))
+
+    def test_growth_sentinel_closes_descriptor_before_decode(self):
+        original = os.read
+        fds = []
+        def growing(fd, count):
+            fds.append(fd)
+            return original(fd, count) + b' '
+        with core.json_read_limit(len(self.data)), patch.object(os, 'read', side_effect=growing), \
+             patch.object(recovery.json, 'loads', side_effect=AssertionError('decode')):
+            self.refusal('document-budget', lambda: self.admission.read(self.path))
+        with self.assertRaises(OSError): os.fstat(fds[0])
+        self.assertNotIn(self.path, self.admission.files)
+
+    def test_aggregate_and_entry_equal_boundaries(self):
+        with patch.object(recovery, 'MAX_TOTAL_BYTES', len(self.data)):
+            self.assertEqual(self.admission.read(self.path), {'value': 2})
+            with patch.object(recovery.json, 'loads', side_effect=AssertionError('decode')):
+                self.refusal('read-budget', lambda: self.admission.read(self.path))
+        with patch.object(recovery, 'MAX_ENTRIES', 1):
+            self.assertEqual(self.admission.names(self.root), ['record.json'])
+            self.refusal('entry-budget', lambda: self.admission.names(self.root))
+        self.assertEqual(self.path.read_bytes(), self.data)
+
+    def test_publish_budget_precedes_file_creation(self):
+        with patch.object(recovery, 'MAX_DOCUMENT_BYTES', 1), patch.object(os, 'write', side_effect=AssertionError('write')):
+            self.refusal('document-budget', lambda: self.admission.publish(self.path, {'value': 3}))
+            new = self.root / 'new.json'
+            with self.assertRaises(recovery.BudgetRefusal): self.admission.publish(new, {'value': 3})
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+        self.assertEqual(self.path.read_bytes(), self.data)
+
+    def test_nonbudget_refusals_keep_their_type(self):
+        self.path.write_text('{"format":2}')
+        with self.assertRaises(recovery.Refusal) as caught: self.admission.read(self.path)
+        self.assertEqual(caught.exception.code, 'unknown-format')
+        self.assertNotIsInstance(caught.exception, core.MetadataLimitError)
+
+
 if __name__ == '__main__':
     unittest.main()
