@@ -74,6 +74,9 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
     private let identity: Result<StallionFileSystemIdentity, Error>
     private let accessPolicy: AccessPolicy
     init(identity: Result<StallionFileSystemIdentity, Error>, accessPolicy: AccessPolicy = .readOnly) {
+#if STALLION_MOUNT_TRACE
+        _ = MountTrace.shared
+#endif
         self.identity = identity
         self.accessPolicy = accessPolicy
         super.init()
@@ -183,21 +186,51 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
     }
     // Shared decoder also permits direct checks without fabricating FSTaskOptions,
     // whose public initializer is unavailable in the SDK.
-    func loadResource(resource: FSResource, arguments: [String], replyHandler: @escaping (FSVolume?, Error?) -> Void) {
-        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(nil, POSIXError(.E2BIG)); return }
-        loadResource(resource: resource, force: arguments.contains("-f"), readOnly: arguments.contains("--rdonly"), replyHandler: replyHandler)
-    }
     func loadResource(resource: FSResource, force: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
-        loadResource(resource: resource, force: force, readOnly: false, replyHandler: replyHandler)
+        loadResource(resource: resource, arguments: force ? ["-f"] : [], replyHandler: replyHandler)
     }
-    private func loadResource(resource: FSResource, force: Bool, readOnly: Bool, replyHandler: @escaping (FSVolume?, Error?) -> Void) {
+    func loadResource(resource: FSResource, arguments: [String], replyHandler: @escaping (FSVolume?, Error?) -> Void) {
+#if STALLION_MOUNT_TRACE
+        let trace = MountTrace.shared, load = trace.id(), callback = trace.id()
+        trace.emit(1, 1, load: load, callback: callback, value: UInt64(min(arguments.count, 65)))
+        let originalReply = replyHandler
+#endif
+        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else {
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 1, load: load, callback: callback, stage: .arguments, error: POSIXError(.E2BIG))
+#endif
+            replyHandler(nil, POSIXError(.E2BIG)); return
+        }
+        let force = arguments.contains("-f"), readOnly = arguments.contains("--rdonly")
+#if STALLION_MOUNT_TRACE
+        var entryStage: MountTrace.Stage = .identity
+        let replyHandler: (FSVolume?, Error?) -> Void = { result, error in
+            trace.emit(3, 1, load: load, callback: callback, stage: entryStage, error: error)
+            originalReply(result, error)
+        }
+#endif
         let identity: StallionFileSystemIdentity
         do { identity = try self.identity.get() }
         catch { replyHandler(nil, error); return }
+#if STALLION_MOUNT_TRACE
+        entryStage = .resourceSize
+#endif
         guard boundedResource(resource) else { replyHandler(nil, POSIXError(.ENAMETOOLONG)); return }
+#if STALLION_MOUNT_TRACE
+        entryStage = .resourceType
+#endif
         guard let path = resource as? FSPathURLResource else { replyHandler(nil, POSIXError(.EINVAL)); return }
+#if STALLION_MOUNT_TRACE
+        entryStage = .force
+#endif
         guard !force else { replyHandler(nil, POSIXError(.ENOTSUP)); return }
+#if STALLION_MOUNT_TRACE
+        entryStage = .enqueue
+#endif
         guard callbacks.acquire(4096) else { replyHandler(nil, POSIXError(.EAGAIN)); return }
+#if STALLION_MOUNT_TRACE
+        entryStage = .routing
+#endif
         routingLock.lock()
         guard case .idle = routing else {
             routingLock.unlock(); callbacks.release(4096); replyHandler(nil, POSIXError(.EINVAL)); return
@@ -210,6 +243,14 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
         routingLock.unlock()
         queue.async(execute: DispatchWorkItem {
         defer { self.callbacks.release(4096) }
+#if STALLION_MOUNT_TRACE
+        trace.emit(2, 1, load: load, callback: callback, value: (path.isWritable ? 1 : 0) | (path.isRevoked ? 2 : 0) | 4)
+        var stage: MountTrace.Stage = .open
+        let replyHandler: (FSVolume?, Error?) -> Void = { result, error in
+            trace.emit(3, 1, load: load, callback: callback, stage: stage, error: error)
+            originalReply(result, error)
+        }
+#endif
         do {
             // --rdonly wins before open, even over a private fixture binding.
             let expected: UUID?
@@ -230,8 +271,15 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
                 throw POSIXError(.ENOTSUP)
 #endif
             } else { access = .readOnly }
+#if STALLION_MOUNT_TRACE
+            trace.emit(4, 1, load: load, callback: callback, value: access == .readOnly ? 0 : access == .contextualWrites ? 1 : 2)
+#endif
             let (opened, scoped) = try self.open(path, access: access, expectedUUID: expected)
             let loaded = StallionVolume(identity: identity, admission: opened, resource: path, scope: scoped, queue: self.queue)
+#if STALLION_MOUNT_TRACE
+            loaded.mountTraceLoad = load
+            stage = .enable
+#endif
 #if STALLION_ADAPTER_CHECK
             configurationHook?()
 #endif
@@ -250,6 +298,9 @@ final class StallionFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, 
 #endif
             context.volume = loaded
             self.finishOpening(context, live: true)
+#if STALLION_MOUNT_TRACE
+            stage = .complete
+#endif
             self.containerStatus = .ready; replyHandler(loaded, nil)
         } catch {
             self.finishOpening(context, live: false)

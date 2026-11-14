@@ -184,6 +184,19 @@ class FSKitInterfaces(unittest.TestCase):
             self.command('diagnostic-hooks', [*cflags, '-c', tests / 'fskit_write_hooks.c', '-o', hooks], 90)
             self.command('normal-core', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
             sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
+            trace_executable = self.base / 'mount-trace-check'
+            trace_images = self.base / 'mount-trace-images'
+            trace_images.mkdir(mode=0o700)
+            self.command('mount-trace-build', [self.tools['swiftc'], '-swift-version', '6',
+                         '-strict-concurrency=complete', '-warnings-as-errors', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-Onone', '-parse-as-library',
+                         '-module-cache-path', self.base / 'trace-cache',
+                         '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                         '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                         '-D', 'STALLION_MOUNT_TRACE', *sources, tests / 'fskit_write_driver.swift',
+                         diagnostic, hooks, '-o', trace_executable], 180, swift='context')
+            traced = self.command('mount-trace-run', [trace_executable, '--mount-trace', trace_images], 90)
+            self.assertEqual(traced.stdout, 'PASS mount trace masks, stages, replies, rollback, concurrent IDs, cap and discarded emitter\n')
             forbidden = ('sfs_diag_', 'sfs_image_diagnostic_', 'enablewritediagnostic', 'diagnosticwrite',
                          'sfs_test_', 'fixtureidentity', 'reclaimfortesting', 'ownsfortesting',
                          'unloadadmissionhook', 'loadconfigurationhook', 'drainresourceworkfortesting',
@@ -328,6 +341,25 @@ class FSKitInterfaces(unittest.TestCase):
                                  ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
                                   'fixturewritablemetadata', 'fixtureidentity', 'privatetestidentity',
                                   'fortesting', 'reclaimfortesting', 'createabortfortesting')))
+            self.assertNotIn('mounttrace', symbols)
+            self.assertNotIn(b'com.alvinhhh.stallionfs.mounttrace', module.read_bytes())
+            trace_module = self.base / 'context-mount-trace-module'
+            self.command('context-mount-trace-module-build', [self.tools['swiftc'],
+                         '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                         '-D', 'STALLION_MOUNT_TRACE', '-swift-version', '6',
+                         '-strict-concurrency=complete', '-warnings-as-errors', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-Onone', '-parse-as-library',
+                         '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
+                         '-module-cache-path', self.base / 'context-mount-trace-cache',
+                         *sources, normal, '-o', trace_module], 180, swift='context')
+            trace_symbols = self.command('context-mount-trace-symbols', [self.tools['nm'], trace_module], 90).stdout.lower()
+            self.assertIn('stallionfs_mount_trace_schema1_build1', trace_symbols)
+            self.assertIn(b'com.alvinhhh.stallionfs.mounttrace', trace_module.read_bytes())
+            self.assertEqual(package.compiled_factory_profile(package.read_executable(trace_module),
+                             'contextual-writes')['policy'], 'contextual-writes')
+            self.assertFalse(any(word in trace_symbols for word in
+                                 ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
+                                  'fixtureidentity', 'fortesting', 'sqlite')))
             # Assemble the ordinary both-flags extension, not a test driver.
             # This verifies unsigned package wiring; it does not activate FSKit.
             host = self.base / 'production-package-host'
