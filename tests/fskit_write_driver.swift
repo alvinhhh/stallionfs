@@ -877,6 +877,16 @@ func attributes(_ parent: URL) throws -> [Int] {
     let metadataFields: [FSItem.Attribute] = [.mode,.flags,.accessTime,.modifyTime,.birthTime]
     var unavailable = Set<Int>()
     let f = try Fixture(parent, "attributes")
+    let direct = try Mounted(f)
+    for n in [18, 61, 62, 63] {
+        let request = FSItem.GetAttributesRequest()
+        request.wantedAttributes = FSItem.Attribute(rawValue: Int(bitPattern: UInt(1) << n))
+        let result: (FSItem.Attributes?, Error?) = wait { done in
+            direct.volume.getAttributes(request, of: direct.file) { done(($0, $1)) }
+        }
+        need(result.0 == nil && code(result.1) == Int(ENOTSUP), "direct GET retains strict unknown refusal")
+    }
+    direct.close()
     for (field, set, error) in fields {
         let policyError = metadataAllowed && metadataFields.contains(field) ? 0 : error
         need(code(StallionVolume.sizeRequestError(valid: [field],metadata:metadataAllowed)) == policyError, "finite policy covers every SDK field")
@@ -1775,9 +1785,137 @@ func checkPreparedAttributes(_ a: FSItem.Attributes, _ m: sfs_metadata_entry, re
     if a.isValid(.supportsLimitedXAttrs) { need(!a.supportsLimitedXAttrs, "xattr capability") }
     if a.isValid(.inhibitKernelOffloadedIO) { need(a.inhibitKernelOffloadedIO, "I/O routing attribute") }
 }
+// Exercise the shared SDK GET handler with literal expectations for SDK 27.
+func contextualGetBoundary(_ m: Mounted) {
+    let v = m.volume, caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    let sdk = FSGetAttributesResult.requestedAttributes.wantedAttributes
+    let full = FSItem.Attribute(rawValue: 0x3fff)
+    func bit(_ n: Int) -> FSItem.Attribute { FSItem.Attribute(rawValue: Int(bitPattern: UInt(1) << n)) }
+    let recorded = full.union(bit(62))
+    let fresh = FSItem.Attributes()
+    try! StallionVolume.requireValidForTesting(fresh, required: bit(62))
+    for n in [18, 61, 63] { completenessRefused(fresh, required: bit(n)) }
+    fresh.invalidateAllProperties()
+    completenessRefused(fresh, required: bit(62))
+    var prepared: FSItem.Attributes?, constructors = 0
+    m.serial {
+        v.preparedAttributesForTesting = { _, a in prepared = a }
+        v.rejectResultForTesting = { _ in constructors += 1; return false }
+    }
+    func get(_ raw: FSItem.Attribute, expected: Int = 0, stage: Int = 8,
+             item: FSItem? = nil, who: CallerIdentity? = nil, mutate: Bool = false) {
+#if STALLION_MOUNT_TRACE
+        MountTrace.shared.resetForTesting()
+#endif
+        prepared = nil; constructors = 0
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = raw
+        let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        v.enqueue { held.signal(); need(release.wait(timeout: .now()+20) == .success, "boundary release") }
+        need(held.wait(timeout: .now()+20) == .success, "boundary hold")
+        var replies = 0
+        let result: (FSGetAttributesResult?, Error?) = wait { done in
+            v.attributesResultForTesting(request, item: item ?? m.file, caller: who ?? caller) {
+                replies += 1; done(($0, $1))
+            }
+            need(replies == 0, "boundary deferred")
+            if mutate { request.wantedAttributes = .backupTime }
+            release.signal()
+        }
+        m.serial {}
+        need(replies == 1 && code(result.1) == expected && (result.0 != nil) == (expected == 0), "boundary exact atomic outcome")
+        need(constructors == (stage == 7 || expected == 0 ? 1 : 0), "boundary constructor count")
+        need(request.wantedAttributes == (mutate ? .backupTime : raw) && FSGetAttributesResult.requestedAttributes.wantedAttributes == sdk, "boundary request ownership")
+        if expected == 0 {
+            let a = prepared!
+            // Independent per-bit assertions over both original obligations.
+            for required in [raw, sdk] {
+                for n in 0..<64 where UInt(bitPattern: required.rawValue) & (UInt(1) << n) != 0 {
+                    need(a.isValid(bit(n)), "boundary raw completeness")
+                }
+            }
+            m.serial {
+                var metadata = sfs_metadata_entry(), status = sfs_result()
+                need(sfs_image_stat_metadata(m.coreHandle, 0, (m.file as! StallionItem).inode, &metadata, &status) == SFS_OK, "boundary metadata")
+                checkPreparedAttributes(a, metadata, required: full)
+            }
+            need(!a.supportsLimitedXAttrs && a.inhibitKernelOffloadedIO, "boundary truthful policies")
+            m.serial {
+                need(v.capturedRecords().last!.mask == UInt64(bitPattern: Int64(sdk.union(raw.intersection(full)).rawValue)), "effective operation mask")
+            }
+        }
+#if STALLION_MOUNT_TRACE
+        let rows = MountTrace.shared.recordsForTesting().filter { $0.contains(" o=4 ") }
+        need(rows.count == 3, "boundary entry body reply")
+        for row in rows {
+            need(row.contains(" m=\(String(UInt(bitPattern: raw.rawValue), radix: 16)) ") &&
+                 row.contains(" k=\(String(UInt(bitPattern: sdk.rawValue), radix: 16)) "), "boundary raw trace masks")
+            need(row.split(separator: " ")[7] == rows[0].split(separator: " ")[7], "boundary callback identity")
+        }
+        need(rows.last!.contains(" s=\(stage) ") && rows.last!.contains(" n=\(expected)"), "boundary exact trace stage")
+        let access = MountTrace.shared.accessRecordsForTesting()
+        need(access.count == (stage >= 5 ? 1 : 0), "one access observation only after access reached")
+        if let a = access.first {
+            need(a.hasPrefix("SMA1 ") && a.utf8.count <= 256, "separate bounded access schema")
+            need(a.contains(" l=\(rows[0].split(separator: " ")[6].dropFirst(2)) ") &&
+                 a.contains(" c=\(rows[0].split(separator: " ")[7].dropFirst(2)) "), "access association")
+            need(a.contains(stage == 5 ? " s=1 r=0 p=0 " : " s=4 r=0 p=1 "), "policy versus actual core success")
+        }
+
+#endif
+    }
+    for raw in [FSItem.Attribute(), .type, full, recorded, bit(62), bit(62).union(.type)] + (0..<14).map(bit) { get(raw) }
+    for n in 14...17 {
+        for raw in [bit(n), bit(n).union(full), bit(n).union(bit(18)), bit(n).union(bit(62))] { get(raw, expected: Int(ENOTSUP), stage: 2) }
+    }
+    get(FSItem.Attribute(rawValue: 0x3ffff), expected: Int(ENOTSUP), stage: 2)
+    for n in [18, 61, 63] {
+        for raw in [bit(n), bit(n).union(.type), bit(n).union(full), bit(n).union(bit(62))] { get(raw, expected: Int(ENOTSUP), stage: 6) }
+    }
+    let foreign = CallerIdentity(uid: Int(geteuid())+1, gid: Int(getegid()))
+    for raw in [full, recorded, bit(18)] {
+        get(raw, expected: Int(EINVAL), stage: 3, item: FSItem())
+        get(raw, expected: Int(EACCES), stage: 5, who: foreign)
+    }
+    for who in [CallerIdentity(uid: -1, gid: caller.gid),
+                CallerIdentity(uid: Int(UInt32.max) + 1, gid: caller.gid),
+                CallerIdentity(uid: caller.uid, gid: -1),
+                CallerIdentity(uid: caller.uid, gid: Int(UInt32.max) + 1)] {
+        get(full, expected: Int(EACCES), stage: 5, who: who)
+    }
+    if geteuid() != 0 { get(full, expected: Int(EACCES), stage: 5, who: CallerIdentity(uid: 0, gid: caller.gid)) }
+    get(bit(18).union(.backupTime), expected: Int(ENOTSUP), stage: 2, item: FSItem())
+    get(bit(18).union(.backupTime), expected: Int(ENOTSUP), stage: 2, who: foreign)
+    get(recorded, mutate: true)
+    get(bit(18), expected: Int(ENOTSUP), stage: 6, mutate: true)
+    m.serial {
+        v.preparedAttributesForTesting = { _, a in
+            let copy = incompleteSnapshot(a); copy.size = a.size
+            a.invalidateAllProperties()
+            a.type = copy.type; a.mode = copy.mode; a.linkCount = copy.linkCount
+            a.uid = copy.uid; a.gid = copy.gid; a.flags = copy.flags
+            a.size = copy.size; a.allocSize = copy.allocSize; a.fileID = copy.fileID; a.parentID = copy.parentID
+            a.accessTime = copy.accessTime; a.modifyTime = copy.modifyTime
+            a.changeTime = copy.changeTime; a.birthTime = copy.birthTime
+            for n in 0..<14 { need(a.isValid(bit(n)), "known fields survive invalidation") }
+            need(!a.isValid(bit(62)), "policy validity cleared")
+        }
+    }
+    get(recorded, expected: Int(ENOTSUP), stage: 6)
+    get([], expected: Int(ENOTSUP), stage: 6)
+    m.serial {
+        v.preparedAttributesForTesting = { _, a in prepared = a }
+        v.rejectResultForTesting = { _ in constructors += 1; return true }
+    }
+    get(recorded, expected: Int(EIO), stage: 7)
+    m.serial { v.preparedAttributesForTesting = nil; v.rejectResultForTesting = nil }
+#if STALLION_MOUNT_TRACE
+    MountTrace.shared.resetForTesting()
+#endif
+}
 func contextualResults(_ parent: URL) throws {
     let f = try Fixture(parent, "handler-results"), m = try Mounted(f), v = m.volume
     let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    contextualGetBoundary(m)
     let resultTypes: [FSVolumeHandlerResult.Type] = [FSLookupItemResult.self, FSGetAttributesResult.self,
         FSReadSymlinkResult.self, FSReadFileResult.self, FSWriteFileResult.self, FSSetAttributesResult.self]
     let resultMasks = resultTypes.map { ($0, $0.requestedAttributes.wantedAttributes) }
@@ -1799,7 +1937,7 @@ func contextualResults(_ parent: URL) throws {
             }
         }
     }
-    for unsupported in [unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
+    for unsupported in [FSItem.Attribute(rawValue: 1 << 62), unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
         do { _ = try StallionVolume.resultRequestForTesting(FSWriteFileResult.self, explicit: unsupported); need(false, "unsupported mandatory field") }
         catch { need(code(error) == Int(ENOTSUP), "unsupported result request refused") }
     }
@@ -1896,7 +2034,7 @@ func contextualResults(_ parent: URL) throws {
          explicitEntries.0 == emptyEntries.0 && explicitEntries.1 == emptyEntries.1 && emptyEntries.1.allSatisfy { $0 > 16 }, "explicit empty and full masks omit dot entries")
     let wrongVerifier = enumeration(explicit, start: nilEntries.1.last!, verifier: nilEntries.2)
     need(wrongVerifier.3 != nil && wrongVerifier.0.isEmpty, "attribute mode cannot reuse nil-enumeration verifier")
-    for unsupported in [unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
+    for unsupported in [FSItem.Attribute(rawValue: 1 << 62), unknownCallerAttribute(), .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO, [.size, .supportsLimitedXAttrs], [.size, .inhibitKernelOffloadedIO]] {
         let invalid = FSItem.GetAttributesRequest(); invalid.wantedAttributes = unsupported
         let refused = enumeration(invalid)
         need(code(refused.3) == Int(ENOTSUP) && refused.0.isEmpty, "unsupported explicit entry mask refused before packing")
@@ -1938,6 +2076,12 @@ func contextualResults(_ parent: URL) throws {
     let deniedList: (FSEnumerateDirectoryResult?, Error?) = wait { done in v.enumerationResultForTesting(m.root, caller: foreign, pack: { _,_,_,_,_ in need(false, "denied listing must not pack"); return true }) { done(($0,$1)) } }
     need(code(deniedLookup.1) == Int(EACCES) && code(deniedRead.1) == Int(EACCES) && code(deniedList.1) == Int(EACCES), "shared contextual bodies deny foreign values")
     m.close()
+    let closedRequest = FSItem.GetAttributesRequest(); closedRequest.wantedAttributes = FSItem.Attribute(rawValue: 0x4000000000003fff)
+    var closedReplies = 0
+    v.attributesResultForTesting(closedRequest, item: m.file, caller: caller) { result, error in
+        closedReplies += 1; need(result == nil && code(error) == Int(ENXIO), "closed GET atomic refusal")
+    }
+    need(closedReplies == 1, "closed GET synchronous exactly once")
 }
 func queuedResizeAfterIncompleteSnapshot(_ parent: URL) throws {
     let f = try Fixture(parent, "queued-incomplete"), m = try Mounted(f), v = m.volume, before = m.volume.anchor
@@ -5427,8 +5571,222 @@ func contextualXattrQueue(_ parent: URL) throws {
 #endif
 
 #endif
+#if STALLION_MOUNT_TRACE && STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+func accessBranchChecks(_ parent: URL) throws {
+    let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
+    for scenario in 0..<6 {
+        let f = try Fixture(parent, "access-branch-\(scenario)", mode: 0,
+                            acl: scenario == 2, owner: scenario == 1 ? geteuid() + 1 : geteuid())
+        let resource = SeekResource(url: f.url, writable: true)
+        let m = try Mounted(f, suppliedResource: resource), v = m.volume
+        var constructors = 0
+        m.serial {
+            v.rejectResultForTesting = { _ in constructors += 1; return false }
+            v.getAccessBoundaryForTesting = {
+                if scenario == 3 { resource.observationsBeforeRevocation = 0 }
+                if scenario == 4 { sfs_image_clear_read_cache(m.coreHandle); fault(8, 1) }
+                return scenario == 5 ? POSIXError(.EACCES) : nil
+            }
+        }
+        func get() -> (FSGetAttributesResult?, Error?) {
+            MountTrace.shared.resetForTesting()
+            let request = FSItem.GetAttributesRequest(); request.wantedAttributes = .type
+            return wait { done in v.attributesResultForTesting(request, item: m.file, caller: caller) { done(($0, $1)) } }
+        }
+        let result = get(); m.serial {}
+        let expected = [0, Int(EACCES), Int(ENOTSUP), Int(EACCES), Int(EIO), Int(EACCES)][scenario]
+        need(code(result.1) == expected && (result.0 != nil) == (expected == 0), "access branch \(scenario) result \(code(result.1)) expected \(expected)")
+        need(constructors == (expected == 0 ? 1 : 0), "denial precedes result constructor")
+        let records = MountTrace.shared.accessRecordsForTesting()
+        need(records.count == 1, "one branch observation")
+        let a = records[0]
+        need(a.contains(" n=\(expected)") && a.contains(" u=\(caller.uid) g=\(caller.gid) "), "copied identity and access outcome")
+        let branch = [" s=4 r=0 p=1 ", " s=1 r=0 p=0 ", " s=5 r=0 p=1 ", " s=2 r=2 p=0 ", " s=4 r=0 p=1 ", " s=2 r=1 p=0 "][scenario]
+        need(a.contains(branch), "actual branch observation")
+        if scenario == 4 { need(hits() == 1 && a.contains(" x=2 ") && a.contains(" e=5 "), "actual core IO receipt") }
+        need(MountTrace.shared.recordsForTesting().last!.contains(" s=\(expected == 0 ? 8 : 5) "), "unchanged outer stage")
+        // A latched failure at metadata on the next GET never reaches ownerAccess.
+        if scenario >= 3 {
+            m.serial { v.getAccessBoundaryForTesting = nil; resource.observationsBeforeRevocation = nil; fault(0, 0) }
+            let again = get()
+            need(code(again.1) == expected && MountTrace.shared.accessRecordsForTesting().isEmpty, "earlier latch does not invent access evidence")
+        }
+        m.serial { v.getAccessBoundaryForTesting = nil; resource.observationsBeforeRevocation = nil; fault(0, 0) }
+        m.close()
+    }
+}
+func mountTraceChecks(_ parent: URL) throws {
+    try accessBranchChecks(parent)
+    let trace = MountTrace.shared
+    let wideAccess = MountTrace.Access(load: .max, callback: .max, inode: .max,
+        caller: CallerIdentity(uid: Int.min, gid: Int.min), owner: .max, metadataUID: .max, mask: .max)
+    wideAccess.stage = .max; wideAccess.readyFailure = .max; wideAccess.corePresent = true
+    wideAccess.status = .max; wideAccess.phase = .max; wideAccess.systemErrno = .min
+    let wideText = wideAccess.payload(error: NSError(domain: NSPOSIXErrorDomain, code: Int.min))
+    need(wideText.utf8.count <= 256 && wideText.allSatisfy { $0.isASCII }, "maximum numeric access payload")
+    trace.resetForTesting()
+    DispatchQueue.concurrentPerform(iterations: 256) { _ in
+        let a = MountTrace.Access(load: 1, callback: 2, inode: 1,
+            caller: CallerIdentity(uid: 1, gid: 1), owner: 1, metadataUID: 1, mask: 128)
+        trace.emitAccess(a, error: NSError(domain: "PRIVATE STRING", code: 13))
+    }
+    need(trace.accessRecordsForTesting().count == 8 && trace.recordsForTesting().count == 1 && trace.id() == 1,
+         "independent concurrent access cap without SMT reservations or IDs")
+    need(trace.accessRecordsForTesting().allSatisfy { !$0.contains("PRIVATE") && $0.contains(" d=2 n=13") }, "numeric domain only")
+    let widest = MountTrace.payload(.max, .max, .max, .max, .max, .max, .max, Int.min, .max, .max, .max, .max, .max, Int.min)
+    need(widest.utf8.count <= 256, "maximum-width payload")
+    trace.resetForTesting()
+    DispatchQueue.concurrentPerform(iterations: 256) { _ in
+        let load = trace.id(), callback = trace.id()
+        trace.emit(1, 4, load: load, callback: callback)
+    }
+    let rows = trace.recordsForTesting()
+    need(rows.count == 64 && rows.filter { $0.contains(" e=5 ") }.count == 1, "63 ordinary including startup plus one overflow")
+    need(rows.reduce(0) { $0 + $1.utf8.count } <= 16384 && rows.allSatisfy { $0.utf8.count <= 256 }, "application payload bounds")
+    let seq = rows.map { $0.split(separator:" ")[2] }
+    need(Set(seq).count == 64, "concurrent sequence reservations unique")
+    let ids = rows.filter { $0.contains(" e=1 ") }.map { $0.split(separator:" ")[7] }
+    need(Set(ids).count == ids.count, "concurrent callback IDs unique")
+    let loads = rows.filter { $0.contains(" e=1 ") }.map { $0.split(separator:" ")[6] }
+    need(Set(loads).count == loads.count && Set(loads.map { String($0.dropFirst(2)) }).isDisjoint(with: Set(ids.map { String($0.dropFirst(2)) })), "concurrent load IDs unique and distinct from callback IDs")
+    trace.emit(1, 4); need(trace.recordsForTesting().count == 64, "no repeated overflow")
+    let f = try Fixture(parent, "mount-trace"), m = try Mounted(f), v = m.volume
+    let caller = CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
+    func get(_ raw: FSItem.Attribute, who: CallerIdentity? = nil, item: FSItem? = nil, expected: Int, stage: Int, reset: Bool = true) {
+        if reset { trace.resetForTesting() }
+        let request = FSItem.GetAttributesRequest(); request.wantedAttributes = raw
+        var count = 0
+        let result: (FSGetAttributesResult?, Error?) = wait { done in
+            v.attributesResultForTesting(request,item:item ?? m.file,caller:who ?? caller) {
+                if reset && stage >= 5 { need(trace.accessRecordsForTesting().count == 1, "access emitted before reply") }
+                count += 1; done(($0,$1))
+            }
+            if stage == 1 { need(count == 1,"GET enqueue refusal synchronous") }
+        }
+        m.serial {}
+        need(count == 1 && code(result.1) == expected && (result.0 == nil) == (expected != 0), "GET exactly once and atomic outcome")
+        need(request.wantedAttributes == raw, "original mask unchanged")
+        if reset {
+            let records = trace.recordsForTesting()
+            let entry = records.filter { $0.contains(" e=1 o=4 ") }, reply = records.filter { $0.contains(" e=3 o=4 ") }
+            need(entry.count == 1 && reply.count == 1, "GET paired evidence")
+            let mask = " m=\(String(UInt(bitPattern:raw.rawValue),radix:16)) "
+            need(entry[0].contains(mask) && reply[0].contains(mask) && reply[0].contains(" s=\(stage) ") && reply[0].contains(" n=\(expected)"), "original mask and exact stage survive failure")
+            need(entry[0].split(separator:" ")[7] == reply[0].split(separator:" ")[7], "callback association")
+        }
+    }
+    contextualGetBoundary(m)
+    get([.size,.fileID], expected:0, stage:8)
+    for raw: FSItem.Attribute in [.supportsLimitedXAttrs,.inhibitKernelOffloadedIO,[.size,.supportsLimitedXAttrs],[.size,.inhibitKernelOffloadedIO],.backupTime,.addedTime] {
+        get(raw,expected:Int(ENOTSUP),stage:2)
+    }
+    get(FSItem.Attribute(rawValue: 1 << 18),expected:Int(ENOTSUP),stage:6)
+    for raw in [0x10000, 0x20000, 0x30040] {
+        get(FSItem.Attribute(rawValue:raw),expected:Int(ENOTSUP),stage:2)
+    }
+    get(.supportsLimitedXAttrs,item:FSItem(),expected:Int(ENOTSUP),stage:2)
+    get(.size,who:CallerIdentity(uid:Int(geteuid())+1,gid:Int(getegid())),expected:Int(EACCES),stage:5)
+    m.serial { v.rejectResultForTesting = { $0 == "FSGetAttributesResult" } }
+    get(.size,expected:Int(EIO),stage:7)
+    m.serial { v.rejectResultForTesting = nil }
+    // Block the owner queue: admitted GET must defer its reply.
+    let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0), done = DispatchSemaphore(value:0)
+    v.enqueue { held.signal(); need(release.wait(timeout:.now()+20) == .success,"release trace queue") }
+    need(held.wait(timeout:.now()+20) == .success,"hold trace queue")
+    let request = FSItem.GetAttributesRequest();request.wantedAttributes = .size
+    v.attributesResultForTesting(request,item:m.file,caller:caller) { _, error in need(error == nil,"queued GET outcome");done.signal() }
+    need(done.wait(timeout:.now()) == .timedOut,"admitted GET is deferred")
+    release.signal();need(done.wait(timeout:.now()+20) == .success,"queued GET delivered")
+    for arguments in [Array(repeating:"x",count:65),[String(repeating:"x",count:1025)]] {
+        trace.resetForTesting();var count = 0
+        v.mount(arguments:arguments) { error in count += 1;need(code(error)==Int(E2BIG),"mount E2BIG") }
+        need(count == 1 && trace.recordsForTesting().last!.contains(" s=9 "),"synchronous argument refusal")
+    }
+    trace.resetForTesting()
+    let force: Error? = wait { v.mount(arguments:["-f"],replyHandler:$0) }
+    need(code(force)==Int(ENOTSUP) && trace.recordsForTesting().last!.contains(" s=10 "),"force stage")
+    trace.resetForTesting();for _ in 0..<100 { trace.emit(4,5) }
+    get(.size,expected:0,stage:8,reset:false)
+    need(trace.recordsForTesting().count == 64,"saturated emitter preserves reply")
+    trace.resetForTesting(discard:true)
+    get(.size,expected:0,stage:8,reset:false)
+    need(trace.recordsForTesting().isEmpty && trace.accessRecordsForTesting().isEmpty,"discarded emitters preserve reply")
+    let _: Bool = wait { done in v.unmount { done(true) } }
+    trace.resetForTesting();get(.size,expected:Int(ENXIO),stage:1)
+    need(trace.accessRecordsForTesting().isEmpty, "queue rejection has no access observation")
+    // Restore with ordinary callback, then use existing deterministic cleanup.
+    let mounted: Error? = wait { v.mount(arguments:[],replyHandler:$0) };need(mounted == nil,"restore test callback state")
+    m.close()
+    // Activation constructor rejection must roll back inactive state.
+    let af = try Fixture(parent,"trace-activation"), fs = fixtureFileSystem()
+    let resource = FSPathURLResource(url:af.url,writable:false)
+    let loaded: (FSVolume?,Error?) = wait { done in fs.loadResource(resource:resource,arguments:[]) { done(($0,$1)) } }
+    need(loaded.1 == nil,"activation fixture load");let av = loaded.0 as! StallionVolume
+    let _: Bool = wait { done in av.enqueue { av.rejectResultForTesting = { $0 == "FSActivateResult" };done(true) } }
+    trace.resetForTesting()
+    let active: (FSActivateResult?,Error?) = wait { done in av.activateResultForTesting { done(($0,$1)) } }
+    need(active.0 == nil && code(active.1)==Int(EIO),"activation constructor error")
+    need(trace.recordsForTesting().last!.contains(" s=7 z=0 "),"activation rollback precedes reply")
+    let unloaded: Error? = wait { fs.unloadResource(resource:resource,replyHandler:$0) };need(unloaded == nil,"activation fixture closed")
+    // Every synchronous load exit and deferred open/configuration failure.
+    func loadFailure(_ fs: StallionFileSystem, _ resource: FSResource, _ arguments: [String], _ expected: Int, _ stage: Int, synchronous: Bool) {
+        trace.resetForTesting();var count = 0
+        let done = DispatchSemaphore(value:0)
+        fs.loadResource(resource:resource,arguments:arguments) { volume, error in
+            need(volume == nil && code(error)==expected,"load original outcome"); count += 1;done.signal()
+        }
+        if synchronous { need(count == 1,"load early reply synchronous") }
+        need(done.wait(timeout:.now()+20) == .success,"load failure reply")
+        let drained: Bool = wait { fs.drainResourceWorkForTesting($0) };need(drained,"load budget released")
+        need(count == 1,"load exactly once")
+        need(trace.recordsForTesting().last!.contains(" s=\(stage) "),"load precise selected stage")
+    }
+    let lr = FSPathURLResource(url:af.url,writable:false)
+    loadFailure(fixtureFileSystem(),lr,Array(repeating:"-f",count:65),Int(E2BIG),9,synchronous:true)
+    loadFailure(fixtureFileSystem(),lr,[String(repeating:"x",count:1025)],Int(E2BIG),9,synchronous:true)
+    loadFailure(StallionExtension.fileSystemForTesting(extensionAttributes:nil),lr,[],Int(EINVAL),17,synchronous:true)
+    loadFailure(fixtureFileSystem(),FSGenericURLResource(url:af.url),[],Int(EINVAL),19,synchronous:true)
+    loadFailure(fixtureFileSystem(),FSPathURLResource(url:URL(fileURLWithPath:"/"+String(repeating:"x",count:4200)),writable:false),[],Int(ENAMETOOLONG),18,synchronous:true)
+    loadFailure(fixtureFileSystem(),lr,["-f"],Int(ENOTSUP),10,synchronous:true)
+    let revoked = FSPathURLResource(url:af.url,writable:false);revoked.revoke()
+    loadFailure(fixtureFileSystem(),revoked,[],Int(EACCES),15,synchronous:false)
+    let writable = FSPathURLResource(url:af.url,writable:true), configuring = fixtureFileSystem(accessPolicy:.contextualWrites)
+    configuring.setLoadConfigurationHookForTesting { writable.revoke() }
+    loadFailure(configuring,writable,[],Int(EACCES),16,synchronous:false)
+    // One held load permits deterministic routing and callback-budget refusals.
+    let busyFS = fixtureFileSystem(), entered = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0), loadedDone = DispatchSemaphore(value:0)
+    busyFS.setLoadConfigurationHookForTesting { entered.signal();need(resume.wait(timeout:.now()+20) == .success,"release load") }
+    busyFS.loadResource(resource:lr,arguments:[]) { volume,error in need(volume != nil && error == nil,"held load preserved");loadedDone.signal() }
+    need(entered.wait(timeout:.now()+20) == .success,"held load entered")
+    trace.resetForTesting();var routingCount = 0
+    busyFS.loadResource(resource:lr,arguments:[]) { volume,error in routingCount += 1;need(volume == nil && code(error)==Int(EINVAL),"routing refusal") }
+    need(routingCount == 1 && trace.recordsForTesting().last!.contains(" s=20 "),"routing synchronous outside lock")
+    let probes = DispatchGroup()
+    for _ in 1..<ReadOnlyLimits.callbacks {
+        probes.enter();busyFS.probeResource(resource:FSGenericURLResource(url:af.url)) { _,error in need(error == nil,"probe drains");probes.leave() }
+    }
+    trace.resetForTesting();var budgetCount = 0
+    busyFS.loadResource(resource:lr,arguments:[]) { volume,error in budgetCount += 1;need(volume == nil && code(error)==Int(EAGAIN),"budget refusal") }
+    need(budgetCount == 1 && trace.recordsForTesting().last!.contains(" s=1 "),"budget synchronous outside lock")
+    resume.signal();need(loadedDone.wait(timeout:.now()+20) == .success && probes.wait(timeout:.now()+20) == .success,"held load and probes close")
+    let busyClosed: Error? = wait { busyFS.unloadResource(resource:lr,replyHandler:$0) };need(busyClosed == nil,"load ownership closed")
+    trace.resetForTesting();var activationCount = 0
+    av.activateResultForTesting { result,error in activationCount += 1;need(result == nil && code(error)==Int(ENXIO),"activation enqueue rejection") }
+    need(activationCount == 1 && trace.recordsForTesting().last!.contains(" s=1 "),"activation rejection synchronous")
+    trace.resetForTesting();var mountCount = 0
+    av.mount(arguments:[]) { error in mountCount += 1;need(code(error)==Int(ENXIO),"mount enqueue rejection") }
+    need(mountCount == 1 && trace.recordsForTesting().last!.contains(" s=1 "),"mount rejection synchronous")
+    print("PASS mount trace masks, stages, replies, rollback, concurrent IDs, cap and discarded emitter")
+}
+#endif
+
 @main struct Driver {
     static func main() throws {
+#if STALLION_MOUNT_TRACE && STALLION_CONTEXT_HANDLERS && STALLION_WRITE_DIAGNOSTIC
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--mount-trace" {
+            try mountTraceChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true));return
+        }
+#endif
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--factory-policy" {
             try factoryPolicyChecks(URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))
             print("PASS public factory access selection, refusal and persistence")
@@ -5440,6 +5798,15 @@ func contextualXattrQueue(_ parent: URL) throws {
             return
         }
 #if STALLION_WRITE_DIAGNOSTIC
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--get-boundary" {
+            let parent = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+#if STALLION_CONTEXT_HANDLERS
+            try contextualPolicyValues(); try contextualResults(parent); try rejectedHandlerResults(parent)
+#endif
+            _ = try attributes(parent)
+            print("PASS GET boundary and strict attribute regressions")
+            return
+        }
 #if STALLION_CONTEXT_HANDLERS
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--xattr-unhooked" {
             let parent = URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
