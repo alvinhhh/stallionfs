@@ -72,20 +72,20 @@ def validate_compound(workspace, record):
             bad()
     # Helpers are flat, owned by this operation, and belong to one ordered
     # qualification + lifecycle attempt. No nested owners can finish the journal.
-    groups = []
+    groups = {}
     for kind in ('unmount', 'remount'):
         attempts = record.get(kind + '_attempts')
         if not isinstance(attempts, list): bad()
         for index, attempt in enumerate(attempts):
             if not isinstance(attempt, dict) or type(attempt.get('launched')) is not bool: bad()
-            groups.append((kind, index))
+            groups[(kind, index)] = len(groups)
     previous = -1
     labels = {}
     for helper in record['helpers']:
         if not isinstance(helper, dict): bad()
         group = (helper.get('stage'), helper.get('attempt'))
-        if group not in groups or type(group[1]) is not int: bad()
-        position = groups.index(group)
+        if group[0] not in ('unmount', 'remount') or type(group[1]) is not int or group not in groups: bad()
+        position = groups[group]
         if position < previous: bad()
         previous = position
         sequence = labels.setdefault(group, [])
@@ -115,6 +115,8 @@ def validate_compound(workspace, record):
             if helper['label'] == 'mount' and helper['argv'] == legacy_mount: continue
             if helper['label'] != 'verify-package' or helper['argv'] != _native.package_argv(host): bad()
     if record['outcome'] == 'complete' and record['phase'] != 'final-verified': bad()
+    if record['originally_mounted']:
+        _mount_publication_lineage(record)
 
 
 def _confirmed_bridge(record):
@@ -347,6 +349,11 @@ def _unmount_compound(store, path, metadata, operation):
     with _native.resource_binding(path, target, record) as check:
         _, row = _matching_mount(store, path, metadata, target, expected=record['accepted_mount'])
         attempt['before'] = row
+        if 'ordinary_interval' in record['accepted_mount']:
+            from ._native_interval import check_input
+            value = record['accepted_mount']['ordinary_interval']
+            check_input(store, path, metadata, target, row, value, owner=record['id'])
+            attempt['ordinary_interval'] = value
         record['phase'] = 'unmount-attempted'
         attempt['launched'] = True
         operation.persist()
@@ -369,6 +376,17 @@ def _offline_admission(store, path, operation):
             raise core.StallionError('Native backing admission or consumed close is incomplete')
         absent(store, path)
         check()
+        if record['unmount_attempts'] and 'ordinary_interval' in record['unmount_attempts'][-1]:
+            attempt = record['unmount_attempts'][-1]
+            if not _terminal_attempt(record, 'unmount'):
+                raise core.StallionError('Input interval unmount is not terminal')
+            close = {'version': 1, 'ordinary_interval': attempt['ordinary_interval'],
+                     'attempt': len(record['unmount_attempts']) - 1, 'before': attempt['before'],
+                     'observed_mount': None, 'guard': receipt}
+            from ._native_binding import _same_evidence
+            if 'input_interval_close' in attempt and not _same_evidence(attempt['input_interval_close'], close):
+                raise core.StallionError('Input interval close changed')
+            attempt['input_interval_close'] = close
         record['offline_admission'] = receipt
         record['phase'] = 'offline'
         operation.persist()
@@ -446,18 +464,103 @@ def _remount_compound(store, path, metadata, operation):
     return row
 
 
-def _mount_completion_evidence(record, row, index=None):
+def _mount_completion_evidence(record, row, index=None, *, helpers=None):
+    """A successful publishing attempt, not merely a terminal owned child."""
+    from ._native_binding import _same_evidence, _pair_guard, _chain_observation
     if index is None: index = len(record['remount_attempts']) - 1
-    if not _terminal_attempt(record, 'remount', index): return False
+    if not 0 <= index < len(record['remount_attempts']): return False
     attempt = record['remount_attempts'][index]
+    if helpers is None:
+        helpers = [h for h in record['helpers'] if h.get('stage') == 'remount'
+                   and type(h.get('attempt')) is int and h['attempt'] == index]
+    if (attempt.get('launched') is not True
+            or [h.get('label') for h in helpers] != ['verify-package', 'discover', 'mount']
+            or any(h.get('outcome') != 'success' or type(h.get('returncode')) is not int
+                   or h['returncode'] != 0 for h in helpers)
+            or 'response' not in attempt
+            or attempt['response'] is not None and not _same_evidence(
+                attempt['response'], {'outcome': 'success', 'returncode': 0})):
+        return False
+    # Retained legacy attempts may lose the response summary after durable
+    # usability evidence. The owned mount helper above must still record exact
+    # success; a present summary cannot contradict it. Never rewrite the loss.
+    try:
+        _native.check_helpers({'child_pending': record.get('child_pending'),
+                               'protocol': record.get('protocol'), 'helpers': helpers},
+                              {'verify-package', 'discover', 'mount'})
+        _pair_guard(attempt.get('guard'), record['target'])
+        if _chain_observation(row, Path(record['target']['directory']),
+                              {'controller_profile': record['profile']}) is None:
+            return False
+    except core.StallionError:
+        return False
     evidence, qualified = attempt.get('evidence'), attempt.get('qualified')
     return (isinstance(evidence, dict) and evidence.get('usable') is True
             and evidence.get('repo') == str(Path(record['target']['directory']) / 'volume/repo')
-            and evidence.get('observation') == row and row is not None
+            and _same_evidence(evidence.get('observation'), row)
             and isinstance(qualified, dict) and qualified.get('profile') == record['profile']
             and qualified.get('host') == record['host']
             and qualified.get('filesystem') == _native.PROFILES[record['profile']]['type']
             and _native._consumed(attempt.get('guard'), record['target'], record['committed_anchor']))
+
+
+def _mount_publication_lineage(record):
+    """Validate asserted successes in one pass, preserving failed attempts."""
+    from ._native_binding import _same_evidence
+    def bad():
+        raise core.StallionError('Compound mount publication evidence is inconsistent')
+    attempts = record['remount_attempts']
+    groups = {}
+    for helper in record['helpers']:
+        if helper.get('stage') == 'remount' and type(helper.get('attempt')) is int:
+            groups.setdefault(helper['attempt'], []).append(helper)
+    latest_saved = None
+    for index, attempt in enumerate(attempts):
+        evidence = attempt.get('evidence')
+        if 'evidence' in attempt or 'final_evidence' in attempt:
+            if (type(evidence) is not dict or not _mount_completion_evidence(
+                    record, evidence.get('observation'), index, helpers=groups.get(index, []))):
+                bad()
+        if 'final_evidence' in attempt:
+            if not _same_evidence(attempt['final_evidence'], {'observation': evidence['observation']}):
+                bad()
+            latest_saved = index
+    if record['phase'] == 'final-verified':
+        if (not attempts or not _mount_completion_evidence(record,
+                record['final_evidence']['observation'], helpers=groups.get(len(attempts) - 1, []))):
+            bad()
+    elif 'final_evidence' in record:
+        if (latest_saved is None or record['phase'] not in ('committed', 'remount-attempted')
+                or not _same_evidence(record['final_evidence'], attempts[latest_saved]['final_evidence'])):
+            bad()
+    return latest_saved, groups
+
+
+def _mounted_marker_evidence(record, row):
+    """Match a validated publication from this exact owner's attempt history.
+
+    A retained marker describes its producer, not the current namespace. A
+    later failed remount can leave that marker intact without becoming success.
+    """
+    from ._native_binding import _same_evidence
+    _, groups = _mount_publication_lineage(record)
+    attempts = record['remount_attempts']
+    latest = len(attempts) - 1
+    if latest < 0: return False
+    current = _mount_completion_evidence(record, row, latest, helpers=groups.get(latest, []))
+    if record['phase'] == 'final-verified' or record['outcome'] == 'complete':
+        return current and _same_evidence(record.get('final_evidence'), {'observation': row})
+    if current:
+        return True
+    # _remount_compound durably records usability before publishing its marker,
+    # before final verification or a saved-final reset can exist. Later failed
+    # attempts (or a crash before replacing the marker) retain that publication.
+    # The lineage check above validates every asserted success first, so a
+    # contradictory newer attempt cannot fall back to older valid evidence.
+    return (record['phase'] in ('committed', 'remount-attempted')
+            and any('evidence' in attempt
+                    and _same_evidence(attempt['evidence']['observation'], row)
+                    for attempt in attempts))
 
 
 def _historical_final_attempt(record):
@@ -531,6 +634,9 @@ def compound_locked(store, path, metadata, action, name, *, operation_id=None, w
         _mounts_only_at(store, path)
         row = _native.observe(path / 'volume', metadata['controller_profile'])
         accepted = _matching_mount(store, path, metadata, target)[0] if row is not None else None
+        if accepted is not None and 'ordinary_interval' in accepted:
+            from ._native_interval import capture
+            capture(store, path, metadata, target, row)
         details = {'phase': 'prepared', 'name': name, 'originally_mounted': row is not None,
             'accepted_mount': accepted, 'profile': metadata['controller_profile'], 'host': metadata['native_host'],
             'bridge_attempted': False, 'bridge_returned': False, 'unmount_attempts': [], 'remount_attempts': []}

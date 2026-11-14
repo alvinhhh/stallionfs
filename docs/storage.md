@@ -304,3 +304,26 @@ close must establish a current lifecycle baseline. Permanent purge still
 requires the original exact device and inode pairs: translated destructive
 authority after device renumbering is not supported, including after explicit
 current-image adoption. A stored hosting UUID alone cannot grant it.
+
+
+### Reconcile legacy offline mount history
+
+`sfs creations ID --reconcile-current TRANSACTION` explicitly admits the selected
+current backing when an otherwise valid legacy mount recovery lacks evidence that
+its unlinked unmount occurred afterward. Ordinary `--adopt-current` does not perform
+this reconciliation automatically.
+
+The operation requires an absent namespace, no pending operation, the original
+backing identity, valid terminal helper and initial acceptance evidence, and a fresh
+consumed exclusive guard. It saves an immutable receipt identifying the exact legacy
+records by raw hash, then publishes a binding only after another fresh guard and
+scope check. Existing installation bindings cannot be replaced by this action.
+Later operations remain independently validated; the receipt does not waive new
+history or require the current mount marker to remain unchanged.
+
+A successful result reports `current-image-reconciled` and
+`authority=legacy-offline-reconciliation`. It admits the present structurally checked
+root for further lifecycle use. It does not prove historical unmount order, recover
+missing content, or prove that earlier acknowledged writes survived. Prepared or
+unknown children, missing guard evidence and incomplete compound operations remain
+subject to their own recovery requirements.

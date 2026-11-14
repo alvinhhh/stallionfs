@@ -10,7 +10,7 @@ import re
 import stat
 import uuid
 
-from . import core, _native, _scan
+from . import core, _native, _scan, _bundle, _native_interval, _native_reconcile, _native_recovery
 from ._native_create_recovery import Admission, require, pair, safe, semantic
 
 NAME = 'native-binding.json'
@@ -171,7 +171,7 @@ def completed_operation(record, path, metadata, name):
         require(False, 'binding-unresolved-resources')
 
 
-def exclusions(store, a, path, metadata):
+def exclusions(store, a, path, metadata, *, reconciliation=None):
     """No stale ownership or mount evidence can authorize a new epoch/translation."""
     require(path.parent == a.root / 'workspaces', 'binding-moved')
     require(not a.exists(a.root / 'journals' / (path.name + '.json')), 'binding-pending-operation')
@@ -181,14 +181,14 @@ def exclusions(store, a, path, metadata):
                 'binding-retirement')
     store._no_mounts(path)
     require(not a.names(path / 'volume'), 'occupied-volume')
-    records = {}
-    if a.exists(path / 'native-operations'):
-        for name in a.names(path / 'native-operations'):
-            require(re.fullmatch('[0-9a-f]{32}', name), 'binding-operation-schema')
-            records[name] = a.read(path / 'native-operations' / name / 'record.json')
+    from ._native_interval import load
+    if reconciliation is not None and reconciliation.get('complete') is True:
+        from ._native_reconcile import validate_scope
+        validate_scope(a, path, metadata, reconciliation)
+    records = load(a, path)
     mounted = a.read(path / 'native-mount.json') if a.exists(path / 'native-mount.json') else None
-    proof = a.read(path / 'native-install.json') if mounted is None else None
-    return archive_anchor(records, path, metadata, mounted, proof)
+    proof = a.read(path / 'native-install.json')
+    return archive_anchor(records, path, metadata, mounted, proof, reconciliation=reconciliation)
 
 
 def _same_evidence(left, right):
@@ -217,8 +217,139 @@ def _pair_guard(receipt, target):
             and _native._consumed(receipt, target), 'binding-resolution-guard')
 
 
-def archive_anchor(records, path, metadata, mounted, proof=None):
+
+def _chain_observation(row, path, metadata):
+    """Return only independently typed mount authority, never source text."""
+    if row is None:
+        return None
+    profile = metadata.get('controller_profile')
+    require(type(profile) is str and profile in _native.PROFILES, 'binding-operation-profile')
+    require(type(row) is dict and type(row.get('path')) is str
+            and row['path'] == str(path / 'volume')
+            and type(row.get('filesystem')) is str
+            and row['filesystem'] == _native.PROFILES[profile]['type']
+            and type(row.get('owner')) is int and row['owner'] == os.getuid()
+            and type(row.get('flags')) is int
+            and type(row.get('fsid')) is list and len(row['fsid']) == 2
+            and all(type(n) is int for n in row['fsid'])
+            and row.get('readonly') is False and row.get('ignore_ownership') is False,
+            'binding-resolution-observation')
+    return {key: row[key] for key in ('path', 'filesystem', 'owner', 'flags', 'fsid')}
+
+
+def _chain_member(record, path, metadata, name):
+    """Validate an ordinary exceptional member without changing its outcome."""
+    require(record.get('id') == name and record.get('workspace') == path.name
+            and record.get('outcome') in ('incomplete', 'complete')
+            and record.get('operation') in ('native-mount', 'native-unmount')
+            and not any(k in record for k in ('observation_error', 'receipt_error'))
+            and ('protocol' not in record or type(record['protocol']) is int
+                 and record['protocol'] in (2, 3)), 'binding-unresolved-resources')
+    _native.check_pending(path.name, record)
+    target = core.native_target({'ownership': 'external-reference', 'native_image': record.get('target')})
+    old = metadata['native_image']
+    require(target['directory'] == str(path) and target['component'] == 'image.sfs'
+            and target['uuid'] == old['uuid'] and target['parent'][1] == old['object'][1]
+            and target['file'][1] == old['file'][1] and target['parent'][0] == target['file'][0],
+            'binding-operation-target')
+    require('observed_mount' in record, 'binding-resolution-observation')
+    after = _chain_observation(record['observed_mount'], path, metadata)
+    guard = record.get('current_guard')
+    if 'current_guard' in record:
+        _pair_guard(guard, target)
+    if 'failed_current_guard' in record:
+        _pair_guard(record['failed_current_guard'], target)
+        require(guard is not None and _same_evidence(guard, record['failed_current_guard']),
+                'binding-resolution-guard')
+    helpers = record['helpers']
+    require(all(k not in record or type(record[k]) is bool for k in
+                ('mount_attempted', 'already_absent')), 'binding-operation-incomplete')
+    if 'protocol' not in record and any(any(k in h for k in
+            ('streams_eof', 'streams_durable', 'output_bytes')) for h in helpers):
+        _native.check_helpers(dict(record, protocol=2), {'verify-package', 'discover', 'mount', 'unmount'})
+    require(all(not any(k in h for k in ('receipt_error', 'collector_error', 'stream_close_errors',
+                'interrupted', 'stop_errors')) for h in helpers), 'binding-operation-incomplete')
+    require(all(h['outcome'] in ('success', 'error', 'not-launched') for h in helpers)
+            and all(h['outcome'] == 'success' for h in helpers[:-1]), 'binding-operation-incomplete')
+    profile = metadata.get('controller_profile')
+    require(type(profile) is str and profile in _native.PROFILES, 'binding-operation-profile')
+    if record['operation'] == 'native-mount':
+        labels = ['verify-package', 'discover', 'mount']
+        require(guard is not None and len(helpers) <= 3
+                and [h['label'] for h in helpers] == labels[:len(helpers)], 'binding-operation-incomplete')
+        for h in helpers:
+            if h['label'] == 'mount':
+                argv = ['/sbin/mount', '-t', _native.PROFILES[profile]['type'], str(path), str(path / 'volume')]
+                require(record.get('mount_attempted') is True
+                        and h['argv'] in (argv, argv[:1] + ['-F'] + argv[1:]), 'binding-mount-argv')
+            elif h['label'] == 'discover':
+                require(len(h['argv']) == 2 and h['argv'][1] == '--discover-json'
+                        and Path(h['argv'][0]).is_absolute()
+                        and Path(h['argv'][0]).name == 'StallionFS'
+                        and Path(h['argv'][0]).parent.name == 'MacOS', 'binding-mount-argv')
+            else:
+                # Package argv contains the historical signed app location.
+                require(len(h['argv']) == 7
+                        and h['argv'] == _native.package_argv(Path(h['argv'][-1]) / 'Contents/MacOS/StallionFS'),
+                        'binding-mount-argv')
+        if helpers:
+            host = str(Path(helpers[0]['argv'][-1]) / 'Contents/MacOS/StallionFS')
+            require('native_host' not in metadata or metadata['native_host'] == host, 'binding-mount-argv')
+            if len(helpers) >= 2:
+                require(helpers[1]['argv'] == [host, '--discover-json'], 'binding-mount-argv')
+        if after is not None:
+            require(len(helpers) == 3, 'binding-operation-incomplete')
+        if record['outcome'] == 'complete' and 'write_probe' in record:
+            probe = record['write_probe']
+            require(type(probe) is dict and probe.get('complete') is True
+                    and type(probe.get('path')) is str
+                    and Path(probe['path']).parent == path / 'volume/repo'
+                    and re.fullmatch(r'\.stallionfs-write-[0-9a-f]{32}', Path(probe['path']).name),
+                    'binding-operation-incomplete')
+        return None, after, guard, False
+    require('before_mount' in record, 'binding-resolution-observation')
+    before = _chain_observation(record['before_mount'], path, metadata)
+    if before is None:
+        require(record.get('already_absent') is True and helpers == []
+                and after is None and guard is not None, 'binding-operation-incomplete')
+    else:
+        require(len(helpers) == 1 and helpers[0]['label'] == 'unmount'
+                and helpers[0]['argv'] == ['/sbin/umount', str(path / 'volume')], 'binding-operation-incomplete')
+        if helpers[0]['outcome'] == 'success':
+            require(after is None and guard is not None, 'binding-operation-incomplete')
+        else:
+            require(record['outcome'] == 'incomplete' and guard is None
+                    and _same_evidence(before, after), 'binding-operation-incomplete')
+    return before, after, guard, after is None
+
+
+def _mount_acceptance(record, proof, path):
+    """The producer persists initial acceptance before completing its mount."""
+    require(type(proof) is dict and proof.get('first_mount_attempted') is True,
+            'binding-initial-acceptance')
+    first = proof.get('first_use')
+    require(type(first) is dict and first.get('accepted') is True
+            and type(first.get('operation')) is str
+            and re.fullmatch('[0-9a-f]{32}', first['operation']), 'binding-initial-acceptance')
+    probe = first.get('write_probe')
+    require(type(probe) is dict and probe.get('complete') is True
+            and type(probe.get('path')) is str
+            and Path(probe['path']).parent == path / 'volume/repo'
+            and re.fullmatch(r'\.stallionfs-write-[0-9a-f]{32}', Path(probe['path']).name),
+            'binding-initial-acceptance')
+    if first['operation'] == record['id']:
+        require(_same_evidence(record.get('write_probe'), probe), 'binding-initial-acceptance')
+    else:
+        # _usable(initial=False) never emits a probe. A different initial
+        # identity cannot explain a probe on this completed operation.
+        require('write_probe' not in record, 'binding-initial-acceptance')
+
+
+def archive_anchor(records, path, metadata, mounted, proof=None, *, reconciliation=None, collect_legacy=False):
     """Validate an Admission-bounded archive map without following any stored paths."""
+    from ._native_interval import correlate_marker
+    if mounted is not None:
+        correlate_marker(records, mounted, path, metadata)
     closed = []
     incoming = {}
     paths = {str(path / 'native-operations' / name / 'record.json'): name for name in records}
@@ -235,57 +366,125 @@ def archive_anchor(records, path, metadata, mounted, proof=None):
                 targets.add(paths[reference['record']])
             for target in targets:
                 incoming.setdefault(target, []).append(name)
+    exceptional = set()
+    successor = {}
     for name, record in records.items():
         if record.get('outcome') == 'complete':
             completed_operation(record, path, metadata, name)
             if record['operation'] in ('native-snapshot', 'native-restore', 'native-catalog-observe',
                                        'native-mounted-snapshot', 'native-mounted-restore'):
                 closed.append(record['native_image_result']['close_receipt'])
+        else:
+            exceptional.add(name)
+            candidates = incoming.get(name, [])
+            require(len(candidates) == 1 and candidates[0] != name, 'binding-resolution-edge')
+            successor[name] = candidates[0]
+    # Walk each suffix once; no recursion or ordering/timestamp assumptions.
+    resolved = set()
+    used = set()
+    for start in exceptional:
+        trail, visiting = [], set()
+        current = start
+        while current not in resolved:
+            require(current not in visiting, 'binding-resolution-edge')
+            visiting.add(current)
+            trail.append(current)
+            used.add(current)
+            if current not in exceptional:
+                require(records[current].get('outcome') == 'complete'
+                        and records[current].get('operation') in ('native-mount', 'native-unmount'),
+                        'binding-resolution-edge')
+                break
+            current = successor[current]
+        resolved.update(trail)
+    # Check every used incoming reference, including completed boundaries.
+    pending = list(used)
+    predecessors = {}
+    while pending:
+        name = pending.pop()
+        record = records[name]
+        require('previous_unresolved' in record, 'binding-resolution-edge')
+        reference = record['previous_unresolved']
+        if reference is None:
             continue
-        require(record.get('operation') == 'native-mount' and record.get('outcome') == 'incomplete'
-                and record.get('id') == name and record.get('workspace') == path.name
-                and 'previous_unresolved' in record and record['previous_unresolved'] is None
-                and record.get('mount_attempted') is True
-                and 'observed_mount' in record and record['observed_mount'] is None,
-                'binding-unresolved-resources')
-        successors = incoming.get(name, [])
-        require(len(successors) == 1 and successors[0] != name, 'binding-resolution-edge')
-        successor = records[successors[0]]
-        reference = dict(operation='native-mount', id=name, outcome='incomplete',
-                         record=str(path / 'native-operations' / name / 'record.json'))
-        require(successor.get('previous_unresolved') == reference
-                and successor.get('operation') == 'native-unmount'
-                and successor.get('already_absent') is True
-                and 'before_mount' in successor and successor['before_mount'] is None
-                and 'observed_mount' in successor and successor['observed_mount'] is None
-                and successor.get('helpers') == [], 'binding-resolution-edge')
-        for row in (record, successor):
-            require('protocol' not in row or type(row['protocol']) is int and row['protocol'] in (2, 3),
-                    'binding-operation-protocol')
-        completed_operation(successor, path, metadata, successors[0])
-        _native.check_pending(path.name, record)
-        for row in (record, successor):
-            target = core.native_target({'ownership': 'external-reference', 'native_image': row.get('target')})
-            _pair_guard(row.get('current_guard'), target)
-        require(_same_evidence(record.get('target'), successor['target'])
-                and _same_evidence(record.get('current_guard'), successor.get('current_guard')),
-                'binding-resolution-target')
-        helpers = record['helpers']
-        require([h['label'] for h in helpers] == ['verify-package', 'discover', 'mount']
-                and all(h['outcome'] == 'success' and h['returncode'] == 0 for h in helpers[:2])
-                and helpers[-1]['outcome'] == 'error' and helpers[-1]['returncode'] != 0,
-                'binding-operation-incomplete')
-        profile = metadata.get('controller_profile')
-        require(type(profile) is str and profile in _native.PROFILES, 'binding-operation-profile')
-        argv = ['/sbin/mount', '-t', _native.PROFILES[profile]['type'], str(path), str(path / 'volume')]
-        require(helpers[-1]['argv'] in (argv, argv[:1] + ['-F'] + argv[1:]), 'binding-mount-argv')
-        if mounted is not None and mounted.get('operation') == successors[0]:
-            target = core.native_target({'ownership': 'external-reference', 'native_image': mounted.get('target')})
-            _pair_guard(mounted.get('current_guard'), target)
-            require(_same_evidence(mounted.get('target'), successor['target'])
-                    and _same_evidence(mounted.get('current_guard'), successor['current_guard']),
-                    'binding-resolution-marker')
-        closed.append(successor['current_guard'])
+        require(type(reference) is dict and type(reference.get('id')) is str
+                and re.fullmatch('[0-9a-f]{32}', reference['id'])
+                and reference['id'] in records and reference['id'] != name, 'binding-resolution-edge')
+        previous = reference['id']
+        prior = records[previous]
+        expected = dict(operation=prior.get('operation'), id=previous, outcome=prior.get('outcome'),
+                        record=str(path / 'native-operations' / previous / 'record.json'))
+        require(_same_evidence(reference, expected) and incoming.get(previous) == [name]
+                and _same_evidence(record.get('target'), prior.get('target')), 'binding-resolution-edge')
+        predecessors[name] = previous
+        if previous not in used:
+            require(prior.get('outcome') == 'complete', 'binding-resolution-edge')
+            used.add(previous)
+            pending.append(previous)
+    members = {name: _chain_member(records[name], path, metadata, name) for name in used}
+    require(mounted is not None or not any(records[n]['outcome'] == 'complete'
+            and records[n]['operation'] == 'native-mount' for n in used), 'binding-missing-closed-anchor')
+    completed_mounts = [n for n in used if records[n]['outcome'] == 'complete'
+                        and records[n]['operation'] == 'native-mount']
+    for name in completed_mounts:
+        _mount_acceptance(records[name], proof, path)
+    from ._native_interval import Index
+    intervals = Index(records, path, metadata)
+    require(not intervals.open, 'binding-open-interval')
+    for name in intervals.origins:
+        if records[name]['outcome'] == 'complete':
+            _mount_acceptance(records[name], proof, path)
+    closed.extend(intervals.closed_guards)
+    legacy = set(completed_mounts) - intervals.origins.keys()
+    if legacy:
+        from ._native_reconcile import legacy_closes
+        closed.extend(legacy_closes(records, path, metadata, legacy))
+        require(type(reconciliation) is dict and legacy <= set(reconciliation['scope']['endpoints']),
+                'binding-close-continuity-unproven')
+        closed.append(reconciliation['guard'])
+    for name in set(completed_mounts) - legacy:
+        require(name in intervals.closes, 'binding-close-continuity-unproven')
+    if intervals.origins or mounted is not None and 'lifecycle_version' in mounted:
+        require(type(mounted) is dict and type(mounted.get('operation')) is str
+                and mounted['operation'] in records, 'binding-resolution-marker')
+        current = records[mounted['operation']]
+        completed_operation(current, path, metadata, current['id'])
+        require(_same_evidence(current.get('target'), mounted.get('target'))
+                and _same_evidence(current.get('current_guard'), mounted.get('current_guard'))
+                and _same_evidence(current.get('ordinary_interval'), mounted.get('ordinary_interval')),
+                'binding-resolution-marker')
+    # Propagate only witnessed guards along each explicit linear sequence.
+    following = {previous: name for name, previous in predecessors.items()}
+    seen = set()
+    for root in used - predecessors.keys():
+        current, previous_after, last_guard = root, None, None
+        first = True
+        while current is not None:
+            require(current not in seen, 'binding-resolution-edge')
+            seen.add(current)
+            before, after, guard, is_close = members[current]
+            if not first:
+                require(_same_evidence(previous_after, before), 'binding-resolution-observation')
+            if guard is not None and last_guard is not None:
+                if before is None:
+                    require(_same_evidence(guard, last_guard), 'binding-resolution-guard')
+                else:
+                    require(guard['generation'] >= last_guard['generation'], 'binding-resolution-guard')
+                    if guard['generation'] == last_guard['generation']:
+                        require(all(_same_evidence(guard[k], last_guard[k]) for k in
+                                    ('generation', 'committed_end', 'root_digest')), 'binding-conflicting-anchors')
+            if guard is not None:
+                last_guard = guard
+            if is_close:
+                closed.append(guard)
+            if mounted is not None and mounted.get('operation') == current:
+                target = core.native_target({'ownership': 'external-reference', 'native_image': mounted.get('target')})
+                _pair_guard(mounted.get('current_guard'), target)
+                require(is_close and _same_evidence(mounted['target'], records[current]['target'])
+                        and _same_evidence(mounted['current_guard'], guard), 'binding-resolution-marker')
+            previous_after, first = after, False
+            current = following.get(current)
+    require(seen == used, 'binding-resolution-edge')
     if mounted is not None:
         require(mounted.get('state') == 'absent' and type(mounted.get('target')) is dict
                 and mounted['target']['uuid'] == metadata['native_image']['uuid']
@@ -307,14 +506,18 @@ def archive_anchor(records, path, metadata, mounted, proof=None):
         generation = anchor['generation']
         require(generation not in anchors or anchors[generation] == anchor, 'binding-conflicting-anchors')
         anchors[generation] = anchor
-    return max(closed, key=lambda receipt: receipt['generation'])
+    result = max(closed, key=lambda receipt: receipt['generation'])
+    return (result, legacy) if collect_legacy else result
 
 
 def validate(record, metadata, digest):
-    require(type(record) is dict and set(record) == KEYS and type(record['schema']) is int
-            and record['schema'] == 1 and record['complete'] is True
+    require(type(record) is dict and type(record.get('schema')) is int
+            and (record['schema'] == 1 and set(record) == KEYS
+                 and record.get('authority') in ('installation', 'current-image-adoption')
+                 or record['schema'] == 2 and set(record) == KEYS | {'basis'}
+                 and record.get('authority') == 'legacy-offline-reconciliation') and record['complete'] is True
             and type(record['publication_file_id']) is int and 0 < record['publication_file_id'] < 1 << 64
-            and record['authority'] in ('installation', 'current-image-adoption')
+            and record['authority'] in ('installation', 'current-image-adoption', 'legacy-offline-reconciliation')
             and isinstance(record['epoch'], str) and re.fullmatch('[0-9a-f]{32}', record['epoch'])
             and record['workspace'] == metadata['id'] and record['transaction'] == metadata['transaction']
             and record['origin_target'] == metadata['native_image'] and record['historical'] == digest,
@@ -349,6 +552,12 @@ def resolve(store, path, metadata, *, admission=None):
         digest, _ = evidence(a, path, metadata)
         record = a.read(binding)
         validate(record, metadata, digest)
+        reconciliation = None
+        if record['schema'] == 2:
+            from ._native_reconcile import read_basis
+            reconciliation = read_basis(a, path, metadata, record['basis'])
+            if not a.exists(a.root / 'journals' / (path.name + '.json')) and _native.observe(path / 'volume', metadata['controller_profile']) is None:
+                exclusions(store, a, path, metadata, reconciliation=reconciliation)
         require(a.files[binding][0][1] == record['publication_file_id'], 'binding-publication-substitution')
         require(record['admitted_target']['directory'] == str(a.root / 'workspaces' / path.name),
                 'binding-store-location-changed')
@@ -357,18 +566,28 @@ def resolve(store, path, metadata, *, admission=None):
             require(stable == expected, 'hosting-identity-changed')
             mounted_path = path / 'native-mount.json'
             mounted = a.read(mounted_path) if a.exists(mounted_path) else {}
+            from ._native_interval import correlate_marker, load, pending_ordinary
+            journal = a.root / 'journals' / (path.name + '.json')
+            pending = a.read(journal) if a.exists(journal) else None
+            records = load(a, path)
+            # Retained receipts keep their original workspace paths after a
+            # managed move. Validate that historical identity without changing
+            # it into current relocation or destructive authority.
+            history_path = a.root / 'workspaces' / path.name
+            correlate_marker(records, mounted, history_path, metadata, pending)
             translated = target['file'][0] != record['admitted_target']['file'][0]
             if translated:
-                journal = a.root / 'journals' / (path.name + '.json')
-                pending = a.read(journal) if a.exists(journal) else None
-                require(pending is None or pending.get('target') == target, 'binding-pending-operation')
+                require(pending is None or _same_evidence(pending.get('target'), target), 'binding-pending-operation')
                 location_path = path / 'native-location.json'
                 location = a.read(location_path) if a.exists(location_path) else {}
                 located = (location.get('complete') is True and location.get('object') == target['parent']
                            and location.get('file') == target['file'] and location.get('uuid') == target['uuid']
                            and _native._consumed(location.get('guard'), target))
                 if mounted.get('target') != target and not located:
-                    exclusions(store, a, path, metadata)
+                    if pending is None:
+                        exclusions(store, a, path, metadata, reconciliation=reconciliation)
+                    else:
+                        pending_ordinary(records, pending, path, metadata)
                 elif mounted.get('state') != 'mounted' and not located:
                     require(mounted.get('state') == 'absent' and _native._consumed(mounted.get('current_guard'), target),
                             'binding-mount-uncertain')
@@ -383,38 +602,48 @@ def resolve(store, path, metadata, *, admission=None):
             a.close()
 
 
-def enroll(store, a, path, metadata, *, adopt=False):
+def enroll(store, a, path, metadata, *, adopt=False, reconciliation=None):
     """Caller holds store/use/workspace locks. Publish only after consumed close."""
     if a.exists(path / NAME):
+        existing = a.read(path / NAME)
+        if existing.get('schema') == 2:
+            from ._native_reconcile import read_basis
+            reconciliation = read_basis(a, path, metadata, existing.get('basis'))
         if adopt:
-            exclusions(store, a, path, metadata)
-            require(a.read(path / NAME).get('authority') == 'current-image-adoption',
+            exclusions(store, a, path, metadata, reconciliation=reconciliation)
+            require(a.read(path / NAME).get('authority') in ('current-image-adoption', 'legacy-offline-reconciliation'),
                     'image-already-has-installation-binding')
         resolve(store, path, metadata, admission=a)
         return {'status': 'current-image-adopted' if adopt else 'bound', 'already_adopted': True,
                 'workspace': path.name, 'transaction': metadata['transaction']}
     digest, _ = evidence(a, path, metadata)
-    closed = exclusions(store, a, path, metadata)
+    closed = exclusions(store, a, path, metadata, reconciliation=reconciliation)
     require(closed.get('physical_end') == closed.get('committed_end'), 'binding-uncertain-physical-end')
     anchor = {k: closed[k] for k in ('generation', 'committed_end', 'root_digest')}
     with descriptors(a, path, metadata) as (stable, target, observe):
+        if reconciliation is not None:
+            require(_same_evidence(stable, reconciliation['scope']['stable']), 'reconciliation-host-changed')
         if not adopt:
             require(target == historical_target(path, metadata)
                     and pair(os.fstat(a.directory(path.parent))) == metadata['native_image']['parent'],
                     'legacy-device-changed-use-adopt-current')
         def held(token):
-            exclusions(store, a, path, metadata)
+            exclusions(store, a, path, metadata, reconciliation=reconciliation)
             require(observe() == (stable, target) and evidence(a, path, metadata)[0] == digest,
                     'binding-evidence-changed')
         receipt = _native.guarded(target, held, anchor=anchor, expected_anchor=anchor)
         require(receipt.get('physical_end') == anchor['committed_end'], 'binding-uncertain-physical-end')
         require(observe() == (stable, target) and evidence(a, path, metadata)[0] == digest,
                 'binding-evidence-changed')
-        exclusions(store, a, path, metadata)
+        exclusions(store, a, path, metadata, reconciliation=reconciliation)
         record = dict(schema=1, epoch=uuid.uuid4().hex,
                       authority='current-image-adoption' if adopt else 'installation', workspace=path.name,
                       transaction=metadata['transaction'], historical=digest, origin_target=metadata['native_image'],
                       stable=stable, admitted_target=target, anchor=anchor, guard=receipt, complete=True)
+        if reconciliation is not None:
+            from ._native_reconcile import binding_basis
+            record.update(schema=2, authority='legacy-offline-reconciliation',
+                          basis=binding_basis(a, path, reconciliation))
         publish(a, path / NAME, record)
         require(a.read(path / NAME) == record and observe() == (stable, target), 'binding-publication-changed')
     return {'status': 'current-image-adopted' if adopt else 'bound', 'workspace': path.name,

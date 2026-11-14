@@ -43,8 +43,11 @@ class NativeMountCommand(unittest.TestCase):
 
     def test_failed_fskit_mount_is_retained_without_legacy_retry(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            (root / 'workspaces').mkdir(mode=0o700)
+            (root / 'journals').mkdir(mode=0o700)
             workspace = root / 'workspaces/owned-image'
+            workspace.mkdir(mode=0o700)
             metadata = {'controller_profile': 'production'}
             proof = {'first_use': {'accepted': False}}
             operation = Mock(record={})
