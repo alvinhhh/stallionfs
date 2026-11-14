@@ -1,6 +1,7 @@
 """Completed history and publication recovery on owned fixtures."""
 import contextlib
 import copy
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -184,10 +185,13 @@ class BindingHistory(unittest.TestCase):
                              final_evidence={'observation': None})
             binding.completed_operation(op.record, self.path, self.meta, op.record['id'])
             mounted = copy.deepcopy(op.record)
-            row = {'filesystem': 'stallionfs', 'path': str(self.path / 'volume')}
+            row = {'filesystem': 'stallionfs', 'path': str(self.path / 'volume'),
+                   'owner': os.getuid(), 'flags': 0, 'fsid': [1, 2],
+                   'readonly': False, 'ignore_ownership': False}
             mounted.update(originally_mounted=True, accepted_mount=row, final_evidence={'observation': row},
                            unmount_attempts=[{'launched': True}], remount_attempts=[{
                                'launched': True, 'guard': _native.guarded(mounted['target']),
+                               'response': {'outcome': 'success', 'returncode': 0},
                                'qualified': {'profile': 'production', 'host': str(_native.HOST), 'filesystem': 'stallionfs'},
                                'evidence': {'usable': True, 'repo': str(self.path / 'volume/repo'), 'observation': row}}])
             for stage in ('unmount', 'remount'):
@@ -325,6 +329,10 @@ class ResolvedMountHistory(unittest.TestCase):
     def setUp(self):
         import json
         self.wire = json.loads((Path(__file__).parent / 'fixtures/native-resolved-mount-history.json').read_text())
+        # The immutable sanitized fixture uses a public placeholder signer.
+        from stallionfs import _bundle
+        signer = patch.object(_bundle, 'PUBLISHER_TEAM', 'TESTTEAM00')
+        signer.start(); self.addCleanup(signer.stop)
         self.path = Path(self.wire['mount']['target']['directory'])
         target = self.wire['mount']['target']
         self.meta = {'controller_profile': 'production', 'native_image': {

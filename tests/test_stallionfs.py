@@ -97,7 +97,8 @@ class Workspaces(unittest.TestCase):
                             "if sys.argv[1:] != ['--discover-json']: raise SystemExit(2)\n"
                             'print(' + repr(json.dumps(inventory)) + ')\n')
             host.chmod(0o700)
-        verifier = [sys.executable, '-I', '-B', '-c', 'pass']
+        package_argv = _native.package_argv
+        verifier = package_argv(host)
         original_open, original_close = os.open, os.close
         executor = _native.execute_owned
         def opened(path, flags, *args, **kwargs):
@@ -117,8 +118,16 @@ class Workspaces(unittest.TestCase):
         def command(argv, record, persist, directory, **kwargs):
             if argv[0] == runtime['executable']:
                 return executor(argv, record, persist, directory, **kwargs)
-            if argv == verifier or argv == [str(host), '--discover-json']:
+            if argv == verifier:
                 state['helper_commands'].append(list(argv))
+                record.update(argv=list(argv), child_pending=False, outcome='success', returncode=0,
+                              pid=123, reaped=True, streams_eof=True, streams_durable=True, output_bytes=0,
+                              stdout=str(directory / 'stdout'), stderr=str(directory / 'stderr'))
+                persist()
+                return record
+            if argv == [str(host), '--discover-json']:
+                state['helper_commands'].append(list(argv))
+                kwargs.setdefault('output_limit', 2 * 1024 * 1024)
                 return executor(argv, record, persist, directory, **kwargs)
             self.assertIn(argv[0], ('/sbin/mount', '/sbin/umount'))
             state['commands'].append(list(argv))
@@ -154,7 +163,8 @@ class Workspaces(unittest.TestCase):
                 self.assertEqual(len(argv), 2)
                 result = state.get('unmount_status', 0)
                 if not result: state['rows'].pop(argv[1], None)
-            record.update(child_pending=False, reaped=True, returncode=result, outcome='success' if not result else 'error')
+            record.update(child_pending=False, reaped=True, returncode=result, outcome='success' if not result else 'error',
+                          streams_eof=True, streams_durable=True, output_bytes=0)
             persist()
             if state.get('interrupt'):
                 record['outcome'] = 'unknown'; persist()
@@ -215,6 +225,7 @@ class Workspaces(unittest.TestCase):
             operation.persist()
             return _native.PROFILES[metadata['controller_profile']]['type']
         with self.native_creation_fixture() as runtime, \
+             patch('stallionfs._native.package_argv', side_effect=package_argv), \
              patch('stallionfs._native.HOST', host), \
              patch('stallionfs._native.qualify', side_effect=qualify), \
              patch('stallionfs._native.execute_owned', side_effect=command), \

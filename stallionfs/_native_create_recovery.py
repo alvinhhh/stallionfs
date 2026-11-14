@@ -5,6 +5,7 @@ import contextlib
 import copy
 import fcntl
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -66,6 +67,7 @@ class Admission:
     def __init__(self, root):
         self.root = Path(root).expanduser().absolute()
         self.fds, self.bindings, self.files = {}, {}, {}
+        self.raw_hashes = {}
         self.entries = self.bytes = 0
 
     def close(self):
@@ -154,6 +156,7 @@ class Admission:
             stamp = (pair(after), after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             require(path not in self.files or self.files[path] == stamp, 'metadata-substitution', path)
             self.files[path] = stamp
+            self.raw_hashes[path] = hashlib.sha256(data).hexdigest()
             value = json.loads(data, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
                                object_pairs_hook=unique_object)
             require(type(value) is dict and type(value.get('format')) is int and value['format'] == 1,

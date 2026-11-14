@@ -116,6 +116,7 @@ def main(argv=None):
     creation_action.add_argument('--continue', dest='continue_operation', metavar='TRANSACTION', help='Continue the matching retained creation')
     creation_action.add_argument('--purge', dest='purge_creation', metavar='TRANSACTION')
     creation_action.add_argument('--adopt-current', dest='adopt_current', metavar='TRANSACTION', help='Adopt the selected current closed image')
+    creation_action.add_argument('--reconcile-current', dest='reconcile_current', metavar='TRANSACTION', help='Reconcile selected legacy offline history against current backing')
     creations.add_argument('--confirm', action='store_true')
     creations.add_argument('--native-host', type=Path, help='Qualified containing-app discovery executable')
     for action in ("mount", "unmount"):
@@ -190,6 +191,8 @@ def main(argv=None):
     if setup and args.action != "prepare":
         parser.error("Only prepare accepts a command after --")
     if args.action == 'creations':
+        if args.reconcile_current is not None and args.id is None:
+            parser.error('creations --reconcile-current requires ID')
         if args.adopt_current is not None and args.id is None:
             parser.error('creations --adopt-current requires ID')
         if args.purge_creation is not None and args.id is None:
@@ -198,7 +201,7 @@ def main(argv=None):
             parser.error('--confirm requires --purge')
         if args.continue_operation is not None and args.id is None:
             parser.error('creations --continue requires ID')
-        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation), ('TRANSACTION', args.purge_creation), ('TRANSACTION', args.adopt_current)):
+        for label, value in (('ID', args.id), ('TRANSACTION', args.continue_operation), ('TRANSACTION', args.purge_creation), ('TRANSACTION', args.adopt_current), ('TRANSACTION', args.reconcile_current)):
             if value is not None and re.fullmatch('[0-9a-f]{32}', value) is None:
                 parser.error(label + ' must contain 32 lowercase hexadecimal characters')
         if args.native_host is not None and args.continue_operation is None:
@@ -225,7 +228,12 @@ def main(argv=None):
             from ._native_create_recovery import inventory, continue_creation
             root = Path(args.root).expanduser().absolute()
             continuing = args.continue_operation is not None
-            if args.adopt_current is not None:
+            if args.reconcile_current is not None:
+                from ._native_reconcile import reconcile_current
+                result = reconcile_current(root, args.id, args.reconcile_current)
+                success = result['status'] == 'current-image-reconciled'
+                text = json.dumps(result, sort_keys=True)
+            elif args.adopt_current is not None:
                 from ._native_binding import adopt_current
                 result = adopt_current(root, args.id, args.adopt_current)
                 success = result['status'] == 'current-image-adopted'

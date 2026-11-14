@@ -584,6 +584,9 @@ class Operation:
         private_directory(parent)
         self.directory = parent / (operation_id or uuid.uuid4().hex)
         self.directory.mkdir(mode=0o700)
+        if details is not None and details.get('lifecycle_version') == 1 and action == 'native-mount':
+            from ._native_interval import seed
+            details = dict(details, interval_seed=seed(self.directory.name, path, target))
         self.record = {'operation': action, 'workspace': path.name, 'id': self.directory.name,
                        'target': target, 'outcome': 'prepared', 'child_pending': False,
                        'helpers': [], 'previous_unresolved': self.previous_reference(previous)}
@@ -911,6 +914,13 @@ def _record_failure(error, operation, volume, profile):
         operation.record['failed_current_guard'] = current_guard
     try:
         operation.record['observed_mount'] = observe(volume, profile)
+        if (operation.record.get('lifecycle_version') == 1
+                and operation.record['operation'] == 'native-mount'
+                and operation.record['observed_mount'] is not None
+                and 'ordinary_interval' not in operation.record):
+            from ._native_interval import token
+            operation.record['ordinary_interval'] = token(operation.record['id'], operation.path,
+                {'controller_profile': profile}, operation.record['target'], operation.record['observed_mount'])
     except BaseException as observed_error:
         operation.record['observation_error'] = {'type': type(observed_error).__name__, 'message': str(observed_error)}
     try:
@@ -974,9 +984,13 @@ def mount_locked(store, path, metadata):
                     or any(state['observation'].get(key) != row[key] for key in ('path', 'filesystem', 'owner', 'flags', 'fsid'))):
                 raise failure('Expected native mount is present with unresolved completion; explicitly unmount before retrying',
                               {'workspace': path.name, 'observed_mount': row, 'observed_usable': (volume / 'repo').is_dir()})
+            from ._native_interval import capture
+            capture(store, path, metadata, target, row)
             return {**metadata, 'path': _usable(store, path, metadata), 'mount': row}
+        from ._native_interval import capture
+        capture(store, path, metadata, target, None)
         private_directory(volume)
-        operation = Operation(store, path, 'native-mount', target)
+        operation = Operation(store, path, 'native-mount', target, details={'lifecycle_version': 1})
         transport['native_operation'] = operation.record
         try:
             operation.record['current_guard'] = _guard_current(target)
@@ -993,6 +1007,11 @@ def mount_locked(store, path, metadata):
             if command['returncode'] != 0:
                 raise failure('Native mount command failed; installed workspace retained', operation.record)
             row = _observe_until(volume, profile, True)
+            from ._native_interval import token
+            operation.record['observed_mount'] = row
+            operation.record['ordinary_interval'] = token(operation.record['id'], path, metadata, target, row)
+            operation.record['outcome'] = 'incomplete'
+            operation.persist()
             check()
             repo = _usable(store, path, metadata, initial=initial, operation=operation)
             if initial:
@@ -1000,7 +1019,8 @@ def mount_locked(store, path, metadata):
                                       'write_probe': operation.record['write_probe']}
                 _persist(path / 'native-install.json', proof)
             transport['path'] = repo
-            state = {'state': 'mounted', 'target': target, 'profile': profile, 'observation': row, 'operation': operation.record['id']}
+            state = {'state': 'mounted', 'target': target, 'profile': profile, 'observation': row, 'operation': operation.record['id'],
+                     'lifecycle_version': 1, 'ordinary_interval': operation.record['ordinary_interval']}
             _persist(state_path, state)
             operation.record['observed_mount'] = row
             operation.finish()
@@ -1019,10 +1039,18 @@ def unmount_locked(store, path, metadata):
     with resource_binding(path, target, transport) as check:
         # observe closes its mounted descriptor before umount is launched.
         row = observe(volume, profile)
-        operation = Operation(store, path, 'native-unmount', target)
+        from ._native_interval import capture
+        interval = capture(store, path, metadata, target, row)
+        details = {'lifecycle_version': 1, 'before_mount': row}
+        if interval is not None:
+            details['ordinary_interval'] = interval
+        operation = Operation(store, path, 'native-unmount', target, details=details)
         transport['native_operation'] = operation.record
         try:
             operation.record['before_mount'] = row
+            from ._native_interval import recheck_capture
+            recheck_capture(store, path, metadata, operation)
+            check()
             if row is not None:
                 command = operation.command('unmount', ['/sbin/umount', str(volume)])
                 if command['returncode'] != 0:
@@ -1034,8 +1062,13 @@ def unmount_locked(store, path, metadata):
             receipt = _guard_current(target)
             operation.record['current_guard'] = receipt
             operation.record['observed_mount'] = None
-            _persist(path / 'native-mount.json', {'state': 'absent', 'target': target,
-                'operation': operation.record['id'], 'current_guard': receipt})
+            operation.record['outcome'] = 'incomplete'
+            operation.persist()
+            marker = {'state': 'absent', 'target': target, 'operation': operation.record['id'],
+                      'current_guard': receipt, 'lifecycle_version': 1}
+            if interval is not None:
+                marker['ordinary_interval'] = interval
+            _persist(path / 'native-mount.json', marker)
             store._open(path.name, path, metadata)
             operation.finish()
             return {'unmounted': path.name, 'already_absent': row is None, 'native_operation': operation.record}
