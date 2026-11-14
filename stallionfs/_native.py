@@ -911,18 +911,53 @@ def _usable(store, path, metadata, *, initial=False, operation=None):
             raise failure('Initial native repository does not match the prepared branch and commit', operation.record)
         probe = repo / ('.stallionfs-write-' + uuid.uuid4().hex)
         operation.record['write_probe'] = {'path': str(probe), 'complete': False}
-        operation.persist()
-        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # Diagnostic only: retain step updates through the existing failure
+        # handler without adding journal syncs or changing acceptance evidence.
+        diagnostic = {'attempted_steps': []}
+        operation.record['write_probe_diagnostic'] = diagnostic
+
+        def attempted(step):
+            diagnostic['attempted_steps'].append(step)
+
+        def summary(error):
+            result = {'type': type(error).__name__[:64]}
+            number = getattr(error, 'errno', None)
+            if type(number) is int and -(1 << 31) <= number < 1 << 31:
+                result['errno'] = number
+            return result
+
         try:
-            data = b'stallionfs writable path\n'
-            if os.write(fd, data) != len(data):
-                raise OSError(errno.EIO, 'Short mounted write probe')
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        probe.unlink()
-        operation.record['write_probe']['complete'] = True
-        operation.persist()
+            attempted('persist')
+            operation.persist()
+            attempted('open')
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                data = b'stallionfs writable path\n'
+                attempted('write')
+                if os.write(fd, data) != len(data):
+                    raise OSError(errno.EIO, 'Short mounted write probe')
+                attempted('fsync')
+                os.fsync(fd)
+            except BaseException:
+                diagnostic['failed_step'] = diagnostic['attempted_steps'][-1]
+                try:
+                    attempted('close')
+                    os.close(fd)
+                except BaseException as cleanup_error:
+                    diagnostic['cleanup_error'] = {'step': 'close', **summary(cleanup_error)}
+                raise
+            else:
+                attempted('close')
+                os.close(fd)
+            attempted('unlink')
+            probe.unlink()
+            operation.record['write_probe']['complete'] = True
+            attempted('completion-persist')
+            operation.persist()
+        except BaseException as error:
+            diagnostic.setdefault('failed_step', diagnostic['attempted_steps'][-1])
+            diagnostic['error'] = summary(error)
+            raise
     return str(repo)
 
 
