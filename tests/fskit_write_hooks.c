@@ -40,6 +40,7 @@ ssize_t sfs_diag_pread(int fd, void *p, size_t n, off_t at) {
     return result;
 }
 int sfs_diag_fcntl(int fd, int command, ...) {
+    if (command == F_GETFL) return fcntl(fd, command);
     if (command == F_DUPFD_CLOEXEC) {
         va_list ap; va_start(ap, command); int minimum = va_arg(ap, int); va_end(ap);
         return fcntl(fd, command, minimum);
