@@ -7,8 +7,8 @@ import Darwin
 @_silgen_name("sfs_diag_fault") func fault(_ kind: Int32, _ nth: Int32)
 @_silgen_name("sfs_diag_hit") func hits() -> Int32
 @_silgen_name("sfs_diag_fences") func fences() -> Int32
-func need(_ condition: @autoclosure () -> Bool, _ message: String) {
-    if !condition() { fatalError(message) }
+func need(_ condition: @autoclosure () -> Bool, _ message: String, file: StaticString = #fileID, line: UInt = #line) {
+    if !condition() { fatalError(message, file: file, line: line) }
 }
 #if STALLION_CONTEXT_HANDLERS && STALLION_RESULT_MASK_TRACE
 func resultMaskTrace(_ text: String) {
@@ -106,19 +106,22 @@ struct Fixture {
 }
 #if STALLION_CONTEXT_HANDLERS
 func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region: FSVolume.SeekRegion,
-                expected: off_t? = nil, error: Int32 = 0, caller: CallerIdentity? = nil) {
+                expected: off_t? = nil, error: Int32 = 0, caller: CallerIdentity? = nil, caseLine: UInt = #line) {
     let before = volume.anchor
+    let identity = caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))
     var supplied: off_t?, replies = 0
     let _: Bool = wait { done in volume.enqueue { volume.preparedSeekOffsetForTesting = { supplied = $0 }; done(true) } }
     let result: (FSSeekRegionResult?,Error?) = wait { done in
-        volume.seekResultForTesting(item,offset:offset,region:region,caller:caller ?? CallerIdentity(uid:Int(geteuid()),gid:Int(getegid()))) {
+        volume.seekResultForTesting(item,offset:offset,region:region,caller:identity) {
             replies += 1; done(($0,$1))
         }
     }
     let _: Bool = wait { done in volume.enqueue { volume.preparedSeekOffsetForTesting = nil; done(true) } }
-    need(replies == 1 && code(result.1) == Int(error) && (result.0 != nil) == (error == 0),"seek real SDK result/error and one reply")
-    if error == 0 { need(expected != nil && supplied == expected,"checked offset passed to the real opaque SDK constructor") }
-    need(anchorMatches(before,volume.anchor),"seek never changes committed anchor")
+    let regionName = region == .data ? "data" : region == .hole ? "hole" : "unknown"
+    let details = "line=\(caseLine) offset=\(offset) region=\(regionName) uid=\(identity.uid) gid=\(identity.gid) expected_errno=\(error) actual_errno=\(code(result.1)) expected_offset=\(expected.map { String($0) } ?? "nil") supplied_offset=\(supplied.map { String($0) } ?? "nil") result_present=\(result.0 != nil) replies=\(replies)"
+    need(replies == 1 && code(result.1) == Int(error) && (result.0 != nil) == (error == 0),"seek real SDK result/error and one reply: \(details)")
+    if error == 0 { need(expected != nil && supplied == expected,"checked offset passed to the real opaque SDK constructor: \(details)") }
+    need(anchorMatches(before,volume.anchor),"seek never changes committed anchor: \(details)")
 }
 #endif
 
@@ -191,7 +194,7 @@ func seekAccess(_ volume: StallionVolume, _ item: FSItem, offset: off_t, region:
 
 // Permission regressions use an explicit scope/intent fixture double. The
 // producer-to-consumer suite separately exercises the Python request producer.
-func activateManagedFixture(_ volume: StallionVolume, _ directory: URL) throws -> (FSItem?, Error?) {
+func activateManagedFixture(_ volume: StallionVolume, _ directory: URL, caseLine: UInt = #line) throws -> (FSItem?, Error?) {
     let operation = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     let attempt = directory.appendingPathComponent("native-operations/" + operation + "/activation-" + nonce)
@@ -211,7 +214,12 @@ func activateManagedFixture(_ volume: StallionVolume, _ directory: URL) throws -
     need(gate >= 0 && lease >= 0 && flock(lease,LOCK_EX|LOCK_NB) == 0,"owned fixture lease")
     defer { need(Darwin.close(lease) == 0 && Darwin.close(gate) == 0,"fixture lease checked close") }
     let _: Bool = wait { done in volume.enqueue { volume.managedScopeForTesting = true; done(true) } }
-    return wait { done in volume.activateArgumentsForTesting(["-o","rw,owners,sfs_activation=" + operation + "." + nonce]) { done(($0,$1)) } }
+    var replies = 0
+    let active: (FSItem?, Error?) = wait { done in volume.activateArgumentsForTesting(["-o","rw,owners,sfs_activation=" + operation + "." + nonce]) {
+        replies += 1; done(($0,$1))
+    } }
+    need(replies == 1,"managed activation reply count line=\(caseLine) replies=\(replies) errno=\(code(active.1)) root_present=\(active.0 != nil)")
+    return active
 }
 
 @MainActor func accessPolicyChecks(_ parent: URL, factory: Bool = false, identity: StallionFileSystemIdentity = fixtureFileSystemIdentity) throws {
@@ -312,7 +320,8 @@ func activateManagedFixture(_ volume: StallionVolume, _ directory: URL) throws -
     need(coreRO,"pending admission uses actual readonly core")
     var competing: OpaquePointer?, receipt = sfs_result()
     need(sfs_image_open(f.url.path,"image.sfs",&competing,&receipt)==SFS_BUSY && competing == nil,"same-inode exclusive ownership retained")
-    let active = try activateManagedFixture(v,f.url);need(active.1 == nil,"mutation activation")
+    let active = try activateManagedFixture(v,f.url)
+    need(active.1 == nil,"mutation activation errno=\(code(active.1)) root_present=\(active.0 != nil) factory=\(factory) identity=\(identity.rawValue)")
     need(!v.requestedMountOptions.contains(.readOnly),"managed activation selects writable mount")
     let admittedRO: Bool = wait { done in v.enqueue { done(v.coreReadOnlyForTesting()) } }
     need(!admittedRO,"managed activation uses actual writable core")
@@ -747,7 +756,7 @@ func contextualSeeks(_ parent: URL) throws {
         for identity in [CallerIdentity(uid:caller.uid+1,gid:caller.gid),CallerIdentity(uid:-1,gid:caller.gid),CallerIdentity(uid:caller.uid,gid:-1)] {
             seekAccess(v,m.file,offset:0,region:.data,error:EACCES,caller:identity)
         }
-        if geteuid() != 0 { seekAccess(v,m.file,offset:0,region:.data,error:EACCES,caller:CallerIdentity(uid:0,gid:0)) }
+        if geteuid() != 0 { seekAccess(v,m.file,offset:0,region:.data,expected:0,caller:CallerIdentity(uid:0,gid:0)) }
         m.serial { var limited = sfs_image_seek_budget(); limited.checks = 1; v.seekBudgetForTesting = limited }
         seekAccess(v,m.file,offset:0,region:.hole,error:EAGAIN)
         m.serial { v.seekBudgetForTesting = nil; v.rejectResultForTesting = { $0 == "FSSeekRegionResult" } }
@@ -1624,9 +1633,15 @@ func metadataAccessChecks(_ parent: URL) throws {
     }
     for writable in [false,true] {
         let m = try CreationMount(parent,"metadata-access-disabled-\(writable)",writable:writable,enable:false), v = m.volume
+        let before = v.anchor
+        need(!v.supportedVolumeCapabilities.doesNotSupportSettingFilePermissions,
+             "contextual build implements permission setting independently of mount mode")
+        need(v.requestedMountOptions.contains(.readOnly),"disabled metadata fixture requests read-only mounting")
         let result: (FSCheckAccessResult?,Error?) = wait { done in v.accessForTesting(m.root,access:[.writeAttributes,.writeSecurity],caller:caller) { done(($0,$1)) } }
-        need(result.0 == nil && code(result.1) == Int(EACCES) && v.supportedVolumeCapabilities.doesNotSupportSettingFilePermissions,"read-only or disabled factory keeps metadata access refusal")
-        let a = metadataRequest(); need(code(metadataSet(m,m.root,a).1) == Int(EROFS) && a.consumedAttributes.isEmpty,"disabled setter refuses before mutation")
+        need(result.0 == nil && code(result.1) == Int(EACCES),"read-only or disabled factory keeps metadata access refusal")
+        let a = metadataRequest(), changed = metadataSet(m,m.root,a)
+        need(changed.0 == nil && code(changed.1) == Int(EROFS) && a.consumedAttributes.isEmpty &&
+             anchorMatches(before,v.anchor) && v.diagnosticSnapshot().0.commits == 0,"disabled setter refuses before mutation")
         m.close()
     }
     let revoked = try CreationMount(parent,"metadata-access-revoked"), rv = revoked.volume, revokedItem = revoked.create().2!; revoked.resource.revoke()
