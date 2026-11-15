@@ -1,8 +1,10 @@
 """Installed benchmark selection, ownership, evidence and exit boundaries."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+import argparse
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -12,7 +14,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,7 +24,7 @@ from stallionfs import __main__ as cli, benchmark
 def arguments(**changes):
     values = dict(list=False, full=False, fixtures=None, operations=None, samples=10,
                   scratch=None, jobs=4, output=None, json=True, node=None, npm=None,
-                  npm_cache=None, cache=['warm'])
+                  npm_cache=None, cache=['warm'], copy_tools=None)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -891,6 +893,190 @@ class BenchmarkDeadline(unittest.TestCase):
             value = json.loads(stream.getvalue())
             self.assertEqual(value['status'], 'interrupted')
             self.assertTrue(value['command_receipt']['completion_uncertain'])
+
+
+class QuickBenchmarkReferences(unittest.TestCase):
+    def setUp(self):
+        perf = Path(__file__).parent / 'perf'
+        spec = importlib.util.spec_from_file_location('reference_report_fixture', perf / 'native_report.py')
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, 'path', [str(perf), *sys.path]):
+            spec.loader.exec_module(module)
+        runtime = ModuleType('stallionfs._benchmark_runtime')
+        runtime.__path__ = []
+        patch = mock.patch.dict(sys.modules, {'stallionfs._benchmark_runtime': runtime,
+            'stallionfs._benchmark_runtime.native_report': module})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ReportJournal = module.ReportJournal
+
+    def test_public_parser_exposes_only_supported_reference_names(self):
+        parser = argparse.ArgumentParser()
+        benchmark.parser(parser.add_subparsers(dest='action'))
+        selected = parser.parse_args(['benchmark', '--operations', 'clone', '--copy-tools', 'ditto', 'cp'])
+        self.assertEqual(selected.copy_tools, ['ditto', 'cp'])
+        self.assertIsNone(parser.parse_args(['benchmark']).copy_tools)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            parser.parse_args(['benchmark', '--copy-tools', '/untrusted/tool'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_invalid_duplicate_full_and_nonclone_selection_precedes_resource_access(self):
+        cases = (dict(copy_tools=['cp', 'cp'], operations=['clone']),
+                 dict(copy_tools=['unknown'], operations=['clone']),
+                 dict(copy_tools=[], operations=['clone']),
+                 dict(copy_tools=['ditto'], full=True),
+                 dict(copy_tools=['ditto'], operations=['copy']),
+                 dict(copy_tools=['ditto'], operations=['clone', 'move']))
+        for change in cases:
+            with self.subTest(change=change), mock.patch.object(sys, 'platform', 'darwin'), \
+                    mock.patch.object(benchmark, '_resources', side_effect=AssertionError('resource access')):
+                with self.assertRaises(ValueError):
+                    benchmark._preflight(arguments(**change))
+
+    def collect(self, root, args, *, exit_code=0, prepare=None, completion_uncertain=False):
+        budget = importlib.import_module('stallionfs._benchmark_budget')
+        seen = []
+        def command(argv, **options):
+            seen.append(argv)
+            if prepare:
+                prepare(root, args)
+            options['receipt'].update(exit_code=exit_code, completion_uncertain=completion_uncertain)
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        directory = SimpleNamespace(path=root, fd=descriptor, check=lambda: None)
+        try:
+            with mock.patch.object(budget, 'command', side_effect=command), \
+                    mock.patch.object(benchmark, '_read_native', return_value=(
+                        {'status': 'complete', 'passed': True, 'cleanup_passed': True}, [])):
+                result = benchmark._collect_pinned(args, root, root / 'stallionfs', directory,
+                    ['docs_5k_100mb'], ['clone'], io.BytesIO(), {})
+        finally:
+            os.close(descriptor)
+        return result, seen[0]
+
+    def test_default_and_explicit_reference_order_reach_the_collector_and_result(self):
+        for selected, expected in ((None, ['cp-clone', 'cp', 'ditto', 'rsync']),
+                                   (['rsync', 'ditto'], ['rsync', 'ditto']), (['ditto'], ['ditto'])):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temporary:
+                result, argv = self.collect(Path(temporary).resolve(), arguments(copy_tools=selected))
+                self.assertEqual(argv[argv.index('--copy-tools') + 1:], expected)
+                self.assertEqual(result['selection']['copy_tools'], expected)
+                self.assertEqual(result['selection']['copy_tools_explicit'], selected is not None)
+                self.assertFalse(result['qualified'])
+
+    def failed_report(self, root, args, *, change=None):
+        selection = {'binary': str(root / 'stallionfs'), 'scratch': str(root), 'output': str(root / 'native.json'),
+                     'samples': 10, 'runs': 1, 'cache': ['warm'], 'jobs': 4,
+                     'fixtures': ['docs_5k_100mb'], 'operations': ['clone'],
+                     'copy_tools': benchmark._copy_tools(args, ['clone'])}
+        state = {'status': 'complete', 'passed': False, 'cleanup_passed': True, 'selection': selection}
+        rows = [dict(run=0, fixture='docs_5k_100mb', operation='clone', reference='cp-clone',
+                     method='cp-clone', phase='resources', sample=0, ok=True, validated=False,
+                     completion_uncertain=False, source_unchanged=True,
+                     correctness={'strict_equal': False, 'sparse_preserved': True, 'independent_clone': True,
+                         'candidate_losses': [{'field': 'acl', 'path': 'metadata-fixture/sparse'},
+                                              {'field': 'hardlink_groups', 'path': None}]}),
+                dict(run=0, fixture='docs_5k_100mb', operation='clone', reference='rsync',
+                     method='rsync', phase='resources', sample=0, ok=True, validated=False,
+                     completion_uncertain=False, source_unchanged=True,
+                     correctness={'strict_equal': True, 'sparse_preserved': False, 'independent_clone': True,
+                                  'candidate_losses': []},
+                     data_stream_sharing={'required': True, 'full_data_stream_sharing': False})]
+        if change == 'incomplete':
+            state['status'] = 'running'
+        if change == 'selection':
+            selection['samples'] = 11
+        if change == 'selection-none':
+            state['selection'] = None
+        if change == 'correctness-none':
+            rows[0]['correctness'] = None
+        if change == 'correctness-list':
+            rows[0]['correctness'] = []
+        if change == 'loss-container':
+            rows[0]['correctness']['candidate_losses'] = {}
+        if change == 'loss-item':
+            rows[0]['correctness']['candidate_losses'] = [None]
+        if change == 'sharing-none':
+            rows[0]['data_stream_sharing'] = None
+        if change == 'sharing-list':
+            rows[0]['data_stream_sharing'] = []
+        journal = self.ReportJournal(root / 'native.json')
+        try:
+            for index, row in enumerate(rows):
+                journal.append('rows', index, row)
+            journal.finish(state)
+        finally:
+            journal.close()
+        if change == 'journal':
+            with (root / 'native.json.journal').open('ab') as stream:
+                stream.write(b'uncommitted')
+        elif change == 'final-json':
+            report = json.loads((root / 'native.json').read_text())
+            report['rows'][0]['correctness']['candidate_losses'] = []
+            (root / 'native.json').write_text(json.dumps(report))
+        elif change == 'missing':
+            (root / 'native.json').unlink()
+        elif change in ('final-recursion', 'manifest-recursion'):
+            path = root / ('native.json' if change == 'final-recursion' else 'native.json.manifest')
+            path.write_text('[' * 1500 + '0' + ']' * 1500)
+        elif change == 'event-recursion':
+            raw = (b'{"sequence":0,"kind":"rows","id":0,"payload":{"deep":'
+                   + b'[' * 1500 + b'0' + b']' * 1500 + b'}}\n')
+            (root / 'native.json.journal').write_bytes(raw)
+            path = root / 'native.json.manifest'
+            manifest = json.loads(path.read_text())
+            manifest.update(committed_bytes=len(raw), event_count=1, prefix_sha256=hashlib.sha256(raw).hexdigest())
+            path.write_text(json.dumps(manifest))
+
+    def test_completed_nonzero_report_has_verified_losses_and_separate_failed_gates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            result, _ = self.collect(root, arguments(), exit_code=1, prepare=self.failed_report)
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['exit_code'], 1)
+            self.assertFalse(result['collection_complete'])
+            self.assertFalse(result['qualified'])
+            self.assertEqual(result['report'], str(root / 'native.json'))
+            failures = {item['reference']: item for item in result['reference_failures']}
+            self.assertEqual(failures['cp-clone']['loss_counts'], {'acl': 1, 'hardlink_groups': 1})
+            self.assertEqual(failures['rsync']['loss_counts'], {})
+            self.assertEqual(failures['rsync']['gate_counts'], {'sparse_preserved': 1, 'data_stream_sharing': 1})
+            self.assertEqual(failures['rsync']['failed_rows'], 1)
+
+    def test_tampered_missing_incomplete_and_foreign_reports_have_no_attributed_diagnostics(self):
+        for change in ('journal', 'final-json', 'incomplete', 'selection', 'missing'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                def prepare(root, args):
+                    self.failed_report(root, args, change=change)
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1, prepare=prepare)
+
+    def test_uncertain_or_unavailable_child_completion_never_reads_failure_diagnostics(self):
+        for uncertain in (True, None):
+            with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.object(benchmark, '_native_failures', side_effect=AssertionError('unsafe report read')):
+                with self.assertRaises(RuntimeError):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1,
+                                 prepare=self.failed_report, completion_uncertain=uncertain)
+
+    def test_malformed_and_recursive_reports_have_generic_failed_diagnostics(self):
+        changes = ('selection-none', 'correctness-none', 'correctness-list', 'loss-container', 'loss-item',
+                   'sharing-none', 'sharing-list', 'final-recursion', 'manifest-recursion', 'event-recursion')
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                def prepare(root, args):
+                    self.failed_report(root, args, change=change)
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1, prepare=prepare)
+
+    def test_diagnostic_journal_limit_rejects_before_reader_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self.failed_report(root, arguments())
+            with mock.patch.dict(benchmark.FAILURE_READER_LIMITS, {'max_journal_bytes': 1}), \
+                    mock.patch.object(self.ReportJournal, '_verify', side_effect=AssertionError('journal scanned')) as verify:
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(root, arguments(), exit_code=1)
+                verify.assert_not_called()
 
 
 class InstalledCollectorEntry(unittest.TestCase):
