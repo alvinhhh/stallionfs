@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -91,12 +92,163 @@ def descriptors(a, path, metadata):
         os.close(fd)
 
 
+_C_RECEIPT_FIELDS = {'status', 'phase', 'system_errno', 'generation', 'committed_end',
+    'physical_end', 'device', 'inode', 'uuid', 'root_digest', 'coverage', 'incomplete_reason',
+    'limit_reason', 'fence_attempted', 'fence_succeeded', 'transaction_active', 'poisoned'}
+
+
+def _terminal_target(record, path, metadata, name, *, source=None):
+    require(type(record) is dict and record.get('workspace') == path.name
+            and type(name) is str and re.fullmatch('[0-9a-f]{32}', name)
+            and record.get('id') == name and record.get('child_pending') is False
+            and type(record.get('helpers')) is list and record['helpers'] == [],
+            'binding-terminal-owner')
+    target = core.native_target({'ownership': 'external-reference', 'native_image': record.get('target')})
+    old = metadata['native_image']
+    require(type(target) is dict and set(target) == {'directory', 'component', 'parent', 'file', 'uuid'}
+            and target['directory'] == str(path if source is None else source)
+            and target['component'] == 'image.sfs' and target['uuid'] == old['uuid']
+            and target['parent'][1] == old['object'][1] and target['file'][1] == old['file'][1]
+            and target['parent'][0] == target['file'][0]
+            and all(type(n) is int and 0 <= n < 1 << 64 for k in ('parent', 'file') for n in target[k]),
+            'binding-operation-target')
+    return target
+
+
+def _catalog_receipt(row, target, *, status, phase, coverage, limit=0):
+    # The complete fixed schema emitted by _image.c:receipt, not its partial
+    # allocation-failure carrier. Enum values come from filesystem/image.h.
+    require(type(row) is dict and set(row) == _C_RECEIPT_FIELDS
+            and all(type(row[k]) is int and 0 <= row[k] < 1 << 64
+                    for k in _C_RECEIPT_FIELDS - {'uuid', 'root_digest', 'transaction_active', 'poisoned'})
+            and row['status'] == status and row['phase'] in phase and row['coverage'] == coverage
+            and row['limit_reason'] == limit and row['system_errno'] == 0
+            and row['incomplete_reason'] == row['fence_attempted'] == row['fence_succeeded'] == 0
+            and row['transaction_active'] is False and row['poisoned'] is False
+            and [row['device'], row['inode']] == target['file'] and row['uuid'] == target['uuid']
+            and type(row['root_digest']) is str and re.fullmatch('[0-9a-f]{64}', row['root_digest'])
+            and row['physical_end'] >= row['committed_end'], 'binding-catalog-failure')
+
+
+def closed_catalog_failure(record, path, metadata, name):
+    """Recognize a closed structure-limit refusal without changing its failure."""
+    action = record.get('operation')
+    if record.get('outcome') != 'incomplete' or action not in ('native-snapshot', 'native-restore'):
+        return None
+    target = _terminal_target(record, path, metadata, name)
+    _native_recovery.validate_intent(path.name, record)
+    fields = {'operation', 'workspace', 'id', 'target', 'outcome', 'child_pending', 'helpers',
+              'previous_unresolved', 'bridge_attempted', 'name', 'native_image_result', 'error'}
+    if action == 'native-restore':
+        fields.add('recovery_name')
+    error = record.get('error')
+    require(set(semantic(record)) == fields and record['bridge_attempted'] is True
+            and type(error) is dict and set(error) == {'type', 'message'}
+            and error['type'] == 'StallionError' and type(error['message']) is str,
+            'binding-catalog-failure')
+    result = record['native_image_result']
+    result_fields = {'ok', 'operation', 'error_code', 'committed', 'commit_attempted', 'outcome',
+        'receipt', 'opened_receipt', 'staged_receipt', 'abort_attempted', 'abort_receipt',
+        'close_attempted', 'close_receipt', 'guard_close_errno', 'path_errno', 'deadline_expired',
+        'interrupted', 'view', 'recovery_view', 'snapshot', 'recovery', 'snapshots', 'identity'}
+    require(type(result) is dict and set(result) == result_fields and result['ok'] is False
+            and result['operation'] == ('snapshot' if action == 'native-snapshot' else 'restore')
+            and type(result['error_code']) is int and result['error_code'] == errno.EOVERFLOW
+            and result['committed'] is False and result['commit_attempted'] is False
+            and result['outcome'] == 'not_committed' and result['abort_attempted'] is False
+            and result['abort_receipt'] is None and result['close_attempted'] is True
+            and result['interrupted'] is False and result['deadline_expired'] is False
+            and all(type(result[k]) is int and result[k] == 0
+                    for k in ('guard_close_errno', 'path_errno', 'recovery_view'))
+            and type(result['view']) is int and (result['view'] == 0 if action == 'native-snapshot'
+                                                else 1 <= result['view'] <= 32)
+            and result['snapshot'] == record['name'] and result['recovery'] == record.get('recovery_name')
+            and type(result['snapshots']) is list and result['snapshots'] == []
+            and _same_evidence(result['identity'], {'file': target['file'], 'uuid': target['uuid']}),
+            'binding-catalog-failure')
+    opened, failed, staged, closed = (result[k] for k in
+        ('opened_receipt', 'receipt', 'staged_receipt', 'close_receipt'))
+    _catalog_receipt(opened, target, status=0, phase={5}, coverage=2)
+    _catalog_receipt(failed, target, status=5, phase={6}, coverage=0, limit=3)
+    _catalog_receipt(closed, target, status=0, phase={15}, coverage=0)
+    require(_same_evidence(failed, staged) and all(_same_evidence(opened[k], row[k])
+            for row in (failed, closed) for k in ('generation', 'committed_end', 'physical_end', 'root_digest')),
+            'binding-catalog-failure')
+    return closed
+
+
+def _move_guard(receipt, target):
+    require(type(receipt) is dict
+            and set(receipt) == _C_RECEIPT_FIELDS | {'core_consumed', 'parent_close_errno'},
+            'binding-move-incomplete')
+    _pair_guard(receipt, target)
+    _catalog_receipt({k: receipt[k] for k in _C_RECEIPT_FIELDS}, target,
+                     status=0, phase={15}, coverage=0)
+
+
+def _completed_move(record, path, metadata, name):
+    action = record['operation']
+    source = 'workspaces' if action == 'native-retire' else 'trash'
+    destination = 'trash' if source == 'workspaces' else 'workspaces'
+    require(path.parent.name in ('workspaces', 'trash'), 'binding-move-location')
+    historical = path.parent.parent / source / path.name
+    target = _terminal_target(record, path, metadata, name, source=historical)
+    _native_recovery.validate_intent(path.name, record, moving=True)
+    require(type(record.get('metadata')) is dict and _same_evidence(semantic(record['metadata']), semantic(metadata))
+            and metadata.get('ownership') == 'store-created' and metadata.get('backend') == 'native-image'
+            and type(metadata.get('transaction')) is str and re.fullmatch('[0-9a-f]{32}', metadata['transaction']),
+            'binding-move-owner')
+    locations = {}
+    keys = {'schema', 'workspace', 'transaction', 'origin_target', 'collection', 'parent',
+            'object', 'file', 'uuid', 'operation', 'complete', 'guard'}
+    for key, collection in (('source_location', source), ('destination_location', destination)):
+        value = record.get(key)
+        require(type(value) is dict, 'binding-move-location')
+        value = semantic(value)
+        require(set(value) == keys and type(value['schema']) is int and value['schema'] == 1
+                and value['workspace'] == path.name and value['transaction'] == metadata['transaction']
+                and _same_evidence(value['origin_target'], metadata['native_image'])
+                and value['collection'] == collection and _same_evidence(value['object'], target['parent'])
+                and _same_evidence(value['file'], target['file']) and value['uuid'] == target['uuid']
+                and type(value['parent']) is list and len(value['parent']) == 2
+                and all(type(n) is int and 0 <= n < 1 << 64 for n in value['parent'])
+                and value['parent'][0] == target['parent'][0]
+                and type(value['operation']) is str and re.fullmatch('[0-9a-f]{32}', value['operation']),
+                'binding-move-location')
+        locations[key] = value
+    old, new = locations['source_location'], locations['destination_location']
+    require(old['complete'] is True and type(old['guard']) is dict
+            and new['complete'] is False and new['guard'] is None and new['operation'] == name,
+            'binding-move-location')
+    _move_guard(old['guard'], target)
+    workspace_location = old if source == 'workspaces' else new
+    require(workspace_location['parent'][1] == metadata['native_image']['parent'][1]
+            and old['parent'][1] != new['parent'][1], 'binding-move-location')
+    fields = {'operation', 'workspace', 'id', 'target', 'outcome', 'child_pending', 'helpers',
+              'previous_unresolved', 'metadata', 'source_location', 'destination_location', 'rename_attempted'}
+    if record.get('stale_reset') is True:
+        require(set(semantic(record)) == fields | {'stale_reset', 'current_guard'}
+                and action == 'native-retire' and record['rename_attempted'] is False,
+                'binding-move-incomplete')
+        _move_guard(record['current_guard'], target)
+    else:
+        require(set(semantic(record)) == fields | {'current_location'} and record['rename_attempted'] is True
+                and type(record.get('current_location')) is dict, 'binding-move-incomplete')
+        current = semantic(record['current_location'])
+        _move_guard(current.get('guard'), target)
+        require(_same_evidence(current, dict(new, complete=True, guard=current['guard'])),
+                'binding-move-location')
+
+
 def completed_operation(record, path, metadata, name):
     """Admit archived terminal evidence against its own historical target."""
     from . import _native_recovery as recovery
     require(record.get('workspace') == path.name and record.get('id') == name
             and record.get('outcome') == 'complete' and record.get('child_pending') is False,
             'binding-unresolved-resources')
+    if record.get('operation') in recovery.MOVES:
+        _completed_move(record, path, metadata, name)
+        return
     target = core.native_target({'ownership': 'external-reference', 'native_image': record.get('target')})
     old = metadata['native_image']
     require(target['directory'] == str(path) and target['component'] == 'image.sfs'
@@ -380,6 +532,10 @@ def archive_anchor(records, path, metadata, mounted, proof=None, *, reconciliati
             if record['operation'] in ('native-snapshot', 'native-restore', 'native-catalog-observe',
                                        'native-mounted-snapshot', 'native-mounted-restore'):
                 closed.append(record['native_image_result']['close_receipt'])
+        elif closed_catalog_failure(record, path, metadata, name) is not None:
+            # The failed mutation remains failed. Its own clean close, not a
+            # later observation, proves that this archive owns no open resource.
+            closed.append(record['native_image_result']['close_receipt'])
         else:
             exceptional.add(name)
             candidates = incoming.get(name, [])

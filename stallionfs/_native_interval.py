@@ -174,7 +174,7 @@ def correlate_marker(records, marker, path, metadata, pending=None):
 
 class Index:
     def __init__(self, records, path, metadata, *, active_compound=None):
-        from ._native_binding import _same_evidence, _chain_member, completed_operation
+        from ._native_binding import _same_evidence, _chain_member, completed_operation, closed_catalog_failure
         self.origins, self.closes, self.tokens = {}, {}, {}
         self.closed_guards = []
         self.records = records
@@ -200,6 +200,8 @@ class Index:
             core.native_target({'ownership': 'external-reference', 'native_image': record.get('target')})
             if record.get('outcome') == 'complete':
                 completed_operation(record, path, metadata, name)
+            elif closed_catalog_failure(record, path, metadata, name) is not None:
+                pass  # A failed catalog mutation is not an ordinary interval.
             elif record.get('operation') in ('native-mount', 'native-unmount'):
                 _native.check_pending(path.name, record)
             else:
