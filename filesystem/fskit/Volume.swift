@@ -1294,7 +1294,13 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
-            let invalid: Error? = [FSSyncFlags.wait, .dWait, .noWait].contains(flags) ? nil : POSIXError(.EINVAL)
+            let timingMask = FSSyncFlags.wait.rawValue | FSSyncFlags.noWait.rawValue | FSSyncFlags.dWait.rawValue
+            // macOS 27 FSKit forwards the vnode synchronization origin marker with the timing selector.
+            let allowedMask = timingMask | 0x10000
+            let raw = flags.rawValue, timing = raw & timingMask
+            let valid = raw >= 0 && raw & ~allowedMask == 0 &&
+                [FSSyncFlags.wait.rawValue, FSSyncFlags.noWait.rawValue, FSSyncFlags.dWait.rawValue].contains(timing)
+            let invalid: Error? = valid ? nil : POSIXError(.EINVAL)
             enqueue(maintenance: true, syncOperation: true, syncFlags: UInt64(bitPattern: Int64(flags.rawValue)), validationError: invalid, rejected: { replyHandler($0) }) {
                 let retained = self.deliveryError()
                 var error = retained ?? self.failure

@@ -872,6 +872,50 @@ func executionProfileRefusals(_ parent: URL) throws {
     } }
 }
 
+func synchronizeCompatibility(_ parent: URL) throws {
+    let f = try Fixture(parent, "sync-compatibility"), m = try Mounted(f), v = m.volume
+    let flags = [1, 2, 4, 0x10001, 0x10002, 0x10004]
+    let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), replies = DispatchGroup()
+    v.enqueue { held.signal(); need(release.wait(timeout: .now()+20) == .success, "release synchronization queue") }
+    need(held.wait(timeout: .now()+20) == .success, "hold preceding write and synchronization")
+    let before = v.anchor.generation
+    var written = false, synchronized = 0, durable = sfs_result(), committedFences: Int32 = 0
+    replies.enter()
+    v.writeCountForTesting(contents: Data("synced!!".utf8), to: m.file, at: 0) { count, error in
+        need(count == 8 && error == nil, "preceding queued write succeeds")
+        durable = v.anchor; committedFences = fences(); written = true
+        let counts = v.diagnosticSnapshot().0
+        need(durable.generation == before + 1 && counts.commits == 1 &&
+             counts.recordSuccess == 1 && counts.commitSuccess == 1, "write completes both durability fences")
+        replies.leave()
+    }
+    for raw in flags {
+        replies.enter()
+        v.synchronize(flags: FSSyncFlags(rawValue: raw)!) { error in
+            need(written && error == nil, "sync \(String(raw, radix: 16)) follows successful write")
+            let counts = v.diagnosticSnapshot().0
+            need(anchorMatches(v.anchor,durable) && counts.commits == 1 && counts.recordSuccess == 1 &&
+                 counts.commitSuccess == 1 && fences() == committedFences, "sync preserves generation and existing fences")
+            synchronized += 1; replies.leave()
+        }
+    }
+    need(!written && synchronized == 0, "all sync selectors submit asynchronously behind preceding work")
+    release.signal(); need(replies.wait(timeout: .now()+20) == .success, "ordered synchronization replies")
+    need(synchronized == flags.count, "every timing selector and vnode origin combination succeeds")
+    let trace = v.diagnosticSnapshot().1
+    for raw in flags {
+        need(trace.contains { $0.operation == 2005 && $0.mask == UInt64(raw) } &&
+             trace.contains { $0.operation == 1005 && $0.mask == UInt64(raw) && $0.code == 0 }, "sync traces preserve raw flags")
+    }
+    for raw in [0, 0x10000, -1, Int.min, 3, 5, 6, 7, 0x10003, 0x10005, 0x10006, 0x10007,
+                8, 0x10009, 0x20001, 0x80010001] {
+        need(code(m.sync(FSSyncFlags(rawValue: raw)!)) == Int(EINVAL), "invalid synchronization flags \(raw)")
+    }
+    need(anchorMatches(v.anchor,durable) && v.diagnosticSnapshot().0.commits == 1 && fences() == committedFences,
+         "rejected synchronization changes no durable state")
+    m.close(); need(f.contents() == Data("synced!!".utf8), "preceding acknowledged write persists on reopen")
+}
+
 func successfulWrites(_ parent: URL) throws {
     let f = try Fixture(parent, "writes"), m = try Mounted(f), v = m.volume
     let generation = v.anchor.generation
@@ -5808,6 +5852,7 @@ func accessBranchChecks(_ parent: URL) throws {
     } }
 }
 func deliveryTraceChecks(_ parent: URL) throws {
+    try synchronizeCompatibility(parent)
     let trace = DeliveryTrace.shared
     trace.resetForTesting()
     let secret = NSError(domain: "PRIVATE PATH NAME", code: Int.min,
@@ -5848,25 +5893,31 @@ func deliveryTraceChecks(_ parent: URL) throws {
     let first = trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") }
     need(first.count == 1 && first[0].contains("err=1,22"), "first delivery captured")
     need(code(m.write(Data([1]), at: off_t.max).1) == Int(EFBIG), "second validation reply preserved")
-    need(code(m.sync()) == Int(EINVAL), "sticky first delivery preserved")
-    need(trace.recordsForTesting().last!.contains("v=0,0 a=0,0 r=1,22"), "valid flags sticky attribution")
-    need(code(m.sync(FSSyncFlags(rawValue: 3)!)) == Int(EINVAL), "combined flags unchanged")
-    need(trace.recordsForTesting().last!.contains("v=1,22 a=1,22 r=1,22"), "invalid flags and sticky both visible")
+    for raw in [1, 0x10001] {
+        need(code(m.sync(FSSyncFlags(rawValue: raw)!)) == Int(EINVAL), "sync preserves sticky first delivery")
+        need(trace.recordsForTesting().last!.contains("f=\(String(raw,radix:16)) v=0,0 a=0,0 r=1,22"), "valid flags sticky attribution")
+    }
+    for raw in [3, 0x10003] {
+        need(code(m.sync(FSSyncFlags(rawValue: raw)!)) == Int(EINVAL), "combined flags unchanged")
+        need(trace.recordsForTesting().last!.contains("v=1,22 a=1,22 r=1,22"), "invalid flags and sticky both visible")
+    }
     need(trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") } == first, "first failure remains sticky")
     m.close()
-    let queued = try Mounted(Fixture(parent, "delivery-queued"))
+    for marker in [0, 0x10000] {
+    let queued = try Mounted(Fixture(parent, "delivery-queued-\(marker)"))
     trace.resetForTesting()
     let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
     queued.volume.enqueue { held.signal(); need(release.wait(timeout: .now()+20) == .success, "release queued sync") }
     need(held.wait(timeout: .now()+20) == .success, "hold queued sync")
-    queued.volume.synchronize(flags: .wait) { need(code($0) == Int(EINVAL), "admitted sync retained error"); done.signal() }
+    let raw = marker == 0 ? 1 : 0x10002
+    queued.volume.synchronize(flags: FSSyncFlags(rawValue: raw)!) { need(code($0) == Int(EINVAL), "admitted sync retained error"); done.signal() }
     let _: (Int, Error?) = wait { callback in
         queued.volume.writeCountForTesting(contents: Data(), to: queued.file, at: -1) { callback(($0, $1)) }
     }
     release.signal(); need(done.wait(timeout: .now()+20) == .success, "queued sync reply")
-    need(trace.recordsForTesting().last!.contains("s=2 k=0 f=1 v=0,0 a=0,0 r=1,22 b=0,0 c=0,0 h=1,22 out=1,22"), "admitted retained attribution")
+    need(trace.recordsForTesting().last!.contains("s=2 k=0 f=\(String(raw,radix:16)) v=0,0 a=0,0 r=1,22 b=0,0 c=0,0 h=1,22 out=1,22"), "admitted retained attribution preserves raw flags")
     queued.close()
-    let active = try Mounted(Fixture(parent, "delivery-active"))
+    let active = try Mounted(Fixture(parent, "delivery-active-\(marker)"))
     trace.resetForTesting()
     let missing: Error? = wait { done in
         active.volume.lookupItem(named: FSFileName(string: "absent"), inDirectory: active.root) { _, _, error in done(error) }
@@ -5875,13 +5926,15 @@ func deliveryTraceChecks(_ parent: URL) throws {
     need(active.volume.diagnosticSnapshot().2 == nil && trace.recordsForTesting().isEmpty,
          "prior lookup creates no delivery failure")
     active.serial { var r = sfs_result(); need(sfs_image_begin(active.coreHandle, &r) == SFS_OK, "owned synthetic transaction") }
-    need(code(active.sync()) == Int(EIO), "active transaction sync outcome unchanged")
+    let activeRaw = marker == 0 ? 1 : 0x10004
+    need(code(active.sync(FSSyncFlags(rawValue: activeRaw)!)) == Int(EIO), "sync rejects active transaction")
     let suppliedRows = trace.recordsForTesting().filter { $0.hasPrefix("SMD1 l=1 ") }
     need(suppliedRows.count == 1 && suppliedRows[0].contains("err=1,5 x=10 p=5 e=0"),
          "supplied retained receipt predates first delivery error")
-    need(trace.recordsForTesting().last!.contains("s=2 k=3 f=1 v=0,0 a=0,0 r=0,0 b=0,0 c=1,5 h=1,5 out=1,5"), "current own sync guard and final recheck despite prior receipt")
+    need(trace.recordsForTesting().last!.contains("s=2 k=3 f=\(String(activeRaw,radix:16)) v=0,0 a=0,0 r=0,0 b=0,0 c=1,5 h=1,5 out=1,5"), "current own sync guard and final recheck despite prior receipt")
     active.serial { var r = sfs_result(); need(sfs_image_abort(active.coreHandle, &r) == SFS_OK, "abort owned transaction") }
     active.close()
+    }
     let failedWrite = try Mounted(Fixture(parent, "delivery-core-write"))
     trace.resetForTesting()
     fault(1, 1)
@@ -6198,6 +6251,12 @@ func directoryOpenChecks(_ parent: URL, baseline: Bool) throws {
             return
         }
 #if STALLION_WRITE_DIAGNOSTIC
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--sync-focused" {
+            let parent = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+            try synchronizeCompatibility(parent); try failures(parent); try admission(parent)
+            print("PASS synchronization compatibility, durability, failures and admission")
+            return
+        }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--get-boundary" {
             let parent = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
 #if STALLION_CONTEXT_HANDLERS
