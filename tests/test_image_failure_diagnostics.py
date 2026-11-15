@@ -1,5 +1,6 @@
 """Mocks only: no disk-image commands, mounts, or diagnostic subprocesses."""
 import ast
+import base64
 import errno
 from contextlib import contextmanager, nullcontext
 from contextvars import Context
@@ -1141,6 +1142,71 @@ class WorkflowTests(unittest.TestCase):
             '      - name: Check installed runtime and doctor\n', 1)[0]
         return textwrap.dedent(step.split(" <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0])
 
+    def test_image_retention_requires_completed_status_and_existing_admissions(self):
+        worker, _ = self.workflow()
+        prefix = "(success() || failure()) && matrix.phase == 'installed'"
+        conditions = {
+            'Admit validation': prefix + " && steps.ci-python.outcome == 'success'",
+            'Validate bounded image diagnostic artifact': prefix + " && steps.ci-python.outcome == 'success' && steps.tail-validation.outputs.admitted == 'true'",
+            'Admit image-upload': prefix + " && steps.image-diagnostics.outputs.available == 'true'",
+            'Upload bounded image failure diagnostics': prefix + " && steps.image-diagnostics.outputs.available == 'true' && steps.tail-image-upload.outputs.admitted == 'true'",
+        }
+        for name, expected in conditions.items():
+            step = worker.split('      - name: '+name+'\n', 1)[1].split('      - name:', 1)[0]
+            condition = re.search(r'^        if: (.+)$', step, re.MULTILINE)[1]
+            self.assertEqual(condition, expected)
+            for outcome in ('success', 'failure', 'cancelled', 'skipped'):
+                for installed in (True, False):
+                    for ready in (True, False):
+                        for admitted in (True, False):
+                            with self.subTest(step=name, outcome=outcome, installed=installed,
+                                              ready=ready, admitted=admitted):
+                                expression = condition
+                                for token, value in (
+                                        ('success()', outcome == 'success'), ('failure()', outcome == 'failure'),
+                                        ("matrix.phase == 'installed'", installed),
+                                        ("steps.ci-python.outcome == 'success'", ready),
+                                        ("steps.image-diagnostics.outputs.available == 'true'", ready),
+                                        ("steps.tail-validation.outputs.admitted == 'true'", admitted),
+                                        ("steps.tail-image-upload.outputs.admitted == 'true'", admitted)):
+                                    expression = expression.replace(token, str(value))
+                                actual = eval(expression.replace('&&', ' and ').replace('||', ' or '),
+                                              {'__builtins__': {}}, {})
+                                self.assertEqual(actual, outcome in ('success', 'failure') and installed
+                                                 and ready and (admitted or name.startswith('Admit ')))
+            phase = 'validation' if 'validation' in name.lower() or name.startswith('Validate ') else 'image-upload'
+            if name.startswith('Admit '):
+                self.assertIn('tools/ci_job_budget.py" tail '+phase, step)
+            else:
+                self.assertIn('        timeout-minutes: 1\n', step)
+        upload = worker.split('      - name: Upload bounded image failure diagnostics\n', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('          path: ${{ runner.temp }}/image-failure-diagnostics/image-failures.jsonl\n', upload)
+        self.assertIn('          if-no-files-found: error\n', upload)
+        self.assertIn('          retention-days: 1\n', upload)
+
+    def test_workflow_validator_keeps_recovery_and_refuses_absent_or_invalid_artifact(self):
+        worker, _ = self.workflow()
+        step = worker.split('      - name: Validate bounded image diagnostic artifact\n', 1)[1].split('      - name:', 1)[0]
+        script = compile(textwrap.dedent(step.split(" <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0]),
+                         '<workflow-image-validation>', 'exec')
+        recovered = dict(kind='eject_outcome', operation_id=1, phase='after', timestamp_ns=100,
+                         commands=2, first_status=1, continuation_status=0, outcome='recovered')
+        for name, content, available in (('absent', None, False), ('invalid', b'not json\n', False),
+                                         ('recovered', (json.dumps(recovered)+'\n').encode(), True)):
+            with self.subTest(artifact=name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve(); base.chmod(0o700)
+                artifact = base/'image-failure-diagnostics'; artifact.mkdir(mode=0o700)
+                report = artifact/diagnostics.REPORT
+                if content is not None:
+                    report.write_bytes(content); report.chmod(0o600)
+                output = base/'output'
+                environment = dict(GITHUB_WORKSPACE=str(Path(__file__).resolve().parents[1]),
+                                   RUNNER_TEMP=str(base), GITHUB_OUTPUT=str(output))
+                with patch.dict(os.environ, environment), patch.object(sys, 'path', list(sys.path)):
+                    exec(script, {})
+                self.assertEqual(output.read_text(), 'available='+str(available).lower()+'\n')
+                self.assertEqual(report.read_bytes() if report.exists() else None, content)
+
     def test_phase_coverage_and_legacy_context_convergence(self):
         worker, gate = self.workflow()
         expected = [('macos-15', '3.12', '0'), ('macos-26', '3.11', '1'),
@@ -1159,7 +1225,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
         self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
         self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
-        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && matrix.python != '3.13' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
+        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
         self.assertIn('      fail-fast: false\n', worker)
         self.assertNotIn('continue-on-error:', worker + gate)
         sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]
@@ -2109,6 +2175,129 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(order, ['before', 'eject', 'report', 'log'])
         self.assertIsNone(diagnostics._detach_observation.get())
 
+    def failed_eject_setup(self):
+        current = dict(image=str(self.image), device=self.args[2], mountpoint=str(self.point),
+                       volume_device='/dev/disk999s1', attachment=plistlib.dumps({'system-entities': [
+                           {'dev-entry': self.args[2]},
+                           {'dev-entry': '/dev/disk999s1', 'mount-point': str(self.point)}]}))
+        unmounted = dict(current, mountpoint=None, volume_device=None,
+                         attachment=space.images._unmounted_snapshot(current, self.point))
+        return current, unmounted
+
+    def test_completed_eject_results_keep_both_failures_and_local_windows(self):
+        current, unmounted = self.failed_eject_setup()
+        first = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'Eject failed for disk999\n', b'Volume failed to eject\n'))
+        continuation = ('/usr/bin/hdiutil', 'detach', self.args[2])
+        second = space.images._CommandFailure(continuation, subprocess.CompletedProcess(
+            continuation, 1, b'second\x00\xff', b'second stderr\r\n'))
+        with patch.object(space.images, '_command', side_effect=[first, second]) as command, \
+                patch.object(space.images, 'mounted', side_effect=[current, current, unmounted, unmounted]):
+            collector = diagnostics.install(space.images, self.base/'completed-results')
+            self.addCleanup(collector.close)
+            with patch.object(collector, 'report', return_value=1), patch.object(collector, 'eject_log'), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                    self.assertRaises(space.images._CommandFailure) as caught:
+                space.images.detach(self.image, self.point)
+        self.assertIs(caught.exception, first)
+        self.assertIs(first.__cause__, second)
+        self.assertEqual(command.call_args_list, [call(*self.args), call(*continuation)])
+        rows = [json.loads(line) for line in (collector.directory/diagnostics.REPORT).read_bytes().splitlines()]
+        events = [row for row in rows if row['kind'] == 'eject_command']
+        self.assertEqual([row['attempt'] for row in events], [1, 2])
+        for row, error in zip(events, (first, second)):
+            self.assertEqual((row['executable'], row['verb'], row['device']), error.args_native)
+            self.assertEqual(row['returncode'], error.returncode)
+            self.assertEqual(base64.b64decode(row['stdout_base64']), error.stdout)
+            self.assertEqual(base64.b64decode(row['stderr_base64']), error.stderr)
+            self.assertTrue(row['complete'])
+            self.assertLessEqual(row['started_mono_ns'], row['finished_mono_ns'])
+        self.assertLessEqual(events[0]['finished_mono_ns'], events[1]['started_mono_ns'])
+        self.assertTrue(diagnostics.artifact_available(collector.directory))
+
+    def test_eject_result_observation_failure_preserves_identical_primary(self):
+        current, _ = self.failed_eject_setup()
+        for failure in ('copy', 'clock', 'write'):
+            with self.subTest(failure=failure):
+                primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+                    self.args, 64, b'original stdout', b'original stderr'))
+                with patch.object(space.images, '_command', side_effect=primary) as command, \
+                        patch.object(space.images, 'mounted', return_value=current):
+                    collector = diagnostics.install(space.images, self.base/('failed-'+failure))
+                    self.addCleanup(collector.close)
+                    fault = (patch.object(diagnostics, '_eject_command_result', side_effect=KeyboardInterrupt())
+                             if failure == 'copy' else
+                             patch.object(diagnostics.time, 'monotonic_ns', side_effect=OSError('clock'))
+                             if failure == 'clock' else
+                             patch.object(collector, '_emit', side_effect=OSError('write')))
+                    with fault as injected, patch.object(collector, 'report', return_value=1), \
+                            patch.object(collector, 'eject_log'), \
+                            diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                            self.assertRaises(space.images._CommandFailure) as caught:
+                        space.images.detach(self.image, self.point)
+                    self.assertTrue(injected.called)
+                    self.assertIs(caught.exception, primary)
+                    self.assertIsNone(primary.__cause__)
+                    command.assert_called_once_with(*self.args)
+                    collector.close()
+
+    def test_eject_result_recovered_call_does_not_invent_success_stderr(self):
+        current, unmounted = self.failed_eject_setup()
+        primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'', b'Volume failed to eject'))
+        with patch.object(space.images, '_command', side_effect=[primary, b'success']) as command, \
+                patch.object(space.images, 'mounted', side_effect=[current, current, unmounted, unmounted, None]):
+            collector = diagnostics.install(space.images, self.base/'recovered-results')
+            self.addCleanup(collector.close)
+            with patch.object(collector, 'report', return_value=1), patch.object(collector, 'eject_log'), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point):
+                self.assertIsNone(space.images.detach(self.image, self.point))
+        rows = [json.loads(line) for line in (collector.directory/diagnostics.REPORT).read_bytes().splitlines()]
+        events = [row for row in rows if row['kind'] == 'eject_command']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['returncode'], 1)
+        self.assertEqual(rows[-1]['outcome'], 'recovered')
+        self.assertEqual(command.call_args_list, [call(*self.args),
+                                                call('/usr/bin/hdiutil', 'detach', self.args[2])])
+
+    def test_eject_result_schema_bounds_and_legacy_artifacts(self):
+        primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'x'*1025, b'\xff\x00'))
+        value = diagnostics._eject_command_result(self.args, primary, 1, (100, 200), (90, 300))
+        self.assertFalse(value['complete'])  # Wall-clock adjustment is retained, not used as elapsed time.
+        self.assertTrue(value['stdout_truncated'])
+        self.assertEqual(value['stdout_bytes'], 1025)
+        self.assertEqual(base64.b64decode(value['stdout_base64']), b'x'*1024)
+        self.reporter.phase, self.reporter.operation_id = 'after', 1
+        self.reporter._emit(time.monotonic()+1, 'eject_command', **value)
+        path = self.reporter.directory/diagnostics.REPORT
+        valid = json.loads(path.read_bytes())
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+        for executable, verb, attempt, accepted in (
+                ('/usr/sbin/diskutil', 'eject', 2, True),
+                ('/usr/bin/hdiutil', 'detach', 2, True),
+                ('/usr/bin/hdiutil', 'detach', 1, False),
+                ('/usr/bin/hdiutil', 'eject', 2, False),
+                ('/usr/sbin/diskutil', 'detach', 2, False),
+                ('hdiutil', 'detach', 2, False)):
+            with self.subTest(executable=executable, verb=verb, attempt=attempt):
+                path.write_text(json.dumps(valid | dict(executable=executable, verb=verb, attempt=attempt))+'\n')
+                self.assertEqual(diagnostics.artifact_available(self.reporter.directory), accepted)
+        for change in ({'attempt': True}, {'attempt': 3}, {'returncode': 0}, {'device': '/dev/disk999s1'},
+                       {'stdout_base64': '!'}, {'stdout_bytes': 1024}, {'stdout_truncated': False},
+                       {'complete': True}, {'finished_mono_ns': 199}, {'started_ns': True},
+                       {'stdout_base64': 'A'*2000}, {'stderr_bytes': -1}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps(valid | change)+'\n')
+                self.assertFalse(diagnostics.artifact_available(self.reporter.directory))
+        legacy = dict(kind='eject_outcome', operation_id=1, phase='after', timestamp_ns=100,
+                      commands=2, first_status=1, continuation_status=1, outcome='failed')
+        path.write_text(json.dumps(legacy)+'\n')
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+        self.reporter.events = diagnostics.EVENTS
+        self.reporter._emit(time.monotonic()+1, 'eject_command', **value)
+        self.assertEqual(json.loads(path.read_bytes()), legacy)
+
     def test_real_detach_observes_before_validation_and_refuses_changed_owned_backing(self):
         cases = ('stable', 'observer_error', 'observer_timeout', 'exhausted', 'missing',
                  'replaced', 'symlink', 'private', 'error_replaced', 'disappeared',
@@ -2379,13 +2568,13 @@ class DiagnosticTests(unittest.TestCase):
         step = worker.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
         self.assertIn("        if: matrix.phase == 'installed'\n", step)
         expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
-        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
+        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'closed-snapshot' || matrix.os == 'macos-26-intel' && 'enospc-initial-detach' || 'initial-unmount' }}")
         rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: installed\}$", worker, re.MULTILINE)
         self.assertEqual(len(rows), 6)
         self.assertEqual(worker.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
         choices = ['restored-cleanup' if (runner, python) == ('macos-26', '3.11') else
-                   'enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
-                   'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount'
+                   'closed-snapshot' if (runner, python) == ('macos-26', '3.14') else
+                   'enospc-initial-detach' if runner == 'macos-26-intel' else 'initial-unmount'
                    for runner, python, images in rows]
         self.assertEqual(choices.count('enospc-initial-detach'), 1)
         self.assertEqual(choices.count('closed-snapshot'), 1)
@@ -3281,8 +3470,39 @@ class DiagnosticTests(unittest.TestCase):
         query.assert_called_once()
         self.assertIn('Eject log unavailable: OSError', primary.__notes__)
 
+    def test_alternate_detach_capture_requires_same_active_continuation(self):
+        alternate = ('/usr/bin/hdiutil', 'detach', self.args[2])
+        for change in ({'command_count': 0}, {'command_count': 2},
+                       {'command_statuses': [0]}, {'command_statuses': [64]},
+                       {'command_targets': ['/dev/disk998']}, {'diagnostics': object()}):
+            with self.subTest(change=change):
+                primary = OSError('unselected error')
+                original = Mock(side_effect=primary)
+                images = SimpleNamespace(_command=original)
+                collector = diagnostics.install(images, self.base / 'unused')
+                self.addCleanup(collector.close)
+                invocation = dict(diagnostics=collector, command_count=1,
+                                  command_statuses=[1], command_targets=[self.args[2]]) | change
+                token = diagnostics._detach_call.set(invocation)
+                try:
+                    with patch.object(collector, 'before') as before, \
+                            patch.object(collector, 'report') as report, \
+                            self.assertRaises(OSError) as caught:
+                        images._command(*alternate)
+                    self.assertIs(caught.exception, primary)
+                    original.assert_called_once_with(*alternate)
+                    before.assert_not_called()
+                    report.assert_not_called()
+                finally:
+                    diagnostics._detach_call.reset(token)
+                    collector.close()
+
     def test_only_exact_normal_whole_device_eject_is_intercepted(self):
         commands = (('/usr/bin/hdiutil', 'detach', '/dev/disk999'),
+                    ('/usr/bin/hdiutil', 'detach', '-force', '/dev/disk999'),
+                    ('/usr/bin/hdiutil', 'detach', '/dev/disk999s1'),
+                    ('/usr/bin/hdiutil', 'detach', '/dev/rdisk999'),
+                    ('/usr/bin/hdiutil', 'eject', '/dev/disk999'),
                     ('/usr/sbin/diskutil', 'eject', '/dev/disk999s1'),
                     ('/usr/sbin/diskutil', 'eject', '/dev/disk999', 'force'),
                     ('/usr/sbin/diskutil', 'eject', '/dev/rdisk999'),

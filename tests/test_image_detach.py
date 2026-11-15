@@ -96,7 +96,9 @@ class DetachContinuationTests(unittest.TestCase):
         return {'images': [] if value is None else [value]}
 
     def command(self, args, **kwargs):
-        self.assertEqual(args, ['/usr/sbin/diskutil', 'eject', '/dev/disk7'])
+        self.assertLess(len(self.runs), 2)
+        expected = ('/usr/sbin/diskutil', 'eject') if not self.runs else ('/usr/bin/hdiutil', 'detach')
+        self.assertEqual(args, [*expected, '/dev/disk7'])
         self.runs.append(tuple(args))
         self.command_hook()
         value = self.results[len(self.runs) - 1]
@@ -117,7 +119,8 @@ class DetachContinuationTests(unittest.TestCase):
         images.detach(self.image, self.point)
         self.assertEqual(self.reads, 5)
         self.assertEqual(len(self.runs), 2)
-        self.assertEqual(self.runs[0], self.runs[1])
+        self.assertEqual(self.runs, [('/usr/sbin/diskutil', 'eject', '/dev/disk7'),
+                                     ('/usr/bin/hdiutil', 'detach', '/dev/disk7')])
         self.assertEqual(self.image.read_bytes(), b'owned backing')
 
     def test_store_unmount_keeps_one_public_call_and_holds_workspace_lock(self):
@@ -215,6 +218,22 @@ class DetachContinuationTests(unittest.TestCase):
         self.sequence[-1] = self.closed
         error = self.refused(commands=2)
         self.assertIn('remains attached', str(error.__cause__))
+
+    def test_continuation_timeout_preserves_first_failure_without_third_attempt(self):
+        timeout = subprocess.TimeoutExpired(['/usr/bin/hdiutil', 'detach', '/dev/disk7'], 1)
+        self.results[1] = timeout
+        error = self.refused(commands=2)
+        self.assertIs(error.__cause__, timeout)
+        self.assertEqual(self.reads, 4)
+
+    def test_continuation_interrupt_propagates_without_third_attempt(self):
+        interruption = KeyboardInterrupt('detach interrupted')
+        self.results[1] = interruption
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            images.detach(self.image, self.point)
+        self.assertIs(caught.exception, interruption)
+        self.assertIn('First eject failure', ' '.join(interruption.__notes__))
+        self.assertEqual((len(self.runs), self.reads), (2, 4))
 
     def test_still_mounted_or_disappeared_refuses_continuation(self):
         for entry in (self.entry, None):

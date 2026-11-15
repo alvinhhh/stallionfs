@@ -3032,7 +3032,14 @@ static void memo_target_check(unsigned passes, int rejected_first_link) {
     }
     fflush(stdout);
 }
-static void symlink_verify(void) {
+static void symlink_verify_progress(unsigned group, const char *stage) {
+    struct timespec now; assert(!clock_gettime(CLOCK_MONOTONIC, &now));
+    printf("{\"case\":\"symlink-verify-progress\",\"group\":%u,\"stage\":\"%s\",\"monotonic_ns\":%llu}\n", group, stage,
+           (unsigned long long)now.tv_sec * UINT64_C(1000000000) + (unsigned long long)now.tv_nsec);
+    fflush(stdout);
+}
+static void symlink_verify_semantics(void) {
+    symlink_verify_progress(0, "start");
     sfs_image *h; sfs_result r; sfs_recovery recovery;
     for (unsigned first = 0; first < 2; first++) for (unsigned bad = 0; bad < 2; bad++) {
         fixture f = symlink_graph(first, 0, bad); assert(symlink_guard(f.p, f.p, f.n)); fixture_save(&f);
@@ -3113,44 +3120,75 @@ static void symlink_verify(void) {
     budget = generous; budget.cancelled = symlink_cancel_after_raw; budget.context = &fired; reset("", 0);
     assert(sfs_image_verify(h, &budget, &r) == SFS_CORRUPT && !r.system_errno && raw_hash_input == 4132 && !fired);
     assert(sfs_image_begin(h, &r) == SFS_POISONED); image_unwritten(); close_image(h); retain(1370);
-    /* Reuse the established 1201-leaf eviction size and <=256MiB sparse address bound. */
-    for (unsigned first = 0; first < 2; first++) for (unsigned sparse = 0; sparse < 2; sparse++) {
-        f = symlink_graph(first, 1, 0);
-        unsigned char target_ref[56], *space = namespace_at(f.p, f.p, f.n);
-        unsigned char *link_extent = record(f.p, leaf_row(f.p, space + 64, first ? 2 : 3, f.n, 440) + 32, f.n);
-        memcpy(target_ref, link_extent + 648, 56);
-        assert(get16(record(f.p, leaf_row(f.p, space + 64, first ? 3 : 2, f.n, 440) + 32, f.n) + 68) > 0);
-        assert(symlink_guard(f.p, f.p, f.n));
-        if (sparse) symlink_sparse_save(&f); else fixture_save(&f);
-        uint64_t length; unsigned char before[32], after[32]; file_digest("image", before, &length); assert(length <= UINT64_C(268435456));
-        struct stat identity, after_identity; assert(!lstat("image", &identity));
-        reset("", 0); open_image(&h); reset("", 0); memo_target_start(target_ref, 6, (int)sparse); symlink_full(h);
-        assert(raw_hash_input == 8264 && raw_hashes == 2 && watch_bytes[0] == CELL && watch_reads[0] == 1 && metadata_hash_input > 4194304);
-        if (sparse) { assert(aux_write_calls && aux_write_bytes && aux_read_bytes); memo_target_check(1, 0); }
-        counters("symlink-shared-raw-eviction"); memo_target_enabled = 0;
-        symlink_expect(h, 0, first ? 2 : 3, "shared", 6); symlink_expect(h, 2, first ? 2 : 3, "shared", 6);
-        /* A fresh verification must fetch/hash the shared raw again, not trust any handle memo. */
-        reset("", 0); memo_target_start(target_ref, 6, (int)sparse); symlink_full(h);
-        assert(raw_hash_input == 8264 && raw_hashes == 2 && watch_bytes[0] == CELL && watch_reads[0] == 1);
-        if (sparse) memo_target_check(1, 0); memo_target_enabled = 0;
-        uint64_t after_length; file_digest("image", after, &after_length); assert(after_length == length && !memcmp(before, after, 32));
-        assert(!lstat("image", &after_identity)); identical_identity(&identity, &after_identity);
-        int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); unsigned char changed = 'X'; raw_write(fd, &changed, 1, 8192); assert(!close(fd));
-        reset("", 0); assert(sfs_image_verify(h, &generous, &r) == SFS_CORRUPT && raw_hash_input == 4132 && raw_hashes == 1);
-        assert(sfs_image_begin(h, &r) == SFS_POISONED); image_unwritten(); close_image(h); retain(1361 + (int)(first * 2 + sparse));
-        /* Regular-first NUL is rejected after target reload; link-first correctly rejects before eviction. */
-        f = symlink_graph(first, 1, 1); space = namespace_at(f.p, f.p, f.n);
-        link_extent = record(f.p, leaf_row(f.p, space + 64, first ? 2 : 3, f.n, 440) + 32, f.n); memcpy(target_ref, link_extent + 648, 56);
-        assert(symlink_guard(f.p, f.p, f.n));
-        if (sparse) symlink_sparse_save(&f); else fixture_save(&f);
-        reset("", 0); memo_target_start(target_ref, 2, (int)sparse); h = NULL;
-        enum sfs_status status = sfs_image_inspect(root, "image", &h, &recovery, &generous, &r);
-        assert(status == SFS_RECOVERY_REQUIRED && !h && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT);
-        assert(r.phase == SFS_PHASE_READ && !r.system_errno && watch_bytes[0] == 2 * CELL && watch_reads[0] == 2);
-        assert(raw_hashes == (first ? 2u : 4u) && raw_hash_input == (first ? 8264u : 16528u));
-        if (sparse) memo_target_check(2, (int)first);
-        memo_target_enabled = 0; watch_count = 0; image_unwritten(); retain(1365 + (int)(first * 2 + sparse));
-    }
+    symlink_verify_progress(0, "done");
+}
+
+/* Keep both verifies, corruption and paired NUL rejection in the same process. */
+static void symlink_verify_eviction(unsigned first, unsigned sparse) {
+    assert(first < 2 && sparse < 2);
+    sfs_image *h; sfs_result r; sfs_recovery recovery;
+    unsigned group = 1 + first * 2 + sparse;
+    symlink_verify_progress(group, "start");
+    fixture f = symlink_graph(first, 1, 0);
+    unsigned char target_ref[56], *space = namespace_at(f.p, f.p, f.n);
+    unsigned char *link_extent = record(f.p, leaf_row(f.p, space + 64, first ? 2 : 3, f.n, 440) + 32, f.n);
+    memcpy(target_ref, link_extent + 648, 56);
+    assert(get16(record(f.p, leaf_row(f.p, space + 64, first ? 3 : 2, f.n, 440) + 32, f.n) + 68) > 0);
+    assert(symlink_guard(f.p, f.p, f.n));
+    if (sparse) symlink_sparse_save(&f); else fixture_save(&f);
+    symlink_verify_progress(group, "fixture-saved");
+    uint64_t length; unsigned char before[32], after[32];
+    symlink_verify_progress(group, "digest-before-start");
+    file_digest("image", before, &length); assert(length <= UINT64_C(268435456));
+    symlink_verify_progress(group, "digest-before-done");
+    struct stat identity, after_identity; assert(!lstat("image", &identity));
+    symlink_verify_progress(group, "open-start");
+    reset("", 0); open_image(&h);
+    symlink_verify_progress(group, "open-done");
+    reset("", 0); memo_target_start(target_ref, 6, (int)sparse);
+    symlink_verify_progress(group, "verify-first-start");
+    symlink_full(h);
+    symlink_verify_progress(group, "verify-first-done");
+    assert(raw_hash_input == 8264 && raw_hashes == 2 && watch_bytes[0] == CELL && watch_reads[0] == 1 && metadata_hash_input > 4194304);
+    if (sparse) { assert(aux_write_calls && aux_write_bytes && aux_read_bytes); memo_target_check(1, 0); }
+    counters("symlink-shared-raw-eviction"); memo_target_enabled = 0;
+    symlink_expect(h, 0, first ? 2 : 3, "shared", 6); symlink_expect(h, 2, first ? 2 : 3, "shared", 6);
+    /* A fresh verification must fetch/hash the shared raw again, not trust any handle memo. */
+    reset("", 0); memo_target_start(target_ref, 6, (int)sparse);
+    symlink_verify_progress(group, "verify-second-start");
+    symlink_full(h);
+    symlink_verify_progress(group, "verify-second-done");
+    assert(raw_hash_input == 8264 && raw_hashes == 2 && watch_bytes[0] == CELL && watch_reads[0] == 1);
+    if (sparse) memo_target_check(1, 0); memo_target_enabled = 0;
+    symlink_verify_progress(group, "digest-after-start");
+    uint64_t after_length; file_digest("image", after, &after_length); assert(after_length == length && !memcmp(before, after, 32));
+    symlink_verify_progress(group, "digest-after-done");
+    assert(!lstat("image", &after_identity)); identical_identity(&identity, &after_identity);
+    int fd = open("image", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); assert(fd >= 0); unsigned char changed = 'X'; raw_write(fd, &changed, 1, 8192); assert(!close(fd));
+    reset("", 0); assert(sfs_image_verify(h, &generous, &r) == SFS_CORRUPT && raw_hash_input == 4132 && raw_hashes == 1);
+    assert(sfs_image_begin(h, &r) == SFS_POISONED); image_unwritten(); close_image(h); retain(1361 + (int)(first * 2 + sparse));
+    /* Regular-first NUL is rejected after target reload; link-first correctly rejects before eviction. */
+    symlink_verify_progress(group, "bad-fixture-start");
+    f = symlink_graph(first, 1, 1); space = namespace_at(f.p, f.p, f.n);
+    link_extent = record(f.p, leaf_row(f.p, space + 64, first ? 2 : 3, f.n, 440) + 32, f.n); memcpy(target_ref, link_extent + 648, 56);
+    assert(symlink_guard(f.p, f.p, f.n));
+    if (sparse) symlink_sparse_save(&f); else fixture_save(&f);
+    reset("", 0); memo_target_start(target_ref, 2, (int)sparse); h = NULL;
+    symlink_verify_progress(group, "bad-inspect-start");
+    enum sfs_status status = sfs_image_inspect(root, "image", &h, &recovery, &generous, &r);
+    symlink_verify_progress(group, "bad-inspect-done");
+    assert(status == SFS_RECOVERY_REQUIRED && !h && recovery.slots[0].status == SFS_CORRUPT && recovery.slots[1].status == SFS_CORRUPT);
+    assert(r.phase == SFS_PHASE_READ && !r.system_errno && watch_bytes[0] == 2 * CELL && watch_reads[0] == 2);
+    assert(raw_hashes == (first ? 2u : 4u) && raw_hash_input == (first ? 8264u : 16528u));
+    if (sparse) memo_target_check(2, (int)first);
+    memo_target_enabled = 0; watch_count = 0; image_unwritten(); retain(1365 + (int)(first * 2 + sparse));
+    symlink_verify_progress(group, "done");
+}
+
+static void symlink_verify(void) {
+    symlink_verify_semantics();
+    for (unsigned first = 0; first < 2; first++) for (unsigned sparse = 0; sparse < 2; sparse++)
+        symlink_verify_eviction(first, sparse);
 }
 
 /* Opaque attribute bytes have no path or resource-fork interpretation. */
@@ -5829,6 +5867,11 @@ int main(int argc, char **argv) {
     else if(!strcmp(argv[1],"symlink-views")) symlink_views();
     else if(!strcmp(argv[1],"symlink-failures")) symlink_failures();
     else if(!strcmp(argv[1],"symlink-verify")) symlink_verify();
+    else if(!strcmp(argv[1],"symlink-verify-semantics")) symlink_verify_semantics();
+    else if(!strcmp(argv[1],"symlink-verify-regular-dense")) symlink_verify_eviction(0, 0);
+    else if(!strcmp(argv[1],"symlink-verify-regular-sparse")) symlink_verify_eviction(0, 1);
+    else if(!strcmp(argv[1],"symlink-verify-link-dense")) symlink_verify_eviction(1, 0);
+    else if(!strcmp(argv[1],"symlink-verify-link-sparse")) symlink_verify_eviction(1, 1);
     else if(!strcmp(argv[1],"cache")) cache_purge();
     else if(!strcmp(argv[1],"cache-commit")) cache_commit();
     else if(!strcmp(argv[1],"readonly")) readonly(); else if(!strcmp(argv[1],"resume")) resume(); else assert(0);

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 from pathlib import Path
 import stat
 import tempfile
@@ -24,10 +25,15 @@ class Signing(unittest.TestCase):
         _,self.observer,self.o=p._maintenance_source();self.roles=self.o['RESOURCE_ROLES']
         self.write(self.roles['native'],b'unsigned',0o755)
         self.write(self.roles['observer'],self.observer)
-        self.write(self.roles['compatibility'],b'compatibility')
+        self.build = dict(bundle_id='com.alvinhhh.stallionfs', bundle_version='9',
+                          package_version='0.7.0', source_build_id='a'*64)
+        self.write(self.roles['compatibility'],self.o['create_compatibility'](self.observer,self.build))
+        self.write('Contents/Info.plist', plistlib.dumps(dict(CFBundleIdentifier=self.build['bundle_id'],
+                                                          CFBundleVersion=self.build['bundle_version'])))
         self.write('Contents/Resources/Runtime/Git/bin/git',b'fake-git',0o755)
         payload=p._runtime_bundle().git_payload(self.app/'Contents/Resources/Runtime/Git')
         self.write('Contents/Resources/Runtime/runtime.json',json.dumps(dict(schema=2,source_build_id='a'*64,
+            package_version='0.7.0', bundle_version='9',
             git=dict(self.o['GIT_CONTRACT'],input_inventory_sha256='9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700',
                      payload_entries=payload['entries'],payload_sha256=payload['sha256']))).encode())
         self.write('Contents/Resources/Runtime/CPython/bin/python3.13',b'\xcf\xfa\xed\xfefake signed python',0o755)
@@ -80,6 +86,20 @@ class Signing(unittest.TestCase):
         self.write('Contents/Resources/Runtime/runtime.json',b'stale-relative-to-archive')
         with patch.object(p,'_tool_output',side_effect=verify),self.assertRaises(ValueError):
             p.final_maintenance_bindings(self.app,archive,expected_publisher=self.o['PUBLISHER_TEAM'])
+
+    def test_signed_declaration_is_bound_without_post_sign_mutation_or_test_authority(self):
+        predecessor = dict(predecessor_artifact_id='1'*64, predecessor_descriptor_sha256='2'*64)
+        data = self.o['create_compatibility'](self.observer, self.build, [predecessor])
+        self.write(self.roles['compatibility'], data)
+        self.write('Contents/_CodeSignature/CodeResources',b'inert seal')
+        archive, rows = self.archive()
+        with patch.object(p, '_tool_output', return_value=''):
+            mapping = p.final_maintenance_bindings(self.app, archive, expected_publisher=self.o['PUBLISHER_TEAM'])
+        self.assertEqual(mapping['build'], self.build)
+        self.assertEqual(mapping['public_upgrade_support'], json.loads(data)['public_upgrade_support'])
+        self.assertEqual(p._runtime_inventory(self.app), rows)
+        self.assertNotIn('qualified', mapping)
+        self.assertEqual(mapping['artifact']['compatibility_sha256'], hashlib.sha256(data).hexdigest())
 
     def test_unsealed_wrong_publisher_tampered_leaf_and_zip_scope_refuse(self):
         archive,rows=self.archive()

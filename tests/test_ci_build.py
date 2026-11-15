@@ -1397,7 +1397,7 @@ class OwnedCIInterpreter(unittest.TestCase):
             expected_count = 2 if name == 'Install current owned wheel' else 1
             self.assertTrue(len(commands) == expected_count and all(command.startswith('          "${CI_PYTHON:?}" -I -B ') for command in commands), 'owned-consumer:' + name)
         diagnostic = step(ordinary, 'Validate bounded image diagnostic artifact')
-        self.assertIn("if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'", diagnostic)
+        self.assertIn("if: (success() || failure()) && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'", diagnostic)
         install = step(ordinary, 'Install current owned wheel')
         doctor = step(ordinary, 'Check installed runtime and doctor')
         self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', doctor)
@@ -1430,10 +1430,60 @@ class OwnedCIInterpreter(unittest.TestCase):
 
 class FetchPhases(unittest.TestCase):
 
+    def test_worker_budget_matches_every_installed_and_sanitizer_row(self):
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
+        worker = job(text, 'test-execution')
+        runner = re.search(r'^    timeout-minutes: \$\{\{ (.+) \}\}$', worker, re.MULTILINE)[1]
+        allocation = re.search(r'^          CI_JOB_MINUTES: \$\{\{ (.+) \}\}$', worker, re.MULTILINE)[1]
+        self.assertEqual(runner, allocation)
+        rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: (\w+)\}$",
+                          worker, re.MULTILINE)
+        expected = {
+            ('macos-15', '3.12', '0', 'installed'): 20,
+            ('macos-26', '3.11', '1', 'installed'): 30,
+            ('macos-26', '3.13', '1', 'installed'): 30,
+            ('macos-26', '3.14', '1', 'installed'): 30,
+            ('macos-26-intel', '3.13', '1', 'installed'): 45,
+            ('xcode-27', '3.13', '1', 'installed'): 30,
+            ('macos-26', '3.13', '1', 'sanitizer'): 20,
+            ('macos-26-intel', '3.13', '1', 'sanitizer'): 30,
+            ('xcode-27', '3.13', '1', 'sanitizer'): 30,
+        }
+        self.assertEqual(len(rows), len(expected))
+        self.assertEqual(set(rows), set(expected))
+
+        def evaluate(node, matrix):
+            # Interpret only the budget's literal comparisons/boolean choices.
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body, matrix)
+            if isinstance(node, ast.Constant) and type(node.value) in (str, int):
+                return node.value
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == 'matrix' and node.attr in matrix):
+                return matrix[node.attr]
+            if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+                left, right = evaluate(node.left, matrix), evaluate(node.comparators[0], matrix)
+                if isinstance(node.ops[0], ast.Eq): return left == right
+                if isinstance(node.ops[0], ast.NotEq): return left != right
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+                for operand in node.values:
+                    value = evaluate(operand, matrix)
+                    if (isinstance(node.op, ast.And) and not value
+                            or isinstance(node.op, ast.Or) and value):
+                        return value
+                return value
+            self.fail('Unsupported allocation expression')
+
+        for label, expression in (('runner', runner), ('allocation', allocation)):
+            tree = ast.parse(expression.replace('&&', ' and ').replace('||', ' or '), mode='eval')
+            for row in rows:
+                with self.subTest(binding=label, row=row):
+                    self.assertEqual(evaluate(tree, dict(zip(('os', 'python', 'images', 'phase'), row))), expected[row])
+
     def test_workflow_fetch_budget_artifacts_and_sanitizer_coverage(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
         ordinary = job(text, 'test-execution')
-        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && matrix.python != '3.13' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
         fetch = step(ordinary, 'Fetch exact qualified architecture component')
         self.assertIn('tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch', fetch)
         build = step(ordinary, 'Build current wheel with enforced Git cache reuse')
@@ -1443,7 +1493,7 @@ class FetchPhases(unittest.TestCase):
         self.assertIn("if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'", large)
         for name, condition, missing in (
                 ('Upload component fetch failure diagnostics', "failure() && steps.component-fetch.outcome == 'failure'", 'ignore'),
-                ('Upload bounded image failure diagnostics', "failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'", 'error'),
+                ('Upload bounded image failure diagnostics', "(success() || failure()) && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'", 'error'),
                 ('Upload FSKit interface failure diagnostics', "failure() && matrix.phase == 'installed'", 'ignore')):
             artifact = step(ordinary, name)
             for value in ('if: ' + condition, 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',

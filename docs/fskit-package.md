@@ -469,6 +469,28 @@ owned user links and installed FSKit lifecycle remain separate qualification
 gates. Do not treat a private assembly or CLI test as an installation/update
 permission or a stable mounted-filesystem result.
 
+## Upgrade declarations
+
+For an explicitly declared cross-version release, `--upgrade-predecessors
+/absolute/predecessors.json` accompanies `--runtime-inputs`. The file is a JSON
+array of objects with exactly `predecessor_artifact_id` (the predecessor's final
+canonical inventory hash) and `predecessor_descriptor_sha256`. Both are lowercase
+64-character hashes from independently admitted predecessor release records.
+The packager pins and rechecks this input, generates schema-2 exact-pair rows
+bound to the current candidate source/build, observer, runtime and parser, and
+includes them before signing. Without the option, existing schema-1 output and
+empty support remain unchanged. Neither arbitrary version ranges nor a
+descriptor-only predecessor is accepted for the upgrade controller.
+
+`final_maintenance_bindings` validates the signed resource against actual bundle
+and runtime build metadata and returns its declared support and build along with
+the exact final inventory, archive and signing roles. This records capability,
+not qualification. Qualify the unchanged finished signed artifact against each
+declared exact predecessor before publishing its existing authenticated release
+mapping. Do not edit or reseal the app to attach test results. The retained
+upgrade controller, manual publication steps and interruption/rollback boundaries
+are specified in [Exact-artifact maintenance](fskit-maintenance.md#cross-version-upgrade-controller).
+
 ## User command link
 
 The Control Panel offers `Install Command`, `Remove Command` and `Refresh` for

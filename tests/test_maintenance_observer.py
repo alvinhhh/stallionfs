@@ -482,7 +482,7 @@ class Compatibility(unittest.TestCase):
             with self.assertRaises(o.Refusal): o.compatible_predecessor(data,self.observer,self.build,pair)
 
     def test_resource_refuses_malformed_unknown_aliases_and_authority(self):
-        updates = [dict(schema=True), dict(schema=2), dict(verified=True), dict(publisher='candidate'),
+        updates = [dict(schema=True), dict(schema=3), dict(verified=True), dict(publisher='candidate'),
             dict(roles=dict(o.RESOURCE_ROLES, observer='../observer.py')),
             dict(roles=dict(o.RESOURCE_ROLES, observer=o.RESOURCE_ROLES['compatibility'])),
             dict(roles=dict(o.RESOURCE_ROLES, observer='Contents/Resources/Maintenance/./observer.py')),
@@ -507,6 +507,24 @@ class Compatibility(unittest.TestCase):
             with self.assertRaises(o.Refusal):o.validate_compatibility(self.data,observer,self.build)
         with self.assertRaises(o.Refusal):
             o.validate_compatibility(self.data,self.observer,dict(self.build,package_version='0.8.0'))
+
+    def test_exact_predecessor_inventory_and_descriptor_declaration(self):
+        predecessor = dict(predecessor_artifact_id='1'*64, predecessor_descriptor_sha256='b'*64)
+        data = o.create_compatibility(self.observer, self.build, [predecessor])
+        value = o.validate_compatibility(data, self.observer, self.build)
+        self.assertEqual(value['schema'], 2)
+        pair = dict(self.pair, predecessor_artifact_id='1'*64)
+        self.assertEqual(value['public_upgrade_support'], [pair])
+        self.assertEqual(o.compatible_predecessor(data, self.observer, self.build, pair),
+                         dict(structurally_consistent=True, authenticated=False))
+        for field in ('predecessor_artifact_id', 'predecessor_descriptor_sha256'):
+            with self.subTest(field=field), self.assertRaises(o.Refusal):
+                o.compatible_predecessor(data, self.observer, self.build, dict(pair, **{field:'2'*64}))
+        for rows in ([predecessor]*2, [dict(predecessor, qualified=True)], [dict(predecessor_artifact_id=True)]):
+            with self.subTest(rows=rows), self.assertRaises(o.Refusal):
+                o.create_compatibility(self.observer, self.build, rows)
+        self.assertEqual(o.create_compatibility(self.observer, self.build), self.data)
+        self.assertEqual(json.loads(self.data)['public_upgrade_support'], [])
 
 
 
@@ -952,6 +970,113 @@ class CleanupRegression(unittest.TestCase):
 
     def test_report_cleanup_survives_later_report_write_failure(self):
         self.test_report_finish_cleanup_reaches_main(fail_report=True)
+
+
+class InstalledAnchor(unittest.TestCase):
+    @contextlib.contextmanager
+    def filesystem(self, path=o.APP, *, anchor_mode=0o775, anchor_uid=0,
+                   anchor_gid=80, app_mode=0o755, symlink=None, changed=None,
+                   acl_failure=False, admin=None, member=False):
+        path = Path(path)
+        nodes = {}
+        for index, current in enumerate(reversed([path, *path.parents])):
+            mode = anchor_mode if current.name == 'Applications' else app_mode if current == path else 0o755
+            uid = anchor_uid if current.name == 'Applications' else 501 if current == path else 0
+            gid = anchor_gid if current.name == 'Applications' else 20 if current == path else 0
+            nodes[current] = types.SimpleNamespace(st_dev=1, st_ino=100+index,
+                st_uid=uid, st_gid=gid, st_mode=stat.S_IFDIR|mode,
+                st_nlink=2, st_size=0, st_mtime_ns=1, st_ctime_ns=1)
+        opened = {}; closed = []; flags_seen = []; acl_seen = []
+        def opening(name, flags, *, dir_fd=None):
+            current = Path('/') if dir_fd is None else opened[dir_fd]/name
+            flags_seen.append(flags)
+            self.assertTrue(flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW)
+            if current == symlink:
+                raise OSError(40, 'symlink rejected')
+            fd = nodes[current].st_ino; opened[fd] = current
+            return fd
+        def named(name, *, dir_fd=None, follow_symlinks=True):
+            self.assertFalse(follow_symlinks)
+            current = Path(name) if dir_fd is None else opened[dir_fd]/name
+            if member and current == path/'unsafe':
+                return types.SimpleNamespace(st_uid=501, st_mode=stat.S_IFREG|0o664)
+            info = nodes[current]
+            return types.SimpleNamespace(**{**vars(info), 'st_ino':info.st_ino+1}) if current == changed else info
+        def acl(fd, *, ancestor=False):
+            acl_seen.append((opened[fd], ancestor))
+            if acl_failure and opened[fd] == Path('/Applications'):
+                raise o.Refusal('unsupported-acl')
+        group = admin if admin is not None else types.SimpleNamespace(gr_name='admin', gr_gid=80)
+        lookup = unittest.mock.Mock(return_value=group)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {'grp':types.SimpleNamespace(getgrnam=lookup)}))
+            stack.enter_context(patch.object(o.os, 'open', side_effect=opening))
+            stack.enter_context(patch.object(o.os, 'fstat', side_effect=lambda fd:nodes[opened[fd]]))
+            stack.enter_context(patch.object(o.os, 'stat', side_effect=named))
+            stack.enter_context(patch.object(o.os, 'close', side_effect=closed.append))
+            stack.enter_context(patch.object(o.os, 'getuid', return_value=501))
+            stack.enter_context(patch.object(o.os, 'listdir', return_value=['unsafe'] if member else []))
+            stack.enter_context(patch.object(o, 'empty_acl', side_effect=acl))
+            yield dict(opened=opened, closed=closed, flags=flags_seen, acl=acl_seen, lookup=lookup)
+        self.assertEqual(set(opened), set(closed))
+        self.assertEqual(len(closed), len(set(closed)))
+
+    def test_fixed_installed_inventory_accepts_root_named_admin_anchor(self):
+        for mode in (0o755, 0o775):
+            with self.subTest(mode=oct(mode)), self.filesystem(anchor_mode=mode) as fs:
+                self.assertEqual(o.app_inventory(o.APP), [])
+                fs['lookup'].assert_called_once_with('admin')
+                self.assertEqual([ancestor for path,ancestor in fs['acl']
+                                  if path == Path('/Applications')], [True, True])
+                self.assertTrue(all(not ancestor for path,ancestor in fs['acl']
+                                    if path == Path(o.APP)))
+
+    def test_anchor_exception_requires_exact_fixed_app_prefix(self):
+        for path in ('/Applications', '/Applications/Other.app',
+                     '/Applications/StallionFS.app-copy', '/tmp/Applications/StallionFS.app'):
+            with self.subTest(path=path), self.filesystem(path) as fs:
+                with self.assertRaises(o.Refusal) as caught: o.physical_directory(path)
+                self.assertEqual(caught.exception.code, 'physical-directory-owner-mode')
+                fs['lookup'].assert_not_called()
+
+    def test_fixed_app_descendant_keeps_only_applications_exception(self):
+        with self.filesystem(Path(o.APP)/'Contents') as fs:
+            fd = o.physical_directory(Path(o.APP)/'Contents'); o.os.close(fd)
+            fs['lookup'].assert_called_once_with('admin')
+
+    def test_anchor_rejects_wrong_owner_group_and_modes(self):
+        for settings in (dict(anchor_uid=501), dict(anchor_gid=20),
+                         dict(anchor_mode=0o777), dict(anchor_mode=0o2775)):
+            with self.subTest(settings=settings), self.filesystem(**settings):
+                with self.assertRaises(o.Refusal) as caught: o.app_inventory(o.APP)
+                self.assertEqual(caught.exception.code, 'physical-directory-owner-mode')
+
+    def test_anchor_rejects_invalid_named_admin_group(self):
+        for group in (types.SimpleNamespace(gr_name='wheel',gr_gid=80),
+                      types.SimpleNamespace(gr_name='admin',gr_gid=True),
+                      types.SimpleNamespace(gr_name='admin',gr_gid=-1)):
+            with self.subTest(group=group), self.filesystem(admin=group):
+                with self.assertRaises(o.Refusal) as caught: o.app_inventory(o.APP)
+                self.assertEqual(caught.exception.code, 'physical-directory-admin-group')
+
+    def test_app_root_and_members_remain_nonwritable(self):
+        for settings,code in ((dict(app_mode=0o775),'physical-directory-owner-mode'),
+                              (dict(member=True),'app-member-owner-mode')):
+            with self.subTest(settings=settings), self.filesystem(**settings):
+                with self.assertRaises(o.Refusal) as caught: o.app_inventory(o.APP)
+                self.assertEqual(caught.exception.code, code)
+
+    def test_anchor_and_app_symlinks_are_not_followed(self):
+        for path in (Path('/Applications'), Path(o.APP)):
+            with self.subTest(path=path), self.filesystem(symlink=path):
+                with self.assertRaises(OSError): o.app_inventory(o.APP)
+
+    def test_anchor_named_identity_and_acl_guards_remain(self):
+        for settings,code in ((dict(changed=Path('/Applications')),'physical-directory-changed'),
+                              (dict(acl_failure=True),'unsupported-acl')):
+            with self.subTest(settings=settings), self.filesystem(**settings):
+                with self.assertRaises(o.Refusal) as caught: o.app_inventory(o.APP)
+                self.assertEqual(caught.exception.code, code)
 
 
 if __name__ == '__main__':
