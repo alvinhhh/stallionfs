@@ -1,5 +1,6 @@
 """Read-only existing-store observation and structural resource consistency."""
 import ctypes
+import contextlib
 import copy
 import errno
 import fcntl
@@ -125,6 +126,8 @@ class Existing:
         self.entries = self.bytes = 0
         self.device = None
         self.cleanup_failures = []
+        self.raw_hashes = {}
+        self.final_checks = []
 
     def admit(self):
         path = Path('/')
@@ -135,7 +138,7 @@ class Existing:
         self.device = os.fstat(self.fds[self.root]).st_dev
         return pair(os.fstat(self.fds[self.root]))
 
-    def _open(self, path, *, ancestor=False, directory=True):
+    def _open(self, path, *, ancestor=False, directory=True, payload=False):
         if path in self.fds:
             self.check_one(path)
             return self.fds[path]
@@ -146,7 +149,7 @@ class Existing:
         require(stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode) and before.st_nlink == 1,
                 'unsafe-type-or-hardlink', path)
         require(before.st_uid in ((0, os.getuid()) if ancestor else (os.getuid(),))
-                and not mode & (0o022 if ancestor else 0o077), 'unsafe-owner-mode', path)
+                and not mode & (0o022 if ancestor or payload else 0o077), 'unsafe-owner-mode', path)
         if self.device is not None:
             require(before.st_dev == self.device, 'foreign-volume', path)
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -187,6 +190,7 @@ class Existing:
             require(len(data) <= self.limits['document'], 'document-budget', path)
             require(self.bytes <= self.limits['control_bytes'], 'control-byte-budget', path)
         self.check_one(path)
+        self.raw_hashes[path] = hashlib.sha256(data).hexdigest()
         if not document:
             return bytes(data)
         value = json.loads(data, object_pairs_hook=unique_object,
@@ -194,6 +198,10 @@ class Existing:
         require(type(value) is dict and type(value.get('format')) is int and value['format'] == 1,
                 'unknown-format', path)
         return {key: item for key, item in value.items() if key != 'format'}
+
+    def exists(self, path):
+        # Absence is scoped to a held, subsequently rechecked directory.
+        return path.name in self.names(path.parent)
 
     def lock(self, path):
         self.directory(path.parent)
@@ -214,17 +222,27 @@ class Existing:
         current, saved = stamp(info), self.stamps[path]
         held = stamp(os.fstat(self.fds[path]))
         indexes = range(5) if self.paths.get(path, False) else range(9)
-        require(all(current[i] == saved[i] == held[i] for i in indexes), 'binding-changed', path)
+        if not all(current[i] == saved[i] == held[i] for i in indexes):
+            error = Refusal('binding-changed', path)
+            error.expected_stamp, error.observed_stamp, error.held_stamp = saved, current, held
+            error.compared_indexes = list(indexes)
+            raise error
 
     def finish(self):
         failures = []; primary = None; handled = None
         try:
+            for check in self.final_checks:
+                try:
+                    check()
+                except (OSError, ValueError) as error:
+                    failures.append(dict(code='exit-hosting-recheck-failed', detail=str(error)))
             for path in self.fds:
                 try:
                     self.check_one(path); empty_acl(self.fds[path], ancestor=self.paths.get(path, False))
                 except (OSError, Refusal) as error:
                     if handled is None: handled = error
-                    failures.append(dict(code='exit-recheck-failed', path=str(path), detail=str(error)))
+                    failures.append(dict(code='exit-recheck-failed', path=str(path), detail=str(error),
+                                         cause=diagnostic(error, path)))
         except BaseException as error:
             primary = error
             raise
@@ -246,6 +264,8 @@ def diagnostic(error, path):
                   path=getattr(error, 'path', None) or str(path), detail=str(error))
     if getattr(error, 'cleanup_failures', None):
         result['cleanup_failures'] = error.cleanup_failures
+    for key in ('expected_stamp', 'observed_stamp', 'held_stamp', 'compared_indexes', 'observations'):
+        if hasattr(error, key): result[key] = getattr(error, key)
     return result
 
 
@@ -297,7 +317,170 @@ def pending(a, path, record, runtime):
         row['actor_activity'] = 'requires-exact-actor-and-OS-attribution'
     return row
 
-def observe_root(item, limits, runtime):
+def observed_lifecycle(a, path, metadata, payload, *, validators=None, target=None):
+    state = a.read(a.root/'lifecycle'/(path.name+'.json'))
+    required = {'id', 'generation', 'status', 'enrolled', 'object', 'payload'}
+    require(set(state) - {'native_idle'} in (required, required | {'closed_at'})
+            and state.get('id') == path.name and type(state.get('enrolled')) is bool
+            and state.get('status') in ('open', 'closed')
+            and state.get('object') == pair(os.fstat(a.directory(path)))
+            and state.get('payload') == pair(os.fstat(a.fds[payload])), 'lifecycle-schema', path)
+    identifier(state.get('generation'), 32)
+    require(('closed_at' in state) == (state['status'] == 'closed'), 'lifecycle-schema', path)
+    if state['status'] == 'closed':
+        require(type(state['closed_at']) in (int, float) and 0 < state['closed_at'] <= time.time(),
+                'lifecycle-schema', path)
+    if 'native_idle' in state:
+        idle = state['native_idle']
+        require(metadata.get('backend') == 'native-image' and validators is not None and target is not None
+                and type(idle) is dict and set(idle) == {'generation', 'target', 'anchor', 'observed_at', 'guard'}
+                and idle['generation'] == state['generation']
+                and validators.binding._same_evidence(idle['target'], target)
+                and type(idle['observed_at']) in (int, float) and 0 < idle['observed_at'] <= time.time()
+                and validators.recovery._valid_anchor(idle['anchor'])
+                and validators.native._consumed(idle['guard'], target, idle['anchor']),
+                'native-idle-schema', path)
+    return state
+
+
+def observed_activation(a, directory, helper, validators):
+    value = helper['activation']
+    encoded = validators.activation.encode(value)
+    path = directory/('activation-'+value['nonce'])
+    names = set(a.names(path))
+    require({'gate', 'lease', 'request'} <= names and names <= {'gate', 'lease', 'request', 'claim'}
+            and (helper.get('outcome') != 'success' or 'claim' in names), 'activation-layout', path)
+    for name in ('gate', 'lease', 'claim'):
+        if name in names:
+            a._open(path/name, directory=False)
+            require(os.fstat(a.fds[path/name]).st_size == 0, 'activation-control-content', path/name)
+    def idle():
+        a.lock(path/'gate'); a.lock(path/'lease')
+    idle(); a.final_checks.append(idle)
+    require(a.read(path/'request', document=False) == encoded, 'activation-request-binding', path)
+    return path.name
+
+
+def observed_native(a, path, metadata, validators):
+    binding, reconcile, scan = validators.binding, validators.reconcile, validators.scan
+    names = set(a.names(path))
+    required = {'meta.json', 'native-create.json', 'native-install.json', 'native-binding.json', 'image.sfs', 'volume'}
+    require(required <= names and names <= required | {'native-operations', 'native-mount.json', 'native-reconciliations'},
+            'native-object-layout', path)
+    require(metadata.get('id') == path.name and metadata.get('state') == 'installed'
+            and metadata.get('ownership') == 'store-created', 'native-object-schema', path)
+    require(a.names(path/'volume') == [], 'native-volume-not-empty', path)
+    image = path/'image.sfs'; a._open(image, directory=False)
+    fingerprint, proof = binding.evidence(a, path, metadata)
+    record = a.read(path/'native-binding.json')
+    binding.validate(record, metadata, fingerprint)
+    target = binding.historical_target(path, metadata)
+    require(metadata['native_image']['parent'] == pair(os.fstat(a.directory(path.parent)))
+            and target['parent'] == pair(os.fstat(a.directory(path)))
+            and target['file'] == pair(os.fstat(a.fds[image]))
+            and record['admitted_target'] == target
+            and record['publication_file_id'] == os.fstat(a.fds[path/'native-binding.json']).st_ino,
+            'native-physical-binding', path)
+    def hosting():
+        rows = []
+        for member in (path.parent, path, image):
+            a.check_one(member)
+            row = scan.hosting_identity(a.fds[member])
+            a.check_one(member)
+            require(type(row) is dict and set(row) == {'volume_uuid', 'file_id'}
+                    and type(row['file_id']) is int and row['file_id'] > 0
+                    and row['file_id'] == os.fstat(a.fds[member]).st_ino
+                    and type(row['volume_uuid']) is str
+                    and re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', row['volume_uuid'])
+                    and row['volume_uuid'] != '00000000-0000-0000-0000-000000000000', 'native-hosting-identity', member)
+            rows.append(row)
+        require(len({row['volume_uuid'] for row in rows}) == 1
+                and record['stable'] == dict(volume_uuid=rows[0]['volume_uuid'], collection=rows[0]['file_id'],
+                                             object=rows[1]['file_id'], file=rows[2]['file_id']),
+                'native-hosting-binding', path)
+    hosting(); a.final_checks.append(hosting)
+    records = {}
+    if 'native-operations' in names:
+        for name in a.names(path/'native-operations'):
+            identifier(name, 32)
+            directory = path/'native-operations'/name
+            records[name] = a.read(directory/'record.json')
+            helpers = records[name].get('helpers')
+            require(type(helpers) is list, 'native-operation-helpers', directory)
+            expected = {'record.json'}
+            for index, helper in enumerate(helpers):
+                label = helper.get('label')
+                require(label in ('verify-package', 'discover', 'mount', 'unmount'), 'native-operation-helper', directory)
+                child = directory/(str(index).zfill(2)+'-'+label); expected.add(child.name)
+                require(a.names(child) == ['stderr', 'stdout'], 'native-operation-output', child)
+                for stream in ('stdout', 'stderr'):
+                    require(helper.get(stream) == str(child/stream), 'native-operation-output-binding', child)
+                    a._open(child/stream, directory=False)
+                if 'activation' in helper:
+                    activation = observed_activation(a, directory, helper, validators)
+                    require(activation not in expected, 'activation-reused', directory)
+                    expected.add(activation)
+            require(set(a.names(directory)) == expected, 'native-operation-layout', directory)
+            require(records[name].get('operation') not in ('native-retire', 'native-return'), 'native-moved-history', directory)
+    reconciliation = None
+    if record['schema'] == 2:
+        reconciliation = reconcile.read_basis(a, path, metadata, record['basis'])
+        require(set(a.names(path/'native-reconciliations')) == {record['basis']['reconciliation']+'.json'},
+                'native-reconciliation-layout', path)
+    else:
+        require('native-reconciliations' not in names, 'native-unbound-reconciliation', path)
+    marker = a.read(path/'native-mount.json') if 'native-mount.json' in names else None
+    binding.archive_anchor(records, path, metadata, marker, proof, reconciliation=reconciliation)
+    observed_lifecycle(a, path, metadata, image, validators=validators, target=target)
+    return dict(path=str(path), status='recognized-offline-native', blocking=False,
+                identity=pair(os.fstat(a.directory(path))), payload_identity=pair(os.fstat(a.fds[image])),
+                control_hashes={str(p.relative_to(a.root)): value for p, value in a.raw_hashes.items()
+                                if p.is_relative_to(path)})
+
+
+def observed_object(a, path, collection, validators):
+    identifier(path.name, 64 if collection == 'seeds' else 32)
+    names = set(a.names(path)); metadata = a.read(path/'meta.json')
+    require(metadata.get('id') == path.name, 'object-id', path)
+    if metadata.get('backend') == 'native-image':
+        require(collection == 'workspaces', 'native-object-kind', path)
+        return observed_native(a, path, metadata, validators)
+    backend = metadata.get('backend', 'folder')
+    require(backend in ('folder', 'image') and type(metadata.get('commit')) is str
+            and re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', metadata['commit'])
+            and type(metadata.get('created')) in (int, float) and metadata['created'] > 0, 'object-schema', path)
+    if collection == 'seeds':
+        keys = {'source', 'commit', 'origin', 'key', 'command', 'system', 'release', 'machine'}
+        expected = keys | {'id', 'created'} | ({'backend', 'capacity_gib'} if backend == 'image' else set())
+        require(set(metadata) == expected and all(type(metadata[k]) is str for k in keys - {'command'})
+                and type(metadata['command']) is list and all(type(v) is str for v in metadata['command']), 'seed-schema', path)
+        spec = {k: v for k, v in metadata.items() if k not in ('id', 'created')}
+        require(hashlib.sha256(json.dumps(dict(format=1, **spec), sort_keys=True).encode()).hexdigest() == path.name,
+                'seed-digest', path)
+    else:
+        expected = {'id', 'seed', 'name', 'branch', 'commit', 'created'} | ({'backend', 'capacity_gib'} if backend == 'image' else set())
+        require(set(metadata) == expected and type(metadata['name']) is str
+                and (not metadata['name'] or re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,63}', metadata['name']))
+                and metadata['branch'] == 'stallionfs/'+(metadata['name']+'-' if metadata['name'] else '')+path.name,
+                'workspace-schema', path)
+        identifier(metadata['seed'], 64)
+    if backend == 'folder':
+        require(names == {'meta.json', 'repo'}, 'folder-object-layout', path)
+        payload = path/'repo'; a._open(payload, payload=True)
+    else:
+        require(validators.attachments().get('detached') is True, 'image-attached-or-ambiguous', path)
+        require(type(metadata.get('capacity_gib')) is int and 1 <= metadata['capacity_gib'] <= 65536, 'image-capacity', path)
+        expected = {'meta.json', 'workspace.sparseimage'} | ({'volume', 'ready.json'} if collection == 'workspaces' else set())
+        require(names == expected, 'image-object-layout', path)
+        payload = path/'workspace.sparseimage'; a._open(payload, directory=False)
+        if collection == 'workspaces':
+            require(a.names(path/'volume') == [] and a.read(path/'ready.json') == {'id': path.name}, 'image-not-offline-ready', path)
+    if collection == 'workspaces': observed_lifecycle(a, path, metadata, payload)
+    return dict(path=str(path), status='recognized-offline-'+backend, blocking=False,
+                identity=pair(os.fstat(a.directory(path))), payload_identity=pair(os.fstat(a.fds[payload])))
+
+
+def observe_root(item, limits, runtime, validators=None):
     row = dict(input=item, complete=True, blockers=[], entries=[], coverage=[], omitted=[])
     a = None
     primary = None; handled = None
@@ -344,6 +527,14 @@ def observe_root(item, limits, runtime):
                                 record = a.read(path)
                                 require(record.get('operation') == 'native-create', 'unsupported-journal-operation', path)
                                 entry = pending(a, path, record, runtime)
+                        elif validators is not None and collection in ('seeds', 'workspaces'):
+                            entry = observed_object(a, path, collection, validators)
+                        elif validators is not None and collection == 'lifecycle':
+                            require(re.fullmatch('[0-9a-f]{32}\\.json', name)
+                                    and a.exists(a.root/'workspaces'/path.stem), 'orphan-lifecycle', path)
+                            # The workspace branch validates the complete state against its held payload.
+                            a.read(path)
+                            entry = dict(path=str(path), status='workspace-lifecycle', blocking=False)
                         else:
                             info = os.stat(name, dir_fd=a.directory(parent), follow_symlinks=False)
                             # Do not descend into ordinary user payload or opaque image bytes.
@@ -358,7 +549,8 @@ def observe_root(item, limits, runtime):
                         row['entries'].append(entry)
                         if entry['blocking']:
                             row['blockers'].append(dict(code='pending-or-unqualified', path=str(path)))
-                    except (OSError, ValueError, TypeError, RecursionError) as error:
+                    except (OSError, ValueError, TypeError, RecursionError,
+                            validators.error if validators is not None else Refusal) as error:
                         if handled is None: handled = error
                         row['blockers'].append(diagnostic(error, path)); row['complete'] = False
                         row['omitted'].append(str(path))
@@ -398,7 +590,7 @@ def observe_root(item, limits, runtime):
             row['blockers'].extend(failures); row['complete'] = False
     return row
 
-def observe(request, *, limits=None):
+def observe(request, *, limits=None, validators=None):
     request = copy.deepcopy(request)
     limits = {**LIMITS, **(limits or {})}
     started = time.time_ns()
@@ -436,7 +628,7 @@ def observe(request, *, limits=None):
     else:
         seen = {}
         for item in root_items:
-            row = observe_root(item, limits, request.get('runtime'))
+            row = observe_root(item, limits, request.get('runtime'), validators)
             identity = tuple(row.get('physical_identity', []))
             if identity and not row['blockers']:
                 if identity in seen:
@@ -692,9 +884,14 @@ def compatibility_build(value):
     return value
 
 
-def compatibility_tuple(value):
-    require(type(value) is dict and set(value) == {'predecessor_descriptor_sha256',
-        'candidate_build', 'runtime_contract', 'parser_contract', 'observer_sha256'}, 'compatibility-tuple')
+def compatibility_tuple(value, schema=1):
+    keys = {'predecessor_descriptor_sha256', 'candidate_build', 'runtime_contract',
+            'parser_contract', 'observer_sha256'}
+    if schema == 2:
+        keys.add('predecessor_artifact_id')
+    require(type(value) is dict and set(value) == keys, 'compatibility-tuple')
+    if schema == 2:
+        identifier(value['predecessor_artifact_id'], 64)
     identifier(value['predecessor_descriptor_sha256'], 64)
     identifier(value['observer_sha256'], 64)
     compatibility_build(value['candidate_build'])
@@ -703,14 +900,24 @@ def compatibility_tuple(value):
     return value
 
 
-def create_compatibility(observer, build):
+def create_compatibility(observer, build, predecessors=None):
     """Describe unsigned build inputs; final descriptor identity remains external."""
     require(type(observer) is bytes and 0 < len(observer) <= OBSERVER_LIMIT, 'compatibility-observer-size')
     compatibility_build(build)
-    value = {'schema': 1, 'roles': dict(RESOURCE_ROLES), 'build': copy.deepcopy(build),
+    support = []
+    if predecessors is not None:
+        require(type(predecessors) is list and len(predecessors) <= 16, 'compatibility-support-limit')
+        for row in predecessors:
+            require(type(row) is dict and set(row) == {'predecessor_artifact_id',
+                    'predecessor_descriptor_sha256'}, 'compatibility-predecessor')
+            support.append(dict(row, candidate_build=copy.deepcopy(build),
+                runtime_contract=copy.deepcopy(RUNTIME_CONTRACT),
+                parser_contract=copy.deepcopy(PARSER_CONTRACT),
+                observer_sha256=hashlib.sha256(observer).hexdigest()))
+    value = {'schema': 1 if predecessors is None else 2, 'roles': dict(RESOURCE_ROLES), 'build': copy.deepcopy(build),
              'observer': {'sha256': hashlib.sha256(observer).hexdigest(), 'size': len(observer)},
              'runtime_contract': copy.deepcopy(RUNTIME_CONTRACT),
-             'parser_contract': copy.deepcopy(PARSER_CONTRACT), 'public_upgrade_support': []}
+             'parser_contract': copy.deepcopy(PARSER_CONTRACT), 'public_upgrade_support': support}
     data = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False)+'\n').encode()
     validate_compatibility(data, observer, build)
     return data
@@ -728,7 +935,7 @@ def validate_compatibility(data, observer, expected_build):
         raise Refusal('compatibility-json') from error
     require(type(value) is dict and set(value) == {'schema', 'roles', 'build', 'observer',
         'runtime_contract', 'parser_contract', 'public_upgrade_support'}
-        and type(value['schema']) is int and value['schema'] == 1, 'compatibility-schema')
+        and type(value['schema']) is int and value['schema'] in (1, 2), 'compatibility-schema')
     require(value['roles'] == RESOURCE_ROLES, 'compatibility-roles')
     compatibility_build(value['build'])
     require(value['build'] == expected_build, 'compatibility-build-mismatch')
@@ -742,7 +949,7 @@ def validate_compatibility(data, observer, expected_build):
     require(type(support) is list and len(support) <= 16, 'compatibility-support-limit')
     seen = set()
     for item in support:
-        compatibility_tuple(item)
+        compatibility_tuple(item, value['schema'])
         require(item['candidate_build'] == expected_build and item['observer_sha256'] == row['sha256'],
                 'compatibility-tuple-binding')
         binding = digest(item)
@@ -754,7 +961,7 @@ def validate_compatibility(data, observer, expected_build):
 def compatible_predecessor(data, observer, expected_build, requested_tuple):
     """Exact structural match only; publisher admission must precede execution."""
     value = validate_compatibility(data, observer, expected_build)
-    compatibility_tuple(requested_tuple)
+    compatibility_tuple(requested_tuple, value['schema'])
     require(requested_tuple in value['public_upgrade_support'], 'unsupported-predecessor')
     return {'structurally_consistent': True, 'authenticated': False}
 
@@ -933,15 +1140,86 @@ def actual_runtime(expected):
     return actual
 
 
+VALIDATOR_SOURCES = ('__init__', 'core', 'lifecycle', '_native', '_native_create_recovery',
+    '_native_binding', '_native_interval', '_native_reconcile', '_native_recovery', '_bundle', '_native_activation')
+
+
+@contextlib.contextmanager
+def installed_validators(release):
+    """Load only the already admitted fixed app's exact package closure.
+
+    Python source is compiled from hash-checked bytes, never a cache. Extension
+    origins are exact inventoried files. No package search path is appended.
+    """
+    import importlib.util
+    import importlib.machinery
+    root = Path(RUNTIME_CONTRACT['site_packages'])/'stallionfs'
+    require(root.is_relative_to(Path(APP)) and not any(n == 'stallionfs' or n.startswith('stallionfs.')
+            for n in sys.modules), 'validator-import-origin')
+    sources = VALIDATOR_SOURCES
+    rows = {row['path']: row for row in release['inventory']}
+    modules = {}
+    for name in sources + ('_scan', '_image'):
+        candidates = [root/(name+'.py')] if name in sources else [root/(name+suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES]
+        candidates = [path for path in candidates if str(path.relative_to(APP)) in rows]
+        require(len(candidates) == 1, 'validator-module-missing-or-ambiguous', name)
+        path = candidates[0]; row = rows[str(path.relative_to(APP))]
+        data = retained_read(path, 128*1024*1024)
+        require(row['type'] == 'file' and row['sha256'] == hashlib.sha256(data).hexdigest(), 'validator-module-digest', path)
+        fullname = 'stallionfs' if name == '__init__' else 'stallionfs.'+name
+        modules[fullname] = (path, data if name in sources else None)
+    class ExactSource:
+        def create_module(self, spec): return None
+        def exec_module(self, module):
+            path, data = modules[module.__name__]
+            module.__file__ = str(path)
+            if module.__name__ == 'stallionfs': module.__path__ = [str(root)]
+            exec(compile(data, str(path), 'exec', dont_inherit=True), module.__dict__)
+    class ExactFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != 'stallionfs' and not fullname.startswith('stallionfs.'): return None
+            require(fullname in modules, 'validator-import-outside-closure', fullname)
+            location, data = modules[fullname]
+            if data is None:
+                require(hashlib.sha256(retained_read(location, 128*1024*1024)).hexdigest()
+                        == rows[str(location.relative_to(APP))]['sha256'], 'validator-extension-changed', location)
+                return importlib.util.spec_from_file_location(fullname, location)
+            return importlib.util.spec_from_loader(fullname, ExactSource(), origin=str(location), is_package=fullname == 'stallionfs')
+    finder = ExactFinder(); sys.meta_path.insert(0, finder)
+    try:
+        from stallionfs import _native_binding, _native_reconcile, _native_activation, _native_recovery, _native, _scan
+        for name, module in list(sys.modules.items()):
+            if name == 'stallionfs' or name.startswith('stallionfs.'):
+                require(name in modules and Path(module.__file__) == modules[name][0], 'validator-import-origin', name)
+        from stallionfs.core import StallionError
+        yield types.SimpleNamespace(binding=_native_binding, reconcile=_native_reconcile,
+                                    activation=_native_activation, recovery=_native_recovery,
+                                    native=_native, scan=_scan, error=StallionError)
+    finally:
+        sys.meta_path.remove(finder)
+        for name in list(sys.modules):
+            if name == 'stallionfs' or name.startswith('stallionfs.'): del sys.modules[name]
+
+
 def static_signature(path, requirement, retention, label):
     """Only the system verifier runs; timeout never claims helper cleanup."""
-    import subprocess
-    import select
     require(type(requirement) is str and requirement.startswith('anchor apple generic and ')
             and '\0' not in requirement and len(requirement) <= 1024, 'publisher-requirement')
     argv = ['/usr/bin/codesign','--verify','--deep','--strict','-R','='+requirement,str(path)]
+    _, receipt = retained_inspection(argv, retention, label)
+    require(receipt['returncode'] == 0, 'publisher-or-signature-refused', path)
+    return receipt
+
+
+def retained_inspection(argv, retention, label):
+    """Bound the existing system inspection subprocess and retain its lifetime evidence."""
+    import subprocess
+    import select
+    require(argv == ['/usr/bin/hdiutil', 'info', '-plist'] or len(argv) == 7
+            and argv[:5] == ['/usr/bin/codesign','--verify','--deep','--strict','-R'], 'inspection-command')
+    retention.check(); started_ns = time.time_ns()
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, close_fds=True, env={'PATH':'/usr/bin:/bin','LANG':'C'})
+        stderr=subprocess.STDOUT, close_fds=True, cwd='/', env={'PATH':'/usr/bin:/bin','LANG':'C'})
     data = bytearray(); eof = False; collector_error = None
     try:
         deadline = time.monotonic()+30
@@ -965,7 +1243,8 @@ def static_signature(path, requirement, retention, label):
             complete = False; collector_error = dict(kind=type(error).__name__,detail=str(error))
     receipt = dict(argv=argv, pid=process.pid, returncode=status, reaped=status is not None,
                    streams_eof=eof, complete=bool(complete), output_sha256=hashlib.sha256(data).hexdigest(),
-                   output_bytes=len(data), cleanup_complete=bool(complete),collector_error=collector_error)
+                   output_bytes=len(data), cleanup_complete=bool(complete),collector_error=collector_error,
+                   started_ns=started_ns, finished_ns=time.time_ns())
     if not complete: _UNRESOLVED_TOOLS.append(process)
     output_error = None
     try: retention.write(label+'.output', bytes(data))
@@ -976,8 +1255,38 @@ def static_signature(path, requirement, retention, label):
     retention.write(label+'.json', json_bytes(receipt))
     require(complete and not output_error, 'signature-helper-lifetime-or-output-unresolved',
             'owned-verifier-pid:'+str(process.pid))
-    require(status == 0, 'publisher-or-signature-refused', path)
-    return receipt
+    retention.check()
+    return bytes(data), receipt
+
+
+def attachment_inventory(data, receipt, request):
+    import plistlib
+    require(type(receipt) is dict and receipt.get('argv') == ['/usr/bin/hdiutil','info','-plist']
+            and receipt.get('complete') is True and receipt.get('cleanup_complete') is True
+            and receipt.get('reaped') is True and receipt.get('streams_eof') is True
+            and receipt.get('returncode') == 0 and receipt.get('collector_error') is None
+            and type(receipt.get('started_ns')) is int and type(receipt.get('finished_ns')) is int
+            and request['acquisition']['acquired_ns'] <= receipt['started_ns'] <= receipt['finished_ns']
+            and receipt.get('output_bytes') == len(data) and len(data) <= 2*1024*1024
+            and receipt.get('output_sha256') == hashlib.sha256(data).hexdigest(), 'image-inventory-capture')
+    value = plistlib.loads(data)
+    require(type(value) is dict and type(value.get('images')) is list, 'image-inventory-schema')
+    for row in value['images']:
+        require(type(row) is dict and type(row.get('image-path')) is str
+                and row['image-path'].startswith('/') and '\0' not in row['image-path']
+                and type(row.get('system-entities')) is list and row['system-entities'], 'image-inventory-schema')
+    # Do not follow a reported path to guess whether an alias is another image.
+    # A nonempty inventory remains a blocker, including attached/unmounted images.
+    return dict(detached=value['images'] == [], receipt_sha256=retained_digest(receipt),
+                output_sha256=receipt['output_sha256'], started_ns=receipt['started_ns'], finished_ns=receipt['finished_ns'],
+                request_sha256=retained_digest(request), boot_id=request['cooperation']['boot_id'])
+
+
+def acquire_attachments(retention, request):
+    data, receipt = retained_inspection(['/usr/bin/hdiutil','info','-plist'], retention, 'image-attachments')
+    result = attachment_inventory(data, receipt, request)
+    retention.write('image-attachment-assessment.json', json_bytes(result))
+    return result
 
 
 def validate_authorization(data, expected_sha256, expected_publisher):
@@ -1185,7 +1494,11 @@ def app_inventory(app):
                         close_owned(owned_child, child_primary)
                 require(stamp(os.stat(name, dir_fd=fd, follow_symlinks=False)) == stamp(info), 'app-path-changed', relative)
                 rows.append(row)
-            require(stamp(os.fstat(fd)) == stamp(before), 'app-directory-changed', prefix)
+            after = os.fstat(fd)
+            if stamp(after) != stamp(before):
+                error = Refusal('app-directory-changed', prefix)
+                error.expected_stamp, error.observed_stamp = stamp(before), stamp(after)
+                raise error
         visit(root, '')
         require(stamp(os.stat(app, follow_symlinks=False)) == stamp(initial), 'app-root-changed')
         table = {r['path']:r for r in rows}
@@ -1242,6 +1555,414 @@ def acquire_native(retention, leaf, authorization, request):
     require(hashlib.sha256(retained_read(leaf,len(data),private=True)).hexdigest() == expected, 'external-leaf-changed')
     activity = native_activity(native, completion, request, leaf_path=leaf, collector_pid=process.pid)
     return activity
+
+
+def validate_upgrade_authorization(data, expected_sha256, expected_publisher):
+    """The independent digest admits both releases, the controller and current history."""
+    require(hashlib.sha256(data).hexdigest() == identifier(expected_sha256, 64), 'authorization-digest')
+    value = json.loads(data, object_pairs_hook=unique_object)
+    require(type(value) is dict and set(value) == {'schema', 'kind', 'old', 'candidate',
+            'controller', 'runtime_artifact_id', 'home', 'cooperation', 'history'} and type(value['schema']) is int
+            and value['schema'] == 2 and value['kind'] == 'upgrade-session', 'upgrade-authorization-schema')
+    require(type(value['home']) is str and os.path.isabs(value['home']), 'upgrade-home')
+    for role in ('old', 'candidate'):
+        release = value[role]
+        fields = {'schema', 'kind', 'publisher', 'artifact',
+            'archive', 'inventory', 'roles', 'runtime', 'store_runtime', 'build',
+            'public_upgrade_support', 'signing_roles'}
+        require(type(release) is dict and (set(release) == fields
+            or role == 'old' and set(release) == fields - {'build'}) and type(release['schema']) is int
+            and release['schema'] == 1 and release['kind'] == 'final-maintenance-artifact-bindings',
+            'upgrade-release-schema')
+        if 'build' in release:
+            compatibility_build(release['build'])
+            require(release['build']['bundle_id'] == 'com.alvinhhh.stallionfs', 'upgrade-bundle-id')
+        authority = upgrade_authority(value, role)
+        raw = json_bytes(authority)
+        validate_authorization(raw, hashlib.sha256(raw).hexdigest(), expected_publisher)
+        # Artifact ids use the packager's canonical inventory encoding, not digest().
+        require(release['artifact']['id'] == hashlib.sha256(json.dumps(release['inventory'],
+                sort_keys=True, separators=(',', ':')).encode()).hexdigest(), 'upgrade-artifact-inventory')
+        if 'build' in release:
+            require(release['build']['source_build_id'] == release['store_runtime']['source_build_id'],
+                    'upgrade-source-build')
+        require(type(release['archive']['path']) is str and os.path.isabs(release['archive']['path']),
+                'upgrade-archive-path')
+        require(type(release['signing_roles']) is list and bool(release['signing_roles']), 'upgrade-signing-roles')
+        require(type(release['public_upgrade_support']) is list, 'upgrade-support')
+    old, candidate = value['old']['artifact'], value['candidate']['artifact']
+    require(old['id'] != candidate['id'], 'upgrade-identical-artifacts')
+    require(value['runtime_artifact_id'] in (old['id'], candidate['id']), 'upgrade-runtime-artifact')
+    require(value['controller'] == {'artifact_id': candidate['id'],
+            'observer_sha256': candidate['observer_sha256']}, 'upgrade-controller')
+    history = value['history']
+    require(type(history) is dict and set(history) == {'request_sha256', 'previous_step_sha256', 'last_installed',
+            'candidate_access', 'continuous_downtime'} and history['candidate_access'] in ('none', 'possible', 'unknown')
+            and type(history['continuous_downtime']) is bool
+            and history['last_installed'] in (None, old['id'], candidate['id']), 'upgrade-history')
+    for key in ('request_sha256', 'previous_step_sha256'):
+        if history[key] is not None: identifier(history[key], 64)
+    return value
+
+
+def upgrade_authority(session, role):
+    release = session[role]
+    keys = ('artifact', 'archive', 'inventory', 'roles', 'runtime', 'publisher', 'store_runtime')
+    return dict({key: release[key] for key in keys}, schema=1, home=session['home'],
+        cooperation=session['cooperation'], last_installed=release['artifact']['id'],
+        executable_history=[release['artifact']['id']],
+        store_history={'runtime': release['artifact']['id'], 'mutation': 'known-same-artifact'})
+
+
+def upgrade_binding(session):
+    return {key: session[key] for key in ('old', 'candidate', 'controller', 'home')}
+
+
+def upgrade_request(explicit, session):
+    request = original_request('reinstall', explicit, upgrade_authority(session, 'old'))
+    request.update(operation='upgrade', candidate=session['candidate']['artifact'],
+                   archives={role: session[role]['archive'] for role in ('old', 'candidate')},
+                   authority=upgrade_binding(session))
+    return request
+
+
+def upgrade_output_scope(retention, request, candidate):
+    """Only path metadata is read before the original denominator is retained."""
+    import unicodedata
+    def normalized(path):
+        path = os.fspath(path)
+        if path.startswith('~/'): path = request['acquisition']['home']+path[1:]
+        parts = tuple(unicodedata.normalize('NFC', p).casefold()
+                      for p in Path(os.path.abspath(os.path.normpath(path))).parts)
+        return ('/', *parts[4:]) if parts[:4] == ('/', 'system', 'volumes', 'data') else parts
+    def overlap(a, b): return a[:len(b)] == b or b[:len(a)] == a
+    stores = [row['literal'] for row in request['roots']]
+    artifacts = [APP, candidate, *[request['archives'][role]['path'] for role in ('old', 'candidate')]]
+    output = normalized(retention.path)
+    require(all(not overlap(output, normalized(p)) for p in [*stores, *artifacts]), 'retention-overlaps-app-or-store')
+    require(all(not overlap(normalized(a), normalized(s)) for a in artifacts for s in stores),
+            'upgrade-artifact-overlaps-store')
+    require(all(not overlap(normalized(archive), normalized(app))
+                for archive in artifacts[2:] for app in artifacts[:2]), 'upgrade-archive-must-be-external')
+    ancestors = {tuple(pair(os.fstat(fd))) for fd in retention.access.fds.values()}
+    identities = {}
+    for literal in [*stores, *artifacts]:
+        path = Path(literal).expanduser().absolute()
+        rows = []
+        for index, member in enumerate([path, *path.parents]):
+            try: identity = tuple(pair(os.stat(member)))
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENOTDIR): continue
+                raise Refusal('retention-scope-metadata-unavailable', member) from error
+            require(identity != tuple(retention.identity) and not (index == 0 and identity in ancestors),
+                    'retention-physical-overlap-app-or-store', member)
+            rows.append((index, identity))
+        identities[literal] = rows
+    for artifact in artifacts:
+        for store in stores:
+            a, s = identities[artifact], identities[store]
+            require(not any(index == 0 and identity in [item[1] for item in s] for index, identity in a)
+                    and not any(index == 0 and identity in [item[1] for item in a] for index, identity in s),
+                    'upgrade-artifact-physical-overlap-store')
+    retention.safe_for_failures = True
+
+
+def admit_upgrade_app(path, release, retention, label, *, allow_legacy_build=False):
+    """Authenticate the entire app without executing any of its code."""
+    import plistlib
+    app = Path(path)
+    before = app_inventory(app)
+    require(before == release['inventory'], 'upgrade-app-inventory', app)
+    fixed = {'.': 'com.alvinhhh.stallionfs',
+             'Contents/Extensions/StallionFS.appex': 'com.alvinhhh.stallionfs.module',
+             RESOURCE_ROLES['native']: 'com.alvinhhh.stallionfs.maintenance'}
+    expected = {name: '='+publisher_requirement(identity, release['publisher']) for name, identity in fixed.items()}
+    magic = {bytes.fromhex(value) for value in
+             ('cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
+    generic = '=anchor apple generic and certificate leaf[subject.OU] = "'+release['publisher']+'"'
+    for row in before:
+        if row['type'] == 'file' and retained_read(app/row['path'], 128*1024*1024)[:4] in magic:
+            expected.setdefault(row['path'], generic)
+    supplied = release['signing_roles']
+    require(all(type(row) is dict and set(row) == {'path', 'requirement'} for row in supplied)
+            and len(supplied) == len(expected)
+            and {row['path']: row['requirement'] for row in supplied} == expected, 'upgrade-signing-roles')
+    for index, (name, requirement) in enumerate(sorted(expected.items())):
+        static_signature(app/name, requirement[1:], retention, label+'-signature-'+str(index))
+    for name, key in ((DESCRIPTOR, 'descriptor_sha256'), (RESOURCE_ROLES['observer'], 'observer_sha256'),
+                      (RESOURCE_ROLES['native'], 'native_sha256'), (RESOURCE_ROLES['compatibility'], 'compatibility_sha256')):
+        require(hashlib.sha256(retained_read(app/name, 8*1024*1024)).hexdigest() == release['artifact'][key],
+                'upgrade-role-digest', name)
+    metadata = json.loads(retained_read(app/DESCRIPTOR), object_pairs_hook=unique_object)
+    info = plistlib.loads(retained_read(app/'Contents/Info.plist'))
+    build = dict(bundle_id=info['CFBundleIdentifier'], bundle_version=info['CFBundleVersion'],
+                 package_version=metadata['package_version'], source_build_id=metadata['source_build_id'])
+    compatibility_build(build)
+    require(build['bundle_id'] == 'com.alvinhhh.stallionfs'
+            and metadata['bundle_version'] == build['bundle_version']
+            and build['source_build_id'] == release['store_runtime']['source_build_id'], 'upgrade-app-build')
+    require(build == release.get('build') or allow_legacy_build and 'build' not in release, 'upgrade-app-build')
+    store_runtime = release['store_runtime']
+    require(metadata.get('schema') == 2 and metadata.get('git') == {key: store_runtime[key]
+            for key in set(GIT_CONTRACT) | {'input_inventory_sha256', 'payload_entries', 'payload_sha256'}}
+            and hashlib.sha256(retained_read(app/'Contents/Resources/Runtime/Git/bin/git', 128*1024*1024)).hexdigest()
+                == store_runtime['executable_sha256'], 'upgrade-app-store-runtime')
+    observer = retained_read(app/RESOURCE_ROLES['observer'], OBSERVER_LIMIT)
+    data = retained_read(app/RESOURCE_ROLES['compatibility'], RESOURCE_LIMIT)
+    compatibility = validate_compatibility(data, observer, build)
+    require(compatibility['public_upgrade_support'] == release['public_upgrade_support'], 'upgrade-declaration-binding')
+    require(app_inventory(app) == before, 'upgrade-app-changed')
+    retention.write(label+'-build.json', json_bytes(dict(artifact_id=release['artifact']['id'], build=build)))
+    return data, observer, compatibility
+
+
+def upgrade_pair(session, data, observer):
+    candidate, old = session['candidate'], session['old']
+    value = validate_compatibility(data, observer, candidate['build'])
+    require(value['schema'] == 2, 'upgrade-exact-pair-schema-required')
+    requested = dict(predecessor_artifact_id=old['artifact']['id'],
+        predecessor_descriptor_sha256=old['artifact']['descriptor_sha256'],
+        candidate_build=candidate['build'], runtime_contract=RUNTIME_CONTRACT,
+        parser_contract=PARSER_CONTRACT, observer_sha256=candidate['artifact']['observer_sha256'])
+    compatible_predecessor(data, observer, candidate['build'], requested)
+
+
+def upgrade_installed_state(session, errors=None):
+    try:
+        rows = app_inventory(APP)
+    except FileNotFoundError:
+        # A missing descendant is a partial app, not an absent target.
+        return 'partial' if os.path.lexists(APP) else 'absent'
+    except (OSError, Refusal) as error:
+        if errors is not None: errors.append(diagnostic(error, APP))
+        return 'unresolved'
+    for role in ('old', 'candidate'):
+        if rows == session[role]['inventory']: return role
+    return 'foreign'
+
+
+def retained_digest(value):
+    """Hash the exact canonical retained bytes, including their final newline."""
+    return hashlib.sha256(json_bytes(value)).hexdigest()
+
+
+def upgrade_steps(retention, request):
+    """Read a contiguous exclusive journal. A torn record is never discarded."""
+    names = sorted(name for name in os.listdir(retention.fd) if name.startswith('step-'))
+    require(len(names) <= 64, 'upgrade-step-limit')
+    previous = retained_digest(request); steps = []
+    for index, name in enumerate(names):
+        require(name == 'step-%04d.json' % index, 'upgrade-step-sequence')
+        row = json.loads(retained_read(retention.path/name, 65536, private=True), object_pairs_hook=unique_object)
+        require(type(row) is dict and set(row) == {'schema', 'request_sha256', 'previous_sha256',
+                'phase', 'candidate_access', 'installed_state', 'attempt', 'next_action', 'baseline_sha256'}
+                and type(row['schema']) is int and row['schema'] == 1
+                and row['request_sha256'] == retained_digest(request) and row['previous_sha256'] == previous
+                and row['phase'] in ('prepare', 'publish', 'verify', 'resume', 'rollback')
+                and row['candidate_access'] in ('none', 'possible', 'unknown')
+                and type(row['attempt']) is str and re.fullmatch(r'attempt-[0-9a-f]{32}', row['attempt']),
+                'upgrade-step-binding')
+        require(index != 0 or row['phase'] == 'prepare', 'upgrade-missing-prepare')
+        identifier(row['baseline_sha256'], 64)
+        require(not steps or row['baseline_sha256'] == steps[0]['baseline_sha256'], 'upgrade-baseline-changed')
+        if any(item['candidate_access'] != 'none' for item in steps):
+            require(row['candidate_access'] != 'none', 'upgrade-exposure-regression')
+        previous = retained_digest(row); steps.append(row)
+    return steps
+
+
+def upgrade_unclosed_attempts(retention, steps):
+    """Only a committed step closes an attempt; retain every unreferenced attempt."""
+    names = {name for name in os.listdir(retention.fd) if name.startswith('attempt-')}
+    require(len(names) <= 128, 'upgrade-attempt-limit')
+    referenced = [row['attempt'] for row in steps]
+    require(len(set(referenced)) == len(referenced) and set(referenced) <= names, 'upgrade-attempt-reference')
+    for name in names:
+        require(re.fullmatch(r'attempt-[0-9a-f]{32}', name), 'upgrade-attempt-name')
+        info = os.stat(name, dir_fd=retention.fd, follow_symlinks=False)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700, 'upgrade-attempt-binding')
+    return sorted(names - set(referenced))
+
+
+def upgrade_root_coverage(report, request, baseline=None):
+    require(report.get('request_binding') == retained_digest(request) and report.get('declared_roots') == request['roots']
+            and report.get('declaration_complete') is True and report.get('complete') is True
+            and report.get('exit_code') == 0 and report.get('blockers') == []
+            and report.get('cleanup_complete') is True
+            and len(report.get('roots', [])) == len(request['roots']), 'upgrade-root-coverage')
+    require(all(report.get(key) == request.get(key) for key in
+                ('operation', 'root_contract', 'runtime', 'old', 'candidate', 'archives')), 'upgrade-report-context')
+    for index, (item, row) in enumerate(zip(request['roots'], report['roots'])):
+        require(row.get('input') == item and row.get('complete') is True and row.get('blockers') == []
+                and row.get('omitted') == [] and (row.get('physical_identity') or row.get('status') == 'absent-default'),
+                'upgrade-root-blocked')
+        if baseline is not None:
+            old = baseline['roots'][index]
+            require(row.get('physical_identity') == old.get('physical_identity')
+                    and row.get('status') == old.get('status'), 'upgrade-root-identity-changed')
+
+
+def upgrade_recovery(session, installed, steps, *, runtime_available, unclosed_attempts=(), original_window=True):
+    """Software repair selection never grants store access or infers absent exposure."""
+    history = session['history']
+    exposure = 'unknown'
+    if (history['candidate_access'] == 'none' and history['continuous_downtime'] is True
+            and history['last_installed'] == session['old']['artifact']['id'] and original_window):
+        exposure = 'none'
+    if (any(row['candidate_access'] != 'none' for row in steps) or installed == 'candidate'
+            or history['last_installed'] == session['candidate']['artifact']['id']):
+        exposure = 'possible'
+    uncertain = bool(unclosed_attempts) or history['last_installed'] is None or history['candidate_access'] == 'unknown'
+    if uncertain: exposure = 'unknown'
+    if installed in ('foreign', 'unresolved'):
+        action = 'stop-preserve-all'
+    elif not runtime_available:
+        action = 'native-static-exact-candidate-repair-only'
+    elif installed == 'candidate' and uncertain:
+        action = 'verify-exact-candidate-software-only'
+    elif installed == 'candidate':
+        action = 'verify-settings-discovery-and-command-link'
+    elif exposure != 'none':
+        action = 'finder-repair-exact-candidate-at-fixed-path'
+    else:
+        action = 'keep-exact-predecessor'
+    return dict(candidate_access=exposure, next_action=action, store_access_eligible=False)
+
+
+def upgrade_acquisition(phase, explicit, candidate_path, session, retention):
+    """Retain a transaction and issue one manual step after fresh acquisition."""
+    import uuid
+    require(phase in ('prepare', 'publish', 'verify', 'resume', 'rollback'), 'upgrade-phase')
+    current = upgrade_request(explicit, session)
+    upgrade_output_scope(retention, current, candidate_path)
+    retention.safe_for_failures = phase == 'prepare'
+    if phase == 'prepare':
+        require(not os.listdir(retention.fd), 'retention-not-empty')
+        require(session['history'] == dict(request_sha256=None, previous_step_sha256=None,
+            last_installed=session['old']['artifact']['id'], candidate_access='none', continuous_downtime=True),
+            'upgrade-prepare-history')
+        request = current
+        retention.write('request.json', json_bytes(request))
+        retention.write('authorization.json', json_bytes(session))
+        steps = []; baseline = None; unclosed_attempts = []
+    else:
+        request = json.loads(retained_read(retention.path/'request.json', LIMITS['output'], private=True),
+                             object_pairs_hook=unique_object)
+        require(session['history']['request_sha256'] == retained_digest(request), 'upgrade-original-request-binding')
+        require(request.get('authority') == upgrade_binding(session), 'upgrade-authority-changed')
+        upgrade_output_scope(retention, request, candidate_path)
+        require(current['roots'] == request['roots'] and current['root_contract'] == request['root_contract']
+                and current['environment'] == request['environment'], 'upgrade-current-root-scope-changed')
+        steps = upgrade_steps(retention, request)
+        require(bool(steps), 'upgrade-prepare-incomplete')
+        require(session['history']['previous_step_sha256'] == retained_digest(steps[-1]), 'upgrade-journal-history-binding')
+        baseline = json.loads(retained_read(retention.path/'baseline.json', LIMITS['output'], private=True),
+                              object_pairs_hook=unique_object)
+        upgrade_root_coverage(baseline, request)
+        require(retained_digest(baseline) == steps[0]['baseline_sha256'], 'upgrade-baseline-binding')
+        unclosed_attempts = upgrade_unclosed_attempts(retention, steps)
+    require(len(steps) < 64, 'upgrade-step-limit')
+    attempt_name = 'attempt-'+uuid.uuid4().hex
+    os.mkdir(attempt_name, 0o700, dir_fd=retention.fd); os.fsync(retention.fd)
+    attempt = Retention(retention.path/attempt_name)
+    primary = None
+    try:
+        attempt.safe_for_failures = True
+        attempt.write('authorization.json', json_bytes(session))
+        require(hashlib.sha256(retained_read(Path(__file__), OBSERVER_LIMIT, private=True)).hexdigest()
+                == session['controller']['observer_sha256'], 'upgrade-external-controller-digest')
+        # Archive authority is retained independently of either executable app.
+        for role in ('old', 'candidate'):
+            archive = session[role]['archive']
+            require(hashlib.sha256(retained_read(archive['path'], 512*1024*1024, private=True)).hexdigest()
+                    == archive['sha256'], 'upgrade-archive-digest')
+        data, observer, _ = admit_upgrade_app(candidate_path, session['candidate'], attempt, 'candidate')
+        upgrade_pair(session, data, observer)
+        installed_errors = []
+        installed = upgrade_installed_state(session, installed_errors)
+        if installed not in ('old', 'candidate'):
+            error = Refusal('upgrade-fixed-runtime-unavailable-use-native-static-recovery')
+            error.observations = dict(installed_state=installed, errors=installed_errors)
+            raise error
+        require(session['runtime_artifact_id'] == session[installed]['artifact']['id'], 'upgrade-installed-runtime-pairing')
+        if phase == 'prepare': require(installed == 'old', 'upgrade-predecessor-not-installed')
+        if phase == 'verify': require(installed == 'candidate', 'upgrade-candidate-not-installed')
+        admit_upgrade_app(APP, session[installed], attempt, 'installed', allow_legacy_build=installed == 'old')
+        actual_runtime(session[installed]['runtime'])
+        leaf_data = retained_read(Path(candidate_path)/RESOURCE_ROLES['native'], 8*1024*1024)
+        attempt.write('stallionfs-maintenance', leaf_data, 0o700)
+        fresh = copy.deepcopy(request)
+        fresh['cooperation'] = session['cooperation']; fresh['acquisition']['acquired_ns'] = time.time_ns()
+        activity = acquire_native(attempt, attempt.path/'stallionfs-maintenance',
+                                  upgrade_authority(session, 'candidate'), fresh)
+        attempt.write('activity.json', json_bytes(activity))
+        # The observation still binds the immutable denominator, not new ambient defaults.
+        observed = copy.deepcopy(request); observed['activity'] = activity
+        with installed_validators(session[installed]) as validators:
+            snapshots = []
+            def attachments():
+                if not snapshots: snapshots.append(acquire_attachments(attempt, fresh))
+                return snapshots[0]
+            if validators is not None: validators.attachments = attachments
+            report = observe(observed, validators=validators)
+        report['request_binding'] = retained_digest(request)
+        attempt.write('observation.json', serialize(report))
+        try:
+            upgrade_root_coverage(report, request, baseline)
+        except Refusal as error:
+            error.observations = {key: report.get(key) for key in
+                ('status', 'complete', 'declaration_complete', 'blockers', 'cleanup_complete')}
+            error.observations['roots'] = [{key: row.get(key) for key in
+                ('input', 'status', 'complete', 'physical_identity', 'blockers', 'omitted')}
+                for row in report.get('roots', [])]
+            raise
+        same_window = (session['cooperation'] == request['cooperation']
+                       and session['history']['continuous_downtime'] is True)
+        policy = upgrade_recovery(session, installed, steps, runtime_available=True,
+                                  unclosed_attempts=unclosed_attempts, original_window=same_window)
+        exposure = policy['candidate_access']
+        action = policy['next_action']
+        require(action != 'stop-preserve-all', 'upgrade-history-unresolved')
+        if phase == 'prepare':
+            action = 'prepared-request-publication'; exposure = 'none'
+        elif phase == 'rollback':
+            require(exposure == 'none' and same_window and installed == 'old'
+                    and session['history']['last_installed'] == session['old']['artifact']['id'],
+                    'upgrade-predecessor-rollback-refused')
+            action = 'keep-exact-predecessor'
+        elif phase == 'publish':
+            require(installed == 'old' and exposure == 'none' and same_window
+                    and session['history']['last_installed'] == session['old']['artifact']['id'],
+                    'upgrade-publication-already-exposed-or-uncertain')
+            action = 'finder-preserve-predecessor-and-install-exact-candidate'; exposure = 'possible'
+        final_errors = []
+        final_state = upgrade_installed_state(session, final_errors)
+        if final_state != installed:
+            error = Refusal('upgrade-installed-state-changed')
+            error.observations = dict(expected_state=installed, observed_state=final_state, errors=final_errors)
+            raise error
+        require(app_inventory(candidate_path) == session['candidate']['inventory'], 'upgrade-candidate-changed')
+        if phase == 'prepare': retention.write('baseline.json', json_bytes(report))
+        step = dict(schema=1, request_sha256=retained_digest(request),
+            previous_sha256=retained_digest(steps[-1]) if steps else retained_digest(request), phase=phase,
+            candidate_access=exposure, installed_state=installed, attempt=attempt_name, next_action=action,
+            baseline_sha256=retained_digest(report if phase == 'prepare' else baseline))
+        # Commit exposure before returning any publication, enablement or launch handoff.
+        attempt.close()
+        retention.write('step-%04d.json' % len(steps), json_bytes(step))
+        return dict(status='manual-step-ready', exit_code=0, request_sha256=retained_digest(request), step_sha256=retained_digest(step),
+                    candidate_access=exposure, next_action=action, store_access_eligible=False,
+                    maintenance_clearance=False, retained=str(retention.path), cleanup_complete=True)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try: attempt.close()
+        except BaseException as error:
+            if primary is None: raise
+            primary.cleanup_failures = merge_cleanup(getattr(primary, 'cleanup_failures', []),
+                                                     getattr(error, 'cleanup_failures', []))
 
 
 def acquisition(operation, explicit, authorization, retention):
@@ -1311,21 +2032,32 @@ def acquisition(operation, explicit, authorization, retention):
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description='Observe maintenance state')
-    parser.add_argument('operation', choices=('remove','reinstall','restore'))
+    parser.add_argument('operation', choices=('remove','reinstall','restore','upgrade'))
+    parser.add_argument('--phase', choices=('prepare','publish','verify','resume','rollback'))
+    parser.add_argument('--candidate-app', help='Statically admitted candidate; never launched for admission')
     parser.add_argument('--root', action='append', default=[])
     parser.add_argument('--authorization', required=True)
     parser.add_argument('--authorization-sha256', required=True)
     parser.add_argument('--publisher', required=True)
     parser.add_argument('--retain', required=True, help='Existing private external 0700 directory')
     args = parser.parse_args(argv)
+    if args.operation == 'upgrade':
+        if args.phase is None or args.candidate_app is None:
+            parser.error('upgrade requires --phase and --candidate-app')
+    elif args.phase is not None or args.candidate_app is not None:
+        parser.error('--phase and --candidate-app require upgrade')
     retention = None; primary = None; pending = False; result = {}
     try:
-        authority = validate_authorization(retained_read(args.authorization,4*1024*1024,private=True),
-                                           args.authorization_sha256,args.publisher)
+        validator = validate_upgrade_authorization if args.operation == 'upgrade' else validate_authorization
+        authority = validator(retained_read(args.authorization,4*1024*1024,private=True),
+                              args.authorization_sha256,args.publisher)
         retention = Retention(args.retain)
-        require(not list(os.listdir(retention.fd)), 'retention-not-empty')
-        report = acquisition(args.operation,args.root,authority,retention)
-        result = dict(status=report['status'],exit_code=report['exit_code'],
+        if args.operation == 'upgrade':
+            result = upgrade_acquisition(args.phase,args.root,args.candidate_app,authority,retention)
+        else:
+            require(not list(os.listdir(retention.fd)), 'retention-not-empty')
+            report = acquisition(args.operation,args.root,authority,retention)
+            result = dict(status=report['status'],exit_code=report['exit_code'],
                       maintenance_clearance=False,retained=str(retention.path),
                       cleanup_complete=report.get('cleanup_complete', True),
                       cleanup_failures=report.get('cleanup_failures', []))
@@ -1369,6 +2101,8 @@ def main(argv=None):
     result.setdefault('cleanup_complete',not bool(_UNRESOLVED_TOOLS))
     if _UNRESOLVED_TOOLS:
         result.update(status='blocked',exit_code=1,owned_helpers_unresolved=[p.pid for p in _UNRESOLVED_TOOLS])
+    if result.get('exit_code') != 0:
+        result.pop('next_action', None)
     print(json.dumps(result,sort_keys=True))
     return result['exit_code']
 

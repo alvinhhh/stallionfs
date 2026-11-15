@@ -879,7 +879,9 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
         build = {'bundle_id': bundle_id, 'bundle_version': bundle_version,
                  'package_version': PACKAGE_VERSION, 'source_build_id': prepared['source_build_id']}
         observer = prepared['observer']
-        compatibility = maintenance['create_compatibility'](observer, build)
+        predecessors = prepared.get('upgrade_predecessors')
+        compatibility = (maintenance['create_compatibility'](observer, build) if predecessors is None else
+                         maintenance['create_compatibility'](observer, build, predecessors))
         roles = dict(maintenance['RESOURCE_ROLES'])
         for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
             mode = 0o755 if role == 'native' else 0o644
@@ -915,7 +917,8 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
         resource = _runtime_read_at(app, roles['compatibility'])
         _runtime_require(observed == observer and resource == compatibility, 'Maintenance resource readback differs')
         contract = maintenance['validate_compatibility'](resource, observer, build)
-        _runtime_require(contract['public_upgrade_support'] == [], 'Installed maintenance pairs are not qualified')
+        _runtime_require(contract == maintenance['validate_compatibility'](compatibility, observer, build),
+                         'Maintenance declarations changed')
         for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
             _runtime_require(_runtime_read_at(app, roles[role]) == data, 'Maintenance role readback differs')
             _runtime_require([row for row in rows if row['path'] == roles[role]]
@@ -941,6 +944,8 @@ def main():
     parser.add_argument('--manifest-out', type=Path, help='Fresh external sibling .json candidate receipt')
     parser.add_argument('--maintenance-native', type=Path, help='Standalone native maintenance leaf from the matching source build')
     parser.add_argument('--runtime-inputs', type=Path, help='Pinned private runtime, wheel, Git and license/source inputs')
+    parser.add_argument('--upgrade-predecessors', type=Path,
+                        help='Pre-sign exact predecessor declarations; qualification is a separate release gate')
     parser.add_argument('--profile', choices=('production', 'private-sfsro27'), default='production')
     parser.add_argument('--access-policy', choices=('read-only', 'contextual-writes'),
                         help='Optional assertion; policy is derived from the compiled factory')
@@ -956,6 +961,8 @@ def main():
     location = _manifest_location(args.manifest_out, output)
     if args.runtime_inputs is not None and location is None:
         parser.error('--runtime-inputs requires --manifest-out')
+    if args.upgrade_predecessors is not None and args.runtime_inputs is None:
+        parser.error('--upgrade-predecessors requires --runtime-inputs')
     host, extension = read_executable(args.host), read_executable(args.extension)
     values = _load_templates()
     factory, targets = inspect_package_artifacts(host, extension,
@@ -964,6 +971,16 @@ def main():
         parser.error('--runtime-inputs requires --maintenance-native')
     native = read_executable(args.maintenance_native) if args.maintenance_native is not None else None
     runtime = _prepare_runtime(args.runtime_inputs.absolute(), output, args.maintenance_native.absolute()) if args.runtime_inputs is not None else None
+    if args.upgrade_predecessors is not None:
+        declarations = _runtime_read(args.upgrade_predecessors.absolute())
+        _runtime_require(len(declarations) <= 32768, 'Upgrade declarations exceed their limit')
+        runtime['upgrade_predecessors'] = json.loads(declarations,
+            object_pairs_hook=runtime['maintenance']['unique_object'])
+        runtime['maintenance']['create_compatibility'](runtime['observer'],
+            dict(bundle_id=values[0]['CFBundleIdentifier'], bundle_version=args.bundle_version,
+                 package_version=PACKAGE_VERSION, source_build_id=runtime['source_build_id']),
+            runtime['upgrade_predecessors'])
+        runtime['pins'][str(args.upgrade_predecessors.absolute())] = _runtime_sha(declarations)
     plists = []
     for index, value in enumerate(values):
         if value.get('CFBundleVersion') != '__BUNDLE_VERSION__':
@@ -1232,6 +1249,12 @@ def final_maintenance_bindings(app, archive, *, expected_publisher):
              ('compatibility_sha256',roles['compatibility']))}
         _runtime_require(_runtime_inventory(app,root) == rows,'Signed app changed during final binding')
         metadata = json.loads(_runtime_read_at(root,'Contents/Resources/Runtime/runtime.json'))
+        info = plistlib.loads(_runtime_read_at(root, 'Contents/Info.plist'))
+        build = dict(bundle_id=info['CFBundleIdentifier'], bundle_version=info['CFBundleVersion'],
+                     package_version=metadata['package_version'], source_build_id=metadata['source_build_id'])
+        _runtime_require(metadata['bundle_version'] == build['bundle_version'], 'Final bundle version differs')
+        compatibility = maintenance['validate_compatibility'](
+            _runtime_read_at(root, roles['compatibility']), observer, build)
         git = metadata['git']
         _runtime_require(set(git) == set(maintenance['GIT_CONTRACT']) | {'input_inventory_sha256','payload_entries','payload_sha256'}
             and all(git[key] == value for key,value in maintenance['GIT_CONTRACT'].items()), 'Final Git runtime contract differs')
@@ -1250,7 +1273,7 @@ def final_maintenance_bindings(app, archive, *, expected_publisher):
             'artifact':dict(id=_runtime_sha(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()),**hashes),
             'archive':{'path':archive.name,'sha256':_runtime_sha(archive_data)},'inventory':rows,
             'roles':dict(roles),'runtime':dict(maintenance['RUNTIME_CONTRACT']),'store_runtime':store_runtime,
-            'public_upgrade_support':[],'signing_roles':signing_roles}
+            'build':build,'public_upgrade_support':compatibility['public_upgrade_support'],'signing_roles':signing_roles}
     finally:
         os.close(root)
 
