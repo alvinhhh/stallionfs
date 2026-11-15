@@ -588,6 +588,25 @@ def _supervise(argv, event_path, timeout, *, output_cap, echo, cancelled, mode, 
     return receipt
 
 
+CONTEXTUAL_TEST = 'test_fskit.FSKitInterfaces.test_contextual_and_legacy_callbacks_and_production_builds'
+ACTIVATION_TEST = 'test_fskit.FSKitInterfaces.test_managed_activation_and_pending_lock_lifetime'
+ADAPTER_TEST = 'test_native_activation.ActivationAdapter.test_producer_consumer_and_terminal_callback_drain'
+
+
+class ContextualResult(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.contextual_successes = 0
+        self.activation_successes = 0
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        if test.id() == CONTEXTUAL_TEST:
+            self.contextual_successes += 1
+        if test.id() == ACTIVATION_TEST:
+            self.activation_successes += 1
+
+
 def account_result(result, probe, require_contextual, contextual_test):
     if probe:
         return not result.wasSuccessful() or bool(result.skipped) or result.testsRun != 1
@@ -596,17 +615,29 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() == 'setUpClass (test_fskit.FSKitInterfaces)'
         and reason.startswith('FSKit capability unavailable: ')
     ]
-    for _, reason in capability_skips:
+    activation_successes = getattr(result, 'activation_successes', 0)
+    activation_covered = type(activation_successes) is int and activation_successes == 1
+    # The managed selector compiles its driver and runs this exact adapter test,
+    # asserting one successful, unskipped nested result before it can pass.
+    adapter_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() == ADAPTER_TEST and reason == 'requires compiled offline activation driver'
+        and (activation_covered or (not require_contextual and len(capability_skips) == 1))
+    ]
+    for _, reason in capability_skips + adapter_skips:
         print(reason, file=sys.stderr)
     required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
-        entry for entry in result.skipped if entry not in capability_skips
+        entry for entry in result.skipped if entry not in capability_skips + adapter_skips
     ]
     if required_skips:
         print('Required filesystem tests were skipped.', file=sys.stderr)
     missing_contextual = require_contextual and result.contextual_successes != 1
     if missing_contextual:
         print(f'Required {contextual_test} successes: expected 1, observed {result.contextual_successes}', file=sys.stderr)
-    return not result.wasSuccessful() or bool(required_skips) or missing_contextual
+    missing_activation = require_contextual and not activation_covered
+    if missing_activation:
+        print(f'Required {ACTIVATION_TEST} successes: expected 1, observed {activation_successes}', file=sys.stderr)
+    return not result.wasSuccessful() or bool(required_skips) or missing_contextual or missing_activation
 
 
 def installed(probe=None):
@@ -621,7 +652,7 @@ def installed(probe=None):
     from stallionfs import images, _scan
 
     require_contextual = os.environ.get('STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT') == '1'
-    contextual_test = 'test_fskit.FSKitInterfaces.test_contextual_and_legacy_callbacks_and_production_builds'
+    contextual_test = CONTEXTUAL_TEST
 
     def require_contextual_environment():
         host = (sys.platform, platform.mac_ver()[0], platform.machine())
@@ -640,15 +671,6 @@ def installed(probe=None):
                 or not re.fullmatch(r'Xcode 27\.1\nBuild version [A-Za-z0-9]+', xcode)
                 or sdk != '27.0'):
             raise RuntimeError('Contextual FSKit requires macOS 27+ ARM64 with selected Xcode 27.1 and SDK 27.0')
-
-    class ContextualResult(unittest.TextTestResult):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.contextual_successes = 0
-        def addSuccess(self, test):
-            super().addSuccess(test)
-            if test.id() == contextual_test:
-                self.contextual_successes += 1
 
     if require_contextual:
         require_contextual_environment()

@@ -213,8 +213,8 @@ class EntryTests(unittest.TestCase):
     def test_required_skip_and_contextual_accounting(self):
         from types import SimpleNamespace
         from unittest.mock import patch
-        def result(skips=(), contextual=0, success=True):
-            return SimpleNamespace(skipped=list(skips), contextual_successes=contextual,
+        def result(skips=(), contextual=0, activation=1, success=True):
+            return SimpleNamespace(skipped=list(skips), contextual_successes=contextual, activation_successes=activation,
                                    wasSuccessful=lambda: success, testsRun=1)
         capability = (SimpleNamespace(id=lambda: 'setUpClass (test_fskit.FSKitInterfaces)'),
                       'FSKit capability unavailable: synthetic')
@@ -227,6 +227,47 @@ class EntryTests(unittest.TestCase):
             self.assertTrue(entry.account_result(result(contextual=2), None, True, 'context'))
             self.assertTrue(entry.account_result(result(success=False), None, False, 'context'))
             self.assertTrue(entry.account_result(result([capability]), 'pass', False, 'context'))
+
+    def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import contextlib, io
+        capability = (SimpleNamespace(id=lambda: 'setUpClass (test_fskit.FSKitInterfaces)'),
+                      'FSKit capability unavailable: synthetic unsupported host')
+        adapter = (SimpleNamespace(id=lambda: entry.ADAPTER_TEST), 'requires compiled offline activation driver')
+        def refused(skips, successes=0, required=False, successful=True, contextual=1):
+            result = SimpleNamespace(skipped=skips, activation_successes=successes,
+                                     contextual_successes=contextual, wasSuccessful=lambda: successful)
+            return entry.account_result(result, None, required, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'), contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(refused([adapter], 1, required=True))
+            self.assertFalse(refused([adapter, capability]))
+            for count in (0, 2, -1, True, None):
+                with self.subTest(count=count):
+                    self.assertTrue(refused([adapter], count, required=True))
+            self.assertTrue(refused([adapter, capability], required=True))
+            self.assertTrue(refused([adapter], 1, successful=False))
+            self.assertTrue(refused([], 0, required=True))
+            self.assertTrue(refused([adapter], 1, required=True, contextual=0))
+            self.assertTrue(refused([(adapter[0], 'different skip')], 1))
+            self.assertTrue(refused([(SimpleNamespace(id=lambda: 'other.test'), adapter[1])], 1))
+            self.assertTrue(refused([adapter]))
+
+    def test_result_counts_only_actual_successful_required_selectors(self):
+        import io
+        class Synthetic(unittest.TestCase):
+            def __init__(self, identity, outcome='pass'):
+                super().__init__('runTest'); self.identity=identity; self.outcome=outcome
+            def id(self): return self.identity
+            def runTest(self):
+                if self.outcome == 'fail': self.fail('controlled required-selector failure')
+                if self.outcome == 'skip': self.skipTest('controlled required-selector skip')
+        for outcome in ('pass', 'fail', 'skip'):
+            suite=unittest.TestSuite([Synthetic(entry.CONTEXTUAL_TEST), Synthetic(entry.ACTIVATION_TEST, outcome)])
+            result=unittest.TextTestRunner(stream=io.StringIO(), resultclass=entry.ContextualResult).run(suite)
+            self.assertEqual(result.contextual_successes, 1)
+            self.assertEqual(result.activation_successes, int(outcome == 'pass'))
+            self.assertEqual(result.wasSuccessful(), outcome != 'fail')
 
     def test_workflow_entry_allocation_and_fixed_discovery(self):
         import ast
@@ -243,6 +284,10 @@ class EntryTests(unittest.TestCase):
                        if 'timeout-minutes: ${{' in line or 'CI_JOB_MINUTES: ${{' in line]
         self.assertEqual(len(expressions), 2)
         self.assertEqual(expressions[0], expressions[1])
+        self.assertIn("matrix.os == 'macos-26' && matrix.phase == 'installed' && matrix.python != '3.13' && 30", expressions[0])
+        # Keep the original anchor and shared tail reserve; the slow installed
+        # workers receive room for the observed suite rather than a fresh clock.
+        self.assertEqual(entry.remainder(100*NS, 30, 344*NS), 1426)
         self.assertIn("'tools/ci_test_entry.py'", worker)
         self.assertIn('raise SystemExit(entry.main())', worker)
         tree = ast.parse(SOURCE.read_text())
