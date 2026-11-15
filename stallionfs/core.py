@@ -932,6 +932,11 @@ class Store(Lifecycle):
         native_result = [None]
         with self._workspace_lock(workspace, native_result=native_result):
             path, metadata = self.object("workspaces", workspace)
+            if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
+                # Finish the producer's installation before publishing a new use generation.
+                from ._native import recover_install
+                recover_install(self, path, metadata)
+                metadata = read_json(path / 'meta.json')
             self._open(workspace, path, metadata)
             result = self._mount(path, metadata)
             if metadata.get('backend') == 'native-image':

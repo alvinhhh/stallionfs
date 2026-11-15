@@ -119,6 +119,22 @@ class Workspaces(unittest.TestCase):
             if argv[0] == runtime['executable']:
                 return executor(argv, record, persist, directory, **kwargs)
             if argv == verifier:
+                directory = Path(directory)
+                self.assertTrue(directory.is_relative_to(self.base))
+                missing = []
+                parent = directory
+                while not parent.exists():
+                    missing.append(parent)
+                    parent = parent.parent
+                for parent in reversed(missing):
+                    parent.mkdir(mode=0o700)
+                    sync_directory(parent.parent)
+                for name in ('stdout', 'stderr'):
+                    with (directory / name).open('xb') as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                sync_directory(directory)
                 state['helper_commands'].append(list(argv))
                 record.update(argv=list(argv), child_pending=False, outcome='success', returncode=0,
                               pid=123, reaped=True, streams_eof=True, streams_durable=True, output_bytes=0,

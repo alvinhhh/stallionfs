@@ -562,7 +562,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         need(rootReply.0 != nil && rootReply.1 == nil, "activation root")
         let root = rootReply.0!
         let duplicate: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
-        need(root === duplicate.0, "canonical duplicate root")
+        need(duplicate.0 == nil && code(duplicate.1) == Int(EBUSY), "duplicate activation refused")
         let mounted: Error? = wait { done in volume.mount(arguments: ["--rdonly"], replyHandler: done) }
         need(mounted == nil && volume.requestedMountOptions.contains(.readOnly), "readonly mounted helper")
         let request = FSItem.GetAttributesRequest(); request.wantedAttributes = FSItem.Attribute(rawValue: 0x33fff)
@@ -721,7 +721,7 @@ func generalNamespaceChecks(_ parent: URL) throws {
         let deactivated: Error? = wait { done in volume.deactivate(options: [], replyHandler: done) }
         need(deactivated == nil && hooksReads() == 0 && hooksCloses() == 0, "deactivate memory-only")
         let reactivate: (FSItem?, Error?) = wait { done in volume.activate { done(($0, $1)) } }
-        need(reactivate.0 === root && reactivate.1 == nil, "root retained across activation")
+        need(reactivate.0 == nil && code(reactivate.1) == Int(EBUSY), "deactivated instance cannot reactivate")
         hooksReset(); hooksFailClose()
         let closed: Error? = wait { done in volume.enqueue { done(volume.unload().error) } }
         need(code(closed) == Int(EIO), "consumed close failure")
