@@ -1412,10 +1412,24 @@ def software_plan(authorization, activity, app_state, *, request_retained, leaf_
         qualification='installed-fixed-path-interruption-restart-and-persistence-trials-required')
 
 
+def _applications_anchor(info):
+    try:
+        import grp
+        admin = grp.getgrnam('admin')
+    except (ImportError, KeyError, OSError):
+        raise Refusal('physical-directory-admin-group') from None
+    group = getattr(admin, 'gr_gid', None)
+    require(getattr(admin, 'gr_name', None) == 'admin' and type(group) is int
+            and 0 <= group < 2**32, 'physical-directory-admin-group')
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_gid == group
+            and stat.S_IMODE(info.st_mode) in (0o755, 0o775), 'physical-directory-owner-mode')
+
+
 def physical_directory(path):
     path = Path(path)
     require(path.is_absolute() and '..' not in path.parts, 'invalid-physical-directory')
     held = {}; bindings = []; primary = None
+    installed = path.parts[:3] == ('/', 'Applications', 'StallionFS.app')
     try:
         current = Path('/')
         for index, name in enumerate(path.parts):
@@ -1425,8 +1439,11 @@ def physical_directory(path):
                 dir_fd=next(reversed(held.values())) if held else None)
             held[current] = fd
             info = os.fstat(fd); bindings.append((current, stamp(info)[:5]))
-            require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0,os.getuid())
-                    and not info.st_mode & 0o022, 'physical-directory-owner-mode')
+            if installed and current == Path('/Applications'):
+                _applications_anchor(info)
+            else:
+                require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0,os.getuid())
+                        and not info.st_mode & 0o022, 'physical-directory-owner-mode')
             empty_acl(fd,ancestor=current != path)
         for current, saved in bindings:
             parent = None if current == Path('/') else held[current.parent]
