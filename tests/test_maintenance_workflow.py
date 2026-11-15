@@ -1,6 +1,6 @@
 """Owned inert fixtures for maintenance acquisition and software/STORE boundaries."""
 import copy
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import hashlib
 import importlib.util
 import json
@@ -19,6 +19,22 @@ spec = importlib.util.spec_from_file_location('maintenance_workflow',SOURCE/'fil
 o = importlib.util.module_from_spec(spec); spec.loader.exec_module(o)
 INSTALLED_VALIDATORS = o.installed_validators
 ACQUIRE_ATTACHMENTS = o.acquire_attachments
+
+
+@contextmanager
+def fresh_stallionfs_namespace():
+    """Give a synthetic controller its own package namespace and restore its caller."""
+    saved = {name: module for name, module in list(sys.modules.items())
+             if name == 'stallionfs' or name.startswith('stallionfs.')}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == 'stallionfs' or name.startswith('stallionfs.'):
+                del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def authority(home):
@@ -895,6 +911,7 @@ class PopulatedUpgrade(Upgrade):
         return result
 
     def setUp(self):
+        self.enterContext(fresh_stallionfs_namespace())
         super().setUp()
         self.hosting_calls = []
         self.validators.side_effect = self.loaded
@@ -1296,6 +1313,66 @@ class PopulatedUpgrade(Upgrade):
                 self.assertEqual(before,self.snapshot_store());self.assertFalse((self.controls/'step-0000.json').exists())
                 if other is not None:other.write_bytes(saved)
                 self.controls=self.base/('idle-fault-'+fault);self.controls.mkdir(mode=0o700)
+
+
+class PackageNamespaceFixture(unittest.TestCase):
+    def preloaded(self):
+        import types
+        return {name: types.ModuleType(name) for name in ('stallionfs', 'stallionfs.core')}
+
+    def assert_namespace(self, expected):
+        actual = {name: module for name, module in list(sys.modules.items())
+                  if name == 'stallionfs' or name.startswith('stallionfs.')}
+        self.assertEqual(set(actual), set(expected))
+        for name, module in expected.items():
+            self.assertIs(actual[name], module)
+
+    def test_preloaded_identity_restored_after_success_and_hostile_refusal(self):
+        import types
+        with fresh_stallionfs_namespace():
+            ambient = self.preloaded(); sys.modules.update(ambient)
+            fixture = PopulatedUpgrade('test_admitted_loader_rejects_changed_missing_ambient_and_outside_closure')
+            try:
+                fixture.setUp()
+                self.assert_namespace({})
+                with fixture.loaded(fixture.session['old']):
+                    self.assertIsNot(sys.modules['stallionfs'], ambient['stallionfs'])
+                    self.assertIsNot(sys.modules['stallionfs.core'], ambient['stallionfs.core'])
+                hostile = types.ModuleType('stallionfs')
+                sys.modules['stallionfs'] = hostile
+                with self.assertRaisesRegex(o.Refusal, 'validator-import-origin'):
+                    with fixture.loaded(fixture.session['old']):
+                        self.fail('Hostile ambient package reached consumer')
+                self.assertIs(sys.modules['stallionfs'], hostile)
+            finally:
+                fixture.doCleanups()
+            self.assert_namespace(ambient)
+
+    def test_nested_namespace_restores_exact_objects_after_exception(self):
+        with fresh_stallionfs_namespace():
+            ambient = self.preloaded(); sys.modules.update(ambient)
+            with self.assertRaisesRegex(RuntimeError, 'consumer failure'):
+                with fresh_stallionfs_namespace():
+                    nested = self.preloaded(); sys.modules.update(nested)
+                    with fresh_stallionfs_namespace():
+                        self.assert_namespace({})
+                        sys.modules.update(self.preloaded())
+                    self.assert_namespace(nested)
+                    raise RuntimeError('consumer failure')
+            self.assert_namespace(ambient)
+
+    def test_setup_failure_restores_preloaded_namespace(self):
+        with fresh_stallionfs_namespace():
+            ambient = self.preloaded(); sys.modules.update(ambient)
+            fixture = PopulatedUpgrade('test_admitted_loader_rejects_changed_missing_ambient_and_outside_closure')
+            try:
+                with patch.object(Upgrade, 'setUp', side_effect=RuntimeError('setup failure')):
+                    with self.assertRaisesRegex(RuntimeError, 'setup failure'):
+                        fixture.setUp()
+                self.assert_namespace({})
+            finally:
+                fixture.doCleanups()
+            self.assert_namespace(ambient)
 
 
 if __name__=='__main__':unittest.main()
