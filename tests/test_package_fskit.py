@@ -582,10 +582,13 @@ class RuntimeAssembly(unittest.TestCase):
         self.assertEqual(argv[0], '/usr/bin/otool')
         return APPLE_BUILD_VERSION
 
-    def assemble(self):
+    def assemble(self, predecessors=None):
         argv = ['package_fskit.py', '--host', str(self.host), '--extension', str(self.extension),
                 '--out', str(self.app), '--bundle-version', '9', '--manifest-out', str(self.manifest),
                 '--runtime-inputs', str(self.descriptor), '--maintenance-native', str(self.native)]
+        if predecessors is not None:
+            declarations = json_file(self.root / 'upgrade-predecessors.json', predecessors)
+            argv += ['--upgrade-predecessors', str(declarations)]
         self.stdout = io.StringIO()
         with patch.object(sys, 'argv', argv), patch.object(package, '_tool_output', side_effect=self.inspect), redirect_stdout(self.stdout):
             package.main()
@@ -784,6 +787,20 @@ class RuntimeAssembly(unittest.TestCase):
         self.assertEqual((self.app / roles['observer']).read_bytes(), observer)
         self.assertEqual(module['validate_compatibility'](resource,observer,build)['public_upgrade_support'], [])
         self.assertIn(digest(observer), runtime['input_file_sha256'])
+
+    def test_explicit_upgrade_declarations_are_bound_before_signing(self):
+        self.inputs()
+        predecessor = dict(predecessor_artifact_id='1'*64, predecessor_descriptor_sha256='2'*64)
+        self.assemble([predecessor])
+        runtime = json.loads(self.manifest.read_bytes())['runtime']
+        _, observer, module = package._maintenance_source()
+        build = dict(bundle_id='com.alvinhhh.stallionfs', bundle_version='9', package_version=package.PACKAGE_VERSION,
+                     source_build_id=runtime['source_build_id'])
+        data = (self.app / module['RESOURCE_ROLES']['compatibility']).read_bytes()
+        contract = module['validate_compatibility'](data, observer, build)
+        self.assertEqual(contract['schema'], 2)
+        self.assertEqual(contract['public_upgrade_support'][0]['predecessor_artifact_id'], '1'*64)
+        self.assertIn(digest((self.root / 'upgrade-predecessors.json').read_bytes()), runtime['input_file_sha256'])
 
     def test_missing_or_changed_observer_source_never_succeeds(self):
         self.inputs()

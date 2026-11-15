@@ -482,7 +482,7 @@ class Compatibility(unittest.TestCase):
             with self.assertRaises(o.Refusal): o.compatible_predecessor(data,self.observer,self.build,pair)
 
     def test_resource_refuses_malformed_unknown_aliases_and_authority(self):
-        updates = [dict(schema=True), dict(schema=2), dict(verified=True), dict(publisher='candidate'),
+        updates = [dict(schema=True), dict(schema=3), dict(verified=True), dict(publisher='candidate'),
             dict(roles=dict(o.RESOURCE_ROLES, observer='../observer.py')),
             dict(roles=dict(o.RESOURCE_ROLES, observer=o.RESOURCE_ROLES['compatibility'])),
             dict(roles=dict(o.RESOURCE_ROLES, observer='Contents/Resources/Maintenance/./observer.py')),
@@ -507,6 +507,24 @@ class Compatibility(unittest.TestCase):
             with self.assertRaises(o.Refusal):o.validate_compatibility(self.data,observer,self.build)
         with self.assertRaises(o.Refusal):
             o.validate_compatibility(self.data,self.observer,dict(self.build,package_version='0.8.0'))
+
+    def test_exact_predecessor_inventory_and_descriptor_declaration(self):
+        predecessor = dict(predecessor_artifact_id='1'*64, predecessor_descriptor_sha256='b'*64)
+        data = o.create_compatibility(self.observer, self.build, [predecessor])
+        value = o.validate_compatibility(data, self.observer, self.build)
+        self.assertEqual(value['schema'], 2)
+        pair = dict(self.pair, predecessor_artifact_id='1'*64)
+        self.assertEqual(value['public_upgrade_support'], [pair])
+        self.assertEqual(o.compatible_predecessor(data, self.observer, self.build, pair),
+                         dict(structurally_consistent=True, authenticated=False))
+        for field in ('predecessor_artifact_id', 'predecessor_descriptor_sha256'):
+            with self.subTest(field=field), self.assertRaises(o.Refusal):
+                o.compatible_predecessor(data, self.observer, self.build, dict(pair, **{field:'2'*64}))
+        for rows in ([predecessor]*2, [dict(predecessor, qualified=True)], [dict(predecessor_artifact_id=True)]):
+            with self.subTest(rows=rows), self.assertRaises(o.Refusal):
+                o.create_compatibility(self.observer, self.build, rows)
+        self.assertEqual(o.create_compatibility(self.observer, self.build), self.data)
+        self.assertEqual(json.loads(self.data)['public_upgrade_support'], [])
 
 
 

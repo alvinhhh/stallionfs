@@ -1,13 +1,18 @@
 # Exact-artifact maintenance
 
-This procedure covers removal, reinstall, interrupted reinstall and restoration
+The same-artifact procedure covers removal, reinstall, interrupted reinstall and restoration
 of the exact last independently authorized app at `/Applications/StallionFS.app`.
 It preserves stores. It does not authorize an upgrade, downgrade, pending-request
 recovery, forced unmount, process termination, registration reset or automatic
-replacement. `public_upgrade_support` remains empty.
+replacement. Default packages retain empty `public_upgrade_support`. The separate
+cross-version controller below requires an explicit signed exact-pair declaration
+and release qualification for the final artifacts.
 
 The implementation supplies a standalone native collector and an external
-stdlib observer. Its parser reports and policy functions are diagnostics, not
+observer. Same-artifact observation uses only the standard library; populated
+cross-version observation additionally uses the independently admitted installed
+package's bounded schema validators and read-only hosting identity primitive.
+Its parser reports and policy functions are diagnostics, not
 a maintenance reservation or execution capability. `maintenance_clearance` and
 `store_access_eligible` remain false. Follow this procedure only after the exact
 installed qualification rows below pass for the final signed artifact.
@@ -269,6 +274,173 @@ Current host observation includes persistent live process paths that remain
 unavailable. The implemented refusal stays in place; neither native counts nor
 synthetic tests establish normal-host maintenance clearance.
 
+## Cross-version upgrade controller
+
+`observer.py upgrade` retains a cross-version transaction and issues one manual
+step at a time. It never copies, deletes or launches an app, changes Settings,
+manages registrations, or mutates a store. Its output is a next step under the
+continuing cooperative window; `maintenance_clearance` and
+`store_access_eligible` remain false. Installation, selection and actual mounted
+persistence are separately checked outcomes.
+
+A schema-2 compatibility resource declares the exact predecessor's complete
+final inventory ID and descriptor SHA256, plus the candidate build/source ID,
+observer SHA256, runtime and parser contracts. Schema-1 resources remain readable
+but do not authorize this route. Version ranges, descriptor equality alone, and
+same-publisher equality do not admit another predecessor. Declare the pair before
+signing, then qualify that exact finished signed artifact. Publish its unchanged
+authenticated release mapping only after qualification; there is no runtime
+`qualified` flag or separate test-result authentication mechanism.
+
+Before running the external controller, independently admit both release mappings
+and statically verify the candidate observer and the selected **installed**
+runtime. The controller is the candidate's signed observer retained externally;
+it need not equal the predecessor observer. Prepare/publication use the admitted
+predecessor at the fixed path. After publication, verification uses the admitted
+candidate at that same path. Never execute a staged candidate to authenticate it.
+The current runtime artifact identity is supplied independently in each session
+and must match the complete installed inventory before runtime and store checks.
+Runtime routing checks cannot authenticate an interpreter already loaded before
+the required static checks.
+
+Populated stores are inspected through held, no-follow descriptors. Recognized
+folder and sparseimage seeds/workspaces retain their payloads without traversal
+or image interpretation. Native workspaces require matching creation and install
+lineage, binding, hosting volume UUID/file identities, lifecycle, terminal operation
+archive and absent-mount evidence. Schema-2 bindings also require their exact
+reconciliation receipt and scope. A lifecycle status of `open` alone does not
+mean an active mount. Unknown entries, pending operations, orphan lifecycle
+records, moved/device-translated identities and unrecognized layouts block the
+handoff. Cooperative downtime and the fresh native activity snapshot remain
+mandatory; schema recognition is not a reservation against other writers.
+Open or closed native lifecycle records may retain a `native_idle` baseline.
+Its generation, held target, timestamp, anchor and consumed guard must agree;
+the baseline may be historically stale and never replaces the independent
+terminal archive, absent-mount evidence or fresh downtime checks.
+
+Sparseimage admission additionally captures `/usr/bin/hdiutil info -plist` with
+the existing bounded inspection collector (30 seconds, 2 MiB, EOF, reaped child,
+durable output/readback and a fresh request/boot binding). **Every attached disk
+image blocks sparseimage admission**, including unrelated images and attachments
+without a mounted volume. Reported image paths are never followed to guess alias
+equivalence. Use an extracted ZIP candidate; a mounted installer DMG also blocks
+this check. The controller never detaches an image. Failed, stale, malformed or
+incomplete inspection remains a blocker.
+
+The controller imports a fixed module closure only from the fully inventoried,
+publisher-verified installed package. It checks every source/extension hash,
+compiles source bytes without accepting cached bytecode, rejects ambient product
+imports and does not add site/user/staged-candidate search paths. Store constructors,
+resolution/recovery routines and native backing operations are not called. The
+only package-native primitive used is `hosting_identity` on already held directory
+and image descriptors; it reads host metadata and is rechecked before descriptor
+release. The old installed package supplies these validators before publication;
+the candidate installed package supplies them afterward. A missing API blocks
+the operation and never selects an alternate package or interpreter.
+
+The independently SHA256-pinned schema-2 session object has exactly:
+
+| Field | Value |
+| --- | --- |
+| `schema`, `kind` | `2`, `upgrade-session` |
+| `old`, `candidate` | Exact `final_maintenance_bindings` mappings with complete inventory/signing roles and archive digest; candidate requires `build`. A legacy predecessor mapping may omit `build` as described below. Resolve archive locations to admitted absolute external paths. |
+| `controller` | Candidate `artifact_id` and `observer_sha256`. |
+| `runtime_artifact_id` | Exact independently admitted installed predecessor or candidate artifact ID for this invocation. |
+| `home`, `cooperation` | Account database home and the existing explicit all-user/cooperative window contract. |
+| `history` | `request_sha256`, `previous_step_sha256`, `last_installed`, `candidate_access` (`none`, `possible`, `unknown`), `continuous_downtime` (boolean). |
+
+For preparation, both history digests are null, last installed is the exact
+predecessor, access is `none`, and downtime is continuously established. These
+are independently established history assertions, not facts inferred from an
+empty journal. For continuation, use the returned request and step digests in a
+fresh independently admitted session with current history/cooperation. The app
+bindings, original root denominator and baseline stay unchanged. Test reports
+are retained release evidence, not fields added to this session.
+
+Older schema-1 final mappings did not contain `build`. Preserve that exact old
+mapping and signed app. After its full historical inventory, nested publishers
+and descriptor/resource hashes pass, derive the predecessor build from its own
+Info.plist and runtime descriptor. Require their versions, fixed bundle ID,
+source ID in the independently admitted store runtime, and signed compatibility
+resource to agree. Retain the derived build in that attempt without enriching
+or changing the original mapping. Missing or conflicting old metadata refuses;
+candidate build metadata cannot substitute for it. The candidate mapping still
+requires an explicit independently admitted build.
+
+Use the existing trusted static admission before each command. The argument
+paths below are placeholders for independently admitted absolute paths:
+
+```text
+/Applications/StallionFS.app/Contents/Resources/Runtime/CPython/bin/python3.13 -I -B -S /external/observer.py upgrade --phase prepare --candidate-app /external/candidate/StallionFS.app --authorization /external/session.json --authorization-sha256 EXPECTED --publisher 4CQS5J4848 --retain /external/upgrade --root /exact/store
+```
+
+`prepare` requires an empty private external `0700` transaction directory and an
+intact exact predecessor. It retains the original literal roots/reasons,
+environment/default contract, both artifacts/archives, controller and history
+before reading store controls. Candidate/archive locations must be outside
+stores; archives must also be outside the installed and staged apps. The
+baseline records every requested root's physical identity or admitted absent
+default. Duplicate aliases remain separate requested rows. Pending work,
+unknown activity, incomplete roots, unsafe paths or cleanup uncertainty stop.
+
+Repeat the command with the same transaction directory, explicit roots and an
+updated admitted session, selecting one phase:
+
+| Phase | Result |
+| --- | --- |
+| `publish` | Recheck both admitted artifacts, full original root coverage, continuous original cooperation and fresh native downtime. Durably record possible candidate exposure **before** returning the Finder instruction to preserve the predecessor and install the exact candidate. |
+| `verify` | Require the actual fixed-path candidate, its full inventory/signatures, declared pair and candidate runtime. Reobserve the original roots before the ordinary Settings/discovery/link verification handoff. This does not assert those manual steps succeeded. |
+| `resume` | Inspect actual installed bytes and the bound journal/history. An intact predecessor after possible/unknown exposure yields exact-candidate repair. An intact candidate with unknown last-installed/access history or an unclosed attempt yields software-only verification, without the Settings/discovery handoff. Foreign or unresolved artifacts stop. |
+| `rollback` | Before any exposure handoff, require positive complete baseline/current root evidence and unchanged uninterrupted cooperation/history. Keep the intact exact predecessor. This bounded route does not restore an older app after publication. |
+
+Each invocation retains its own signature/activity/observation attempt. Steps
+are exclusive, fsynced and read back, with the original request, baseline and
+previous-step digests. These digests hash the exact canonical retained JSON bytes
+including their final newline, so native `openssl dgst -sha256` can compare them
+without Python. Partial/torn records are preserved and block continuation;
+no step is silently discarded. A lost response after the exposure record was
+written still counts as possible exposure. A stale external continuation digest
+stops; inspect and independently reconcile retained history before supplying a
+new digest. Record absence alone never proves that candidate code did not run.
+Changed default/environment roots, dropped/added explicit roots, changed physical
+identities and newly appearing absent-default roots stop instead of rebasing.
+
+Every durably created attempt directory must be accounted for. Only its committed
+step closes an attempt. An unreferenced attempt, including controller death before
+the exposure record, is preserved and makes access unknown; it cannot silently
+inherit the earlier prepared step's continuity. Such a transaction cannot issue
+initial publication or predecessor rollback. Fresh complete admission may still
+permit exact-candidate software repair. Unknown last-installed history likewise
+cannot issue first publication or normal candidate verification; a claimed prior
+candidate installation cannot be interpreted as an unexposed predecessor merely
+because the actual current app is the predecessor.
+
+Publication, enablement or a possible launch makes this transaction candidate-only
+for software repair. An unknown launch/history interval or broken cooperative
+window cannot regain predecessor rollback. Restoring an old app after candidate
+STORE access needs a separately qualified reverse transition; it is not provided
+by this forward controller. Preserve the old app/archive, candidate, partial
+copies, records, every store and foreign command links throughout.
+
+If installed Python is absent or partial, this Python controller cannot run.
+Use the native/static no-Python procedure below with the exact independently
+authorized **candidate** and fresh complete downtime to restore software
+availability only. The original scope and all STORE restrictions remain. Do not
+substitute predecessor restoration, a relocated Python or a source interpreter.
+If exact candidate history/authority, static verification or native downtime is
+unavailable, stop and preserve everything. After candidate restoration, verify
+the full fixed-path inventory and nested signatures before launching its Python
+and this externally admitted controller. Foreign/uncertain installed contents
+need independently resolved history; do not overwrite them opportunistically.
+
+Release qualification must exercise the real predecessor-to-candidate path,
+normal unmount/remount, cross-version content and admitted metadata persistence,
+cancelled/partial publication, controller death and reboot recovery. Source
+tests exercise inert app/store bytes and retained transaction I/O with controlled
+signature/runtime/activity adapters; they do not qualify installed replacement,
+FSKit selection, or user-data persistence. No historical private metadata trial
+is converted into a compatibility waiver or a universal writer-proof requirement.
+
 ## No-Python admission and decision commands
 
 Use this branch only to restore executable availability. It is an intermediate
@@ -413,9 +585,24 @@ an older archive. A lost request in5 can permit **software-only** restoration,
 but never STORE access or silent scope reduction. Unknown/mixed STORE mutation
 history similarly stays blocked while exact software availability can be restored.
 
+For an interrupted declared upgrade, replace the same-artifact history conditions
+2 and 3 with the independently admitted upgrade session and its exact candidate
+release mapping: verify the original request and latest step byte digests against
+the retained independent pins; preserve the candidate-only exposure/history
+classification; exclude any executable outside the admitted predecessor/candidate
+pair. Admit the schema-2 pair and current candidate runtime selection from the
+retained authenticated release/session packet before the native procedure. This
+manual software-only branch may repair only that candidate, never the predecessor.
+A missing/torn transaction, unavailable pins, foreign/unknown executable identity,
+or inability to establish this limited history stops; no current Python policy
+result is invented. Unknown STORE mutations within the admitted pair still block
+STORE access. All native/static checks, fresh cooperation and original-scope
+preservation remain mandatory.
+
 Only after every applicable check passes may Finder copy the statically admitted
 `STAGED` app to `/Applications/StallionFS.app` for the exact absent/partial/known
-interrupted same-artifact case. Record cancellation/denial/space/copy failure as
+interrupted same-artifact case or the admitted candidate-only upgrade repair
+above. Record cancellation/denial/space/copy failure as
 an interruption and reacquire before retry. An intact-wrong target with unknown
 or possibly newer history stops. Once installed bytes/static roles and ordinary
 Settings/discovery pass, run the restored admitted observer over the original
