@@ -453,7 +453,9 @@ def artifact_available(directory):
                 return False
             if value['kind'] == 'eject_command':
                 if (value['phase'] != 'after' or type(value['attempt']) is not int or value['attempt'] not in (1, 2) or
-                        value['executable'] != '/usr/sbin/diskutil' or value['verb'] != 'eject' or
+                        (value['executable'], value['verb'], value['attempt']) not in (
+                            ('/usr/sbin/diskutil', 'eject', 1), ('/usr/sbin/diskutil', 'eject', 2),
+                            ('/usr/bin/hdiutil', 'detach', 2)) or
                         not isinstance(value['device'], str) or not re.fullmatch(r'/dev/disk[0-9]+', value['device']) or
                         type(value['returncode']) is not int or value['returncode'] == 0 or
                         not all(type(value[name]) is int and value[name] > 0 for name in
@@ -1202,13 +1204,19 @@ def install(images, directory):
         if diagnostics.closed or images._command is not command:
             return original(*args)
         creating = len(args) >= 3 and args[:2] == ('/usr/bin/hdiutil', 'create')
-        ejecting = (len(args) == 3 and args[:2] == ('/usr/sbin/diskutil', 'eject')
+        invocation = _detach_call.get()
+        if invocation is not None and invocation['diagnostics'] is not diagnostics:
+            invocation = None
+        continuation = (invocation is not None and invocation['command_count'] == 1
+                        and invocation['command_statuses'] == [1]
+                        and len(args) == 3 and invocation['command_targets'] == [args[2]]
+                        and args[:2] == ('/usr/bin/hdiutil', 'detach'))
+        ejecting = (len(args) == 3 and
+                    (args[:2] == ('/usr/sbin/diskutil', 'eject') or continuation)
                     and isinstance(args[2], str) and re.fullmatch(r'/dev/disk[0-9]+', args[2]))
         if not (creating or ejecting):
             return original(*args)
-        invocation = _detach_call.get() if ejecting else None
-        if invocation is not None and invocation['diagnostics'] is not diagnostics:
-            invocation = None
+        invocation = invocation if ejecting else None
         observation = invocation['observation'] if invocation is not None else _detach_observation.get() if ejecting else None
         record = invocation or observation
         if record is not None:

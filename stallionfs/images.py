@@ -306,9 +306,9 @@ def detach(image, mountpoint):
                 if (identity != _backing_identity(image) or
                         device_identity != _device_identity(current['device'])):
                     raise _error('Image or selected device identity changed before continuation')
-            # This narrows name reuse races; diskutil-by-name is not atomic with
+            # This narrows name reuse races; detaching by name is not atomic with
             # external detach/reattach, even under a managed workspace lock.
-            _command('/usr/sbin/diskutil', 'eject', current['device'])
+            _command('/usr/bin/hdiutil', 'detach', current['device'])
             verify_absent()
         except BaseException as recovery:
             original.add_note(f'Eject continuation refused or failed; keep {image}: '
