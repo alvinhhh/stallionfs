@@ -1,0 +1,68 @@
+[
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/curl.h",
+    "file": "baseline/include/curl/curl.h",
+    "sha256": "daa679638e891998b0c4abdfe616e810d05fc06e7392166b35d7d72348f86d7b",
+    "bytes": 121983
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/curlver.h",
+    "file": "baseline/include/curl/curlver.h",
+    "sha256": "b4cbc1688f77376802b0c7c57e59a961c02afb9dd218ce733b091e0bec3f6ec7",
+    "bytes": 3071
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/easy.h",
+    "file": "baseline/include/curl/easy.h",
+    "sha256": "7e6eda5ae9683b59585898f28d287fed5c34422ad7ddea9c93d285c4af87bd2c",
+    "bytes": 4016
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/header.h",
+    "file": "baseline/include/curl/header.h",
+    "sha256": "6a169e28fa0e9bcbe1e220091e773023bead7b242c7433496013fed34792f4f9",
+    "bytes": 2829
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/mprintf.h",
+    "file": "baseline/include/curl/mprintf.h",
+    "sha256": "bce9829272824b2af32fd7305439fed1d556a9a566d510f1440bd2f66eb1624c",
+    "bytes": 2105
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/multi.h",
+    "file": "baseline/include/curl/multi.h",
+    "sha256": "2b7f10958ed810d2cdc8d6dfc989d16aff0b98e9527f3c29bc0dba5ff195f5c5",
+    "bytes": 17299
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/options.h",
+    "file": "baseline/include/curl/options.h",
+    "sha256": "aabc84f3f5ae5395c81d3f94b915cac5e8ab768b8e562e65c66664a3eb971f5e",
+    "bytes": 2414
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/stdcheaders.h",
+    "file": "baseline/include/curl/stdcheaders.h",
+    "sha256": "cd7a2750e52b5aca14681e3b37ea4953f18687c51a9b29165d633a336c904172",
+    "bytes": 1375
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/system.h",
+    "file": "baseline/include/curl/system.h",
+    "sha256": "9a4c42bc10337c742740515d433a43ee4a7c525d6b6a67ddf6bb226a41e79a72",
+    "bytes": 18524
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/typecheck-gcc.h",
+    "file": "baseline/include/curl/typecheck-gcc.h",
+    "sha256": "a2eaf5def999f3b27af971e285db628a02a98b28384d60a23ade2ed37a3aefa5",
+    "bytes": 43023
+  },
+  {
+    "archive_member": "curl-913bdd410e7bb72b815ba6d4f02a1c32e34635fe/curl/include/curl/urlapi.h",
+    "file": "baseline/include/curl/urlapi.h",
+    "sha256": "212e556e1dee748af8fd49b767a0447d7e3523710e391360d8afd95b071cc185",
+    "bytes": 5293
+  }
+]

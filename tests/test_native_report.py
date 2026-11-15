@@ -278,6 +278,53 @@ class ReportTests(unittest.TestCase):
             writer.finish({'schema': 1})
         self.assertEqual(len(json.loads(self.output.read_text())['rows']), 3)
 
+    def test_reader_manifest_limit_precedes_json_parse(self):
+        writer = self.writer()
+        writer.finish({'schema': 1})
+        with mock.patch.object(journal, '_load', side_effect=AssertionError('manifest parsed')) as parse:
+            with self.assertRaisesRegex(ValueError, 'Oversized journal manifest'):
+                journal.ReportJournal.open_existing(self.output, max_manifest_bytes=8)
+        parse.assert_not_called()
+
+    def test_reader_total_and_declared_event_limits_precede_verification(self):
+        writer = self.writer()
+        for index in range(2): writer.append('rows', index, {'value': index})
+        writer.finish({'schema': 1})
+        size = writer.journal_path.stat().st_size
+        for limits in ({'max_journal_bytes': size - 1}, {'max_events': 1}):
+            with self.subTest(limits=limits), \
+                    mock.patch.object(journal.ReportJournal, '_verify', side_effect=AssertionError('journal read')) as verify:
+                with self.assertRaisesRegex(ValueError, 'reader .* limit'):
+                    journal.ReportJournal.open_existing(self.output, **limits)
+                verify.assert_not_called()
+
+    def test_reader_event_byte_limit_precedes_rebuild_and_latest_parsing(self):
+        writer = self.writer()
+        writer.append('rows', 0, {'value': 'payload'})
+        writer.finish({'schema': 1})
+        with mock.patch.object(journal.ReportJournal, '_event', side_effect=AssertionError('event parsed')) as parse:
+            with self.assertRaisesRegex(ValueError, 'event exceeds reader byte limit'):
+                journal.ReportJournal.open_existing(self.output, max_event_bytes=8)
+            parse.assert_not_called()
+        reader = self.reader()
+        reader._max_event_bytes = 8
+        with mock.patch.object(journal.ReportJournal, '_event', side_effect=AssertionError('event parsed')) as parse:
+            with self.assertRaisesRegex(ValueError, 'event exceeds reader byte limit'):
+                list(reader.iter_latest('rows'))
+            parse.assert_not_called()
+
+    def test_reader_running_event_limit_rejects_underdeclared_count_before_next_parse(self):
+        writer = self.writer()
+        for index in range(2): writer.append('rows', index, {'value': index})
+        writer.finish({'schema': 1})
+        manifest = json.loads(writer.manifest_path.read_text())
+        manifest['event_count'] = 0
+        writer.manifest_path.write_text(json.dumps(manifest))
+        with mock.patch.object(journal.ReportJournal, '_event', wraps=journal.ReportJournal._event) as parse:
+            with self.assertRaisesRegex(ValueError, 'reader event count limit'):
+                journal.ReportJournal.open_existing(self.output, max_events=1)
+            self.assertEqual(parse.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

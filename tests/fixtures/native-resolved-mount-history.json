@@ -1,0 +1,244 @@
+{
+  "mount": {
+    "child_pending": false,
+    "current_guard": {
+      "committed_end": 35422208,
+      "core_consumed": true,
+      "coverage": 0,
+      "device": 100,
+      "fence_attempted": 0,
+      "fence_succeeded": 0,
+      "generation": 2,
+      "incomplete_reason": 0,
+      "inode": 300,
+      "limit_reason": 0,
+      "parent_close_errno": 0,
+      "phase": 15,
+      "physical_end": 35422208,
+      "poisoned": false,
+      "root_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "status": 0,
+      "system_errno": 0,
+      "transaction_active": false,
+      "uuid": "44444444444444444444444444444444"
+    },
+    "discovery": {
+      "modules": [
+        {
+          "access_policy": "contextual-writes",
+          "bundle_id": "com.alvinhhh.stallionfs.module",
+          "enabled": true,
+          "minimum_os": "27.0",
+          "short_name": "stallionfs",
+          "signature_status": 0,
+          "signing_identifier": "com.alvinhhh.stallionfs.module",
+          "team_identifier": "TESTTEAM00",
+          "url": "/Applications/StallionFS.app/Contents/Extensions/StallionFS.appex",
+          "version": "153"
+        },
+        {
+          "access_policy": null,
+          "bundle_id": "com.apple.fskit.exfat",
+          "enabled": true,
+          "minimum_os": "27.0",
+          "short_name": "exfat",
+          "signature_status": 0,
+          "signing_identifier": "com.apple.fskit.exfat",
+          "team_identifier": null,
+          "url": "/System/Library/ExtensionKit/Extensions/com.apple.fskit.exfat.appex",
+          "version": "1"
+        },
+        {
+          "access_policy": null,
+          "bundle_id": "com.apple.fskit.msdos",
+          "enabled": true,
+          "minimum_os": "27.0",
+          "short_name": "msdos",
+          "signature_status": 0,
+          "signing_identifier": "com.apple.fskit.msdos",
+          "team_identifier": null,
+          "url": "/System/Library/ExtensionKit/Extensions/com.apple.fskit.msdos.appex",
+          "version": "1"
+        },
+        {
+          "access_policy": null,
+          "bundle_id": "com.apple.fskit.ftp",
+          "enabled": true,
+          "minimum_os": "27.0",
+          "short_name": "ftp",
+          "signature_status": 0,
+          "signing_identifier": "com.apple.fskit.ftp",
+          "team_identifier": null,
+          "url": "/System/Library/ExtensionKit/Extensions/com.apple.fskit.ftp.appex",
+          "version": "1"
+        }
+      ],
+      "ok": true,
+      "protocol": 1
+    },
+    "format": 1,
+    "helpers": [
+      {
+        "argv": [
+          "/usr/bin/codesign",
+          "--verify",
+          "--deep",
+          "--strict",
+          "-R",
+          "=anchor apple generic and identifier \"com.alvinhhh.stallionfs\" and certificate leaf[subject.OU] = \"TESTTEAM00\"",
+          "/Applications/StallionFS.app"
+        ],
+        "child_pending": false,
+        "label": "verify-package",
+        "outcome": "success",
+        "pid": 401,
+        "reaped": true,
+        "returncode": 0,
+        "stderr": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/00-verify-package/stderr",
+        "stdout": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/00-verify-package/stdout"
+      },
+      {
+        "argv": [
+          "/Applications/StallionFS.app/Contents/MacOS/StallionFS",
+          "--discover-json"
+        ],
+        "child_pending": false,
+        "label": "discover",
+        "outcome": "success",
+        "pid": 402,
+        "reaped": true,
+        "returncode": 0,
+        "stderr": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/01-discover/stderr",
+        "stdout": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/01-discover/stdout"
+      },
+      {
+        "argv": [
+          "/sbin/mount",
+          "-t",
+          "stallionfs",
+          "/fixture/store/workspaces/11111111111111111111111111111111",
+          "/fixture/store/workspaces/11111111111111111111111111111111/volume"
+        ],
+        "child_pending": false,
+        "label": "mount",
+        "outcome": "error",
+        "pid": 403,
+        "reaped": true,
+        "returncode": 72,
+        "stderr": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/02-mount/stderr",
+        "stdout": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/02-mount/stdout"
+      }
+    ],
+    "id": "22222222222222222222222222222222",
+    "mount_attempted": true,
+    "observed_mount": null,
+    "operation": "native-mount",
+    "outcome": "incomplete",
+    "previous_unresolved": null,
+    "target": {
+      "component": "image.sfs",
+      "directory": "/fixture/store/workspaces/11111111111111111111111111111111",
+      "file": [
+        100,
+        300
+      ],
+      "parent": [
+        100,
+        200
+      ],
+      "uuid": "44444444444444444444444444444444"
+    },
+    "workspace": "11111111111111111111111111111111"
+  },
+  "unmount": {
+    "already_absent": true,
+    "before_mount": null,
+    "child_pending": false,
+    "current_guard": {
+      "committed_end": 35422208,
+      "core_consumed": true,
+      "coverage": 0,
+      "device": 100,
+      "fence_attempted": 0,
+      "fence_succeeded": 0,
+      "generation": 2,
+      "incomplete_reason": 0,
+      "inode": 300,
+      "limit_reason": 0,
+      "parent_close_errno": 0,
+      "phase": 15,
+      "physical_end": 35422208,
+      "poisoned": false,
+      "root_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "status": 0,
+      "system_errno": 0,
+      "transaction_active": false,
+      "uuid": "44444444444444444444444444444444"
+    },
+    "format": 1,
+    "helpers": [],
+    "id": "33333333333333333333333333333333",
+    "observed_mount": null,
+    "operation": "native-unmount",
+    "outcome": "complete",
+    "previous_unresolved": {
+      "id": "22222222222222222222222222222222",
+      "operation": "native-mount",
+      "outcome": "incomplete",
+      "record": "/fixture/store/workspaces/11111111111111111111111111111111/native-operations/22222222222222222222222222222222/record.json"
+    },
+    "target": {
+      "component": "image.sfs",
+      "directory": "/fixture/store/workspaces/11111111111111111111111111111111",
+      "file": [
+        100,
+        300
+      ],
+      "parent": [
+        100,
+        200
+      ],
+      "uuid": "44444444444444444444444444444444"
+    },
+    "workspace": "11111111111111111111111111111111"
+  },
+  "marker": {
+    "current_guard": {
+      "committed_end": 35422208,
+      "core_consumed": true,
+      "coverage": 0,
+      "device": 100,
+      "fence_attempted": 0,
+      "fence_succeeded": 0,
+      "generation": 2,
+      "incomplete_reason": 0,
+      "inode": 300,
+      "limit_reason": 0,
+      "parent_close_errno": 0,
+      "phase": 15,
+      "physical_end": 35422208,
+      "poisoned": false,
+      "root_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "status": 0,
+      "system_errno": 0,
+      "transaction_active": false,
+      "uuid": "44444444444444444444444444444444"
+    },
+    "format": 1,
+    "operation": "33333333333333333333333333333333",
+    "state": "absent",
+    "target": {
+      "component": "image.sfs",
+      "directory": "/fixture/store/workspaces/11111111111111111111111111111111",
+      "file": [
+        100,
+        300
+      ],
+      "parent": [
+        100,
+        200
+      ],
+      "uuid": "44444444444444444444444444444444"
+    }
+  }
+}

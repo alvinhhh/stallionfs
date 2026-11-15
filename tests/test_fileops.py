@@ -85,12 +85,35 @@ class FileOperations(unittest.TestCase):
         source = self.fixture()
         external = self.base / 'external'
         external.write_bytes(b'outside stays untouched')
+        perf = str(Path(__file__).parent / 'perf')
+        sys.path.insert(0, perf)
+        self.addCleanup(sys.path.remove, perf)
+        import native_correctness as checks
+        external_before = checks.snapshot(external)
+        requested = 1_700_000_000_987_654_321
+        for name in ('dangling', 'outside'):
+            link = source / name
+            os.utime(link, ns=(1_600_000_000_000_000_000, requested), follow_symlinks=False)
+            self.assertEqual(link.lstat().st_mtime_ns, requested)
+        self.assertTrue(checks.verify_source(external_before, checks.snapshot(external))['unchanged'])
         original = source / 'directory-0/file-0'
         os.link(original, source / 'hardlink')
+        before = checks.snapshot(source)
+        for name in ('dangling', 'outside'):
+            self.assertEqual(before['entries'][name]['mtime_ns'], requested)
         for jobs in (1, 4):
             with self.subTest(jobs=jobs):
                 target = self.base / f'copy-{jobs}'
                 _scan.clone(source, target, jobs=jobs)
+                report = checks.verify_clone(before, checks.snapshot(target))
+                self.assertTrue(report['strict_equal'], report)
+                self.assertTrue(report['independent_clone'], report)
+                self.assertIs(report['sparse_preserved'], True, report)
+                for name in ('dangling', 'outside'):
+                    self.assertEqual((target / name).lstat().st_mtime_ns, requested)
+                    self.assertEqual(os.readlink(os.fsencode(target / name)), os.readlink(os.fsencode(source / name)))
+                self.assertTrue(checks.verify_source(before, checks.snapshot(source))['unchanged'])
+                self.assertTrue(checks.verify_source(external_before, checks.snapshot(external))['unchanged'])
                 self.assertEqual(_scan.scan(target), _scan.scan(source))
                 self.assertEqual(os.readlink(target / 'outside'), str(external))
                 self.assertEqual(os.readlink(target / 'dangling'), 'missing')
@@ -102,11 +125,24 @@ class FileOperations(unittest.TestCase):
                 self.assertEqual((target / 'hardlink').stat().st_ino, (target / 'directory-0/file-0').stat().st_ino)
                 self.assertNotEqual((target / 'hardlink').stat().st_ino, original.stat().st_ino)
                 self.assertEqual(external.read_bytes(), b'outside stays untouched')
-        for source_name in ('directory-0/file-0', 'dangling'):
-            target = self.base / ('single-' + Path(source_name).name)
-            _scan.clone(source / source_name, target)
-            if target.is_symlink(): self.assertEqual(os.readlink(target), 'missing')
-            else: self.assertEqual(target.read_bytes(), original.read_bytes())
+        for source_name in ('directory-0/file-0', 'dangling', 'outside'):
+            source_path = source / source_name
+            expected = checks.snapshot(source_path)
+            if source_path.is_symlink():
+                self.assertEqual(expected['entries']['']['mtime_ns'], requested)
+            for jobs in (1, 4):
+                target = self.base / f'single-{Path(source_name).name}-{jobs}'
+                _scan.clone(source_path, target, jobs=jobs)
+                report = checks.verify_clone(expected, checks.snapshot(target))
+                self.assertTrue(report['strict_equal'], report)
+                self.assertTrue(report['independent_clone'], report)
+                if target.is_symlink():
+                    self.assertEqual(target.lstat().st_mtime_ns, requested)
+                    self.assertEqual(os.readlink(os.fsencode(target)), os.readlink(os.fsencode(source_path)))
+                else:
+                    self.assertEqual(target.read_bytes(), original.read_bytes())
+                self.assertTrue(checks.verify_source(before, checks.snapshot(source))['unchanged'])
+                self.assertTrue(checks.verify_source(external_before, checks.snapshot(external))['unchanged'])
         with self.assertRaises(OSError):
             _scan.clone(source, source / 'recursive')
         self.assertFalse((source / 'recursive').exists())

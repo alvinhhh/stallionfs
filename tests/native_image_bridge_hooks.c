@@ -94,7 +94,11 @@ enum sfs_status sfs_bridge_test_import_write(sfs_image *h, sfs_inode inode, uint
     return status;
 }
 void *sfs_bridge_test_import_malloc(size_t size) {
-    if (bridge_flags & 65536) { bridge_flags &= ~65536; errno = ENOMEM; return NULL; }
+    /* Keep the five-byte xattr fault distinct from identity-table allocation. */
+    if ((bridge_flags & 65536) && size==5) { bridge_flags &= ~65536; errno = ENOMEM; return NULL; }
+    if ((bridge_flags & 2097152) && size==512) { bridge_flags &= ~2097152; errno = ENOMEM; return NULL; }
+    if ((bridge_flags & 4194304) && size==1024) { bridge_flags &= ~4194304; errno = ENOMEM; return NULL; }
+    if ((bridge_flags & 8388608) && size==1024) { bridge_flags &= ~8388608; raise(SIGINT); }
     return malloc(size);
 }
 ssize_t sfs_bridge_test_import_pwrite(int fd, const void *bytes, size_t size, off_t offset) {

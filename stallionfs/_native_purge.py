@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ STAGES = ('prepared', 'container-ready', 'relocation-authorized', 'relocated',
           'image-unlink-authorized', 'image-absent', 'metadata-removal-authorized',
           'resource-removal-authorized', 'container-removal-authorized', 'complete')
 PARENTS = ('trash', 'workspaces', 'staging', 'protected', 'journals', 'lifecycle')
-PROOFS = {'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'native-mount.json'}
+PROOFS = {'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'native-mount.json', 'native-binding.json'}
 REQUIRED = {'image.sfs', 'meta.json', 'native-create.json', 'native-install.json', 'native-location.json', 'volume', 'native-operations'}
 
 
@@ -71,6 +72,7 @@ def checked(parent, name, expected, *, directory=False, missing=False):
 def descriptors(record):
     """All purge directory descriptors close even when a primary operation fails."""
     held = []
+    controls = {}
     primary = None
     def opening(parent, name, expected=None):
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
@@ -85,6 +87,28 @@ def descriptors(record):
         held.remove(fd)
         os.close(fd)
     opening.close = closing
+    def control(parent, name, expected=None):
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        ident = identity(info)
+        if (not valid_identity(ident) or info.st_mode & 0o7777 != 0o600
+                or (expected is not None and not matches(info, expected))):
+            refuse('unsafe activation control')
+        key = (info.st_dev, info.st_ino)
+        if key in controls:
+            if not matches(os.fstat(controls[key]), ident): refuse('activation control changed')
+            return controls[key]
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        held.append(fd)
+        if (not matches(os.fstat(fd), ident)
+                or not matches(os.stat(name, dir_fd=parent, follow_symlinks=False), ident)):
+            refuse('activation control changed while opening')
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: refuse('activation control is active')
+        controls[key] = fd
+        return fd
+    # Locks survive preview/scan, every destructive phase and all resumed
+    # rechecks until the enclosing descriptor owner closes them once.
+    opening.control = control
     try: yield opening
     except BaseException as error:
         primary = error
@@ -146,6 +170,7 @@ def record_json(data):
 def scan(opening, resource, workspace):
     """Enumerate only the fixed resource grammar; never traverse arbitrary trees."""
     result = []
+    metadata = None
     def add(fd, name, relative, directory=False, proof=False):
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         ident = identity(info)
@@ -160,7 +185,7 @@ def scan(opening, resource, workspace):
         if len(result) > MAX_ENTRIES: refuse('manifest exceeds 16384 entries')
         return data
     present = set(names(resource))
-    if not REQUIRED <= present or not present <= REQUIRED | {'native-mount.json'}:
+    if not REQUIRED <= present or not present <= REQUIRED | {'native-mount.json', 'native-binding.json'}:
         refuse('unexpected or missing resource entries')
     for name in sorted(present):
         if name in ('volume', 'native-operations'):
@@ -200,10 +225,44 @@ def scan(opening, resource, workspace):
                         refuse('launched helper output missing')
                     for leaf in sorted(outputs): add(output, leaf, prefix + '/' + label + '/' + leaf)
                     opening.close(output)
+                    if helper['label'] == 'mount' and ('activation_protocol' in record
+                            or 'activation' in helper or 'activation_version' in helper):
+                        # These are retained control records, never additional
+                        # purge authority. Existing history/guard gates still
+                        # authorize the enclosing resource before this scan.
+                        from . import _native_activation as activation
+                        if (record['operation'] != 'native-mount' or type(metadata) is not dict
+                                or metadata.get('id') != workspace
+                                or metadata.get('controller_profile') not in _native.PROFILES):
+                            refuse('activation owner differs from operation')
+                        activation.validate_helper(record, helper,
+                            _native.PROFILES[metadata['controller_profile']]['type'],
+                            Path(record['target']['directory']), metadata.get('transaction'), record.get('current_guard'))
+                        value = helper['activation']
+                        control = 'activation-' + value['nonce']
+                        if control in expected or control not in entries: refuse('activation directory missing or repeated')
+                        expected.add(control)
+                        relative = prefix + '/' + control
+                        add(archive, control, relative, directory=True)
+                        attempt = opening(archive, control)
+                        opening.control(attempt, 'gate')
+                        opening.control(attempt, 'lease')
+                        controls = set(names(attempt))
+                        if controls not in ({'gate', 'lease', 'request'}, {'gate', 'lease', 'request', 'claim'}):
+                            refuse('unexpected activation control entry')
+                        for leaf in sorted(controls):
+                            if os.stat(leaf, dir_fd=attempt, follow_symlinks=False).st_mode & 0o7777 != 0o600:
+                                refuse('activation control mode differs')
+                            data = add(attempt, leaf, relative + '/' + leaf, proof=True)
+                            if data != (activation.encode(value) if leaf == 'request' else b''):
+                                refuse('activation control content differs')
+                        opening.close(attempt)
                 if entries != expected: refuse('unexpected operation archive entry')
                 opening.close(archive)
             opening.close(directory)
-        else: add(resource, name, name, proof=name in PROOFS)
+        else:
+            data = add(resource, name, name, proof=name in PROOFS)
+            if name == 'meta.json': metadata = record_json(data)
     return result
 
 
@@ -216,17 +275,19 @@ def manifest_valid(rows):
         path = row['path']; kind = row['kind']
         if not isinstance(path, str) or path in seen or kind not in ('file', 'directory'): refuse('invalid manifest path')
         parts = path.split('/')
-        permitted = ((len(parts) == 1 and path in REQUIRED | {'native-mount.json'})
+        permitted = ((len(parts) == 1 and path in REQUIRED | {'native-mount.json', 'native-binding.json'})
             or (parts[0] == 'native-operations' and 2 <= len(parts) <= 4
                 and re.fullmatch('[0-9a-f]{32}', parts[1])
                 and (len(parts) == 2 or (len(parts) == 3 and parts[2] == 'record.json')
                      or (re.fullmatch(r'[0-9]{2}-(verify-package|discover|mount|unmount)', parts[2])
-                         and (len(parts) == 3 or parts[3] in ('stdout', 'stderr'))))))
+                         and (len(parts) == 3 or parts[3] in ('stdout', 'stderr')))
+                     or (re.fullmatch(r'activation-[0-9a-f]{32}', parts[2])
+                         and (len(parts) == 3 or parts[3] in ('gate', 'lease', 'request', 'claim'))))))
         if not permitted or not valid_identity(row['identity'], directory=kind == 'directory'): refuse('invalid manifest binding')
         expected_dir = path in ('volume', 'native-operations') or (len(parts) == 2) or (len(parts) == 3 and parts[2] != 'record.json')
         if (kind == 'directory') != expected_dir: refuse('manifest kind differs from fixed grammar')
         if 'sha256' in row and not re.fullmatch('[0-9a-f]{64}', str(row['sha256'])): refuse('invalid proof digest')
-        if path in PROOFS or path.endswith('/record.json'):
+        if path in PROOFS or path.endswith('/record.json') or (len(parts) == 4 and parts[2].startswith('activation-')):
             if 'sha256' not in row: refuse('proof digest missing')
         if len(parts) > 1 and '/'.join(parts[:-1]) not in seen: refuse('manifest parent missing or unordered')
         seen.add(path)
@@ -249,7 +310,7 @@ def validate(record, workspace, *, complete=False):
         'data_absent', 'cleanup_complete', 'unlink_outcome', 'guard_outcome', 'ownership', 'previous_unresolved'}
     if not complete: required.add('manifest')
     optional = {'format', 'guard', 'first_error', 'last_error', 'error_count', 'failed_guard',
-        'guard_receipt_unavailable', 'descriptor_close_error', 'abandoned_attempt'}
+        'guard_receipt_unavailable', 'descriptor_close_error', 'abandoned_attempt', 'creation', 'creation_binding'}
     if not required <= set(record) or not set(record) <= required | optional: refuse('unknown or missing purge fields')
     if complete and record['stage'] != 'complete': refuse('incomplete completion receipt')
     if not complete and record['stage'] == 'complete': refuse('completion must use its compact receipt')
@@ -408,6 +469,12 @@ def inspect_manifest(opening, resource, record, *, missing=False, image_absent=F
             present.add(relative)
             if row['kind'] == 'directory':
                 child = opening(fd, leaf, row['identity'])
+                if re.fullmatch(r'native-operations/[0-9a-f]{32}/activation-[0-9a-f]{32}', relative):
+                    for name in ('gate', 'lease'):
+                        control = children.get(relative, {}).get(name)
+                        if control is None: refuse('activation manifest omits control')
+                        if at(child, name) is not None:
+                            opening.control(child, name, control['identity'])
                 visit(child, relative)
                 opening.close(child)
             elif 'sha256' in row:
@@ -458,6 +525,10 @@ def initial(store, workspace, opening, fds, prior):
         'ownership': {'transaction': metadata['transaction'], 'origin_target': metadata['native_image']},
         'previous_unresolved': None if prior is None else {'operation': prior['operation'],
             'id': prior['id'], 'outcome': prior['outcome']}}
+    from ._native_create_authority import installed
+    record['creation'] = installed(path, metadata)
+    record['creation_binding'] = next(row for row in manifest if row['path'] == 'native-create.json')
+    writer_authority(record)
     validate(record, workspace)
     references(store, record)
     return record
@@ -676,11 +747,13 @@ def compact(record):
 
 
 def same_completion(record, journal):
-    for key in ('workspace', 'id', 'target', 'parents', 'object', 'container', 'container_identity', 'marker', 'protection', 'manifest_digest'):
+    for key in ('workspace', 'id', 'target', 'parents', 'object', 'container', 'container_identity', 'marker', 'protection', 'manifest_digest', 'creation', 'creation_binding'):
         if record.get(key) != journal.get(key): refuse('completion and journal disagree')
 
 
 def finish(store, record, opening, fds, *, mutate):
+    if mutate:
+        writer_authority(record)
     workspace = record['workspace']
     check_parents(store, record)
     for parent, name in ((fds['trash'], workspace), (fds['workspaces'], workspace), (fds['staging'], record['container'])):
@@ -732,7 +805,23 @@ def admit_resume_inputs(opening, fds, record):
         opening.close(tombstone)
 
 
+def writer_authority(record):
+    from ._native_create_authority import retained
+    retained(record.get('creation'), record['target'], record['workspace'])
+    binding = record.get('creation_binding')
+    if (type(binding) is not dict or set(binding) != {'path', 'kind', 'identity', 'sha256'}
+            or binding['path'] != 'native-create.json' or binding['kind'] != 'file'
+            or not valid_identity(binding['identity'])):
+        refuse('native creation proof binding is missing')
+    data = (json.dumps({'format': 1, **record['creation']['proof']}, sort_keys=True, indent=2) + '\n').encode()
+    if hashlib.sha256(data).hexdigest() != binding['sha256']:
+        refuse('native creation proof binding changed')
+    if 'manifest' in record and [row for row in record['manifest'] if row['path'] == 'native-create.json'] != [binding]:
+        refuse('native creation proof manifest changed')
+
+
 def execute(store, record, opening, fds, *, resumed):
+    writer_authority(record)
     workspace = record['workspace']
     if record['target']['directory'] != str(store.root / 'trash' / workspace) or record['target']['component'] != 'image.sfs':
         refuse('source target is outside the selected trash resource')
@@ -811,6 +900,7 @@ def _purge_locked(store, workspace, *, yes=False):
                     return response(record, would_delete=True, scope='current filesystem and all in-image snapshots; not secure erasure')
                 save(store, record)
             elif not yes:
+                writer_authority(record)
                 return response(record, would_delete=True, pending=True)
             return execute(store, record, opening, fds, resumed=resumed)
     except BaseException as error:

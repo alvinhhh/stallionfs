@@ -19,6 +19,7 @@ import shutil
 import stat
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -35,6 +36,14 @@ LARGE_PROFILES = {
     "dataset_2k_50gb": {"files": 2_000, "bytes": 50_000_000_000},
 }
 HEADROOM = 2 * 1024**3
+
+
+def collector_argv(name, *arguments):
+    resources = Path(__file__).resolve().parent
+    if (resources / 'manifest.json').is_file():
+        from stallionfs.benchmark import _collector_argv
+        return _collector_argv(resources, name, *arguments)
+    return [sys.executable, '-B', str(resources / name), *map(os.fspath, arguments)]
 
 
 def require(condition, message):

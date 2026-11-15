@@ -14,6 +14,7 @@ from pathlib import Path
 import plistlib
 import platform
 import re
+import selectors
 import signal
 import stat
 import subprocess
@@ -144,7 +145,7 @@ def _owned_signals(record):
                 pass
 
 
-def execute_owned(argv, record, persist, directory, *, deadline=DEADLINE):
+def execute_owned(argv, record, persist, directory, *, deadline=DEADLINE, cwd=None, env=None, output_limit=None):
     """Own exactly one helper until reaped, including timeout/interruption.
 
     Streams stay in retained files. Failed stop/reap attempts keep supervising
@@ -161,13 +162,20 @@ def execute_owned(argv, record, persist, directory, *, deadline=DEADLINE):
             try:
                 stdout = stdout_path.open('xb'); streams.append(stdout)
                 stderr = stderr_path.open('xb'); streams.append(stderr)
+                if output_limit is not None:
+                    for stream in streams:
+                        os.fchmod(stream.fileno(), 0o600)
                 interrupted()
                 expires = time.monotonic() + deadline
-                child = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=stdout,
-                                         stderr=stderr, close_fds=True)
+                child = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE if output_limit is not None else stdout,
+                                         stderr=subprocess.PIPE if output_limit is not None else stderr,
+                                         close_fds=True, cwd=cwd, env=env)
                 record.update(pid=child.pid, outcome='running')
                 persist()
                 interrupted()
+                if output_limit is not None:
+                    _collect_owned(child, stdout, stderr, record, output_limit, expires, interrupted)
                 while child.poll() is None:
                     interrupted()
                     remaining = expires - time.monotonic()
@@ -190,13 +198,32 @@ def execute_owned(argv, record, persist, directory, *, deadline=DEADLINE):
                 record.update(outcome='not-launched', child_pending=False, reaped=False)
             if primary is None:
                 record['outcome'] = 'success' if child.returncode == 0 else 'error'
+            if child is not None and output_limit is not None:
+                # Popen owns these pipes even if persistence/interruption stops
+                # execution before the collector starts. Attempt both closes.
+                for pipe in (child.stdout, child.stderr):
+                    try:
+                        pipe.close()
+                    except BaseException as error:
+                        record.setdefault('stream_close_errors', []).append(type(error).__name__)
+                        if primary is None:
+                            primary = error
             for stream in reversed(streams):
                 try:
-                    stream.close()
+                    try:
+                        if output_limit is not None:
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    finally:
+                        stream.close()
                 except BaseException as error:
                     record.setdefault('stream_close_errors', []).append(type(error).__name__)
                     if primary is None:
                         primary = error
+            if output_limit is not None:
+                record['streams_durable'] = primary is None and record.get('streams_eof') is True
+                if primary is not None:
+                    record['outcome'] = 'unknown' if child is not None else 'not-launched'
             try:
                 interrupted()
             except BaseException as error:
@@ -218,6 +245,31 @@ def execute_owned(argv, record, persist, directory, *, deadline=DEADLINE):
             pass
         raise
     return record
+
+
+def _collect_owned(child, stdout, stderr, record, limit, expires, interrupted):
+    """Drain both pipes with one combined bound, including after direct-child exit."""
+    record.update(streams_eof=False, streams_durable=False, output_bytes=0)
+    with selectors.DefaultSelector() as selector:
+        for pipe, destination in ((child.stdout, stdout), (child.stderr, stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, destination)
+        while selector.get_map():
+            interrupted()
+            if time.monotonic() >= expires:
+                raise subprocess.TimeoutExpired(child.args, DEADLINE)
+            for key, _ in selector.select(min(0.1, max(0, expires - time.monotonic()))):
+                block = os.read(key.fileobj.fileno(), min(65536, limit - record['output_bytes'] + 1))
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                record['output_bytes'] += len(block)
+                if record['output_bytes'] > limit:
+                    record['collector_error'] = 'output-limit'
+                    raise ValueError('Native actor output limit exceeded')
+                if key.data.write(block) != len(block):
+                    raise OSError(errno.EIO, 'Native actor output short write')
+        record['streams_eof'] = True
 
 
 def _supervision_error(record, error, phase):
@@ -352,18 +404,23 @@ def installed_target(store, path, metadata, *, confirmed=True, _location=None):
     created = validate_native_creation_proof(origin, read_json(path / 'native-create.json'))
     target = metadata.get('native_image')
     if (not isinstance(target, dict) or set(target) != {'component', 'parent', 'object', 'file', 'uuid'}
-            or target['component'] != 'image.sfs' or target['parent'] != identity(store.root / 'workspaces')
-            or target['object'] != identity(path) or target['object'] != created['object']
+            or target['component'] != 'image.sfs'
+            or target['object'] != created['object']
             or target['file'] != created['file']
             or target['uuid'] != created['uuid'] or metadata.get('transaction') != origin.get('transaction')
             or any(metadata.get(key) != origin.get(key) for key in
                    ('id', 'seed', 'commit', 'branch', 'name', 'created', 'capacity_gib'))):
         raise failure('Installed native lineage or location changed', {'workspace': path.name})
+    from ._native_binding import resolve
+    current = resolve(store, path, metadata)
+    if current is None and (target['parent'] != identity(store.root / 'workspaces')
+                            or target['object'] != identity(path)):
+        raise failure('Legacy hosting device changed; use creations --adopt-current with the original transaction', {'workspace': path.name})
     from ._native_recovery import location
-    location(store, path, metadata, override=_location)
+    location(store, path, metadata, override=_location, current=current)
     backing = (path / 'image.sfs').lstat()
     if (not stat.S_ISREG(backing.st_mode) or backing.st_nlink != 1 or backing.st_uid != os.getuid()
-            or _same(backing) != target['file']):
+            or _same(backing) != (current['file'] if current else target['file'])):
         raise failure('Installed native backing changed', {'workspace': path.name})
     resolved = {'directory': str(path), 'component': 'image.sfs', 'parent': target['object'],
                 'file': target['file'], 'uuid': target['uuid']}
@@ -375,12 +432,14 @@ def installed_target(store, path, metadata, *, confirmed=True, _location=None):
                 or proof.get('target') != target or proof.get('complete') is not True
                 or not _consumed(proof.get('guard'), resolved, created['anchor'])):
             raise failure('Native installation needs current first-install recovery', {'workspace': path.name})
-    return resolved
+    return current or resolved
 
 
 def install_candidate(store, response, intent, metadata, profile, host):
     """Continue the producer's store/seed/workspace lock scope into one rename."""
     from .core import owned_native_target, read_json, sync_directory
+    from ._native_create_authority import proof
+    proof(metadata, read_json(Path(response['candidate']) / 'native-create.json'))
     from .lifecycle import identity
     if profile not in PROFILES:
         raise failure('Unknown native controller profile', response)
@@ -399,6 +458,8 @@ def install_candidate(store, response, intent, metadata, profile, host):
     response.update(installed=False, installation_confirmed=False, workspace=metadata['id'])
     intent['installation'] = {'metadata': installed, 'first_mount_attempted': False,
                               'rename_attempted': False, 'guard': None, 'outcome': 'prepared'}
+    from ._native_create_recovery import lifecycle_intent
+    lifecycle_intent(intent['installation'], metadata)
     _persist(journal, intent)
     _persist(source / 'meta.json', installed)
     tokens = []
@@ -443,30 +504,65 @@ def install_candidate(store, response, intent, metadata, profile, host):
 
 def _complete_install(store, path, metadata, intent, journal, receipt):
     from .core import sync_directory
+    from ._native_create_authority import installed
+    installed(path, metadata)
     target = installed_target(store, path, metadata, confirmed=False)
     if not _consumed(receipt, target, metadata['origin']['native_image']['anchor']):
         raise failure('First-install anchor differs from verified import', {'current_guard': receipt})
+    from ._native_create_recovery import Admission, lifecycle, lifecycle_intent, publish_lifecycle, require
+    origin = metadata['origin']
+    with_lifecycle = 'lifecycle' in intent['installation']
+    a = Admission(store.root)
+    try:
+        # An old producer's unattributed state is never adopted on retry.
+        existing = lifecycle(a, metadata['id'], origin, intent['installation'].get('lifecycle'))
+        require(existing is None or with_lifecycle, 'unattributed-lifecycle')
+        expected = lifecycle_intent(intent['installation'], origin)
+        if not with_lifecycle:
+            _persist(journal, intent)
+    finally:
+        a.close()
     proof = {'operation': 'native-install', 'id': metadata['id'], 'transaction': metadata['transaction'],
              'target': metadata['native_image'], 'complete': True, 'guard': receipt,
              'previous_installation': intent['installation'], 'first_mount_attempted': False,
-             'first_use': {'accepted': False}}
+             'first_use': {'accepted': False}, 'lifecycle': expected}
     _persist(path / 'native-install.json', proof)
     installed = {**metadata, 'state': 'installed'}
     _persist(path / 'meta.json', installed)
-    store._open(metadata['id'], path, installed, enrolled=False)
+    a = Admission(store.root)
+    try:
+        publish_lifecycle(a, origin, expected)
+    finally:
+        a.close()
     # Installed ownership is independently durable before the intent disappears.
     installed_target(store, path, installed)
     sync_directory(path)
     journal.unlink()
     sync_directory(journal.parent)
+    _enroll_current(store, path, installed)
+
+
+def _enroll_current(store, path, metadata):
+    from ._native_binding import Admission, enroll
+    a = Admission(store.root)
+    try:
+        enroll(store, a, path, metadata)
+    finally:
+        a.close()
 
 
 def recover_install(store, path, metadata):
     """Fresh guard only: no repeated import or rename, old outcome stays recorded."""
     from .core import read_json
+    from ._native_create_authority import installed
+    installed(path, metadata)
     journal = store.root / 'journals' / (metadata['id'] + '.json')
     if not journal.exists():
-        return installed_target(store, path, metadata)
+        target = installed_target(store, path, metadata)
+        from ._native_binding import NAME
+        if not os.path.lexists(path / NAME) and observe(path / 'volume', metadata['controller_profile']) is None:
+            _enroll_current(store, path, metadata)
+        return target
     intent = read_json(journal)
     if intent.get('operation') != 'native-create':
         return installed_target(store, path, metadata)
@@ -507,6 +603,9 @@ class Operation:
         private_directory(parent)
         self.directory = parent / (operation_id or uuid.uuid4().hex)
         self.directory.mkdir(mode=0o700)
+        if details is not None and details.get('lifecycle_version') == 1 and action == 'native-mount':
+            from ._native_interval import seed
+            details = dict(details, interval_seed=seed(self.directory.name, path, target))
         self.record = {'operation': action, 'workspace': path.name, 'id': self.directory.name,
                        'target': target, 'outcome': 'prepared', 'child_pending': False,
                        'helpers': [], 'previous_unresolved': self.previous_reference(previous)}
@@ -558,8 +657,12 @@ class Operation:
         directory = self.directory / f'{len(self.record["helpers"]):02}-{label}'
         directory.mkdir(mode=0o700)
         result = {'label': label, **getattr(self, 'command_context', {})}
+        if self.record.get('protocol') == 3:
+            result.update(cwd=str(self.directory), environment='native-preflight-empty-environment-v3')
         self.record['helpers'].append(result)
-        return execute_owned(argv, result, self.persist, directory)
+        options = ({'output_limit': 2 * 1024 * 1024, 'env': {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+                    'cwd': self.directory} if self.record.get('protocol') in (2, 3) else {})
+        return execute_owned(argv, result, self.persist, directory, **options)
 
     def finish(self):
         from .core import sync_directory, read_json
@@ -638,6 +741,17 @@ def check_helpers(record, allowed):
               or (item['outcome'] == 'success' and item['returncode'] != 0)
               or (item['outcome'] == 'error' and item['returncode'] == 0)):
             malformed()
+        if record.get('protocol') in (2, 3):
+            # Protocol 2 collects bounded pipes. A reaped direct child alone
+            # cannot establish completion after collection or receipt failure.
+            if any(key in item for key in ('collector_error', 'stream_close_errors', 'receipt_error')):
+                malformed()
+            if item['outcome'] != 'not-launched' and (
+                    item['outcome'] not in ('success', 'error')
+                    or item.get('streams_eof') is not True or item.get('streams_durable') is not True
+                    or type(item.get('output_bytes')) is not int or not 0 <= item['output_bytes'] <= 2 * 1024 * 1024
+                    or 'interrupted' in item or 'stop_errors' in item):
+                malformed()
 
 
 def _bounded_plist(path, record):
@@ -664,12 +778,33 @@ def _version(value):
     return pieces + (0,) * (3 - len(pieces))
 
 
+def verify_package(operation, host):
+    from ._bundle import PUBLISHER_TEAM
+    host = Path(host)
+    if not host.is_absolute() or host.name != 'StallionFS' or host.parent.name != 'MacOS':
+        raise failure('Native discovery host path is invalid', operation.record)
+    app = host.parent.parent.parent
+    signed = operation.command('verify-package', package_argv(host))
+    if signed['returncode'] != 0:
+        raise failure('Native package signature verification failed', operation.record)
+    return signed
+
+
+def package_argv(host):
+    from ._bundle import PUBLISHER_TEAM
+    requirement = ('anchor apple generic and identifier "com.alvinhhh.stallionfs" '
+                   'and certificate leaf[subject.OU] = "' + PUBLISHER_TEAM + '"')
+    return ['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', '=' + requirement,
+            str(Path(host).parent.parent.parent)]
+
+
 def qualify(operation, metadata):
     """Validate a signed compiled-profile package and public module discovery.
 
     This does not attest which module handles a live mount. The extension still
     independently requires both compiled write flags and caller/resource rights.
     """
+    from ._bundle import PUBLISHER_TEAM
     profile = metadata['controller_profile']
     if profile not in PROFILES:
         raise failure('Unknown native controller profile', operation.record)
@@ -699,9 +834,7 @@ def qualify(operation, metadata):
             or attributes.get('FSShortName') != PROFILES[profile]['type']
             or module_info.get('StallionFSAccessPolicy') != 'contextual-writes'):
         raise failure('Install a qualified writable StallionFS package with discovery protocol 1', operation.record)
-    signed = operation.command('verify-package', ['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
-    if signed['returncode'] != 0:
-        raise failure('Native package signature verification failed', operation.record)
+    verify_package(operation, host)
     discovery = operation.command('discover', [str(host), '--discover-json'])
     if discovery['returncode'] != 0:
         raise failure('Native module discovery failed; inspect its retained error', operation.record)
@@ -732,7 +865,7 @@ def qualify(operation, metadata):
     row = matching[0]
     if (len(collisions) != 1 or collisions[0] != row or row.get('signature_status') != 0
             or row.get('signing_identifier') != PROFILES[profile]['bundle']
-            or not isinstance(row.get('team_identifier'), str) or not row['team_identifier']
+            or row.get('team_identifier') != PUBLISHER_TEAM
             or row.get('version') != module_info.get('CFBundleVersion')
             or row.get('minimum_os') != module_info.get('LSMinimumSystemVersion')
             or row.get('access_policy') != 'contextual-writes'):
@@ -769,37 +902,117 @@ def _usable(store, path, metadata, *, initial=False, operation=None):
     info = repo.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise failure('Native repository path is not a real directory', {'workspace': path.name})
-    store._standalone_git(repo)
+    from ._native_create_git import qualified_runtime
+    runtime = qualified_runtime(metadata.get('native_host'))
+    store._standalone_git(repo, runtime=runtime)
     if initial:
-        from .core import git
-        if git(repo, 'rev-parse', 'HEAD') != metadata['commit'] or git(repo, 'branch', '--show-current') != metadata['branch']:
+        from ._native_create_git import readiness
+        if readiness(repo, metadata) != (metadata['commit'], metadata['branch']):
             raise failure('Initial native repository does not match the prepared branch and commit', operation.record)
         probe = repo / ('.stallionfs-write-' + uuid.uuid4().hex)
         operation.record['write_probe'] = {'path': str(probe), 'complete': False}
-        operation.persist()
-        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # Diagnostic only: retain step updates through the existing failure
+        # handler without adding journal syncs or changing acceptance evidence.
+        diagnostic = {'attempted_steps': []}
+        operation.record['write_probe_diagnostic'] = diagnostic
+
+        def attempted(step):
+            diagnostic['attempted_steps'].append(step)
+
+        def summary(error):
+            result = {'type': type(error).__name__[:64]}
+            number = getattr(error, 'errno', None)
+            if type(number) is int and -(1 << 31) <= number < 1 << 31:
+                result['errno'] = number
+            return result
+
         try:
-            data = b'stallionfs writable path\n'
-            if os.write(fd, data) != len(data):
-                raise OSError(errno.EIO, 'Short mounted write probe')
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        probe.unlink()
-        operation.record['write_probe']['complete'] = True
-        operation.persist()
+            attempted('persist')
+            operation.persist()
+            attempted('open')
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                data = b'stallionfs writable path\n'
+                attempted('write')
+                if os.write(fd, data) != len(data):
+                    raise OSError(errno.EIO, 'Short mounted write probe')
+                attempted('fsync')
+                os.fsync(fd)
+            except BaseException:
+                diagnostic['failed_step'] = diagnostic['attempted_steps'][-1]
+                try:
+                    attempted('close')
+                    os.close(fd)
+                except BaseException as cleanup_error:
+                    diagnostic['cleanup_error'] = {'step': 'close', **summary(cleanup_error)}
+                raise
+            else:
+                attempted('close')
+                os.close(fd)
+            attempted('unlink')
+            probe.unlink()
+            operation.record['write_probe']['complete'] = True
+            attempted('completion-persist')
+            operation.persist()
+        except BaseException as error:
+            diagnostic.setdefault('failed_step', diagnostic['attempted_steps'][-1])
+            diagnostic['error'] = summary(error)
+            raise
     return str(repo)
 
 
+def _mount_diagnostic(candidate, volume):
+    """Copy bounded observation fields only; never recovery authority."""
+    if type(candidate) is not dict:
+        return None
+    def row(value):
+        if type(value) is not dict or value.get('path') != str(volume):
+            return None
+        result = {'path': str(volume)}
+        for key in ('owner', 'flags'):
+            n = value.get(key)
+            if type(n) is int and 0 <= n < 1 << 64: result[key] = n
+        fsid = value.get('fsid')
+        if type(fsid) in (list, tuple) and len(fsid) == 2 and all(type(n) is int and -(1 << 63) <= n < 1 << 64 for n in fsid):
+            result['fsid'] = list(fsid)
+        filesystem = value.get('filesystem')
+        if type(filesystem) is str and len(filesystem) <= 64 and filesystem.isascii(): result['filesystem'] = filesystem
+        for key in ('readonly', 'ignore_ownership'):
+            if type(value.get(key)) is bool: result[key] = value[key]
+        return result
+    copied = {}
+    for key in ('mount_row', 'descriptor', 'before'):
+        value = row(candidate.get(key))
+        if value is not None: copied[key] = value
+    for key in ('mount_rows', 'after'):
+        values = candidate.get(key)
+        if type(values) is list and len(values) <= 4:
+            copied[key] = [entry for value in values if (entry := row(value)) is not None]
+    return copied or None
+
+
 def _record_failure(error, operation, volume, profile):
+    original = getattr(error, 'native_candidate_result', None)
+    diagnostic = _mount_diagnostic(original, volume) if original is not operation.record else None
+    if diagnostic is not None:
+        operation.record.setdefault('original_mount_failure', diagnostic)
     operation.record['outcome'] = 'incomplete'
     current_guard = getattr(error, 'native_current_guard', None)
     if current_guard is not None:
         operation.record['failed_current_guard'] = current_guard
     try:
         operation.record['observed_mount'] = observe(volume, profile)
+        if (operation.record.get('lifecycle_version') == 1
+                and operation.record['operation'] == 'native-mount'
+                and operation.record['observed_mount'] is not None
+                and 'ordinary_interval' not in operation.record):
+            from ._native_interval import token
+            operation.record['ordinary_interval'] = token(operation.record['id'], operation.path,
+                {'controller_profile': profile}, operation.record['target'], operation.record['observed_mount'])
     except BaseException as observed_error:
-        operation.record['observation_error'] = {'type': type(observed_error).__name__, 'message': str(observed_error)}
+        operation.record['observation_error'] = {'type': type(observed_error).__name__, 'message': str(observed_error)[:256]}
+        later = _mount_diagnostic(getattr(observed_error, 'native_candidate_result', None), volume)
+        if later is not None: operation.record.setdefault('later_mount_failure', later)
     try:
         operation.persist()
     except BaseException as saving_error:
@@ -861,9 +1074,14 @@ def mount_locked(store, path, metadata):
                     or any(state['observation'].get(key) != row[key] for key in ('path', 'filesystem', 'owner', 'flags', 'fsid'))):
                 raise failure('Expected native mount is present with unresolved completion; explicitly unmount before retrying',
                               {'workspace': path.name, 'observed_mount': row, 'observed_usable': (volume / 'repo').is_dir()})
+            from ._native_interval import capture
+            capture(store, path, metadata, target, row)
             return {**metadata, 'path': _usable(store, path, metadata), 'mount': row}
+        from ._native_interval import capture
+        capture(store, path, metadata, target, None)
         private_directory(volume)
-        operation = Operation(store, path, 'native-mount', target)
+        operation = Operation(store, path, 'native-mount', target,
+                              details={'lifecycle_version': 1, 'activation_protocol': 1})
         transport['native_operation'] = operation.record
         try:
             operation.record['current_guard'] = _guard_current(target)
@@ -876,10 +1094,16 @@ def mount_locked(store, path, metadata):
             _persist(path / 'native-install.json', proof)
             operation.record['mount_attempted'] = True
             operation.persist()
-            command = operation.command('mount', ['/sbin/mount', '-t', filesystem, str(path), str(volume)])
+            from ._native_activation import mount
+            command = mount(operation, metadata, filesystem, operation.record['current_guard'])
             if command['returncode'] != 0:
                 raise failure('Native mount command failed; installed workspace retained', operation.record)
             row = _observe_until(volume, profile, True)
+            from ._native_interval import token
+            operation.record['observed_mount'] = row
+            operation.record['ordinary_interval'] = token(operation.record['id'], path, metadata, target, row)
+            operation.record['outcome'] = 'incomplete'
+            operation.persist()
             check()
             repo = _usable(store, path, metadata, initial=initial, operation=operation)
             if initial:
@@ -887,7 +1111,8 @@ def mount_locked(store, path, metadata):
                                       'write_probe': operation.record['write_probe']}
                 _persist(path / 'native-install.json', proof)
             transport['path'] = repo
-            state = {'state': 'mounted', 'target': target, 'profile': profile, 'observation': row, 'operation': operation.record['id']}
+            state = {'state': 'mounted', 'target': target, 'profile': profile, 'observation': row, 'operation': operation.record['id'],
+                     'lifecycle_version': 1, 'ordinary_interval': operation.record['ordinary_interval']}
             _persist(state_path, state)
             operation.record['observed_mount'] = row
             operation.finish()
@@ -906,10 +1131,19 @@ def unmount_locked(store, path, metadata):
     with resource_binding(path, target, transport) as check:
         # observe closes its mounted descriptor before umount is launched.
         row = observe(volume, profile)
-        operation = Operation(store, path, 'native-unmount', target)
+        from ._native_interval import capture
+        captured = {}
+        interval = capture(store, path, metadata, target, row, unmount_recovery=True, captured=captured)
+        details = {'lifecycle_version': 1, 'before_mount': row}
+        if interval is not None:
+            details['ordinary_interval'] = interval
+        operation = Operation(store, path, 'native-unmount', target, details=details)
         transport['native_operation'] = operation.record
         try:
             operation.record['before_mount'] = row
+            from ._native_interval import recheck_capture
+            recheck_capture(store, path, metadata, operation, expected_predecessor=captured['predecessor'])
+            check()
             if row is not None:
                 command = operation.command('unmount', ['/sbin/umount', str(volume)])
                 if command['returncode'] != 0:
@@ -921,8 +1155,13 @@ def unmount_locked(store, path, metadata):
             receipt = _guard_current(target)
             operation.record['current_guard'] = receipt
             operation.record['observed_mount'] = None
-            _persist(path / 'native-mount.json', {'state': 'absent', 'target': target,
-                'operation': operation.record['id'], 'current_guard': receipt})
+            operation.record['outcome'] = 'incomplete'
+            operation.persist()
+            marker = {'state': 'absent', 'target': target, 'operation': operation.record['id'],
+                      'current_guard': receipt, 'lifecycle_version': 1}
+            if interval is not None:
+                marker['ordinary_interval'] = interval
+            _persist(path / 'native-mount.json', marker)
             store._open(path.name, path, metadata)
             operation.finish()
             return {'unmounted': path.name, 'already_absent': row is None, 'native_operation': operation.record}
@@ -931,7 +1170,7 @@ def unmount_locked(store, path, metadata):
             raise
 
 
-def preflight_create(store, response, intent, stage, journal, profile, host):
+def preflight_create(store, response, intent, stage, journal, profile, host, *, discover=True):
     """Read-only qualification under the producer's already-held creation lease."""
     if profile not in PROFILES:
         raise failure('Unknown native controller profile', response)
@@ -946,4 +1185,7 @@ def preflight_create(store, response, intent, stage, journal, profile, host):
     response['controller_preflight'] = intent
     # Publish this transition before qualification can inspect or launch helpers.
     operation.persist()
-    qualify(operation, {'controller_profile': profile, 'native_host': str(host or HOST)})
+    if discover:
+        qualify(operation, {'controller_profile': profile, 'native_host': str(host or HOST)})
+    else:
+        verify_package(operation, host or HOST)

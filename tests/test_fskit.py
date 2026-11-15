@@ -122,6 +122,39 @@ class FSKitInterfaces(unittest.TestCase):
         self.assertEqual(child.stderr, '')
         cls.failed = False
 
+    def test_managed_activation_and_pending_lock_lifetime(self):
+        cls = type(self)
+        cls.failed = True
+        directory = self.base / 'managed-activation'
+        directory.mkdir(mode=0o700)
+        images = directory / 'images'; images.mkdir(mode=0o700)
+        filesystem = self.source / 'filesystem'
+        tests = self.source / 'tests'
+        cflags = [self.tools['clang'], '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                  '-Wno-deprecated-declarations', '-isysroot', self.sdk]
+        core = directory / 'image.o'
+        self.command('activation-core', [*cflags, '-c', filesystem / 'image.c', '-o', core], 90)
+        lifetime = directory / 'lifetime'
+        self.command('activation-sanitizer-build', [*cflags, '-fsanitize=address,undefined',
+                     '-fno-omit-frame-pointer', tests / 'image_activation.c', '-o', lifetime], 90)
+        self.command('activation-sanitizer-run', [lifetime, images], 30)
+        driver = directory / 'activation'
+        self.command('activation-adapter-build', [self.tools['swiftc'], '-D', 'STALLION_ADAPTER_CHECK',
+                     '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                     '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors',
+                     '-target', 'arm64-apple-macos27.0', '-sdk', self.sdk, '-I', filesystem / 'fskit',
+                     '-Onone', '-parse-as-library', '-module-cache-path', directory / 'cache',
+                     filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift',
+                     tests / 'fskit_activation_driver.swift', core, '-o', driver], 180, swift='context')
+        from test_native_activation import ActivationAdapter
+        case = ActivationAdapter('test_producer_consumer_and_terminal_callback_drain')
+        result = unittest.TestResult()
+        with mock.patch.dict(os.environ, STALLIONFS_ACTIVATION_DRIVER=str(driver)):
+            case.run(result)
+        self.assertFalse(result.failures + result.errors + result.skipped)
+        self.assertEqual(result.testsRun, 1)
+        cls.failed = False
+
     def test_admission_ownership_and_legacy_callbacks(self):
         cls = type(self)
         cls.failed = True
@@ -167,6 +200,53 @@ class FSKitInterfaces(unittest.TestCase):
             capture._latch_command('fskit_resource_admission', repr(error))
             raise
 
+    def test_delivery_trace_focused(self):
+        filesystem = self.source / 'filesystem'
+        tests = self.source / 'tests'
+        target = 'arm64-apple-macos27.0'
+        cflags = [self.tools['clang'], '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1',
+                  '-target', target, '-isysroot', self.sdk, '-I', filesystem]
+        diagnostic, hooks, normal = (self.base / name for name in ('diagnostic.o', 'hooks.o', 'normal.o'))
+        self.command('core', [*cflags, *(f'-D{name}=sfs_diag_{name}' for name in
+                     ('pread', 'pwrite', 'fcntl', 'clock_gettime', 'malloc', 'calloc')),
+                     '-include', tests / 'fskit_write_hooks.h', '-c', filesystem / 'image.c', '-o', diagnostic], 90)
+        self.command('hooks', [*cflags, '-c', tests / 'fskit_write_hooks.c', '-o', hooks], 90)
+        self.command('normal', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
+        swift = [self.tools['swiftc'], '-swift-version', '6', '-strict-concurrency=complete',
+                 '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit',
+                 '-Onone', '-parse-as-library', '-module-cache-path', self.base / 'cache']
+        context = ['-warnings-as-errors', '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES']
+        sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
+        executable = self.base / 'trace-check'
+        self.command('trace-build', [*swift, *context, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                     '-D', 'STALLION_MOUNT_TRACE', *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks,
+                     '-o', executable], 180, swift='context')
+        for mode in ('delivery-trace',):
+            fixtures = self.base / mode
+            fixtures.mkdir(mode=0o700)
+            result = self.command(mode, [executable, '--' + mode, fixtures], 90)
+            self.assertTrue(result.stdout.startswith('PASS '))
+            self.assertEqual(result.stderr, '')
+        legacy = self.base / 'legacy-sync-check'
+        self.command('legacy-sync-build', [*swift, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                     *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', legacy], 180, swift='legacy')
+        fixtures = self.base / 'legacy-sync'
+        fixtures.mkdir(mode=0o700)
+        result = self.command('legacy-sync', [legacy, '--sync-focused', fixtures], 90)
+        self.assertEqual(result.stdout, 'PASS synchronization compatibility, durability, failures and admission\n')
+        self.assertEqual(result.stderr, '')
+        for trace in (True, False):
+            name = 'production-trace' if trace else 'production'
+            binary = self.base / name
+            self.command(name, [*swift, *context, *(['-D', 'STALLION_MOUNT_TRACE'] if trace else []),
+                         '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
+                         *sources, normal, '-o', binary], 180, swift='context')
+            symbols = self.command(name + '-symbols', [self.tools['nm'], binary], 30).stdout
+            self.assertEqual('DeliveryTrace' in symbols, trace)
+            self.assertNotIn('sfs_diag_', symbols)
+            self.assertNotIn('recordsForTesting', symbols)
+        # Keep this bounded run's receipts for independent review.
+
     def test_contextual_and_legacy_callbacks_and_production_builds(self):
         cls = type(self)
         try:
@@ -184,6 +264,19 @@ class FSKitInterfaces(unittest.TestCase):
             self.command('diagnostic-hooks', [*cflags, '-c', tests / 'fskit_write_hooks.c', '-o', hooks], 90)
             self.command('normal-core', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
             sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
+            trace_executable = self.base / 'mount-trace-check'
+            trace_images = self.base / 'mount-trace-images'
+            trace_images.mkdir(mode=0o700)
+            self.command('mount-trace-build', [self.tools['swiftc'], '-swift-version', '6',
+                         '-strict-concurrency=complete', '-warnings-as-errors', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-Onone', '-parse-as-library',
+                         '-module-cache-path', self.base / 'trace-cache',
+                         '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                         '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                         '-D', 'STALLION_MOUNT_TRACE', *sources, tests / 'fskit_write_driver.swift',
+                         diagnostic, hooks, '-o', trace_executable], 180, swift='context')
+            traced = self.command('mount-trace-run', [trace_executable, '--mount-trace', trace_images], 90)
+            self.assertEqual(traced.stdout, 'PASS mount trace masks, stages, replies, rollback, concurrent IDs, cap and discarded emitter\n')
             forbidden = ('sfs_diag_', 'sfs_image_diagnostic_', 'enablewritediagnostic', 'diagnosticwrite',
                          'sfs_test_', 'fixtureidentity', 'reclaimfortesting', 'ownsfortesting',
                          'unloadadmissionhook', 'loadconfigurationhook', 'drainresourceworkfortesting',
@@ -225,6 +318,13 @@ class FSKitInterfaces(unittest.TestCase):
                              '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
                              *mutation_defines, *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', executable],
                              180, swift=variant)
+                if variant == 'context':
+                    directory_images = directory / 'directory-open-images'
+                    directory_images.mkdir(mode=0o700)
+                    directory_child = self.command('directory-open-run',
+                                                   [executable, '--directory-open', directory_images], 180)
+                    self.assertEqual(directory_child.stdout.strip(),
+                                     'PASS directory open/close policy and lifetime regressions')
                 child = self.command(variant + '-write-run', [executable, images], 180)
                 lines = child.stdout.splitlines()
                 self.assertEqual(lines[:2], [
@@ -240,7 +340,7 @@ class FSKitInterfaces(unittest.TestCase):
                     self.assertRegex(lines[4], r'^RENAME requested mask: 0x[0-9a-f]+; replacement and same-inode '
                                                r'branches: actual-result success$')
                     print(lines[4], flush=True)
-                    self.assertRegex(lines[5], r'^METADATA requested mask: 0x[0-9a-f]+; mode and timestamp '
+                    self.assertRegex(lines[5], r'^METADATA requested mask: 0x[0-9a-f]+; mode, flags and timestamp '
                                                r'branches: actual-result success$')
                     print(lines[5], flush=True)
                     self.assertEqual(lines[6], 'XATTR supported kinds: file, root, directory, symlink; '
@@ -328,6 +428,25 @@ class FSKitInterfaces(unittest.TestCase):
                                  ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
                                   'fixturewritablemetadata', 'fixtureidentity', 'privatetestidentity',
                                   'fortesting', 'reclaimfortesting', 'createabortfortesting')))
+            self.assertNotIn('mounttrace', symbols)
+            self.assertNotIn(b'com.alvinhhh.stallionfs.mounttrace', module.read_bytes())
+            trace_module = self.base / 'context-mount-trace-module'
+            self.command('context-mount-trace-module-build', [self.tools['swiftc'],
+                         '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES',
+                         '-D', 'STALLION_MOUNT_TRACE', '-swift-version', '6',
+                         '-strict-concurrency=complete', '-warnings-as-errors', '-target', target,
+                         '-sdk', self.sdk, '-I', filesystem / 'fskit', '-Onone', '-parse-as-library',
+                         '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
+                         '-module-cache-path', self.base / 'context-mount-trace-cache',
+                         *sources, normal, '-o', trace_module], 180, swift='context')
+            trace_symbols = self.command('context-mount-trace-symbols', [self.tools['nm'], trace_module], 90).stdout.lower()
+            self.assertIn('stallionfs_mount_trace_schema1_build1', trace_symbols)
+            self.assertIn(b'com.alvinhhh.stallionfs.mounttrace', trace_module.read_bytes())
+            self.assertEqual(package.compiled_factory_profile(package.read_executable(trace_module),
+                             'contextual-writes')['policy'], 'contextual-writes')
+            self.assertFalse(any(word in trace_symbols for word in
+                                 ('sfs_diag_', 'sfs_test_', 'enablewritediagnostic', 'diagnosticwrite',
+                                  'fixtureidentity', 'fortesting', 'sqlite')))
             # Assemble the ordinary both-flags extension, not a test driver.
             # This verifies unsigned package wiring; it does not activate FSKit.
             host = self.base / 'production-package-host'
@@ -366,6 +485,7 @@ class FSKitInterfaces(unittest.TestCase):
             attributes = module_info['EXAppExtensionAttributes']
             self.assertEqual(attributes['EXExtensionPointIdentifier'], 'com.apple.fskit.fsmodule')
             self.assertEqual(attributes['FSShortName'], 'stallionfs')
+            self.assertEqual(attributes['FSActivateOptionSyntax'], {'shortOptions': 'o:'})
             self.assertTrue(attributes['FSSupportsPathURLs'])
             self.assertTrue(attributes['FSRequiresSecurityScopedPathURLResources'])
             self.assertFalse(attributes['FSSupportsBlockResources'])

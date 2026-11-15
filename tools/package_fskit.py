@@ -4,6 +4,7 @@ import ast
 import base64
 import csv
 import io
+import importlib.util
 import hashlib
 import json
 import os
@@ -12,9 +13,14 @@ import plistlib
 import re
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unicodedata
+import uuid
 import zipfile
+
+
+PACKAGE_VERSION = '0.7.0'
 
 
 def read_executable(path):
@@ -498,7 +504,7 @@ def _runtime_wheel_members(data, metadata):
     wheel = files[dist + '/WHEEL'].decode()
     tags = [line[5:] for line in wheel.splitlines() if line.startswith('Tag: ')]
     _runtime_require(len(tags) == 1 and tags[0] == tag + '-' + tag + '-macosx_15_0_arm64', 'Pinned wheel ABI/tag mismatch')
-    _runtime_require(b'Name: stallionfs\n' in files[dist + '/METADATA'] and b'Version: 0.6.3\n' in files[dist + '/METADATA'], 'Wheel _runtime_identity mismatch')
+    _runtime_require(b'Name: stallionfs\n' in files[dist + '/METADATA'] and ('Version: ' + PACKAGE_VERSION + '\n').encode() in files[dist + '/METADATA'], 'Wheel _runtime_identity mismatch')
     _runtime_require(b'stallionfs-python = stallionfs.__main__:main' in files[dist + '/entry_points.txt'], 'Wheel entry point mismatch')
     record_path = dist + '/RECORD'
     record = list(csv.reader(io.StringIO(files[record_path].decode())))
@@ -571,6 +577,8 @@ def _runtime_source_wheel(data, metadata, pins):
     source_names = {'setup.py', 'pyproject.toml', *(path.relative_to(source).as_posix()
                     for path in (source / 'stallionfs').iterdir()
                     if path.is_file() and path.suffix in ('.py', '.c', '.h'))}
+    source_names.update({'tools/build_git_runtime.py', 'tools/_git_capture.py',
+        *('tools/git-inputs/' + name for name in ('combined.patch', 'notices.patch', 'config.mak', 'header-manifest.json', 'alias.c'))})
     _runtime_require(set(build_sources) == source_names, 'Wheel lacks the current bundled source')
     for name, digest in build_sources.items():
         _runtime_relative(name)
@@ -586,6 +594,8 @@ def _runtime_source_wheel(data, metadata, pins):
     resource_members = {'stallionfs/_benchmark_runtime/' + name for name in resources}
     resource_members.add('stallionfs/_benchmark_runtime/manifest.json')
     allowed_package = {name for name in build_sources if name.startswith('stallionfs/')} | set(extensions) | resource_members
+    package_git = _runtime_package_git(files)
+    allowed_package |= package_git
     _runtime_require({name for name in files if name.startswith('stallionfs/')} <= allowed_package,
                      'Wheel contains unlisted package members')
     for name, input_name in resources.items():
@@ -593,7 +603,90 @@ def _runtime_source_wheel(data, metadata, pins):
         _runtime_require(member in files, 'Wheel benchmark resource is missing: ' + name)
         data = _runtime_pinned({'path': str(source / input_name), 'sha256': provenance['resources'][name]}, pins)
         _runtime_require(files[member] == data, 'Wheel benchmark resource differs: ' + name)
-    return files, scripts, extensions, tag, build_sources
+    # The app uses its separately qualified companion, never the wheel runtime.
+    source_assets = {name[len('stallionfs/_git/'):]: files[name] for name in package_git
+                     if name[len('stallionfs/_git/'):].startswith('sources/')
+                     or name[len('stallionfs/_git/'):] in ('COPYING', 'CURL-COPYING', 'SOURCES.txt')}
+    return ({name: data for name, data in files.items() if name not in package_git},
+            scripts, extensions, tag, build_sources, source_assets)
+
+
+def _runtime_git_sources(sources, licenses, contract, build_sources, wheel_assets):
+    """Keep the complete offline-rebuild tree beside the separate companion."""
+    values = dict(sources)
+    fixed = {'sources/git-source.tar.xz': 'source_distribution_sha256', 'sources/combined.patch': 'combined_patch_sha256',
+             'sources/notices.patch': 'notice_patch_sha256', 'sources/config.mak': 'build_config_sha256',
+             'sources/header-manifest.json': 'curl_header_manifest_sha256', 'sources/alias.c': 'alias_source_sha256'}
+    for name, key in fixed.items():
+        _runtime_require('Git/' + name in values and _runtime_sha(values['Git/' + name]) == contract[key],
+                         'Git source/build contract differs')
+    headers = json.loads(values['Git/sources/header-manifest.json'])
+    _runtime_require(type(headers) is list and len(headers) == 11, 'Git header inputs are incomplete')
+    expected = {'Git/' + name for name in fixed} | {'Git/COPYING', 'Git/CURL-COPYING', 'Git/SOURCES.txt',
+                                                     'Git/sources/build-scripts.tar.xz'}
+    for row in headers:
+        _runtime_require(type(row) is dict and set(row) == {'archive_member', 'file', 'sha256', 'bytes'}
+                         and type(row['file']) is str and re.fullmatch(r'baseline/include/curl/[A-Za-z0-9_-]+\.h', row['file'])
+                         and type(row['bytes']) is int and 0 < row['bytes'] <= 1024 * 1024,
+                         'Git header inputs are incomplete')
+        name = 'Git/sources/' + row['file']
+        _runtime_require(name not in expected and name in values and len(values[name]) == row['bytes']
+                         and _runtime_sha(values[name]) == row['sha256'], 'Git header input differs')
+        expected.add(name)
+    _runtime_require(len(sources) == len(expected) and set(values) == expected,
+                     'Git corresponding source set differs')
+    license_values = dict(licenses)
+    _runtime_require(all(name in license_values and license_values[name] == values[name]
+                         for name in ('Git/COPYING', 'Git/CURL-COPYING')),
+                     'Git and curl license inputs are required')
+    required = {'tools/build_git_runtime.py', 'tools/_git_capture.py', 'stallionfs/_git_sources.py', 'stallionfs/_bundle.py'}
+    required |= {'tools/git-inputs/' + Path(name).name for name in fixed if not name.endswith('git-source.tar.xz')}
+    with tarfile.open(fileobj=io.BytesIO(values['Git/sources/build-scripts.tar.xz']), mode='r:xz') as archive:
+        members = archive.getmembers()
+        _runtime_require(len(members) == len(required) and {m.name for m in members} == required
+                         and all(m.isfile() and m.size <= 1024 * 1024 for m in members),
+                         'Git build scripts are incomplete')
+        for name in required:
+            data = archive.extractfile(name).read()
+            if name.startswith('tools/git-inputs/'):
+                expected_data = values['Git/sources/' + Path(name).name]
+                _runtime_require(data == expected_data, 'Git archived build input differs')
+            else:
+                _runtime_require(_runtime_sha(data) == build_sources[name], 'Git archived build script differs')
+    if wheel_assets:
+        _runtime_require(values == {'Git/' + name: data for name, data in wheel_assets.items()},
+                         'Git corresponding source differs from the verified wheel')
+
+
+def _runtime_package_git(files):
+    prefix = 'stallionfs/_git/'
+    members = {name for name in files if name.startswith(prefix)}
+    if not members:
+        return set()
+    manifest = prefix + 'manifest.json'
+    _runtime_require(manifest in members and len(files[manifest]) <= 1024 * 1024, 'Package Git manifest is missing or oversized')
+    value = json.loads(files[manifest])
+    bundle = _runtime_bundle()
+    source = {key: bundle.GIT_CONTRACT[key] for key in bundle.GIT_SOURCE_KEYS}
+    _runtime_require(type(value) is dict and set(value) == {'schema', 'kind', 'source', 'build', 'files'}
+                     and type(value['schema']) is int and value['schema'] == 1
+                     and value['kind'] == 'package-git-runtime' and value['source'] == source
+                     and type(value['build']) is dict
+                     and type(value['files']) is list and 0 < len(value['files']) <= 4096,
+                     'Unsupported package Git manifest')
+    seen = set()
+    for row in value['files']:
+        _runtime_require(type(row) is dict and set(row) == {'path', 'mode', 'size', 'sha256'}, 'Invalid package Git row')
+        name = prefix + _runtime_relative(row['path'])
+        _runtime_require(name != manifest and name in members and name not in seen
+                         and row['mode'] in ('0o644', '0o755') and type(row['size']) is int
+                         and row['size'] == len(files[name]) and row['sha256'] == _runtime_sha(files[name]),
+                         'Package Git payload differs')
+        seen.add(name)
+    _runtime_require(seen | {manifest} == members
+                     and {prefix + name for name in ('bin/git', 'libexec/git-core/git', 'share/git-core/templates/description', 'COPYING')}
+                     <= seen, 'Package Git namespace is incomplete')
+    return members
 
 
 def _inspect_runtime_wheel(files, scripts, extensions, directory):
@@ -612,8 +705,50 @@ def _inspect_runtime_wheel(files, scripts, extensions, directory):
     return observations
 
 
-def _prepare_runtime(path, output):
-    pins = {}
+def _runtime_admit_git(git, pins, *, architecture):
+    """Admit the exact qualified native input independently of app Python ABI."""
+    _runtime_require(type(architecture) is str and architecture in ('arm64', 'x86_64'),
+                     'Git build architecture differs')
+    _runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'},
+                     'Invalid private Git input')
+    git_rows = json.loads(_runtime_pinned(git['inventory'], pins))
+    qualification = json.loads(_runtime_pinned(git['qualification'], pins))
+    _runtime_require(isinstance(qualification, dict) and type(qualification.get('schema')) is int
+                     and qualification['schema'] == 1
+                     and qualification.get('inventory_sha256') == git['inventory']['sha256']
+                     and qualification.get('static_closure_accepted') is True
+                     and qualification.get('local_correctness_passed') is True,
+                     'Private Git qualification is incomplete')
+    bundle = _runtime_bundle()
+    git_contract = dict(bundle.GIT_CONTRACT, input_inventory_sha256=git['inventory']['sha256'])
+    bundle.git_contract(git_contract, architecture=architecture)
+    native_create = qualification.get('native_create')
+    _runtime_require(isinstance(native_create, dict) and type(native_create.get('schema')) is int
+                     and native_create == git_contract, 'Private Git create contract is missing or unsupported')
+    _runtime_require(_runtime_inventory(git['root']) == git_rows, 'Private Git inventory differs')
+    _runtime_require({'bin/git', 'libexec/git-core', 'share/git-core/templates'}
+                     <= {row['path'] for row in git_rows}, 'Private Git support is incomplete')
+    return {'root': Path(git['root']), 'inventory': git_rows,
+            'contract': git_contract, 'qualification': qualification}
+
+
+def _maintenance_source():
+    # Load only the fixed repository source, from the bytes retained for staging.
+    path = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_observer.py'
+    data = _runtime_read(path)
+    _runtime_require(0 < len(data) <= 128 * 1024, 'Maintenance observer exceeds its limit')
+    namespace = {'__file__': str(path), '__name__': 'maintenance_observer_resource'}
+    exec(compile(data, str(path), 'exec'), namespace)
+    return path, data, namespace
+
+
+def _prepare_runtime(path, output, native_path):
+    observer_path, observer, maintenance = _maintenance_source()
+    native_source = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_native.c'
+    native_source_data = _runtime_read(native_source)
+    native = read_executable(native_path)
+    pins = {str(observer_path): _runtime_sha(observer), str(native_path): _runtime_sha(native),
+            str(native_source): _runtime_sha(native_source_data)}
     parent = _runtime_directory(output.parent)
     try:
         _runtime_require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'Runtime output parent must be private 0700')
@@ -643,20 +778,10 @@ def _prepare_runtime(path, output):
                       'lib/python3.13/encodings/__init__.py'} <= {row['path'] for row in python_rows},
                      'Python runtime support is incomplete')
     git = value['git']
-    _runtime_require(isinstance(git, dict) and set(git) == {'root', 'inventory', 'qualification'},
-                     'Invalid private Git input')
-    git_rows = json.loads(_runtime_pinned(git['inventory'], pins))
-    qualification = json.loads(_runtime_pinned(git['qualification'], pins))
-    _runtime_require(isinstance(qualification, dict) and type(qualification.get('schema')) is int
-                     and qualification['schema'] == 1
-                     and qualification.get('inventory_sha256') == git['inventory']['sha256']
-                     and qualification.get('static_closure_accepted') is True
-                     and qualification.get('local_correctness_passed') is True,
-                     'Private Git qualification is incomplete')
-    _runtime_require(_runtime_inventory(git['root']) == git_rows, 'Private Git inventory differs')
-    _runtime_require({'bin/git', 'libexec/git-core', 'share/git-core/templates'}
-                     <= {row['path'] for row in git_rows}, 'Private Git support is incomplete')
-    files, scripts, extensions, tag, build_sources = _runtime_source_wheel(
+    admitted_git = _runtime_admit_git(git, pins, architecture='arm64')
+    git_rows = admitted_git['inventory']
+    git_contract = admitted_git['contract']
+    files, scripts, extensions, tag, build_sources, wheel_assets = _runtime_source_wheel(
         _runtime_pinned(value['wheel'], pins), metadata, pins)
     licenses = []
     python_licenses = json.loads(checked['license_records'])['licenses']
@@ -670,9 +795,8 @@ def _prepare_runtime(path, output):
                      'License/source mapping must be explicit')
     licenses += [_runtime_mapping(item, pins) for item in value['licenses']]
     sources = [_runtime_mapping(item, pins) for item in value['sources']]
-    _runtime_require(any(name == 'Git/COPYING' for name, _ in licenses)
-                     and len(sources) >= 2 and all(name.startswith('Git/') for name, _ in sources),
-                     'Git license and complete source/build sidecar inputs are required')
+    _runtime_require(git_contract['input_inventory_sha256'] == git['inventory']['sha256'], 'Git source/build contract differs')
+    _runtime_git_sources(sources, licenses, git_contract, build_sources, wheel_assets)
     for mappings in (licenses, sources):
         names = [unicodedata.normalize('NFC', name).casefold() for name, _ in mappings]
         _runtime_require(len(names) == len(set(names)), 'Duplicate license/source destination')
@@ -690,8 +814,8 @@ def _prepare_runtime(path, output):
     with tempfile.TemporaryDirectory(prefix='stallionfs-wheel-', dir=output.parent) as temporary:
         directory = Path(temporary)
         observations = _inspect_runtime_wheel(files, scripts, extensions, directory)
-    return {'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
-            'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources,
+    return {'observer': observer, 'native': native, 'maintenance': maintenance, 'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
+            'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources, 'git_contract': dict(git_contract),
             'sidecar': sidecar, 'wheel_tag': tag, 'wheel_observations': observations,
             'source_build_id': _runtime_sha(json.dumps(build_sources, sort_keys=True, separators=(',', ':')).encode())}
 
@@ -714,7 +838,7 @@ def _runtime_verify_layout(actual, expected):
     _runtime_require(actual == sorted(table.values(), key=lambda row: row['path']), 'Final runtime mapping changed')
 
 
-def _stage_runtime(output, prepared, bundle_version):
+def _stage_runtime(output, prepared, bundle_version, bundle_id):
     parent = _runtime_directory(output.parent)
     app = _runtime_subdir(parent, output.name)
     original = _runtime_identity(os.fstat(app))
@@ -743,12 +867,24 @@ def _stage_runtime(output, prepared, bundle_version):
                  'git': 'Contents/Resources/Runtime/Git/bin/git',
                  'git_exec_path': 'Contents/Resources/Runtime/Git/libexec/git-core',
                  'git_template_dir': 'Contents/Resources/Runtime/Git/share/git-core/templates'}
-        descriptor = {'schema': 1, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
-                      'package_version': '0.6.3', 'source_build_id': prepared['source_build_id'],
+        payload = _runtime_bundle().git_payload(output / 'Contents/Resources/Runtime/Git')
+        git_contract = {**prepared['git_contract'], 'payload_entries': payload['entries'], 'payload_sha256': payload['sha256']}
+        descriptor = {'schema': 2, 'git': git_contract, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
+                      'package_version': PACKAGE_VERSION, 'source_build_id': prepared['source_build_id'],
                       'bundle_version': bundle_version, 'paths': paths}
         descriptor_data = (json.dumps(descriptor, sort_keys=True, indent=2) + '\n').encode()
         _runtime_write_at(app, 'Contents/Resources/Runtime/runtime.json', descriptor_data)
         expected.append(_runtime_file_row('Contents/Resources/Runtime/runtime.json', descriptor_data))
+        maintenance = prepared['maintenance']
+        build = {'bundle_id': bundle_id, 'bundle_version': bundle_version,
+                 'package_version': PACKAGE_VERSION, 'source_build_id': prepared['source_build_id']}
+        observer = prepared['observer']
+        compatibility = maintenance['create_compatibility'](observer, build)
+        roles = dict(maintenance['RESOURCE_ROLES'])
+        for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
+            mode = 0o755 if role == 'native' else 0o644
+            _runtime_write_at(app, roles[role], data, mode)
+            expected.append(_runtime_file_row(roles[role], data, mode))
         for name, data in prepared['licenses']:
             _runtime_write_at(app, 'Contents/Resources/Licenses/' + name, data)
             expected.append(_runtime_file_row('Contents/Resources/Licenses/' + name, data))
@@ -775,9 +911,20 @@ def _stage_runtime(output, prepared, bundle_version):
         os.fchmod(app, 0o755)
         rows = _runtime_inventory(output, app)
         _runtime_verify_layout(rows, expected)
+        observed = _runtime_read_at(app, roles['observer'])
+        resource = _runtime_read_at(app, roles['compatibility'])
+        _runtime_require(observed == observer and resource == compatibility, 'Maintenance resource readback differs')
+        contract = maintenance['validate_compatibility'](resource, observer, build)
+        _runtime_require(contract['public_upgrade_support'] == [], 'Installed maintenance pairs are not qualified')
+        for role, data in (('observer', observer), ('native', prepared['native']), ('compatibility', compatibility)):
+            _runtime_require(_runtime_read_at(app, roles[role]) == data, 'Maintenance role readback differs')
+            _runtime_require([row for row in rows if row['path'] == roles[role]]
+                             == [_runtime_file_row(roles[role], data, 0o755 if role == 'native' else 0o644)], 'Maintenance inventory role differs')
         return {'kind': 'self-contained-runtime-payload', 'complete_candidate': False,
                 'distribution_signing_performed': False, 'source_build_id': prepared['source_build_id'],
                 'wheel_tag': prepared['wheel_tag'], 'wheel_observations': prepared['wheel_observations'],
+                'git': git_contract, 'descriptor_sha256': _runtime_sha(descriptor_data),
+                'maintenance_roles': roles,
                 'input_file_sha256': sorted(prepared['pins'].values()), 'inventory': rows,
                 'licenses': [{'path': name, 'sha256': _runtime_sha(data)} for name, data in prepared['licenses']],
                 'source_sidecar': {'path': prepared['sidecar'].name, 'inventory': source_rows}}
@@ -792,6 +939,7 @@ def main():
     parser.add_argument('--extension', required=True, type=Path)
     parser.add_argument('--out', required=True, type=Path, help='Fresh .app path; never an installed app')
     parser.add_argument('--manifest-out', type=Path, help='Fresh external sibling .json candidate receipt')
+    parser.add_argument('--maintenance-native', type=Path, help='Standalone native maintenance leaf from the matching source build')
     parser.add_argument('--runtime-inputs', type=Path, help='Pinned private runtime, wheel, Git and license/source inputs')
     parser.add_argument('--profile', choices=('production', 'private-sfsro27'), default='production')
     parser.add_argument('--access-policy', choices=('read-only', 'contextual-writes'),
@@ -812,7 +960,10 @@ def main():
     values = _load_templates()
     factory, targets = inspect_package_artifacts(host, extension,
         values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy)
-    runtime = _prepare_runtime(args.runtime_inputs.absolute(), output) if args.runtime_inputs is not None else None
+    if args.runtime_inputs is not None and args.maintenance_native is None:
+        parser.error('--runtime-inputs requires --maintenance-native')
+    native = read_executable(args.maintenance_native) if args.maintenance_native is not None else None
+    runtime = _prepare_runtime(args.runtime_inputs.absolute(), output, args.maintenance_native.absolute()) if args.runtime_inputs is not None else None
     plists = []
     for index, value in enumerate(values):
         if value.get('CFBundleVersion') != '__BUNDLE_VERSION__':
@@ -839,9 +990,13 @@ def main():
                  (module / 'Info.plist', plists[1], 0o644),
                  (app / 'MacOS/StallionFS', host, 0o755),
                  (module / 'MacOS/StallionFS', extension, 0o755)]
+        if native is not None and runtime is None:
+            maintenance_path = app / 'Resources/Maintenance'
+            maintenance_path.mkdir(parents=True, mode=0o755)
+            files.append((maintenance_path / 'stallionfs-maintenance', native, 0o755))
         for path, data, mode in files:
             write_new(path, data, mode)
-        runtime_manifest = _stage_runtime(output, runtime, args.bundle_version) if runtime is not None else None
+        runtime_manifest = _stage_runtime(output, runtime, args.bundle_version, values[0]['CFBundleIdentifier']) if runtime is not None else None
         if reservation is not None:
             manifest = _candidate_manifest(args, values, targets, factory, files, output)
             if runtime_manifest is not None:
@@ -852,6 +1007,252 @@ def main():
             os.close(reservation[1])
             os.close(reservation[0])
     print('Unsigned package: ' + str(output))
+
+
+def _runtime_unsealed(root):
+    contents = _runtime_subdir(root, 'Contents')
+    try:
+        try:
+            os.stat('_CodeSignature', dir_fd=contents, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ValueError('Finalize Git before sealing the containing app')
+    finally:
+        os.close(contents)
+
+
+def finalize_git_payload(app, *, expected_descriptor_sha256, before_rows, signed_leaf_sha256):
+    """Finalize generated runtime metadata after Git signing, before the outer seal.
+
+    The signing controller supplies the trusted assembly rows and descriptor
+    hash, and the exact resulting hashes of its verified signature transforms.
+    The caller retains exclusive control until the outer seal. This function
+    does not sign or establish that those transforms are valid.
+    """
+    bundle = _runtime_bundle()
+    app = Path(app)
+    _runtime_require(app.suffix == '.app', 'Ordinary app directory required')
+    _runtime_require(isinstance(expected_descriptor_sha256, str)
+                     and re.fullmatch('[0-9a-f]{64}', expected_descriptor_sha256), 'Invalid assembled descriptor digest')
+    _runtime_require(isinstance(before_rows, list) and all(isinstance(row, dict) and isinstance(row.get('path'), str)
+                     for row in before_rows), 'Invalid assembled Git rows')
+    names = [_runtime_relative(row['path']) for row in before_rows]
+    _runtime_require(names == sorted(set(names)), 'Invalid assembled Git namespace')
+    _runtime_require(isinstance(signed_leaf_sha256, dict) and all(
+        isinstance(name, str) and _runtime_relative(name) and isinstance(digest, str)
+        and re.fullmatch('[0-9a-f]{64}', digest) for name, digest in signed_leaf_sha256.items()),
+        'Invalid signed Git leaf mapping')
+    root = _runtime_directory(app)
+    parent = None
+    temporary = '.runtime.json.' + uuid.uuid4().hex
+    try:
+        root_identity = _runtime_identity(os.fstat(root))
+        _runtime_unsealed(root)
+        parent = _runtime_subdir(root, 'Contents/Resources/Runtime')
+        before = os.stat('runtime.json', dir_fd=parent, follow_symlinks=False)
+        data = _runtime_read_at(parent, 'runtime.json')
+        _runtime_require(_runtime_sha(data) == expected_descriptor_sha256, 'Assembled descriptor digest differs')
+        value = json.loads(data)
+        git = value.get('git') if isinstance(value, dict) else None
+        _runtime_require(isinstance(value, dict) and type(value.get('schema')) is int and value['schema'] == 2
+            and isinstance(git, dict) and set(git) == set(bundle.GIT_CONTRACT) | {'input_inventory_sha256', 'payload_entries', 'payload_sha256'}
+            and type(git.get('schema')) is int and all(git.get(key) == expected for key, expected in bundle.GIT_CONTRACT.items()),
+            'Unsupported Git provenance')
+        bundle.git_contract({key: git[key] for key in set(bundle.GIT_CONTRACT) | {'input_inventory_sha256'}}, architecture='arm64')
+        _runtime_require(type(git['payload_entries']) is int and git['payload_entries'] == len(before_rows)
+            and git['payload_sha256'] == _runtime_sha(json.dumps(before_rows, sort_keys=True, separators=(',', ':')).encode()),
+            'Assembled Git payload differs')
+        git_root = app / 'Contents/Resources/Runtime/Git'
+        current = _runtime_inventory(git_root)
+        old, actual = ({row['path']: row for row in rows} for rows in (before_rows, current))
+        _runtime_require(set(old) == set(actual) and set(signed_leaf_sha256) <= set(old), 'Signed Git namespace differs')
+        for name, row in actual.items():
+            expected = old[name]
+            if name in signed_leaf_sha256:
+                _runtime_require(expected.get('type') == row['type'] == 'file'
+                    and row['sha256'] == signed_leaf_sha256[name], 'Signed Git leaf differs')
+                expected = dict(expected, size=row['size'], sha256=row['sha256'])
+            _runtime_require(row == expected, 'Unapproved Git payload change')
+        payload = bundle.git_payload(git_root)
+        _runtime_require(payload['entries'] == len(current) and payload['sha256']
+            == _runtime_sha(json.dumps(current, sort_keys=True, separators=(',', ':')).encode()), 'Git payload changed')
+        value['git'] = dict(git, payload_entries=payload['entries'], payload_sha256=payload['sha256'])
+        updated = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | RUNTIME_NOFOLLOW, 0o644, dir_fd=parent)
+        try:
+            os.fchmod(fd, 0o644)
+            _runtime_require(os.write(fd, updated) == len(updated), 'Runtime descriptor short write')
+            os.fsync(fd)
+            temporary_identity = _runtime_identity(os.fstat(fd))
+        finally:
+            os.close(fd)
+        _runtime_require(_runtime_read_at(parent, temporary) == updated
+            and _runtime_identity(os.stat(temporary, dir_fd=parent, follow_symlinks=False)) == temporary_identity,
+            'Runtime temporary descriptor differs')
+        _runtime_require(_runtime_identity(os.stat('runtime.json', dir_fd=parent, follow_symlinks=False))
+                         == _runtime_identity(before), 'Runtime descriptor substituted')
+        _runtime_require(bundle.git_payload(git_root) == payload, 'Git payload changed before finalization')
+        _runtime_require(_runtime_identity(os.fstat(root)) == root_identity, 'App directory changed')
+        _runtime_unsealed(root)
+        os.replace(temporary, 'runtime.json', src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+        _runtime_require(_runtime_read_at(parent, 'runtime.json') == updated, 'Runtime descriptor readback differs')
+        physical_parent = _runtime_directory(app / 'Contents/Resources/Runtime')
+        try:
+            _runtime_require(_runtime_identity(os.fstat(physical_parent)) == _runtime_identity(os.fstat(parent)),
+                'Runtime directory substituted')
+        finally:
+            os.close(physical_parent)
+        return value['git']
+    finally:
+        if parent is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(parent)
+        os.close(root)
+
+
+def _runtime_bundle():
+    source = Path(__file__).resolve().parents[1] / 'stallionfs/_bundle.py'
+    spec = importlib.util.spec_from_file_location('_packaging_bundle', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def sign_maintenance_leaf(app, *, expected_unsigned_sha256, identity, expected_publisher):
+    """Sign the fixed standalone role before the containing app is sealed."""
+    _, _, maintenance = _maintenance_source()
+    _runtime_require(expected_publisher == maintenance['PUBLISHER_TEAM'], 'Unexpected maintenance publisher')
+    _runtime_require(type(identity) is str and identity and not identity.startswith('-'), 'Explicit signing identity required')
+    app = Path(app)
+    root = _runtime_directory(app)
+    try:
+        _runtime_unsealed(root)
+        name = maintenance['RESOURCE_ROLES']['native']
+        data = _runtime_read_at(root, name)
+        _runtime_require(_runtime_sha(data) == expected_unsigned_sha256, 'Unsigned maintenance leaf differs')
+        _tool_output(['/usr/bin/codesign','--force','--sign',identity,'--identifier',
+            'com.alvinhhh.stallionfs.maintenance','--options','runtime','--timestamp',str(app/name)], app.parent)
+        requirement = maintenance['publisher_requirement']('com.alvinhhh.stallionfs.maintenance',expected_publisher)
+        _tool_output(['/usr/bin/codesign','--verify','--strict','-R','='+requirement,str(app/name)],app.parent)
+        signed = _runtime_read_at(root,name)
+        return {'path':name,'sha256':_runtime_sha(signed),'size':len(signed),
+                'publisher':expected_publisher,'outer_seal_pending':True}
+    finally:
+        os.close(root)
+
+
+def verify_maintenance_archive(data, rows, app_name):
+    """An exact app-only ZIP; source sidecars are retained separately."""
+    expected = {row['path']: row for row in rows}
+    seen, members, total, root_seen = set(), set(), 0, False
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        _runtime_require(len(archive.infolist()) <= RUNTIME_MAX_FILES + 1, 'Maintenance ZIP entry limit')
+        for member in archive.infolist():
+            name = member.filename.rstrip('/')
+            _runtime_relative(name)
+            _runtime_require(name not in seen and member.flag_bits & 1 == 0, 'Duplicate or encrypted maintenance ZIP member')
+            seen.add(name)
+            if name == app_name:
+                mode = member.external_attr >> 16
+                _runtime_require(member.create_system == 3 and member.is_dir() and stat.S_ISDIR(mode)
+                    and stat.S_IMODE(mode) == 0o755 and member.file_size == 0 and archive.read(member) == b'',
+                    'Maintenance ZIP root type or mode')
+                root_seen = True
+                continue
+            _runtime_require(name.startswith(app_name + '/'), 'Unexpected maintenance ZIP member')
+            relative = name[len(app_name)+1:]
+            row = expected.get(relative)
+            _runtime_require(row is not None, 'Maintenance ZIP member outside signed inventory')
+            mode = member.external_attr >> 16
+            members.add(relative)
+            if member.is_dir():
+                _runtime_require(row['type'] == 'dir' and member.create_system == 3 and stat.S_ISDIR(mode)
+                    and stat.S_IMODE(mode) == int(row['mode'], 8) and member.file_size == 0
+                    and archive.read(member) == b'',
+                                 'Maintenance ZIP directory differs')
+                continue
+            _runtime_require(member.create_system == 3 and row['type'] in ('file','symlink') and member.file_size <= RUNTIME_MAX_FILE,
+                             'Maintenance ZIP file type or size')
+            total += member.file_size
+            _runtime_require(total <= RUNTIME_MAX_TOTAL, 'Maintenance ZIP total byte limit')
+            value = archive.read(member)
+            _runtime_require(len(value) == row['size'] and stat.S_IMODE(mode) == int(row['mode'],8),
+                             'Maintenance ZIP file size or mode differs')
+            if row['type'] == 'symlink':
+                _runtime_require(stat.S_ISLNK(mode) and value == os.fsencode(row['link']), 'Maintenance ZIP link differs')
+            else:
+                _runtime_require(stat.S_ISREG(mode) and _runtime_sha(value) == row['sha256'], 'Maintenance ZIP file differs')
+    _runtime_require(root_seen and members == set(expected),
+                     'Maintenance ZIP is incomplete')
+
+
+def final_maintenance_bindings(app, archive, *, expected_publisher):
+    """External final identities, after Git finalization and every signature.
+
+    The returned mapping must be independently retained/authenticated. It has no
+    installed-history, cooperation or STORE authority.
+    """
+    _, observer, maintenance = _maintenance_source()
+    _runtime_require(expected_publisher == maintenance['PUBLISHER_TEAM'], 'Unexpected maintenance publisher')
+    app, archive = Path(app), Path(archive)
+    root = _runtime_directory(app)
+    try:
+        _runtime_require(stat.S_IMODE(os.fstat(root).st_mode) == 0o755, 'Final app root mode differs')
+        _runtime_require(_runtime_read_at(root,maintenance['RESOURCE_ROLES']['observer']) == observer,
+                         'Final observer differs from source')
+        _runtime_read_at(root,'Contents/_CodeSignature/CodeResources')
+        rows = _runtime_inventory(app,root)
+        roles = maintenance['RESOURCE_ROLES']
+        fixed = {str(app):'com.alvinhhh.stallionfs',
+                 str(app/'Contents/Extensions/StallionFS.appex'):'com.alvinhhh.stallionfs.module',
+                 str(app/roles['native']):'com.alvinhhh.stallionfs.maintenance'}
+        signing_roles = []
+        for path, identifier in fixed.items():
+            requirement = maintenance['publisher_requirement'](identifier,expected_publisher)
+            _tool_output(['/usr/bin/codesign','--verify','--deep','--strict','-R','='+requirement,path],app.parent)
+            signing_roles.append({'path':'.' if Path(path)==app else str(Path(path).relative_to(app)),
+                                  'requirement':'='+requirement})
+        publisher = 'anchor apple generic and certificate leaf[subject.OU] = "'+expected_publisher+'"'
+        magic = {b'\xcf\xfa\xed\xfe',b'\xce\xfa\xed\xfe',b'\xfe\xed\xfa\xcf',b'\xfe\xed\xfa\xce',
+                 b'\xca\xfe\xba\xbe',b'\xbe\xba\xfe\xca',b'\xca\xfe\xba\xbf',b'\xbf\xba\xfe\xca'}
+        for row in rows:
+            if row['type'] != 'file': continue
+            data = _runtime_read_at(root,row['path'])
+            if data[:4] in magic and str(app/row['path']) not in fixed:
+                _tool_output(['/usr/bin/codesign','--verify','--strict','-R','='+publisher,str(app/row['path'])],app.parent)
+                signing_roles.append({'path':row['path'],'requirement':'='+publisher})
+        hashes = {key:_runtime_sha(_runtime_read_at(root,name)) for key,name in
+            (('descriptor_sha256','Contents/Resources/Runtime/runtime.json'),
+             ('observer_sha256',roles['observer']),('native_sha256',roles['native']),
+             ('compatibility_sha256',roles['compatibility']))}
+        _runtime_require(_runtime_inventory(app,root) == rows,'Signed app changed during final binding')
+        metadata = json.loads(_runtime_read_at(root,'Contents/Resources/Runtime/runtime.json'))
+        git = metadata['git']
+        _runtime_require(set(git) == set(maintenance['GIT_CONTRACT']) | {'input_inventory_sha256','payload_entries','payload_sha256'}
+            and all(git[key] == value for key,value in maintenance['GIT_CONTRACT'].items()), 'Final Git runtime contract differs')
+        bundle = _runtime_bundle()
+        bundle.git_contract({key:git[key] for key in set(bundle.GIT_CONTRACT)|{'input_inventory_sha256'}},architecture='arm64')
+        payload = bundle.git_payload(app/'Contents/Resources/Runtime/Git')
+        _runtime_require(payload['entries'] == git['payload_entries'] and payload['sha256'] == git['payload_sha256'],
+                         'Final Git payload differs')
+        store_runtime = dict(git,descriptor_sha256=hashes['descriptor_sha256'],
+            executable_sha256=_runtime_sha(_runtime_read_at(root,'Contents/Resources/Runtime/Git/bin/git')),
+            source_build_id=metadata['source_build_id'],publisher=expected_publisher)
+        archive_data = _runtime_read(archive)
+        verify_maintenance_archive(archive_data, rows, app.name)
+        _runtime_require(_runtime_inventory(app,root) == rows,'Signed app changed while reading archive')
+        return {'schema':1,'kind':'final-maintenance-artifact-bindings','publisher':expected_publisher,
+            'artifact':dict(id=_runtime_sha(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()),**hashes),
+            'archive':{'path':archive.name,'sha256':_runtime_sha(archive_data)},'inventory':rows,
+            'roles':dict(roles),'runtime':dict(maintenance['RUNTIME_CONTRACT']),'store_runtime':store_runtime,
+            'public_upgrade_support':[],'signing_roles':signing_roles}
+    finally:
+        os.close(root)
 
 
 if __name__ == '__main__':

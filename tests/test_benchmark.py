@@ -1,15 +1,20 @@
 """Installed benchmark selection, ownership, evidence and exit boundaries."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+import argparse
 import errno
 import fcntl
+import hashlib
+import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+import time
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -19,7 +24,7 @@ from stallionfs import __main__ as cli, benchmark
 def arguments(**changes):
     values = dict(list=False, full=False, fixtures=None, operations=None, samples=10,
                   scratch=None, jobs=4, output=None, json=True, node=None, npm=None,
-                  npm_cache=None, cache=['warm'])
+                  npm_cache=None, cache=['warm'], copy_tools=None)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -888,6 +893,324 @@ class BenchmarkDeadline(unittest.TestCase):
             value = json.loads(stream.getvalue())
             self.assertEqual(value['status'], 'interrupted')
             self.assertTrue(value['command_receipt']['completion_uncertain'])
+
+
+class QuickBenchmarkReferences(unittest.TestCase):
+    def setUp(self):
+        perf = Path(__file__).parent / 'perf'
+        spec = importlib.util.spec_from_file_location('reference_report_fixture', perf / 'native_report.py')
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, 'path', [str(perf), *sys.path]):
+            spec.loader.exec_module(module)
+        runtime = ModuleType('stallionfs._benchmark_runtime')
+        runtime.__path__ = []
+        patch = mock.patch.dict(sys.modules, {'stallionfs._benchmark_runtime': runtime,
+            'stallionfs._benchmark_runtime.native_report': module})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ReportJournal = module.ReportJournal
+
+    def test_public_parser_exposes_only_supported_reference_names(self):
+        parser = argparse.ArgumentParser()
+        benchmark.parser(parser.add_subparsers(dest='action'))
+        selected = parser.parse_args(['benchmark', '--operations', 'clone', '--copy-tools', 'ditto', 'cp'])
+        self.assertEqual(selected.copy_tools, ['ditto', 'cp'])
+        self.assertIsNone(parser.parse_args(['benchmark']).copy_tools)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            parser.parse_args(['benchmark', '--copy-tools', '/untrusted/tool'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_invalid_duplicate_full_and_nonclone_selection_precedes_resource_access(self):
+        cases = (dict(copy_tools=['cp', 'cp'], operations=['clone']),
+                 dict(copy_tools=['unknown'], operations=['clone']),
+                 dict(copy_tools=[], operations=['clone']),
+                 dict(copy_tools=['ditto'], full=True),
+                 dict(copy_tools=['ditto'], operations=['copy']),
+                 dict(copy_tools=['ditto'], operations=['clone', 'move']))
+        for change in cases:
+            with self.subTest(change=change), mock.patch.object(sys, 'platform', 'darwin'), \
+                    mock.patch.object(benchmark, '_resources', side_effect=AssertionError('resource access')):
+                with self.assertRaises(ValueError):
+                    benchmark._preflight(arguments(**change))
+
+    def collect(self, root, args, *, exit_code=0, prepare=None, completion_uncertain=False):
+        budget = importlib.import_module('stallionfs._benchmark_budget')
+        seen = []
+        def command(argv, **options):
+            seen.append(argv)
+            if prepare:
+                prepare(root, args)
+            options['receipt'].update(exit_code=exit_code, completion_uncertain=completion_uncertain)
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        directory = SimpleNamespace(path=root, fd=descriptor, check=lambda: None)
+        try:
+            with mock.patch.object(budget, 'command', side_effect=command), \
+                    mock.patch.object(benchmark, '_read_native', return_value=(
+                        {'status': 'complete', 'passed': True, 'cleanup_passed': True}, [])):
+                result = benchmark._collect_pinned(args, root, root / 'stallionfs', directory,
+                    ['docs_5k_100mb'], ['clone'], io.BytesIO(), {})
+        finally:
+            os.close(descriptor)
+        return result, seen[0]
+
+    def test_default_and_explicit_reference_order_reach_the_collector_and_result(self):
+        for selected, expected in ((None, ['cp-clone', 'cp', 'ditto', 'rsync']),
+                                   (['rsync', 'ditto'], ['rsync', 'ditto']), (['ditto'], ['ditto'])):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temporary:
+                result, argv = self.collect(Path(temporary).resolve(), arguments(copy_tools=selected))
+                self.assertEqual(argv[argv.index('--copy-tools') + 1:], expected)
+                self.assertEqual(result['selection']['copy_tools'], expected)
+                self.assertEqual(result['selection']['copy_tools_explicit'], selected is not None)
+                self.assertFalse(result['qualified'])
+
+    def failed_report(self, root, args, *, change=None):
+        selection = {'binary': str(root / 'stallionfs'), 'scratch': str(root), 'output': str(root / 'native.json'),
+                     'samples': 10, 'runs': 1, 'cache': ['warm'], 'jobs': 4,
+                     'fixtures': ['docs_5k_100mb'], 'operations': ['clone'],
+                     'copy_tools': benchmark._copy_tools(args, ['clone'])}
+        state = {'status': 'complete', 'passed': False, 'cleanup_passed': True, 'selection': selection}
+        rows = [dict(run=0, fixture='docs_5k_100mb', operation='clone', reference='cp-clone',
+                     method='cp-clone', phase='resources', sample=0, ok=True, validated=False,
+                     completion_uncertain=False, source_unchanged=True,
+                     correctness={'strict_equal': False, 'sparse_preserved': True, 'independent_clone': True,
+                         'candidate_losses': [{'field': 'acl', 'path': 'metadata-fixture/sparse'},
+                                              {'field': 'hardlink_groups', 'path': None}]}),
+                dict(run=0, fixture='docs_5k_100mb', operation='clone', reference='rsync',
+                     method='rsync', phase='resources', sample=0, ok=True, validated=False,
+                     completion_uncertain=False, source_unchanged=True,
+                     correctness={'strict_equal': True, 'sparse_preserved': False, 'independent_clone': True,
+                                  'candidate_losses': []},
+                     data_stream_sharing={'required': True, 'full_data_stream_sharing': False})]
+        if change == 'incomplete':
+            state['status'] = 'running'
+        if change == 'selection':
+            selection['samples'] = 11
+        if change == 'selection-none':
+            state['selection'] = None
+        if change == 'correctness-none':
+            rows[0]['correctness'] = None
+        if change == 'correctness-list':
+            rows[0]['correctness'] = []
+        if change == 'loss-container':
+            rows[0]['correctness']['candidate_losses'] = {}
+        if change == 'loss-item':
+            rows[0]['correctness']['candidate_losses'] = [None]
+        if change == 'sharing-none':
+            rows[0]['data_stream_sharing'] = None
+        if change == 'sharing-list':
+            rows[0]['data_stream_sharing'] = []
+        journal = self.ReportJournal(root / 'native.json')
+        try:
+            for index, row in enumerate(rows):
+                journal.append('rows', index, row)
+            journal.finish(state)
+        finally:
+            journal.close()
+        if change == 'journal':
+            with (root / 'native.json.journal').open('ab') as stream:
+                stream.write(b'uncommitted')
+        elif change == 'final-json':
+            report = json.loads((root / 'native.json').read_text())
+            report['rows'][0]['correctness']['candidate_losses'] = []
+            (root / 'native.json').write_text(json.dumps(report))
+        elif change == 'missing':
+            (root / 'native.json').unlink()
+        elif change in ('final-recursion', 'manifest-recursion'):
+            path = root / ('native.json' if change == 'final-recursion' else 'native.json.manifest')
+            path.write_text('[' * 1500 + '0' + ']' * 1500)
+        elif change == 'event-recursion':
+            raw = (b'{"sequence":0,"kind":"rows","id":0,"payload":{"deep":'
+                   + b'[' * 1500 + b'0' + b']' * 1500 + b'}}\n')
+            (root / 'native.json.journal').write_bytes(raw)
+            path = root / 'native.json.manifest'
+            manifest = json.loads(path.read_text())
+            manifest.update(committed_bytes=len(raw), event_count=1, prefix_sha256=hashlib.sha256(raw).hexdigest())
+            path.write_text(json.dumps(manifest))
+
+    def test_completed_nonzero_report_has_verified_losses_and_separate_failed_gates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            result, _ = self.collect(root, arguments(), exit_code=1, prepare=self.failed_report)
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['exit_code'], 1)
+            self.assertFalse(result['collection_complete'])
+            self.assertFalse(result['qualified'])
+            self.assertEqual(result['report'], str(root / 'native.json'))
+            failures = {item['reference']: item for item in result['reference_failures']}
+            self.assertEqual(failures['cp-clone']['loss_counts'], {'acl': 1, 'hardlink_groups': 1})
+            self.assertEqual(failures['rsync']['loss_counts'], {})
+            self.assertEqual(failures['rsync']['gate_counts'], {'sparse_preserved': 1, 'data_stream_sharing': 1})
+            self.assertEqual(failures['rsync']['failed_rows'], 1)
+
+    def test_tampered_missing_incomplete_and_foreign_reports_have_no_attributed_diagnostics(self):
+        for change in ('journal', 'final-json', 'incomplete', 'selection', 'missing'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                def prepare(root, args):
+                    self.failed_report(root, args, change=change)
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1, prepare=prepare)
+
+    def test_uncertain_or_unavailable_child_completion_never_reads_failure_diagnostics(self):
+        for uncertain in (True, None):
+            with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.object(benchmark, '_native_failures', side_effect=AssertionError('unsafe report read')):
+                with self.assertRaises(RuntimeError):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1,
+                                 prepare=self.failed_report, completion_uncertain=uncertain)
+
+    def test_malformed_and_recursive_reports_have_generic_failed_diagnostics(self):
+        changes = ('selection-none', 'correctness-none', 'correctness-list', 'loss-container', 'loss-item',
+                   'sharing-none', 'sharing-list', 'final-recursion', 'manifest-recursion', 'event-recursion')
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                def prepare(root, args):
+                    self.failed_report(root, args, change=change)
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(Path(temporary).resolve(), arguments(), exit_code=1, prepare=prepare)
+
+    def test_diagnostic_journal_limit_rejects_before_reader_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self.failed_report(root, arguments())
+            with mock.patch.dict(benchmark.FAILURE_READER_LIMITS, {'max_journal_bytes': 1}), \
+                    mock.patch.object(self.ReportJournal, '_verify', side_effect=AssertionError('journal scanned')) as verify:
+                with self.assertRaisesRegex(RuntimeError, 'no verified completed failure report'):
+                    self.collect(root, arguments(), exit_code=1)
+                verify.assert_not_called()
+
+
+class InstalledCollectorEntry(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='installed collector ')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.site = self.root / 'CLI/lib/python3.13/site-packages'
+        self.package = self.site / 'stallionfs'
+        self.resources = self.package / '_benchmark_runtime'
+        self.resources.mkdir(parents=True)
+        source = Path(__file__).resolve().parents[1]
+        for name in ('__init__.py', 'benchmark.py', '_benchmark_cases.py',
+                     '_benchmark_budget.py', '_benchmark_entry.py'):
+            shutil.copyfile(source / 'stallionfs' / name, self.package / name)
+        for name in benchmark.RUNTIME_FILES:
+            target = self.resources / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / 'tests/perf' / name, target)
+        self.write_manifest()
+        self.cwd = self.root / 'hostile cwd'
+        (self.cwd / 'stallionfs').mkdir(parents=True)
+        (self.cwd / 'stallionfs/__init__.py').write_text("raise RuntimeError('wrong package')\n")
+        (self.cwd / 'sitecustomize.py').write_text("raise RuntimeError('site initialized')\n")
+        (self.site / 'argparse.py').write_text("raise RuntimeError('site sibling shadowed stdlib')\n")
+        (self.site / 'fileops.py').write_text("raise RuntimeError('unverified sibling collector')\n")
+        self.environment = {**os.environ, 'PYTHONPATH': str(self.cwd), 'PYTHONHOME': '/not-a-runtime',
+                            'PYTHONDONTWRITEBYTECODE': '1'}
+
+    def write_manifest(self):
+        manifest = {'schema': 1, 'kind': 'build-source provenance', 'build_source_sha256': {},
+                    'resources': {name: hashlib.sha256((self.resources / name).read_bytes()).hexdigest()
+                                  for name in benchmark.RUNTIME_FILES}}
+        (self.resources / 'manifest.json').write_text(json.dumps(manifest))
+
+    def child(self, name, *arguments, environment=None):
+        argv = benchmark._collector_argv(self.resources, name, *arguments)
+        return subprocess.run(argv, cwd=self.cwd, env=environment or self.environment,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+
+    def test_clean_installed_native_suite_reaches_bounded_inventory_command(self):
+        binary = self.root / 'inventory fixture'
+        binary.write_text('#!/bin/sh\nprintf "inventory reached\\n" >&2\nexit 23\n')
+        binary.chmod(0o700)
+        scratch = self.root / 'scratch'
+        scratch.mkdir(mode=0o700)
+        receipts = self.root / 'receipts'
+        receipts.mkdir(mode=0o700)
+        result = self.child('native_suite.py', '--binary', binary, '--scratch', scratch,
+                            '--output', self.root / 'report.json', '--fixtures', 'docs_5k_100mb',
+                            '--operations', 'clone', '--copy-tools', 'ditto',
+                            environment={**self.environment,
+                                'STALLIONFS_BENCHMARK_DEADLINE': str(time.monotonic() + 10),
+                                'STALLIONFS_BENCHMARK_RECEIPTS': str(receipts)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Command failed (23)', result.stderr)
+        self.assertIn('inventory reached', result.stderr)
+        self.assertNotIn('ModuleNotFoundError', result.stderr)
+        recorded = [json.loads(path.read_text()) for path in receipts.iterdir()]
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]['argv'], [str(binary), '--json', 'volumes'])
+        self.assertEqual(recorded[0]['exit_code'], 23)
+        self.assertFalse(recorded[0]['completion_uncertain'])
+        self.assertEqual(list(scratch.iterdir()), [])
+        self.assertFalse((self.root / 'report.json').exists())
+
+    def test_full_campaign_and_nested_stage_share_clean_installed_entry(self):
+        result = self.child('campaign.py', '--help')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        probe = self.resources / 'native_suite.py'
+        probe.write_text('''if __name__ == '__main__':
+    import json, subprocess, sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    import campaign
+    args = SimpleNamespace(scratch=Path(sys.argv[1]), samples=10, node=Path('/fixture/node'),
+        npm=Path('/fixture/npm'), npm_cache=Path('/fixture/cache'), binary=Path('/fixture/stallionfs'),
+        cache=['warm'], output_dir=Path(sys.argv[1]))
+    stage = next(row for row in campaign.stages(args, 1) if row[0] == 'native-cli-delete')
+    argv = stage[2][:stage[2].index('--scratch')] + ['--help']
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    print(json.dumps({'argv': argv, 'help': result.stdout}))
+''')
+        self.write_manifest()
+        result = self.child('native_suite.py', self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(Path(data['argv'][0]).resolve(), Path(sys.executable).resolve())
+        self.assertEqual(data['argv'][1:4], ['-I', '-B', '-S'])
+        self.assertEqual(data['argv'][4:6], [str(self.package / '_benchmark_entry.py'), 'cli.py'])
+        self.assertIn('--native-delete', data['help'])
+
+    def test_scan_memory_child_uses_the_same_installed_package(self):
+        counts = {'files': 1}
+        native = self.package / '_scan.py'
+        native.write_text('''def scan(*args, **kwargs):
+    import sys
+    forbidden = ('scan', 'fileops', 'native_suite', 'native_correctness', 'native_fixtures',
+                 'native_metrics', 'native_report', 'stallionfs.benchmark',
+                 'stallionfs._benchmark_cases', 'stallionfs._benchmark_budget')
+    assert not any(name in sys.modules for name in forbidden), 'orchestration imported in measured child'
+    assert not any('_benchmark_runtime' in path for path in sys.path), 'collector import root in measured child'
+    return {'files': 1}
+''')
+        digest = hashlib.sha256(native.read_bytes()).hexdigest()
+        (self.resources / 'native_suite.py').write_text(f'''if __name__ == '__main__':
+    import json, subprocess
+    import scan
+    seen = []
+    def measure(argv, metrics):
+        seen.append(argv)
+        result = subprocess.run(argv, capture_output=True, timeout=10)
+        return {{'exit_code': result.returncode, 'rss_bytes': 1}}, result
+    scan.f.measure_memory = measure
+    result = scan.memory_sample('/unused', 'posix', {counts!r}, {digest!r}, '/unused-metrics')
+    print(json.dumps({{'result': result, 'argv': seen[0]}}))
+''')
+        self.write_manifest()
+        result = self.child('native_suite.py')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['result']['counts'], counts)
+        self.assertEqual(data['result']['native_binary_sha256'], digest)
+        self.assertEqual(data['argv'][1:5], ['-I', '-B', '-S', '-c'])
+        self.assertEqual(data['argv'][6], str(self.site))
+
+    def test_changed_collector_is_rejected_before_execution(self):
+        target = self.resources / 'native_suite.py'
+        target.write_text("raise RuntimeError('changed collector executed')\n")
+        result = self.child('native_suite.py', '--help')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Installed benchmark resource changed: native_suite.py', result.stderr)
+        self.assertNotIn('changed collector executed', result.stderr)
 
 
 if __name__ == '__main__':

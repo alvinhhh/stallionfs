@@ -14,9 +14,20 @@ import sys
 import tempfile
 from xml.parsers.expat import ExpatError
 
+from .core import StallionError
+
+
+class _CommandFailure(StallionError):
+    """A completed native command, distinct from validation or launch failures."""
+    def __init__(self, args, result):
+        self.args_native = tuple(str(arg) for arg in args)
+        self.returncode = result.returncode
+        self.stdout, self.stderr = result.stdout, result.stderr
+        super().__init__(f"{args[0]} failed ({result.returncode}): "
+                         + result.stderr.decode(errors='replace').strip())
+
 
 def _error(message):
-    from .core import StallionError
     return StallionError(message)
 
 
@@ -30,10 +41,7 @@ def _command(*args):
     result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077)
     if result.returncode:
-        error = _error(f"{args[0]} failed ({result.returncode}): "
-                       + result.stderr.decode(errors="replace").strip())
-        error.returncode = result.returncode
-        raise error
+        raise _CommandFailure(args, result)
     return result.stdout
 
 
@@ -112,6 +120,22 @@ def _attachments(image):
         raise _error(f"Image changed while checking its attachment: {image}")
     if len(matches) > 1:
         raise _error(f"Image has multiple attachments; inspect before continuing: {image}")
+    if matches:
+        selected_entities = matches[0].get('system-entities')
+        if not isinstance(selected_entities, list):
+            raise _error(f'Invalid attachment entity metadata: {image}')
+        devices = {e.get('dev-entry') for e in selected_entities
+                   if isinstance(e, dict) and isinstance(e.get('dev-entry'), str)}
+        for entry in inventory:
+            if entry is matches[0]:
+                continue
+            entities = entry.get('system-entities')
+            if (not isinstance(entities, list) or not entities or
+                    any(not isinstance(e, dict) or not isinstance(e.get('dev-entry'), str) or
+                        not re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', e['dev-entry']) for e in entities)):
+                raise _error('Invalid image attachment entities in inventory')
+            if any(isinstance(e.get('dev-entry'), str) and e['dev-entry'] in devices for e in entities):
+                raise _error(f'Ambiguous image attachment devices: {image}')
     return matches
 
 
@@ -128,13 +152,18 @@ def mounted(image):
     devices = [e.get('dev-entry') for e in entities]
     if not devices or not all(isinstance(d, str) and re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', d) for d in devices):
         raise _error(f"Invalid attachment device metadata: {image}")
+    if len(set(devices)) != len(devices):
+        raise _error(f"Duplicate attachment devices: {image}")
     whole = [d for d in devices if re.fullmatch(r'/dev/disk[0-9]+', d)]
     if not whole:
         raise _error(f"Image attachment has no disk device: {image}")
     volumes = [e for e in entities if e.get('mount-point')]
     if len(volumes) > 1:
         raise _error(f"Image unexpectedly contains multiple mounted volumes: {image}")
-    mapping = {'image': str(image), 'device': whole[0], 'mountpoint': None, 'volume_device': None}
+    # Serialize the complete inventory entry from this same read. Bytes preserve
+    # ordered entities and cannot be changed through a later caller's dictionary.
+    mapping = {'image': str(image), 'device': whole[0], 'mountpoint': None, 'volume_device': None,
+               'attachment': plistlib.dumps(entry, fmt=plistlib.FMT_BINARY)}
     if volumes:
         volume = volumes[0]
         point = _path(volume['mount-point'])
@@ -187,11 +216,54 @@ def attach(image, mountpoint):
         raise
 
 
+def _backing_identity(image):
+    info = _image(image).lstat()
+    return info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink
+
+
+def _device_identity(device):
+    info = os.lstat(device)
+    if not stat.S_ISBLK(info.st_mode):
+        raise _error(f'Expected a block device: {device}')
+    return info.st_dev, info.st_ino, info.st_rdev, info.st_mode
+
+
+def _unmounted_snapshot(current, point):
+    entry = plistlib.loads(current['attachment'])
+    for entity in entry['system-entities']:
+        if 'mount-point' in entity:
+            if entity['mount-point'] != str(point):
+                raise _error('Unexpected attachment mount metadata')
+            del entity['mount-point']
+    return plistlib.dumps(entry, fmt=plistlib.FMT_BINARY)
+
+
+def _no_graph_mounts(current, point):
+    from ._scan import mounts
+    devices = {e['dev-entry'] for e in plistlib.loads(current['attachment'])['system-entities']}
+    records = mounts()
+    if (not isinstance(records, list) or any(not isinstance(r, dict) or
+            not isinstance(r.get('device'), str) or not r['device'] or
+            not isinstance(r.get('path'), str) or not r['path'].startswith('/') for r in records)):
+        raise _error('Unknown mount inventory; preserve the image')
+    if os.path.ismount(point) or any(r['device'] in devices or r['path'] == str(point) for r in records):
+        raise _error('An image device or expected mountpoint is still mounted; preserve the image')
+
+
+def _completed_eject_failure(error, device):
+    # Exit statuses are not errno values. Match the observed diagnostic exactly;
+    # fresh inventories must independently prove partial unmount below.
+    return (isinstance(error, _CommandFailure) and error.returncode == 1 and
+            error.args_native == ('/usr/sbin/diskutil', 'eject', device) and
+            error.stdout.strip() in (b'', f'Eject failed for {device.removeprefix("/dev/")}'.encode()) and
+            error.stderr.strip() == b'Volume failed to eject')
+
+
 def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
     image, point = _image(image), _path(mountpoint)
     _directory(point.parent)
-    identity = image.stat()
+    identity = _backing_identity(image)
     current = mounted(image)
     if not current:
         if os.path.ismount(point):
@@ -204,16 +276,49 @@ def detach(image, mountpoint):
         raise _error(f"Invalid image attachment target: {image}")
     # Keep the selected device from this owned image; never choose another
     # whole device if its attachment mapping changes before the command.
+    device_identity = _device_identity(current['device'])
     confirmed = mounted(image)
-    before = image.stat()
-    if confirmed != current or (identity.st_dev, identity.st_ino) != (before.st_dev, before.st_ino):
+    if (confirmed != current or identity != _backing_identity(image) or
+            device_identity != _device_identity(current['device'])):
         raise _error(f"Image attachment changed before eject: {image}")
-    _command('/usr/sbin/diskutil', 'eject', current['device'])
-    remaining = mounted(image)
-    after = image.stat()
-    if (remaining is not None or os.path.ismount(point) or
-            (identity.st_dev, identity.st_ino) != (after.st_dev, after.st_ino)):
-        raise _error(f"Image remains attached or changed; keep its files: {image}")
+
+    def verify_absent():
+        if mounted(image) is not None or identity != _backing_identity(image):
+            raise _error(f"Image remains attached or changed; keep its files: {image}")
+        _no_graph_mounts(current, point)
+
+    try:
+        _command('/usr/sbin/diskutil', 'eject', current['device'])
+    except _CommandFailure as original:
+        if not _completed_eject_failure(original, current['device']):
+            raise
+        try:
+            if current['mountpoint'] != str(point):
+                raise _error('Eject did not begin with the expected mounted image')
+            expected = dict(current, mountpoint=None, volume_device=None,
+                            attachment=_unmounted_snapshot(current, point))
+            # Two fresh normal inventory reads, each with independent mount-table
+            # checks, admit only the original graph with its mount-point removed.
+            for _ in range(2):
+                if mounted(image) != expected:
+                    raise _error('Image attachment did not become the same unmounted graph')
+                _no_graph_mounts(current, point)
+                if (identity != _backing_identity(image) or
+                        device_identity != _device_identity(current['device'])):
+                    raise _error('Image or selected device identity changed before continuation')
+            # This narrows name reuse races; diskutil-by-name is not atomic with
+            # external detach/reattach, even under a managed workspace lock.
+            _command('/usr/sbin/diskutil', 'eject', current['device'])
+            verify_absent()
+        except BaseException as recovery:
+            original.add_note(f'Eject continuation refused or failed; keep {image}: '
+                              f'{type(recovery).__name__}: {recovery}')
+            if not isinstance(recovery, Exception):
+                recovery.add_note(f'First eject failure: {original}')
+                raise
+            raise original from recovery
+        return
+    verify_absent()
 
 
 def flush(image):
