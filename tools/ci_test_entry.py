@@ -412,11 +412,28 @@ def validate_receipt(data):
     return r
 
 
-def remainder(start, minutes, now=None):
-    now = time.monotonic() if now is None else now
-    if type(minutes) is not int or minutes not in (15, 20, 30, 45) or type(start) not in (int, float) or type(now) not in (int, float) or not math.isfinite(now) or not math.isfinite(start) or not 0 <= start <= now:
+def allocation_clock_ns():
+    # Explicit Darwin clock IDs share an origin across Python versions; the
+    # system Python's time.monotonic() may instead start at each process.
+    try:
+        if sys.platform != 'darwin':
+            raise ValueError('Darwin allocation clock required')
+        value = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    except (AttributeError, OSError) as error:
+        raise ValueError('Allocation clock unavailable') from error
+    if type(value) is not int or value < 0:
+        raise ValueError('Invalid allocation clock')
+    return value
+
+
+def remainder(start_ns, minutes, now_ns=None, *, tail=False):
+    now_ns = allocation_clock_ns() if now_ns is None else now_ns
+    if (type(minutes) is not int or minutes not in (15, 20, 30, 45)
+            or type(start_ns) is not int or type(now_ns) is not int
+            or not 0 <= start_ns <= now_ns or type(tail) is not bool):
         raise ValueError('Invalid worker allocation')
-    return max(0, min(minutes * 60 - RESERVE, start + minutes * 60 - RESERVE - now))
+    limit_ns = (minutes * 60 - (10 if tail else RESERVE)) * 10**9
+    return max(0, min(limit_ns, start_ns + limit_ns - now_ns)) / 10**9
 
 
 class CaptureResult:

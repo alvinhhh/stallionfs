@@ -14,6 +14,14 @@ spec = importlib.util.spec_from_file_location('entry', ROOT / 'tools/ci_test_ent
 entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
 spec = importlib.util.spec_from_file_location('budget', ROOT / 'tools/ci_job_budget.py')
 budget = importlib.util.module_from_spec(spec); spec.loader.exec_module(budget)
+NS = 10**9
+EPOCH_NS = 10000 * NS
+
+
+def allocation_record(start_ns, minutes, environment):
+    return dict(schema=1, clock='darwin-CLOCK_MONOTONIC_RAW-ns-v1',
+                start_ns=start_ns, minutes=minutes,
+                identity={key: environment[key] for key in budget.IDENTITY}, token='a'*32)
 
 WRITER = """
 import json,os,sys,time
@@ -274,10 +282,10 @@ class EvidenceTests(unittest.TestCase):
     def test_anchor_state_and_phase_order(self):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {
             'RUNNER_TEMP':d,'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'1',
-            'GITHUB_JOB':'test','CI_WORKER':'macos-15-3.12-0-installed','CI_SPARSE_REQUIRED':'1'}):
+            'GITHUB_JOB':'test','CI_WORKER':'macos-15-3.12-0-installed','CI_SPARSE_REQUIRED':'1'}), \
+                patch.object(entry.time, 'clock_gettime_ns', return_value=EPOCH_NS):
             path=Path(d)/'ci-allocation.json'
-            record=dict(start=time.monotonic()-25,minutes=20,
-                        identity={k:os.environ[k] for k in budget.IDENTITY},token='a'*32)
+            record=allocation_record(EPOCH_NS-25*NS,20,os.environ)
             def save(r):
                 data=json.dumps(r).encode();path.write_bytes(data)
                 os.environ['CI_ALLOCATION_SHA256']=budget.digest(data)
@@ -291,26 +299,53 @@ class EvidenceTests(unittest.TestCase):
             for phase in ('pass','fail','suite'):
                 j,_=budget.claim(phase);budget.finish(phase,j)
             with self.assertRaises(FileExistsError):budget.claim('suite')
-            path.write_text(json.dumps(dict(record,start=time.monotonic())))
+            path.write_text(json.dumps(dict(record,start_ns=EPOCH_NS)))
             with self.assertRaises(ValueError):budget.load()
-            for changes in (dict(start=time.monotonic()+100),dict(start=1),
-                            dict(start=float('nan')),dict(start=True),dict(minutes=True),
+            for changes in (dict(start_ns=EPOCH_NS+100*NS),dict(start_ns=1),
+                            dict(start_ns=float('nan')),dict(start_ns=True),dict(start_ns=-1),
+                            dict(start_ns=1.0),dict(start_ns=float('inf')),dict(minutes=True),
+                            dict(schema=True),dict(schema=2),dict(clock='time.monotonic'),
                             dict(identity=dict(record['identity'],GITHUB_RUN_ATTEMPT='2')),
                             dict(identity=[])):
                 save(dict(record,**changes))
                 with self.assertRaises(ValueError):budget.load()
 
+    def test_workflow_anchor_keeps_setup_time_across_generic_clock_origins(self):
+        import textwrap
+        text=(ROOT/'.github/workflows/checks.yml').read_text()
+        anchor=text.split("          /usr/bin/python3 -I -B - <<'PYTHON'\n",1)[1].split('          PYTHON\n',1)[0]
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {
+            'RUNNER_TEMP':d,'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'1',
+            'GITHUB_JOB':'test','CI_WORKER':'worker','CI_JOB_MINUTES':'20',
+            'GITHUB_ENV':str(Path(d)/'environment')}):
+            with patch.object(entry.time,'clock_gettime_ns',return_value=EPOCH_NS), \
+                    patch.object(entry.time,'monotonic',return_value=.01), \
+                    patch.object(entry.time,'perf_counter',return_value=.01):
+                exec(compile(textwrap.dedent(anchor),'<allocation-anchor>','exec'),{})
+            path=Path(d)/'ci-allocation.json';original=path.read_bytes()
+            marker=Path(os.environ['GITHUB_ENV']).read_text().strip()
+            os.environ['CI_ALLOCATION_SHA256']=marker.split('=',1)[1]
+            with patch.object(entry.time,'clock_gettime_ns',return_value=EPOCH_NS+25*NS), \
+                    patch.object(entry.time,'monotonic',return_value=999999), \
+                    patch.object(entry.time,'perf_counter',return_value=999999):
+                record,job,remaining=budget.load()
+                self.assertEqual(remaining,1045)
+                self.assertEqual(budget.load(tail=True)[2],1165)
+            self.assertEqual(record['start_ns'],EPOCH_NS)
+            self.assertEqual(job,budget.digest(original))
+            self.assertEqual(path.read_bytes(),original)
+
     def test_tail_uses_absolute_deadline_and_retains_refusal(self):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {
             'RUNNER_TEMP':d,'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'1',
-            'GITHUB_JOB':'test','CI_WORKER':'worker','GITHUB_OUTPUT':str(Path(d)/'outputs')}):
-            record=dict(start=time.monotonic()-800,minutes=15,
-                        identity={k:os.environ[k] for k in budget.IDENTITY},token='a'*32)
+            'GITHUB_JOB':'test','CI_WORKER':'worker','GITHUB_OUTPUT':str(Path(d)/'outputs')}), \
+                patch.object(entry.time, 'clock_gettime_ns', return_value=EPOCH_NS):
+            record=allocation_record(EPOCH_NS-800*NS,15,os.environ)
             data=json.dumps(record).encode()
             (Path(d)/'ci-allocation.json').write_bytes(data)
             os.environ['CI_ALLOCATION_SHA256']=budget.digest(data)
             self.assertEqual(budget.tail('suite-upload'),0)
-            with patch.object(budget.time,'monotonic',return_value=record['start']+850):
+            with patch.object(entry.time,'clock_gettime_ns',return_value=record['start_ns']+850*NS):
                 self.assertEqual(budget.tail('image-upload'),1)
             paths=list(Path(d).glob('suite-closure-refusal-*.json'))
             self.assertEqual(len(paths),1)
@@ -325,8 +360,7 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {
             'RUNNER_TEMP':d,'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'1',
             'GITHUB_JOB':'test','CI_WORKER':'worker','CI_SPARSE_REQUIRED':'1'}):
-            record=dict(start=time.monotonic(),minutes=15,
-                        identity={k:os.environ[k] for k in budget.IDENTITY},token='a'*32)
+            record=allocation_record(entry.allocation_clock_ns(),15,os.environ)
             data=json.dumps(record).encode()
             (Path(d)/'ci-allocation.json').write_bytes(data)
             os.environ['CI_ALLOCATION_SHA256']=budget.digest(data)
@@ -358,9 +392,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("'doctor'], check=True)",admission)
         self.assertIn("'check', str(container)], check=True)",admission)
         self.assertIn('resource.RLIMIT_CPU, (300, 300)',text)
-        self.assertEqual(entry.remainder(100,20,200),970)
-        self.assertGreater(entry.remainder(100,20,200),686)
-        self.assertGreater(entry.remainder(100,45,125),1792)
+        self.assertEqual(entry.remainder(100*NS,20,200*NS),970)
+        self.assertGreater(entry.remainder(100*NS,20,200*NS),686)
+        self.assertGreater(entry.remainder(100*NS,45,125*NS),1792)
 
 
 
@@ -368,8 +402,7 @@ class PublicBudgetTests(unittest.TestCase):
     def anchor(self, root):
         env=dict(os.environ,RUNNER_TEMP=str(root),GITHUB_RUN_ID='42',GITHUB_RUN_ATTEMPT='1',
                  GITHUB_JOB='test',CI_WORKER='owned',CI_SPARSE_REQUIRED='1',GITHUB_OUTPUT=str(root/'output'))
-        data=json.dumps(dict(start=time.monotonic(),minutes=15,
-                             identity={k:env[k] for k in budget.IDENTITY},token='a'*32)).encode()
+        data=json.dumps(allocation_record(entry.allocation_clock_ns(),15,env)).encode()
         (root/'ci-allocation.json').write_bytes(data)
         env['CI_ALLOCATION_SHA256']=budget.digest(data)
         return env

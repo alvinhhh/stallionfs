@@ -12,6 +12,7 @@ SOURCE = Path(__file__).resolve().parents[1] / 'tools/ci_test_entry.py'
 spec = importlib.util.spec_from_file_location('ci_test_entry_test', SOURCE)
 entry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entry)
+NS = 10**9
 
 CHILD = '''
 import importlib.util, os, sys, threading, time, unittest
@@ -19,6 +20,26 @@ spec = importlib.util.spec_from_file_location('entry', sys.argv[1])
 e = importlib.util.module_from_spec(spec); spec.loader.exec_module(e)
 events = e.Events(sys.argv[2])
 mode = sys.argv[3]
+observer_done = threading.Event()
+exit_done = threading.Event()
+stack_count = 0
+original_emit = events.emit
+def observed_emit(value):
+    global stack_count
+    original_emit(value)
+    if value.get('kind') == 'stack':
+        stack_count += 1
+        if stack_count == 3: observer_done.set()
+    if value.get('phase') == 'exit' and value.get('state') == 'end': exit_done.set()
+events.emit = observed_emit
+original_snapshots = events.snapshots
+def snapshots(delays):
+    if mode == 'finalization' and not exit_done.wait(2):
+        raise RuntimeError('exit observer did not progress')
+    original_snapshots(delays)
+events.snapshots = snapshots
+def wait_for_observer():
+    if not observer_done.wait(2): raise RuntimeError('snapshot observer did not progress')
 secret = 'SECRET_SENTINEL_4821'
 os.environ['PRIVATE_TEST_VALUE'] = secret
 class Case(unittest.TestCase):
@@ -26,14 +47,19 @@ class Case(unittest.TestCase):
         self.assertTrue(mode != 'fail', 'controlled assertion failure')
 def boundary(name):
     if mode == name + '-error': raise ValueError(secret)
-    if mode == name + '-delay': exec(compile('import time; time.sleep(.3)', '/private/' + secret + '/fake.py', 'exec'))
+    if mode == name + '-delay':
+        exec(compile('import time; time.sleep(.3)', '/private/' + secret + '/fake.py', 'exec'))
+        wait_for_observer()
     if mode == name + '-stall': time.sleep(10)
 def factory():
     def suite(): return unittest.TestSuite([Case()])
     def account(result):
         boundary('accounting')
         if mode in ('finalization', 'finalization-stall'):
-            threading.Thread(target=lambda: time.sleep(10 if mode.endswith('stall') else .3)).start()
+            def finalize():
+                time.sleep(10 if mode.endswith('stall') else .3)
+                if mode == 'finalization': wait_for_observer()
+            threading.Thread(target=finalize).start()
         return not result.wasSuccessful()
     return suite, lambda: boundary('close'), lambda: boundary('admission'), account, unittest.TextTestResult
 code = e.lifecycle(factory, events, snapshot_delays=(.04, .04, .04))
@@ -153,10 +179,35 @@ class EntryTests(unittest.TestCase):
             with self.assertRaises(ValueError): entry.validate(path)
 
     def test_job_remainder_is_anchored_and_reserves_upload(self):
-        self.assertEqual(entry.remainder(100, 20, 125), 1045)
-        self.assertEqual(entry.remainder(100, 20, 5000), 0)
-        for start, minutes in ((float('nan'), 20), (501, 20), (0, 46)):
-            with self.assertRaises(ValueError): entry.remainder(start, minutes, 500)
+        self.assertEqual(entry.remainder(100*NS, 20, 125*NS), 1045)
+        self.assertEqual(entry.remainder(100*NS, 20, 5000*NS), 0)
+        self.assertEqual(entry.remainder(100*NS, 15, 900*NS, tail=True), 90)
+        self.assertEqual(entry.remainder(100*NS, 15, 870*NS), 0)
+        self.assertEqual(entry.remainder(100*NS, 15, 990*NS, tail=True), 0)
+        self.assertEqual(entry.remainder(100*NS, 15, 125*NS+1), 744.999999999)
+        for start, minutes in ((float('nan'), 20), (501*NS, 20), (0, 46),
+                               (True, 20), (-1, 20), (100.0, 20), (0, True)):
+            with self.assertRaises(ValueError): entry.remainder(start, minutes, 500*NS)
+        for now in (True, float('inf'), float('nan'), -1, 100.0):
+            with self.assertRaises(ValueError): entry.remainder(0, 20, now)
+        with self.assertRaises(ValueError): entry.remainder(0, 20, NS, tail=1)
+
+    def test_allocation_uses_explicit_clock_without_generic_origin_or_fallback(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with patch.object(entry.time, 'clock_gettime_ns', return_value=10025*NS) as clock, \
+                patch.object(entry.time, 'monotonic', side_effect=AssertionError('wrong origin')), \
+                patch.object(entry.time, 'perf_counter', side_effect=AssertionError('wrong origin')):
+            self.assertEqual(entry.remainder(10000*NS,20),1045)
+            clock.assert_called_once_with(entry.time.CLOCK_MONOTONIC_RAW)
+        for clock_value in (True, -1, 1.5, float('inf'), float('nan')):
+            with self.subTest(clock_value=clock_value), \
+                    patch.object(entry.time, 'clock_gettime_ns', return_value=clock_value):
+                with self.assertRaises(ValueError): entry.allocation_clock_ns()
+        with patch.object(entry, 'time', SimpleNamespace()):
+            with self.assertRaisesRegex(ValueError, 'clock unavailable'): entry.allocation_clock_ns()
+        with patch.object(entry.time, 'clock_gettime_ns', side_effect=OSError('unavailable')):
+            with self.assertRaisesRegex(ValueError, 'clock unavailable'): entry.allocation_clock_ns()
 
 
     def test_required_skip_and_contextual_accounting(self):
@@ -183,7 +234,11 @@ class EntryTests(unittest.TestCase):
         text = (root / '.github/workflows/checks.yml').read_text()
         worker = text.split('  test-execution:', 1)[1].split('\n  test:', 1)[0]
         self.assertLess(worker.index('Anchor worker allocation'), worker.index('uses: actions/checkout'))
-        self.assertIn("time.monotonic()", worker)
+        self.assertIn("time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)", worker)
+        self.assertIn("clock='darwin-CLOCK_MONOTONIC_RAW-ns-v1'", worker)
+        self.assertLess(worker.index('Create owned CI interpreter'), worker.index('Check shared allocation clock'))
+        self.assertLess(worker.index('Check shared allocation clock'), worker.index('Install pinned wheel backend'))
+        self.assertIn("record['start_ns'] <= before_ns <= sample['sample_ns'] <= after_ns", worker)
         expressions = [line.split('${{ ', 1)[1] for line in worker.splitlines()
                        if 'timeout-minutes: ${{' in line or 'CI_JOB_MINUTES: ${{' in line]
         self.assertEqual(len(expressions), 2)
@@ -195,8 +250,8 @@ class EntryTests(unittest.TestCase):
                        and isinstance(node.func, ast.Attribute) and node.func.attr == 'discover']
         self.assertEqual(len(discoveries), 1)
         self.assertEqual(ast.unparse(discoveries[0]), "unittest.defaultTestLoader.discover(str(checkout / 'tests'))")
-        self.assertEqual(entry.remainder(100, 45, 125), 2545)
-        self.assertGreater(entry.remainder(100, 45, 125), 1792)
+        self.assertEqual(entry.remainder(100*NS, 45, 125*NS), 2545)
+        self.assertGreater(entry.remainder(100*NS, 45, 125*NS), 1792)
 
 
 
@@ -422,7 +477,8 @@ def run_public_entry(root, case):
     import subprocess,hashlib
     env=dict(os.environ,RUNNER_TEMP=str(root),GITHUB_RUN_ID='entry',GITHUB_RUN_ATTEMPT='1',
              GITHUB_JOB='test',CI_WORKER='owned',CI_SPARSE_REQUIRED='0')
-    data=json.dumps(dict(start=time.monotonic(),minutes=15,
+    data=json.dumps(dict(schema=1,clock='darwin-CLOCK_MONOTONIC_RAW-ns-v1',
+         start_ns=entry.allocation_clock_ns(),minutes=15,
          identity={k:env[k] for k in ('GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','CI_WORKER')},token='a'*32)).encode()
     (root/'ci-allocation.json').write_bytes(data)
     env['CI_ALLOCATION_SHA256']=hashlib.sha256(data).hexdigest()
