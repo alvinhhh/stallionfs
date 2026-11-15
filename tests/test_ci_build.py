@@ -1397,7 +1397,7 @@ class OwnedCIInterpreter(unittest.TestCase):
             expected_count = 2 if name == 'Install current owned wheel' else 1
             self.assertTrue(len(commands) == expected_count and all(command.startswith('          "${CI_PYTHON:?}" -I -B ') for command in commands), 'owned-consumer:' + name)
         diagnostic = step(ordinary, 'Validate bounded image diagnostic artifact')
-        self.assertIn("if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'", diagnostic)
+        self.assertIn("if: (success() || failure()) && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'", diagnostic)
         install = step(ordinary, 'Install current owned wheel')
         doctor = step(ordinary, 'Check installed runtime and doctor')
         self.assertIn('"${CI_STALLIONFS:?}" --root "$RUNNER_TEMP/stallionfs-smoke" doctor', doctor)
@@ -1493,7 +1493,7 @@ class FetchPhases(unittest.TestCase):
         self.assertIn("if: success() && matrix.phase == 'installed' && matrix.os == 'macos-15' && matrix.python == '3.12'", large)
         for name, condition, missing in (
                 ('Upload component fetch failure diagnostics', "failure() && steps.component-fetch.outcome == 'failure'", 'ignore'),
-                ('Upload bounded image failure diagnostics', "failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'", 'error'),
+                ('Upload bounded image failure diagnostics', "(success() || failure()) && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'", 'error'),
                 ('Upload FSKit interface failure diagnostics', "failure() && matrix.phase == 'installed'", 'ignore')):
             artifact = step(ordinary, name)
             for value in ('if: ' + condition, 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',

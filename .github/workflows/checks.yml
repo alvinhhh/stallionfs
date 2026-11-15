@@ -396,12 +396,12 @@ jobs:
           PY
       - name: Admit validation
         id: tail-validation
-        if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'
+        if: (success() || failure()) && matrix.phase == 'installed' && steps.ci-python.outcome == 'success'
         run: |
           "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail validation
       - name: Validate bounded image diagnostic artifact
         timeout-minutes: 1
-        if: failure() && matrix.phase == 'installed' && steps.ci-python.outcome == 'success' && steps.tail-validation.outputs.admitted == 'true'
+        if: (success() || failure()) && matrix.phase == 'installed' && steps.ci-python.outcome == 'success' && steps.tail-validation.outputs.admitted == 'true'
         id: image-diagnostics
         run: |
           cd "$RUNNER_TEMP"
@@ -436,12 +436,12 @@ jobs:
           retention-days: 1
       - name: Admit image-upload
         id: tail-image-upload
-        if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'
+        if: (success() || failure()) && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true'
         run: |
           "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail image-upload
       - name: Upload bounded image failure diagnostics
         timeout-minutes: 1
-        if: failure() && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true' && steps.tail-image-upload.outputs.admitted == 'true'
+        if: (success() || failure()) && matrix.phase == 'installed' && steps.image-diagnostics.outputs.available == 'true' && steps.tail-image-upload.outputs.admitted == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-failure-${{ matrix.os }}-${{ matrix.python }}
