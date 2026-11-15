@@ -75,7 +75,7 @@ Files are stored in `~/Library/Application Support/stallionfs`. Set `STALLIONFS_
 
 ## Installation
 
-Requires macOS, Python 3.11+ and Xcode Command Line Tools. Workspace storage must be on APFS. Install from source:
+Requires macOS, Python 3.11+ and Xcode Command Line Tools when building from source. Workspace storage must be on APFS. Install from source:
 
 ```sh
 git clone https://github.com/alvinhhh/stallionfs.git
@@ -85,7 +85,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+Source and editable installs build a pinned private Git dependency targeting macOS 13 without installing system files. The first build downloads verified upstream source archives. Wheels include that dependency and its corresponding source; their macOS tag reflects the highest deployment target in the complete payload. Ordinary Git operations retain the selected Git provider's configuration and authentication behavior. Providers supporting configured hooks use the packaged runtime with the provider's live default paths. See [dependency builds](CONTRIBUTING.md#git-dependency) for offline inputs and rebuilding the delivered source.
+
 ## Performance
+
+[November 15: three private CLI document-clone comparisons against ditto](docs/performance-cli167-ditto-20261115.md).
 
 macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median elapsed times include command startup; each row has ten timing pairs and ten separate resource pairs. These results describe the pinned measured executable; build provenance and exact commands are linked below.
 
@@ -111,4 +115,4 @@ macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median
 
 ## License
 
-[MIT](LICENSE). Maintained by [@alvinhhh](https://github.com/alvinhhh).
+StallionFS code is [MIT](LICENSE). Bundled Git is GPLv2; the runtime includes component licenses and corresponding source. See [dependency builds](CONTRIBUTING.md#git-dependency). Maintained by [@alvinhhh](https://github.com/alvinhhh).

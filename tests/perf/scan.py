@@ -42,8 +42,15 @@ print(json.dumps({'counts': counts, 'native_binary_sha256': native}))
 
 
 def memory_sample(path, method, expected, native_hash, metrics, record=None):
-    row, completed = f.measure_memory([sys.executable, '-I', '-B', '-c', CHILD, path, method,
-                                       json.dumps(expected), native_hash], metrics)
+    if Path(f.__file__).with_name('manifest.json').is_file():
+        import stallionfs
+        package_parent = str(Path(stallionfs.__file__).resolve().parent.parent)
+        child = 'import sys\nsys.path.append(sys.argv.pop(1))\n' + CHILD
+        argv = [sys.executable, '-I', '-B', '-S', '-c', child, package_parent,
+                path, method, json.dumps(expected), native_hash]
+    else:
+        argv = [sys.executable, '-I', '-B', '-c', CHILD, path, method, json.dumps(expected), native_hash]
+    row, completed = f.measure_memory(argv, metrics)
     if record is not None:
         record.update(row)
     if row.get('completion_uncertain') or row['exit_code'] != 0:
@@ -192,7 +199,8 @@ def main():
                         json.dump(expected_source, stream, sort_keys=True)
                         stream.write('\n')
                 metadata['snapshot_sha256'] = f.digest(baseline)
-                metadata['coverage'] = native_fixtures.verify_metadata_coverage(expected_source, metadata['seed'])
+                metadata['coverage'] = native_fixtures.verify_metadata_coverage(
+                    expected_source, metadata['seed'], precision_links=(), precision_scope='scan-only')
                 f.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
                 metadata['status'] = 'prepared'
                 prepared_sources[path] = expected_source

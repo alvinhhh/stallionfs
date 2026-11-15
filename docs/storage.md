@@ -31,6 +31,18 @@ Folder cloning pins files with open descriptors and uses `fclonefileat`, preserv
 
 The prepared image is detached and fully flushed before publication. Each copy mounts with file ownership enabled. Attachment checks use the backing image path, current device and mountpoint; copied volume UUIDs are never used as identity. Managed workspace cleanup retains busy or uncertain attachments and never force-detaches a volume or deletes an attached image.
 
+If a completed normal eject reports `Volume failed to eject` with exit status 1,
+StallionFS can continue once on the same device only when that attempt fully
+unmounted the original volume. Two fresh inventory reads must retain the same
+private backing file, attachment owner, complete ordered device graph and
+selected block-device identity, allowing only removal of the expected mountpoint.
+The mount table must independently show every original graph device unmounted.
+Success requires the attachment to disappear and the backing file to remain
+unchanged. Other command errors, uncertain inventories and still-mounted volumes
+retain the image and the first error. A failed continuation retains both errors.
+These checks narrow device-name reuse races; they cannot make `diskutil eject`
+atomic with external detach or attach operations.
+
 Folder clones still create metadata for each file. Image clones share the backing file's blocks, including the filesystem metadata, until changed. Each workspace has its own Git repository. `du` and file block counts do not reliably identify unique physical space shared by APFS clones, so performance results do not infer a physical-space percentage from them.
 
 The store assumes one trusted operating-system user. Do not edit internal metadata, replace store directories with links, or modify prepared seeds while creating workspaces. Agents run as that same user and are not isolated from the rest of the account.
@@ -106,6 +118,55 @@ the original anchor and lineage to complete installation without repeating impor
 or rename. It preserves the previous result. Once mounting has been attempted,
 that first-install recovery route is closed. Installed ownership blocks external
 registration of the backing inode independently of the creation journal.
+
+`creations [ID]` reads an existing store without initializing or repairing it.
+It includes unbound stages and publication remnants as diagnostic evidence;
+a destination ID in a remnant does not authorize continuation. Candidate
+installation through `creations ID --continue TRANSACTION` requires completed
+verification, an authoritative journal and the exact transaction. Repeating
+continuation for an installed workspace checks its installation proof.
+Normal installation durably records one lifecycle generation in its installation
+intent before rename and carries that generation into the installation proof.
+Continuation publishes or validates that exact generation before removing the
+journal; repeating continuation never creates a replacement generation.
+Older interrupted installations with an unattributed lifecycle file, or a removed
+journal and no lifecycle binding in the proof, remain unqualified for offline
+continuation. This does not authorize adopting an arbitrary legacy generation.
+
+New creation requests also support one fresh replacement after a pre-install
+interruption. An immutable request binds the prepared seed, branch, capacity,
+import policy, installation settings, qualified Git payload and controller lock
+identities before any helper, clone or Git effect. Explicit import budgets retain
+all six values. Otherwise the request binds the default policy; the importer
+derives its actual budget after population and records it in the import receipt.
+The seed must remain quiescent under its managed lock. Direct same-user changes
+to a seed, controls or payload are outside managed exclusion and may cause refusal.
+
+The old journal reserves exactly one replacement. Continuation completes an
+exact control-only bootstrap prefix, or reports an already attempted child; it
+never recursively retries that child through the old ID. A completed image uses
+the existing installation proof route. Fresh replacements get new IDs and do not
+read or reuse the old partial input. A qualified Git actor with unresolved output
+may permit a fresh replacement, but never authorizes deletion of the old input.
+Unresolved package/Host helpers retain the attempt. No PID disappearance, free
+controller lease or elapsed time establishes that a lost writer has stopped.
+
+`creations ID --purge TRANSACTION` previews deliberate disposal of an eligible
+pre-install attempt. `--confirm` permanently removes only its bound stage input,
+partial backing and fixed metadata after exact locks, terminal actor receipts,
+ownership and namespace checks. A write-ahead deletion journal supports resumed
+removal; unexpected entries, substituted files and unverified writers refuse.
+The compact completion keeps the original IDs, request and replacement mapping;
+controller lock files remain. This does not reclaim unknown-writer attempts,
+installed workspaces or arbitrary unbound stages. No automatic expiration is used.
+An interrupted disposal remains inspectable from its bound journal after input,
+marker or stage removal. Inspection reports disposal progress instead of claiming
+that files are preserved. Only an exact confirmed purge resumes removal. A partial
+compact completion can be finished only as its expected byte prefix on the bound
+control inode; file and directory fences and exact readback precede journal removal,
+including confirmed retries. Conflicting or substituted completion controls refuse.
+Incomplete inspection retains discovered entries and reports paths it could not
+finish inspecting. Process interruption tests do not qualify physical power loss.
 
 Mount/unmount intents and helper output remain in each workspace's
 `native-operations` directory; the active typed record is also in the existing
@@ -203,3 +264,115 @@ and excluded from generic removal. A bound replacement or any changed original
 still refuses; no such restart is allowed after relocation authorization.
 Installed writable persistence and ordinary distribution qualification remain
 separate from source/core fixture validation.
+
+### Native hosting identity after restart
+
+New native installations record `native-binding.json` after successful exclusive
+backing admission and consumed close. It binds the original workspace and
+creation transaction to the hosting APFS volume UUID and 64-bit file IDs of the
+workspaces collection, workspace directory, and backing file. Runtime targets
+use freshly observed device numbers. Creation, installation, mount, and close
+receipts retain their original identities; their evidence is validated against
+those historical targets.
+
+A legacy installation with unchanged devices can enroll during ordinary offline
+admission. If its device numbers have already changed and no hosting binding
+exists, select the current closed image explicitly:
+
+```sh
+sfs --root STORE creations WORKSPACE_ID --adopt-current ORIGINAL_TRANSACTION
+```
+
+This publishes a separate current-image adoption epoch. It does not establish
+which volume hosted the original installation, import another image, or recreate
+prepared-tree verification. It requires the original creation and installation
+proofs, unchanged file IDs, private physical paths, an owned single-link backing,
+the image UUID, and a successful exclusive guard against a recorded closed
+committed anchor. The anchor check compares generation, committed end, and root
+digest; it does not authenticate every byte in the image.
+
+Adoption refuses pending or uncertain operations, mounted images, unresolved
+owned processes, moved/retired objects, and purge recovery. Resolve those states
+through their existing explicit workflows. Do not edit recorded identity pins.
+A successful exact retry preserves the existing adoption epoch. Interrupted
+publication leaves either no binding (temporary files remain diagnostic) or a
+complete binding whose guard already closed successfully. An exact creation
+continuation also completes missing guarded enrollment if installation already
+removed its journal; it cannot report installed-unmounted success without it.
+
+Completed catalog, snapshot, restore, mount and unmount history is validated
+against each operation's recorded target and terminal evidence. Catalog commits
+can advance the closed anchor used for enrollment; the newest recorded generation
+must match the fresh guard. Unknown, incomplete or conflicting history refuses
+admission. Historical receipts and cleanup timestamps are not renewed.
+
+A binding grants no cleanup authority. Old mount observations and cleanup
+baselines do not acquire new credit after device renumbering. A new ordinary
+close must establish a current lifecycle baseline. Permanent purge still
+requires the original exact device and inode pairs: translated destructive
+authority after device renumbering is not supported, including after explicit
+current-image adoption. A stored hosting UUID alone cannot grant it.
+
+
+### Reconcile legacy offline mount history
+
+`sfs creations ID --reconcile-current TRANSACTION` explicitly admits the selected
+current backing when an otherwise valid legacy mount recovery lacks evidence that
+its unlinked unmount occurred afterward. Ordinary `--adopt-current` does not perform
+this reconciliation automatically.
+
+The operation requires an absent namespace, no pending operation, the original
+backing identity, valid terminal helper and initial acceptance evidence, and a fresh
+consumed exclusive guard. It saves an immutable receipt identifying the exact legacy
+records by raw hash, then publishes a binding only after another fresh guard and
+scope check. Existing installation bindings cannot be replaced by this action.
+Later operations remain independently validated; the receipt does not waive new
+history or require the current mount marker to remain unchanged.
+
+A successful result reports `current-image-reconciled` and
+`authority=legacy-offline-reconciliation`. It admits the present structurally checked
+root for further lifecycle use. It does not prove historical unmount order, recover
+missing content, or prove that earlier acknowledged writes survived. Prepared or
+unknown children, missing guard evidence and incomplete compound operations remain
+subject to their own recovery requirements.
+
+Managed native activation uses a versioned, one-use `rw,owners` request in the
+already granted resource directory. Probe and load hold an ordinary ROOT_ONLY,
+read-only core admission. They do not obtain a writable descriptor or create
+scratch files. Activation requires the complete supported option stream, a
+current controller lease and request bound to the operation, transaction,
+workspace, backing identity and exact selected anchor, plus a successfully
+activated, non-revoked original resource scope. An absent request stays read-only;
+malformed, stale, conflicting and replayed requests do not authorize promotion.
+
+The consumer validates under a shared gate. Observing the controller's held
+lease at that point transfers one bounded activation attempt; a later controller
+exit cannot retroactively cancel that transfer. Exclusive claim creation prevents
+reuse. A claim can remain after a subsequent write-open or admission failure;
+it is consumption evidence, never fresh recovery authority. These records provide
+cooperative same-account authority, not cryptographic authentication.
+
+Activation opens a separate writable descriptor through the unchanged resource,
+revalidates its identity and ROOT_ONLY anchor, and retains the original read-only
+file description as the exclusive lock owner until all I/O stops. The adapter
+admits contextual writes only after this transition, retaining that mode rather
+than relying on the resource's writable getter. Owner, ACL, caller-context and
+revocation checks still apply. A failed promoted activation blocks new callbacks,
+drains already admitted callbacks and consumes the handle before returning its
+failure. Final OS writable and owner-enforcing mount checks remain mandatory;
+offline activation tests do not establish mounted flag or grant behavior.
+
+New ordinary operations and each new compound remount attempt record activation
+protocol 1 before dispatch. History validation uses that exact operation or
+attempt's version and guard. Historical attempts without this protocol retain
+only their exact historical command forms, without rewriting their receipts.
+Bounded original and later mount observations are retained separately for
+diagnostics; neither can authorize recovery or writable activation.
+
+If an ordinary unmount helper succeeds but the current image guard remains busy,
+the absent observation does not close its lifecycle interval. An explicit unmount
+retry can acquire a fresh guard without launching another helper. The new
+operation owns that closure; earlier incomplete records remain unchanged.
+Mounting and offline archive authority remain blocked until this guarded
+resolution completes. Ambiguous helper ownership, changed predecessors, and
+competing interval histories remain refusals.

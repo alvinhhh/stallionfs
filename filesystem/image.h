@@ -325,6 +325,22 @@ enum sfs_status sfs_image_open(const char *directory, const char *name,
  * Mutations return STATE; fatal reads poison this ordinary handle. */
 enum sfs_status sfs_image_open_readonly(const char *directory, const char *name,
                                       sfs_image **out, sfs_result *result);
+/* Pending admission is O_RDONLY, ROOT_ONLY and exclusively locked. No pins,
+ * verification scratch, transactions or mutations are permitted. Only this
+ * distinct policy can be activated; ordinary readonly/recovery cannot.
+ * Activation borrows parent and rw_fd for this call and never closes them.
+ * It duplicates rw_fd on success and retains the original lock description
+ * until checked close, after closing IO and auxiliary descriptors. Caller
+ * serializes all calls and validates current scoped activation authority first.
+ * parent must be newly resolved through that same still-authorized resource.
+ * Caller must not concurrently close/reuse borrowed descriptors or change their
+ * shared status flags; close its RW descriptor before exposing the activated
+ * handle. cleanup_errno reports a failed owned-candidate close separately from
+ * the primary admission result; failed close is never retried. */
+enum sfs_status sfs_image_open_pending(const char *directory, const char *name,
+                                     sfs_image **out, sfs_result *result);
+enum sfs_status sfs_image_activate_pending(sfs_image *, int parent, int rw_fd,
+                                         const sfs_result *expected, int *cleanup_errno, sfs_result *result);
 /* Inspection is read-only, never selects a candidate implicitly. */
 enum sfs_status sfs_image_inspect(const char *directory, const char *name,
                                 sfs_image **out, sfs_recovery *recovery,

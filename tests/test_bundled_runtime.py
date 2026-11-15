@@ -18,6 +18,32 @@ from stallionfs import _bundle
 SOURCE = Path(__file__).resolve().parents[1]
 
 
+class GitProvenance(unittest.TestCase):
+    def test_exact_native_input_registration(self):
+        profiles = {
+            '9b9401eaea9d2f2b3e88c8c87509b52414b5522016c505718c050cd562725700': 'arm64',
+            '020c08613be10d2d21d46a4defd6c4c98724b0af61426a9a2096e1bee48d546a': 'x86_64',
+        }
+        self.assertEqual(_bundle.QUALIFIED_GIT_INPUTS, frozenset(profiles))
+        self.assertEqual(_bundle.QUALIFIED_GIT_ARCHITECTURES, profiles)
+        for inventory, architecture in profiles.items():
+            contract = dict(_bundle.GIT_CONTRACT, input_inventory_sha256=inventory)
+            self.assertIs(_bundle.git_contract(contract, architecture=architecture), contract)
+
+    def test_registration_keeps_contract_and_inventory_fences(self):
+        contract = dict(_bundle.GIT_CONTRACT, input_inventory_sha256=next(iter(_bundle.QUALIFIED_GIT_INPUTS)))
+        for changed in (dict(_bundle.LEGACY_GIT_CONTRACT),
+                        dict(contract, input_inventory_sha256='0' * 64),
+                        dict(contract, input_inventory_sha256='502cd32f075e275a2638b0b11533ba5b9909e2750f29ea272f7e05f9d9d49107'),
+                        dict(contract, combined_patch_sha256='0' * 64),
+                        dict(contract, schema=True),
+                        {key: value for key, value in contract.items() if key != 'notice_patch_sha256'}):
+            with self.subTest(contract=changed), self.assertRaises(_bundle.BundleError):
+                _bundle.git_contract(changed)
+        unregistered = dict(contract, input_inventory_sha256='0' * 64)
+        self.assertIs(_bundle.git_contract(unregistered, qualified=False), unregistered)
+
+
 def put(path, data=b'fixture', mode=0o644):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -51,8 +77,11 @@ class PrivateFixture(unittest.TestCase):
             put(site / 'stallionfs' / name)
         for name in ('sfs', 'stallionfs'):
             put((app / _bundle.RELATIVE_PATHS['helper']).with_name(name), mode=0o755)
-        descriptor = {'schema': 1, 'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
-                      'package_version': '0.6.3', 'source_build_id': 'a' * 64, 'bundle_version': '9',
+        payload = _bundle.git_payload((app / _bundle.RELATIVE_PATHS['git']).parent.parent)
+        descriptor = {'schema': 2, 'git': dict(_bundle.GIT_CONTRACT, input_inventory_sha256='6' * 64,
+                      payload_entries=payload['entries'], payload_sha256=payload['sha256']),
+                      'python_version': '3.13.18', 'soabi': 'cpython-313-darwin',
+                      'package_version': '0.7.0', 'source_build_id': 'a' * 64, 'bundle_version': '9',
                       'paths': dict(_bundle.RELATIVE_PATHS)}
         json_file(app / _bundle.DESCRIPTOR, descriptor)
         app.chmod(0o755)
@@ -286,7 +315,7 @@ class BundlePaths(PrivateFixture):
         app, module = self.bundle()
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
         site = module.parent.parent
-        put(site / 'stallionfs/__init__.py', b'__version__ = "0.6.3"\n')
+        put(site / 'stallionfs/__init__.py', b'__version__ = "0.7.0"\n')
         put(site / 'stallionfs/__main__.py', b'import os, sys\ndef main():\n return {"argv": list(sys.argv), "cwd": os.getcwd(), "origin": __file__}\n')
         helper = app / _bundle.RELATIVE_PATHS['helper']
         before_cwd, before_environment = os.getcwd(), dict(os.environ)
@@ -313,7 +342,7 @@ class BundlePaths(PrivateFixture):
     def test_bootstrap_uses_validated_package_with_hostile_cwd_and_environment(self):
         app, module = self.bundle()
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
-        put(module.parent / '__init__.py', b'__version__ = "0.6.3"\n')
+        put(module.parent / '__init__.py', b'__version__ = "0.7.0"\n')
         put(module.parent / '__main__.py', b'import os\ndef main():\n return os.getcwd()\n')
         marker = self.root / 'hostile-imported'
         locations = [self.root / name for name in ('Caller Cwd', 'Python Path', 'User Site')]
@@ -337,7 +366,7 @@ class BundlePaths(PrivateFixture):
         module.write_bytes((SOURCE / 'stallionfs/_bundle.py').read_bytes())
         outside = put(self.root / 'outside.py')
         package = ModuleType('stallionfs')
-        package.__file__, package.__version__ = str(outside), '0.6.3'
+        package.__file__, package.__version__ = str(outside), '0.7.0'
         package.__path__ = [str(outside.parent)]
         entry = ModuleType('stallionfs.__main__')
         entry.__file__ = str(outside)
@@ -518,6 +547,7 @@ class GitRouting(PrivateFixture):
         for internal in (False, True):
             with patch.object(_bundle, '__file__', str(SOURCE / 'stallionfs/_bundle.py')), \
                     patch.dict(os.environ, {'PATH': '/user/path', 'GIT_DIR': '/wrong', 'STALLIONFS_BENCHMARK_DEADLINE': ''}), \
+                    patch('stallionfs._git_runtime.select', side_effect=lambda env, *, cwd=None: ('git', env)), \
                     patch.object(self.core.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='', stderr='')) as command:
                 self.core.run(['git', '--version'], internal_git=internal)
             self.assertEqual(command.call_args.args[0], ['git', '--version'])

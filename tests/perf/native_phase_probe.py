@@ -175,7 +175,7 @@ def probe(binary, wheel, scratch, output, revision):
         source = fileops.large_fixture(base, 'docs_5k_100mb', fileops.LARGE_PROFILES['docs_5k_100mb'])
         seed = {}; native_fixtures.enrich_metadata(source, receipt=seed)
         expected = correct.snapshot(source)
-        require(native_fixtures.verify_metadata_coverage(expected, seed)['populated'] is True, 'metadata_incomplete')
+        require(native_fixtures.verify_metadata_coverage(expected, seed, precision_links=(), precision_scope='copy-clone')['populated'] is True, 'metadata_incomplete')
         destination = base / 'destination'
         require(not os.path.lexists(destination), 'destination_exists')
         before = correct.snapshot(source)

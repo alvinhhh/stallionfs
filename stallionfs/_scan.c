@@ -1,6 +1,11 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <sys/mount.h>
+#include <sys/attr.h>
+#include <sys/stat.h>
+#include <sys/acl.h>
+#include <uuid/uuid.h>
+#include <unistd.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -242,7 +247,76 @@ static PyObject *protected_directory_fd(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+/* Volume and object attributes are separate queries: volume queries do not
+ * return a valid ATTR_CMN_FILEID on APFS. All payloads use 4-byte packing. */
+static PyObject *hosting_identity(PyObject *self, PyObject *arg) {
+    (void)self;
+    int fd = PyObject_AsFileDescriptor(arg);
+    if (fd < 0) return NULL;
+    struct stat before, after;
+    struct statfs fs;
+    if (fstat(fd, &before) || fstatfs(fd, &fs)) return PyErr_SetFromErrno(PyExc_OSError);
+    if (strcmp(fs.f_fstypename, "apfs") || before.st_uid != getuid() ||
+        (before.st_mode & 0077) ||
+        (!S_ISDIR(before.st_mode) && (!S_ISREG(before.st_mode) || before.st_nlink != 1 ||
+                                    (before.st_mode & 0600) != 0600))) {
+        errno = EPERM; return PyErr_SetFromErrno(PyExc_OSError);
+    }
+    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if (!acl && errno != ENOENT) return PyErr_SetFromErrno(PyExc_OSError);
+    if (acl) {
+        acl_entry_t entry;
+        errno = 0;
+        int rc = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
+        int error = rc == 0 ? EPERM : errno == EINVAL ? 0 : errno ? errno : EIO;
+        if (acl_free(acl) && !error) error = errno;
+        if (error) { errno = error; return PyErr_SetFromErrno(PyExc_OSError); }
+    }
+    unsigned char buffer[64];
+    struct attrlist attrs = {.bitmapcount = ATTR_BIT_MAP_COUNT,
+                            .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_FILEID};
+    if (fgetattrlist(fd, &attrs, buffer, sizeof(buffer), 0)) return PyErr_SetFromErrno(PyExc_OSError);
+    uint32_t length; attribute_set_t returned; uint64_t fileid;
+    memcpy(&length, buffer, 4); memcpy(&returned, buffer + 4, sizeof(returned));
+    attribute_set_t expected = {.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_FILEID};
+    if (length != 4 + sizeof(returned) + 8 || memcmp(&returned, &expected, sizeof(expected))) goto invalid;
+    memcpy(&fileid, buffer + 4 + sizeof(returned), 8);
+    if (!fileid || fileid != (uint64_t)before.st_ino) goto invalid;
+    attrs.commonattr = ATTR_CMN_RETURNED_ATTRS;
+    attrs.volattr = ATTR_VOL_INFO | ATTR_VOL_UUID;
+    if (fgetattrlist(fd, &attrs, buffer, sizeof(buffer), 0)) return PyErr_SetFromErrno(PyExc_OSError);
+    memcpy(&length, buffer, 4); memcpy(&returned, buffer + 4, sizeof(returned));
+    expected.commonattr = ATTR_CMN_RETURNED_ATTRS; expected.volattr = ATTR_VOL_UUID;
+    if (length != 4 + sizeof(returned) + sizeof(uuid_t) || memcmp(&returned, &expected, sizeof(expected))) goto invalid;
+    uuid_t volume; char text[37];
+    memcpy(volume, buffer + 4 + sizeof(returned), sizeof(volume));
+    if (uuid_is_null(volume)) goto invalid;
+    uuid_unparse_lower(volume, text);
+    if (fstat(fd, &after)) return PyErr_SetFromErrno(PyExc_OSError);
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_uid != after.st_uid || before.st_mode != after.st_mode ||
+        before.st_nlink != after.st_nlink) goto invalid;
+    return Py_BuildValue("{s:s,s:K}", "volume_uuid", text, "file_id", (unsigned long long)fileid);
+invalid:
+    errno = ESTALE; return PyErr_SetFromErrno(PyExc_OSError);
+}
+
+static PyObject *publish_no_replace(PyObject *self, PyObject *args) {
+    (void)self;
+    int parent; const char *source, *destination;
+    if (!PyArg_ParseTuple(args, "iss", &parent, &source, &destination)) return NULL;
+    if (!*source || !*destination || strchr(source, '/') || strchr(destination, '/') ||
+        !strcmp(source, ".") || !strcmp(source, "..") ||
+        !strcmp(destination, ".") || !strcmp(destination, "..")) {
+        PyErr_SetString(PyExc_ValueError, "Publication requires two filename components"); return NULL;
+    }
+    if (renameatx_np(parent, source, parent, destination, RENAME_EXCL)) return PyErr_SetFromErrno(PyExc_OSError);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef methods[] = {
+    {"_publish_no_replace", publish_no_replace, METH_VARARGS, "Publish one descriptor-relative file without replacing a destination."},
+    {"hosting_identity", hosting_identity, METH_O, "Read persistent APFS volume UUID and 64-bit file ID from a private borrowed descriptor."},
     {"_protected_directory_fd", protected_directory_fd, METH_VARARGS, "Validate pinned directory ownership, mode and ACLs without changing them."},
     {"_private_directory", private_directory, METH_O, "Validate private directory ownership, mode and ACLs without changing them."},
     {"scan", (PyCFunction)(void(*)(void))scan_tree, METH_VARARGS | METH_KEYWORDS, "Count directory entries and regular-file logical bytes without following symlinks."},

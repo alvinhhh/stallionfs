@@ -74,6 +74,19 @@ class ReportJournal:
         self._stream = None
         self._poisoned = False
         self._finished = False
+        self._max_manifest_bytes = self._max_journal_bytes = self._max_event_bytes = self._max_events = None
+
+    def _manifest_limit(self):
+        return (MAX_MANIFEST_BYTES if self._max_manifest_bytes is None
+                else min(MAX_MANIFEST_BYTES, self._max_manifest_bytes))
+
+    def _read_event_line(self, remaining):
+        limit = remaining if self._max_event_bytes is None else min(remaining, self._max_event_bytes + 1)
+        raw = self._stream.readline(limit)
+        _require(self._max_event_bytes is None or len(raw) <= self._max_event_bytes,
+                 'Journal event exceeds reader byte limit')
+        _require(raw.endswith(b'\n'), 'Incomplete journal event')
+        return raw
 
     def _owned(self):
         _require(self._stream is not None and not self._stream.closed, 'Journal is closed')
@@ -143,9 +156,14 @@ class ReportJournal:
         self._manifest_sha256 = manifest_digest.hexdigest()
 
     @classmethod
-    def open_existing(cls, output):
+    def open_existing(cls, output, *, max_manifest_bytes=None, max_journal_bytes=None,
+                      max_event_bytes=None, max_events=None):
         self = cls.__new__(cls)
         self._initialize(output)
+        for name, value in (('max_manifest_bytes', max_manifest_bytes), ('max_journal_bytes', max_journal_bytes),
+                            ('max_event_bytes', max_event_bytes), ('max_events', max_events)):
+            _require(value is None or type(value) is int and value > 0, 'Reader limits must be positive integers')
+            setattr(self, '_' + name, value)
         self._readonly = True
         fd = os.open(self.manifest_path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
@@ -154,8 +172,8 @@ class ReportJournal:
             self._manifest_identity = _identity(info)
             with os.fdopen(fd, 'rb') as stream:
                 fd = -1
-                raw = stream.read(MAX_MANIFEST_BYTES + 1)
-                _require(len(raw) <= MAX_MANIFEST_BYTES, 'Oversized journal manifest')
+                raw = stream.read(self._manifest_limit() + 1)
+                _require(len(raw) <= self._manifest_limit(), 'Oversized journal manifest')
                 self._manifest = _load(raw)
                 self._manifest_sha256 = hashlib.sha256(raw).hexdigest()
         finally:
@@ -170,6 +188,10 @@ class ReportJournal:
                  and isinstance(manifest['prefix_sha256'], str) and len(manifest['prefix_sha256']) == 64
                  and isinstance(manifest['state'], dict) and not set(manifest['state']).intersection(KINDS),
                  'Invalid journal manifest')
+        _require(self._max_journal_bytes is None or manifest['committed_bytes'] <= self._max_journal_bytes,
+                 'Journal exceeds reader byte limit')
+        _require(self._max_events is None or manifest['event_count'] <= self._max_events,
+                 'Journal exceeds reader event count limit')
         fd = os.open(self.journal_path, os.O_RDONLY | os.O_NOFOLLOW)
         self._stream = os.fdopen(fd, 'rb')
         self._journal_identity = _identity(os.fstat(fd))
@@ -201,8 +223,8 @@ class ReportJournal:
             info = os.fstat(stream.fileno())
             _require(stat.S_ISREG(info.st_mode) and _identity(info) == self._manifest_identity,
                      'Manifest path changed')
-            raw = stream.read(MAX_MANIFEST_BYTES + 1)
-            _require(len(raw) <= MAX_MANIFEST_BYTES, 'Oversized journal manifest')
+            raw = stream.read(self._manifest_limit() + 1)
+            _require(len(raw) <= self._manifest_limit(), 'Oversized journal manifest')
             _require(hashlib.sha256(raw).hexdigest() == self._manifest_sha256,
                      'Manifest content changed')
         committed = self._manifest['committed_bytes']
@@ -220,9 +242,10 @@ class ReportJournal:
             self._stream.seek(0)
             sequence = 0
             while self._stream.tell() < committed:
+                _require(self._max_events is None or sequence < self._max_events,
+                         'Journal exceeds reader event count limit')
                 offset = self._stream.tell()
-                raw = self._stream.readline(committed - offset)
-                _require(raw.endswith(b'\n'), 'Incomplete journal event')
+                raw = self._read_event_line(committed - offset)
                 event = self._event(raw)
                 _require(event['sequence'] == sequence, 'Journal event sequence mismatch')
                 kind, id = event['kind'], event['id']
@@ -247,7 +270,7 @@ class ReportJournal:
         _require(kind in KINDS, 'Unknown journal kind')
         for id, offset in enumerate(self._offsets[kind]):
             self._stream.seek(offset)
-            raw = self._stream.readline(self._manifest['committed_bytes'] - offset)
+            raw = self._read_event_line(self._manifest['committed_bytes'] - offset)
             event = self._event(raw)
             _require(event['kind'] == kind and event['id'] == id, 'Journal index disagrees with record')
             yield event['payload']

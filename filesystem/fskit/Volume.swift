@@ -6,6 +6,186 @@ import Security
 import OSLog
 import SFSImage
 
+
+#if STALLION_MOUNT_TRACE
+// Schema 1; all fields are numeric. Sequence denotes reservation order only.
+// Events: startup=0, entry=1, body=2, reply_pre=3, getter=4, overflow=5.
+// Operations: load=1, activate=2, mount=3, GET=4, options=5, capabilities=6, statistics=7.
+// Stages: entry=0, enqueue=1, request=2, item=3, metadata=4, access=5,
+// attributes=6, constructor=7, complete=8, arguments=9, force=10,
+// state=11, ready=12, randomness=13, unmount=14, open=15, enable=16,
+// identity=17, resource size=18, resource type=19, routing=20.
+@_cdecl("stallionfs_mount_trace_schema1_build1")
+public func stallionMountTraceMarker() -> Int32 { 1 }
+final class MountTrace: @unchecked Sendable {
+    enum Stage: UInt8 {
+        case entry = 0, enqueue, request, item, metadata, access, attributes, constructor, complete
+        case arguments, force, state, ready, randomness, unmount, open, enable, identity
+        case resourceSize, resourceType, routing
+    }
+    static let shared = MountTrace()
+    private let lock = NSLock()
+    private var sequence: UInt64 = 0
+    private var identifier: UInt64 = 0
+    private var accessCount = 0
+    private let accessLogger = Logger(subsystem: "com.alvinhhh.stallionfs.mountaccess", category: "access-v1")
+    // SMA1 is independent of SMT1 reservations. Absence/truncation is inconclusive.
+    // l/c/i/a are unsigned hex load/callback/inode/access. All others are decimal:
+    // u/g signed caller IDs; w/m volume/metadata UID; s substage; r ready failure;
+    // p core receipt present; x/f/e actual status/phase/errno; d/n access error
+    // domain (0 none, 1 POSIX, 2 other) and code. No arbitrary strings are logged.
+    // Numeric identities are diagnostic exposure, compiled out without tracing.
+    // Substages: policy=1, ready=2, token=3, core=4, ACL=5.
+    // Ready failure: latched=1, revoked=2, unavailable=3; zero means unobserved.
+    final class Access {
+        let load: UInt64, callback: UInt64, inode: UInt64, uid: Int, gid: Int
+        let owner: UInt32, metadataUID: UInt32, mask: UInt64
+        var stage: UInt8 = 1, readyFailure: UInt8 = 0
+        var corePresent = false
+        var status: UInt32 = 0, phase: UInt32 = 0, systemErrno: Int32 = 0
+        init(load: UInt64, callback: UInt64, inode: UInt64, caller: CallerIdentity,
+             owner: UInt32, metadataUID: UInt32, mask: UInt64) {
+            self.load = load; self.callback = callback; self.inode = inode
+            uid = caller.uid; gid = caller.gid; self.owner = owner
+            self.metadataUID = metadataUID; self.mask = mask
+        }
+        func payload(error: Error?) -> String {
+            let ns = error as NSError?
+            return "SMA1 l=\(String(load,radix:16)) c=\(String(callback,radix:16)) i=\(String(inode,radix:16)) u=\(uid) g=\(gid) w=\(owner) m=\(metadataUID) a=\(String(mask,radix:16)) s=\(stage) r=\(readyFailure) p=\(corePresent ? 1 : 0) x=\(status) f=\(phase) e=\(systemErrno) d=\(ns == nil ? 0 : ns!.domain == NSPOSIXErrorDomain ? 1 : 2) n=\(ns?.code ?? 0)"
+        }
+    }
+    func emitAccess(_ observation: Access, error: Error?) {
+        lock.lock(); defer { lock.unlock() }
+        guard accessCount < 8 else { return }
+        accessCount += 1
+        let text = observation.payload(error: error)
+        guard text.utf8.count <= 256 else { return }
+#if STALLION_ADAPTER_CHECK
+        if !discard { capturedAccess.append(text) }
+#else
+        accessLogger.notice("\(text, privacy: .public)")
+#endif
+    }
+    private let logger = Logger(subsystem: "com.alvinhhh.stallionfs.mounttrace", category: "mount-v1")
+#if STALLION_ADAPTER_CHECK
+    private var captured: [String] = []
+    private var capturedAccess: [String] = []
+    func accessRecordsForTesting() -> [String] { lock.lock(); defer { lock.unlock() }; return capturedAccess }
+    private var discard = false
+    func resetForTesting(discard: Bool = false) {
+        lock.lock(); sequence = 0; identifier = 0; accessCount = 0; capturedAccess = []; captured = []; self.discard = discard; lock.unlock()
+        startup()
+    }
+    func recordsForTesting() -> [String] { lock.lock(); defer { lock.unlock() }; return captured }
+#endif
+    private init() { startup() }
+    private func startup() {
+        var profile: UInt64 = 0
+#if STALLION_CONTEXT_HANDLERS
+        profile |= 1
+#endif
+#if STALLION_CONTEXT_WRITES
+        profile |= 2
+#endif
+#if STALLION_WRITE_DIAGNOSTIC
+        profile |= 4
+#endif
+#if STALLION_ADAPTER_CHECK
+        profile |= 8
+#endif
+        emit(0, 0, value: profile)
+    }
+    func id() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        // Once capped, no later identifier can be observed.
+        guard sequence < 64, identifier < UInt64.max else { return 0 }
+        identifier += 1; return identifier
+    }
+    static func payload(_ sequence: UInt64, _ uptime: UInt64, _ event: UInt8, _ operation: UInt8,
+                        _ load: UInt64, _ callback: UInt64, _ stage: UInt8, _ state: Int,
+                        _ mask: UInt64, _ sdk: UInt64, _ hint: UInt64, _ value: UInt64,
+                        _ domain: UInt8, _ code: Int) -> String {
+        // Hexadecimal scalars keep maximum-width values below 256 UTF-8 bytes.
+        "SMT1 b=1 q=\(String(sequence,radix:16)) t=\(String(uptime,radix:16)) e=\(event) o=\(operation) l=\(String(load,radix:16)) c=\(String(callback,radix:16)) s=\(stage) z=\(state) m=\(String(mask,radix:16)) k=\(String(sdk,radix:16)) i=\(String(hint,radix:16)) v=\(String(value,radix:16)) d=\(domain) n=\(code)"
+    }
+    func emit(_ event: UInt8, _ operation: UInt8, load: UInt64 = 0, callback: UInt64 = 0,
+              stage: Stage = .entry, state: Int = -1, mask: UInt64 = 0, sdk: UInt64 = 0,
+              hint: UInt64 = 0, value: UInt64 = 0, error: Error? = nil) {
+        lock.lock()
+        guard sequence < 64 else { lock.unlock(); return }
+        sequence += 1; let reserved = sequence
+        lock.unlock()
+        let overflow = reserved == 64
+        let ns = error as NSError?
+        let text = Self.payload(reserved, DispatchTime.now().uptimeNanoseconds, overflow ? 5 : event,
+            overflow ? 0 : operation, overflow ? 0 : load, overflow ? 0 : callback,
+            overflow ? 0 : stage.rawValue, overflow ? -1 : state, overflow ? 0 : mask,
+            overflow ? 0 : sdk, overflow ? 0 : hint, overflow ? 0 : value,
+            overflow || ns == nil ? 0 : ns!.domain == NSPOSIXErrorDomain ? 1 : 2,
+            overflow ? 0 : ns?.code ?? 0)
+        guard text.utf8.count <= 256 else { return }
+#if STALLION_ADAPTER_CHECK
+        lock.lock(); if !discard { captured.append(text) }; lock.unlock()
+#else
+        logger.notice("\(text, privacy: .public)")
+#endif
+    }
+}
+#endif
+
+#if STALLION_MOUNT_TRACE
+// SMD1 is independent of SMT1/SMA1. No caller identities or arbitrary strings.
+// Three reserved budgets: first failure 7+cap, sync success 7+cap,
+// sync error 15+cap; at most 32 rows/process, each <=512 UTF-8 bytes.
+final class DeliveryTrace: @unchecked Sendable {
+    static let shared = DeliveryTrace()
+    private let lock = NSLock()
+    private var failures = 0, successes = 0, errors = 0
+    private var identifier: UInt64 = 0
+    func id() -> UInt64 { lock.lock(); defer { lock.unlock() }; if identifier < UInt64.max { identifier += 1 }; return identifier }
+    private let logger = Logger(subsystem: "com.alvinhhh.stallionfs.delivery", category: "delivery-v1")
+#if STALLION_ADAPTER_CHECK
+    private var rows: [String] = []
+    func resetForTesting() { lock.lock(); defer { lock.unlock() }; failures = 0; successes = 0; errors = 0; rows = [] }
+    func recordsForTesting() -> [String] { lock.lock(); defer { lock.unlock() }; return rows }
+#endif
+    static func pair(_ error: Error?) -> String {
+        let ns = error as NSError?
+        return "\(ns == nil ? 0 : ns!.domain == NSPOSIXErrorDomain ? 1 : 2),\(ns?.code ?? 0)"
+    }
+    // No acquisition of submissionLock or MountTrace.lock, and no callbacks.
+    // Callers may hold submissionLock; the only lock edge is toward this lock.
+    private func emit(_ lane: Int, _ payload: String) {
+        lock.lock(); defer { lock.unlock() }
+        let count: Int, limit: Int
+        switch lane {
+        case 1: count = failures; limit = 8; if count < limit { failures += 1 }
+        case 2: count = successes; limit = 8; if count < limit { successes += 1 }
+        default: count = errors; limit = 16; if count < limit { errors += 1 }
+        }
+        guard count < limit else { return }
+        let text = "SMD1 l=\(lane) q=\(count + 1) " + (count == limit - 1 ? "cap=1" : payload)
+        guard text.utf8.count <= 512 else { return }
+#if STALLION_ADAPTER_CHECK
+        rows.append(text)
+#else
+        logger.notice("\(text, privacy: .public)")
+#endif
+    }
+    // x/p/e describe the SUPPLIED retained receipt, which may come from an
+    // earlier operation or be zero/default. Nonzero fields never establish
+    // freshness or causation for this first delivery error.
+    func first(volume: UInt64 = 0, site: UInt, origin: UInt, error: Error, result: sfs_result) {
+        emit(1, "vol=\(volume) site=\(site) origin=\(origin) err=\(Self.pair(error)) x=\(result.status.rawValue) p=\(result.phase.rawValue) e=\(result.system_errno)")
+    }
+    func sync(volume: UInt64 = 0, stage: UInt8, check: UInt8 = 0, flags: UInt64, validation: Error? = nil, admission: Error? = nil,
+              retained: Error? = nil, volumeError: Error? = nil, core: Error? = nil,
+              recheck: Error? = nil, outcome: Error?) {
+        emit(outcome == nil ? 2 : 3, "vol=\(volume) s=\(stage) k=\(check) f=\(String(flags, radix: 16)) v=\(Self.pair(validation)) a=\(Self.pair(admission)) r=\(Self.pair(retained)) b=\(Self.pair(volumeError)) c=\(Self.pair(core)) h=\(Self.pair(recheck)) out=\(Self.pair(outcome))")
+    }
+}
+#endif
+
 func sfsError(_ status: sfs_status, _ result: sfs_result, missing: Int32 = ENOENT) -> Error {
     let code: Int32
     switch status {
@@ -86,7 +266,7 @@ func checkedXattrListTotal(_ total: Int, count: Int, next: Int) throws -> Int {
 }
 func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSVolume.AccessMask,
                     allowFileExecution: Bool = false) throws {
-    guard uid == Int(owner) && m.uid == owner else { throw POSIXError(.EACCES) }
+    guard m.uid == owner, uid == Int(owner) || (uid == 0 && access == .readAttributes) else { throw POSIXError(.EACCES) }
     var allowed: FSVolume.AccessMask = [.readAttributes]
     if m.mode & 0o400 != 0 { allowed.formUnion([.readData, .readXattr]) }
     if m.entry.kind == SFS_DIRECTORY && m.mode & 0o100 != 0 { allowed.insert(.search) }
@@ -94,17 +274,19 @@ func checkOwnerMode(_ m: sfs_metadata_entry, owner: uid_t, uid: Int, access: FSV
     // opts into readable owner execution. Other reads/searches keep their policy.
     if allowFileExecution && m.entry.kind == SFS_FILE && access.contains(.execute) {
         guard m.mode & 0o500 == 0o500, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
-        guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+        guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
         allowed.insert(.execute)
     }
     guard access.subtracting(allowed).isEmpty else { throw POSIXError(.EACCES) }
 }
+// SFS_FLAGS_SUPPORTED is a UINT32_C macro that Swift cannot import.
+let supportedBSDFlags = UInt32(UF_NODUMP | UF_HIDDEN)
 struct CallerIdentity {
     let uid: Int, gid: Int
     init(uid: Int, gid: Int) { self.uid = uid; self.gid = gid }
     init(_ context: FSContext) { uid = context.effectiveUserID; gid = context.effectiveGroupID }
 }
-// Owner-only profile: a group or root identity never grants an exception.
+// Owner access plus exact metadata reads by effective UID 0; groups grant no exception.
 func checkOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: CallerIdentity,
                       access: FSVolume.AccessMask, writable: Bool, hasACL: Bool,
                       allowFileExecution: Bool = false) throws {
@@ -124,7 +306,7 @@ func checkMetadataOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Cal
     guard uid_t(exactly: caller.uid) != nil, gid_t(exactly: caller.gid) != nil,
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
     guard m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY || m.entry.kind == SFS_SYMLINK,
-          m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+          m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func metadataTime(_ value: timespec) throws -> sfs_timestamp {
@@ -139,7 +321,7 @@ func checkXattrOwnerPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Caller
     case SFS_FILE, SFS_DIRECTORY, SFS_SYMLINK: break
     default: throw POSIXError(.ENOTSUP)
     }
-    guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o200 != 0, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func writableXattrName(_ bytes: Data) throws {
@@ -155,7 +337,7 @@ func checkLinkParentPolicy(_ m: sfs_metadata_entry, owner: uid_t, caller: Caller
           caller.uid == Int(owner), m.uid == owner else { throw POSIXError(.EACCES) }
     guard m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTDIR) }
     guard m.link_count > 0 else { throw POSIXError(.ENOENT) }
-    guard m.flags == 0 else { throw POSIXError(.ENOTSUP) }
+    guard m.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
     guard m.mode & 0o300 == 0o300, m.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
 }
 func checkLinkCount(_ count: UInt64) throws {
@@ -194,8 +376,8 @@ struct LastKnownParent {
 }
 final class StallionItem: FSItem {
     let inode: UInt64
-#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var retainedModes: FSVolume.OpenModes = []
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     var pin: sfs_pin?
     var reclaimed = false
     var lastKnownParent: LastKnownParent?
@@ -210,6 +392,10 @@ extension StallionVolume: FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.
 extension StallionVolume: FSVolume.Operations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations {}
 #endif
 final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.AccessCheckHandler, @unchecked Sendable {
+#if STALLION_MOUNT_TRACE
+    // Assigned before the volume is published; immutable thereafter.
+    var mountTraceLoad: UInt64 = 0
+#endif
     enum State: Int { case inactive, active, mounted, terminal }
     struct ParentEvidence { var core: UInt64?; var mapped: UInt64? }
     enum EnumerationStop: UInt64 { case eof = 1, refused = 2, error = 3 }
@@ -230,12 +416,52 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var scope: Bool
     let owner: uid_t
     private(set) var anchor: sfs_result
-    private let selectedAccess: ImageAdmission.Access
+    // Access publication has its own lock: callback entry may already hold
+    // submissionLock. No path holds this lock while acquiring another lock.
+    private struct AccessPublication {
+        var mode: ImageAdmission.Access
+        var configured = false
+        var admitted = false
+    }
+    private let accessLock = NSLock()
+    private var accessPublication: AccessPublication
+    private var selectedAccess: ImageAdmission.Access {
+        get { accessLock.lock(); defer { accessLock.unlock() }; return accessPublication.mode }
+        set { accessLock.lock(); accessPublication.mode = newValue; accessLock.unlock() }
+    }
+    private func publishActivation(_ admitted: Bool) {
+        accessLock.lock(); accessPublication.admitted = admitted; accessLock.unlock()
+    }
+    private var publishedWritable: Bool {
+        accessLock.lock(); defer { accessLock.unlock() }
+        return accessPublication.admitted && accessPublication.configured
+    }
+    private enum Activation { case loaded, validating, readOnly, contextual, failed }
+    private var activation = Activation.loaded
+    private var activationFailureReply: ((Error) -> Void)?
+#if STALLION_ADAPTER_CHECK
+    var managedScopeForTesting = false
+    var activationBoundaryForTesting: (() throws -> Void)?
+    var activationResultBoundaryForTesting: (() throws -> Void)?
+    var releaseItemForTesting: ((OpaquePointer, sfs_pin, inout sfs_result) -> sfs_status)?
+    func activateArgumentsForTesting(_ arguments: [String], reply: @escaping (FSItem?, Error?) -> Void) {
+        activateBody(arguments: arguments, prepare: { $0 }, reply: reply)
+    }
+    var activationConsumedForTesting: Bool { handle == nil && !scope && state == .terminal }
+#endif
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
     // Required write state is shared; optional tracing never authorizes access.
     private var tracingEnabled: Bool { selectedAccess == .fixtureWritable }
     private static let writablePinBytes: UInt64 = 8 * 1024 * 1024
-    private(set) var writesEnabled = false
+    private(set) var writesEnabled: Bool {
+        get { accessLock.lock(); defer { accessLock.unlock() }; return accessPublication.configured }
+        set {
+            accessLock.lock(); accessPublication.configured = newValue
+            if accessPublication.mode == .fixtureWritable { accessPublication.admitted = newValue }
+            if !newValue { accessPublication.admitted = false }
+            accessLock.unlock()
+        }
+    }
     struct DeliveryFailure {
         let code: Int, sequence: UInt64, durableGeneration: UInt64
         let result: sfs_result
@@ -252,6 +478,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         var recordFences: UInt64 = 0, recordSuccess: UInt64 = 0, commitFences: UInt64 = 0, commitSuccess: UInt64 = 0
         var refused: UInt64 = 0, syncs: UInt64 = 0, overflow = false
     }
+    #if STALLION_MOUNT_TRACE
+    private let deliveryTraceVolume = DeliveryTrace.shared.id()
+    #endif
     private var deliveryFailure: DeliveryFailure?
     private var lastCoreFailure: sfs_result?
     private var diagnosticSequence: UInt64 = 0
@@ -284,8 +513,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func deliveryError() -> Error? {
         submissionLock.lock(); defer { submissionLock.unlock() }; return deliveryFailure?.error
     }
-    private func rememberDeliveryLocked(_ error: Error, _ result: sfs_result = sfs_result()) {
+    private func rememberDeliveryLocked(_ error: Error, _ result: sfs_result = sfs_result(), site: UInt = #line, origin: UInt = 0) {
         if deliveryFailure == nil {
+#if STALLION_MOUNT_TRACE
+            DeliveryTrace.shared.first(volume: deliveryTraceVolume, site: site, origin: origin, error: error, result: result)
+#endif
             // A first-error observation has its own sequence, independent of
             // how many later callbacks were already admitted while it ran.
             saturated(&diagnosticSequence)
@@ -293,12 +525,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 durableGeneration: diagnosticDurable, result: result)
         }
     }
-    private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result()) {
-        submissionLock.lock(); rememberDeliveryLocked(error, result); submissionLock.unlock()
+    private func rememberDelivery(_ error: Error, _ result: sfs_result = sfs_result(), site: UInt = #line, origin: UInt = 0) {
+        submissionLock.lock(); rememberDeliveryLocked(error, result, site: site, origin: origin); submissionLock.unlock()
     }
     func enableAdmittedWrites() throws {
         guard selectedAccess != .readOnly, state == .inactive,
-              resource.isWritable && !resource.isRevoked, items.isEmpty, !writesEnabled,
+              (selectedAccess == .contextualWrites || resource.isWritable) && !resource.isRevoked, items.isEmpty, !writesEnabled,
               let handle else { throw POSIXError(.EACCES) }
 #if !(STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         guard selectedAccess == .fixtureWritable else { throw POSIXError(.ENOTSUP) }
@@ -308,7 +540,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         var r = sfs_result()
         try check(sfs_image_pin_configure(handle, UInt32(itemLimit), Self.writablePinBytes, &r), r)
         items.reserveCapacity(itemLimit)
-        writesEnabled = true; diagnosticDurable = anchor.generation
+        submissionLock.lock()
+        diagnosticDurable = anchor.generation
+        writesEnabled = true
+        submissionLock.unlock()
         if tracingEnabled { writeRecords.reserveCapacity(4096) }
     }
 #if STALLION_WRITE_DIAGNOSTIC
@@ -412,17 +647,19 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private var sequence: UInt64 = 0
     private var overflow = false
     private var emitted = false
-    init(admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
+    private let identity: StallionFileSystemIdentity
+    init(identity: StallionFileSystemIdentity, admission: ImageAdmission, resource: FSPathURLResource, scope: Bool, queue: DispatchQueue,
          itemLimit: Int = ReadOnlyLimits.activeItems) {
         precondition(itemLimit > 0 && itemLimit <= ReadOnlyLimits.activeItems)
+        self.identity = identity
         self.itemLimit = itemLimit
         self.handle = admission.handle; self.resource = resource; self.scope = scope; self.anchor = admission.anchor
-        selectedAccess = admission.access
+        accessPublication = AccessPublication(mode: admission.access)
         self.queue = queue; owner = geteuid()
         let bytes = rawBytes(admission.anchor.uuid)
         let uuid = UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]))
         super.init(volumeID: .init(uuid: uuid), volumeName: FSFileName(string: "StallionFS"))
-        if selectedAccess != .contextualWrites { records.reserveCapacity(4096) }
+        if selectedAccess != .contextualWrites && selectedAccess != .pendingContextual { records.reserveCapacity(4096) }
         record(0)
     }
 #if STALLION_ADAPTER_CHECK
@@ -452,7 +689,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
     func enqueue(retainedBytes: Int = 0, maintenance: Bool = false,
                  dataOperation: Bool = false, writeOperation: Bool = false, namespaceOperation: Bool = false,
-                 syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil,
+                 syncOperation: Bool = false, syncFlags: UInt64 = 0, validationError: Error? = nil, site: UInt = #line,
                  rejected: (Error) -> Void, _ block: @escaping () -> Void) {
         submissionLock.lock()
         var error: Error?
@@ -461,6 +698,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         else if !maintenance && admission != .open { error = POSIXError(admission == .draining ? .EAGAIN : .ENXIO) }
         else if !callbacks.acquire(retainedBytes) { error = POSIXError(.EAGAIN) }
         else { error = nil }
+#if STALLION_MOUNT_TRACE
+        let enqueueError = error
+#endif
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
             if syncOperation && tracingEnabled {
@@ -484,18 +724,27 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
             if let rejectedError = error, dataOperation {
                 if tracingEnabled { saturated(&writeCounters.refused) }
-                rememberDeliveryLocked(rejectedError)
+                rememberDeliveryLocked(rejectedError, origin: site)
             }
             if syncOperation, let first = deliveryFailure {
                 if error == nil { callbacks.release(retainedBytes) }
                 error = first.error
             }
             if syncOperation, let error { controlRecordLocked(5, mask: syncFlags, error: error) }
+#if STALLION_MOUNT_TRACE
+            if syncOperation, error != nil {
+                DeliveryTrace.shared.sync(volume: deliveryTraceVolume, stage: 1, flags: syncFlags, validation: validationError,
+                    admission: enqueueError, retained: deliveryFailure?.error, outcome: error)
+            }
+#endif
         }
 #endif
         guard error == nil else { submissionLock.unlock(); rejected(error!); return }
         // Reservation and submission are atomic against the unmount cutoff.
-        queue.async(execute: DispatchWorkItem { defer { self.callbacks.release(retainedBytes) }; block() })
+        queue.async(execute: DispatchWorkItem {
+            defer { self.callbacks.release(retainedBytes); self.finishFailedActivation() }
+            block()
+        })
         submissionLock.unlock()
     }
 #if STALLION_ADAPTER_CHECK
@@ -505,7 +754,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                         cookie: UInt64 = 0, verifier: UInt64 = 0, returnedVerifier: UInt64 = 0,
                         acceptedCookie: UInt64 = 0, stop: UInt64 = 0,
                         parents: ParentEvidence = ParentEvidence(), accepted: Int64 = -1, reclaim: Int64 = -1) {
-        guard selectedAccess != .contextualWrites else { return }
+        guard selectedAccess != .contextualWrites && selectedAccess != .pendingContextual else { return }
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled && [1, 2, 3, 4, 5, 6, 12, 15, 16].contains(op) {
             submissionLock.lock(); controlRecordLocked(op, inode: inode, mask: mask, error: error); submissionLock.unlock()
@@ -544,10 +793,29 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
         guard anchorMatches(result, anchor) else { let error = POSIXError(.ESTALE); latch(error); throw error }
     }
+#if STALLION_MOUNT_TRACE
+    // Only set for the synchronous ownerAccess call on the owning serial queue.
+    private var accessObservation: MountTrace.Access?
+#endif
     private func ready(mounted: Bool = false) throws -> OpaquePointer {
-        if let failure { throw failure }
-        guard !resource.isRevoked else { let error = POSIXError(.EACCES); latch(error); throw error }
-        guard let handle, state == .active || state == .mounted, !mounted || state == .mounted else { throw POSIXError(.ENXIO) }
+        if let failure {
+#if STALLION_MOUNT_TRACE
+            accessObservation?.readyFailure = 1
+#endif
+            throw failure
+        }
+        guard !resource.isRevoked else {
+#if STALLION_MOUNT_TRACE
+            accessObservation?.readyFailure = 2
+#endif
+            let error = POSIXError(.EACCES); latch(error); throw error
+        }
+        guard let handle, state == .active || state == .mounted, !mounted || state == .mounted else {
+#if STALLION_MOUNT_TRACE
+            accessObservation?.readyFailure = 3
+#endif
+            throw POSIXError(.ENXIO)
+        }
         return handle
     }
     private func ownedItem(_ item: FSItem) throws -> StallionItem {
@@ -629,18 +897,28 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         guard let pin = token, let handle else {
             let e = POSIXError(.EINVAL); latch(e); rememberDelivery(e); return e
         }
-        var r = sfs_result(); let status = sfs_image_pin_release(handle, pin, &r)
+        var r = sfs_result()
+        let status: sfs_status
+#if STALLION_ADAPTER_CHECK
+        if let release = releaseItemForTesting { status = release(handle, pin, &r) }
+        else { status = sfs_image_pin_release(handle, pin, &r) }
+#else
+        status = sfs_image_pin_release(handle, pin, &r)
+#endif
         if status == SFS_OK && anchorMatches(r, anchor) { return nil }
         let e = status == SFS_OK ? POSIXError(.ESTALE) as Error : sfsError(status, r)
         latch(e); rememberDelivery(e, r); return e
     }
+#endif
     private func closeModes(_ item: FSItem, modes: FSVolume.OpenModes) throws {
         let own = try ownedItem(item)
-        guard own.pin != nil, modes.subtracting([.read, .write]).isEmpty,
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        if writesEnabled { guard own.pin != nil else { throw POSIXError(.EINVAL) } }
+#endif
+        guard modes.subtracting([.read, .write]).isEmpty,
               modes.subtracting(own.retainedModes).isEmpty else { throw POSIXError(.EINVAL) }
         own.retainedModes = modes
     }
-#endif
     private func readTarget(_ h: OpaquePointer, inode: UInt64, offset: UInt64,
                             data: UnsafeMutableRawPointer?, length: Int, count: inout Int,
                             receipt: inout sfs_result) throws -> sfs_status {
@@ -748,7 +1026,15 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     var isAccessCheckInhibited: Bool { false }
     var requestedMountOptions: FSVolume.MountOptions {
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
-        if writesEnabled { return [] }
+        if publishedWritable {
+#if STALLION_MOUNT_TRACE
+            MountTrace.shared.emit(4, 5, load: mountTraceLoad, value: 0)
+#endif
+            return []
+        }
+#endif
+#if STALLION_MOUNT_TRACE
+        MountTrace.shared.emit(4, 5, load: mountTraceLoad, value: UInt64(FSVolume.MountOptions.readOnly.rawValue))
 #endif
         return [.readOnly]
     }
@@ -758,63 +1044,201 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         c.supports64BitObjectIDs = true; c.supportsJournal = false; c.supportsActiveJournal = false
         c.doesNotSupportVolumeSizes = true; c.doesNotSupportSettingFilePermissions = true; c.doesNotSupportImmutableFiles = true
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
-        if writesEnabled { c.doesNotSupportSettingFilePermissions = false }
+        c.doesNotSupportSettingFilePermissions = false // Implemented capability; mode remains separately enforced.
+#endif
+#if STALLION_MOUNT_TRACE
+        // v: sensitive, hardlinks, symlinks, sparse, 64-bit IDs, journal,
+        // active journal, no sizes, no permission setting, no immutable files.
+        MountTrace.shared.emit(4, 6, load: mountTraceLoad, value: 0x29f | (c.doesNotSupportSettingFilePermissions ? 0x100 : 0))
 #endif
         return c
     }
     var volumeStatistics: FSStatFSResult {
-        let s = FSStatFSResult(fileSystemTypeName: "sfsro27"); s.blockSize = 4096; s.ioSize = 4096; return s
+        let s = FSStatFSResult(fileSystemTypeName: identity.rawValue); s.blockSize = 4096; s.ioSize = 4096
+#if STALLION_MOUNT_TRACE
+        MountTrace.shared.emit(4, 7, load: mountTraceLoad, sdk: UInt64(s.ioSize), value: UInt64(s.blockSize))
+#endif
+        return s
     }
 #if !STALLION_CONTEXT_HANDLERS || STALLION_ADAPTER_CHECK
-    func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activate(replyHandler: replyHandler) }
+    func activate(options: FSTaskOptions, replyHandler: @escaping (FSItem?, Error?) -> Void) { activateBody(arguments: options.taskOptions, prepare: { $0 }, reply: replyHandler) }
     func activate(replyHandler: @escaping (FSItem?, Error?) -> Void) { activateBody(prepare: { $0 }, reply: replyHandler) }
 #endif
-    private func activateBody<T>(prepare: @escaping (StallionItem) throws -> T, reply: @escaping (T?, Error?) -> Void) {
-        enqueue(maintenance: true, rejected: { reply(nil, $0) }) {
+    private func activateBody<T>(arguments: [String] = [], prepare: @escaping (StallionItem) throws -> T, reply: @escaping (T?, Error?) -> Void) {
+#if STALLION_MOUNT_TRACE
+        let trace = MountTrace.shared, callback = trace.id(), load = mountTraceLoad
+        trace.emit(1, 2, load: load, callback: callback)
+#endif
+        let parsed: ActivationOptions?
+        do { parsed = try ActivationOptions.parse(arguments) }
+        catch {
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 2, load: load, callback: callback, stage: .arguments, error: error)
+#endif
+            reply(nil, error); return
+        }
+        enqueue(maintenance: true, rejected: { error in
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 2, load: load, callback: callback, stage: .enqueue, error: error)
+#endif
+            reply(nil, error)
+        }) {
+#if STALLION_MOUNT_TRACE
+            trace.emit(2, 2, load: load, callback: callback, state: self.state.rawValue)
+            var stage: MountTrace.Stage = .state
+            let originalReply = reply
+            let reply: (T?, Error?) -> Void = { result, error in
+                trace.emit(3, 2, load: load, callback: callback, stage: stage, state: self.state.rawValue, error: error)
+                originalReply(result, error)
+            }
+#endif
             let previous = self.state
+            let terminalOnFailure = self.selectedAccess == .pendingContextual
             do {
                 if let failure = self.failure { throw failure }
                 guard self.state != .terminal && self.handle != nil else { throw POSIXError(.ENXIO) }
-                if self.state == .inactive { self.state = .active }
+                guard self.activation == .loaded, self.state == .inactive, self.items.isEmpty else { throw POSIXError(.EBUSY) }
+                self.activation = .validating
+#if STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES
+                if self.selectedAccess == .pendingContextual {
+                    if let parsed, let handle = self.handle {
+                        var admittedScope = self.scope
+#if STALLION_ADAPTER_CHECK
+                        admittedScope = admittedScope || self.managedScopeForTesting
+#endif
+                        try ManagedActivation.promote(handle, expected: self.anchor, resource: self.resource, scope: admittedScope, intent: parsed)
+#if STALLION_ADAPTER_CHECK
+                        try self.activationBoundaryForTesting?()
+#endif
+                        self.selectedAccess = .contextualWrites
+                        try self.enableAdmittedWrites()
+                    } else { self.selectedAccess = .readOnly }
+                } else if parsed != nil { throw POSIXError(.EACCES) }
+#else
+                if parsed != nil { throw POSIXError(.EACCES) }
+#endif
+                self.state = .active
+#if STALLION_MOUNT_TRACE
+                stage = .metadata
+#endif
                 _ = try self.metadata(1)
-                let result = try self.canonicalResult(1, prepare: prepare)
+#if STALLION_MOUNT_TRACE
+                stage = .constructor
+#endif
+                let result = try self.canonicalResult(1, activationOwned: terminalOnFailure, prepare: prepare)
+#if STALLION_ADAPTER_CHECK
+                try self.activationResultBoundaryForTesting?()
+#endif
+                guard !self.resource.isRevoked else { throw POSIXError(.EACCES) }
+#if STALLION_MOUNT_TRACE
+                stage = .complete
+#endif
+                self.activation = self.selectedAccess == .contextualWrites ? .contextual : .readOnly
+                self.publishActivation(true)
                 self.record(1); reply(result, nil)
-            } catch { if previous == .inactive { self.state = .inactive }; self.record(1, error: error); reply(nil, error) }
+            } catch {
+                if self.activation == .validating && terminalOnFailure {
+                    self.activation = .failed
+                    self.state = .inactive
+                    self.publishActivation(false)
+                    // A failed result/pin setup after promotion is terminal, never RO fallback.
+                    self.submissionLock.lock()
+                    self.admission = .terminal
+                    self.latch(error)
+                    self.activationFailureReply = { failure in reply(nil, failure) }
+                    self.submissionLock.unlock()
+                    self.record(1, error: error)
+                    return // The final admitted callback owns cleanup and this reply.
+                } else if previous == .inactive {
+                    self.state = .inactive
+                    if self.activation == .validating { self.activation = .loaded }
+                }
+                self.record(1, error: error); reply(nil, error)
+            }
         }
     }
-    private func canonicalResult<T>(_ inode: UInt64, prepare: (StallionItem) throws -> T) throws -> T {
+    private func canonicalResult<T>(_ inode: UInt64, activationOwned: Bool = false, prepare: (StallionItem) throws -> T) throws -> T {
         let existed = items[inode] != nil, item = try canonical(inode)
         do { return try prepare(item) }
         catch {
+            var primary = error
             if !existed {
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
-                if writesEnabled { _ = releaseItem(item) }
+                if writesEnabled {
+                    if activationOwned { latch(error); rememberDelivery(error) }
+                    if let cleanup = releaseItem(item), activationOwned {
+                        primary = activationCleanupError(error, cleanup)
+                        failure = primary
+                    }
+                }
                 else { items.removeValue(forKey: inode) }
 #else
                 items.removeValue(forKey: inode)
 #endif
             }
-            throw error
+            throw primary
         }
     }
     func mount(options: FSTaskOptions, replyHandler: @escaping (Error?) -> Void) { mount(arguments: options.taskOptions, replyHandler: replyHandler) }
     func mount(arguments: [String], replyHandler: @escaping (Error?) -> Void) {
-        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else { replyHandler(POSIXError(.E2BIG)); return }
-        enqueue(retainedBytes: arguments.reduce(0) { $0 + $1.utf8.count }, maintenance: true, rejected: { replyHandler($0) }) {
+#if STALLION_MOUNT_TRACE
+        let trace = MountTrace.shared, callback = trace.id(), load = mountTraceLoad
+        trace.emit(1, 3, load: load, callback: callback, value: UInt64(min(arguments.count, 65)))
+        let originalReply = replyHandler
+#endif
+        guard arguments.count <= 64 && arguments.allSatisfy({ $0.utf8.count <= 1024 }) else {
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 3, load: load, callback: callback, stage: .arguments, error: POSIXError(.E2BIG))
+#endif
+            replyHandler(POSIXError(.E2BIG)); return
+        }
+        enqueue(retainedBytes: arguments.reduce(0) { $0 + $1.utf8.count }, maintenance: true, rejected: { error in
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 3, load: load, callback: callback, stage: .enqueue, error: error)
+#endif
+            replyHandler(error)
+        }) {
+#if STALLION_MOUNT_TRACE
+        trace.emit(2, 3, load: load, callback: callback, state: self.state.rawValue)
+        var stage: MountTrace.Stage = .force
+        let replyHandler: (Error?) -> Void = { error in
+            trace.emit(3, 3, load: load, callback: callback, stage: stage, state: self.state.rawValue, error: error)
+            originalReply(error)
+        }
+#endif
         do {
-            guard !arguments.contains("-f") else { throw POSIXError(.ENOTSUP) }
+            let hasLowercaseForce = arguments.contains("-f")
+#if STALLION_MOUNT_TRACE
+            trace.emit(4, 3, load: load, callback: callback, stage: .force, value: hasLowercaseForce ? 1 : 0)
+#endif
+            guard !hasLowercaseForce else { throw POSIXError(.ENOTSUP) }
+#if STALLION_MOUNT_TRACE
+            stage = .state
+#endif
             guard self.state != .inactive else { throw POSIXError(.EINVAL) }
+#if STALLION_MOUNT_TRACE
+            stage = .ready
+#endif
             _ = try self.ready()
+#if STALLION_MOUNT_TRACE
+            stage = .randomness
+#endif
             var bytes = [UInt8](repeating: 0, count: 16)
             if self.state != .mounted {
                 guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw POSIXError(.EIO) }
             }
+#if STALLION_MOUNT_TRACE
+            stage = .unmount
+#endif
             self.submissionLock.lock()
             guard self.pendingUnmountReplies == 0 && self.admission != .terminal else {
                 self.submissionLock.unlock(); throw POSIXError(.EBUSY)
             }
             if self.state != .mounted { self.nonce = bytes; self.state = .mounted }
             self.admission = .open; self.submissionLock.unlock()
+#if STALLION_MOUNT_TRACE
+            stage = .complete
+#endif
             self.record(2); replyHandler(nil)
         } catch { self.record(2, error: error); replyHandler(error) }
     } }
@@ -839,6 +1263,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             if self.pendingUnmountReplies == 0 && self.admission != .terminal { self.admission = .unmounted }
             self.submissionLock.unlock()
             self.record(3, error: self.failure); replyHandler()
+            self.finishFailedActivation()
         })
         submissionLock.unlock()
     }
@@ -869,18 +1294,49 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     func synchronize(flags: FSSyncFlags, replyHandler: @escaping (Error?) -> Void) {
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
-            let invalid: Error? = [FSSyncFlags.wait, .dWait, .noWait].contains(flags) ? nil : POSIXError(.EINVAL)
+            let timingMask = FSSyncFlags.wait.rawValue | FSSyncFlags.noWait.rawValue | FSSyncFlags.dWait.rawValue
+            // macOS 27 FSKit forwards the vnode synchronization origin marker with the timing selector.
+            let allowedMask = timingMask | 0x10000
+            let raw = flags.rawValue, timing = raw & timingMask
+            let valid = raw >= 0 && raw & ~allowedMask == 0 &&
+                [FSSyncFlags.wait.rawValue, FSSyncFlags.noWait.rawValue, FSSyncFlags.dWait.rawValue].contains(timing)
+            let invalid: Error? = valid ? nil : POSIXError(.EINVAL)
             enqueue(maintenance: true, syncOperation: true, syncFlags: UInt64(bitPattern: Int64(flags.rawValue)), validationError: invalid, rejected: { replyHandler($0) }) {
-                var error = self.deliveryError() ?? self.failure
+                let retained = self.deliveryError()
+                var error = retained ?? self.failure
+#if STALLION_MOUNT_TRACE
+                let volumeError = self.failure
+                var ownError: Error?
+                var ownCheck: UInt8 = 0
+#endif
                 if error == nil {
                     do {
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 1
+#endif
                         let h = try self.ready(); var info = sfs_image_information(), r = sfs_result()
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 2
+#endif
                         try self.check(sfs_image_get_information(h, &info, &r), r)
+#if STALLION_MOUNT_TRACE
+                        ownCheck = 3
+#endif
                         guard r.transaction_active == 0 else { throw POSIXError(.EIO) }
-                    } catch let caught { self.latch(caught); self.rememberDelivery(caught, self.lastCoreFailure ?? sfs_result()); error = caught }
+                    } catch let caught {
+#if STALLION_MOUNT_TRACE
+                        ownError = caught
+#endif
+                        self.latch(caught); self.rememberDelivery(caught, self.lastCoreFailure ?? sfs_result()); error = caught
+                    }
                 }
                 // Recheck under the same lock used by prequeue rejection.
-                error = self.deliveryError() ?? error
+                let recheck = self.deliveryError()
+                error = recheck ?? error
+#if STALLION_MOUNT_TRACE
+                DeliveryTrace.shared.sync(volume: self.deliveryTraceVolume, stage: 2, check: ownCheck, flags: UInt64(bitPattern: Int64(flags.rawValue)),
+                    retained: retained, volumeError: volumeError, core: ownError, recheck: recheck, outcome: error)
+#endif
                 self.record(5, mask: UInt64(bitPattern: Int64(flags.rawValue)), error: error); replyHandler(error)
             }
             return
@@ -889,6 +1345,33 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         enqueue(maintenance: true, rejected: { replyHandler($0) }) {
         self.record(5, error: self.failure); replyHandler(self.failure)
     } }
+    // Called only after a callback releases its reservation, or a lifecycle
+    // reply completes. New submissions are already terminally blocked.
+    private func finishFailedActivation() {
+        submissionLock.lock()
+        guard activation == .failed, callbacks.isEmpty, pendingUnmountReplies == 0,
+              let reply = activationFailureReply else { submissionLock.unlock(); return }
+        activationFailureReply = nil
+        state = .terminal; admission = .terminal
+        let owned = handle; handle = nil
+        let primary = failure ?? POSIXError(.EIO)
+        submissionLock.unlock()
+        var cleanup: Error?
+        if let owned {
+            var result = sfs_result()
+            let status = sfs_image_close(owned, &result)
+            if status != SFS_OK { cleanup = sfsError(status, result) }
+        }
+        if scope { scope = false; resource.url.stopAccessingSecurityScopedResource() }
+#if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
+        writesEnabled = false
+#endif
+        items.removeAll(); nonce.removeAll()
+        if let cleanup {
+            let combined = activationCleanupError(primary, cleanup)
+            failure = combined; reply(combined)
+        } else { reply(primary) }
+    }
     // Queue-only. Busy is nonconsuming; a close error still consumes ownership.
     func unload() -> (consumed: Bool, error: Error?) {
         submissionLock.lock()
@@ -918,7 +1401,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             submissionLock.unlock(); return (false, failure ?? POSIXError(.EBUSY))
         }
 #endif
-        admission = .terminal; submissionLock.unlock()
+        admission = .terminal; publishActivation(false); submissionLock.unlock()
         state = .terminal; nonce.removeAll(); let owned = handle; handle = nil
         if let owned { var r = sfs_result(); let status = sfs_image_close(owned, &r); if status != SFS_OK { latch(sfsError(status, r)) } }
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
@@ -941,18 +1424,80 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func getAttributesBody<T>(_ makeRequest: @escaping () throws -> FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity?,
                                      requirements: ResultRequirements? = nil,
                                      prepare: @escaping (FSItem.Attributes) throws -> T, reply: @escaping (T?, Error?) -> Void) {
-        enqueue(rejected: { reply(nil, $0) }) {
+#if STALLION_MOUNT_TRACE
+        let trace = MountTrace.shared, load = mountTraceLoad
+        let callback = requirements?.traceCallback ?? trace.id()
+        let explicit = UInt64(bitPattern: Int64(requirements?.caller.rawValue ?? 0))
+        let sdk = UInt64(bitPattern: Int64(requirements?.sdk.rawValue ?? 0))
+        let hint = requirements?.traceHint ?? 0
+#endif
+        enqueue(rejected: { error in
+#if STALLION_MOUNT_TRACE
+            trace.emit(3, 4, load: load, callback: callback, stage: .enqueue, mask: explicit, sdk: sdk, hint: hint, error: error)
+#endif
+            reply(nil, error)
+        }) {
+#if STALLION_MOUNT_TRACE
+            trace.emit(2, 4, load: load, callback: callback, state: self.state.rawValue, mask: explicit, sdk: sdk, hint: hint)
+            var stage: MountTrace.Stage = .request
+            var prepared: UInt64 = 0
+            let originalReply = reply
+            let reply: (T?, Error?) -> Void = { result, error in
+                trace.emit(3, 4, load: load, callback: callback, stage: stage, state: self.state.rawValue,
+                           mask: explicit, sdk: sdk, hint: hint, value: prepared, error: error)
+                originalReply(result, error)
+            }
+#endif
             var parents = ParentEvidence(), inode: UInt64 = 0
             var mask: UInt64 = 0
             do {
                 let request = try makeRequest(); mask = UInt64(bitPattern: Int64(request.wantedAttributes.rawValue))
-                inode = try self.id(item); let m = try self.metadata(inode)
-                if let caller { try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller) }
+#if STALLION_MOUNT_TRACE
+                stage = .item
+#endif
+                inode = try self.id(item)
+#if STALLION_MOUNT_TRACE
+                stage = .metadata
+#endif
+                let m = try self.metadata(inode)
+#if STALLION_MOUNT_TRACE
+                stage = .access
+#endif
+#if STALLION_ADAPTER_CHECK
+                if let error = self.getAccessBoundaryForTesting?() { self.latch(error) }
+#endif
+                if let caller {
+#if STALLION_MOUNT_TRACE
+                    let observation = MountTrace.Access(load: load, callback: callback, inode: inode,
+                        caller: caller, owner: self.owner, metadataUID: m.uid,
+                        mask: UInt64(FSVolume.AccessMask.readAttributes.rawValue))
+                    self.accessObservation = observation
+                    var accessError: Error?
+                    defer { self.accessObservation = nil; trace.emitAccess(observation, error: accessError) }
+                    do { try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller) }
+                    catch { accessError = error; throw error }
+#else
+                    try self.ownerAccess(m, inode: inode, access: .readAttributes, caller: caller)
+#endif
+                }
+#if STALLION_MOUNT_TRACE
+                stage = .attributes
+#endif
                 let a: FSItem.Attributes
                 if let requirements { a = try self.preparedResultAttributes(m, request, requirements, parents: &parents) }
                 else { a = try self.attributes(m, request, parents: &parents) }
+#if STALLION_MOUNT_TRACE
+                stage = .constructor
+                let limitedValid = a.isValid(.supportsLimitedXAttrs), inhibitValid = a.isValid(.inhibitKernelOffloadedIO)
+                prepared = 1 | (limitedValid ? 2 : 0) | (inhibitValid ? 4 : 0)
+                if limitedValid && a.supportsLimitedXAttrs { prepared |= 8 }
+                if inhibitValid && a.inhibitKernelOffloadedIO { prepared |= 16 }
+#endif
                 let result = try prepare(a)
                 self.record(10, inode, mask: mask, allocation: request.isAttributeWanted(.allocSize) ? a.allocSize : 0, parents: parents)
+#if STALLION_MOUNT_TRACE
+                stage = .complete
+#endif
                 reply(result, nil)
             } catch { parents.mapped = nil; self.record(10, inode, mask: mask, error: error, parents: parents); reply(nil, error) }
         }
@@ -1164,7 +1709,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard caller.uid == Int(self.owner) else { throw POSIXError(.EACCES) }
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
             if self.writesEnabled {
-                guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+                guard !modes.isEmpty && modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
+                guard m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY else { throw POSIXError(.EINVAL) }
+                if m.entry.kind == SFS_DIRECTORY && modes.contains(.write) { throw POSIXError(.EISDIR) }
                 if modes.contains(.write) { try self.ownerAccess(m, inode: inode, access: .writeData, caller: caller) }
                 if modes.contains(.read) { try self.ownerAccess(m, inode: inode, access: .readData, caller: caller) }
                 (item as! StallionItem).retainedModes.formUnion(modes)
@@ -1172,8 +1719,9 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
 #endif
             if modes.contains(.write) { throw POSIXError(.EROFS) }
-            guard modes == .read && m.entry.kind == SFS_FILE else { throw POSIXError(.EINVAL) }
+            guard modes == .read && (m.entry.kind == SFS_FILE || m.entry.kind == SFS_DIRECTORY) else { throw POSIXError(.EINVAL) }
             try self.ownerAccess(m, inode: inode, access: .readData, caller: caller)
+            (item as! StallionItem).retainedModes.formUnion(modes)
             self.record(15, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
         } catch { self.record(15, mask: UInt64(modes.rawValue), uid: Int64(caller.uid), error: error); reply(error) }
     } }
@@ -1201,6 +1749,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             }
 #endif
             guard modes.isEmpty || modes == .read else { throw POSIXError(.EROFS) }
+            try self.closeModes(item, modes: modes)
             self.record(16, inode, mask: UInt64(modes.rawValue), uid: Int64(caller.uid)); reply(nil)
         } catch { self.record(16, uid: Int64(caller.uid), error: error); reply(error) }
     } }
@@ -1231,14 +1780,14 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         allowFileExecution = writesEnabled && selectedAccess == .contextualWrites
         if allowFileExecution && m.entry.kind == SFS_FILE && access.contains(.execute) {
             _ = try ready(mounted: true)
-            guard resource.isWritable else { throw POSIXError(.EACCES) }
+            guard (selectedAccess == .contextualWrites || resource.isWritable) else { throw POSIXError(.EACCES) }
         }
 #endif
 #if STALLION_CONTEXT_HANDLERS && (STALLION_WRITE_DIAGNOSTIC || STALLION_CONTEXT_WRITES)
         let metadataRights: FSVolume.AccessMask = [.writeAttributes, .writeSecurity]
         if writesEnabled && !access.intersection(metadataRights).isEmpty {
             _ = try ready(mounted: true)
-            guard resource.isWritable else { throw POSIXError(.EACCES) }
+            guard (selectedAccess == .contextualWrites || resource.isWritable) else { throw POSIXError(.EACCES) }
             try checkMetadataOwnerPolicy(m, owner: owner, caller: caller)
             // Security writes also cover ACL requests. Their mutation callbacks remain unsupported.
             // Validate every remaining right and the opaque ACL policy against the original item.
@@ -1247,7 +1796,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         }
         if writesEnabled && access.contains(.writeXattr) {
             _ = try ready(mounted: true)
-            guard resource.isWritable else { throw POSIXError(.EACCES) }
+            guard (selectedAccess == .contextualWrites || resource.isWritable) else { throw POSIXError(.EACCES) }
             try checkXattrOwnerPolicy(m, owner: owner, caller: caller)
             try ownerAccess(m, inode: inode, access: access.subtracting(.writeXattr), caller: caller)
             return
@@ -1255,20 +1804,32 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         let creationRights = access.intersection([.addFile, .addSubdirectory])
         if writesEnabled && m.entry.kind == SFS_DIRECTORY && !creationRights.isEmpty {
             _ = try ready(mounted: true)
-            guard resource.isWritable else { throw POSIXError(.EACCES) }
+            guard (selectedAccess == .contextualWrites || resource.isWritable) else { throw POSIXError(.EACCES) }
             try checkLinkParentPolicy(m, owner: owner, caller: caller)
             // Every remaining right and the ACL policy use the original metadata.
             try ownerAccess(m, inode: inode, access: access.subtracting(creationRights), caller: caller)
             return
         }
 #endif
+#if STALLION_MOUNT_TRACE
+        accessObservation?.stage = 1
+#endif
         try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: false, allowFileExecution: allowFileExecution)
         // Opaque security descriptors are not an implemented ACL evaluator.
         let name = Data("com.apple.system.Security".utf8)
+#if STALLION_MOUNT_TRACE
+        accessObservation?.stage = 2
+#endif
         var size: UInt64 = 0, r = sfs_result(); let h = try ready()
+#if STALLION_MOUNT_TRACE
+        accessObservation?.stage = 3
+#endif
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         let pin: sfs_pin?
         if writesEnabled { pin = try token(inode) } else { pin = nil }
+#endif
+#if STALLION_MOUNT_TRACE
+        accessObservation?.stage = 4
 #endif
         let status = name.withUnsafeBytes { bytes -> sfs_status in
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
@@ -1276,8 +1837,17 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #endif
             return sfs_image_xattr_size(h, 0, inode, bytes.baseAddress, bytes.count, &size, &r)
         }
+#if STALLION_MOUNT_TRACE
+        accessObservation?.corePresent = true
+        accessObservation?.status = status.rawValue
+        accessObservation?.phase = r.phase.rawValue
+        accessObservation?.systemErrno = r.system_errno
+#endif
         if status == SFS_NOT_FOUND { return }
         try check(status, r)
+#if STALLION_MOUNT_TRACE
+        accessObservation?.stage = 5
+#endif
         try checkOwnerPolicy(m, owner: owner, caller: caller, access: access, writable: writable, hasACL: true, allowFileExecution: allowFileExecution)
     }
 #if !STALLION_CONTEXT_HANDLERS
@@ -1420,17 +1990,37 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         guard wanted.rawValue & ~0x3fff == 0 else { throw POSIXError(.ENOTSUP) }
     }
     private struct ResultRequirements {
+#if STALLION_MOUNT_TRACE
+        var traceCallback: UInt64 = 0
+        var traceHint: UInt64 = 0
+#endif
         let type: FSVolumeHandlerResult.Type
         let caller: FSItem.Attribute
+        let policyCaller: FSItem.Attribute
         let sdk: FSItem.Attribute
         init(_ type: FSVolumeHandlerResult.Type, explicit: FSItem.Attribute = []) {
-            self.type = type; caller = explicit
+            self.type = type; caller = explicit; policyCaller = explicit
             sdk = type.requestedAttributes.wantedAttributes
         }
+        init(contextualSDKGet caller: FSItem.Attribute) {
+            type = FSGetAttributesResult.self
+            self.caller = caller
+            sdk = type.requestedAttributes.wantedAttributes
+            let snapshot = FSItem.GetAttributesRequest()
+            snapshot.wantedAttributes = caller
+            let publicAttributes: [FSItem.Attribute] = [
+                .type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize,
+                .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime,
+                .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO
+            ]
+            policyCaller = publicAttributes.reduce(into: FSItem.Attribute()) { projection, attribute in
+                if snapshot.isAttributeWanted(attribute) { projection.insert(attribute) }
+            }
+        }
         func request() throws -> FSItem.GetAttributesRequest {
-            try StallionVolume.validateCallerWanted(caller)
+            try StallionVolume.validateCallerWanted(policyCaller)
             let request = FSItem.GetAttributesRequest()
-            request.wantedAttributes = sdk.union(caller)
+            request.wantedAttributes = sdk.union(policyCaller)
             return request
         }
     }
@@ -1449,6 +2039,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
 #if STALLION_ADAPTER_CHECK
     var rejectResultForTesting: ((String) -> Bool)?
+    // Inject only between metadata and access; absent from production builds.
+    var getAccessBoundaryForTesting: (() -> Error?)?
     var preparedAttributesForTesting: ((String, FSItem.Attributes) -> Void)?
     static func resultRequestForTesting(_ type: FSVolumeHandlerResult.Type, explicit: FSItem.Attribute = []) throws -> FSItem.GetAttributesRequest {
         try ResultRequirements(type, explicit: explicit).request()
@@ -1541,8 +2133,8 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     } }
     private func preparedResultAttributes(_ m: sfs_metadata_entry, _ request: FSItem.GetAttributesRequest,
                                           _ requirements: ResultRequirements, parents: inout ParentEvidence, detachedParent: LastKnownParent? = nil) throws -> FSItem.Attributes {
-        try Self.validateCallerWanted(requirements.caller)
-        guard request.wantedAttributes == requirements.sdk.union(requirements.caller) else { throw POSIXError(.EIO) }
+        try Self.validateCallerWanted(requirements.policyCaller)
+        guard request.wantedAttributes == requirements.sdk.union(requirements.policyCaller) else { throw POSIXError(.EIO) }
         // SDK result snapshots may supply additional truthful policy attributes.
         let attributes = try populateAttributes(m, request, parents: &parents, includeResultPolicy: true, detachedParent: detachedParent)
 #if STALLION_ADAPTER_CHECK
@@ -1558,10 +2150,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         return try preparedResultAttributes(m, requirements.request(), requirements, parents: &parents)
     }
     func activateVolume(options: FSTaskOptions, replyHandler: @escaping (FSActivateResult?, Error?) -> Void) {
-        activateHandler(replyHandler: replyHandler)
+        activateHandler(arguments: options.taskOptions, replyHandler: replyHandler)
     }
-    private func activateHandler(replyHandler: @escaping (FSActivateResult?, Error?) -> Void) {
-        activateBody(prepare: { root in
+    private func activateHandler(arguments: [String] = [], replyHandler: @escaping (FSActivateResult?, Error?) -> Void) {
+        activateBody(arguments: arguments, prepare: { root in
             return try self.handlerResult(FSActivateResult.self) { FSActivateResult(rootItem: root) }
         }, reply: replyHandler)
     }
@@ -1588,7 +2180,17 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     private func getAttributesHandler(_ request: FSItem.GetAttributesRequest, item: FSItem, caller: CallerIdentity,
                                       reply: @escaping (FSGetAttributesResult?, Error?) -> Void) {
         let explicit = request.wantedAttributes
-        let requirements = ResultRequirements(FSGetAttributesResult.self, explicit: explicit)
+#if STALLION_MOUNT_TRACE
+        let trace = MountTrace.shared, callback = trace.id()
+        let hint = (item as? StallionItem)?.inode ?? 0
+        var requirements = ResultRequirements(contextualSDKGet: explicit)
+        trace.emit(1, 4, load: mountTraceLoad, callback: callback,
+                   mask: UInt64(bitPattern: Int64(explicit.rawValue)),
+                   sdk: UInt64(bitPattern: Int64(requirements.sdk.rawValue)), hint: hint)
+        requirements.traceCallback = callback; requirements.traceHint = hint
+#else
+        let requirements = ResultRequirements(contextualSDKGet: explicit)
+#endif
         getAttributesBody({ try requirements.request() }, item: item, caller: caller, requirements: requirements, prepare: { attributes in
             return try self.handlerResult(FSGetAttributesResult.self) { FSGetAttributesResult(attributes: attributes) }
         }, reply: reply)
@@ -1680,7 +2282,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         attributes.consumedAttributes = []
 #if STALLION_WRITE_DIAGNOSTIC || (STALLION_CONTEXT_HANDLERS && STALLION_CONTEXT_WRITES)
         if writesEnabled {
-            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.mode, .size, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime, .fileID])
+            let requirements = ResultRequirements(FSSetAttributesResult.self, explicit: [.mode, .flags, .size, .allocSize, .accessTime, .modifyTime, .changeTime, .birthTime, .fileID])
             setWritableAttributes(attributes, item: item, caller: caller, requirements: requirements,
                 request: { try requirements.request() }, prepare: { a in
                     return try self.handlerResult(FSSetAttributesResult.self) { FSSetAttributesResult(attributes: a, freeSpace: nil) }
@@ -1728,10 +2330,11 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
             guard kind == 0 || kind == modeKind else { throw POSIXError(.EINVAL) }
             guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
             var used: FSItem.Attribute = [.mode, .uid, .gid]
-            if attributes.isValid(.flags) { guard attributes.flags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
+            if attributes.isValid(.flags) { guard attributes.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.flags) }
             if attributes.isValid(.size) { guard self.kind != SFS_SYMLINK, attributes.size == 0 else { throw POSIXError(.ENOTSUP) }; used.insert(.size) }
             var value = sfs_metadata_initial()
             value.mode = modeKind | (mode & 0o777); value.uid = uid; value.gid = gid
+            if attributes.isValid(.flags) { value.flags = attributes.flags }
             if attributes.isValid(.accessTime) {
                 value.access = try metadataTime(attributes.accessTime)
                 value.restore |= UInt32(SFS_RESTORE_ACCESS.rawValue); used.insert(.accessTime)
@@ -1832,7 +2435,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 try self.createStageForTesting?("preflight", nil)
 #endif
                 let h = try self.ready(mounted: true)
-                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) else { throw POSIXError(.EACCES) }
                 let parent = try self.id(directory), parentMetadata = try self.metadata(parent)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
                 try self.ownerAccess(parentMetadata, inode: parent, access: values.kind == SFS_DIRECTORY ? [.addSubdirectory, .search] : [.addFile, .search], caller: caller)
@@ -1840,7 +2443,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 let status = bytes.withUnsafeBytes { sfs_image_lookup(h, 0, parent, $0.baseAddress, $0.count, &found, &receipt) }
                 if status != SFS_NOT_FOUND { try self.check(status, receipt); throw POSIXError(.EEXIST) }
                 guard anchorMatches(receipt, self.anchor) else { let e = POSIXError(.ESTALE); self.latch(e); throw e }
-                let requirements = ResultRequirements(resultType), request = try requirements.request()
+                let requirements = ResultRequirements(resultType, explicit: [.flags]), request = try requirements.request()
                 guard self.pendingCreate == nil, self.items.count < self.itemLimit else { throw POSIXError(.ENFILE) }
                 self.pendingCreate = PendingCreate(); ownsPending = true
                 var pin = sfs_pin()
@@ -1952,12 +2555,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 self.linkPreflightForTesting?()
 #endif
                 let h = try self.ready(mounted: true)
-                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) else { throw POSIXError(.EACCES) }
                 let source = try self.id(item), parent = try self.id(directory)
                 let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, parentMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
@@ -2024,12 +2627,12 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if STALLION_ADAPTER_CHECK
                 self.removePreflightForTesting?()
 #endif
-                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) else { throw POSIXError(.EACCES) }
                 let source = try self.id(item), parent = try self.id(directory)
                 let sourceMetadata = try self.metadata(source), parentMetadata = try self.metadata(parent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard source != 1, sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_SYMLINK || sourceMetadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, parentMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, parentMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(parentMetadata, owner: self.owner, caller: caller)
@@ -2122,14 +2725,14 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if STALLION_ADAPTER_CHECK
                 self.renamePreflightForTesting?()
 #endif
-                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) else { throw POSIXError(.EACCES) }
                 let source = try self.id(item), oldParent = try self.id(sourceDirectory), newParent = try self.id(destinationDirectory)
                 let sourceMetadata = try self.metadata(source), oldMetadata = try self.metadata(oldParent), newMetadata = try self.metadata(newParent)
                 guard sourceMetadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                 guard source != 1,
                       sourceMetadata.entry.kind == SFS_FILE || sourceMetadata.entry.kind == SFS_DIRECTORY || sourceMetadata.entry.kind == SFS_SYMLINK else { throw POSIXError(.ENOTSUP) }
                 if sourceMetadata.entry.kind == SFS_DIRECTORY && sourceMetadata.link_count != 1 { throw POSIXError(.ENOTSUP) }
-                guard sourceMetadata.flags == 0, oldMetadata.flags == 0, newMetadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                guard sourceMetadata.flags & ~supportedBSDFlags == 0, oldMetadata.flags & ~supportedBSDFlags == 0, newMetadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                 guard sourceMetadata.mode & 0o7000 == 0 else { throw POSIXError(.EACCES) }
                 try self.ownerAccess(sourceMetadata, inode: source, access: .readAttributes, caller: caller)
                 try checkLinkParentPolicy(oldMetadata, owner: self.owner, caller: caller)
@@ -2165,7 +2768,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 if newStatus == SFS_OK && found.inode == source {
                     guard suppliedVictim == nil || suppliedVictim === item else { throw POSIXError(.ESTALE) }
                     let result = try prepared(sourceMetadata, oldMetadata, newMetadata)
-                    guard self.resource.isWritable && !self.resource.isRevoked else { throw POSIXError(.EACCES) }
+                    guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) && !self.resource.isRevoked else { throw POSIXError(.EACCES) }
                     reply(result, nil); return
                 }
                 let victim: StallionItem?, victimMetadata: sfs_metadata_entry?
@@ -2178,7 +2781,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     let metadata = try self.metadata(suppliedVictim.inode)
                     guard metadata.link_count > 0 else { throw POSIXError(.ENOENT) }
                     guard suppliedVictim.inode != 1, metadata.entry.kind == SFS_FILE || metadata.entry.kind == SFS_SYMLINK || metadata.entry.kind == SFS_DIRECTORY else { throw POSIXError(.ENOTSUP) }
-                    guard metadata.flags == 0 else { throw POSIXError(.ENOTSUP) }
+                    guard metadata.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
                     guard metadata.mode & 0o6000 == 0 else { throw POSIXError(.EACCES) }
                     try self.ownerAccess(metadata, inode: suppliedVictim.inode, access: .readAttributes, caller: caller)
                     if sourceMetadata.entry.kind == SFS_DIRECTORY && metadata.entry.kind != SFS_DIRECTORY { throw POSIXError(.ENOTDIR) }
@@ -2271,7 +2874,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 if let error = self.deliveryError() { throw error }
                 let h = try self.ready(mounted: true)
                 guard self.pendingCreate == nil else { throw POSIXError(.EBUSY) }
-                guard self.resource.isWritable else { throw POSIXError(.EACCES) }
+                guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) else { throw POSIXError(.EACCES) }
                 let inode = try self.id(item), m = try self.metadata(inode), pin = try self.token(inode)
                 try self.ownerAccess(m, inode: inode, access: .writeXattr, caller: caller)
                 // Whole-value resource forks remain a regular-file-only mutation.
@@ -2347,7 +2950,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     func refusedMutationForTesting(replyHandler: (Error?) -> Void) { refuse { replyHandler($0) } }
 #if STALLION_CONTEXT_HANDLERS
-    func activateResultForTesting(replyHandler: @escaping (FSActivateResult?, Error?) -> Void) { activateHandler(replyHandler: replyHandler) }
+    func activateResultForTesting(arguments: [String] = [], replyHandler: @escaping (FSActivateResult?, Error?) -> Void) { activateHandler(arguments: arguments, replyHandler: replyHandler) }
     func lookupResultForTesting(_ name: String, directory: FSItem, caller: CallerIdentity, replyHandler: @escaping (FSLookupItemResult?, Error?) -> Void) {
         lookupHandler(FSFileName(string: name), directory: directory, caller: caller, reply: replyHandler)
     }
@@ -2412,7 +3015,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     // is staged. The original receipt survives abort/verification failures.
     private func mutate<T>(_ body: (OpaquePointer, inout sfs_result) throws -> Void,
                            prepare: (OpaquePointer, inout sfs_result) throws -> T,
-                           receipt: inout sfs_result) throws -> T {
+                           receipt: inout sfs_result, origin: UInt = #line) throws -> T {
         let h = try ready(mounted: true), before = anchor
         var began = false, committed = false
         do {
@@ -2440,7 +3043,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
 #if STALLION_ADAPTER_CHECK
             diagnosticBeforeCommit?()
 #endif
-            guard resource.isWritable && !resource.isRevoked else { throw POSIXError(.EACCES) }
+            guard (selectedAccess == .contextualWrites || resource.isWritable) && !resource.isRevoked else { throw POSIXError(.EACCES) }
 #if STALLION_CONTEXT_HANDLERS
             pendingCreate?.outcome.commitAttempted = true
             let status = sfs_image_commit(h, &receipt)
@@ -2529,7 +3132,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     if checked != SFS_OK || cleanup.transaction_active != 0 || !anchorMatches(cleanup, before) { latch(POSIXError(.EIO)) }
                 }
             }
-            receipt = original; rememberDelivery(error, original); throw error
+            receipt = original; rememberDelivery(error, original, origin: origin); throw error
         }
     }
     private func performWrite<T>(_ contents: Data, item: FSItem, offset: off_t,
@@ -2606,7 +3209,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
     }
     static func sizeRequestError(valid: [FSItem.Attribute], metadata: Bool = false) -> Error? {
         let computed: [FSItem.Attribute] = [.type, .linkCount, .allocSize, .fileID, .parentID, .changeTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO]
-        let disabled: [FSItem.Attribute] = metadata ? [.uid, .gid, .flags] : [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
+        let disabled: [FSItem.Attribute] = metadata ? [.uid, .gid] : [.mode, .uid, .gid, .flags, .accessTime, .modifyTime, .birthTime]
         if computed.contains(where: { valid.contains($0) }) { return POSIXError(.EINVAL) }
         if disabled.contains(where: { valid.contains($0) }) { return POSIXError(.ENOTSUP) }
         // addedTime and backupTime have no representation and stay unconsumed.
@@ -2625,7 +3228,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
         a.consumedAttributes = []
         let hasSize = a.isValid(.size), size = hasSize ? a.size : 0
         let mode: UInt32? = a.isValid(.mode) ? a.mode : nil
-        let metadataFields: [FSItem.Attribute] = [.mode, .accessTime, .modifyTime, .birthTime]
+        let metadataFields: [FSItem.Attribute] = [.mode, .flags, .accessTime, .modifyTime, .birthTime]
         let usedMetadata = metadataFields.filter { a.isValid($0) }.reduce(FSItem.Attribute()) { $0.union($1) }
         let hasMutation = hasSize || !usedMetadata.isEmpty
         var update = sfs_metadata_update(), validation = Self.sizeRequestError(a, metadata: true)
@@ -2634,6 +3237,10 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 if let mode {
                     guard mode & ~(UInt32(S_IFMT) | 0o777) == 0 else { throw POSIXError(.ENOTSUP) }
                     update.fields |= UInt32(SFS_META_MODE.rawValue); update.mode = mode
+                }
+                if a.isValid(.flags) {
+                    guard a.flags & ~supportedBSDFlags == 0 else { throw POSIXError(.ENOTSUP) }
+                    update.fields |= UInt32(SFS_META_FLAGS.rawValue); update.flags = a.flags
                 }
                 if a.isValid(.accessTime) { update.fields |= UInt32(SFS_META_ACCESS.rawValue); update.access = try metadataTime(a.accessTime) }
                 if a.isValid(.modifyTime) { update.fields |= UInt32(SFS_META_MODIFICATION.rawValue); update.modification = try metadataTime(a.modifyTime) }
@@ -2650,7 +3257,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 _ = try self.ready(mounted: true); inode = try self.id(item); let m = try self.metadata(inode)
                 let regularSize = hasSize && m.entry.kind == SFS_FILE
                 var access: FSVolume.AccessMask = regularSize ? .writeData : .readAttributes
-                if usedMetadata.contains(.mode) { access.insert(.writeSecurity) }
+                if !usedMetadata.intersection([.mode, .flags]).isEmpty { access.insert(.writeSecurity) }
                 if !usedMetadata.intersection([.accessTime, .modifyTime, .birthTime]).isEmpty { access.insert(.writeAttributes) }
                 try self.ownerAccess(m, inode: inode, access: access, caller: caller)
                 var pendingUpdate = requestedUpdate
@@ -2665,6 +3272,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                 }
                 let changedSize = regularSize && size != m.entry.size
                 let changedMetadata = (mode != nil && pendingUpdate.mode != m.mode) ||
+                    (usedMetadata.contains(.flags) && pendingUpdate.flags != m.flags) ||
                     changedTime(.accessTime, pendingUpdate.access, m.access) ||
                     changedTime(.modifyTime, pendingUpdate.modification, m.modification) ||
                     changedTime(.birthTime, pendingUpdate.birth, m.birth)
@@ -2693,7 +3301,7 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     }, receipt: &receipt)
                 } else {
                     result = try prepare(snapshot(m))
-                    if hasMutation { guard self.resource.isWritable && !self.resource.isRevoked else { throw POSIXError(.EACCES) } }
+                    if hasMutation { guard (self.selectedAccess == .contextualWrites || self.resource.isWritable) && !self.resource.isRevoked else { throw POSIXError(.EACCES) } }
                 }
                 a.consumedAttributes = usedMetadata.union(regularSize ? [.size] : [])
 #if STALLION_ADAPTER_CHECK

@@ -1,6 +1,6 @@
 """Real disk-image lifecycle checks; enable with STALLIONFS_TEST_IMAGES=1."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import os
 from pathlib import Path
@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from stallionfs.core import StallionError, Store, git, read_json, remove_tree, write_json
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_seed_create
+    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope, observe_seed_create
+    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 
 
 class ImageFixture:
@@ -25,6 +25,7 @@ class ImageFixture:
         self.store, self.base = store, base
         self.failed = set()
         self.unknown = False
+        self.cleanup_observation = None
 
     def call(self, method, *args, workspace=None, expected=False, stage='body', **kwargs):
         kind = 'trash' if kwargs.get('restore') else 'workspaces'
@@ -41,7 +42,8 @@ class ImageFixture:
                         self.unknown = True
                 raise
 
-    def cleanup(self):
+    def cleanup(self, *, observe=False):
+        selected, self.cleanup_observation = (self.cleanup_observation if observe else None), None
         errors = []
         if self.unknown:
             return errors  # No identity for the failed operation: retain without guessing.
@@ -63,7 +65,8 @@ class ImageFixture:
             if item['id'] in self.failed:
                 continue
             try:
-                self.call(self.store.unmount, item['id'], workspace=item['id'], stage='cleanup')
+                with observe_detach() if item['id'] == selected else nullcontext():
+                    self.call(self.store.unmount, item['id'], workspace=item['id'], stage='cleanup')
             except Exception as error:
                 errors.append((error, error.__traceback__))
         return errors
@@ -89,7 +92,7 @@ def image_fixture(store, base):
         _cleanup_notes(primary, errors, base)
         raise
     else:
-        errors = fixture.cleanup()
+        errors = fixture.cleanup(observe=True)
         if errors:
             primary, trace = errors[0]
             _cleanup_notes(primary, errors[1:], base)
@@ -105,6 +108,11 @@ def image_fixture(store, base):
 
 
 class ImageRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        from stallionfs import images
+        # Synthetic device names; real node admission is covered in test_image_detach.
+        self.enterContext(patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)))
+
     def test_image_command_preserves_machine_status(self):
         from stallionfs import images
         result = subprocess.CompletedProcess(['owned-command'], errno.EBUSY, b'', b'localized busy message')
@@ -114,7 +122,7 @@ class ImageRecoveryTests(unittest.TestCase):
         self.assertEqual(raised.exception.returncode, errno.EBUSY)
         self.assertIn('localized busy message', str(raised.exception))
 
-    def test_detach_uses_one_unchanged_target_and_preserves_every_command_error(self):
+    def test_detach_preserves_ineligible_errors_regardless_of_synthetic_returncode(self):
         from stallionfs import images
         for status in (1, 5, 16, 64, None, 'interrupt'):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
@@ -212,8 +220,10 @@ class ImageRecoveryTests(unittest.TestCase):
                      'system-entities': [{'dev-entry': '/dev/disk999'}]}
             valid = {'images': [entry]}
             with patch.object(images, '_plist', return_value=valid):
-                self.assertEqual(images.mounted(image), dict(image=str(image), device='/dev/disk999',
-                                                            mountpoint=None, volume_device=None))
+                state = images.mounted(image)
+                self.assertEqual({key: state[key] for key in ('image', 'device', 'mountpoint', 'volume_device')},
+                                 dict(image=str(image), device='/dev/disk999', mountpoint=None, volume_device=None))
+                self.assertIsInstance(state['attachment'], bytes)
             missing, loop, denied = base / 'missing.sparseimage', base / 'loop.sparseimage', base / 'denied.sparseimage'
             loop.symlink_to(loop)
             denied.symlink_to(image)
@@ -365,6 +375,7 @@ class ImageRecoveryTests(unittest.TestCase):
                      "requires macOS disk-image access and explicit test selection")
 class ImageStoreTests(unittest.TestCase):
     def test_snapshot_rollback_and_protected_retirement(self):
+        observation = detach_observation_selection()
         from stallionfs import lifecycle
         base = Path(tempfile.mkdtemp(prefix="stallionfs-image-lifecycle-test-")).resolve()
         store = Store(base / "store")
@@ -385,8 +396,10 @@ class ImageStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StallionError, "external worktree"):
                 fixture.call(store.snapshot, value, workspace=value, expected=True)
             git(repo, "config", "--local", "--unset", "include.path")
-            fixture.call(store.unmount, value, workspace=value)
-            closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
+            with observe_detach() if observation == 'initial-unmount' else nullcontext():
+                fixture.call(store.unmount, value, workspace=value)
+            with observe_detach() if observation == 'closed-snapshot' else nullcontext():
+                closed_snapshot = fixture.call(store.snapshot, value, workspace=value)
             self.assertFalse(repo.exists())
             fixture.call(store.mount, value, workspace=value)
             snapshot = fixture.call(store.snapshot, value, workspace=value)
@@ -407,6 +420,8 @@ class ImageStoreTests(unittest.TestCase):
             restored = fixture.call(store.move, value, restore=True, workspace=value)
             self.assertEqual((Path(restored["path"]) / "file").read_text(), "snapshot state\n")
             self.assertEqual(read_json(store._state(value))["status"], "open")
+            if observation == 'restored-cleanup':
+                fixture.cleanup_observation = value
 
     def test_lifecycle_and_interrupted_mount(self):
         from stallionfs import images

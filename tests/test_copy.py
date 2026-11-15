@@ -120,7 +120,7 @@ class OrdinaryCopy(unittest.TestCase):
         os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
         source.chmod(0o750)
         before = self.checks.snapshot(source)
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         self.assertEqual(before['entries']['']['mode'], 0o750)
         self.assertEqual(before['entries']['']['flags'], stat.UF_NODUMP)
         self.assertIs(self.public_copy, self.native.copy)
@@ -176,7 +176,7 @@ class OrdinaryCopy(unittest.TestCase):
                 protected.append(path)
             before = self.checks.snapshot(source)
             outside_before = self.checks.snapshot(outside)
-            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+            self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
             for jobs in (1, 2, 4):
                 with self.subTest(jobs=jobs):
                     destination = self.base / f'copy-{jobs}'
@@ -186,8 +186,10 @@ class OrdinaryCopy(unittest.TestCase):
                     self.assertEqual((destination / 'nested/data').stat().st_ino,
                                      (destination / 'nested/alias').stat().st_ino)
                     self.assertEqual((destination / 'nested/data').stat().st_nlink, 2)
-                    self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
-            self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+                    report = self.checks.verify_source(before, self.checks.snapshot(source))
+                    self.assertTrue(report['unchanged'], report)
+            report = self.checks.verify_source(outside_before, self.checks.snapshot(outside))
+            self.assertTrue(report['unchanged'], report)
         finally:
             for path in protected:
                 if path.exists():
@@ -248,7 +250,9 @@ class OrdinaryCopy(unittest.TestCase):
                 subprocess.run(['/bin/chmod', '-h', '+a', 'everyone allow read', str(source)],
                                check=True, capture_output=True, timeout=15)
                 os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_987_654_321), follow_symlinks=False)
+                self.assertEqual(source.lstat().st_mtime_ns, 1_700_000_000_987_654_321)
                 before = self.checks.snapshot(source)
+                self.assertEqual(before['entries']['']['mtime_ns'], 1_700_000_000_987_654_321)
                 self.assertTrue(before['entries']['']['xattrs'])
                 self.assertTrue(before['entries']['']['acl']['text_hex'])
                 destination = self.base / (name + '-copy')
@@ -283,7 +287,7 @@ class OrdinaryCopy(unittest.TestCase):
         source.chmod(0o550)
         os.utime(source, ns=(1_600_000_000_000_000_000, 1_700_000_000_123_456_789))
         before = self.checks.snapshot(source)
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         outside_before = self.checks.snapshot(outside)
         for jobs in range(1, 5):
             with self.subTest(jobs=jobs):
@@ -308,8 +312,10 @@ class OrdinaryCopy(unittest.TestCase):
                 (destination / 'b/file').write_bytes(b'changed')
                 self.assertEqual((destination / 'c/file').read_bytes(), b'changed')
                 self.assertEqual((source / 'a/file').read_bytes(), b'original')
-                self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
-        self.assertTrue(self.checks.verify_source(outside_before, self.checks.snapshot(outside))['unchanged'])
+                report = self.checks.verify_source(before, self.checks.snapshot(source))
+                self.assertTrue(report['unchanged'], report)
+        report = self.checks.verify_source(outside_before, self.checks.snapshot(outside))
+        self.assertTrue(report['unchanged'], report)
 
     def test_existing_destinations_are_never_merged_replaced_or_followed(self):
         source = self.base / 'source'
@@ -433,7 +439,7 @@ class OrdinaryCopy(unittest.TestCase):
         shutil.copy2(installed, launcher)
         self.assertFalse((standalone / 'stallionfs-python').exists())
         environment = {**os.environ, 'PATH': '/usr/bin:/bin'}
-        for name, command in (('native', [str(launcher)]), ('python', [sys.executable, '-I', '-m', 'stallionfs'])):
+        for name, command in (('native', [str(launcher)]), ('python', [sys.executable, '-I', '-B', '-m', 'stallionfs'])):
             with self.subTest(cli=name):
                 source = '--source café 🐎 "\\\t\n\x01'
                 path = self.base / source
@@ -517,7 +523,7 @@ class OrdinaryCopy(unittest.TestCase):
         self.eligible_child(source)
         before = self.checks.snapshot(source)
         self.assertEqual({row['gid'] for row in before['entries'].values()}, {group})
-        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt)['populated'])
+        self.assertTrue(self.fixtures.verify_metadata_coverage(before, receipt, precision_links=(), precision_scope='copy-clone')['populated'])
         fault_executable = self.compile_native_faults(self.base) if self.copy_strategy == 'auto' else None
         victim = self.base / 'victim'
         victim.mkdir(mode=0o700)

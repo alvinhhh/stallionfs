@@ -237,6 +237,44 @@ mutators; keep its controller supervising it. Timeout/interruption never means
 that the OS rolled the operation back. Installation recovery before first mount
 uses a new guard of the retained image; it does not repeat import or rename.
 
+Inspect retained creation evidence with `sfs creations` or `sfs creations ID`.
+For a verified candidate, copy its reported `transaction` into
+`sfs creations ID --continue TRANSACTION`. This installs the retained resource
+directory without importing again. An `installed-unmounted` result directs you
+to `sfs mount ID`. The reported resource path is not a
+mounted repository. Once mounting has been attempted, continuation reports
+`already-installed` with a `mount-state` handoff; follow the mount/unmount
+instructions above.
+
+For an eligible interrupted pre-install request, the same continuation command
+creates one fresh replacement from the original prepared seed and reports both
+IDs. It preserves the interrupted attempt. Repeating the old command follows
+that same replacement; an interrupted replacement requires its own ID for a
+new explicit attempt. Lost or pending helper receipts can block continuation.
+
+To inspect deliberate disposal of an abandoned pre-install attempt:
+
+```sh
+sfs --root PATH creations ID --purge TRANSACTION
+sfs --root PATH creations ID --purge TRANSACTION --confirm
+```
+
+The first command is read-only. Confirmation permanently deletes only the
+eligible attempt's retained files. A process that may still write, unknown
+ownership, changed controls or an installed image prevents disposal. The original
+ID and any replacement mapping remain inspectable after completion.
+
+Place global options before the command: `sfs --root PATH --json creations ID`.
+Complete all-store inspection exits 0, including retained or blocked entries.
+By-ID inspection exits 0 for an authoritatively loaded retained attempt,
+candidate, installed workspace or completed creation purge.
+Busy, unavailable, incomplete inspection and refused continuation exit 1 and
+write the full result to stderr; successful results use stdout. Inspection does
+not initialize or repair a store. For explicit continuation, `--native-host PATH`
+can select the containing-app executable when installation settings are first
+recorded. Omitting it preserves recorded settings; conflicting settings are
+refused. It requires `--continue`.
+
 The controller uses ordinary macOS type dispatch and current mount observations.
 These do not authenticate an exact live adapter session or prove a previous
 adapter close succeeded. A fresh guard validates only its own current admission
@@ -284,24 +322,28 @@ sfs snapshot ID --name before-change --quiescent --continue OP
 sfs rollback ID before-change --quiescent --continue OP
 ```
 
-Continuation requires the same workspace, action and name. It never repeats an
+Continuation requires the same workspace, action, name, backing target and
+controller. Pending changed-device restart recovery remains unsupported. It never repeats an
 attempted catalog mutation or creates a new recovery name. Ordinary commands
 preserve a pending compound journal and print its status command.
 
 | Retained phase | Permitted continuation |
 | --- | --- |
-| Prepared | Revalidate the accepted mount, then start the first unmount and mutation. |
+| Prepared | A present accepted matching mount follows normal unmount. With no launched lifecycle or catalog attempt, complete workspace absence plus fresh exclusive backing admission and successful consumed close permits the first mutation. Absence and resource binding are checked again after the guard. |
 | Unmount response missing | Only terminal helper evidence plus fresh absence and backing admission can allow the first mutation. A present mount is not automatically unmounted again. |
 | Bridge response missing, failed, uncertain or close incomplete | Stop. A matching current catalog cannot repair the original result. |
 | Confirmed commit and successful consumed close | Remount only, checking the saved anchor; or finalize an originally unmounted workspace. |
 | Remount response missing | A present mount requires the same operation's durable qualified observation/usability evidence and terminal helper evidence for finish-only continuation. Otherwise stop. Once separately withdrawn and absent, terminal helper evidence permits a new recorded remount attempt. |
-| Final state verified, completion interrupted | Verify retained final evidence and current state, finish the durable record, then remove the matching journal. |
+| Final state verified, completion interrupted | A matching present mount is verified and finalized. For an originally mounted workspace now completely absent, validate historical completion against its exact remount attempt, durably preserve that evidence and reset to committed/incomplete, then qualify a distinct remount against the original committed anchor. The bridge is never replayed. Completed archives remain historical and never trigger this restoration. |
 | Child pending, unreaped or ownership uncertain | Keep its controller running. A new invocation never signals or waits on a saved PID or infers termination from mount absence. |
 
 Before mutation only, `sfs unmount ID --continue OP` permits explicit normal
 withdrawal of the still-present accepted matching mount, retaining the same
-operation without authorizing a catalog mutation. It refuses an unbound or changed
-mount. For an unresolved present remount without durable evidence, arrange normal
+operation without authorizing a catalog mutation. A prepared workspace already
+completely absent follows the same fresh backing admission checks and stops
+offline, reporting `already_absent` without inventing an unmount attempt. It
+refuses an unbound or changed mount. For an unresolved present remount without
+durable evidence, arrange normal
 withdrawal separately after checking the displayed path; the controller does not
 infer authority from that observation. Completed-operation status preserves its
 historical result and reports current mount drift separately.

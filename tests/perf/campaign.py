@@ -96,8 +96,7 @@ def stages(args, cycle):
     )
     for name, script, options in selections:
         output = args.output_dir / f'cycle-{cycle}-{name}.json'
-        yield name, output, [sys.executable, '-B', str(HERE / script), *common,
-                             '--output', str(output), *options]
+        yield name, output, f.collector_argv(script, *common, '--output', str(output), *options)
 
 
 def read_small(path):

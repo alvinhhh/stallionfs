@@ -214,7 +214,7 @@ def probe(binary, wheel, scratch, output, revision):
         guard(); source = fileops.large_fixture(base, 'cache_200k_10gb', spec); guard()
         seed = {}; native_fixtures.enrich_metadata(source, receipt=seed); guard()
         expected = correct.snapshot(source); guard()
-        coverage = native_fixtures.verify_metadata_coverage(expected, seed)
+        coverage = native_fixtures.verify_metadata_coverage(expected, seed, precision_links=(), precision_scope='copy-clone')
         require(coverage['populated'] is True, 'metadata_incomplete')
         require(coverage['regular_files'] == 200002 and coverage['directories'] == 204
                 and coverage['logical_bytes'] == 10016777216, 'fixed_fixture_changed')
