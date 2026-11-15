@@ -317,7 +317,7 @@ jobs:
           fi
           export TMPDIR="$RUNNER_TEMP/sparse-seek-large"
           "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" sparse <<'PY'
-          import os, re, resource, shutil, subprocess, sys, time, unittest
+          import importlib.util, os, resource, sys, time, unittest
           from pathlib import Path
 
           try:
@@ -326,19 +326,10 @@ jobs:
               assert Path.cwd().resolve() == temporary and sys.platform == 'darwin'
               assert os.environ.get('STALLION_SEEK_LARGE_METADATA') == '1'
               assert os.environ.get('CFLAGS', '') == ''
-              disk = shutil.disk_usage(temporary).free
-              vm = subprocess.run(['/usr/bin/vm_stat'], stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, timeout=5, check=True)
-              assert not vm.stderr and len(vm.stdout.encode()) <= 16384
-              page = int(re.search(r'page size of (\d+) bytes', vm.stdout)[1])
-              fields = {k.strip(): int(v) for k, v in
-                        re.findall(r'^([^:\n]+):\s+(\d+)\.', vm.stdout, re.MULTILINE)}
-              memory_estimate = page * sum(fields[k] for k in
-                                          ('Pages free', 'Pages inactive', 'Pages speculative'))
-              print('Large metadata admission:', disk, memory_estimate, flush=True)
-              if disk < 2 * 1024**3 or memory_estimate < 3 * 1024**3:
-                  print('UNQUALIFIED large metadata: insufficient disk/memory headroom', flush=True)
-                  raise SystemExit(2)
+              spec = importlib.util.spec_from_file_location('ci_job_budget', checkout / 'tools/ci_job_budget.py')
+              budget = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(budget)
+              budget.sparse_resource_admission()
 
               import stallionfs
               from stallionfs import _image, _scan
@@ -380,6 +371,7 @@ jobs:
                   super().addSuccess(test)
 
           started = time.monotonic()
+          budget.require_sparse_work_budget()
           result = unittest.TextTestRunner(verbosity=2, resultclass=LargeResult).run(suite)
           print('Large metadata resource observation:', time.monotonic() - started,
                 result.peak_bytes, flush=True)
@@ -391,7 +383,7 @@ jobs:
         env:
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
-          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}
+          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'closed-snapshot' || matrix.os == 'macos-26-intel' && 'enospc-initial-detach' || 'initial-unmount' }}
         run: |
           cd "$RUNNER_TEMP"
           "${CI_PYTHON:?}" -I -B - <<'PY'
@@ -438,6 +430,7 @@ jobs:
             ${{ runner.temp }}/suite-closure/*.json
             ${{ runner.temp }}/suite-closure-refusal-*.json
             ${{ runner.temp }}/sparse-closure/*.json
+            ${{ runner.temp }}/sparse-closure/admission.jsonl
             ${{ runner.temp }}/ci-clock-preflight.json
           if-no-files-found: error
           retention-days: 1

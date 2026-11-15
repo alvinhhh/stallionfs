@@ -1,5 +1,6 @@
 """Mocks only: no disk-image commands, mounts, or diagnostic subprocesses."""
 import ast
+import base64
 import errno
 from contextlib import contextmanager, nullcontext
 from contextvars import Context
@@ -2109,6 +2110,117 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(order, ['before', 'eject', 'report', 'log'])
         self.assertIsNone(diagnostics._detach_observation.get())
 
+    def failed_eject_setup(self):
+        current = dict(image=str(self.image), device=self.args[2], mountpoint=str(self.point),
+                       volume_device='/dev/disk999s1', attachment=plistlib.dumps({'system-entities': [
+                           {'dev-entry': self.args[2]},
+                           {'dev-entry': '/dev/disk999s1', 'mount-point': str(self.point)}]}))
+        unmounted = dict(current, mountpoint=None, volume_device=None,
+                         attachment=space.images._unmounted_snapshot(current, self.point))
+        return current, unmounted
+
+    def test_completed_eject_results_keep_both_failures_and_local_windows(self):
+        current, unmounted = self.failed_eject_setup()
+        first = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'Eject failed for disk999\n', b'Volume failed to eject\n'))
+        second = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'second\x00\xff', b'second stderr\r\n'))
+        with patch.object(space.images, '_command', side_effect=[first, second]) as command, \
+                patch.object(space.images, 'mounted', side_effect=[current, current, unmounted, unmounted]):
+            collector = diagnostics.install(space.images, self.base/'completed-results')
+            self.addCleanup(collector.close)
+            with patch.object(collector, 'report', return_value=1), patch.object(collector, 'eject_log'), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                    self.assertRaises(space.images._CommandFailure) as caught:
+                space.images.detach(self.image, self.point)
+        self.assertIs(caught.exception, first)
+        self.assertIs(first.__cause__, second)
+        self.assertEqual(command.call_args_list, [call(*self.args)]*2)
+        rows = [json.loads(line) for line in (collector.directory/diagnostics.REPORT).read_bytes().splitlines()]
+        events = [row for row in rows if row['kind'] == 'eject_command']
+        self.assertEqual([row['attempt'] for row in events], [1, 2])
+        for row, error in zip(events, (first, second)):
+            self.assertEqual((row['executable'], row['verb'], row['device']), self.args)
+            self.assertEqual(row['returncode'], error.returncode)
+            self.assertEqual(base64.b64decode(row['stdout_base64']), error.stdout)
+            self.assertEqual(base64.b64decode(row['stderr_base64']), error.stderr)
+            self.assertTrue(row['complete'])
+            self.assertLessEqual(row['started_mono_ns'], row['finished_mono_ns'])
+        self.assertLessEqual(events[0]['finished_mono_ns'], events[1]['started_mono_ns'])
+        self.assertTrue(diagnostics.artifact_available(collector.directory))
+
+    def test_eject_result_observation_failure_preserves_identical_primary(self):
+        current, _ = self.failed_eject_setup()
+        for failure in ('copy', 'clock', 'write'):
+            with self.subTest(failure=failure):
+                primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+                    self.args, 64, b'original stdout', b'original stderr'))
+                with patch.object(space.images, '_command', side_effect=primary) as command, \
+                        patch.object(space.images, 'mounted', return_value=current):
+                    collector = diagnostics.install(space.images, self.base/('failed-'+failure))
+                    self.addCleanup(collector.close)
+                    fault = (patch.object(diagnostics, '_eject_command_result', side_effect=KeyboardInterrupt())
+                             if failure == 'copy' else
+                             patch.object(diagnostics.time, 'monotonic_ns', side_effect=OSError('clock'))
+                             if failure == 'clock' else
+                             patch.object(collector, '_emit', side_effect=OSError('write')))
+                    with fault as injected, patch.object(collector, 'report', return_value=1), \
+                            patch.object(collector, 'eject_log'), \
+                            diagnostics.failure_scope(self.base, self.image, mountpoint=self.point), \
+                            self.assertRaises(space.images._CommandFailure) as caught:
+                        space.images.detach(self.image, self.point)
+                    self.assertTrue(injected.called)
+                    self.assertIs(caught.exception, primary)
+                    self.assertIsNone(primary.__cause__)
+                    command.assert_called_once_with(*self.args)
+                    collector.close()
+
+    def test_eject_result_recovered_call_does_not_invent_success_stderr(self):
+        current, unmounted = self.failed_eject_setup()
+        primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'', b'Volume failed to eject'))
+        with patch.object(space.images, '_command', side_effect=[primary, b'success']) as command, \
+                patch.object(space.images, 'mounted', side_effect=[current, current, unmounted, unmounted, None]):
+            collector = diagnostics.install(space.images, self.base/'recovered-results')
+            self.addCleanup(collector.close)
+            with patch.object(collector, 'report', return_value=1), patch.object(collector, 'eject_log'), \
+                    diagnostics.failure_scope(self.base, self.image, mountpoint=self.point):
+                self.assertIsNone(space.images.detach(self.image, self.point))
+        rows = [json.loads(line) for line in (collector.directory/diagnostics.REPORT).read_bytes().splitlines()]
+        events = [row for row in rows if row['kind'] == 'eject_command']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['returncode'], 1)
+        self.assertEqual(rows[-1]['outcome'], 'recovered')
+        self.assertEqual(command.call_args_list, [call(*self.args)]*2)
+
+    def test_eject_result_schema_bounds_and_legacy_artifacts(self):
+        primary = space.images._CommandFailure(self.args, subprocess.CompletedProcess(
+            self.args, 1, b'x'*1025, b'\xff\x00'))
+        value = diagnostics._eject_command_result(self.args, primary, 1, (100, 200), (90, 300))
+        self.assertFalse(value['complete'])  # Wall-clock adjustment is retained, not used as elapsed time.
+        self.assertTrue(value['stdout_truncated'])
+        self.assertEqual(value['stdout_bytes'], 1025)
+        self.assertEqual(base64.b64decode(value['stdout_base64']), b'x'*1024)
+        self.reporter.phase, self.reporter.operation_id = 'after', 1
+        self.reporter._emit(time.monotonic()+1, 'eject_command', **value)
+        path = self.reporter.directory/diagnostics.REPORT
+        valid = json.loads(path.read_bytes())
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+        for change in ({'attempt': True}, {'attempt': 3}, {'returncode': 0}, {'device': '/dev/disk999s1'},
+                       {'stdout_base64': '!'}, {'stdout_bytes': 1024}, {'stdout_truncated': False},
+                       {'complete': True}, {'finished_mono_ns': 199}, {'started_ns': True},
+                       {'stdout_base64': 'A'*2000}, {'stderr_bytes': -1}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps(valid | change)+'\n')
+                self.assertFalse(diagnostics.artifact_available(self.reporter.directory))
+        legacy = dict(kind='eject_outcome', operation_id=1, phase='after', timestamp_ns=100,
+                      commands=2, first_status=1, continuation_status=1, outcome='failed')
+        path.write_text(json.dumps(legacy)+'\n')
+        self.assertTrue(diagnostics.artifact_available(self.reporter.directory))
+        self.reporter.events = diagnostics.EVENTS
+        self.reporter._emit(time.monotonic()+1, 'eject_command', **value)
+        self.assertEqual(json.loads(path.read_bytes()), legacy)
+
     def test_real_detach_observes_before_validation_and_refuses_changed_owned_backing(self):
         cases = ('stable', 'observer_error', 'observer_timeout', 'exhausted', 'missing',
                  'replaced', 'symlink', 'private', 'error_replaced', 'disappeared',
@@ -2379,13 +2491,13 @@ class DiagnosticTests(unittest.TestCase):
         step = worker.split('      - name: Test installed wheel with image failure diagnostics\n', 1)[1].split('        run: |', 1)[0]
         self.assertIn("        if: matrix.phase == 'installed'\n", step)
         expression = re.search(r'^          STALLIONFS_TEST_SNAPSHOT_OBSERVATION: (.+)$', step, re.MULTILINE)[1]
-        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'enospc-initial-detach' || matrix.os == 'macos-26-intel' && 'closed-snapshot' || 'initial-unmount' }}")
+        self.assertEqual(expression, "${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'closed-snapshot' || matrix.os == 'macos-26-intel' && 'enospc-initial-detach' || 'initial-unmount' }}")
         rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: installed\}$", worker, re.MULTILINE)
         self.assertEqual(len(rows), 6)
         self.assertEqual(worker.count('STALLIONFS_TEST_SNAPSHOT_OBSERVATION:'), 1)
         choices = ['restored-cleanup' if (runner, python) == ('macos-26', '3.11') else
-                   'enospc-initial-detach' if (runner, python) == ('macos-26', '3.14') else
-                   'closed-snapshot' if runner == 'macos-26-intel' else 'initial-unmount'
+                   'closed-snapshot' if (runner, python) == ('macos-26', '3.14') else
+                   'enospc-initial-detach' if runner == 'macos-26-intel' else 'initial-unmount'
                    for runner, python, images in rows]
         self.assertEqual(choices.count('enospc-initial-detach'), 1)
         self.assertEqual(choices.count('closed-snapshot'), 1)
