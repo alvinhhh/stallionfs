@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import sys
 import signal
-import time
 import uuid
 
 def entry_module_load():
@@ -16,6 +15,8 @@ def entry_module_load():
 
 
 IDENTITY = ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB', 'CI_WORKER')
+ALLOCATION_SCHEMA = 1
+ALLOCATION_CLOCK = 'darwin-CLOCK_MONOTONIC_RAW-ns-v1'
 
 
 def digest(data):
@@ -33,17 +34,18 @@ def load(*, tail=False):
     if len(data) > 4096 or digest(data) != os.environ['CI_ALLOCATION_SHA256']:
         raise ValueError('Allocation changed')
     record = entry.strict_json(data)
-    if type(record) is not dict or set(record) != {'start', 'minutes', 'identity', 'token'}:
+    if (type(record) is not dict
+            or set(record) != {'schema', 'clock', 'start_ns', 'minutes', 'identity', 'token'}
+            or type(record['schema']) is not int or record['schema'] != ALLOCATION_SCHEMA
+            or type(record['clock']) is not str or record['clock'] != ALLOCATION_CLOCK):
         raise ValueError('Allocation schema')
     expected = {key: os.environ[key] for key in IDENTITY}
     if (record['identity'] != expected or any(type(v) is not str or not v for v in expected.values())
             or type(record['token']) is not str or len(record['token']) != 32
             or any(c not in '0123456789abcdef' for c in record['token'])
-            or type(record['start']) not in (int, float) or type(record['minutes']) is not int):
+            or type(record['start_ns']) is not int or type(record['minutes']) is not int):
         raise ValueError('Allocation identity')
-    remaining = entry.remainder(record['start'], record['minutes'])
-    if tail:
-        remaining = record['start'] + record['minutes'] * 60 - 10 - time.monotonic()
+    remaining = entry.remainder(record['start_ns'], record['minutes'], tail=tail)
     if remaining <= 0:
         raise ValueError('Allocation exhausted')
     return record, digest(data), remaining

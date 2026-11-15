@@ -51,9 +51,15 @@ jobs:
           CI_JOB_MINUTES: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}
         run: |
           /usr/bin/python3 -I -B - <<'PYTHON'
-          import hashlib, json, os, time, uuid
+          import hashlib, json, os, sys, time, uuid
           from pathlib import Path
-          record = dict(start=time.monotonic(), minutes=int(os.environ['CI_JOB_MINUTES']),
+          if sys.platform != 'darwin':
+              raise ValueError('Darwin allocation clock required')
+          start_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+          if type(start_ns) is not int or start_ns < 0:
+              raise ValueError('Invalid allocation clock')
+          record = dict(schema=1, clock='darwin-CLOCK_MONOTONIC_RAW-ns-v1',
+                        start_ns=start_ns, minutes=int(os.environ['CI_JOB_MINUTES']),
                         identity={k: os.environ[k] for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB', 'CI_WORKER')},
                         token=uuid.uuid4().hex)
           data = json.dumps(record, sort_keys=True).encode()
@@ -233,6 +239,45 @@ jobs:
           scope['bootstrap'](Path(os.environ['RUNNER_TEMP']), Path(os.environ['GITHUB_WORKSPACE']).resolve(),
                              Path(os.environ['GITHUB_ENV']), Path(os.environ['GITHUB_PATH']))
           PY
+      - name: Check shared allocation clock across interpreters
+        timeout-minutes: 1
+        run: |
+          "${CI_PYTHON:?}" -I -B - <<'PY'
+          import importlib.util, json, os, subprocess, sys
+          from pathlib import Path
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'tools/ci_job_budget.py'
+          spec = importlib.util.spec_from_file_location('ci_job_budget', source)
+          budget = importlib.util.module_from_spec(spec); spec.loader.exec_module(budget)
+          entry = budget.entry_module_load()
+          record, job, remaining = budget.load()
+          receipt = dict(clock=record['clock'], start_ns=record['start_ns'], job=job,
+                         remaining=remaining, selected_version=sys.version, success=False)
+          probe = ('import json,sys,time; print(json.dumps(dict(version=sys.version, '
+                   'sample_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW))))')
+          try:
+              before_ns = entry.allocation_clock_ns()
+              child = subprocess.run(['/usr/bin/python3', '-I', '-B', '-c', probe],
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+              after_ns = entry.allocation_clock_ns()
+              sample = entry.strict_json(child.stdout)
+              current, current_job, current_remaining = budget.load()
+              receipt.update(before_ns=before_ns, after_ns=after_ns, system=sample,
+                             remaining_after=current_remaining)
+              receipt['success'] = (child.returncode == 0 and child.stderr == b''
+                  and type(sample) is dict and set(sample) == {'version', 'sample_ns'}
+                  and type(sample['version']) is str and type(sample['sample_ns']) is int
+                  and record['start_ns'] <= before_ns <= sample['sample_ns'] <= after_ns
+                  and current == record and current_job == job and current_remaining <= remaining)
+          finally:
+              path = Path(os.environ['RUNNER_TEMP']) / 'ci-clock-preflight.json'
+              with path.open('x') as stream:
+                  os.fchmod(stream.fileno(), 0o600)
+                  json.dump(receipt, stream, allow_nan=False)
+                  stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+          if not receipt['success']:
+              raise ValueError('Cross-interpreter allocation clock differs')
+          print('Shared allocation clock:', receipt, flush=True)
+          PY
       - name: Install pinned wheel backend
         run: &ci-wheel-backend |
           "${CI_PYTHON:?}" -I -B -m pip --isolated install --no-deps --no-compile --only-binary=:all: --require-hashes -r tools/ci-build-requirements.txt
@@ -393,6 +438,7 @@ jobs:
             ${{ runner.temp }}/suite-closure/*.json
             ${{ runner.temp }}/suite-closure-refusal-*.json
             ${{ runner.temp }}/sparse-closure/*.json
+            ${{ runner.temp }}/ci-clock-preflight.json
           if-no-files-found: error
           retention-days: 1
       - name: Admit image-upload
