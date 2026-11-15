@@ -1289,7 +1289,7 @@ class MountedOperationArguments(unittest.TestCase):
             record = self.compound_record(root=root, action=action, name=name)
             path = Path(record['target']['directory'])
             metadata = {'controller_profile': record['profile'], 'native_host': record['host']}
-            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+            with patch('stallionfs._native_recovery._read_compound', return_value=(record, True)), \
                  patch('stallionfs._native_recovery.ready', return_value=record['target']), \
                  patch('stallionfs._native_recovery._mounts_only_at'), \
                  patch('stallionfs._native.observe', return_value=None):
@@ -1297,8 +1297,25 @@ class MountedOperationArguments(unittest.TestCase):
             commands = [(status['next_action'], 'snapshot' if action == 'snapshot' else 'rollback'),
                         (_operation_command(record, 'snapshots', '--operation', record['id']), 'snapshots')]
             self.assertIn(commands[1][0], pending_message(record))
-            record['phase'] = 'unmount-attempted'
-            with patch('stallionfs._native_recovery._load_compound', return_value=(record, True)), \
+            # A failed first withdrawal has not attempted the catalog bridge.
+            record.update(phase='unmount-attempted', bridge_attempted=False, bridge_returned=False,
+                          unmount_attempts=[{'launched': True, 'response': {'returncode': 1, 'outcome': 'error'},
+                                            'before': record['accepted_mount']['observation']}])
+            record.pop('native_image_result')
+            record.pop('committed_anchor')
+            from stallionfs._native import package_argv
+            commands_before_withdrawal = [
+                ('verify-package', package_argv(record['host']), 0),
+                ('discover', [record['host'], '--discover-json'], 0),
+                ('unmount', ['/sbin/umount', str(path / 'volume')], 1)]
+            record['helpers'] = [
+                {'stage': 'unmount', 'attempt': 0, 'label': label, 'argv': argv,
+                 'child_pending': False, 'pid': 1, 'reaped': True, 'returncode': status,
+                 'outcome': 'error' if status else 'success',
+                 'stdout': str(path / 'native-operations' / record['id'] / f'{index:02}-{label}' / 'stdout'),
+                 'stderr': str(path / 'native-operations' / record['id'] / f'{index:02}-{label}' / 'stderr')}
+                for index, (label, argv, status) in enumerate(commands_before_withdrawal)]
+            with patch('stallionfs._native_recovery._read_compound', return_value=(record, True)), \
                  patch('stallionfs._native_recovery.ready', return_value=record['target']), \
                  patch('stallionfs._native_recovery._mounts_only_at'), \
                  patch('stallionfs._native_recovery._matching_mount', return_value=({}, {})), \

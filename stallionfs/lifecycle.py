@@ -420,6 +420,11 @@ class Lifecycle:
                         previous = core.read_json(self._state(workspace))
                         if not self._valid_state(workspace, path, meta, previous, time.time()):
                             raise core.StallionError('--auto-retire requires valid cleanup enrollment')
+                    if meta.get('backend') == 'native-image' and meta.get('ownership') == 'store-created':
+                        # Finish the producer's installation before publishing a new use generation.
+                        from ._native import recover_install
+                        recover_install(self, path, meta)
+                        meta = core.read_json(path / 'meta.json')
                     state = self._open(workspace, path, meta)
                     if auto_retire:
                         state['auto_retire'] = {'generation': state['generation']}

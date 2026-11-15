@@ -1376,7 +1376,7 @@ func reclaimErrorAndRoot(_ parent: URL) throws {
     rootMount.serial { need(rootVolume.ownsForTesting(rootMount.root), "false root reclaim keeps activation token") }
     let accepted: Error? = wait { rootVolume.reclaimForTesting(rootMount.root, eligible: true, replyHandler: $0) }; need(accepted == nil, "successful root reclaim consumes activation owner")
     let activated: (FSItem?, Error?) = wait { done in rootVolume.activate { done(($0,$1)) } }
-    need(activated.1 == nil && activated.0 !== rootMount.root, "reactivation reacquires root")
+    need(activated.0 == nil && code(activated.1) == Int(EBUSY), "root reclaim does not renew activation")
     rootMount.serial {
         var r = sfs_result(), st = sfs_pin_stat()
         need(sfs_image_pin_stat(rootMount.coreHandle, token, &st, &r) == SFS_INVALID, "old root token stays invalid")
@@ -1394,8 +1394,8 @@ func reclaimErrorAndRoot(_ parent: URL) throws {
         need(!rv.ownsForTesting(retained.root) && sfs_image_pin_stat(retained.coreHandle, retainedToken, &st, &r) == SFS_INVALID, "activation root released without data access")
     }
     let next: (FSItem?, Error?) = wait { done in rv.activate { done(($0,$1)) } }
-    need(next.1 == nil && next.0 !== retained.root, "next activation owns fresh root")
-    let mounted: Error? = wait { rv.mount(arguments: [], replyHandler: $0) }; need(mounted == nil, "reactivated volume mounts")
+    need(next.0 == nil && code(next.1) == Int(EBUSY), "deactivated instance requires a fresh load")
+    let mounted: Error? = wait { rv.mount(arguments: [], replyHandler: $0) }; need(code(mounted) == Int(EINVAL), "deactivated instance remains inactive")
     retained.close()
 }
 
