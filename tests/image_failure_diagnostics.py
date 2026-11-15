@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import base64
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from unittest.mock import patch
 ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64 * 1024
 BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
 EJECT_CAPTURE_BYTES, EJECT_RETAINED_BYTES = 16 * 1024, 2048
+EJECT_COMMAND_STREAM_BYTES = 1024
 DA_SUBSYSTEM = 'com.apple.DiskArbitration.diskarbitrationd'
 REPORT = "image-failures.jsonl"
 _metadata = {'operation_id', 'phase', 'timestamp_ns'}
@@ -34,6 +36,10 @@ _fields['observation'] = _fields['failure']
 _fields['validation'] = {'read', 'sample_timestamp_ns', 'sample_status', 'reason',
                          'selected_device', 'volume_device', 'mountpoint_state', 'entities'}
 _fields['eject_outcome'] = {'commands', 'first_status', 'continuation_status', 'outcome'}
+_fields['eject_command'] = {'attempt', 'executable', 'verb', 'device', 'returncode',
+                          'started_ns', 'finished_ns', 'started_mono_ns', 'finished_mono_ns',
+                          'stdout_base64', 'stderr_base64', 'stdout_bytes', 'stderr_bytes',
+                          'stdout_truncated', 'stderr_truncated', 'complete'}
 _scope = ContextVar("image_failure_scope", default=None)
 _detach_observation = ContextVar("image_detach_observation", default=None)
 _detach_call = ContextVar("image_detach_call", default=None)
@@ -45,6 +51,27 @@ _device = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
 _hints = {'', 'GUID_partition_scheme', 'Apple_partition_scheme', 'FDisk_partition_scheme',
           'Apple_APFS', 'Apple_APFS_ISC', 'Apple_APFS_Recovery', 'Apple_HFS', 'Apple_Boot',
           'Apple_Free', 'EFI', '[unrecognized]'}
+
+
+def _eject_command_result(args, error, attempt, started, finished):
+    """Copy an already completed failure, without another command or inferred fields."""
+    if (error.args_native != args or type(error.returncode) is not int or error.returncode == 0 or
+            type(error.stdout) is not bytes or type(error.stderr) is not bytes or
+            type(attempt) is not int or attempt not in (1, 2) or
+            started is None or finished is None or
+            not all(type(value) is int and value > 0 for value in (*started, *finished)) or
+            finished[1] < started[1]):
+        return None
+    value = dict(attempt=attempt, executable=args[0], verb=args[1], device=args[2],
+                 returncode=error.returncode, started_ns=started[0], finished_ns=finished[0],
+                 started_mono_ns=started[1], finished_mono_ns=finished[1])
+    for name in ('stdout', 'stderr'):
+        raw = getattr(error, name)
+        value[name+'_base64'] = base64.b64encode(raw[:EJECT_COMMAND_STREAM_BYTES]).decode('ascii')
+        value[name+'_bytes'] = len(raw)
+        value[name+'_truncated'] = len(raw) > EJECT_COMMAND_STREAM_BYTES
+    value['complete'] = not value['stdout_truncated'] and not value['stderr_truncated']
+    return value
 
 
 def _entities(entries):
@@ -424,6 +451,30 @@ def artifact_available(directory):
                     value['phase'] not in ('before', 'after', 'standalone') or
                     type(value['timestamp_ns']) is not int or value['timestamp_ns'] <= 0):
                 return False
+            if value['kind'] == 'eject_command':
+                if (value['phase'] != 'after' or type(value['attempt']) is not int or value['attempt'] not in (1, 2) or
+                        (value['executable'], value['verb'], value['attempt']) not in (
+                            ('/usr/sbin/diskutil', 'eject', 1), ('/usr/sbin/diskutil', 'eject', 2),
+                            ('/usr/bin/hdiutil', 'detach', 2)) or
+                        not isinstance(value['device'], str) or not re.fullmatch(r'/dev/disk[0-9]+', value['device']) or
+                        type(value['returncode']) is not int or value['returncode'] == 0 or
+                        not all(type(value[name]) is int and value[name] > 0 for name in
+                                ('started_ns', 'finished_ns', 'started_mono_ns', 'finished_mono_ns')) or
+                        value['finished_mono_ns'] < value['started_mono_ns']):
+                    return False
+                for name in ('stdout', 'stderr'):
+                    encoded, size, truncated = (value[name+'_base64'], value[name+'_bytes'], value[name+'_truncated'])
+                    if (not isinstance(encoded, str) or len(encoded) > 4*((EJECT_COMMAND_STREAM_BYTES+2)//3) or
+                            type(size) is not int or size < 0 or type(truncated) is not bool):
+                        return False
+                    raw = base64.b64decode(encoded, validate=True)
+                    if (base64.b64encode(raw).decode('ascii') != encoded or
+                            len(raw) != min(size, EJECT_COMMAND_STREAM_BYTES) or
+                            truncated != (size > EJECT_COMMAND_STREAM_BYTES)):
+                        return False
+                if (type(value['complete']) is not bool or
+                        value['complete'] != (not value['stdout_truncated'] and not value['stderr_truncated'])):
+                    return False
             for name in ('backing_device', 'backing_inode', 'backing_device_after', 'backing_inode_after'):
                 if name in value and (value[name] is None and value['kind'] == 'mapping' or
                         value[name] is not None and (type(value[name]) is not int or value[name] < 0)):
@@ -607,6 +658,8 @@ class Diagnostics:
                 self.operations += 1
                 operation_id = self.operations
             self.operation_id, self.phase = operation_id, 'after'
+            for command in invocation.get('command_results', ()):
+                self._emit(deadline, 'eject_command', **command)
             for sample in invocation['samples']:
                 self._emit(deadline, 'validation', **sample)
             if invocation.get('command_error') is not None and invocation.get('outcome') is not None:
@@ -1151,13 +1204,19 @@ def install(images, directory):
         if diagnostics.closed or images._command is not command:
             return original(*args)
         creating = len(args) >= 3 and args[:2] == ('/usr/bin/hdiutil', 'create')
-        ejecting = (len(args) == 3 and args[:2] == ('/usr/sbin/diskutil', 'eject')
+        invocation = _detach_call.get()
+        if invocation is not None and invocation['diagnostics'] is not diagnostics:
+            invocation = None
+        continuation = (invocation is not None and invocation['command_count'] == 1
+                        and invocation['command_statuses'] == [1]
+                        and len(args) == 3 and invocation['command_targets'] == [args[2]]
+                        and args[:2] == ('/usr/bin/hdiutil', 'detach'))
+        ejecting = (len(args) == 3 and
+                    (args[:2] == ('/usr/sbin/diskutil', 'eject') or continuation)
                     and isinstance(args[2], str) and re.fullmatch(r'/dev/disk[0-9]+', args[2]))
         if not (creating or ejecting):
             return original(*args)
-        invocation = _detach_call.get() if ejecting else None
-        if invocation is not None and invocation['diagnostics'] is not diagnostics:
-            invocation = None
+        invocation = invocation if ejecting else None
         observation = invocation['observation'] if invocation is not None else _detach_observation.get() if ejecting else None
         record = invocation or observation
         if record is not None:
@@ -1181,6 +1240,12 @@ def install(images, directory):
                 diagnostics.eject_contexts.pop(observation['operation_id'], None)
             if 'start_ns' not in observation:
                 observation['start_ns'], observation['start_mono'] = record['start_ns'], record['start_mono']
+        command_started = None
+        if invocation is not None:
+            try:
+                command_started = (time.time_ns(), time.monotonic_ns())
+            except BaseException:
+                pass  # Observing a clock cannot prevent the original command.
         try:
             if creating:
                 return _observed_create(original, args)
@@ -1189,6 +1254,14 @@ def install(images, directory):
                 invocation['command_statuses'].append(0)
             return result
         except Exception as error:
+            if invocation is not None and isinstance(error, getattr(images, '_CommandFailure', ())):
+                try:
+                    finished = (time.time_ns(), time.monotonic_ns())
+                    captured = _eject_command_result(args, error, invocation['command_count'], command_started, finished)
+                    if captured is not None:
+                        invocation['command_results'].append(captured)
+                except BaseException:
+                    pass  # A failed observation must re-raise the identical original exception.
             if diagnostics.closed:
                 raise
             if invocation is not None:
@@ -1258,6 +1331,7 @@ def install(images, directory):
                            scope['mountpoint'] == Path(mountpoint) else None)
             invocation = dict(diagnostics=diagnostics, scope=owned_scope, reads=0, samples=[], targets=[],
                               command_started=False, command_count=0, command_targets=[], command_statuses=[],
+                              command_results=[],
                               pre_observation='not-selected', observation=observation)
             token = _detach_call.set(invocation if owned_scope is not None else None)
             selected_token = _detach_observation.set(observation)

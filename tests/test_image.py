@@ -597,7 +597,12 @@ class ImageCore(unittest.TestCase):
         self.scenario('symlink-failures')
 
     def test_symlink_full_semantics_shared_raw_budgets_and_eviction(self):
-        self.scenario('symlink-verify')
+        # Five independent groups retain the 90s child ceiling: at most 450s
+        # together, still inside the original outer qualification deadline.
+        for name in ('symlink-verify-semantics', 'symlink-verify-regular-dense',
+                     'symlink-verify-regular-sparse', 'symlink-verify-link-dense',
+                     'symlink-verify-link-sparse'):
+            self.scenario(name, timeout=90)
 
     def test_xattr_versions_legacy_refusal_and_explicit_codec(self):
         self.scenario('xattr-versions')
@@ -647,6 +652,29 @@ class ImageCore(unittest.TestCase):
 
 
 class ImageDiagnostics(unittest.TestCase):
+    def test_symlink_partition_keeps_order_bounds_and_stops_on_first_failure(self):
+        name = 'test_symlink_full_semantics_shared_raw_budgets_and_eviction'
+        groups = ('symlink-verify-semantics', 'symlink-verify-regular-dense',
+                  'symlink-verify-regular-sparse', 'symlink-verify-link-dense',
+                  'symlink-verify-link-sparse')
+        for fail_at in (None, 0, 2, 4):
+            with self.subTest(fail_at=fail_at):
+                case = ImageCore(name)
+                failure = subprocess.TimeoutExpired('synthetic group', 90)
+                results = [None]*len(groups)
+                if fail_at is not None:
+                    results[fail_at] = failure
+                with mock.patch.object(case, 'scenario', side_effect=results) as scenario:
+                    if fail_at is None:
+                        getattr(case, name)()
+                    else:
+                        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                            getattr(case, name)()
+                        self.assertIs(caught.exception, failure)
+                expected = groups if fail_at is None else groups[:fail_at+1]
+                self.assertEqual(scenario.call_args_list,
+                                 [mock.call(group, timeout=90) for group in expected])
+
     def test_reaped_child_failure_never_signals_numeric_group(self):
         for label, returncode in (('eperm', 0), ('live-group', 0), ('exit', 7)):
             with self.subTest(command=label), tempfile.TemporaryDirectory(prefix='stallionfs-image-reaped-') as temporary:

@@ -382,6 +382,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertLess(text.index('      - name: '+name),suite)
         self.assertIn('ci_job_budget.py" sparse',text)
         self.assertIn('timeout-minutes: 9',text)
+        self.assertIn('${{ runner.temp }}/sparse-closure/admission.jsonl',text)
         for phase in ('validation','suite-upload','image-upload','interface-upload'):
             self.assertIn('ci_job_budget.py" tail '+phase,text)
             self.assertIn('steps.tail-'+phase+".outputs.admitted == 'true'",text)
@@ -396,6 +397,235 @@ class EvidenceTests(unittest.TestCase):
         self.assertGreater(entry.remainder(100*NS,20,200*NS),686)
         self.assertGreater(entry.remainder(100*NS,45,125*NS),1792)
 
+
+
+class SparseAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        import contextlib
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.root = Path(self.directory)
+        (self.root / 'sparse-closure').mkdir()
+        self.elapsed = 0
+        self.samples = []
+        self.calls = 0
+        self.sleeps = []
+        self.outputs = [self.vm(196608)]
+        self.actual_sample = budget.sparse_vm_sample
+        self.stack.enter_context(patch.dict(os.environ, {
+            'RUNNER_TEMP':str(self.root), 'GITHUB_RUN_ID':'42', 'GITHUB_RUN_ATTEMPT':'1',
+            'GITHUB_JOB':'test', 'CI_WORKER':'worker', 'STALLION_SEEK_LARGE_METADATA':'1',
+            'CFLAGS':'', 'GITHUB_WORKSPACE':str(ROOT),
+            'CI_SPARSE_DEADLINE_NS':str(EPOCH_NS + 536 * NS)}))
+        record = allocation_record(EPOCH_NS, 15, os.environ)
+        data = json.dumps(record).encode()
+        (self.root / 'ci-allocation.json').write_bytes(data)
+        os.environ['CI_ALLOCATION_SHA256'] = os.environ['CI_JOB_BINDING'] = budget.digest(data)
+        self.stack.enter_context(patch.object(budget, 'entry_module_load', return_value=entry))
+        self.stack.enter_context(patch.object(entry, 'allocation_clock_ns',
+                                             side_effect=lambda: EPOCH_NS + int(self.elapsed * NS)))
+        self.stack.enter_context(patch.object(budget.shutil, 'disk_usage',
+                                             return_value=type('Disk', (), {'free':2 * 1024**3})()))
+        self.stack.enter_context(patch.object(budget, 'sparse_vm_sample', side_effect=self.sample))
+        self.stack.enter_context(patch.object(budget.time, 'sleep', side_effect=self.sleep))
+
+    @staticmethod
+    def vm(pages):
+        return ('Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+                'Pages free: %d.\nPages inactive: 0.\nPages speculative: 0.\n' % pages).encode()
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
+
+    def sample(self, entry_module, root, index, timeout, job):
+        self.samples.append((index, timeout, self.elapsed))
+        value = self.outputs[min(index - 1, len(self.outputs) - 1)]
+        if isinstance(value, tuple):
+            return value
+        capture = dict(reason=None, returncode=0, reaped=True, cleanup_uncertainty=False,
+                       eof={'stdout':True, 'stderr':True}, bytes=len(value))
+        return capture, value, b''
+
+    def rows(self):
+        return [json.loads(row) for row in
+                (self.root / 'sparse-closure/admission.jsonl').read_text().splitlines()]
+
+    def workflow(self):
+        """Execute the actual inline selector with inert modules and a real test runner."""
+        import resource
+        import textwrap
+        import types
+        text = (ROOT / '.github/workflows/checks.yml').read_text()
+        script = text.split('"$GITHUB_WORKSPACE/tools/ci_job_budget.py" sparse <<\'PY\'\n', 1)[1]
+        script = textwrap.dedent(script.split('          PY\n', 1)[0])
+        owner = self
+        class ImageCore(unittest.TestCase):
+            def test_seek_default_budget_10gib_metadata_shape(self):
+                owner.calls += 1
+        ImageCore.__module__ = 'test_image'
+        ImageCore.__qualname__ = 'ImageCore'
+        product = types.ModuleType('stallionfs')
+        product.__file__ = str(self.root / 'site-packages/stallionfs/__init__.py')
+        product._image = types.SimpleNamespace(__file__=str(self.root / 'site-packages/stallionfs/_image.so'))
+        product._scan = types.SimpleNamespace(__file__=str(self.root / 'site-packages/stallionfs/_scan.so'))
+        tests = types.ModuleType('test_image')
+        tests.__file__ = str(ROOT / 'tests/test_image.py')
+        tests.ImageCore = ImageCore
+        loader = types.SimpleNamespace(exec_module=lambda module: None)
+        original = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with patch.dict(sys.modules, stallionfs=product, test_image=tests), \
+                    patch.object(sys, 'path', list(sys.path)), \
+                    patch.object(importlib.util, 'spec_from_file_location',
+                                 return_value=types.SimpleNamespace(loader=loader)), \
+                    patch.object(importlib.util, 'module_from_spec', return_value=budget), \
+                    patch.object(resource, 'setrlimit'), \
+                    patch.object(resource, 'getrusage', return_value=types.SimpleNamespace(ru_maxrss=0)):
+                with self.assertRaises(SystemExit) as stopped:
+                    exec(compile(script, '<sparse-workflow>', 'exec'), {})
+                return stopped.exception.code
+        finally:
+            os.chdir(original)
+
+    def test_transient_shortage_admits_exactly_one_real_selector_launch(self):
+        import base64
+        self.outputs = [self.vm(196607), self.vm(196608)]
+        self.assertEqual(self.workflow(), 0)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(len(self.samples), 2)
+        self.assertEqual(self.sleeps, [4])
+        rows = self.rows()
+        self.assertEqual(base64.b64decode(rows[0]['stdout_base64']), self.outputs[0])
+        self.assertEqual(rows[1]['memory_bytes'], 3 * 1024**3)
+        self.assertTrue(rows[0]['raw_complete'])
+        self.assertEqual(rows[-1]['kind'], 'admitted')
+        self.assertEqual(budget.SPARSE_WORK_SECONDS, 506)
+        self.assertEqual(entry.RESERVE, 130)
+
+    def test_persistent_shortage_refuses_after_seven_samples_without_launch(self):
+        self.outputs = [self.vm(196607)]
+        self.assertEqual(self.workflow(), 2)
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(len(self.samples), 7)
+        self.assertEqual(self.sleeps, [4] * 6)
+        self.assertEqual(self.elapsed, 24)
+        self.assertEqual(self.rows()[-1]['kind'], 'refused')
+
+    def test_failed_invalid_or_uncertain_sample_never_retries(self):
+        good = dict(reason=None, returncode=0, reaped=True, cleanup_uncertainty=False,
+                    eof={'stdout':True, 'stderr':True}, bytes=len(self.vm(196608)))
+        cases = [
+            (dict(good, reason='deadline'), self.vm(196608), b''),
+            (dict(good, reason='output_cap', bytes=65536), b'', b''),
+            (dict(good, returncode=1), self.vm(196608), b''),
+            (dict(good, reaped=False), self.vm(196608), b''),
+            (dict(good, cleanup_uncertainty=True), self.vm(196608), b''),
+            (dict(good, eof={'stdout':True,'stderr':False}), self.vm(196608), b''),
+            (good, self.vm(196608), b'warning'),
+            (good, b'invalid', b''),
+            (good, self.vm(196608).replace(b'16384', b'0'), b''),
+            (good, self.vm(196608) + b'Pages free: 1.\n', b''),
+            (good, self.vm(196608).replace(b'Pages inactive', b'Other counter'), b''),
+        ]
+        for value in cases:
+            with self.subTest(value=value):
+                (self.root / 'sparse-closure/admission.jsonl').unlink(missing_ok=True)
+                self.samples.clear()
+                self.outputs = [value]
+                with self.assertRaises((ValueError, KeyError)):
+                    budget.sparse_resource_admission()
+                self.assertEqual(len(self.samples), 1)
+                self.assertEqual(self.sleeps, [])
+                self.assertFalse(self.rows()[0]['valid'])
+                self.assertEqual(self.rows()[-1]['kind'], 'refused')
+
+    def test_insufficient_phase_or_shared_budget_refuses_before_sampling(self):
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                (self.root / 'sparse-closure/admission.jsonl').unlink(missing_ok=True)
+                if shared:
+                    record = allocation_record(EPOCH_NS - 265 * NS, 15, os.environ)
+                    data = json.dumps(record).encode()
+                    (self.root / 'ci-allocation.json').write_bytes(data)
+                    os.environ['CI_ALLOCATION_SHA256'] = os.environ['CI_JOB_BINDING'] = budget.digest(data)
+                os.environ['CI_SPARSE_DEADLINE_NS'] = str(EPOCH_NS + 505 * NS)
+                with self.assertRaises(ValueError):
+                    budget.sparse_resource_admission()
+                self.assertEqual(self.samples, [])
+                self.assertEqual(self.sleeps, [])
+
+    def test_sampling_and_sleep_cannot_reset_admission_clock(self):
+        self.outputs = [self.vm(196607)]
+        original = self.sample
+        def slow(*args):
+            result = original(*args)
+            self.elapsed += 5
+            return result
+        with patch.object(budget, 'sparse_vm_sample', side_effect=slow):
+            with self.assertRaises(ValueError):
+                budget.sparse_resource_admission()
+        self.assertLessEqual(self.elapsed, 30)
+        self.assertLess(len(self.samples), 7)
+        self.assertEqual(self.calls, 0)
+
+    def test_budget_consumed_during_sample_cannot_admit(self):
+        original = self.sample
+        def delayed(*args):
+            result = original(*args)
+            self.elapsed = 31
+            return result
+        with patch.object(budget, 'sparse_vm_sample', side_effect=delayed):
+            with self.assertRaises(ValueError):
+                budget.sparse_resource_admission()
+        self.assertEqual(len(self.samples), 1)
+        self.assertEqual(self.rows()[-1]['kind'], 'refused')
+        self.assertNotIn('admitted', [row['kind'] for row in self.rows()])
+
+    def test_disk_shortage_and_binding_changes_refuse_without_sampler(self):
+        with patch.object(budget.shutil, 'disk_usage',
+                          return_value=type('Disk', (), {'free':2 * 1024**3 - 1})()):
+            with self.assertRaises(ValueError):
+                budget.sparse_resource_admission()
+        self.assertEqual(self.samples, [])
+        os.environ['CI_JOB_BINDING'] = '0' * 64
+        with self.assertRaises(ValueError):
+            budget.require_sparse_work_budget(entry)
+
+    def test_setup_budget_exhaustion_prevents_selector_launch(self):
+        original = budget.sparse_resource_admission
+        def admitted_then_setup_delay():
+            original()
+            self.elapsed = 31
+        with patch.object(budget, 'sparse_resource_admission', side_effect=admitted_then_setup_delay):
+            with self.assertRaisesRegex(ValueError, 'Insufficient sparse work remainder'):
+                self.workflow()
+        self.assertEqual(self.calls, 0)
+
+    def test_sampler_reuses_bounded_owned_capture_and_retains_closure(self):
+        # Substitute only the executable at the collector boundary; never run vm_stat.
+        actual = entry.supervise
+        for index, (body, timeout, reason) in enumerate((
+                ('print("bounded sample")', 1, None),
+                ('import os,time;os.write(1,b"x"*65536);time.sleep(2)', 1, 'output_cap'),
+                ('import time;time.sleep(2)', .05, 'deadline')), 1):
+            def synthetic(argv, *args, **kwargs):
+                self.assertEqual(argv, ['/usr/bin/vm_stat'])
+                self.assertEqual(kwargs['output_cap'], 16384)
+                return actual([sys.executable, '-I', '-B', '-c', body], *args, **kwargs)
+            with patch.object(entry, 'supervise', side_effect=synthetic):
+                capture, stdout, stderr = self.actual_sample(
+                    entry, self.root / 'sparse-closure', index, timeout, os.environ['CI_JOB_BINDING'])
+            self.assertEqual(capture['reason'], reason)
+            self.assertTrue(capture['reaped'])
+            self.assertLessEqual(len(stdout) + len(stderr), 16384)
+            saved = self.root / ('sparse-closure/vm-stat-%02d.jsonl.receipt.json' % index)
+            self.assertEqual(json.loads(saved.read_text()), capture)
+            if reason is None:
+                self.assertTrue(all(capture['eof'].values()))
+                self.assertFalse(capture['cleanup_uncertainty'])
 
 
 class PublicBudgetTests(unittest.TestCase):

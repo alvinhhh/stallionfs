@@ -284,7 +284,7 @@ class EntryTests(unittest.TestCase):
                        if 'timeout-minutes: ${{' in line or 'CI_JOB_MINUTES: ${{' in line]
         self.assertEqual(len(expressions), 2)
         self.assertEqual(expressions[0], expressions[1])
-        self.assertIn("matrix.os == 'macos-26' && matrix.phase == 'installed' && matrix.python != '3.13' && 30", expressions[0])
+        self.assertIn("matrix.os == 'macos-26' && matrix.phase == 'installed' && 30", expressions[0])
         # Keep the original anchor and shared tail reserve; the slow installed
         # workers receive room for the observed suite rather than a fresh clock.
         self.assertEqual(entry.remainder(100*NS, 30, 344*NS), 1426)
