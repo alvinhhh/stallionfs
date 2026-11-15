@@ -2,13 +2,16 @@
 from contextlib import redirect_stdout
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -888,6 +891,140 @@ class BenchmarkDeadline(unittest.TestCase):
             value = json.loads(stream.getvalue())
             self.assertEqual(value['status'], 'interrupted')
             self.assertTrue(value['command_receipt']['completion_uncertain'])
+
+
+class InstalledCollectorEntry(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='installed collector ')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.site = self.root / 'CLI/lib/python3.13/site-packages'
+        self.package = self.site / 'stallionfs'
+        self.resources = self.package / '_benchmark_runtime'
+        self.resources.mkdir(parents=True)
+        source = Path(__file__).resolve().parents[1]
+        for name in ('__init__.py', 'benchmark.py', '_benchmark_cases.py',
+                     '_benchmark_budget.py', '_benchmark_entry.py'):
+            shutil.copyfile(source / 'stallionfs' / name, self.package / name)
+        for name in benchmark.RUNTIME_FILES:
+            target = self.resources / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / 'tests/perf' / name, target)
+        self.write_manifest()
+        self.cwd = self.root / 'hostile cwd'
+        (self.cwd / 'stallionfs').mkdir(parents=True)
+        (self.cwd / 'stallionfs/__init__.py').write_text("raise RuntimeError('wrong package')\n")
+        (self.cwd / 'sitecustomize.py').write_text("raise RuntimeError('site initialized')\n")
+        (self.site / 'argparse.py').write_text("raise RuntimeError('site sibling shadowed stdlib')\n")
+        (self.site / 'fileops.py').write_text("raise RuntimeError('unverified sibling collector')\n")
+        self.environment = {**os.environ, 'PYTHONPATH': str(self.cwd), 'PYTHONHOME': '/not-a-runtime',
+                            'PYTHONDONTWRITEBYTECODE': '1'}
+
+    def write_manifest(self):
+        manifest = {'schema': 1, 'kind': 'build-source provenance', 'build_source_sha256': {},
+                    'resources': {name: hashlib.sha256((self.resources / name).read_bytes()).hexdigest()
+                                  for name in benchmark.RUNTIME_FILES}}
+        (self.resources / 'manifest.json').write_text(json.dumps(manifest))
+
+    def child(self, name, *arguments, environment=None):
+        argv = benchmark._collector_argv(self.resources, name, *arguments)
+        return subprocess.run(argv, cwd=self.cwd, env=environment or self.environment,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+
+    def test_clean_installed_native_suite_reaches_bounded_inventory_command(self):
+        binary = self.root / 'inventory fixture'
+        binary.write_text('#!/bin/sh\nprintf "inventory reached\\n" >&2\nexit 23\n')
+        binary.chmod(0o700)
+        scratch = self.root / 'scratch'
+        scratch.mkdir(mode=0o700)
+        receipts = self.root / 'receipts'
+        receipts.mkdir(mode=0o700)
+        result = self.child('native_suite.py', '--binary', binary, '--scratch', scratch,
+                            '--output', self.root / 'report.json', '--fixtures', 'docs_5k_100mb',
+                            '--operations', 'clone', '--copy-tools', 'ditto',
+                            environment={**self.environment,
+                                'STALLIONFS_BENCHMARK_DEADLINE': str(time.monotonic() + 10),
+                                'STALLIONFS_BENCHMARK_RECEIPTS': str(receipts)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Command failed (23)', result.stderr)
+        self.assertIn('inventory reached', result.stderr)
+        self.assertNotIn('ModuleNotFoundError', result.stderr)
+        recorded = [json.loads(path.read_text()) for path in receipts.iterdir()]
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]['argv'], [str(binary), '--json', 'volumes'])
+        self.assertEqual(recorded[0]['exit_code'], 23)
+        self.assertFalse(recorded[0]['completion_uncertain'])
+        self.assertEqual(list(scratch.iterdir()), [])
+        self.assertFalse((self.root / 'report.json').exists())
+
+    def test_full_campaign_and_nested_stage_share_clean_installed_entry(self):
+        result = self.child('campaign.py', '--help')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        probe = self.resources / 'native_suite.py'
+        probe.write_text('''if __name__ == '__main__':
+    import json, subprocess, sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    import campaign
+    args = SimpleNamespace(scratch=Path(sys.argv[1]), samples=10, node=Path('/fixture/node'),
+        npm=Path('/fixture/npm'), npm_cache=Path('/fixture/cache'), binary=Path('/fixture/stallionfs'),
+        cache=['warm'], output_dir=Path(sys.argv[1]))
+    stage = next(row for row in campaign.stages(args, 1) if row[0] == 'native-cli-delete')
+    argv = stage[2][:stage[2].index('--scratch')] + ['--help']
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    print(json.dumps({'argv': argv, 'help': result.stdout}))
+''')
+        self.write_manifest()
+        result = self.child('native_suite.py', self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(Path(data['argv'][0]).resolve(), Path(sys.executable).resolve())
+        self.assertEqual(data['argv'][1:4], ['-I', '-B', '-S'])
+        self.assertEqual(data['argv'][4:6], [str(self.package / '_benchmark_entry.py'), 'cli.py'])
+        self.assertIn('--native-delete', data['help'])
+
+    def test_scan_memory_child_uses_the_same_installed_package(self):
+        counts = {'files': 1}
+        native = self.package / '_scan.py'
+        native.write_text('''def scan(*args, **kwargs):
+    import sys
+    forbidden = ('scan', 'fileops', 'native_suite', 'native_correctness', 'native_fixtures',
+                 'native_metrics', 'native_report', 'stallionfs.benchmark',
+                 'stallionfs._benchmark_cases', 'stallionfs._benchmark_budget')
+    assert not any(name in sys.modules for name in forbidden), 'orchestration imported in measured child'
+    assert not any('_benchmark_runtime' in path for path in sys.path), 'collector import root in measured child'
+    return {'files': 1}
+''')
+        digest = hashlib.sha256(native.read_bytes()).hexdigest()
+        (self.resources / 'native_suite.py').write_text(f'''if __name__ == '__main__':
+    import json, subprocess
+    import scan
+    seen = []
+    def measure(argv, metrics):
+        seen.append(argv)
+        result = subprocess.run(argv, capture_output=True, timeout=10)
+        return {{'exit_code': result.returncode, 'rss_bytes': 1}}, result
+    scan.f.measure_memory = measure
+    result = scan.memory_sample('/unused', 'posix', {counts!r}, {digest!r}, '/unused-metrics')
+    print(json.dumps({{'result': result, 'argv': seen[0]}}))
+''')
+        self.write_manifest()
+        result = self.child('native_suite.py')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['result']['counts'], counts)
+        self.assertEqual(data['result']['native_binary_sha256'], digest)
+        self.assertEqual(data['argv'][1:5], ['-I', '-B', '-S', '-c'])
+        self.assertEqual(data['argv'][6], str(self.site))
+
+    def test_changed_collector_is_rejected_before_execution(self):
+        target = self.resources / 'native_suite.py'
+        target.write_text("raise RuntimeError('changed collector executed')\n")
+        result = self.child('native_suite.py', '--help')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Installed benchmark resource changed: native_suite.py', result.stderr)
+        self.assertNotIn('changed collector executed', result.stderr)
 
 
 if __name__ == '__main__':

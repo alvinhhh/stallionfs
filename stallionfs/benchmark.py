@@ -26,6 +26,14 @@ RUNTIME_FILES = frozenset(('fileops.py', 'native_suite.py', 'native_metrics.py',
     'native_correctness.py', 'native_fixtures.py', 'native_report.py', 'campaign.py',
     'scan.py', 'run.py', 'cli.py', 'fixture/package.json', 'fixture/package-lock.json',
     'fixture/check.cjs'))
+COLLECTORS = frozenset(('campaign.py', 'native_suite.py', 'cli.py', 'scan.py', 'run.py'))
+
+
+def _collector_argv(resources, name, *arguments):
+    if name not in COLLECTORS:
+        raise ValueError('Unknown installed benchmark collector')
+    return [sys.executable, '-I', '-B', '-S', str(resources.parent / '_benchmark_entry.py'),
+            name, *map(os.fspath, arguments)]
 
 
 def parser(commands):
@@ -346,17 +354,17 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
                        STALLIONFS_BENCHMARK_PACKAGE=str(Path(__file__).parent.resolve()),
                        PYTHONDONTWRITEBYTECODE='1')
     if args.full:
-        argv = [sys.executable, '-B', str(resources / 'campaign.py'), '--binary', str(binary),
+        argv = _collector_argv(resources, 'campaign.py', '--binary', str(binary),
                 '--scratch', str(root), '--output-dir', str(root / 'campaign'),
                 '--samples', str(args.samples), '--cache', *args.cache,
                 '--node', str(args.node.resolve()), '--npm', str(args.npm.resolve()),
-                '--npm-cache', str(args.npm_cache.resolve())]
+                '--npm-cache', str(args.npm_cache.resolve()))
     else:
-        argv = [sys.executable, '-B', str(resources / 'native_suite.py'), '--binary', str(binary),
+        argv = _collector_argv(resources, 'native_suite.py', '--binary', str(binary),
                 '--scratch', str(root), '--output', str(root / 'native.json'), '--samples', str(args.samples),
                 '--runs', '1', '--cache', 'warm', '--jobs', str(args.jobs),
                 '--fixtures', *fixtures, '--operations', *operations, '--copy-tools',
-                *(['cp-clone', 'cp', 'ditto', 'rsync'] if 'clone' in operations else ['cp'])]
+                *(['cp-clone', 'cp', 'ditto', 'rsync'] if 'clone' in operations else ['cp']))
     directory.check()
     command(argv, timeout=(86410 if args.full else 610), environment=environment,
             cwd=root, output=log, persist_success=False, receipt=receipt)
