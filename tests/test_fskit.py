@@ -213,12 +213,12 @@ class FSKitInterfaces(unittest.TestCase):
         self.command('hooks', [*cflags, '-c', tests / 'fskit_write_hooks.c', '-o', hooks], 90)
         self.command('normal', [*cflags, '-c', filesystem / 'image.c', '-o', normal], 90)
         swift = [self.tools['swiftc'], '-swift-version', '6', '-strict-concurrency=complete',
-                 '-warnings-as-errors', '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit',
-                 '-Onone', '-parse-as-library', '-module-cache-path', self.base / 'cache',
-                 '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES']
+                 '-target', target, '-sdk', self.sdk, '-I', filesystem / 'fskit',
+                 '-Onone', '-parse-as-library', '-module-cache-path', self.base / 'cache']
+        context = ['-warnings-as-errors', '-D', 'STALLION_CONTEXT_HANDLERS', '-D', 'STALLION_CONTEXT_WRITES']
         sources = [filesystem / 'fskit/Extension.swift', filesystem / 'fskit/Volume.swift']
         executable = self.base / 'trace-check'
-        self.command('trace-build', [*swift, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+        self.command('trace-build', [*swift, *context, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
                      '-D', 'STALLION_MOUNT_TRACE', *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks,
                      '-o', executable], 180, swift='context')
         for mode in ('delivery-trace',):
@@ -227,10 +227,18 @@ class FSKitInterfaces(unittest.TestCase):
             result = self.command(mode, [executable, '--' + mode, fixtures], 90)
             self.assertTrue(result.stdout.startswith('PASS '))
             self.assertEqual(result.stderr, '')
+        legacy = self.base / 'legacy-sync-check'
+        self.command('legacy-sync-build', [*swift, '-D', 'STALLION_ADAPTER_CHECK', '-D', 'STALLION_WRITE_DIAGNOSTIC',
+                     *sources, tests / 'fskit_write_driver.swift', diagnostic, hooks, '-o', legacy], 180, swift='legacy')
+        fixtures = self.base / 'legacy-sync'
+        fixtures.mkdir(mode=0o700)
+        result = self.command('legacy-sync', [legacy, '--sync-focused', fixtures], 90)
+        self.assertEqual(result.stdout, 'PASS synchronization compatibility, durability, failures and admission\n')
+        self.assertEqual(result.stderr, '')
         for trace in (True, False):
             name = 'production-trace' if trace else 'production'
             binary = self.base / name
-            self.command(name, [*swift, *(['-D', 'STALLION_MOUNT_TRACE'] if trace else []),
+            self.command(name, [*swift, *context, *(['-D', 'STALLION_MOUNT_TRACE'] if trace else []),
                          '-application-extension', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
                          *sources, normal, '-o', binary], 180, swift='context')
             symbols = self.command(name + '-symbols', [self.tools['nm'], binary], 30).stdout
