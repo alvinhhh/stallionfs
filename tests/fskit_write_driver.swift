@@ -2138,7 +2138,60 @@ func contextualGetBoundary(_ m: Mounted, principal: CallerIdentity? = nil) {
     MountTrace.shared.resetForTesting()
 #endif
 }
+func activationHandlerResult(_ parent: URL, reject: Bool) throws {
+    let f = try Fixture(parent, reject ? "reject-activation" : "handler-activation")
+    var handle: OpaquePointer?, receipt = sfs_result()
+    need(sfs_image_open(f.url.path, "image.sfs", &handle, &receipt) == SFS_OK, "open activation result fixture")
+    let resource = FSPathURLResource(url: f.url, writable: true)
+    let v = StallionVolume(identity: fixtureFileSystemIdentity,
+        admission: .forTesting(handle: handle!, anchor: receipt, writable: true),
+        resource: resource, scope: false, queue: DispatchQueue(label: "sfs.activation.result.test"))
+    try v.enableWriteDiagnostic(expectedUUID: f.identity)
+    let before = v.anchor
+    var constructors = 0, commitStarted = false, replies = 0
+    let _: Bool = wait { done in v.enqueue {
+        need(v.activeItemCount() == 0, "activation result fixture starts without retained items")
+        v.diagnosticBeforeCommit = { commitStarted = true }
+        v.rejectResultForTesting = { name in
+            need(name == "FSActivateResult" && !commitStarted, "activation SDK result precedes any commit")
+            constructors += 1; return reject
+        }
+        done(true)
+    } }
+    let activated: (FSActivateResult?, Error?) = wait { done in v.activateResultForTesting {
+        replies += 1; done(($0,$1))
+    } }
+    need(replies == 1 && constructors == 1, "fresh activation reaches its actual constructor exactly once")
+    if reject {
+        need(activated.0 == nil && code(activated.1) == Int(EIO), "actual activation constructor rejection retains EIO")
+    } else {
+        need(activated.0 != nil && activated.1 == nil,
+             "actual activation constructor on fresh volume errno=\(code(activated.1))")
+        let duplicate: (FSActivateResult?, Error?) = wait { done in v.activateResultForTesting {
+            replies += 1; done(($0,$1))
+        } }
+        need(duplicate.0 == nil && code(duplicate.1) == Int(EBUSY) && replies == 2 && constructors == 1,
+             "successful activation cannot reenter the result constructor")
+    }
+    let _: Bool = wait { done in v.enqueue {
+        need(v.activeItemCount() == (reject ? 0 : 1) && anchorMatches(v.anchor, before) &&
+             !commitStarted && v.diagnosticSnapshot().0.commits == 0,
+             "activation result disposition preserves anchor and exact root ownership")
+        v.rejectResultForTesting = nil; v.diagnosticBeforeCommit = nil
+        done(true)
+    } }
+    let deactivated: Error? = wait { v.deactivate(options: [], replyHandler: $0) }
+    need(deactivated == nil, "activation result fixture deactivation")
+    let closed: (Bool, Error?) = wait { done in v.enqueue {
+        need(v.activeItemCount() == 0, "activation result fixture releases root ownership")
+        let result = v.unload(); done((result.consumed, result.error))
+    } }
+    need(closed.0 && closed.1 == nil, "activation result fixture consumes its handle without a close error")
+    need(f.contents() == Data("original".utf8), "activation result fixture preserves reopened bytes")
+}
+
 func contextualResults(_ parent: URL) throws {
+    try activationHandlerResult(parent, reject: false)
     let f = try Fixture(parent, "handler-results"), m = try Mounted(f), v = m.volume
     let caller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
     contextualGetBoundary(m)
@@ -2177,8 +2230,6 @@ func contextualResults(_ parent: URL) throws {
         v.diagnosticBeforeCommit = { commitStarted = true }
         v.rejectResultForTesting = { _ in need(!commitStarted, "SDK result constructed before commit"); return false }
     }
-    let activated: (FSActivateResult?, Error?) = wait { done in v.activateResultForTesting { done(($0,$1)) } }
-    need(activated.0 != nil && activated.1 == nil, "actual activation constructor")
     for name in ["file", "alias"] {
         let result: (FSLookupItemResult?, Error?) = wait { done in v.lookupResultForTesting(name, directory: m.root, caller: caller) { done(($0,$1)) } }
         need(result.0 != nil && result.1 == nil, "actual lookup constructor")
@@ -2341,16 +2392,16 @@ func queuedResizeAfterIncompleteSnapshot(_ parent: URL) throws {
     m.close(); need(f.contents() == Data("original".utf8), "queued completeness failure preserves reopened bytes")
 }
 func rejectedHandlerResults(_ parent: URL) throws {
+    try activationHandlerResult(parent, reject: true)
     let payloadFixture = try Fixture(parent, "reject-no-attributes"), payload = try Mounted(payloadFixture)
     let payloadCaller = CallerIdentity(uid: Int(geteuid()), gid: Int(getegid()))
     let payloadAnchor = payload.volume.anchor
     let payloadCount: Int = wait { done in payload.volume.enqueue { done(payload.volume.activeItemCount()) } }
-    for operation in ["FSActivateResult", "FSGetXattrResult", "FSListXattrsResult", "FSEnumerateDirectoryResult"] {
+    for operation in ["FSGetXattrResult", "FSListXattrsResult", "FSEnumerateDirectoryResult"] {
         var reached = false
         payload.serial { payload.volume.rejectResultForTesting = { type in reached = reached || type == operation; return type == operation } }
         let rejected: (Bool, Error?) = wait { done in
             switch operation {
-            case "FSActivateResult": payload.volume.activateResultForTesting { done(($0 == nil, $1)) }
             case "FSGetXattrResult": payload.volume.xattrResultForTesting(payload.file, caller: payloadCaller) { done(($0 == nil, $1)) }
             case "FSListXattrsResult": payload.volume.xattrsResultForTesting(payload.file, caller: payloadCaller) { done(($0 == nil, $1)) }
             default: payload.volume.enumerationResultForTesting(payload.root, caller: payloadCaller, pack: { _,_,_,_,_ in true }) { done(($0 == nil, $1)) }
