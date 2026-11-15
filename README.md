@@ -89,6 +89,8 @@ Source and editable installs build a pinned private Git dependency targeting mac
 
 ## Performance
 
+[November 15: three private CLI document-clone comparisons against ditto](docs/performance-cli167-ditto-20261115.md).
+
 macOS 27 arm64 · warm generated fixtures · October 29–30, 2026 (UTC). Median elapsed times include command startup; each row has ten timing pairs and ten separate resource pairs. These results describe the pinned measured executable; build provenance and exact commands are linked below.
 
 | Operation | Native reference | Native | stallionfs |
