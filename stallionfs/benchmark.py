@@ -27,6 +27,9 @@ RUNTIME_FILES = frozenset(('fileops.py', 'native_suite.py', 'native_metrics.py',
     'scan.py', 'run.py', 'cli.py', 'fixture/package.json', 'fixture/package-lock.json',
     'fixture/check.cjs'))
 COLLECTORS = frozenset(('campaign.py', 'native_suite.py', 'cli.py', 'scan.py', 'run.py'))
+COPY_TOOLS = ('cp-clone', 'cp', 'ditto', 'rsync')
+FAILURE_READER_LIMITS = {'max_manifest_bytes': 1024 * 1024, 'max_journal_bytes': 64 * 1024 * 1024,
+                         'max_event_bytes': 8 * 1024 * 1024, 'max_events': 100_000}
 
 
 def _collector_argv(resources, name, *arguments):
@@ -42,6 +45,8 @@ def parser(commands):
     p.add_argument('--full', action='store_true', help='Collect the full existing campaign; report required coverage gaps')
     p.add_argument('--fixtures', nargs='+', choices=FIXTURES, help='Select existing native fixtures')
     p.add_argument('--operations', nargs='+', choices=('copy', 'clone', 'move', 'delete', 'scan'))
+    p.add_argument('--copy-tools', nargs='+', choices=COPY_TOOLS,
+                   help='Native references for quick clone comparisons; default: all four')
     p.add_argument('--samples', type=int, choices=range(10, 101), default=10, metavar='N', help='Configurable phase pairs, 10–100; CLI delete timing uses 31 (default: 10)')
     p.add_argument('--scratch', type=Path, help='Existing parent for new disposable storage')
     p.add_argument('--jobs', type=int, choices=range(1, 5), default=4, help='Native workers, 1–4 (default: 4)')
@@ -181,6 +186,7 @@ def _preflight(args):
     if len(args.cache) != len(set(args.cache)) or (not args.full and args.cache != ['warm']):
         raise ValueError('Use distinct cache modes; quick comparisons use warm fixtures')
     fixtures, operations = args.fixtures or ['tiny_4kib'], args.operations or ['copy', 'move', 'delete']
+    _copy_tools(args, operations)
     if len(fixtures) != len(set(fixtures)) or len(operations) != len(set(operations)):
         raise ValueError('Do not repeat fixtures or operations')
     scans = [name.startswith('scan_') for name in fixtures]
@@ -245,6 +251,18 @@ def _preflight(args):
     return resources, binary, parent, fixtures, operations
 
 
+def _copy_tools(args, operations):
+    selected = getattr(args, 'copy_tools', None)
+    if selected is not None:
+        if args.full or operations != ['clone']:
+            raise ValueError('--copy-tools applies only to quick --operations clone comparisons')
+        if (not selected or len(selected) != len(set(selected))
+                or any(name not in COPY_TOOLS for name in selected)):
+            raise ValueError('Select distinct supported --copy-tools references')
+        return list(selected)
+    return list(COPY_TOOLS) if 'clone' in operations else ['cp']
+
+
 def _coverage(cache, *, collected=True):
     result = []
     for case in CASES:
@@ -305,6 +323,99 @@ def _read_native(output):
         journal.close()
 
 
+def _native_failures(output, selection):
+    """Summarize only a verified, completed report belonging to this invocation."""
+    from ._benchmark_runtime.native_report import KINDS, ReportJournal, _load as load_native_json
+    if not output.is_file() or output.is_symlink():
+        raise ValueError('Completed native report is missing')
+    journal = ReportJournal.open_existing(output, **FAILURE_READER_LIMITS)
+    try:
+        journal.verify()
+        state = journal.state
+        if (state.get('status') != 'complete' or state.get('passed') is not False
+                or state.get('cleanup_passed') is not True or state.get('retained_fixture')
+                or not isinstance(state.get('selection'), dict)
+                or any(state['selection'].get(key) != value for key, value in selection.items())):
+            raise ValueError('Native report is incomplete or belongs to another selection')
+        with output.open('rb') as stream:
+            raw = stream.read(32 * 1024 * 1024 + 1)
+        if len(raw) > 32 * 1024 * 1024:
+            raise ValueError('Native report exceeds the diagnostic read limit')
+        document = load_native_json(raw)
+        if (not isinstance(document, dict)
+                or {key: value for key, value in document.items() if key not in KINDS} != state):
+            raise ValueError('Final native report disagrees with verified state')
+        for kind in KINDS:
+            records = document.get(kind)
+            if not isinstance(records, list):
+                raise ValueError('Final native report array is missing')
+            count = 0
+            for index, row in enumerate(journal.iter_latest(kind)):
+                if index >= len(records) or records[index] != row:
+                    raise ValueError('Final native report disagrees with verified journal')
+                count += 1
+            if count != len(records):
+                raise ValueError('Final native report has unverified entries')
+        failures = {}
+        references = {'clone': selection['copy_tools'], 'copy': ['cp'], 'move': ['move'],
+                      'delete': ['delete'], 'scan': ['find-stat']}
+        for row in document['rows']:
+            if row.get('validated') is True and row.get('ok') is True:
+                continue
+            operation, reference, method = row['operation'], row['reference'], row['method']
+            if (row.get('run') != 0 or row['fixture'] not in selection['fixtures']
+                    or operation not in selection['operations'] or reference not in references[operation]
+                    or method not in (reference, 'stallionfs') or row.get('completion_uncertain') is not False
+                    or row.get('source_unchanged') is not True or row.get('phase') not in ('timing', 'resources')
+                    or type(row.get('sample')) is not int or not 0 <= row['sample'] < selection['samples']):
+                raise ValueError('Failed native row has uncertain or unrelated ownership')
+            key = (row['fixture'], operation, reference, method)
+            if key not in failures:
+                if len(failures) >= 128:
+                    raise ValueError('Native failure summary exceeds its case bound')
+                failures[key] = {'fixture': key[0], 'operation': operation, 'reference': reference,
+                                 'method': method, 'failed_rows': 0, 'loss_counts': {},
+                                 'gate_counts': {}, 'examples': []}
+            item = failures[key]
+            item['failed_rows'] += 1
+            correctness = row.get('correctness', {})
+            if not isinstance(correctness, dict):
+                raise ValueError('Invalid native correctness object')
+            losses = correctness.get('candidate_losses', [])
+            if not isinstance(losses, list) or any(not isinstance(loss, dict) for loss in losses):
+                raise ValueError('Invalid native correctness loss list')
+            for loss in losses:
+                field = loss['field']
+                if not isinstance(field, str) or len(field) > 64:
+                    raise ValueError('Invalid native correctness field')
+                item['loss_counts'][field] = item['loss_counts'].get(field, 0) + 1
+                if len(item['loss_counts']) > 32:
+                    raise ValueError('Native correctness field count exceeds its bound')
+                if len(item['examples']) < 3:
+                    path = loss.get('path')
+                    item['examples'].append({'field': field, 'path': path[:160] if isinstance(path, str) else None})
+            gates = [name for name in ('passed', 'strict_equal', 'sparse_preserved', 'independent_clone',
+                                      'move_identity', 'move_source_absent')
+                     if name in correctness and correctness[name] is not True]
+            sharing = row.get('data_stream_sharing', {})
+            if not isinstance(sharing, dict):
+                raise ValueError('Invalid native sharing object')
+            if sharing.get('required') is True and sharing.get('full_data_stream_sharing') is not True:
+                gates.append('data_stream_sharing')
+            if row.get('ok') is not True:
+                gates.append('command_success')
+            if not gates and not losses:
+                gates.append('validated')
+            for gate in gates:
+                item['gate_counts'][gate] = item['gate_counts'].get(gate, 0) + 1
+        if not failures:
+            raise ValueError('Completed failed report has no attributable failed rows')
+        journal.verify()
+        return list(failures.values())
+    finally:
+        journal.close()
+
+
 def _collect(args, resources, binary, root, fixtures, operations, directory=None):
     guard = _PinnedDirectory(root, private=True) if directory is None else nullcontext(directory)
     with guard as directory:
@@ -360,11 +471,15 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
                 '--node', str(args.node.resolve()), '--npm', str(args.npm.resolve()),
                 '--npm-cache', str(args.npm_cache.resolve()))
     else:
+        copy_tools = _copy_tools(args, operations)
+        quick_selection = {'fixtures': list(fixtures), 'operations': list(operations),
+                           'copy_tools': copy_tools,
+                           'copy_tools_explicit': getattr(args, 'copy_tools', None) is not None}
         argv = _collector_argv(resources, 'native_suite.py', '--binary', str(binary),
                 '--scratch', str(root), '--output', str(root / 'native.json'), '--samples', str(args.samples),
                 '--runs', '1', '--cache', 'warm', '--jobs', str(args.jobs),
                 '--fixtures', *fixtures, '--operations', *operations, '--copy-tools',
-                *(['cp-clone', 'cp', 'ditto', 'rsync'] if 'clone' in operations else ['cp']))
+                *copy_tools)
     directory.check()
     command(argv, timeout=(86410 if args.full else 610), environment=environment,
             cwd=root, output=log, persist_success=False, receipt=receipt)
@@ -372,6 +487,19 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
     if receipt.get('completion_uncertain'):
         raise RuntimeError('Collector completion uncertain; all run files retained')
     if receipt.get('exit_code') != 0:
+        if not args.full and receipt.get('exit_code') == 1 and receipt.get('completion_uncertain') is False:
+            output = root / 'native.json'
+            selection = {'binary': str(binary.resolve()), 'scratch': str(root), 'output': str(output),
+                         'samples': args.samples, 'runs': 1, 'cache': ['warm'], 'jobs': args.jobs,
+                         'fixtures': list(fixtures), 'operations': list(operations), 'copy_tools': copy_tools}
+            try:
+                failures = _native_failures(output, selection)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError, RecursionError) as error:
+                raise RuntimeError('Collector failed; no verified completed failure report: ' + str(error)[:512]) from error
+            return {'status': 'failed', 'error': 'Native comparison failed correctness checks; see reference_failures',
+                    'collection_complete': False, 'required_coverage_complete': False, 'qualified': False,
+                    'comparisons': [], 'reference_failures': failures, 'report': str(output),
+                    'selection': quick_selection, 'exit_code': 1}
         raise RuntimeError('Collector failed; see its retained receipt and partial reports')
     if args.full:
         path = root / 'campaign/campaign.json'
@@ -394,7 +522,8 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
             and state.get('cleanup_passed') is True and not state.get('retained_fixture')):
         raise RuntimeError('Comparison failed correctness or cleanup; see retained report')
     return {'status': 'complete', 'collection_complete': True, 'required_coverage_complete': False,
-            'qualified': False, 'comparisons': comparisons, 'report': str(root / 'native.json'), 'exit_code': 0}
+            'qualified': False, 'comparisons': comparisons, 'report': str(root / 'native.json'),
+            'selection': quick_selection, 'exit_code': 0}
 
 
 def run(args):
@@ -411,8 +540,13 @@ def _run(args, directories):
         return 0
     root = None
     directory = None
+    selection = None
     try:
         resources, binary, parent, fixtures, operations = _preflight(args)
+        if not args.full:
+            selection = {'fixtures': list(fixtures), 'operations': list(operations),
+                         'copy_tools': _copy_tools(args, operations),
+                         'copy_tools_explicit': getattr(args, 'copy_tools', None) is not None}
         with _PinnedDirectory(parent) as scratch:
             root = Path(tempfile.mkdtemp(prefix='sfs-benchmark-', dir=scratch.path))
             scratch.check()
@@ -437,11 +571,15 @@ def _run(args, directories):
     if args.full and 'cases' not in result:
         result['cases'] = _coverage(args.cache, collected=False)
         result['required_coverage_complete'] = False
+    if selection is not None:
+        result['selection'] = selection
     result['run_directory'] = str(root) if root else None
     result['scope'] = 'Full collection with required gaps' if args.full else 'Selected warm comparisons'
     result['limits'] = ['Not release qualification', 'RSS is the maximum individual child peak, not whole-system memory',
                         'cp -c permits fallback; sharing observations do not change that contract',
                         'Completion uncertainty retains storage; descendant containment is not established']
+    if selection is not None and selection['copy_tools_explicit']:
+        result['limits'].append('Explicit reference selection does not establish fixed-matrix qualification')
     def closeout_error(message, error):
         result.setdefault('closeout_errors', []).append(message + str(error))
         result['closeout_errors'].extend(getattr(error, '__notes__', ()))
@@ -497,6 +635,13 @@ def _run(args, directories):
         print('Benchmark ' + result['status'] + (': ' + result['error'] if result.get('error') else ''))
         if root:
             print('Results: ' + str(root))
+        for failure in result.get('reference_failures', []):
+            losses = ', '.join(f'{name}={count}' for name, count in failure['loss_counts'].items()) or 'none'
+            gates = ', '.join(f'{name}={count}' for name, count in failure['gate_counts'].items()) or 'none'
+            print(f"{failure['fixture']} reference={failure['reference']} method={failure['method']} "
+                  f"losses: {losses}; failed checks: {gates}")
+        if result.get('reference_failures'):
+            print('Report: ' + result['report'])
         for item in result.get('comparisons', []):
             for metric in ('wall_s', 'cpu_s', 'rss_bytes'):
                 value = item.get('metrics', {}).get(metric)
