@@ -153,6 +153,93 @@ class Repetitions(unittest.TestCase):
             capture._owned_command.assert_not_called()
 
 
+class IntelCampaigns(unittest.TestCase):
+    def env(self):
+        return dict(environment(), IMAGE_REPEAT_MODE=runner.INTEL_MODE, RUNNER_ARCH='X64',
+                    IMAGE_REPEAT_COUNT='10', GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1',
+                    GITHUB_JOB='image-space-repeat')
+
+    def test_gate_binds_architecture_count_and_hosted_run(self):
+        self.assertEqual(runner.gate(self.env()), 10)
+        for key, value in [('RUNNER_ARCH', 'ARM64'), ('IMAGE_REPEAT_COUNT', '11'),
+                           ('GITHUB_RUN_ID', ''), ('GITHUB_RUN_ATTEMPT', '0'), ('GITHUB_JOB', '')]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                runner.gate(dict(self.env(), **{key: value}))
+        self.assertEqual(runner.selectors_for(environment()), (runner.SELECTOR,))
+        self.assertEqual(runner.selectors_for(self.env()), (runner.SELECTOR, runner.SNAPSHOT))
+
+    def test_pairs_stop_at_first_incomplete_test_with_honest_counts(self):
+        for failure in (None, 'space', 'snapshot', 'binding', 'skip', 'cleanup'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary, \
+                    patch.dict(os.environ, self.env()):
+                root = Path(temporary).resolve() / 'campaign'
+                calls = []
+                def command(argv, **kwargs):
+                    selector = argv[-1]
+                    calls.append(selector)
+                    directory = kwargs['cwd']
+                    value = dict(scope='diagnostic-only', full_qualification=False, passed=True,
+                                 selector=selector, observation=runner.OBSERVATION if selector == runner.SELECTOR else None,
+                                 binding=runner.binding(os.environ))
+                    if (failure == 'space' and len(calls) == 1) or (failure == 'snapshot' and len(calls) == 2):
+                        return subprocess.CompletedProcess(argv, 1)
+                    if len(calls) == 2:
+                        if failure == 'binding': value['binding']['GITHUB_RUN_ATTEMPT'] = '2'
+                        if failure == 'skip': value['passed'] = False
+                        if failure == 'cleanup': (directory / 'tmp/retained').write_bytes(b'inert')
+                    (directory / 'result.json').write_text(json.dumps(value))
+                    self.assertEqual(kwargs['timeout'], 180)
+                    self.assertEqual(capture._COMMAND_ENV['TMPDIR'], str(directory / 'tmp'))
+                    return subprocess.CompletedProcess(argv, 0)
+                capture = SimpleNamespace(_owned_command=command, _command_state={})
+                if failure:
+                    with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                        runner.repeat(ROOT, root, 3, capture)
+                else:
+                    runner.repeat(ROOT, root, 3, capture)
+                status = json.loads((root / 'summary.json').read_bytes())
+                self.assertEqual(status['completed'], 0 if failure else 3)
+                self.assertEqual(status['completed_tests'], (0 if failure == 'space' else 1) if failure else 6)
+                self.assertEqual(status['attempted_tests'], len(calls))
+                self.assertEqual(calls, [runner.SELECTOR] if failure == 'space' else
+                                 [runner.SELECTOR, runner.SNAPSHOT] * (1 if failure else 3))
+                self.assertEqual(len(list(root.glob('iteration-*'))), len(calls))
+                self.assertEqual(status['passed'], failure is None)
+
+    def test_snapshot_requires_complete_evidence_for_any_raw_failure(self):
+        for field in ('capture_disabled', 'attempts', 'before_attempts'):
+            diagnostic = SimpleNamespace(capture_disabled=False, attempts=0, before_attempts=0)
+            runner.snapshot_complete(diagnostic, None)
+            setattr(diagnostic, field, True)
+            with self.assertRaises(ValueError): runner.snapshot_complete(diagnostic, None)
+
+    def test_snapshot_suite_accepts_only_one_complete_success(self):
+        for outcome in ('pass', 'skip', 'failure', 'expected-failure', 'zero', 'two'):
+            class Fixture(unittest.TestCase):
+                def runTest(self):
+                    if outcome == 'skip': self.skipTest('inert')
+                    if outcome in ('failure', 'expected-failure'): self.fail('inert')
+            if outcome == 'expected-failure': Fixture.runTest = unittest.expectedFailure(Fixture.runTest)
+            suite = unittest.TestSuite([Fixture() for _ in range(0 if outcome == 'zero' else 2 if outcome == 'two' else 1)])
+            diagnostic = SimpleNamespace(capture_disabled=False, attempts=0, before_attempts=0)
+            with self.subTest(outcome=outcome), redirect_stderr(io.StringIO()):
+                if outcome == 'pass': runner.run_suite(suite, None, diagnostic, None, [])
+                else:
+                    with self.assertRaisesRegex(ValueError, 'Exact test failed'):
+                        runner.run_suite(suite, None, diagnostic, None, [])
+
+    def test_snapshot_selector_cannot_enter_arm_or_wrong_intel_interpreter(self):
+        with patch.dict(os.environ, environment()), self.assertRaisesRegex(ValueError, 'Exact test selector'):
+            runner.invoke(ROOT, Path('/unused'), runner.SNAPSHOT)
+        for architecture, python in [('arm64', (3, 13)), ('x86_64', (3, 11))]:
+            with patch.dict(os.environ, self.env()), patch.object(runner.sys, 'platform', 'darwin'), \
+                    patch.object(runner.platform, 'mac_ver', return_value=('26.0', (), '')), \
+                    patch.object(runner.platform, 'machine', return_value=architecture), \
+                    patch.object(runner.sys, 'version_info', python), \
+                    self.assertRaisesRegex(ValueError, 'actual macOS 26'):
+                runner.invoke(ROOT, Path('/unused'), runner.SNAPSHOT)
+
+
 class Observations(unittest.TestCase):
     def validate(self, rows, available=True, **kwargs):
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,10 +474,11 @@ class Observations(unittest.TestCase):
         with self.assertRaises(ValueError): runner.child_status([live])
 
     def test_close_admission_and_retained_fixture_prevent_child_success(self):
-        for failure in (None, 'close', 'admission', 'fixture'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+        for selector, failure in [(s, f) for s in (runner.SELECTOR, runner.SNAPSHOT)
+                                  for f in (None, 'close', 'admission', 'fixture')]:
+            with self.subTest(selector=selector, failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve(); (root / 'tmp').mkdir()
-                diagnostic = Mock()
+                diagnostic = Mock(attempts=0)
                 if failure == 'close': diagnostic.close.side_effect = OSError('close failed')
                 admitted = {'check': Mock(side_effect=[None, ValueError('late admission')] if failure == 'admission' else None)}
                 fixture = SimpleNamespace(__file__=str(ROOT / 'tests/test_images_space.py'), ImageSpace=Mock())
@@ -399,22 +487,30 @@ class Observations(unittest.TestCase):
                     _scan=SimpleNamespace(__file__='/installed/stallionfs/_scan.so'))
                 modules = {'stallionfs': package, 'test_images_space': fixture,
                     'image_failure_diagnostics': SimpleNamespace(install=Mock(return_value=diagnostic))}
-                test = Mock(); test.id.return_value = runner.SELECTOR
+                if selector == runner.SNAPSHOT:
+                    fixture.__file__ = str(ROOT / 'tests/test_image_store.py')
+                    modules['test_image_store'] = fixture
+                env = environment() if selector == runner.SELECTOR else IntelCampaigns().env()
+                version = (3, 11) if selector == runner.SELECTOR else (3, 13)
+                machine = 'arm64' if selector == runner.SELECTOR else 'x86_64'
+                test = Mock(); test.id.return_value = selector
                 suite = [test]
                 class Suite(list):
                     def countTestCases(self): return 1
                 if failure == 'fixture': (root / 'tmp/retained').write_bytes(b'inert')
-                with patch.dict(sys.modules, modules), patch.dict(os.environ, dict(environment(), TMPDIR=str(root / 'tmp'), RUNNER_TEMP=str(root))), \
-                        patch.object(runner.sys, 'platform', 'darwin'), patch.object(runner.sys, 'version_info', (3, 11)), \
+                with patch.dict(sys.modules, modules), patch.dict(os.environ, dict(env, TMPDIR=str(root / 'tmp'), RUNNER_TEMP=str(root))), \
+                        patch.object(runner.sys, 'platform', 'darwin'), patch.object(runner.sys, 'version_info', version), \
                         patch.object(runner.platform, 'mac_ver', return_value=('26.0', (), '')), \
-                        patch.object(runner.platform, 'machine', return_value='arm64'), patch.object(runner.Path, 'cwd', return_value=root), \
+                        patch.object(runner.platform, 'machine', return_value=machine), patch.object(runner.Path, 'cwd', return_value=root), \
                         patch.object(runner, 'load', return_value=SimpleNamespace(initialize_installed=Mock(return_value=admitted))), \
                         patch.object(runner.unittest.defaultTestLoader, 'loadTestsFromName', return_value=Suite(suite)), \
-                        patch.object(runner, 'run_suite'), patch.object(runner, 'observation_complete'):
+                        patch.object(runner, 'run_suite') as run, patch.object(runner, 'observation_complete'), \
+                        patch.object(runner, 'snapshot_complete'), patch.object(runner, 'bind_test_sources', return_value=Mock()):
                     if failure:
-                        with self.assertRaises((ValueError, OSError)): runner.invoke(ROOT, root, runner.SELECTOR)
+                        with self.assertRaises((ValueError, OSError)): runner.invoke(ROOT, root, selector)
                     else:
-                        runner.invoke(ROOT, root, runner.SELECTOR)
+                        runner.invoke(ROOT, root, selector)
+                self.assertEqual(run.call_args.args[1], fixture.ImageSpace if selector == runner.SELECTOR else None)
                 value = json.loads((root / 'result.json').read_bytes())
                 self.assertEqual(value['passed'], failure is None)
                 self.assertIs(value['full_qualification'], False)
@@ -428,13 +524,189 @@ class Observations(unittest.TestCase):
                 subprocess.Popen([sys.executable, '-I', '-B', '-c', 'raise SystemExit(8)'])
 
 
+@contextmanager
+def inert_sources():
+    # The extension is not built here. Any use of its sole import must fail.
+    # Exercise the real Python detach, diagnostic producer and fixture context.
+    before = set(sys.modules)
+    sys.path.insert(0, str(ROOT / 'tests'))
+    try:
+        with patch.dict(sys.modules, {'stallionfs._scan': SimpleNamespace(
+                _private_directory=Mock(side_effect=AssertionError('native extension forbidden')))}):
+            from stallionfs import images
+            import image_failure_diagnostics as diagnostics
+            import test_image_store as lifecycle
+            with patch.object(subprocess, 'Popen', side_effect=AssertionError('native command forbidden')):
+                yield images, diagnostics, lifecycle
+    finally:
+        sys.path.pop(0)
+        for name in set(sys.modules) - before:
+            if name.startswith('stallionfs') or name in ('test_image_store', 'image_failure_diagnostics'):
+                sys.modules.pop(name, None)
+
+
+class RecoveryAcceptance(unittest.TestCase):
+    @contextmanager
+    def recovered(self, *, selected=False, recover=True):
+        import plistlib
+        with inert_sources() as (images, module, lifecycle), tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            image, point = base / ('sibling.sparseimage' if selected else 'owned.sparseimage'), base / 'volume'
+            image.write_bytes(b'inert owned fixture'); image.chmod(0o600)
+            point.mkdir(mode=0o700)
+            device = '/dev/disk999'
+            entries = [{'dev-entry': device}, {'dev-entry': device+'s1', 'mount-point': str(point)}]
+            current = dict(image=str(image), device=device, mountpoint=str(point), volume_device=device+'s1',
+                           attachment=plistlib.dumps({'system-entities': entries}))
+            unmounted = dict(current, mountpoint=None, volume_device=None,
+                             attachment=images._unmounted_snapshot(current, point))
+            states = iter([current, current, unmounted, unmounted, None])
+            def mounted(path):
+                images._attachments(path)  # Real producer records only normal pre-command inventories.
+                return next(states)
+            args = ('/usr/sbin/diskutil', 'eject', device)
+            failure = images._CommandFailure(args, subprocess.CompletedProcess(args, 1 if recover else 16, b'', b'Volume failed to eject'))
+            captured = dict(returncode=1, stdout=b'', stderr=b'', reaped=True, timeout=False,
+                            truncated=False, capture_error=None, cleanup_error=None)
+            with patch.object(images, '_command', side_effect=[failure, b'']) as command, \
+                    patch.object(images, 'mounted', side_effect=mounted), \
+                    patch.object(images, '_attachments', return_value=[{'system-entities': entries}]), \
+                    patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)), \
+                    patch.object(images, '_no_graph_mounts'), patch.object(images, '_directory'):
+                collector = module.install(images, base / 'diagnostics')
+                try:
+                    with patch.object(collector, '_mapping', return_value=(str(image), [device, device+'s1'],
+                            None, None, (image.stat().st_dev, image.stat().st_ino))), \
+                            patch.object(collector, '_capture', return_value=captured), \
+                            module.failure_scope(base, image, mountpoint=point):
+                        if recover:
+                            images.detach(image, point)
+                        else:
+                            with self.assertRaises(images._CommandFailure): images.detach(image, point)
+                    self.assertEqual(command.call_count, 2 if recover else 1)
+                    self.assertEqual(collector.attempts, 1)
+                    self.assertTrue(module.artifact_available(collector.directory))
+                    yield collector, module, lifecycle, image
+                finally:
+                    module.Diagnostics.close(collector)
+
+    def test_actual_producer_recovery_qualifies_without_erasing_raw_failure(self):
+        with self.recovered() as (collector, module, _, _):
+            runner.snapshot_complete(collector, collector.directory)
+            rows = [json.loads(line) for line in (collector.directory / module.REPORT).read_bytes().splitlines()]
+            self.assertEqual(len([r for r in rows if r['kind'] == 'failure']), 1)
+            self.assertEqual(collector.attempts, 1)
+            with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.INTEL_MODE):
+                runner.recovery_complete(collector, rows)
+
+    def test_actual_unqualified_failure_refuses(self):
+        with self.recovered(recover=False) as (collector, _, _, _):
+            with self.assertRaises(ValueError):
+                runner.snapshot_complete(collector, collector.directory)
+
+    def test_saturated_raw_failure_budget_refuses(self):
+        with self.recovered() as (collector, module, _, _):
+            collector.attempts = module.ATTEMPTS
+            with self.assertRaisesRegex(ValueError, 'artifact incomplete'):
+                runner.snapshot_complete(collector, collector.directory)
+
+    def test_unmatched_incomplete_or_unqualified_recovery_refuses(self):
+        with self.recovered() as (collector, module, _, _):
+            report = collector.directory / module.REPORT
+            original = [json.loads(line) for line in report.read_bytes().splitlines()]
+            mutations = [('eject_outcome', 'commands', 1), ('eject_outcome', 'continuation_status', 1),
+                         ('eject_outcome', 'outcome', 'failed'), ('eject_outcome', 'operation_id', 999),
+                         ('eject_command', 'returncode', 16), ('eject_command', 'complete', False),
+                         ('eject_command', 'device', '/dev/disk123'), ('validation', 'selected_device', '/dev/disk123'),
+                         ('failure', 'operation', 'create'), ('failure', 'expected_busy', True)]
+            candidates = []
+            for kind, key, value in mutations:
+                rows = copy.deepcopy(original)
+                next(r for r in rows if r['kind'] == kind)[key] = value
+                candidates.append(rows)
+            for kind in ('failure', 'eject_command', 'validation', 'eject_outcome'):
+                candidates.append([r for r in original if r['kind'] != kind])
+            candidates.append(original + [next(r for r in original if r['kind'] == 'failure')])
+            for rows in candidates:
+                with self.subTest(rows=rows):
+                    report.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+                    with self.assertRaises(ValueError): runner.snapshot_complete(collector, collector.directory)
+
+    def test_intel_space_accepts_qualified_recovery_and_arm_still_refuses(self):
+        with self.recovered() as (collector, module, _, _):
+            after = [json.loads(line) for line in (collector.directory / module.REPORT).read_bytes().splitlines()]
+            for row in after: row['operation_id'] = 2
+            with Observations().collected() as (before_module, before_collector, _):
+                report = before_collector.directory / before_module.REPORT
+                before = [json.loads(line) for line in report.read_bytes().splitlines()]
+                report.write_text(''.join(json.dumps(r)+'\n' for r in before + after))
+                before_collector.attempts = 1
+                with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.INTEL_MODE):
+                    runner.observation_complete(before_collector, before_collector.directory)
+                    after[-2]['operation_id'] = 999
+                    report.write_text(''.join(json.dumps(r)+'\n' for r in before + after))
+                    with self.assertRaises(ValueError):
+                        runner.observation_complete(before_collector, before_collector.directory)
+                with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.MODE), self.assertRaises(ValueError):
+                    runner.observation_complete(before_collector, before_collector.directory)
+
+    def test_source_binding_detects_cleanup_source_change(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            names = ('tools/ci_image_repeat.py', 'tests/test_images_space.py',
+                     'tests/test_image_store.py', 'tests/image_failure_diagnostics.py')
+            for name in names:
+                path = checkout / name; path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, path)
+            def show(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, (checkout / argv[-1].split(':', 1)[1]).read_bytes())
+            with patch.object(subprocess, 'run', side_effect=show), patch.dict(os.environ, GITHUB_SHA='a'*40):
+                check = runner.bind_test_sources(checkout)
+            check()
+            (checkout / 'tests/test_image_store.py').write_text('changed cleanup')
+            with self.assertRaisesRegex(ValueError, 'cleanup source differs'): check()
+
+    def test_real_fixture_guard_runs_before_removal_and_preserves_on_refusal(self):
+        for failure in (None, 'diagnostics', 'child', 'close', 'source'):
+            with self.subTest(failure=failure), self.recovered() as (collector, module, lifecycle, image):
+                base = image.parent / 'fixture'; base.mkdir()
+                sentinel = base / 'sentinel'; sentinel.write_bytes(b'keep')
+                store = SimpleNamespace(root=base / 'store', list=lambda: [])
+                class Fixture(unittest.TestCase):
+                    def runTest(self):
+                        with lifecycle.image_fixture(store, base):
+                            pass
+                check = Mock(side_effect=ValueError('source changed') if failure == 'source' else None)
+                child = Mock(pid=999); child.poll.return_value = None if failure == 'child' else 0
+                if failure == 'diagnostics': collector.capture_disabled = True
+                if failure == 'close': self.enterContext(patch.object(collector, 'close', side_effect=OSError('close failed')))
+                def remove(path):
+                    self.assertEqual(path, base)
+                    self.assertTrue(collector.closed)
+                    check.assert_called_once()
+                    sentinel.unlink(); base.rmdir()
+                with patch.object(lifecycle, 'remove_tree', side_effect=remove) as removed, redirect_stderr(io.StringIO()):
+                    if failure:
+                        with self.assertRaises(ValueError):
+                            runner.run_suite(unittest.TestSuite([Fixture()]), None, collector, collector.directory,
+                                             [child], snapshot_module=lifecycle, acceptance=check)
+                        removed.assert_not_called()
+                        self.assertEqual(sentinel.read_bytes(), b'keep')
+                    else:
+                        runner.run_suite(unittest.TestSuite([Fixture()]), None, collector, collector.directory,
+                                         [child], snapshot_module=lifecycle, acceptance=check)
+                        removed.assert_called_once_with(base)
+
+
 class Workflow(unittest.TestCase):
     def test_manual_route_reuses_setup_and_preserves_required_gates(self):
         from test_ci_build import job, step, INSTALLED, SANITIZERS, rows
         text = (ROOT / '.github/workflows/checks.yml').read_text()
         manual = job(text, runner.MODE)
-        for value in ("if: github.event_name == 'workflow_dispatch' && inputs.mode == 'image-space-repeat'",
-                      'runs-on: macos-26', "python-version: '3.11'", 'persist-credentials: false',
+        for value in ("if: github.event_name == 'workflow_dispatch' && (inputs.mode == 'image-space-repeat' || inputs.mode == 'image-space-repeat-intel')",
+                      "runs-on: ${{ inputs.mode == 'image-space-repeat-intel' && 'macos-26-intel' || 'macos-26' }}",
+                      "python-version: ${{ inputs.mode == 'image-space-repeat-intel' && '3.13' || '3.11' }}", 'persist-credentials: false',
                       'ref: ${{ github.sha }}', 'STALLIONFS_TEST_SNAPSHOT_OBSERVATION: enospc-sibling-detach',
                       'IMAGE_REPEAT_COUNT: ${{ inputs.repeat-count }}', 'module.gate(os.environ)',
                       'if: always()', '/iteration-*/diagnostics/image-failures.jsonl'):
