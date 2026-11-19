@@ -2,13 +2,10 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
-import uuid
 
 from . import core
 from ._native_create_recovery import Admission, KEYS, pair, require, safe
