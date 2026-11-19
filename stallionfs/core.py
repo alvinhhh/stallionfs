@@ -203,7 +203,7 @@ def native_failure_details(error):
     return None
 
 
-def run(args, cwd=None, *, capture=True, internal_git=False):
+def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
     # Inherited Git routing variables must never redirect an operation elsewhere.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -235,7 +235,8 @@ def run(args, cwd=None, *, capture=True, internal_git=False):
             sys.stderr.write(result.stdout.decode(errors='replace'))
             sys.stderr.write(result.stderr.decode(errors='replace'))
             return None
-        return result.stdout.decode(errors='replace').strip()
+        output = result.stdout.decode(errors='replace')
+        return output.removesuffix('\n') if path_output else output.strip()
     result = subprocess.run(
         [str(a) for a in args], cwd=cwd, env=env, text=True,
         stdout=subprocess.PIPE if capture else sys.stderr,
@@ -246,14 +247,16 @@ def run(args, cwd=None, *, capture=True, internal_git=False):
             f"{args[0]} failed ({result.returncode}): "
             + ((result.stderr or "").strip() if capture else "see stderr")
         )
-    return result.stdout.strip() if capture else None
+    if not capture:
+        return None
+    return result.stdout.removesuffix('\n') if path_output else result.stdout.strip()
 
 
-def git(repo, *args):
+def git(repo, *args, path_output=False):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "hook.post-checkout.enabled=false", "-c", "hook.reference-transaction.enabled=false",
                 "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
-                "-C", repo, *args], internal_git=True)
+                "-C", repo, *args], internal_git=True, path_output=path_output)
 
 
 def identifier(value, length):
@@ -776,7 +779,7 @@ class Store(Lifecycle):
             raise StallionError("Image capacity must be an integer between 1 and 65536 GiB")
         if self.root.is_relative_to(source) or source.is_relative_to(self.root):
             raise StallionError("Source and stallionfs storage must not overlap")
-        if Path(git(source, "rev-parse", "--show-toplevel")).resolve() != source:
+        if Path(git(source, "rev-parse", "--show-toplevel", path_output=True)).resolve() != source:
             raise StallionError("Source must be the root of a Git checkout")
         if git(source, "status", "--porcelain", "--untracked-files=normal"):
             raise StallionError("Commit or stash source changes before preparing a seed")
@@ -784,9 +787,9 @@ class Store(Lifecycle):
         if any(line.startswith("160000 ") for line in git(source, "ls-tree", "-r", commit).splitlines()):
             raise StallionError("Submodules are not supported")
         remotes = git(source, "remote").splitlines()
-        origin = git(source, "remote", "get-url", "origin") if "origin" in remotes else str(source)
+        origin = git(source, "remote", "get-url", "origin", path_output=True) if "origin" in remotes else str(source)
         # Avoid persisting token-bearing HTTP URLs in every workspace's Git config.
-        if re.match(r"https?://[^/]*@", origin) or "?" in origin or "\n" in origin:
+        if re.match(r"https?://[^/]*@", origin.strip()) or "?" in origin or "\n" in origin:
             raise StallionError("Use an origin URL without embedded credentials or query parameters")
         spec = {"source": str(source), "commit": commit, "origin": origin, "key": key,
                 "command": list(command), "system": platform.system(),
@@ -818,7 +821,8 @@ class Store(Lifecycle):
                     raise StallionError("Preparation created shared Git storage or linked worktrees")
                 if any(line.lower().startswith("core.worktree=") for line in git(repo, "config", "--local", "--list").splitlines()):
                     raise StallionError("Preparation set core.worktree; cloned Git directories must be relocatable")
-                if git(repo, "rev-parse", "HEAD") != commit or git(repo, "diff", "HEAD", "--"):
+                if (git(repo, "rev-parse", "HEAD") != commit or git(repo, "diff", "HEAD", "--")
+                        or git(repo, "diff", "--cached", "HEAD", "--")):
                     raise StallionError("Preparation changed tracked files or HEAD; commit those changes in the source first")
                 if any((repo / ".git").rglob("*.lock")):
                     raise StallionError("Preparation left a Git lock; stop background processes before preparing")
