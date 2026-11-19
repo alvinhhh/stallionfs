@@ -31,6 +31,8 @@ Folder cloning pins files with open descriptors and uses `fclonefileat`, preserv
 
 The prepared image is detached and fully flushed before publication. Each copy mounts with file ownership enabled. Attachment checks use the backing image path, current device and mountpoint; copied volume UUIDs are never used as identity. Managed workspace cleanup retains busy or uncertain attachments and never force-detaches a volume or deletes an attached image.
 
+Each `hdiutil` and `diskutil` command has a 300-second limit, so a stuck command fails with a timeout instead of blocking the operation, and the image is kept as for any other command failure. Copying the repository into a new image with `ditto` has no fixed limit.
+
 If a completed normal eject reports `Volume failed to eject` with exit status 1,
 StallionFS can continue once on the same device only when that attempt fully
 unmounted the original volume. Two fresh inventory reads must retain the same
