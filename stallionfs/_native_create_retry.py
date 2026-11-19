@@ -1,7 +1,6 @@
 """One-hop fresh replacement, with the old journal as its sole reservation."""
 import os
 from pathlib import Path
-import re
 import uuid
 
 from . import core, _native
