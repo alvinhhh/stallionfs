@@ -8,6 +8,7 @@ import re
 import sys
 import subprocess
 import tempfile
+import time
 import traceback
 import unittest
 from unittest.mock import patch
@@ -121,6 +122,25 @@ class ImageRecoveryTests(unittest.TestCase):
                 images._command('owned-command')
         self.assertEqual(raised.exception.returncode, errno.EBUSY)
         self.assertIn('localized busy message', str(raised.exception))
+
+    def test_image_commands_are_bounded_except_tree_copy(self):
+        from stallionfs import images
+        result = subprocess.CompletedProcess([], 0, b'', b'')
+        with patch.object(images.subprocess, 'run', return_value=result) as run:
+            images._command('/usr/bin/hdiutil', 'create', 'x')
+            images._command('/usr/sbin/diskutil', 'eject', '/dev/disk9')
+            images._command(Path('/usr/bin/ditto'), 'source', 'destination')
+        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list],
+                         [images._COMMAND_SECONDS, images._COMMAND_SECONDS, None])
+
+    def test_stuck_image_command_times_out_and_is_reaped(self):
+        from stallionfs import images
+        started = time.monotonic()
+        with patch.object(images, '_COMMAND_SECONDS', 0.2), \
+                self.assertRaises(subprocess.TimeoutExpired) as raised:
+            images._command('/bin/sleep', '30')
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(raised.exception.cmd, ['/bin/sleep', '30'])
 
     def test_detach_preserves_ineligible_errors_regardless_of_synthetic_returncode(self):
         from stallionfs import images
