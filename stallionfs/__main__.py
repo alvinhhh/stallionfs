@@ -362,7 +362,10 @@ def main(argv=None):
             store.opportunistic_cleanup()
         if args.json or text:
             print(json.dumps(result, sort_keys=True) if args.json else text)
-        return result["returncode"] if args.action == "run" else 0
+        if args.action == "run":
+            # subprocess reports a signal death as -signal; shells report 128 + signal.
+            return 128 - result["returncode"] if result["returncode"] < 0 else result["returncode"]
+        return 0
     except (StallionError, OSError, shutil.Error, KeyboardInterrupt, MemoryError, subprocess.TimeoutExpired) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         message = "interrupted" if interrupted else str(exc)
