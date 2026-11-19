@@ -10,7 +10,6 @@ from pathlib import Path, PurePosixPath
 import platform
 import re
 import runpy
-import shutil
 import stat
 import sys
 import tarfile
