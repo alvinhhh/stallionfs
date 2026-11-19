@@ -309,6 +309,31 @@ class EntryTests(unittest.TestCase):
             with self.assertRaises(ValueError): entry.remainder(0, 20, now)
         with self.assertRaises(ValueError): entry.remainder(0, 20, NS, tail=1)
 
+    def test_intel_worker_allocation_boundaries(self):
+        self.assertEqual(entry.remainder(100*NS, 45, 125*NS), 2545)
+        self.assertEqual(entry.remainder(100*NS, 60, 100*NS), 3470)
+        self.assertEqual(entry.remainder(100*NS, 60, 125*NS), 3445)
+        self.assertEqual(entry.remainder(100*NS, 60, 125*NS, tail=True), 3565)
+        self.assertEqual(entry.remainder(100*NS, 60, 3570*NS), 0)
+        for minutes in range(121):
+            if minutes not in (15, 20, 30, 45, 60):
+                with self.subTest(minutes=minutes), self.assertRaises(ValueError):
+                    entry.remainder(100*NS, minutes, 125*NS)
+
+    def test_suite_and_receipt_timeout_boundaries(self):
+        for minutes in (45, 60):
+            with self.subTest(minutes=minutes):
+                receipt, _ = self.run_child('pass', timeout=minutes*60-entry.RESERVE)
+                self.assertTrue(receipt['success'])
+                self.assertEqual(receipt['timeout'], minutes*60-entry.RESERVE)
+        for timeout in (60*60-entry.RESERVE+.001, 61*60-entry.RESERVE,
+                        0, -1, True, None, '', float('inf'), float('nan')):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, 'Suite deadline'):
+                    self.run_child('pass', timeout=timeout)
+                with self.assertRaises(ValueError):
+                    entry.validate_receipt(json.dumps(dict(receipt, timeout=timeout)))
+
     def test_allocation_uses_explicit_clock_without_generic_origin_or_fallback(self):
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -402,6 +427,7 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(len(expressions), 2)
         self.assertEqual(expressions[0], expressions[1])
         self.assertIn("matrix.os == 'macos-26' && matrix.phase == 'installed' && 30", expressions[0])
+        self.assertIn("matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 60", expressions[0])
         # Keep the original anchor and shared tail reserve; the slow installed
         # workers receive room for the observed suite rather than a fresh clock.
         self.assertEqual(entry.remainder(100*NS, 30, 344*NS), 1426)
