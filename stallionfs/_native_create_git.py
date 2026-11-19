@@ -174,7 +174,7 @@ def environment(directory, runtime):
 
 def checkout(repo, commit, branch, stage, record, persist, runtime):
     """Exactly five roles; durable pending receipts precede every launch."""
-    admitted = structure(repo)
+    admitted = structure(repo, allow_shallow=True)
     actors = stage / 'actors'
     actors.mkdir(mode=0o700)
     directory = actors / 'environment'
@@ -225,7 +225,7 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
     actor('03-head-state', [*prefix, 'symbolic-ref', '--quiet', 'HEAD'], code=1)
     actor('04-checkout', [*prefix, 'checkout', '-b', branch])
     # core.preferSymlinkRefs intentionally changes HEAD to a contained symlink.
-    after = structure(repo, branch=branch)
+    after = structure(repo, branch=branch, allow_shallow=True)
     require(after == admitted, 'git-config-changed')
 
 
@@ -337,7 +337,7 @@ def readiness(repo, metadata):
     """Qualified bounded read-only queries for an already installed workspace."""
     import tempfile
     runtime = qualified_runtime(metadata.get('native_host'))
-    admitted = structure(repo, branch=True)
+    admitted = structure(repo, branch=True, allow_shallow=True)
     with tempfile.TemporaryDirectory(prefix='sfs-native-readiness-') as temporary:
         directory = Path(temporary).resolve()
         for name in ('home', 'xdg', 'tmp', 'inspect'):
@@ -356,5 +356,5 @@ def readiness(repo, metadata):
         prefix = ['--git-dir=' + str(repo / '.git'), '--work-tree=' + str(repo)]
         commit = query('head', [*prefix, 'rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}']).decode().strip()
         branch = query('branch', [*prefix, 'symbolic-ref', '--quiet', 'HEAD']).decode().strip().removeprefix('refs/heads/')
-        require(structure(repo, branch=True) == admitted, 'git-input-changed')
+        require(structure(repo, branch=True, allow_shallow=True) == admitted, 'git-input-changed')
         return commit, branch
