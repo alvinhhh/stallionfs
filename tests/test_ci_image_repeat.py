@@ -547,7 +547,7 @@ def inert_sources():
 
 class RecoveryAcceptance(unittest.TestCase):
     @contextmanager
-    def recovered(self, *, selected=False, recover=True):
+    def recovered(self, *, selected=False, recover=True, busy=0):
         import plistlib
         with inert_sources() as (images, module, lifecycle), tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -560,7 +560,7 @@ class RecoveryAcceptance(unittest.TestCase):
                            attachment=plistlib.dumps({'system-entities': entries}))
             unmounted = dict(current, mountpoint=None, volume_device=None,
                              attachment=images._unmounted_snapshot(current, point))
-            states = iter([current, current, unmounted, unmounted, None])
+            states = iter([current, current, *[unmounted] * (2 * (busy + 1)), None])
             def mounted(path):
                 images._attachments(path)  # Real producer records only normal pre-command inventories.
                 return next(states)
@@ -568,7 +568,11 @@ class RecoveryAcceptance(unittest.TestCase):
             failure = images._CommandFailure(args, subprocess.CompletedProcess(args, 1 if recover else 16, b'', b'Volume failed to eject'))
             captured = dict(returncode=1, stdout=b'', stderr=b'', reaped=True, timeout=False,
                             truncated=False, capture_error=None, cleanup_error=None)
-            with patch.object(images, '_command', side_effect=[failure, b'']) as command, \
+            detach = ('/usr/bin/hdiutil', 'detach', device)
+            held = images._CommandFailure(detach, subprocess.CompletedProcess(detach, 16, b'',
+                f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode()))
+            with patch.object(images, '_command', side_effect=[failure, *[held] * busy, b'']) as command, \
+                    patch.object(images.time, 'sleep'), \
                     patch.object(images, 'mounted', side_effect=mounted), \
                     patch.object(images, '_attachments', return_value=[{'system-entities': entries}]), \
                     patch.object(images, '_device_identity', return_value=(2, 100, 20, 0o60600)), \
@@ -583,7 +587,7 @@ class RecoveryAcceptance(unittest.TestCase):
                             images.detach(image, point)
                         else:
                             with self.assertRaises(images._CommandFailure): images.detach(image, point)
-                    self.assertEqual(command.call_count, 2 if recover else 1)
+                    self.assertEqual(command.call_count, 2 + busy if recover else 1)
                     self.assertEqual(collector.attempts, 1)
                     self.assertTrue(module.artifact_available(collector.directory))
                     yield collector, module, lifecycle, image
@@ -598,6 +602,21 @@ class RecoveryAcceptance(unittest.TestCase):
             self.assertEqual(collector.attempts, 1)
             with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.INTEL_MODE):
                 runner.recovery_complete(collector, rows)
+
+    def test_busy_detach_retries_qualify_as_one_recovery(self):
+        with self.recovered(busy=2) as (collector, module, _, _):
+            runner.snapshot_complete(collector, collector.directory)
+            rows = [json.loads(line) for line in (collector.directory / module.REPORT).read_bytes().splitlines()]
+            self.assertEqual(len([r for r in rows if r['kind'] == 'failure']), 1)
+            self.assertEqual([r['attempt'] for r in rows if r['kind'] == 'eject_command'], [1, 2, 3])
+            self.assertEqual(next(r for r in rows if r['kind'] == 'eject_outcome')['commands'], 4)
+            with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.INTEL_MODE):
+                runner.recovery_complete(collector, rows)
+                for key, value in (('returncode', 1), ('attempt', 5), ('device', '/dev/disk123')):
+                    changed = copy.deepcopy(rows)
+                    [r for r in changed if r['kind'] == 'eject_command'][1][key] = value
+                    with self.subTest(key=key), self.assertRaises(ValueError):
+                        runner.recovery_complete(collector, changed)
 
     def test_actual_unqualified_failure_refuses(self):
         with self.recovered(recover=False) as (collector, _, _, _):
