@@ -1353,7 +1353,7 @@ def install(images, directory):
                         invocation['target_changed'] = (invocation['reads'] != 2 or
                             invocation['command_count'] < 2 or
                             invocation['targets'] != [invocation.get('target')] * 2 or
-                            invocation['command_targets'] != [invocation.get('target')] * 2)
+                            invocation['command_targets'] != [invocation.get('target')] * invocation['command_count'])
                         _finish_eject(invocation, invocation['command_error'])
                         if observation is not None:
                             observation['finalized'] = True
