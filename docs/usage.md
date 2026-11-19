@@ -152,6 +152,8 @@ Rollback clones the selected snapshot into a permanent recovery directory and at
 
 ## Managed use and cleanup
 
+With `sfs --json run WORKSPACE_ID -- COMMAND`, the child's stdout is sent to stderr so stdout remains a single JSON receipt. Without `--json`, child stdout streams to stdout as usual.
+
 ```sh
 sfs run WORKSPACE_ID -- codex
 sfs enroll WORKSPACE_ID
@@ -438,4 +440,3 @@ command can report a committed change or unknown publication; it does not imply
 rollback. Preserve its recovery name and inspect the image before repeating the
 operation. Later explicitly requested calls use fresh ordinary validation;
 malformed slot pairs require explicit recovery rather than automatic repair.
-

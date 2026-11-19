@@ -73,6 +73,8 @@ sfs gc --yes           # Delete that trash
 
 Files are stored in `~/Library/Application Support/stallionfs`. Set `STALLIONFS_HOME` or pass `--root` to use another location. Use `--json` before the command name for structured output.
 
+With `sfs --json run WORKSPACE_ID -- COMMAND`, the child's stdout streams to stderr so stdout stays a single JSON receipt. Without `--json`, child stdout streams to stdout as usual.
+
 ## Installation
 
 Requires macOS, Python 3.11+ and Xcode Command Line Tools when building from source. Workspace storage must be on APFS. Install from source:
