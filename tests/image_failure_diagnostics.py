@@ -21,6 +21,8 @@ ATTEMPTS, SECONDS, CAPTURE_BYTES, EVENTS, FILE_BYTES = 4, 12, 128 * 1024, 32, 64
 BEFORE_CAPTURE_BYTES, BEFORE_EVENTS, BEFORE_FILE_BYTES = 32 * 1024, 5, 16 * 1024
 EJECT_CAPTURE_BYTES, EJECT_RETAINED_BYTES = 16 * 1024, 2048
 EJECT_COMMAND_STREAM_BYTES = 1024
+# One diskutil eject, then ordinary hdiutil detach retried while the device is busy.
+EJECT_ATTEMPTS = 8
 DA_SUBSYSTEM = 'com.apple.DiskArbitration.diskarbitrationd'
 REPORT = "image-failures.jsonl"
 _metadata = {'operation_id', 'phase', 'timestamp_ns'}
@@ -57,7 +59,7 @@ def _eject_command_result(args, error, attempt, started, finished):
     """Copy an already completed failure, without another command or inferred fields."""
     if (error.args_native != args or type(error.returncode) is not int or error.returncode == 0 or
             type(error.stdout) is not bytes or type(error.stderr) is not bytes or
-            type(attempt) is not int or attempt not in (1, 2) or
+            type(attempt) is not int or not 1 <= attempt <= EJECT_ATTEMPTS or
             started is None or finished is None or
             not all(type(value) is int and value > 0 for value in (*started, *finished)) or
             finished[1] < started[1]):
@@ -452,10 +454,11 @@ def artifact_available(directory):
                     type(value['timestamp_ns']) is not int or value['timestamp_ns'] <= 0):
                 return False
             if value['kind'] == 'eject_command':
-                if (value['phase'] != 'after' or type(value['attempt']) is not int or value['attempt'] not in (1, 2) or
+                if (value['phase'] != 'after' or type(value['attempt']) is not int or
+                        not 1 <= value['attempt'] <= EJECT_ATTEMPTS or
+                        ((value['executable'], value['verb']) != ('/usr/bin/hdiutil', 'detach') or value['attempt'] < 2) and
                         (value['executable'], value['verb'], value['attempt']) not in (
-                            ('/usr/sbin/diskutil', 'eject', 1), ('/usr/sbin/diskutil', 'eject', 2),
-                            ('/usr/bin/hdiutil', 'detach', 2)) or
+                            ('/usr/sbin/diskutil', 'eject', 1), ('/usr/sbin/diskutil', 'eject', 2)) or
                         not isinstance(value['device'], str) or not re.fullmatch(r'/dev/disk[0-9]+', value['device']) or
                         type(value['returncode']) is not int or value['returncode'] == 0 or
                         not all(type(value[name]) is int and value[name] > 0 for name in
@@ -511,7 +514,7 @@ def artifact_available(directory):
                     return False
             if value['kind'] == 'eject_outcome':
                 if (value['phase'] != 'after' or type(value['commands']) is not int or
-                        value['commands'] not in (1, 2) or
+                        not 1 <= value['commands'] <= EJECT_ATTEMPTS or
                         value['outcome'] not in ('recovered', 'failed', 'interrupted', 'refused') or
                         any(value[name] is not None and type(value[name]) is not int
                             for name in ('first_status', 'continuation_status'))):
@@ -666,7 +669,7 @@ class Diagnostics:
                 statuses = invocation.get('command_statuses', [])
                 self._emit(deadline, 'eject_outcome', commands=invocation['command_count'],
                            first_status=invocation.get('command_status'),
-                           continuation_status=statuses[1] if len(statuses) == 2 else None,
+                           continuation_status=statuses[-1] if len(statuses) >= 2 else None,
                            outcome=invocation['outcome'])
         finally:
             self.operation_id, self.phase = 0, 'standalone'
@@ -1207,9 +1210,9 @@ def install(images, directory):
         invocation = _detach_call.get()
         if invocation is not None and invocation['diagnostics'] is not diagnostics:
             invocation = None
-        continuation = (invocation is not None and invocation['command_count'] == 1
-                        and invocation['command_statuses'] == [1]
-                        and len(args) == 3 and invocation['command_targets'] == [args[2]]
+        continuation = (invocation is not None and 1 <= invocation['command_count'] < EJECT_ATTEMPTS
+                        and invocation['command_statuses'] == [1] + [16] * (invocation['command_count'] - 1)
+                        and len(args) == 3 and invocation['command_targets'] == [args[2]] * invocation['command_count']
                         and args[:2] == ('/usr/bin/hdiutil', 'detach'))
         ejecting = (len(args) == 3 and
                     (args[:2] == ('/usr/sbin/diskutil', 'eject') or continuation)
@@ -1266,6 +1269,12 @@ def install(images, directory):
                 raise
             if invocation is not None:
                 invocation['command_statuses'].append(getattr(error, 'returncode', None))
+                # An ordinary busy detach that images will retry is kept as a command
+                # result of this public call, not as another raw failure.
+                busy = getattr(images, '_busy_detach_failure', None)
+                if (continuation and invocation['command_count'] < EJECT_ATTEMPTS and
+                        busy is not None and busy(error, args[2])):
+                    raise
             if record is not None and 'command_error' not in record:
                 record['command_error'] = error
                 record['command_status'] = getattr(error, 'returncode', None)
@@ -1342,7 +1351,7 @@ def install(images, directory):
                     try:
                         diagnostics.validation(invocation)
                         invocation['target_changed'] = (invocation['reads'] != 2 or
-                            invocation['command_count'] != 2 or
+                            invocation['command_count'] < 2 or
                             invocation['targets'] != [invocation.get('target')] * 2 or
                             invocation['command_targets'] != [invocation.get('target')] * 2)
                         _finish_eject(invocation, invocation['command_error'])
@@ -1353,7 +1362,7 @@ def install(images, directory):
                 return result
             except BaseException as error:
                 invocation['outcome'] = ('interrupted' if not isinstance(error, Exception) else
-                                         'failed' if invocation['command_count'] == 2 else 'refused')
+                                         'failed' if invocation['command_count'] >= 2 else 'refused')
                 try:
                     diagnostics.validation(invocation)
                 except BaseException:
@@ -1364,7 +1373,7 @@ def install(images, directory):
                         observation['finalized'] = True
                     else:
                         invocation['target_changed'] = (invocation['reads'] != 2 or
-                            invocation['command_count'] not in (1, 2) or
+                            not 1 <= invocation['command_count'] <= EJECT_ATTEMPTS or
                             invocation['targets'] != [invocation.get('target')] * 2 or
                             invocation['command_targets'] != [invocation.get('target')] * invocation['command_count'])
                     _finish_eject(invocation, error)

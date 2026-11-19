@@ -96,7 +96,7 @@ class DetachContinuationTests(unittest.TestCase):
         return {'images': [] if value is None else [value]}
 
     def command(self, args, **kwargs):
-        self.assertLess(len(self.runs), 2)
+        self.assertLess(len(self.runs), 1 + len(images._BUSY_DETACH_DELAYS) + 1)
         expected = ('/usr/sbin/diskutil', 'eject') if not self.runs else ('/usr/bin/hdiutil', 'detach')
         self.assertEqual(args, [*expected, '/dev/disk7'])
         self.runs.append(tuple(args))
@@ -122,6 +122,51 @@ class DetachContinuationTests(unittest.TestCase):
         self.assertEqual(self.runs, [('/usr/sbin/diskutil', 'eject', '/dev/disk7'),
                                      ('/usr/bin/hdiutil', 'detach', '/dev/disk7')])
         self.assertEqual(self.image.read_bytes(), b'owned backing')
+
+    @classmethod
+    def busy(cls, device='disk7', status=16):
+        return cls.failure(f'hdiutil: couldn\'t eject "{device}" - Resource busy'.encode(), status)
+
+    def test_transient_busy_detach_is_retried_with_fresh_validation(self):
+        self.results = [self.first, self.busy(), self.busy(), subprocess.CompletedProcess([], 0, b'', b'')]
+        self.sequence = [self.entry, self.entry, *[self.closed] * 6, None]
+        with patch.object(images.time, 'sleep') as sleep:
+            images.detach(self.image, self.point)
+        self.assertEqual(self.runs, [('/usr/sbin/diskutil', 'eject', '/dev/disk7'),
+                                     *[('/usr/bin/hdiutil', 'detach', '/dev/disk7')] * 3])
+        self.assertEqual([call.args for call in sleep.call_args_list], [(0.25,), (0.5,)])
+        self.assertEqual(self.reads, 9)
+        self.assertEqual(self.image.read_bytes(), b'owned backing')
+
+    def test_diagnostic_attempt_bound_matches_busy_retries(self):
+        import image_failure_diagnostics
+        self.assertEqual(image_failure_diagnostics.EJECT_ATTEMPTS, 2 + len(images._BUSY_DETACH_DELAYS))
+
+    def test_persistent_busy_detach_is_bounded_and_preserves_first(self):
+        attempts = len(images._BUSY_DETACH_DELAYS) + 1
+        self.results = [self.first, *[self.busy()] * attempts]
+        self.sequence = [self.entry, self.entry, *[self.closed] * (2 * attempts)]
+        with patch.object(images.time, 'sleep') as sleep:
+            error = self.refused(commands=1 + attempts)
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertEqual(error.__cause__.returncode, 16)
+        self.assertIn(f'after {attempts} ordinary detach attempts', ' '.join(error.__cause__.__notes__))
+
+    def test_other_detach_failures_are_not_retried(self):
+        for result in (self.busy('disk9'), self.busy(status=1)):
+            with self.subTest(stderr=result.stderr, status=result.returncode):
+                self.reads = 0; self.runs.clear()
+                self.results = [self.first, result]
+                with patch.object(images.time, 'sleep') as sleep:
+                    self.refused(commands=2)
+                sleep.assert_not_called()
+
+    def test_busy_continuation_changes_refuse_without_further_detach(self):
+        self.results = [self.first, self.busy(), subprocess.CompletedProcess([], 0, b'', b'')]
+        self.sequence = [self.entry, self.entry, self.closed, self.closed, self.entry]
+        with patch.object(images.time, 'sleep'):
+            error = self.refused(commands=2)
+        self.assertIn('same unmounted graph', str(error.__cause__))
 
     def test_store_unmount_keeps_one_public_call_and_holds_workspace_lock(self):
         from stallionfs import core
@@ -159,6 +204,19 @@ class DetachContinuationTests(unittest.TestCase):
     def test_diagnostics_keep_initial_failure_and_refusal_outcome(self):
         self.sequence[2] = self.entry
         self.diagnostic_outcome('refused', 1, None)
+
+    def test_diagnostics_admit_busy_retries_before_recovery(self):
+        self.results = [self.first, self.busy(), subprocess.CompletedProcess([], 0, b'', b'')]
+        self.sequence = [self.entry, self.entry, *[self.closed] * 4, None]
+        with patch.object(images.time, 'sleep'):
+            self.diagnostic_outcome('recovered', 3, 0)
+
+    def test_diagnostics_keep_persistent_busy_failure_outcome(self):
+        attempts = len(images._BUSY_DETACH_DELAYS) + 1
+        self.results = [self.first, *[self.busy()] * attempts]
+        self.sequence = [self.entry, self.entry, *[self.closed] * (2 * attempts)]
+        with patch.object(images.time, 'sleep'):
+            self.diagnostic_outcome('failed', 1 + attempts, 16)
 
     def diagnostic_outcome(self, expected, commands, continuation_status):
         collector = install(images, self.base / 'diagnostics')
