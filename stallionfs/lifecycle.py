@@ -143,8 +143,13 @@ class Lifecycle:
             if attached is not None and attached['mountpoint'] != str(path / 'volume'):
                 raise core.StallionError('Image is not mounted at its managed mountpoint; unmount it before capture')
             repo = Path(self._mount(path, meta)['path']) if attached is None else path / 'volume' / 'repo'
-            self._standalone_git(repo)
-            images.detach(payload, path / 'volume')
+            validated = False
+            try:
+                self._standalone_git(repo)
+                validated = True
+            finally:
+                if validated or attached is None:
+                    images.detach(payload, path / 'volume')
             images.flush(payload)
             self._no_mounts(path)
             return payload, attached is not None
