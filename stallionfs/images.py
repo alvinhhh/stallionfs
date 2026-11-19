@@ -38,9 +38,17 @@ def _require_supported():
         raise _error('APFS image workspaces require macOS 26 or newer')
 
 
+# Image metadata commands finish in seconds; a stuck hdiutil or diskutil must fail
+# instead of blocking forever. Copying the user's tree has no fixed bound.
+_COMMAND_SECONDS = 300
+_UNBOUNDED_COMMANDS = ('/usr/bin/ditto',)
+
+
 def _command(*args):
+    timeout = None if str(args[0]) in _UNBOUNDED_COMMANDS else _COMMAND_SECONDS
     result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077)
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077,
+                            timeout=timeout)
     if result.returncode:
         raise _CommandFailure(args, result)
     return result.stdout
