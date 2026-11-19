@@ -4005,6 +4005,21 @@ os.chflags('file',0x8001)
             self.assertEqual(retired.parent.parent, self.store.root / "staging")
         self.assertEqual(list((self.store.root / "staging").iterdir()), [])
 
+    def test_prepare_clean_shallow_clone(self):
+        git(self.source, "commit", "--allow-empty", "-m", "Second")
+        shallow = self.base / "shallow"
+        git(self.source, "clone", "--depth=1", "--no-local", "--", str(self.source), str(shallow))
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        seed = self.store.prepare(shallow, key="shallow")
+        repo = self.store.root / "seeds" / seed["id"] / "repo"
+        self.assertFalse(seed["cached"])
+        self.assertEqual(git(repo, "rev-parse", "HEAD"), git(shallow, "rev-parse", "HEAD"))
+        self.assertEqual(git(repo, "rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(git(repo, "status", "--porcelain"), "")
+        self.assertEqual((repo / "file").read_text(), "original\n")
+        self.assertEqual(list((self.store.root / "staging").iterdir()), [])
+        self.assertTrue(self.store.prepare(shallow, key="shallow")["cached"])
+
     def test_failure_does_not_publish_partial_seed_or_workspace(self):
         with self.assertRaises(StallionError) as failed:
             self.prepare(command=[sys.executable, "-c", "raise SystemExit(17)"])

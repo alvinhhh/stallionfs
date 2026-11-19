@@ -19,7 +19,7 @@ class Prepare(unittest.TestCase):
         scan._private_directory = lambda path: None
         modules[scan.__name__] = scan
         refs = ModuleType(self.package + '._native_create_git')
-        refs.inspect_refs = lambda repo: ['HEAD']
+        refs.inspect_refs = lambda repo, *, allow_shallow=False: ['HEAD']
         refs.PSEUDO = set()
         modules[refs.__name__] = refs
         isolated = patch.dict(sys.modules, modules)
