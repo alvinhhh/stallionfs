@@ -3,7 +3,7 @@
 The supervisor owns only its retained Popen. EOF and reaping do not establish
 closure of escaped descendants or services. No arbitrary selectors are accepted.
 """
-import faulthandler
+import datetime
 import json
 import math
 import os
@@ -104,7 +104,34 @@ class Events:
                            child_ownership='unavailable'))
 
 
-def lifecycle(factory, events, snapshot_delays=(30, 60, 90)):
+def suite_watchdog(stop, interval):
+    while not stop.wait(interval):
+        lines = [f'Timeout ({datetime.timedelta(seconds=interval)})!']
+        for identity, frame in list(sys._current_frames().items())[:64]:
+            lines.append(f'Thread 0x{identity:x} (most recent call first):')
+            depth = 0
+            while frame is not None and depth < 64:
+                filename = json.dumps(frame.f_code.co_filename[:500], ensure_ascii=True)
+                name = frame.f_code.co_name[:500]
+                lines.append(f'  File {filename}, line {frame.f_lineno} in {name}')
+                frame = frame.f_back
+                depth += 1
+            if frame is not None:
+                lines.append('  ...')
+            frame = None
+            lines.append('')
+        data = ('\n'.join(lines) + '\n').encode('utf-8', errors='backslashreplace')
+        while data and not stop.is_set():
+            try:
+                written = os.write(2, data)
+            except OSError:
+                return
+            if not written:
+                return
+            data = data[written:]
+
+
+def lifecycle(factory, events, snapshot_delays=(30, 60, 90), watchdog_interval=300):
     failed = False
     result = None
     def phase(name, operation):
@@ -124,18 +151,19 @@ def lifecycle(factory, events, snapshot_delays=(30, 60, 90)):
     if prepared is None:
         return 1
     suite, close, admission, account, resultclass = prepared
-    faulthandler.dump_traceback_later(300, repeat=True)
+    stop_watchdog = threading.Event()
+    threading.Thread(target=suite_watchdog, args=(stop_watchdog, watchdog_interval), daemon=True).start()
     try:
         result = phase('suite', lambda: unittest.TextTestRunner(verbosity=2, resultclass=resultclass).run(suite()))
     finally:
-        # Original during-suite watchdog retained; bounded, sanitized observer
+        stop_watchdog.set()
+        # During-suite watchdog retained without a join; bounded, sanitized observer
         # replaces it for the previously unobserved post-suite/finalization tail.
         try:
             threading.Thread(target=events.snapshots, args=(snapshot_delays,), daemon=True).start()
         except RuntimeError:
             failed = True
             events.emit(dict(kind='stack', threads=[], truncated=True, child_ownership='unavailable'))
-        faulthandler.cancel_dump_traceback_later()
     phase('close', close)
     phase('admission', admission)
     def accounting():

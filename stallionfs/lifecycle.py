@@ -399,7 +399,7 @@ class Lifecycle:
             replace_json(self._state(workspace), state)
             return state
 
-    def run(self, workspace, command, *, auto_retire=False):
+    def run(self, workspace, command, *, auto_retire=False, stdout=None):
         if not command:
             raise core.StallionError('Supply a command after --')
         if auto_retire and not self.cleanup_config()['enabled']:
@@ -439,7 +439,7 @@ class Lifecycle:
                     options = {'pass_fds': (lease_fd,), 'env': {
                         **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
                         'STALLIONFS_LEASE_GENERATION': generation}}
-                result = subprocess.run(command, cwd=repo, **options)
+                result = subprocess.run(command, cwd=repo, stdout=stdout, **options)
         except BaseException as error:
             if native_access is not None:
                 try:
