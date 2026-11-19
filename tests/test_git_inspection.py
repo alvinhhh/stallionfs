@@ -154,6 +154,25 @@ class GitInspection(unittest.TestCase):
             with self.subTest(size=len(data)), self.assertRaises((core.StallionError, UnicodeError)):
                 git.inspect_refs(self.repo)
 
+    def test_shallow_admission_is_explicit_and_keeps_native_restriction(self):
+        (self.repo / '.git/shallow').write_text('0' * 40 + '\n')
+        for inspect in (git.structure, git.inspect_standalone, git.inspect_refs):
+            with self.subTest(inspect=inspect.__name__), self.assertRaises(core.StallionError):
+                inspect(self.repo)
+        self.assertFalse(self.calls)
+        self.assertEqual(git.inspect_refs(self.repo, allow_shallow=True), ['HEAD', 'refs/heads/main'])
+        self.calls.clear(); self.refs = b''
+        self.assertEqual(git.inspect_refs(self.repo, allow_shallow=True), [])
+        (self.repo / '.git/MERGE_HEAD').write_text('0' * 40 + '\n')
+        self.calls.clear()
+        with self.assertRaises(core.StallionError): git.inspect_refs(self.repo, allow_shallow=True)
+        self.assertFalse(self.calls)
+
+    def test_shallow_admission_still_rejects_unsafe_entries(self):
+        (self.repo / '.git/shallow').symlink_to('HEAD')
+        with self.assertRaises(core.StallionError): git.inspect_refs(self.repo, allow_shallow=True)
+        self.assertFalse(self.calls)
+
     def test_loose_transient_state_refuses_before_any_product_command(self):
         (self.repo / '.git/MERGE_HEAD').write_text('0' * 40 + '\n')
         with self.assertRaises(core.StallionError): git.inspect_refs(self.repo)
