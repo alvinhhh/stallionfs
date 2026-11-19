@@ -57,6 +57,51 @@ class Prepare(unittest.TestCase):
         self.assertEqual(self.core.git(repo, 'diff', 'HEAD', '--'), '')
         self.assertTrue(self.core.git(repo, 'diff', '--cached', 'HEAD', '--'))
 
+    def assert_refused(self, script):
+        command = [sys.executable, '-c', 'from pathlib import Path; import os, subprocess; ' + script]
+        with self.assertRaisesRegex(self.core.StallionError, 'Preparation changed tracked file'):
+            self.prepare(command)
+        self.assertEqual(list((self.store.root / 'seeds').iterdir()), [])
+        repo, = (self.store.root / 'staging').glob('*/repo')
+        return repo
+
+    def test_change_hidden_by_index_flag_is_refused(self):
+        for flag in ('--assume-unchanged', '--skip-worktree'):
+            with self.subTest(flag=flag):
+                repo = self.assert_refused(
+                    f"subprocess.run(['git', 'update-index', '{flag}', 'file'], check=True); "
+                    "Path('file').write_text('changed\\n')")
+                self.assertEqual(self.core.git(repo, 'diff', 'HEAD', '--'), '')
+                shutil.rmtree(repo.parent)
+
+    def test_mode_change_hidden_by_filemode_config_is_refused(self):
+        repo = self.assert_refused(
+            "subprocess.run(['git', 'config', 'core.filemode', 'false'], check=True); "
+            "os.chmod('file', 0o755)")
+        self.assertEqual(self.core.git(repo, 'diff', 'HEAD', '--'), '')
+
+    def test_tracked_file_replaced_by_symlink_is_refused(self):
+        self.assert_refused(
+            "Path('copy').write_text('original\\n'); "
+            "subprocess.run(['git', 'update-index', '--assume-unchanged', 'file'], check=True); "
+            "os.remove('file'); os.symlink('copy', 'file')")
+
+    def test_checkout_conversion_matching_head_is_published(self):
+        (self.source / '.gitattributes').write_text('file text eol=crlf\n')
+        self.core.git(self.source, 'add', '.gitattributes')
+        self.core.git(self.source, 'commit', '-m', 'Line endings')
+        seed = self.prepare()
+        repo = self.store.root / 'seeds' / seed['id'] / 'repo'
+        self.assertEqual((repo / 'file').read_bytes(), b'original\r\n')
+
+    def test_change_hidden_by_line_ending_conversion_is_refused(self):
+        (self.source / '.gitattributes').write_text('file text eol=crlf\n')
+        self.core.git(self.source, 'add', '.gitattributes')
+        self.core.git(self.source, 'commit', '-m', 'Line endings')
+        self.assert_refused(
+            "subprocess.run(['git', 'update-index', '--assume-unchanged', 'file'], check=True); "
+            "Path('file').write_bytes(b'changed\\r\\n')")
+
     def test_clean_index_and_untracked_output_are_published(self):
         for command in ((), [sys.executable, '-c', "from pathlib import Path; Path('output').write_text('built')"]):
             with self.subTest(command=command):
