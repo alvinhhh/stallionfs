@@ -2,9 +2,12 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -430,6 +433,54 @@ class GitRoutingTests(unittest.TestCase):
         self.assertEqual(select.call_args.kwargs, {'cwd': cwd})
         self.assertEqual(command.call_args.kwargs['cwd'], cwd)
         self.assertEqual(command.call_args.args[0][:3], ['/selected/git', '-C', '/different-repository'])
+
+    def test_prepare_preserves_checkout_and_origin_trailing_spaces(self):
+        source = self.root / 'checkout '
+        source.mkdir()
+        origin = str(self.root / 'origin ')
+        store = SimpleNamespace(root=self.root / 'storage')
+        with self.prepare_git() as core:
+            core.git(source, 'init', '-b', 'main')
+            core.git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                     '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-m', 'Fixture')
+            core.git(source, 'remote', 'add', 'origin', origin)
+            self.assertEqual(core.git(source, 'status', '--porcelain'), '')
+            for deadline in ('', str(time.monotonic() + 60)):
+                with self.subTest(benchmark=bool(deadline)), \
+                        patch.dict(os.environ, STALLIONFS_BENCHMARK_DEADLINE=deadline), \
+                        patch.object(sys, 'platform', 'darwin'), \
+                        patch.object(core.json, 'dumps', wraps=core.json.dumps) as dumps, \
+                        patch.object(core, 'lock', side_effect=RuntimeError('seed lock reached')):
+                    with self.assertRaisesRegex(RuntimeError, '^seed lock reached$'):
+                        core.Store.prepare(store, source, key='test-v1')
+                    spec = dumps.call_args.args[0]
+                    self.assertEqual(spec['source'], str(source.resolve()))
+                    self.assertEqual(spec['origin'], origin)
+
+    def test_git_path_output_empty_and_error(self):
+        with self.prepare_git() as core:
+            core.git(self.root, 'init', '-b', 'main')
+            for deadline in ('', str(time.monotonic() + 60)):
+                with self.subTest(benchmark=bool(deadline)), \
+                        patch.dict(os.environ, STALLIONFS_BENCHMARK_DEADLINE=deadline):
+                    self.assertEqual(core.git(self.root, 'remote', path_output=True), '')
+                    with self.assertRaises(core.StallionError):
+                        core.git(self.root, 'remote', 'get-url', 'missing', path_output=True)
+
+    @contextmanager
+    def prepare_git(self):
+        executable = shutil.which('git')
+        self.assertIsNotNone(executable)
+        scan = ModuleType('stallionfs._scan')
+        scan._private_directory = Mock(side_effect=AssertionError('native storage is not exercised'))
+        with patch.dict(sys.modules, {'stallionfs._scan': scan}):
+            from stallionfs import core
+        budget = ModuleType('stallionfs._benchmark_budget')
+        budget.command = lambda args, *, cwd, environment, persist_success: subprocess.run(
+            args, cwd=cwd, env=environment, capture_output=True)
+        with patch.dict(sys.modules, {'stallionfs._benchmark_budget': budget}), \
+                patch.object(_bundle, 'git_environment', side_effect=lambda env, **kw: (executable, env)):
+            yield core
 
     def test_query_enforces_execution_bounds_and_complete_results(self):
         native = ModuleType('stallionfs._native')
