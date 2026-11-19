@@ -720,11 +720,6 @@ def recovery_policy(state, retained_request):
         return 'restore-exact-same-version-then-observe'
     return 'old-samepath-restore-eligible-for-qualified-manual-procedure' if state.get('downtime') is True else 'stop-activity'
 
-def link_state(kind, *, owned=False, dangling=False):
-    if kind == 'absent': return 'no-link'
-    if kind == 'symlink' and owned: return 'owned-dangling' if dangling else 'owned-link'
-    return 'foreign-entry-preserve'
-
 def inspect_link(path, expected):
     try:
         info = os.lstat(path)
