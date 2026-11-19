@@ -3,10 +3,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 SOURCE = Path(__file__).resolve().parents[1] / 'tools/ci_test_entry.py'
 spec = importlib.util.spec_from_file_location('ci_test_entry_test', SOURCE)
@@ -73,7 +76,121 @@ sys.exit(code)
 '''
 
 
+WATCHDOG_CHILD = '''
+import faulthandler, importlib.util, inspect, os, sys, threading, time, unittest
+spec = importlib.util.spec_from_file_location('entry', sys.argv[1])
+e = importlib.util.module_from_spec(spec); spec.loader.exec_module(e)
+os.environ.update(CI_INVOCATION='watchdog-test', CI_MODE='suite', CI_JOB_BINDING='watchdog-test')
+events = e.Events(sys.argv[2])
+observer_done = threading.Event()
+snapshots = events.snapshots
+def observed_snapshots(delays):
+    time.sleep(.1)
+    snapshots(delays)
+    observer_done.set()
+events.snapshots = observed_snapshots
+if sys.argv[3] == 'blocked':
+    read, write = os.pipe()
+    os.set_blocking(write, False)
+    try:
+        while True: os.write(write, b'x' * 4096)
+    except BlockingIOError:
+        pass
+    os.set_blocking(write, True)
+    os.dup2(write, 2)
+runner = unittest.TextTestRunner
+e.unittest.TextTestRunner = lambda **kwargs: runner(stream=sys.stdout, **kwargs)
+class Case(unittest.TestCase):
+    def runTest(self): time.sleep(.2)
+def close():
+    if not observer_done.wait(2):
+        raise RuntimeError('snapshot observer did not progress')
+def factory():
+    return (lambda: unittest.TestSuite([Case()]), close, lambda: None,
+            lambda result: not result.wasSuccessful(), unittest.TextTestResult)
+kwargs = dict(snapshot_delays=(.01, .01, .01))
+# Keep the same blocked-output reproduction runnable against the native watchdog.
+if 'watchdog_interval' in inspect.signature(e.lifecycle).parameters:
+    kwargs['watchdog_interval'] = .03
+else:
+    dump = faulthandler.dump_traceback_later
+    faulthandler.dump_traceback_later = lambda *args, **kwargs: dump(.03, **kwargs)
+print('main-thread=' + hex(threading.get_ident()), flush=True)
+sys.exit(e.lifecycle(factory, events, **kwargs))
+'''
+
+
 class EntryTests(unittest.TestCase):
+    def run_watchdog_child(self, mode):
+        with tempfile.TemporaryDirectory(prefix='ci-watchdog-owned-') as directory:
+            events = Path(directory) / 'events.jsonl'
+            child = subprocess.run([sys.executable, '-I', '-B', '-c', WATCHDOG_CHILD,
+                                    str(SOURCE), str(events), mode],
+                                   capture_output=True, timeout=3, check=False)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            return child, [json.loads(line) for line in events.read_text().splitlines()]
+
+    def test_blocked_watchdog_output_does_not_block_closure(self):
+        _, events = self.run_watchdog_child('blocked')
+        phases = [(row['phase'], row['state']) for row in events if row['kind'] == 'phase']
+        self.assertEqual(phases, [(phase, state) for phase in entry.PHASES for state in ('start', 'end')])
+        self.assertEqual(len([row for row in events if row['kind'] == 'stack']), 3)
+
+    def test_watchdog_output_contains_main_thread_file_and_line(self):
+        child, _ = self.run_watchdog_child('visible')
+        main_thread = child.stdout.decode().splitlines()[0].split('=')[1]
+        output = child.stderr.decode()
+        self.assertIn('Timeout (0:00:00.030000)!\n', output)
+        main_stack = output.split('Thread ' + main_thread + ' (most recent call first):\n')[1]
+        self.assertRegex(main_stack.split('\n\n')[0], r'  File "<string>", line \d+ in runTest')
+
+    def test_watchdog_empty_frames_and_short_writes(self):
+        stop = Mock()
+        stop.wait.side_effect = (False, True)
+        stop.is_set.return_value = False
+        output = []
+        def write(fd, data):
+            self.assertEqual(fd, 2)
+            output.append(data[:7])
+            return len(data[:7])
+        with patch.object(entry.sys, '_current_frames', return_value={}), \
+                patch.object(entry.os, 'write', side_effect=write):
+            entry.suite_watchdog(stop, 300)
+        self.assertEqual(b''.join(output), b'Timeout (0:05:00)!\n')
+
+    def test_watchdog_stopped_or_closed_output_returns(self):
+        stop = entry.threading.Event()
+        stop.set()
+        with patch.object(entry.os, 'write') as write:
+            entry.suite_watchdog(stop, 300)
+            write.assert_not_called()
+        for outcome in (BrokenPipeError(), 0):
+            stop = Mock()
+            stop.wait.return_value = False
+            stop.is_set.return_value = False
+            with patch.object(entry.sys, '_current_frames', return_value={}), \
+                    patch.object(entry.os, 'write', side_effect=[outcome]) as write:
+                entry.suite_watchdog(stop, .03)
+                write.assert_called_once()
+
+    def test_watchdog_bounds_threads_and_frame_depth(self):
+        stop = Mock()
+        stop.wait.side_effect = (False, True)
+        stop.is_set.return_value = False
+        frame = SimpleNamespace(f_code=SimpleNamespace(co_filename='watchdog.py', co_name='run'), f_lineno=12)
+        frame.f_back = frame
+        output = []
+        def write(fd, data):
+            output.append(data)
+            return len(data)
+        with patch.object(entry.sys, '_current_frames', return_value=dict.fromkeys(range(65), frame)), \
+                patch.object(entry.os, 'write', side_effect=write):
+            entry.suite_watchdog(stop, .03)
+        data = b''.join(output)
+        self.assertEqual(data.count(b'Thread 0x'), 64)
+        self.assertEqual(data.count(b'  File '), 64 * 64)
+        self.assertEqual(data.count(b'  ...\n'), 64)
+
     def run_child(self, mode, timeout=4, **kwargs):
         with tempfile.TemporaryDirectory(prefix='ci-entry-owned-') as directory:
             root = Path(directory)
