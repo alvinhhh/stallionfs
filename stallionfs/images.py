@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from xml.parsers.expat import ExpatError
 
 from .core import StallionError
@@ -103,6 +104,10 @@ def _attachments(image):
         raise _error('Invalid image attachment inventory')
     for entry in inventory:
         recorded = entry.get('image-path') if isinstance(entry, dict) else None
+        # RAM disks have no backing file and can never be this image; their
+        # devices still take part in the ambiguity check below.
+        if isinstance(recorded, str) and re.fullmatch(r'ram://[0-9]+', recorded):
+            continue
         if (not isinstance(recorded, str) or not recorded or '\0' in recorded
                 or not Path(recorded).is_absolute()):
             raise _error('Invalid image attachment path in inventory')
@@ -259,6 +264,18 @@ def _completed_eject_failure(error, device):
             error.stderr.strip() == b'Volume failed to eject')
 
 
+# After a volume unmounts, system clients such as diskutil's storagekitd briefly
+# open the image's raw whole disk; an ordinary detach then reports EBUSY.
+_BUSY_DETACH_DELAYS = (0.25, 0.5, 1, 2, 2, 2)
+
+
+def _busy_detach_failure(error, device):
+    return (isinstance(error, _CommandFailure) and error.returncode == 16 and
+            error.args_native == ('/usr/bin/hdiutil', 'detach', device) and
+            error.stderr.strip() ==
+            f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode())
+
+
 def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
     image, point = _image(image), _path(mountpoint)
@@ -297,18 +314,28 @@ def detach(image, mountpoint):
                 raise _error('Eject did not begin with the expected mounted image')
             expected = dict(current, mountpoint=None, volume_device=None,
                             attachment=_unmounted_snapshot(current, point))
-            # Two fresh normal inventory reads, each with independent mount-table
-            # checks, admit only the original graph with its mount-point removed.
-            for _ in range(2):
-                if mounted(image) != expected:
-                    raise _error('Image attachment did not become the same unmounted graph')
-                _no_graph_mounts(current, point)
-                if (identity != _backing_identity(image) or
-                        device_identity != _device_identity(current['device'])):
-                    raise _error('Image or selected device identity changed before continuation')
-            # This narrows name reuse races; detaching by name is not atomic with
-            # external detach/reattach, even under a managed workspace lock.
-            _command('/usr/bin/hdiutil', 'detach', current['device'])
+            for attempt, delay in enumerate((*_BUSY_DETACH_DELAYS, None), 1):
+                # Two fresh normal inventory reads, each with independent mount-table
+                # checks, admit only the original graph with its mount-point removed.
+                for _ in range(2):
+                    if mounted(image) != expected:
+                        raise _error('Image attachment did not become the same unmounted graph')
+                    _no_graph_mounts(current, point)
+                    if (identity != _backing_identity(image) or
+                            device_identity != _device_identity(current['device'])):
+                        raise _error('Image or selected device identity changed before continuation')
+                # This narrows name reuse races; detaching by name is not atomic with
+                # external detach/reattach, even under a managed workspace lock.
+                try:
+                    _command('/usr/bin/hdiutil', 'detach', current['device'])
+                    break
+                except _CommandFailure as busy:
+                    if not _busy_detach_failure(busy, current['device']):
+                        raise
+                    if delay is None:
+                        busy.add_note(f'Device stayed busy after {attempt} ordinary detach attempts')
+                        raise
+                time.sleep(delay)
             verify_absent()
         except BaseException as recovery:
             original.add_note(f'Eject continuation refused or failed; keep {image}: '
