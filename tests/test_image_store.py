@@ -171,6 +171,27 @@ class ImageRecoveryTests(unittest.TestCase):
                 command.assert_not_called()
                 self.assertTrue(image.exists())
 
+    def test_ram_disk_records_are_skipped_but_still_checked_for_ambiguity(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            image = base / 'workspace.sparseimage'
+            image.write_bytes(b'owned image'); image.chmod(0o600)
+            owned = {'image-path': str(image), 'owner-uid': os.getuid(),
+                     'system-entities': [{'dev-entry': '/dev/disk999'}]}
+            ram = {'image-path': 'ram://16384', 'owner-uid': 0,
+                   'system-entities': [{'dev-entry': '/dev/disk998'}]}
+            with patch.object(images, '_plist', return_value={'images': [ram, owned]}):
+                self.assertEqual(images._attachments(image), [owned])
+            with patch.object(images, '_plist', return_value={'images': [ram]}):
+                self.assertEqual(images._attachments(image), [])
+            clash = dict(ram, **{'system-entities': [{'dev-entry': '/dev/disk999'}]})
+            for record in (clash, dict(ram, **{'image-path': 'ram://'}), dict(ram, **{'image-path': 'ram://1/x'})):
+                with self.subTest(record=record), \
+                        patch.object(images, '_plist', return_value={'images': [record, owned]}), \
+                        self.assertRaises(StallionError):
+                    images._attachments(image)
+
     def test_attachment_inventory_requires_explicit_classifiable_records(self):
         from stallionfs import images
         invalid = ({}, {'images': None}, {'images': {}}, {'images': 'bad'},
