@@ -547,7 +547,7 @@ def inert_sources():
 
 class RecoveryAcceptance(unittest.TestCase):
     @contextmanager
-    def recovered(self, *, selected=False, recover=True, busy=0):
+    def recovered(self, *, selected=False, recover=True, busy=0, warning=False):
         import plistlib
         with inert_sources() as (images, module, lifecycle), tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -570,6 +570,7 @@ class RecoveryAcceptance(unittest.TestCase):
                             truncated=False, capture_error=None, cleanup_error=None)
             detach = ('/usr/bin/hdiutil', 'detach', device)
             held = images._CommandFailure(detach, subprocess.CompletedProcess(detach, 16, b'',
+                (images._DETACH_DEPRECATION + b'\n' if warning else b'') +
                 f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode()))
             with patch.object(images, '_command', side_effect=[failure, *[held] * busy, b'']) as command, \
                     patch.object(images.time, 'sleep'), \
@@ -617,6 +618,14 @@ class RecoveryAcceptance(unittest.TestCase):
                     [r for r in changed if r['kind'] == 'eject_command'][1][key] = value
                     with self.subTest(key=key), self.assertRaises(ValueError):
                         runner.recovery_complete(collector, changed)
+
+    def test_busy_retry_with_macos_27_deprecation_warning_qualifies(self):
+        with self.recovered(busy=1, warning=True) as (collector, module, _, _):
+            from stallionfs import images
+            self.assertEqual(runner.DETACH_DEPRECATION, images._DETACH_DEPRECATION)
+            rows = [json.loads(line) for line in (collector.directory / module.REPORT).read_bytes().splitlines()]
+            with patch.dict(os.environ, IMAGE_REPEAT_MODE=runner.INTEL_MODE):
+                runner.recovery_complete(collector, rows)
 
     def test_actual_unqualified_failure_refuses(self):
         with self.recovered(recover=False) as (collector, _, _, _):

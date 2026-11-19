@@ -152,8 +152,21 @@ class DetachContinuationTests(unittest.TestCase):
         self.assertEqual(error.__cause__.returncode, 16)
         self.assertIn(f'after {attempts} ordinary detach attempts', ' '.join(error.__cause__.__notes__))
 
+    def test_busy_detach_after_macos_27_deprecation_warning_is_retried(self):
+        warned = self.failure(images._DETACH_DEPRECATION + b'\n' + self.busy().stderr + b'\n', 16)
+        self.results = [self.first, warned, subprocess.CompletedProcess([], 0, b'', images._DETACH_DEPRECATION)]
+        self.sequence = [self.entry, self.entry, *[self.closed] * 4, None]
+        with patch.object(images.time, 'sleep') as sleep:
+            images.detach(self.image, self.point)
+        self.assertEqual(len(self.runs), 3)
+        self.assertEqual(sleep.call_count, 1)
+
     def test_other_detach_failures_are_not_retried(self):
-        for result in (self.busy('disk9'), self.busy(status=1)):
+        warning = images._DETACH_DEPRECATION + b'\n'
+        for result in (self.busy('disk9'), self.busy(status=1),
+                       self.failure(b'hdiutil: other warning\n' + self.busy().stderr, 16),
+                       self.failure(warning + self.busy('disk9').stderr, 16),
+                       self.failure(self.busy().stderr + b'\n' + images._DETACH_DEPRECATION, 16)):
             with self.subTest(stderr=result.stderr, status=result.returncode):
                 self.reads = 0; self.runs.clear()
                 self.results = [self.first, result]

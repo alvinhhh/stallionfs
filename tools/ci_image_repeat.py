@@ -79,6 +79,10 @@ def binding(env):
             'interpreter_sha256': hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()}
 
 
+# Mirrors stallionfs.images._DETACH_DEPRECATION; the harness keeps its own copy.
+DETACH_DEPRECATION = b"hdiutil: WARNING: 'hdiutil detach ...' is deprecated. Please use 'diskutil eject ...' instead."
+
+
 def recovery_complete(diagnostics, events):
     """Pair every raw command failure with a complete, admitted public recovery."""
     failures = [row for row in events if row['kind'] == 'failure']
@@ -122,12 +126,13 @@ def recovery_complete(diagnostics, events):
         require(all(current[key] == confirmed[key] for key in
                     ('selected_device', 'volume_device', 'mountpoint_state', 'entities')),
                 'Recovery validation mapping differs')
+        busy_line = f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode()
         for attempt, row in enumerate(busy, 2):
             require(row['attempt'] == attempt and row['executable'] == '/usr/bin/hdiutil'
                     and row['verb'] == 'detach' and row['device'] == device and row['returncode'] == 16
                     and row['complete'] is True
-                    and base64.b64decode(row['stderr_base64'], validate=True).strip() ==
-                        f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode(),
+                    and base64.b64decode(row['stderr_base64'], validate=True).strip().splitlines() in (
+                        [busy_line], [DETACH_DEPRECATION, busy_line]),
                     'Busy detach retry not admitted')
         require(type(outcome['commands']) is int and outcome['commands'] == 2 + len(busy)
                 and type(outcome['first_status']) is int and outcome['first_status'] == 1
