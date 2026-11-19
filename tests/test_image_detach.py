@@ -211,6 +211,19 @@ class DetachContinuationTests(unittest.TestCase):
         with patch.object(images.time, 'sleep'):
             self.diagnostic_outcome('recovered', 3, 0)
 
+    def test_busy_retry_recovery_keeps_verified_target_for_eject_log(self):
+        import image_failure_diagnostics
+        changed = []
+        finish = image_failure_diagnostics._finish_eject
+        def spy(observation, error):
+            changed.append(observation.get('target_changed'))
+            return finish(observation, error)
+        self.results = [self.first, self.busy(), self.busy(), subprocess.CompletedProcess([], 0, b'', b'')]
+        self.sequence = [self.entry, self.entry, *[self.closed] * 6, None]
+        with patch.object(images.time, 'sleep'), patch.object(image_failure_diagnostics, '_finish_eject', spy):
+            self.diagnostic_outcome('recovered', 4, 0)
+        self.assertEqual(changed, [False])
+
     def test_diagnostics_keep_persistent_busy_failure_outcome(self):
         attempts = len(images._BUSY_DETACH_DELAYS) + 1
         self.results = [self.first, *[self.busy()] * attempts]
