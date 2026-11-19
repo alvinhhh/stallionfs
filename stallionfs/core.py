@@ -821,7 +821,8 @@ class Store(Lifecycle):
                     raise StallionError("Preparation created shared Git storage or linked worktrees")
                 if any(line.lower().startswith("core.worktree=") for line in git(repo, "config", "--local", "--list").splitlines()):
                     raise StallionError("Preparation set core.worktree; cloned Git directories must be relocatable")
-                if git(repo, "rev-parse", "HEAD") != commit or git(repo, "diff", "HEAD", "--"):
+                if (git(repo, "rev-parse", "HEAD") != commit or git(repo, "diff", "HEAD", "--")
+                        or git(repo, "diff", "--cached", "HEAD", "--")):
                     raise StallionError("Preparation changed tracked files or HEAD; commit those changes in the source first")
                 if any((repo / ".git").rglob("*.lock")):
                     raise StallionError("Preparation left a Git lock; stop background processes before preparing")
