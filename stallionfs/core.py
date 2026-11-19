@@ -789,7 +789,7 @@ class Store(Lifecycle):
         remotes = git(source, "remote").splitlines()
         origin = git(source, "remote", "get-url", "origin", path_output=True) if "origin" in remotes else str(source)
         # Avoid persisting token-bearing HTTP URLs in every workspace's Git config.
-        if re.match(r"https?://[^/]*@", origin.strip()) or "?" in origin or "\n" in origin:
+        if re.match(r"https?://[^/]*@", origin.strip(), re.I) or "?" in origin or "\n" in origin:
             raise StallionError("Use an origin URL without embedded credentials or query parameters")
         spec = {"source": str(source), "commit": commit, "origin": origin, "key": key,
                 "command": list(command), "system": platform.system(),
