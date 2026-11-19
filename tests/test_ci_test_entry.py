@@ -82,6 +82,13 @@ spec = importlib.util.spec_from_file_location('entry', sys.argv[1])
 e = importlib.util.module_from_spec(spec); spec.loader.exec_module(e)
 os.environ.update(CI_INVOCATION='watchdog-test', CI_MODE='suite', CI_JOB_BINDING='watchdog-test')
 events = e.Events(sys.argv[2])
+observer_done = threading.Event()
+snapshots = events.snapshots
+def observed_snapshots(delays):
+    time.sleep(.1)
+    snapshots(delays)
+    observer_done.set()
+events.snapshots = observed_snapshots
 if sys.argv[3] == 'blocked':
     read, write = os.pipe()
     os.set_blocking(write, False)
@@ -95,8 +102,11 @@ runner = unittest.TextTestRunner
 e.unittest.TextTestRunner = lambda **kwargs: runner(stream=sys.stdout, **kwargs)
 class Case(unittest.TestCase):
     def runTest(self): time.sleep(.2)
+def close():
+    if not observer_done.wait(2):
+        raise RuntimeError('snapshot observer did not progress')
 def factory():
-    return (lambda: unittest.TestSuite([Case()]), lambda: time.sleep(.08), lambda: None,
+    return (lambda: unittest.TestSuite([Case()]), close, lambda: None,
             lambda result: not result.wasSuccessful(), unittest.TextTestResult)
 kwargs = dict(snapshot_delays=(.01, .01, .01))
 # Keep the same blocked-output reproduction runnable against the native watchdog.
