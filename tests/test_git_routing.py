@@ -457,6 +457,27 @@ class GitRoutingTests(unittest.TestCase):
                     self.assertEqual(spec['source'], str(source.resolve()))
                     self.assertEqual(spec['origin'], origin)
 
+    def test_prepare_rejects_whitespace_credentialed_origin(self):
+        source = self.root / 'checkout'
+        source.mkdir()
+        store = SimpleNamespace(root=self.root / 'storage')
+        with self.prepare_git() as core:
+            core.git(source, 'init', '-b', 'main')
+            core.git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                     '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-m', 'Fixture')
+            core.git(source, 'remote', 'add', 'origin', 'https://example.invalid/repo.git')
+            for origin in (' https://user:token@host/r.git', '\thttps://user:token@host/r.git',
+                           'https://u:t@h/r.git ', ' https://host/r.git?token=value '):
+                core.git(source, 'remote', 'set-url', 'origin', origin)
+                for deadline in ('', str(time.monotonic() + 60)):
+                    with self.subTest(origin=origin, benchmark=bool(deadline)), \
+                            patch.dict(os.environ, STALLIONFS_BENCHMARK_DEADLINE=deadline), \
+                            patch.object(sys, 'platform', 'darwin'), \
+                            patch.object(core, 'lock', side_effect=RuntimeError('seed lock reached')):
+                        with self.assertRaisesRegex(core.StallionError,
+                                'Use an origin URL without embedded credentials'):
+                            core.Store.prepare(store, source, key='test-v1')
+
     def test_git_path_output_empty_and_error(self):
         with self.prepare_git() as core:
             core.git(self.root, 'init', '-b', 'main')
