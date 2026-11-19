@@ -4,6 +4,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1001,6 +1002,17 @@ with store._lease(sys.argv[2]):
         self.assertTrue(command('cleanup', '--enable')[1]['enabled'])
         self.assertEqual(command('cleanup', '--apply')[1]['retired'], [])
         self.assertFalse(command('cleanup', '--disable')[1]['enabled'])
+
+    def test_cli_run_reports_signaled_child_as_shell_status(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from stallionfs.__main__ import main
+        output = StringIO()
+        with redirect_stdout(output):
+            status = main(['--root', str(self.store.root), '--json', 'run', self.workspace, '--',
+                           sys.executable, '-c', 'import os, signal; os.kill(os.getpid(), signal.SIGTERM)'])
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertEqual(json.loads(output.getvalue())['returncode'], -signal.SIGTERM)
 
     def test_snapshot_metadata_failure_retains_unpublished_clone(self):
         original = core.write_json
