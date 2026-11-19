@@ -401,10 +401,12 @@ def verify_tracked_tree(repo, commit):
             digest.update(chunk)
         return digest.hexdigest()
     directories, converted = set(), {}
-    for entry in git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).split("\0"):
-        if not entry:
-            continue
+    # Text-mode output folds carriage returns, so ask Git to C-quote every unusual byte instead of using -z.
+    listing = git(repo, "-c", "core.quotePath=true", "ls-tree", "-r", "--full-tree", commit, path_output=True)
+    for entry in listing.splitlines():
         details, name = entry.split("\t", 1)
+        if name.startswith('"'):
+            name = os.fsdecode(name[1:-1].encode().decode("unicode_escape").encode("latin-1"))
         mode, _, oid = details.split(" ")
         item = repo / name
         try:

@@ -1,5 +1,6 @@
 """Prepare publication checks using real Git without the macOS runtime."""
 import importlib
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -101,6 +102,16 @@ class Prepare(unittest.TestCase):
         self.assert_refused(
             "subprocess.run(['git', 'update-index', '--assume-unchanged', 'file'], check=True); "
             "Path('file').write_bytes(b'changed\\r\\n')")
+
+    def test_unusual_tracked_names_matching_head_are_published(self):
+        names = ('carriage\rreturn', 'line\nfeed', 'trailing space ', 'quote"back\\slash', 'caf\u00e9')
+        for name in names:
+            (self.source / name).write_bytes(os.fsencode(name))
+        self.core.git(self.source, 'add', '--', *names)
+        self.core.git(self.source, 'commit', '-m', 'Names')
+        seed = self.prepare()
+        repo = self.store.root / 'seeds' / seed['id'] / 'repo'
+        self.assertEqual([(repo / name).read_bytes() for name in names], [os.fsencode(name) for name in names])
 
     def test_clean_index_and_untracked_output_are_published(self):
         for command in ((), [sys.executable, '-c', "from pathlib import Path; Path('output').write_text('built')"]):
