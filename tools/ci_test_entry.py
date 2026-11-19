@@ -3,6 +3,7 @@
 The supervisor owns only its retained Popen. EOF and reaping do not establish
 closure of escaped descendants or services. No arbitrary selectors are accepted.
 """
+import datetime
 import json
 import math
 import os
@@ -105,7 +106,7 @@ class Events:
 
 def suite_watchdog(stop, interval):
     while not stop.wait(interval):
-        lines = ['Timeout (0:05:00)!']
+        lines = [f'Timeout ({datetime.timedelta(seconds=interval)})!']
         for identity, frame in list(sys._current_frames().items())[:64]:
             lines.append(f'Thread 0x{identity:x} (most recent call first):')
             depth = 0

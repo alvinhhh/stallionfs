@@ -130,7 +130,7 @@ class EntryTests(unittest.TestCase):
         child, _ = self.run_watchdog_child('visible')
         main_thread = child.stdout.decode().splitlines()[0].split('=')[1]
         output = child.stderr.decode()
-        self.assertIn('Timeout (0:05:00)!\n', output)
+        self.assertIn('Timeout (0:00:00.030000)!\n', output)
         main_stack = output.split('Thread ' + main_thread + ' (most recent call first):\n')[1]
         self.assertRegex(main_stack.split('\n\n')[0], r'  File "<string>", line \d+ in runTest')
 
