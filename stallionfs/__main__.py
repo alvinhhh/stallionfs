@@ -331,8 +331,14 @@ def main(argv=None):
             text = args.id
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            stdout = None
+            if args.json:
+                try:
+                    stdout = sys.stderr.fileno()
+                except (AttributeError, OSError, ValueError):
+                    stdout = 2
             result = store.run(args.id, command, auto_retire=args.auto_retire,
-                               stdout=sys.stderr if args.json else None)
+                               stdout=stdout)
             text = json.dumps(result) if args.json else ""
         elif args.action == "cleanup":
             if args.enable or args.disable:

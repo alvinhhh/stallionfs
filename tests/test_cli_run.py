@@ -64,6 +64,25 @@ class ManagedRunOutput(unittest.TestCase):
         self.assertEqual(json.loads(child.stdout), {'workspace': 'workspace', 'returncode': 0})
         self.assertEqual(child.stderr, '')
 
+    def test_json_in_process_caller_with_stringio_stderr(self):
+        script = CLI_SCRIPT.replace('sys.exit(main())', textwrap.dedent('''\
+            import io
+            stream = io.StringIO()
+            with contextlib.redirect_stderr(stream):
+                status = main()
+            assert stream.getvalue() == ''
+            sys.exit(status)
+        '''))
+        child = subprocess.run(
+            [sys.executable, '-c', script, '--json', 'run', 'workspace', '--',
+             sys.executable, '-c', "print('child stdout')"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout), {'workspace': 'workspace', 'returncode': 0})
+        self.assertEqual(child.stderr, 'child stdout\n')
+
     def test_json_failed_child_keeps_receipt_and_status(self):
         child = self.command("import sys; print('child stdout'); print('child stderr', file=sys.stderr); sys.exit(7)")
         self.assertEqual(child.returncode, 7, child.stderr)
