@@ -94,10 +94,11 @@ def recovery_complete(diagnostics, events):
     for failure in failures:
         rows = [row for row in events if row['operation_id'] == failure['operation_id']]
         proof = [row for row in rows if row['kind'] in ('failure', 'eject_command', 'validation', 'eject_outcome')]
+        busy = [row for row in proof if row['kind'] == 'eject_command'][1:]
         require([row['kind'] for row in proof] ==
-                ['failure', 'eject_command', 'validation', 'validation', 'eject_outcome'],
+                ['failure', 'eject_command', *['eject_command'] * len(busy), 'validation', 'validation', 'eject_outcome'],
                 'Recovery evidence incomplete')
-        _, command, current, confirmed, outcome = proof
+        _, command, *_, current, confirmed, outcome = proof
         device = failure['failed_device']
         require(isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device),
                 'Recovery device invalid')
@@ -121,7 +122,14 @@ def recovery_complete(diagnostics, events):
         require(all(current[key] == confirmed[key] for key in
                     ('selected_device', 'volume_device', 'mountpoint_state', 'entities')),
                 'Recovery validation mapping differs')
-        require(type(outcome['commands']) is int and outcome['commands'] == 2
+        for attempt, row in enumerate(busy, 2):
+            require(row['attempt'] == attempt and row['executable'] == '/usr/bin/hdiutil'
+                    and row['verb'] == 'detach' and row['device'] == device and row['returncode'] == 16
+                    and row['complete'] is True
+                    and base64.b64decode(row['stderr_base64'], validate=True).strip() ==
+                        f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode(),
+                    'Busy detach retry not admitted')
+        require(type(outcome['commands']) is int and outcome['commands'] == 2 + len(busy)
                 and type(outcome['first_status']) is int and outcome['first_status'] == 1
                 and type(outcome['continuation_status']) is int and outcome['continuation_status'] == 0
                 and outcome['outcome'] == 'recovered', 'Public recovery incomplete')
