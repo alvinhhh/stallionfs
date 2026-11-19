@@ -122,7 +122,8 @@ def _attachments(image):
         try:
             recorded_image = Path(recorded).resolve(strict=True)
         except (OSError, RuntimeError) as error:
-            raise _error('Cannot classify image attachment path in inventory') from error
+            raise _error(f'Cannot classify image attachment path in inventory: {recorded}; '
+                         'check hdiutil info and detach it if it is no longer in use') from error
         if recorded_image != image:
             continue
         if entry.get('owner-uid') != os.getuid():
@@ -150,6 +151,31 @@ def _attachments(image):
             if any(isinstance(e.get('dev-entry'), str) and e['dev-entry'] in devices for e in entities):
                 raise _error(f'Ambiguous image attachment devices: {image}')
     return matches
+
+
+def _detach_vanished(destination):
+    """Detach an attachment that a failed create left after its image file disappeared."""
+    def leftover():
+        inventory = _plist('/usr/bin/hdiutil', 'info', '-plist').get('images')
+        if not isinstance(inventory, list):
+            raise _error('Invalid image attachment inventory')
+        matches = [e for e in inventory if isinstance(e, dict) and e.get('image-path') == str(destination)]
+        if not matches:
+            return None
+        entities = matches[0].get('system-entities')
+        devices = [e.get('dev-entry') for e in entities if isinstance(e, dict)] if isinstance(entities, list) else []
+        whole = [d for d in devices if isinstance(d, str) and re.fullmatch(r'/dev/disk[0-9]+', d)]
+        if len(matches) > 1 or matches[0].get('owner-uid') != os.getuid() or not whole:
+            raise _error(f'Failed image creation left an attachment to inspect: {destination}')
+        return whole[0]
+    device = leftover()
+    if device is None:
+        return
+    if os.path.lexists(destination):
+        raise _error(f'Failed image creation left {device} attached; inspect before continuing: {destination}')
+    _command('/usr/bin/hdiutil', 'detach', device)
+    if leftover() is not None:
+        raise _error(f'Failed image creation left {device} attached: {destination}')
 
 
 def mounted(image):
@@ -423,6 +449,14 @@ def build(source_repo, destination_image, capacity_gib):
             except BaseException as cleanup:
                 interrupted = cleanup if not isinstance(cleanup, Exception) else original
                 _recovery_failure(interrupted, f"Preparation failed; keep image {destination} and mount {point}: {cleanup}")
+        elif not detach_attempted and not os.path.lexists(destination):
+            # A stuck or killed create can leave the device attached after its file is gone,
+            # and that record blocks classifying every other image.
+            try:
+                _detach_vanished(destination)
+            except BaseException as cleanup:
+                interrupted = cleanup if not isinstance(cleanup, Exception) else original
+                _recovery_failure(interrupted, f"Preparation failed and left an attachment for missing image {destination}: {cleanup}")
         raise
     finally:
         # rmdir cannot traverse data or remove a live mount; no recursive cleanup here.
