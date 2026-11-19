@@ -331,7 +331,8 @@ def main(argv=None):
             text = args.id
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
-            result = store.run(args.id, command, auto_retire=args.auto_retire)
+            result = store.run(args.id, command, auto_retire=args.auto_retire,
+                               stdout=sys.stderr if args.json else None)
             text = json.dumps(result) if args.json else ""
         elif args.action == "cleanup":
             if args.enable or args.disable:
