@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -389,6 +390,55 @@ def validate_tree(root):
                 raise StallionError(f"Special file is unsupported: {item.relative_to(root)}")
 
 
+def verify_tracked_tree(repo, commit):
+    """Compare every tracked worktree entry with the commit, ignoring Git's stat cache and index flags."""
+    algorithm = git(repo, "rev-parse", "--show-object-format")
+    def changed(name):
+        return StallionError(f"Preparation changed tracked file {name}; commit those changes in the source first")
+    def blob(size, chunks):
+        digest = hashlib.new(algorithm, b"blob %d\0" % size)
+        for chunk in chunks:
+            digest.update(chunk)
+        return digest.hexdigest()
+    directories, converted = set(), {}
+    # Text-mode output folds carriage returns, so ask Git to C-quote every unusual byte instead of using -z.
+    listing = git(repo, "-c", "core.quotePath=true", "ls-tree", "-r", "--full-tree", commit, path_output=True)
+    for entry in listing.splitlines():
+        details, name = entry.split("\t", 1)
+        if name.startswith('"'):
+            name = os.fsdecode(name[1:-1].encode().decode("unicode_escape").encode("latin-1"))
+        mode, _, oid = details.split(" ")
+        item = repo / name
+        try:
+            # A symlinked parent directory would redirect reads outside the tracked path.
+            for parent in reversed(Path(name).parents[:-1]):
+                if parent not in directories:
+                    if not stat.S_ISDIR((repo / parent).lstat().st_mode):
+                        raise changed(name)
+                    directories.add(parent)
+            info = item.lstat()
+            if mode == "120000" and stat.S_ISLNK(info.st_mode):
+                target = os.fsencode(os.readlink(item))
+                if blob(len(target), [target]) != oid:
+                    raise changed(name)
+            elif (mode in ("100644", "100755") and stat.S_ISREG(info.st_mode)
+                    and bool(info.st_mode & stat.S_IXUSR) == (mode == "100755")):
+                with open(item, "rb") as handle:
+                    if blob(info.st_size, iter(lambda: handle.read(1 << 20), b"")) != oid:
+                        converted[name] = oid
+            else:
+                raise changed(name)
+        except OSError as error:
+            raise changed(name) from error
+    # Checkout filters (line endings, LFS) legitimately rewrite content; hash those files as Git would store them.
+    names = list(converted)
+    for offset in range(0, len(names), 1000):
+        batch = names[offset:offset + 1000]
+        for name, actual in zip(batch, git(repo, "hash-object", "--", *batch).splitlines(), strict=True):
+            if actual != converted[name]:
+                raise changed(name)
+
+
 from .lifecycle import Lifecycle
 
 
@@ -768,7 +818,6 @@ class Store(Lifecycle):
                 # The intent remains an observational hold, never an exchange journal.
                 return response
     def prepare(self, source, *, ref="HEAD", key, command=(), image_size=None):
-        import hashlib
         import platform
         if sys.platform != "darwin":
             raise StallionError("stallionfs requires macOS and an APFS volume")
@@ -824,6 +873,7 @@ class Store(Lifecycle):
                 if (git(repo, "rev-parse", "HEAD") != commit or git(repo, "diff", "HEAD", "--")
                         or git(repo, "diff", "--cached", "HEAD", "--")):
                     raise StallionError("Preparation changed tracked files or HEAD; commit those changes in the source first")
+                verify_tracked_tree(repo, commit)
                 if any((repo / ".git").rglob("*.lock")):
                     raise StallionError("Preparation left a Git lock; stop background processes before preparing")
                 validate_tree(repo)
