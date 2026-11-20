@@ -4,7 +4,8 @@
 removal plan; it does not install, remove, enable or change anything. Use
 `sfs --root PATH --json doctor --installation` for one JSON report. Exit 0 means
 all reported readiness checks passed; exit 1 means attention is needed (including
-missing verification tools or a missing store root). The product version in
+missing verification tools). A missing store root is informational and does not
+prevent readiness on a fresh install. The product version in
 Info.plist is compared to the CLI version; the independent bundle build number
 is also reported. Passing does not imply release qualification or extension
 enablement. Plain `sfs doctor` still runs the existing clone/isolation test.

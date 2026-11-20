@@ -62,7 +62,7 @@ class Installation(unittest.TestCase):
         self.assertIn('sfs command remove', result['removal_plan'][1])
         self.assertIn('System Settings', result['removal_plan'][2])
         self.assertIn('Trash', result['removal_plan'][3])
-        self.assertIn('Preserve all workspace stores', result['removal_plan'][4])
+        self.assertIn('Your workspaces, snapshots and recovery data in ' + str(self.root), result['removal_plan'][4])
         after = {str(path): (path.lstat().st_mode, path.lstat().st_mtime_ns)
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
@@ -79,6 +79,7 @@ class Installation(unittest.TestCase):
                 result = installation.inspect(self.root)
                 self.assertEqual(result['signature']['state'], expected)
                 self.assertFalse(result['ready'])
+                self.assertIn('Signature: ' + expected, installation.describe(result))
 
     def test_tools_missing_timeout_and_failure_are_reports(self):
         with patch.object(installation.shutil, 'which', return_value=None):
@@ -104,6 +105,11 @@ class Installation(unittest.TestCase):
         for check in ('version_matches_cli', 'extension_present', 'store_root_exists'):
             self.assertFalse(result['checks'][check])
         self.assertFalse(absent.exists())
+        text = installation.describe(result)
+        self.assertIn('version 0.6.0 (does not match CLI)', text)
+        self.assertIn('extension missing', text)
+        self.assertIn('app version must match CLI', text.splitlines()[-1])
+        self.assertNotIn('store', text.splitlines()[-1])
 
     def test_gatekeeper_rejection_does_not_hide_valid_signature(self):
         def rejected(argv, **kwargs):
@@ -115,6 +121,36 @@ class Installation(unittest.TestCase):
         self.assertEqual(result['signature']['state'], 'Developer ID')
         self.assertEqual(result['gatekeeper']['state'], 'rejected')
         self.assertFalse(result['ready'])
+
+    def test_missing_store_is_informational(self):
+        absent = self.root / 'new-store'
+        result = installation.inspect(absent)
+        self.assertTrue(result['ready'])
+        self.assertFalse(result['store_root']['exists'])
+        self.assertFalse(result['checks']['store_root_exists'])
+        self.assertFalse(absent.exists())
+        text = installation.describe(result)
+        self.assertIn('not created yet (informational)', text)
+        self.assertNotIn('Not ready:', text)
+        self.assertIn(str(absent) + ' are kept', text)
+
+    def test_readable_text_without_json_blobs(self):
+        result = installation.inspect(self.root)
+        text = installation.describe(result)
+        self.assertIn('Command: installed at ' + str(self.bin / 'sfs') + ', on PATH', text)
+        self.assertIn('version ' + installation.__version__ + ' (matches CLI)', text)
+        self.assertIn('extension present', text)
+        self.assertIn('Signature: Developer ID (Developer ID Application: Example (TEAM))', text)
+        self.assertIn('Gatekeeper: accepted', text)
+        self.assertNotIn('{', text)
+        self.assertNotIn('Not ready:', text)
+        with patch.object(installation.shutil, 'which', return_value=None):
+            text = installation.describe(installation.inspect(self.root))
+        self.assertIn('Signature: unknown: codesign is not available', text)
+        self.assertIn('Gatekeeper: unavailable: spctl is not available', text)
+        self.assertTrue(text.splitlines()[-1].startswith('Not ready:'))
+        self.assertIn('Developer ID signature required', text.splitlines()[-1])
+        self.assertNotIn('developer_id_signature', text)
 
     def test_missing_command_directory_is_not_created(self):
         (self.bin / 'sfs').unlink()

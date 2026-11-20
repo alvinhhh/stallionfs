@@ -1,5 +1,4 @@
 """Read-only installation observations, not release qualification."""
-import json
 from pathlib import Path
 import plistlib
 import shutil
@@ -13,11 +12,11 @@ from . import __version__, _command
 APP = Path('/Applications/StallionFS.app')
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
 REMOVAL_PLAN = [
-    'Before removal: retain independently authenticated recovery archives and installation history outside the app; stop all writers and helpers normally and normally unmount owned workspaces. Busy, pending or unknown activity stops removal. Do not purge data to proceed.',
-    'First remove only your owned CLI link with sfs command remove while the admitted app is intact. Preserve foreign links/files; other users manage their own links. If the app was deleted first, restore the same exact artifact before normal link removal.',
-    'Quit the app normally and disable its File System Extension in System Settings. Recheck actual enablement and activity; this diagnostic does not establish a safe maintenance window.',
-    'Use Finder to move only /Applications/StallionFS.app to Trash after the required maintenance observations. Do not empty Trash or reset registrations globally.',
-    'Preserve all workspace stores (including custom --root paths), snapshots, sidecars, external references, recovery archives and retained installation history.',
+    'Stop processes using workspaces and unmount them normally. Stop if anything is busy, pending or uncertain; do not force unmount or delete data to proceed. Keep verified recovery archives and installation history outside the app.',
+    'Run sfs command remove while the app is still installed. If it was already deleted, reinstall the same version from your verified recovery copy first. Remove only your owned link; leave other files and other users\' links alone.',
+    'Quit the app and turn off its File System Extension in System Settings. Check that it is off and no processes are using workspaces before continuing.',
+    'Move only /Applications/StallionFS.app to the Trash using Finder. Do not empty the Trash or reset system registrations.',
+    'Your workspaces, snapshots and recovery data in {root} are kept — delete them yourself only if you no longer need them. Other stores, external files and recovery archives are also kept.',
 ]
 
 
@@ -108,20 +107,72 @@ def inspect(root):
     invoked = Path(sys.argv[0]).absolute()
     helper = (invoked.with_name('stallionfs-python') if invoked.name in ('sfs', 'stallionfs', 'stallionfs-python')
               else Path(sysconfig.get_path('scripts')) / 'stallionfs-python')
-    return {'ready': all(checks.values()), 'checks': checks, 'cli_version': __version__,
+    return {'ready': all(value for name, value in checks.items() if name != 'store_root_exists'),
+            'checks': checks, 'cli_version': __version__,
             'python_helper': str(helper), 'command': command,
             'app': app, 'signature': signature, 'gatekeeper': gatekeeper,
             'store_root': {'path': str(root), 'exists': checks['store_root_exists']},
-            'removal_plan': list(REMOVAL_PLAN), 'qualification': QUALIFICATION}
+            'removal_plan': [step.format(root=root) for step in REMOVAL_PLAN], 'qualification': QUALIFICATION}
 
 
 def describe(result):
     lines = ['Installation: ' + ('ready' if result['ready'] else 'not ready'),
              result['qualification'], 'CLI version: ' + result['cli_version'],
              'Python helper: ' + result['python_helper']]
-    for label in ('command', 'app', 'signature', 'gatekeeper', 'store_root'):
-        lines.append(label.replace('_', ' ').capitalize() + ': ' + json.dumps(result[label], sort_keys=True))
-    lines.append('Checks: ' + json.dumps(result['checks'], sort_keys=True))
+    command = result['command']
+    command_text = command['state']
+    if command.get('command'):
+        command_text += ' at ' + command['command']
+        command_text += ', on PATH' if command['on_path'] else ', not on PATH'
+    if command.get('dangling'):
+        command_text += ', broken link (target is missing)'
+    if command.get('error'):
+        command_text += ': ' + command['error']
+    lines.append('Command: ' + command_text)
+    app = result['app']
+    app_text = app['path']
+    if app['present']:
+        if app['version'] is not None:
+            app_text += ', version ' + app['version']
+            app_text += ' (matches CLI)' if app['version_matches_cli'] else ' (does not match CLI)'
+            app_text += ', build ' + app['bundle_version']
+        else:
+            app_text += ', version unavailable'
+        app_text += ', extension present' if app['extension_present'] else ', extension missing'
+    else:
+        app_text += ', missing'
+    if app.get('error'):
+        app_text += ': ' + app['error']
+    lines.append('App: ' + app_text)
+    signature = result['signature']
+    signature_text = signature['state']
+    if signature['authorities']:
+        signature_text += ' (' + '; '.join(signature['authorities']) + ')'
+    if signature['state'] == 'unknown':
+        reasons = []
+        for probe in (signature['verify'], signature['details']):
+            reason = probe.get('error')
+            if not reason and probe.get('returncode', 0) != 0:
+                reason = probe.get('stderr', '').strip() or 'codesign exited ' + str(probe['returncode'])
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        if reasons:
+            signature_text += ': ' + '; '.join(reasons)
+    lines.append('Signature: ' + signature_text)
+    gatekeeper = result['gatekeeper']
+    gatekeeper_text = gatekeeper['state']
+    if gatekeeper['probe'].get('error'):
+        gatekeeper_text += ': ' + gatekeeper['probe']['error']
+    lines.append('Gatekeeper: ' + gatekeeper_text)
+    store = result['store_root']
+    lines.append('Store root: ' + store['path'] + (', exists' if store['exists'] else ', not created yet (informational)'))
     lines.append('Removal plan (instructions only; nothing has been changed):')
     lines.extend(str(index) + '. ' + step for index, step in enumerate(result['removal_plan'], 1))
+    names = {'app_present': 'app missing', 'extension_present': 'extension missing',
+             'version_matches_cli': 'app version must match CLI',
+             'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH',
+             'developer_id_signature': 'Developer ID signature required', 'gatekeeper_accepted': 'Gatekeeper acceptance required'}
+    failed = [label for name, label in names.items() if not result['checks'][name]]
+    if failed:
+        lines.append('Not ready: ' + '; '.join(failed) + '.')
     return '\n'.join(lines)
