@@ -497,6 +497,7 @@ class EntryTests(unittest.TestCase):
         )
         folders = ['test_sigkill_workspace.WorkspaceDeath.' + name for name in folder_names]
         images = ['test_sigkill_workspace.MountedImageDeath.' + name for name in image_names]
+        root_reason = 'SIGKILL Git fixtures require a non-root test process'
         hook = 'SIGKILL pause hook unavailable: workspace rename: DYLD stripped'
         image = 'SIGKILL image fixtures unavailable: missing /usr/bin/hdiutil'
         def skipped(name, reason):
@@ -512,6 +513,17 @@ class EntryTests(unittest.TestCase):
             self.assertFalse(refused(valid))
             self.assertTrue(refused(valid, success=False))
             self.assertTrue(refused(valid, probe='pass'))
+            root_skips = [skipped(name, root_reason) for name in folders[:-1] + images]
+            for skip in root_skips:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(root_skips))
+            self.assertTrue(refused(root_skips, success=False))
+            self.assertTrue(refused(root_skips, probe='pass'))
+            native_delete = skipped(folders[-1], root_reason)
+            self.assertTrue(refused([native_delete]))
+            self.assertTrue(refused(root_skips + [native_delete]))
+            for name in folders + images:
+                self.assertTrue(refused([skipped(name, root_reason + ': other')]))
             for name in folders:
                 self.assertTrue(refused([skipped(name, image)]))
             for reason in ('', 'SIGKILL pause hook unavailable', 'SIGKILL image fixtures unavailable', 'other'):
@@ -522,7 +534,7 @@ class EntryTests(unittest.TestCase):
                          'setUpClass (test_sigkill_workspace.WorkspaceDeath)',
                          'setUpClass (test_sigkill_workspace.MountedImageDeath)',
                          'test_sigkill_workspace.WorkspaceHookCapabilities.test_probe_failure_names_boundary'):
-                for reason in (hook, image):
+                for reason in (hook, image, root_reason):
                     invalid = skipped(name, reason)
                     self.assertTrue(refused([invalid]))
                     self.assertTrue(refused(valid + [invalid]))

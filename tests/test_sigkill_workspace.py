@@ -127,8 +127,11 @@ class WorkspaceDeath(WorkspaceFixture, unittest.TestCase):
                     workspace = self.cli('mount', published.pop())
                 else:
                     stage = self.reported_stage(stages)
-                    partial = self.checks.snapshot(stage / 'repo')
-                    self.assertLessEqual(partial['entries'].keys(), before['entries'].keys())
+                    if phase == 'clone':
+                        partial = self.checks.snapshot(stage / 'repo')
+                        self.assertLessEqual(partial['entries'].keys(), before['entries'].keys())
+                    else:
+                        self.clone_equal(payload, stage / 'repo/payload')
                     workspace = self.cli('create', seed)
                 self.clone_equal(payload, Path(workspace['path']) / 'payload')
                 self.unchanged(before, seed_repo)
@@ -195,7 +198,7 @@ class WorkspaceDeath(WorkspaceFixture, unittest.TestCase):
                 self.assertFalse(trash.exists())
                 stage = self.reported_stage(stages)
                 remainder = self.survivors_equal(before, stage / 'expired')
-                self.assertEqual(self.cli('gc', '--yes', '--older-than', '0'), [])
+                self.assertEqual(self.cli('gc', '--yes', '--older-than', '0'), {'deleted': []})
                 self.unchanged(remainder, stage / 'expired')
                 self.unchanged(outside, source / 'payload')
 
@@ -238,6 +241,8 @@ class MountedImageDeath(WorkspaceFixture, unittest.TestCase):
     def setUp(self):
         if self.hook_unavailable is not None:
             self.skipTest('SIGKILL pause hook unavailable: ' + self.hook_unavailable)
+        if os.geteuid() == 0:
+            self.skipTest('SIGKILL Git fixtures require a non-root test process')
         self.base = Path(tempfile.mkdtemp(prefix='stallionfs-sigkill-images-')).resolve()
         self.root = self.base / 'store'
         self.binary = Path(sysconfig.get_path('scripts')) / 'sfs'
@@ -377,6 +382,20 @@ class MountedImageDeath(WorkspaceFixture, unittest.TestCase):
 
 
 class WorkspaceHookCapabilities(unittest.TestCase):
+    def test_root_image_fixtures_skip_before_allocating_images(self):
+        case = MountedImageDeath('test_killed_mount_and_detach_reconcile_existing_attachment')
+        case.hook_unavailable = None
+        with patch.object(os, 'geteuid', return_value=0), patch.object(tempfile, 'mkdtemp') as allocate:
+            with self.assertRaisesRegex(unittest.SkipTest, '^SIGKILL Git fixtures require a non-root test process$'):
+                case.setUp()
+        allocate.assert_not_called()
+
+    def test_root_folder_git_fixtures_skip_before_creating_repository(self):
+        case = WorkspaceDeath('test_killed_create_publishes_only_complete_workspace')
+        with patch.object(os, 'geteuid', return_value=0):
+            with self.assertRaisesRegex(unittest.SkipTest, '^SIGKILL Git fixtures require a non-root test process$'):
+                case.repository()
+
     def test_probe_requires_rename_unlink_and_image_hooks(self):
         with tempfile.TemporaryDirectory() as temporary, patch(__name__ + '.pause_at_hook') as pause:
             self.assertIsNone(probe_workspace_hooks(Path(temporary) / 'pause.dylib', Path('/unused/sfs'), image_hooks=True))
