@@ -12,6 +12,7 @@ SINGLE_FILE_SAVING_S = 0.00001
 BULK_IMPROVEMENT = 0.10
 MINIMUM_PAIRS = 10
 MINIMUM_RUNS = 3
+CANDIDATE_METHODS = {'stallionfs', 'candidate', 'bulk', 'bulk_serial', 'stallionfs_folder'}
 CATALOG_ONLY = {'cli/scan/empty', 'cli/scan/nested_1000',
                 'cli/volumes/volumes', 'cli/move/tiny_4kib'}
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
@@ -124,6 +125,15 @@ def valid_metric(metric):
                 for side in ('native', 'candidate')))
 
 
+def reference_losses(row):
+    correctness = row.get('correctness', {})
+    if (row.get('method') not in CANDIDATE_METHODS and
+            (correctness.get('candidate_losses') or correctness.get('sparse_preserved') is False)):
+        return {'method': row.get('method'), 'phase': row.get('phase'),
+                'pair_id': row.get('pair_id'), 'correctness': correctness}
+    return None
+
+
 def row_errors(phases):
     errors = []
     if not phases.get('timing'):
@@ -132,12 +142,16 @@ def row_errors(phases):
         methods = {}
         for row in rows:
             correctness = row.get('correctness', {})
-            if (row.get('ok') is not True or row.get('validated') is not True or
+            if (row.get('ok') is not True or row.get('exit_code', 0) != 0 or
                     row.get('completion_uncertain') or row.get('source_unchanged') is False or
                     row.get('source_verification', {}).get('unchanged') is False or
                     row.get('source_precheck', {}).get('unchanged') is False or
                     row.get('counts_validated') is False or
-                    correctness.get('passed') is False or correctness.get('strict_equal') is False):
+                    not reference_losses(row) and
+                    (row.get('validated') is not True or correctness.get('passed') is False or
+                     correctness.get('strict_equal') is False or
+                     any(correctness.get(key) is False for key in
+                         ('sparse_preserved', 'independent_clone', 'move_identity', 'move_source_absent')))):
                 errors.append('row correctness/validation failed')
             if row.get('warmup'):
                 continue
@@ -164,6 +178,10 @@ def evaluate_group(group):
                                            for count in counts.values()) or len(counts) != 2):
             errors.append(name + ': incomplete or inconsistent paired evidence')
     wall = metrics.get('wall_s')
+    if not valid_metric(wall):
+        errors.append('not comparable: no valid elapsed paired comparison')
+    if not any(valid_metric(metrics.get(metric)) for metric in ('cpu_s', 'rss_bytes')):
+        errors.append('not comparable: no valid CPU or peak RSS paired comparison')
     faster = valid_metric(wall) and wall.get('decision') in ('candidate_faster', 'faster')
     if not faster:
         errors.append('elapsed not lower beyond noise with >=10 valid pairs')
@@ -182,7 +200,10 @@ def evaluate_group(group):
                 wall['candidate']['median'] <= wall['native']['median'] * (1 - BULK_IMPROVEMENT)):
             floor_errors.append('bulk median elapsed improvement below 10% or unverified')
     errors.extend(floor_errors)
+    warnings = [reference_losses(row) for rows in group['rows'].values() for row in rows
+                if reference_losses(row)]
     return {**group, 'passed': not errors, 'floor_passed': not floor_errors,
+            'reference_losses': warnings,
             'reasons': sorted(set(errors))}
 
 
@@ -308,6 +329,12 @@ def main(argv=None):
                 detail = '; '.join(value['reasons']) or 'pass'
                 measured = '; '.join(group['reference'] + ': ' + medians(group)
                                      for group in value['references'])
+                losses = sorted({warning['method'] + ': ' + ','.join(sorted(
+                    {loss['field'] for loss in warning['correctness'].get('candidate_losses', [])} |
+                    ({'sparse_preserved'} if warning['correctness'].get('sparse_preserved') is False else set())))
+                    for group in value['references'] for warning in group['reference_losses']})
+                if losses:
+                    detail += '; reference losses (not candidate failures): ' + '; '.join(losses)
                 details.append(f'R{i + 1}: {detail}' + ('; ' + measured if measured else ''))
             print(case + ' | ' + ' | '.join('PASS' if value['passed'] else 'FAIL' for value in values)
                   + ' | ' + ' / '.join(details))

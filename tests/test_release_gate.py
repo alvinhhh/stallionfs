@@ -81,6 +81,58 @@ class ReleaseGate(unittest.TestCase):
                 document['rows'][0].update(change)
                 self.assertFalse(evaluate(document)['passed'])
 
+    def test_reference_losses_are_shown_without_failing_valid_comparisons(self):
+        document = report()
+        document['passed'] = False
+        reference = document['rows'][0]
+        reference.update(validated=False, correctness={'strict_equal': False,
+                         'candidate_losses': [{'path': '', 'field': 'acl'}],
+                         'sparse_preserved': False})
+        result = evaluate(document)
+        self.assertTrue(result['passed'])
+        warnings = result['cases'][0]['references'][0]['reference_losses']
+        self.assertEqual(warnings[0]['method'], 'native')
+        self.assertEqual(warnings[0]['correctness'], reference['correctness'])
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'native.json').write_text(json.dumps(document))
+            with redirect_stdout(io.StringIO()) as output:
+                gate.main([str(root)])
+            self.assertIn('reference losses (not candidate failures): native: acl,sparse_preserved',
+                          output.getvalue())
+        candidate = next(row for row in document['rows'] if row['method'] == 'candidate')
+        candidate.update(validated=False, correctness=copy.deepcopy(reference['correctness']))
+        self.assertFalse(evaluate(document)['passed'])
+
+    def test_candidate_correctness_flags_are_never_waived(self):
+        for key in ('sparse_preserved', 'independent_clone', 'move_identity', 'move_source_absent'):
+            with self.subTest(key=key):
+                document = report()
+                candidate = next(row for row in document['rows'] if row['method'] == 'candidate')
+                candidate['correctness'][key] = False
+                self.assertFalse(evaluate(document)['passed'])
+
+    def test_reference_losses_do_not_invent_comparisons(self):
+        document = report()
+        document['rows'][0].update(validated=False, correctness={'strict_equal': False,
+                                 'candidate_losses': [{'field': 'acl'}]})
+        for comparison in document['comparisons']:
+            for value in comparison['metrics'].values():
+                value.update(complete_pairs=0, excluded_pairs=[{'pair_id': 0}],
+                             decision='insufficient_samples', native=None, candidate=None)
+        result = evaluate(document)
+        self.assertFalse(result['passed'])
+        self.assertIn('not comparable: no valid elapsed paired comparison', result['cases'][0]['reasons'])
+
+    def test_reference_execution_and_source_failures_still_fail(self):
+        for change in ({'ok': False}, {'exit_code': 1}, {'completion_uncertain': True},
+                       {'source_unchanged': False}):
+            with self.subTest(change=change):
+                document = report()
+                document['rows'][0].update(validated=False, correctness={'strict_equal': False,
+                                         'candidate_losses': [{'field': 'acl'}]}, **change)
+                self.assertFalse(evaluate(document)['passed'])
+
     def test_single_file_floor_uses_paired_median_not_difference_of_medians(self):
         for saving, passed in ((0.000009, False), (gate.SINGLE_FILE_SAVING_S, True)):
             with self.subTest(saving=saving):

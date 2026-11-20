@@ -128,9 +128,13 @@ are reported as `not collected`, never dropped. Directories combine reports and
 follow summary/campaign links; overlapping files cannot establish independent runs.
 Native and CLI comparisons retain each recorded reference, cache and output form;
 both API bulk variants must beat POSIX. The gate consumes existing paired decisions,
-requires at least ten validated pairs, and rejects incomplete, unavailable or
-incorrect evidence. Against every recorded reference, elapsed must win beyond
-noise and either CPU or peak process RSS must also win. At least 90% of cases must
+requires at least ten complete pairs and correctness for every candidate operation.
+Reference preservation losses are shown, not attributed to the candidate; command
+failures, source changes and uncertainty still fail. Existing invalid or absent
+comparisons remain `not comparable`: the gate does not regenerate paired decisions
+or recover samples the collector excluded. Against every recorded reference,
+elapsed must win beyond noise and either CPU or peak process RSS must also win.
+At least 90% of cases must
 pass, every tiny-file case must save at least 0.01 ms in median paired elapsed time,
 and every bulk/scan case must improve the elapsed median by at least 10%.
 Qualification requires at least three passing runs with identical per-case verdicts.
