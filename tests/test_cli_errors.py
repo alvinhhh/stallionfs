@@ -17,7 +17,7 @@ class ArgumentErrors(unittest.TestCase):
                 cli.main(argv)
         return raised.exception.code, output.getvalue(), errors.getvalue()
 
-    def test_json_errors_are_single_stdout_objects(self):
+    def test_json_errors_are_single_stderr_objects(self):
         cases = ([], ['unknown'], ['copy'], ['copy', '--bad'],
                  ['copy', 'a', 'b', '--jobs', '9'],
                  ['--bad', 'copy'], ['--root'],
@@ -28,11 +28,11 @@ class ArgumentErrors(unittest.TestCase):
                     with self.subTest(prog=prog, args=args, prefix=prefix):
                         code, output, errors = self.invoke(prefix + args, prog)
                         self.assertEqual(code, 2)
-                        self.assertEqual(errors, '')
-                        value = json.loads(output)
+                        self.assertEqual(output, '')
+                        value = json.loads(errors)
                         self.assertEqual(set(value), {'error'})
                         self.assertTrue(value['error'])
-                        self.assertEqual(len(output.splitlines()), 1)
+                        self.assertEqual(len(errors.splitlines()), 1)
 
     def test_plain_errors_and_help_use_invoked_alias(self):
         for prog in ('sfs', 'stallionfs'):

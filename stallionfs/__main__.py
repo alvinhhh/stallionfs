@@ -82,7 +82,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
     def error(self, message):
         if self.json_errors:
-            print(json.dumps({'error': message}))
+            print(json.dumps({'error': message}), file=sys.stderr)
             self.exit(2)
         super().error(message)
 

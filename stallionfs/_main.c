@@ -18,9 +18,7 @@ static void interrupt(int value) { interrupted = value; }
 static int cancelled(void *unused) { (void)unused; return interrupted != 0; }
 
 static int python(int argc, char **argv) {
-    const char *prog = strrchr(argv[0], '/');
-    prog = prog ? prog + 1 : argv[0];
-    if (setenv("STALLIONFS_CLI_PROG", !strcmp(prog, "sfs") ? "sfs" : "stallionfs", 1)) return -1;
+    if (setenv("STALLIONFS_CLI_PROG", program, 1)) return -1;
     uint32_t size = 0;
     _NSGetExecutablePath(NULL, &size);
     char *raw = malloc(size);
@@ -96,6 +94,7 @@ static int report_error(int json, const char *path, int error) {
 int main(int argc, char **argv) {
     program = strrchr(argv[0], '/');
     program = program ? program + 1 : argv[0];
+    program = !strcmp(program, "sfs") ? "sfs" : "stallionfs";
     int json = 0, command = 1;
     while (command < argc) {
         if (!strcmp(argv[command], "--json")) { json = 1; command++; }
@@ -199,17 +198,13 @@ output:
     if (fflush(stdout) == EOF || ferror(stdout)) { errno = EIO; goto failed; }
     return 0;
 usage:
-    {
-        const char *prog = strrchr(argv[0], '/');
-        prog = prog ? prog + 1 : argv[0];
-        if (json) {
-            fputs("{\"error\":\"invalid arguments; use ", stdout);
-            json_text(stdout, prog);
-            fputc(' ', stdout);
-            json_text(stdout, name);
-            fputs(" --help\"}\n", stdout);
-        } else fprintf(stderr, "%s: invalid arguments; use %s %s --help\n", prog, prog, name);
-    }
+    if (json) {
+        fputs("{\"error\":\"invalid arguments; use ", stderr);
+        json_text(stderr, program);
+        fputc(' ', stderr);
+        json_text(stderr, name);
+        fputs(" --help\"}\n", stderr);
+    } else fprintf(stderr, "%s: invalid arguments; use %s %s --help\n", program, program, name);
     return 2;
 failed:
     return report_error(json, NULL, errno);
