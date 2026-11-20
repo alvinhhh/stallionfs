@@ -179,7 +179,7 @@ def scan(opening, resource, workspace):
         row = {'path': relative, 'kind': 'directory' if directory else 'file', 'identity': ident}
         data = None
         if proof:
-            data, same = read_file(fd, name, ident)
+            data, _ = read_file(fd, name, ident)
             row['sha256'] = hashlib.sha256(data).hexdigest()
         result.append(row)
         if len(result) > MAX_ENTRIES: refuse('manifest exceeds 16384 entries')
