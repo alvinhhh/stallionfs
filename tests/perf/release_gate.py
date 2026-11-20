@@ -277,7 +277,10 @@ def load_run(path):
             document = json.loads(file.read_text(), parse_constant=lambda value: None)
             if not isinstance(document, dict):
                 raise ValueError('expected a JSON object')
-            for row in [document] + list(document.get('stages', [])):
+            stages = document.get('stages', [])
+            if not isinstance(stages, list) or not all(isinstance(row, dict) for row in stages):
+                raise ValueError('malformed campaign stages')
+            for row in [document] + stages:
                 if (row.get('error') or row.get('completion_uncertain') or
                         row.get('status') == 'stopped' or row.get('fingerprints_unchanged') is False):
                     errors.append(f'{file}: collection wrapper stopped or invalidated'

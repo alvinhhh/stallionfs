@@ -341,6 +341,13 @@ class ReleaseGate(unittest.TestCase):
                 self.assertTrue(result['input_errors'])
                 self.assertFalse(result['passed'])
 
+    def test_malformed_campaign_stages_are_input_errors(self):
+        with tempfile.TemporaryDirectory() as name:
+            file = Path(name) / 'campaign.json'
+            for stages in ([None], 'x', [1]):
+                file.write_text(json.dumps({'stages': stages}))
+                self.assertIn('malformed campaign stages', ' '.join(gate.load_run(file)['input_errors']))
+
     def test_summary_directory_still_reads_sibling_reports(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
