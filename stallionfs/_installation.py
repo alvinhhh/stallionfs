@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 import plistlib
-import pwd
 import shutil
 import stat
 import subprocess
@@ -46,24 +45,10 @@ def _probe(tool, arguments):
         return {'state': 'error', 'error': str(error)}
 
 
-TILDE_PATH_SHELLS = frozenset({'bash', 'sh'})
-
-
-def _login_shell():
-    try:
-        return Path(pwd.getpwuid(os.getuid()).pw_shell).name
-    except (KeyError, OSError):
-        return Path(os.environ.get('SHELL', '')).name
-
-
-def _path_command(name):
-    """First executable `name` on PATH, searched as the login shell does.
-
-    bash and sh expand a leading ~ in PATH entries; zsh and others use it literally.
-    """
-    expand = _login_shell() in TILDE_PATH_SHELLS
+def _path_command(name, expand_tilde):
+    """First executable `name` on PATH, with a leading ~ in entries expanded or taken literally."""
     for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
-        if expand and directory.startswith('~'):
+        if expand_tilde and directory.startswith('~'):
             directory = os.path.expanduser(directory)
         candidate = Path(directory or '.') / name
         try:
@@ -72,6 +57,15 @@ def _path_command(name):
         except OSError:
             continue
     return None
+
+
+def _same_file(left, right):
+    if left is None or right is None or left == right:
+        return left == right
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
 
 
 def _same_directory(left, right):
@@ -91,9 +85,13 @@ def _command_status():
         result = _command._result(home, entry, target)
         result['dangling'] = _command._ours(entry, target) and not target.exists()
         result['executable'] = target.is_file() and os.access(target, os.X_OK)
-        resolved = _path_command('sfs')
+        # bash expands a leading ~ in PATH entries and zsh does not; the shell that will
+        # run `sfs` is unknown, so a PATH whose answer depends on it is ambiguous.
+        resolved = _path_command('sfs', expand_tilde=True)
+        literal = _path_command('sfs', expand_tilde=False)
+        result['path_ambiguous'] = not _same_file(resolved, literal)
         result['path_command'] = None if resolved is None else str(resolved)
-        result['on_path'] = (resolved is not None
+        result['on_path'] = (resolved is not None and not result['path_ambiguous']
                              and _same_directory(resolved.parent, home / '.local/bin')
                              and _command._ours(entry, target) and result['executable'])
         return result
@@ -192,6 +190,8 @@ def describe(result):
         command_text += ', broken link (target is missing)'
     elif command.get('state') == 'installed' and not command.get('executable'):
         command_text += ', target is not executable'
+    if command.get('path_ambiguous'):
+        command_text += ', PATH has a ~ entry that bash and zsh resolve differently'
     if command.get('path_command') and not command['on_path']:
         command_text += ', PATH selects ' + command['path_command']
     if command.get('error'):

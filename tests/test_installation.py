@@ -102,32 +102,26 @@ class Installation(unittest.TestCase):
                 self.assertTrue(result['checks']['command_on_path'])
                 self.assertTrue(result['ready'])
 
-    def test_tilde_path_entries_follow_login_shell(self):
+    def test_tilde_path_entries_that_depend_on_the_shell_are_ambiguous(self):
         other_bin = self.home / 'other'
         other_bin.mkdir()
         other = other_bin / 'sfs'
         other.write_bytes(b'foreign executable')
         other.chmod(0o755)
-        shadowed = '~/other' + os.pathsep + str(self.bin)
-        for shell, shadow_ready, tilde_ready in (('bash', False, True), ('sh', False, True),
-                                                  ('zsh', True, False), ('fish', True, False)):
-            with self.subTest(shell=shell), \
-                    patch.object(installation, '_login_shell', return_value=shell):
-                with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': shadowed}):
-                    result = installation.inspect(self.root)
-                self.assertEqual(result['checks']['command_on_path'], shadow_ready)
-                if not shadow_ready:
-                    self.assertEqual(result['command']['path_command'], str(other))
-                with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/.local/bin'}):
-                    self.assertEqual(installation.inspect(self.root)['checks']['command_on_path'], tilde_ready)
+        for path in ('~/other' + os.pathsep + str(self.bin), '~/.local/bin'):
+            with self.subTest(path=path), \
+                    patch.dict(os.environ, {'HOME': str(self.home), 'PATH': path}):
+                result = installation.inspect(self.root)
+                self.assertTrue(result['command']['path_ambiguous'])
+                self.assertFalse(result['checks']['command_on_path'])
+                self.assertFalse(result['ready'])
+                self.assertIn('bash and zsh resolve differently', installation.describe(result))
 
-    def test_login_shell_comes_from_passwd(self):
-        entry = SimpleNamespace(pw_shell='/bin/zsh')
-        with patch.object(installation.pwd, 'getpwuid', return_value=entry):
-            self.assertEqual(installation._login_shell(), 'zsh')
-        with patch.object(installation.pwd, 'getpwuid', side_effect=KeyError), \
-                patch.dict(os.environ, {'SHELL': '/bin/bash'}):
-            self.assertEqual(installation._login_shell(), 'bash')
+    def test_tilde_path_entries_that_do_not_change_the_result_are_fine(self):
+        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': str(self.bin) + os.pathsep + '~/other'}):
+            result = installation.inspect(self.root)
+        self.assertFalse(result['command']['path_ambiguous'])
+        self.assertTrue(result['checks']['command_on_path'])
 
     def test_case_variant_of_managed_bin_counts_when_filesystem_is_case_insensitive(self):
         upper = self.home / '.LOCAL/BIN'
