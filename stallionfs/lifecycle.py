@@ -201,14 +201,15 @@ class Lifecycle:
             if not isinstance(name, str) or len(name) > 128:
                 raise core.StallionError('Snapshot name must be at most 128 characters')
             self._open(workspace, path, meta)
-            payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
-            value = uuid.uuid4().hex
-            with self._retention(), self.staging() as stage:
-                self._clone_payload(payload, stage / payload.name, meta)
-                record = {'id': value, 'workspace': workspace, 'name': name, 'created': time.time(),
-                          'backend': meta.get('backend', 'folder'), 'payload': identity(stage / payload.name)}
-                core.write_json(stage / 'meta.json', record)
-                stage.rename(self.root / 'snapshots' / value)
+            with self._retention():
+                payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+                value = uuid.uuid4().hex
+                with self.staging() as stage:
+                    self._clone_payload(payload, stage / payload.name, meta)
+                    record = {'id': value, 'workspace': workspace, 'name': name, 'created': time.time(),
+                              'backend': meta.get('backend', 'folder'), 'payload': identity(stage / payload.name)}
+                    core.write_json(stage / 'meta.json', record)
+                    stage.rename(self.root / 'snapshots' / value)
             if remount:
                 self._mount(path, meta)
             return record
