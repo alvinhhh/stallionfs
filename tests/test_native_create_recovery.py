@@ -162,16 +162,53 @@ class CreateRecovery(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertEqual(self.guard_calls, [])
 
+    def legacy_input(self, *, shallow=False):
+        from stallionfs import _native_create_git as git
+        source = self.base / 'source'
+        source.mkdir()
+        def command(*args):
+            subprocess.run(['git', '-C', str(source), *args], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command('init', '-b', 'main')
+        for message in ('First', 'Second'):
+            command('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    'commit', '--allow-empty', '-m', message)
+        repo = self.stage / 'input/repo'
+        repo.parent.mkdir(mode=0o700)
+        command('clone', *(['--depth=1'] if shallow else []), '--no-local', '--', str(source), str(repo))
+        admitted = git.bindings(repo)
+        for actor in self.proof['writer']['actors']:
+            actor['input'] = copy.deepcopy(admitted)
+        return admitted
+
     def test_pre_upgrade_writer_without_shallow_identity_recovers(self):
+        self.legacy_input()
         for actor in self.proof['writer']['actors']:
             actor['input'].pop('shallow')
         self.save(self.owned / 'native-create.json', self.proof)
         self.assert_installed(self.continuation())
 
     def test_mixed_legacy_and_current_actor_inputs_agree(self):
+        self.legacy_input()
         self.proof['writer']['actors'][0]['input'].pop('shallow')
         self.save(self.owned / 'native-create.json', self.proof)
         self.assert_installed(self.continuation())
+
+    def test_legacy_shallow_candidate_is_refused_without_publication(self):
+        admitted = self.legacy_input(shallow=True)
+        self.assertIsNotNone(admitted['shallow'])
+        for actor in self.proof['writer']['actors']:
+            actor['input'].pop('shallow')
+        self.save(self.owned / 'native-create.json', self.proof)
+        before = self.snapshot()
+        result = self.continuation()
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(result['code'], 'legacy-shallow-unbound')
+        self.assertTrue(self.journal.exists())
+        self.assertTrue(self.stage.exists())
+        self.assertFalse(self.final.exists())
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.guard_calls, [])
 
     def test_missing_locks_or_containers_never_repaired(self):
         for path in (self.root / '.lock', self.root / 'locks' / ('use-' + self.workspace)):
