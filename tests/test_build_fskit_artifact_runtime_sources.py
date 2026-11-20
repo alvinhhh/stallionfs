@@ -80,9 +80,11 @@ class InertBuild(artifact.Build):
     def __init__(self, source, root, wheel):
         super().__init__(source, root)
         self.wheel = wheel
+        self.calls = []
 
     def run(self, argv, timeout=30, cwd=None, env=None):
         args = [str(value) for value in argv]
+        self.calls.append(args)
         if args == ['git', 'rev-parse', 'HEAD']: return REVISION
         if args == ['git', 'rev-parse', 'HEAD^{tree}']: return 'e' * 40
         if args == ['git', 'status', '--porcelain', '--untracked-files=all']: return ''
@@ -103,7 +105,13 @@ class InertBuild(artifact.Build):
                 path.write_bytes(('inert component: ' + name).encode())
             Path(args[args.index('--manifest-out') + 1]).write_text('{"fixture": true}')
             return ''
-        if args[1:4] == ['-m', 'pip', 'wheel']:
+        if args[1:5] == ['-I', '-B', '-m', 'venv']:
+            return ''
+        if args[1:7] == ['-I', '-B', '-m', 'pip', '--isolated', 'install']:
+            return ''
+        if args[1:4] == ['-I', '-B', '-c']:
+            return '84.2.1'
+        if args[1:7] == ['-I', '-B', '-m', 'pip', '--isolated', 'wheel']:
             Path(args[args.index('--wheel-dir') + 1], WHEEL_NAME).write_bytes(self.wheel)
             return ''
         if args[0] in ('/inert/clang', '/inert/swiftc'):
@@ -126,10 +134,30 @@ class RuntimeWheelSources(unittest.TestCase):
             inspect = stack.enter_context(patch.object(artifact.package, '_inspect_runtime_wheel',
                 return_value=[{'target': {'minimum_os': '15.0'}}] * 4))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            InertBuild(SOURCE, root, wheel).build()
+            build = InertBuild(SOURCE, root, wheel)
+            build.build()
             external.assert_not_called()
             admitted = inspect.call_args.args[0]
             self.assertFalse(any(name.startswith('stallionfs/_git/') for name in admitted))
+            return build.calls
+
+    def test_wheel_uses_only_the_hash_installed_backend_in_its_own_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel, _ = source_wheel()
+            calls = self.build(root, wheel)
+            venv = root / 'build/wheel-venv'
+            self.assertIn([sys.executable, '-I', '-B', '-m', 'venv', str(venv)], calls)
+            install, version, build = (call for call in calls if call[0] == str(venv / 'bin/python'))
+            self.assertIn('--require-hashes', install)
+            self.assertIn('--only-binary=:all:', install)
+            self.assertEqual(install[install.index('-r') + 1], str(SOURCE / 'tools/ci-build-requirements.txt'))
+            self.assertEqual(version[3], '-c')
+            self.assertIn('--no-build-isolation', build)
+            for call in (install, build):
+                self.assertIn('--no-deps', call)
+            manifest = json.loads((root / 'payload/provenance.json').read_bytes())
+            self.assertEqual(manifest['wheel']['setuptools_version'], '84.2.1')
 
     def test_real_wheel_boundary_retains_asset_provenance_and_intact_wheel(self):
         for with_git in (True, False):
