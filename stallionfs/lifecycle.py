@@ -680,12 +680,15 @@ class Lifecycle:
                         raise core.StallionError('Retained image is still attached')
                 if yes:
                     with self.staging() as stage:
+                        expired = stage / 'expired'
+                        path.rename(expired)
                         if kind == 'trash':
+                            core.sync_directory(path.parent)
+                            core.sync_directory(stage)
                             protection = self.root / 'protected' / f'{value}.json'
                             if os.path.lexists(protection):
                                 protection.unlink()
-                        expired = stage / 'expired'
-                        path.rename(expired)
+                                core.sync_directory(protection.parent)
                         core.remove_tree(expired)
                         stage.rmdir()
                 return {'deleted' if yes else 'would_delete': str(path)}

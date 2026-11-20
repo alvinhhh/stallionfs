@@ -995,6 +995,41 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertTrue(any(str(stage) in note for note in raised.exception.__notes__))
 
+    def test_failed_protected_purge_rename_preserves_protection(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        original = protection.read_bytes()
+        rename = Path.rename
+        for error in (OSError(errno.EIO, 'purge rename failed'), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                def interrupted(path, target):
+                    if path == trash:
+                        raise error
+                    return rename(path, target)
+                with patch.object(Path, 'rename', interrupted):
+                    with self.assertRaises(type(error)):
+                        self.store.purge('trash', self.workspace, yes=True)
+                self.assertEqual(protection.read_bytes(), original)
+                self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+                self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+                self.assertTrue(trash.exists())
+
+    def test_protected_purge_sync_failure_keeps_protection(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        original = protection.read_bytes()
+        with patch.object(core, 'sync_directory', side_effect=OSError(errno.EIO, 'purge sync failed')):
+            with self.assertRaisesRegex(OSError, 'purge sync failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertEqual(protection.read_bytes(), original)
+        self.assertFalse((self.store.root / 'trash' / self.workspace).exists())
+        stage = next((self.store.root / 'staging').iterdir())
+        self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
+        self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)
