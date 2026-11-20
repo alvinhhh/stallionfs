@@ -1,5 +1,7 @@
 """Owned synthetic processes only; no product or host storage operations."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -384,7 +386,7 @@ class EntryTests(unittest.TestCase):
             return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
         skips = [(SimpleNamespace(id=lambda name=name: 'test_ownership.Ownership.' + name), reason)
                  for name in names]
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
             self.assertFalse(refused([]))
             self.assertFalse(refused(skips))
             self.assertTrue(refused(skips, success=False))
@@ -408,7 +410,7 @@ class EntryTests(unittest.TestCase):
             result = SimpleNamespace(skipped=entries, contextual_successes=0, activation_successes=0,
                                      wasSuccessful=lambda: success, testsRun=4)
             return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
             self.assertFalse(refused([]))
             for skip in skips:
                 self.assertFalse(refused([skip]))
@@ -434,7 +436,7 @@ class EntryTests(unittest.TestCase):
                                      contextual_successes=0, activation_successes=0,
                                      wasSuccessful=lambda: success, testsRun=1)
             return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
             for name in names:
                 self.assertFalse(refused(name))
                 self.assertTrue(refused(name, success=False))
@@ -444,6 +446,41 @@ class EntryTests(unittest.TestCase):
                          'test_sigkill.ProcessDeath.test_killed_copy_clone_preserve_source_and_allow_partial_destination',
                          'setUpClass (test_sigkill.ProcessDeath)', 'unrelated.test'):
                 self.assertTrue(refused(name))
+
+    def test_qualification_refuses_ownership_hook_and_root_git_skips(self):
+        cases = (
+            ('test_ownership.Ownership.test_privileged_copy_clone_move_preserve_foreign_ownership',
+             'Ownership fixtures require root or passwordless sudo: denied'),
+            ('test_sigkill.ProcessDeath.test_killed_move_has_exactly_one_complete_inode_tree',
+             'SIGKILL pause hook unavailable: denied'),
+            ('test_sigkill.ProcessDeath.test_killed_preparation_is_unpublished_reported_and_not_cached',
+             'SIGKILL Git fixtures require a non-root test process'),
+        )
+        for identity, reason in cases:
+            for images in ('0', '1'):
+                for qualification in ('0', '1'):
+                    with self.subTest(identity=identity, images=images, qualification=qualification), \
+                            patch.dict(os.environ, STALLIONFS_TEST_IMAGES=images,
+                                       STALLIONFS_QUALIFICATION=qualification):
+                        result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: identity), reason)],
+                                                 contextual_successes=0, activation_successes=0,
+                                                 wasSuccessful=lambda: True, testsRun=1)
+                        output = io.StringIO()
+                        with contextlib.redirect_stderr(output):
+                            self.assertEqual(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST),
+                                             qualification == '1')
+                        if qualification == '1':
+                            self.assertIn(f'Qualification requires {identity}: skipped: {reason}', output.getvalue())
+                        result.skipped = []
+                        self.assertFalse(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
+
+    def test_qualification_rejects_unrelated_skips_without_image_flag(self):
+        result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: 'unrelated.test'), 'missing')],
+                                 contextual_successes=0, activation_successes=0,
+                                 wasSuccessful=lambda: True, testsRun=1)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='0', STALLIONFS_QUALIFICATION='1'), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
 
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace

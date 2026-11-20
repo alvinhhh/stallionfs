@@ -690,9 +690,16 @@ def account_result(result, probe, require_contextual, contextual_test):
         and reason == 'SIGKILL Git fixtures require a non-root test process'
     ]
     allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips + sigkill_root_skips
+    qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'
+    qualification_skips = [
+        (test, reason) for test, reason in result.skipped
+        if qualification and test.id() in ownership_tests | sigkill_tests | sigkill_root_tests
+    ]
+    for test, reason in qualification_skips:
+        print(f'Qualification requires {test.id()}: skipped: {reason}', file=sys.stderr)
     for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
-    required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
+    required_skips = (qualification or os.environ.get('STALLIONFS_TEST_IMAGES') == '1') and [
         entry for entry in result.skipped if entry not in allowed_skips
     ]
     if required_skips:
@@ -703,7 +710,7 @@ def account_result(result, probe, require_contextual, contextual_test):
     missing_activation = require_contextual and not activation_covered
     if missing_activation:
         print(f'Required {ACTIVATION_TEST} successes: expected 1, observed {activation_successes}', file=sys.stderr)
-    return not result.wasSuccessful() or bool(required_skips) or missing_contextual or missing_activation
+    return not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) or missing_contextual or missing_activation
 
 
 def installed(probe=None):
