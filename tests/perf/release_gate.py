@@ -281,7 +281,8 @@ def load_run(path):
             if not isinstance(stages, list) or not all(isinstance(row, dict) for row in stages):
                 raise ValueError('malformed campaign stages')
             for row in [document] + stages:
-                if (row.get('error') or row.get('completion_uncertain') or
+                completed_failure_report = 'reference_failures' in row and 'report' in row
+                if ((row.get('error') and not completed_failure_report) or row.get('completion_uncertain') or
                         row.get('status') == 'stopped' or row.get('fingerprints_unchanged') is False):
                     errors.append(f'{file}: collection wrapper stopped or invalidated'
                                   + (f": {row['error']}" if row.get('error') else ''))

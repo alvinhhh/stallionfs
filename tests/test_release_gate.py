@@ -341,6 +341,18 @@ class ReleaseGate(unittest.TestCase):
                 self.assertTrue(result['input_errors'])
                 self.assertFalse(result['passed'])
 
+    def test_reference_loss_summary_defers_to_its_completed_report(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'native.json').write_text(json.dumps(report()))
+            (root / 'summary.json').write_text(json.dumps({
+                'status': 'failed', 'report': 'native.json', 'reference_failures': [{'tool': 'rsync'}],
+                'error': 'Native comparison failed correctness checks; see reference_failures'}))
+            result = gate.load_run(root / 'summary.json')
+            self.assertFalse(result['input_errors'])
+            case = next(case for case in result['cases'] if case['case'] == 'fileops/move/large_64mib')
+            self.assertTrue(case['passed'])
+
     def test_malformed_campaign_stages_are_input_errors(self):
         with tempfile.TemporaryDirectory() as name:
             file = Path(name) / 'campaign.json'
