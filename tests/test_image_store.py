@@ -433,6 +433,28 @@ class ImageRecoveryTests(unittest.TestCase):
             images._detach_vanished(destination)
         command.assert_called_once_with('/usr/bin/hdiutil', 'detach', '/dev/disk9')
 
+    def test_vanished_apfs_guid_container_selects_physical_disk(self):
+        from stallionfs import images
+        destination = Path('/owned/missing.sparseimage')
+        for hint in ('EF57347C-0000-11AA-AA11-00306543ECAC',
+                     'ef57347c-0000-11aa-aa11-00306543ecac'):
+            with self.subTest(hint=hint):
+                entities = [
+                    {'dev-entry': '/dev/disk10s1', 'content-hint': '41504653-0000-11AA-AA11-00306543ECAC',
+                     'volume-kind': 'apfs', 'mount-point': '/Volumes/stallionfs'},
+                    {'dev-entry': '/dev/disk10', 'content-hint': hint},
+                    {'dev-entry': '/dev/disk9s1', 'content-hint': 'EFI'},
+                    {'dev-entry': '/dev/disk9s2', 'content-hint': 'Apple_APFS'},
+                    {'dev-entry': '/dev/disk9', 'content-hint': 'GUID_partition_scheme'}]
+                record = {'image-path': str(destination), 'owner-uid': os.getuid(),
+                          'system-entities': entities}
+                with patch.object(images, '_plist', side_effect=[{'images': [record]},
+                        {'images': [record]}, {'images': []}]), \
+                        patch.object(images.os.path, 'lexists', return_value=False), \
+                        patch.object(images, '_command') as command:
+                    images._detach_vanished(destination)
+                command.assert_called_once_with('/usr/bin/hdiutil', 'detach', '/dev/disk9')
+
     def test_vanished_ambiguous_whole_disks_are_refused(self):
         from stallionfs import images
         destination = Path('/owned/missing.sparseimage')

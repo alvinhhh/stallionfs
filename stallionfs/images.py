@@ -171,7 +171,9 @@ def _detach_vanished(destination):
             raise _error(f'Failed image creation left an attachment to inspect: {destination}')
         whole = [e for e in entities if re.fullmatch(r'/dev/disk[0-9]+', e['dev-entry'])]
         physical = [e for e in whole if e.get('content-hint') in ('GUID_partition_scheme', 'Apple_partition_scheme')]
-        if len(physical) == 1 and all(e is physical[0] or e.get('content-hint') == 'Apple_APFS' for e in whole):
+        if len(physical) == 1 and all(e is physical[0] or
+                (isinstance(e.get('content-hint'), str) and e['content-hint'].lower() in
+                 ('apple_apfs', 'ef57347c-0000-11aa-aa11-00306543ecac')) for e in whole):
             device = physical[0]['dev-entry']
         elif len(whole) == 1 and all(d == whole[0]['dev-entry'] or
                 re.fullmatch(re.escape(whole[0]['dev-entry']) + r'(?:s[0-9]+)+', d) for d in devices):
