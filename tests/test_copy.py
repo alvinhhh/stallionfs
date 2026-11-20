@@ -495,12 +495,12 @@ class OrdinaryCopy(unittest.TestCase):
             result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077,
                                     timeout=timeout)
-            if result.returncode:
-                raise images._CommandFailure(args, result)
-            return result.stdout
         except BaseException:
             self.image_command_failed = True
             raise
+        if result.returncode:
+            raise images._CommandFailure(args, result)
+        return result.stdout
 
     def _detach_copy_image(self, image, point):
         from stallionfs import images
@@ -672,6 +672,57 @@ class CopyFixtureSafety(unittest.TestCase):
             case.tearDown()
         self.assertEqual([call.args[0] for call in run.call_args_list], [eject, detach, detach])
         sleep.assert_called_once_with(0.25)
+        self.assertFalse(case.base.exists())
+
+    def test_copy_fixture_detaches_after_build_eject_recovery(self):
+        from stallionfs import images
+        case = self.fixture()
+        case.image = image = case.base / 'copy.sparseimage'
+        seed, point = case.base / 'seed', case.base / 'mounted'
+        seed.mkdir(mode=0o700)
+        device, volume = '/dev/disk7', '/dev/disk7s1'
+        state = None
+
+        def attach(path, mountpoint):
+            nonlocal state
+            self.assertIsNone(state)
+            attachment = {'system-entities': [{'dev-entry': device},
+                                              {'dev-entry': volume, 'mount-point': str(mountpoint)}]}
+            state = dict(image=str(path), device=device, mountpoint=str(mountpoint), volume_device=volume,
+                         attachment=plistlib.dumps(attachment, fmt=plistlib.FMT_BINARY))
+            return mountpoint
+
+        eject = ['/usr/sbin/diskutil', 'eject', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
+        def run(args, **kwargs):
+            nonlocal state
+            if args[:2] == ['/usr/bin/hdiutil', 'create']:
+                image.write_bytes(b'owned backing')
+                image.chmod(0o600)
+            elif args[0] == '/usr/bin/ditto':
+                self.assertIsNotNone(state)
+            elif args == eject and state['mountpoint'] != str(point):
+                state = dict(state, mountpoint=None, volume_device=None,
+                             attachment=images._unmounted_snapshot(state, Path(state['mountpoint'])))
+                return subprocess.CompletedProcess(args, 1, b'Eject failed for disk7\n', b'Volume failed to eject\n')
+            elif args == detach or args == eject:
+                state = None
+            else:
+                self.fail(f'Unexpected image command: {args}')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        with mock.patch.object(images, '_command', side_effect=case._bounded_image_command), \
+                mock.patch.object(images, '_require_supported'), mock.patch.object(images, 'flush'), \
+                mock.patch.object(images, 'attach', side_effect=attach), \
+                mock.patch.object(images, 'mounted', side_effect=lambda _: state), \
+                mock.patch.object(images, '_device_identity', return_value=(1, 2, 3, 4)), \
+                mock.patch.object(images, '_no_graph_mounts'), \
+                mock.patch.object(subprocess, 'run', side_effect=run) as command:
+            images.build(seed, image, 1)
+            images.attach(image, point)
+            case._detach_copy_image(image, point)
+            case.tearDown()
+        self.assertEqual([call.args[0] for call in command.call_args_list][-3:], [eject, detach, eject])
         self.assertFalse(case.base.exists())
 
 
