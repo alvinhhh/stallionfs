@@ -802,6 +802,77 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.store.snapshots(self.workspace)[0]['id'], snapshot)
         self.assertTrue(self.repo.exists())
 
+    def test_snapshots_remain_listable_in_trash(self):
+        for backend in ('folder', 'image'):
+            with self.subTest(backend=backend):
+                if backend == 'image':
+                    (self.path / 'workspace.sparseimage').write_bytes(b'image')
+                    (self.path / 'workspace.sparseimage').chmod(0o600)
+                    (self.path / 'volume').mkdir(mode=0o700)
+                    lifecycle.replace_json(self.path / 'meta.json', {**self.meta, 'backend': backend})
+                with patch('stallionfs.images.mounted', return_value=None), \
+                        patch('stallionfs.images.detach'), patch('stallionfs.images.flush'), \
+                        patch.object(self.store, '_standalone_git'), \
+                        patch.object(self.store, '_mount', return_value={'path': str(self.repo)}):
+                    self.assertEqual(self.store.snapshots(self.workspace), [])
+                    record = self.store.snapshot(self.workspace, quiescent=True, name='saved')
+                    self.store.move(self.workspace)
+                self.assertEqual(self.store.snapshots(self.workspace), [{'format': 1, **record}])
+                self.store.purge('snapshots', record['id'], yes=True)
+                self.assertEqual(self.store.snapshots(self.workspace), [])
+                trash = self.store.root / 'trash' / self.workspace
+                lifecycle.replace_json(trash / 'meta.json', {**self.meta, 'id': 'b' * 32})
+                with self.assertRaisesRegex(StallionError, 'Metadata ID mismatch'):
+                    self.store.snapshots(self.workspace)
+                lifecycle.replace_json(trash / 'meta.json', {**self.meta, 'backend': backend})
+                with patch.object(self.store, '_mount', return_value={}):
+                    self.store.move(self.workspace, restore=True)
+        with self.assertRaises(FileNotFoundError):
+            self.store.snapshots('c' * 32)
+
+    def test_trashed_owned_native_snapshots_require_restore(self):
+        from stallionfs import _native
+        lifecycle.replace_json(self.path / 'meta.json', {
+            **self.meta, 'backend': 'native-image', 'ownership': 'store-created'})
+        trash = self.store.root / 'trash' / self.workspace
+        self.path.rename(trash)
+        with patch.object(_native, 'installed_target') as installed_target:
+            with self.assertRaisesRegex(StallionError, 'Restore the workspace to list its native snapshots'):
+                self.store.snapshots(self.workspace)
+        self.assertEqual(installed_target.call_args.args[:2], (self.store, trash))
+
+    def test_snapshots_retry_workspace_lookup_after_move(self):
+        snapshot = self.snapshot()
+        object_ = self.store.object
+        for restore in (False, True):
+            with self.subTest(restore=restore):
+                moved = False
+
+                def move_before_lookup(collection, workspace):
+                    nonlocal moved
+                    if not moved:
+                        self.assertEqual(collection, 'trash' if restore else 'workspaces')
+                        moved = True
+                        self.store.move(workspace, restore=restore)
+                    return object_(collection, workspace)
+
+                with patch.object(self.store, 'object', side_effect=move_before_lookup):
+                    self.assertEqual([record['id'] for record in self.store.snapshots(self.workspace)], [snapshot])
+                self.assertTrue(moved)
+
+    def test_snapshots_report_workspace_purged_during_lookup(self):
+        self.store.move(self.workspace)
+        object_ = self.store.object
+
+        def purge_before_lookup(collection, workspace):
+            self.assertEqual(collection, 'trash')
+            self.store.purge('trash', workspace, yes=True)
+            return object_(collection, workspace)
+
+        with patch.object(self.store, 'object', side_effect=purge_before_lookup):
+            with self.assertRaisesRegex(StallionError, 'Workspace no longer exists'):
+                self.store.snapshots(self.workspace)
+
     def test_image_snapshot_git_lock_preserves_prior_mount_state(self):
         from stallionfs import images
         image = self.path / 'workspace.sparseimage'
