@@ -113,6 +113,34 @@ Caches are flushed only for native cold-cache phases. Setup, validation and clea
 
 CPU seconds measure total work. Average CPU cores is the median of per-sample CPU-seconds/wall-seconds ratios: command CPU for file operations, matching lifecycle CPU/wall phases for workspaces. Less CPU work does not imply lower average or instantaneous load. Peak utilization is unmeasured.
 
+## Performance release gate
+
+Collection passing is not release acceptance. Evaluate three independent result
+directories (or benchmark summary/native JSON files) with the stdlib-only gate:
+
+```sh
+python3 tests/perf/release_gate.py RUN1 RUN2 RUN3 --json release-gate.json
+```
+
+The fixed denominator is all 33 non-catalog-only `sfs benchmark --list` cases,
+including native commands, scanner APIs and workspace references. Missing cases
+are reported as `not collected`, never dropped. Directories combine reports and
+follow summary/campaign links; overlapping files cannot establish independent runs.
+Native and CLI comparisons retain each recorded reference, cache and output form;
+both API bulk variants must beat POSIX. The gate consumes existing paired decisions,
+requires at least ten validated pairs, and rejects incomplete, unavailable or
+incorrect evidence. Against every recorded reference, elapsed must win beyond
+noise and either CPU or peak process RSS must also win. At least 90% of cases must
+pass, every tiny-file case must save at least 0.01 ms in median paired elapsed time,
+and every bulk/scan case must improve the elapsed median by at least 10%.
+Qualification requires at least three passing runs with identical per-case verdicts.
+The command prints reasons and native-to-StallionFS medians, writes full evidence
+and verdicts with `--json`, and exits nonzero unless qualified. One or two runs can
+be inspected but cannot qualify. Missing RSS can be covered by a valid CPU win;
+unavailable or failed recorded operations cannot. No missing collector is supplied
+by this gate. Linux/OpenZFS native-only descriptive results do not qualify as
+paired product comparisons; the platform/cache/memory caveats above still apply.
+
 ## Sequential campaign
 
 With the isolated installation above, Node 24 or newer and an existing offline
