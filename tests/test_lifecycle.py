@@ -1095,6 +1095,20 @@ with store._lease(sys.argv[2]):
             purge.assert_called_once_with(self.store, self.workspace, yes=yes)
             self.assertEqual(protection.read_bytes(), original)
 
+    def test_native_purge_pending_return_bypasses_live_workspace_orphan_check(self):
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        write_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        write_json(journal, {'operation': 'native-return'})
+        original = protection.read_bytes(), journal.read_bytes()
+        for yes in (False, True):
+            response = {'pending': 'native-move'}
+            with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+            purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+            self.assertEqual((protection.read_bytes(), journal.read_bytes()), original)
+            self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+
     def test_orphan_native_owned_protection_without_intent_is_refused(self):
         self.stale()
         self.store.cleanup(apply=True)
