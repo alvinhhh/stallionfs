@@ -6,6 +6,7 @@ import fcntl
 import math
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -168,11 +169,16 @@ class Lifecycle:
             core.clone_tree(source, target)
 
     @contextlib.contextmanager
-    def _capture_payload(self, path, meta, *, quiescent):
+    def _capture_payload(self, path, meta, *, quiescent, recovery_journal=None):
         payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
         try:
             yield payload
         except BaseException as original:
+            if remount and recovery_journal is not None and os.path.lexists(recovery_journal):
+                command = shlex.join(['sfs', '--root', str(self.root), 'mount', meta['id']])
+                original.add_note('Workspace left unmounted pending recovery; keep current and recovery files unchanged. '
+                                  f'Run {command} to retry rollback reconciliation before mounting.')
+                raise
             if remount:
                 try:
                     self._mount(path, meta)
@@ -356,7 +362,9 @@ class Lifecycle:
             if saved['backend'] != meta.get('backend', 'folder'):
                 raise core.StallionError('Snapshot backend does not match workspace')
             self._open(workspace, path, meta)
-            with self._retention(), self._capture_payload(path, meta, quiescent=quiescent) as payload:
+            journal = self.root / 'journals' / f'{workspace}.json'
+            with self._retention(), self._capture_payload(
+                    path, meta, quiescent=quiescent, recovery_journal=journal) as payload:
                 recovery = uuid.uuid4().hex
                 slot = self.root / 'recovery' / recovery
                 source, saved = self._snapshot(snapshot, workspace)
@@ -367,7 +375,6 @@ class Lifecycle:
                 record = {'id': recovery, 'workspace': workspace, 'recovery': recovery,
                           'snapshot': snapshot, 'backend': saved['backend'], 'created': time.time(),
                           'old': identity(payload), 'candidate': identity(candidate), 'outcome': 'intent'}
-                journal = self.root / 'journals' / f'{workspace}.json'
                 try:
                     core.write_json(slot / 'meta.json', record)
                     core.write_json(journal, record)

@@ -189,3 +189,20 @@ class SnapshotRetention(unittest.TestCase):
         self.assertIs(caught.exception, original)
         self.assertTrue(self.attached)
         self.mount.assert_called_once()
+
+    def test_rollback_unreconciled_journal_prevents_remount(self):
+        snapshot = self.saved_snapshot()
+        original = OSError('exchange failed')
+        scan = sys.modules[self.package + '._scan']
+        with patch.object(scan, 'move', side_effect=original, create=True), \
+                patch.object(self.store, '_reconcile', side_effect=[None, OSError('reconciliation failed')]):
+            with self.assertRaises(OSError) as caught:
+                self.store.rollback(self.workspace, snapshot)
+        self.assertIs(caught.exception, original)
+        self.assertFalse(self.attached, 'unreconciled workspace was remounted')
+        self.mount.assert_not_called()
+        self.assertTrue((self.store.root / 'journals' / f'{self.workspace}.json').exists())
+        notes = '\n'.join(original.__notes__)
+        self.assertIn('left unmounted pending recovery', notes)
+        self.assertIn(f'sfs --root {self.store.root} mount {self.workspace}', notes)
+        self.assertIn('Rollback reconciliation failed', notes)
