@@ -390,12 +390,13 @@ class ImageRecoveryTests(unittest.TestCase):
                 source, image = base / 'source', base / 'seed.sparseimage'
                 source.mkdir(mode=0o700)
                 record = {'image-path': str(image), 'owner-uid': os.getuid() + (case == 'foreign'),
-                          'system-entities': [{'dev-entry': '/dev/disk9'}, {'dev-entry': '/dev/disk9s1'},
-                                              {'dev-entry': '/dev/disk10'}, {'dev-entry': '/dev/disk10s1'}]}
+                          'system-entities': [{'dev-entry': '/dev/disk9', 'content-hint': 'GUID_partition_scheme'}, {'dev-entry': '/dev/disk9s1'},
+                                              {'dev-entry': '/dev/disk10', 'content-hint': 'Apple_APFS'}, {'dev-entry': '/dev/disk10s1'}]}
                 other = {'image-path': str(base / 'other.sparseimage'), 'owner-uid': os.getuid(),
                          'system-entities': [{'dev-entry': '/dev/disk4'}]}
                 after = [record, other] if case == 'stays' else [other]
-                inventories = [{'images': [other]}] if case == 'none' else [{'images': [record, other]}, {'images': after}]
+                inventories = [{'images': [other]}] if case == 'none' else [
+                    {'images': [record, other]}, {'images': [record, other]}, {'images': after}]
                 timeout = subprocess.TimeoutExpired(['/usr/bin/hdiutil', 'create'], 300)
                 def command(*args):
                     if args[1] == 'create':
@@ -413,11 +414,91 @@ class ImageRecoveryTests(unittest.TestCase):
                 self.assertEqual(detaches, [('/usr/bin/hdiutil', 'detach', '/dev/disk9')] if case in ('detached', 'stays') else [])
                 if case in ('detached', 'none', 'reappeared'):
                     self.assertIs(caught.exception, timeout)
-                    self.assertEqual(inventory.call_count, {'detached': 2, 'none': 1, 'reappeared': 0}[case])
+                    self.assertEqual(inventory.call_count, {'detached': 3, 'none': 1, 'reappeared': 0}[case])
                 else:
-                    self.assertIsInstance(caught.exception, StallionError)
-                    self.assertIs(caught.exception.__cause__, timeout)
-                    self.assertIn('missing image', str(caught.exception))
+                    self.assertIs(caught.exception, timeout)
+                    self.assertTrue(any('missing image' in note for note in timeout.__notes__))
+
+    def test_vanished_device_selection_is_order_independent(self):
+        from stallionfs import images
+        destination = Path('/owned/missing.sparseimage')
+        entities = [{'dev-entry': '/dev/disk9', 'content-hint': 'GUID_partition_scheme'},
+                    {'dev-entry': '/dev/disk9s1'}, {'dev-entry': '/dev/disk10', 'content-hint': 'Apple_APFS'},
+                    {'dev-entry': '/dev/disk10s1'}]
+        record = {'image-path': str(destination), 'owner-uid': os.getuid(), 'system-entities': entities}
+        with patch.object(images, '_plist', side_effect=[{'images': [record]}, {'images': [record]}, {'images': []}]), \
+                patch.object(images.os.path, 'lexists', return_value=False), \
+                patch.object(images, '_command') as command:
+            record['system-entities'] = list(reversed(entities))
+            images._detach_vanished(destination)
+        command.assert_called_once_with('/usr/bin/hdiutil', 'detach', '/dev/disk9')
+
+    def test_vanished_ambiguous_whole_disks_are_refused(self):
+        from stallionfs import images
+        destination = Path('/owned/missing.sparseimage')
+        record = {'image-path': str(destination), 'owner-uid': os.getuid(),
+                  'system-entities': [{'dev-entry': '/dev/disk9'}, {'dev-entry': '/dev/disk10'}]}
+        with patch.object(images, '_plist', return_value={'images': [record]}), \
+                patch.object(images.os.path, 'lexists', return_value=False), \
+                patch.object(images, '_command') as command:
+            with self.assertRaises(StallionError):
+                images._detach_vanished(destination)
+        command.assert_not_called()
+
+    def test_vanished_reappearing_before_detach_is_preserved(self):
+        from stallionfs import images
+        destination = Path('/owned/missing.sparseimage')
+        record = {'image-path': str(destination), 'owner-uid': os.getuid(),
+                  'system-entities': [{'dev-entry': '/dev/disk9'}]}
+        with patch.object(images, '_plist', return_value={'images': [record]}), \
+                patch.object(images.os.path, 'lexists', side_effect=[False, True]), \
+                patch.object(images, '_command') as command:
+            with self.assertRaises(StallionError):
+                images._detach_vanished(destination)
+        command.assert_not_called()
+
+    def test_build_vanished_info_failure_preserves_create_error(self):
+        from stallionfs import images
+        for inspection in (OSError('info failed'), StallionError('Invalid property list')):
+            with self.subTest(inspection=inspection), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                source = base / 'source'
+                source.mkdir(mode=0o700)
+                original = subprocess.TimeoutExpired('create', 300)
+                with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                        patch.object(images, '_command', side_effect=original), \
+                        patch.object(images, '_plist', side_effect=inspection):
+                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        images.build(source, base / 'missing.sparseimage', 1)
+                self.assertIs(caught.exception, original)
+                self.assertTrue(any(str(inspection) in note for note in original.__notes__))
+
+    def test_build_vanished_uses_detach_busy_retry_policy(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            source, destination = base / 'source', base / 'missing.sparseimage'
+            source.mkdir(mode=0o700)
+            record = {'image-path': str(destination), 'owner-uid': os.getuid(),
+                      'system-entities': [{'dev-entry': '/dev/disk9'}]}
+            original = subprocess.TimeoutExpired('create', 300)
+            attempts = []
+            def command(*args):
+                if args[1] == 'create':
+                    raise original
+                attempts.append(args)
+                if len(attempts) == 1:
+                    result = subprocess.CompletedProcess(args, 16, b'', b'hdiutil: couldn\'t eject "disk9" - Resource busy')
+                    raise images._CommandFailure(args, result)
+            with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                    patch.object(images, '_command', side_effect=command), \
+                    patch.object(images, '_plist', side_effect=lambda *args: {'images': [record] if len(attempts) < 2 else []}), \
+                    patch.object(images.time, 'sleep'), patch.object(images, 'detach', wraps=images.detach) as detach:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    images.build(source, destination, 1)
+            self.assertIs(caught.exception, original)
+            detach.assert_called_once()
+            self.assertEqual(len(attempts), 2)
 
     def test_unclassifiable_inventory_record_is_named(self):
         from stallionfs import images
