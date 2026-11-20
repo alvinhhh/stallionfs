@@ -72,7 +72,9 @@ class BenchmarkCLI(unittest.TestCase):
         self.assertEqual({cell['reference'] for cell in row['required_cells']},
                          {'bulk_serial-vs-posix', 'bulk-vs-posix'})
         cli_row = next(row for row in coverage if row['id'] == 'cli/scan/empty')
-        self.assertTrue(all(cell['status'] == 'unavailable' for cell in cli_row['required_cells']))
+        self.assertEqual(cli_row['collector'], 'native-cli-scan')
+        self.assertTrue(all(cell['status'] == 'collected_unverified' for cell in cli_row['required_cells']
+                            if cell['cache'] == 'warm'))
         self.assertTrue(all(not cell['win'] for row in coverage for cell in row['required_cells']))
         workspaces = [row for row in coverage if row['required_set'] == 'WORKSPACE']
         self.assertEqual(len(workspaces), 2)
@@ -201,16 +203,19 @@ class BenchmarkCLI(unittest.TestCase):
         changes = ('none', 'missing', 'duplicate', 'reordered', 'failed', 'cleanup-failed')
         for cache, target, change in ((cache, target, change)
                                      for cache in (['warm'], ['cold'], ['warm', 'cold'])
-                                     for target in ('native-copy', 'native-cli-delete', 'native-cli-clone', 'scan-api-cold' if 'cold' in cache else 'scan-api')
+                                     for target in ('native-copy', 'native-cli-delete', 'native-cli-clone',
+                                                    'native-cli-move', 'native-cli-scan', 'native-cli-volumes',
+                                                    'scan-api-cold' if 'cold' in cache else 'scan-api')
                                      for change in changes):
             with self.subTest(cache=cache, target=target, change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                planned = ['native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone', 'native-scan', 'scan-api',
+                planned = ['native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone',
+                           'native-cli-move', 'native-cli-scan', 'native-cli-volumes', 'native-scan', 'scan-api',
                            *(['scan-api-cold'] if 'cold' in cache else []), 'workspaces']
                 stages = [{'cycle': cycle, 'stage': stage,
                            'outcome': {'passed': True, 'cleanup_passed': True}}
                           for cycle in range(1, 4) for stage in planned]
-                self.assertEqual(len(stages), 24 if 'cold' in cache else 21)
+                self.assertEqual(len(stages), 33 if 'cold' in cache else 30)
                 index = next(index for index, row in enumerate(stages)
                              if row['cycle'] == 2 and row['stage'] == target)
                 if change == 'missing':
@@ -763,17 +768,17 @@ class BenchmarkDeadline(unittest.TestCase):
                     self.assertTrue(all(cell['status'] == 'unavailable' for cell in case['required_cells']
                                         if cell['cache'] == 'cold' or cell['phase'] == 'resources'))
 
-    def test_list_marks_catalog_only_entries_without_starting_collectors(self):
+    def test_list_has_collectors_for_every_catalog_entry(self):
         catalog = benchmark._catalog()
-        collected_cli = {'cli/delete/tiny_4kib', 'cli/clone/tiny_4kib'}
-        self.assertTrue(all(case['catalog_only'] for case in catalog['cases'] if case['id'].startswith('cli/') and case['id'] not in collected_cli))
-        self.assertFalse(any(case['catalog_only'] for case in catalog['cases'] if case['id'].startswith('fileops/')))
-        self.assertFalse(next(case['catalog_only'] for case in catalog['cases'] if case['id'] == 'cli/delete/tiny_4kib'))
-        self.assertFalse(next(case['catalog_only'] for case in catalog['cases'] if case['id'] == 'cli/clone/tiny_4kib'))
+        self.assertFalse(any(case['catalog_only'] for case in catalog['cases']))
 
-    def test_only_existing_cli_delete_and_clone_get_native_coverage(self):
+    def test_all_fixed_cli_cases_get_native_coverage(self):
         selected = {'cli/delete/tiny_4kib': ('native-cli-delete', '/bin/rm -f'),
-                    'cli/clone/tiny_4kib': ('native-cli-clone', '/bin/cp -cRp')}
+                    'cli/clone/tiny_4kib': ('native-cli-clone', '/bin/cp -cRp'),
+                    'cli/move/tiny_4kib': ('native-cli-move', '/bin/mv -n'),
+                    'cli/scan/empty': ('native-cli-scan', 'find-stat'),
+                    'cli/scan/nested_1000': ('native-cli-scan', 'find-stat'),
+                    'cli/volumes/volumes': ('native-cli-volumes', '/sbin/mount')}
         for cache, collected in ((['warm'], True), (['cold'], True), (['warm', 'cold'], True), (['warm', 'cold'], False)):
             coverage = benchmark._coverage(cache, collected=collected)
             self.assertEqual(len(coverage), 37)

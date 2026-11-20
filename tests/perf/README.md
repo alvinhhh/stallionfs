@@ -1,5 +1,27 @@
 # Internal performance checks
 
+## Fixed CLI native-reference collectors
+
+`cli.py --native-move`, `--native-scan` and `--native-volumes` accept the same
+`--candidate`, `--scratch`, `--output`, `--samples` and `--cache warm cold`
+arguments as the native clone/delete collectors. Each candidate plain/JSON form
+is independently paired with its native reference: 31 timing pairs plus one
+warmup, and `--samples` separate resource pairs (minimum ten). Full original
+`cli.make_fixtures` source manifests and the outside sentinel are checked after
+every operation, outside measurement. Runtime/tool pins, correctness, preparation
+receipts and failures are retained in journals; a denied cold purge is not retried.
+
+Move compares `/bin/mv -n` on fresh `cp -cRp` operands, requires the original
+4 KiB fixture contents/mode, source disappearance and unchanged device/inode.
+Scan covers both `empty` and `nested_1000`, comparing the existing find/stat
+numeric protocol with the six CLI counters. This is a **recorded-equivalent
+counts reference**, not identical process work. The scan summary links two
+per-case reports for the release gate; its parent journal retains all rows.
+Volumes compares `/sbin/mount` (a getmntinfo-backed listing), projected to path,
+filesystem and read-only status, against the candidate inventory. Plain/JSON
+candidate contracts remain exact. A changing mount inventory fails validation.
+These four cases now have campaign collectors and are not catalog-only entries.
+
 [Expanded native comparisons and current status](../../work/BENCHMARKS.md).
 
 JSON results retain samples, validation outcomes and source/runtime hashes.
