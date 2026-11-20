@@ -2060,7 +2060,23 @@ func contextualGetBoundary(_ m: Mounted, principal: CallerIdentity? = nil) {
             if mutate { request.wantedAttributes = .backupTime }
             release.signal()
         }
-        m.serial {}
+        m.serial {
+            guard replies != 1 || code(result.1) != expected || (result.0 != nil) != (expected == 0) else { return }
+            let validity: String
+            if let prepared {
+                func missingBits(_ required: FSItem.Attribute) -> [Int] {
+                    (0..<UInt.bitWidth).filter { n in
+                        required.rawValue & bit(n).rawValue != 0 && !prepared.isValid(bit(n))
+                    }
+                }
+                validity = "missingSDK=\(missingBits(sdk)) missingCaller=\(missingBits(raw))"
+            } else {
+                validity = "not-prepared"
+            }
+            let error = result.1 as NSError?
+            let line = "boundary result validity: \(validity) constructors=\(constructors) domain=\(error?.domain ?? "none")\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         need(replies == 1 && code(result.1) == expected && (result.0 != nil) == (expected == 0), "boundary exact atomic outcome")
         need(constructors == (stage == 7 || expected == 0 ? 1 : 0), "boundary constructor count")
         need(request.wantedAttributes == (mutate ? .backupTime : raw) && FSGetAttributesResult.requestedAttributes.wantedAttributes == sdk, "boundary request ownership")
