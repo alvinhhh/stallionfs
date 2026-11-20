@@ -1,9 +1,11 @@
 """Installation observations use inert app fixtures and mocked platform probes."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 from stallionfs import __main__ as cli, _installation as installation
+
+REAL_WHICH = shutil.which
 
 
 class Installation(unittest.TestCase):
@@ -28,10 +32,12 @@ class Installation(unittest.TestCase):
         self.target = self.app / 'Contents/Resources/Runtime/CLI/bin/sfs'
         self.target.parent.mkdir(parents=True)
         self.target.write_bytes(b'inert executable')
+        self.target.chmod(0o755)
         for item in (patch.object(installation, 'APP', self.app),
                      patch.object(installation._command, '_home', return_value=self.home),
                      patch.object(installation._command, '_acl'),
-                     patch.object(installation.shutil, 'which', side_effect=lambda tool: '/usr/bin/' + tool),
+                     patch.object(installation.shutil, 'which', side_effect=lambda tool:
+                                  REAL_WHICH(tool) if tool == 'sfs' else '/usr/bin/' + tool),
                      patch.object(installation.subprocess, 'run', side_effect=self.probe)):
             item.start()
             self.addCleanup(item.stop)
@@ -68,6 +74,60 @@ class Installation(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertFalse((self.bin / installation._command.LOCK).exists())
 
+    def test_command_must_be_executable_and_selected_on_path(self):
+        self.target.chmod(0o644)
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertFalse(result['checks']['command_installed'])
+        self.target.chmod(0o755)
+        other_bin = self.root / 'other-bin'
+        other_bin.mkdir()
+        other = other_bin / 'sfs'
+        other.write_bytes(b'foreign executable')
+        other.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': str(other_bin) + os.pathsep + str(self.bin)}):
+            result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertTrue(result['checks']['command_installed'])
+        self.assertFalse(result['checks']['command_on_path'])
+        self.assertEqual(result['command']['path_command'], str(other))
+
+    def test_nonregular_plist_is_rejected_without_opening(self):
+        self.info.unlink()
+        os.mkfifo(self.info)
+        with patch.object(installation.os, 'open', wraps=os.open) as opened:
+            result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertIn('regular file', result['app']['error'])
+        self.assertNotIn(self.info, [call.args[0] for call in opened.call_args_list])
+        self.info.unlink()
+        self.info.mkdir()
+        result = installation.inspect(self.root)
+        self.assertIn('regular file', result['app']['error'])
+
+    def test_bad_root_has_json_error_without_traceback(self):
+        output, errors = io.StringIO(), io.StringIO()
+        original = Path.expanduser
+
+        def expanduser(path):
+            if str(path).startswith('~nonexistent_sfs_pr70_user/'):
+                raise RuntimeError('Could not determine home directory.')
+            return original(path)
+
+        with patch.object(installation.Path, 'expanduser', expanduser), \
+                redirect_stdout(output), redirect_stderr(errors):
+            code = cli.main(['--root', '~nonexistent_sfs_pr70_user/store', '--json', 'doctor', '--installation'])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(json.loads(errors.getvalue()), {'error': 'Could not determine home directory.'})
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+    def test_gatekeeper_assessment_disables_cache(self):
+        with patch.object(installation.subprocess, 'run', side_effect=self.probe) as run:
+            installation.inspect(self.root)
+        assessment = [call.args[0] for call in run.call_args_list if '--assess' in call.args[0]]
+        self.assertEqual(assessment, [['/usr/bin/spctl', '--assess', '--no-cache', '--type', 'execute', str(self.app)]])
+
     def test_signature_states(self):
         cases = [('unsigned', 1, 'code object is not signed at all'),
                  ('ad-hoc', 0, 'Signature=adhoc'),
@@ -83,7 +143,7 @@ class Installation(unittest.TestCase):
                 self.assertIn('Signature: ' + expected, installation.describe(result))
 
     def test_tools_missing_timeout_and_failure_are_reports(self):
-        with patch.object(installation.shutil, 'which', return_value=None):
+        with patch.object(installation.shutil, 'which', side_effect=lambda tool: REAL_WHICH(tool) if tool == 'sfs' else None):
             result = installation.inspect(self.root)
             self.assertEqual(result['signature']['verify']['state'], 'unavailable')
             self.assertEqual(result['gatekeeper']['state'], 'unavailable')
@@ -159,7 +219,7 @@ class Installation(unittest.TestCase):
         self.assertIn('Gatekeeper: accepted', text)
         self.assertNotIn('{', text)
         self.assertNotIn('Not ready:', text)
-        with patch.object(installation.shutil, 'which', return_value=None):
+        with patch.object(installation.shutil, 'which', side_effect=lambda tool: REAL_WHICH(tool) if tool == 'sfs' else None):
             text = installation.describe(installation.inspect(self.root))
         self.assertIn('Signature: unknown: codesign is not available', text)
         self.assertIn('Gatekeeper: unavailable: spctl is not available', text)

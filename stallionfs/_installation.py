@@ -1,7 +1,9 @@
 """Read-only installation observations, not release qualification."""
+import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -52,7 +54,24 @@ def _command_status():
             _command._check_directories(held)
         result = _command._result(home, entry, target)
         result['dangling'] = _command._ours(entry, target) and not target.exists()
+        result['executable'] = target.is_file() and os.access(target, os.X_OK)
+        resolved = shutil.which('sfs')
+        result['path_command'] = resolved
+        result['on_path'] = (resolved is not None
+                             and Path(resolved).absolute() == home / '.local/bin/sfs'
+                             and _command._ours(entry, target) and result['executable'])
         return result
+
+
+def _app_info():
+    path = APP / 'Contents/Info.plist'
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError('Info.plist must be a regular file')
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError('Info.plist must be a regular file')
+        return plistlib.load(source)
 
 
 def inspect(root):
@@ -60,8 +79,7 @@ def inspect(root):
     app = {'path': str(APP), 'present': _is_dir(APP),
            'extension_present': _is_dir(APP / 'Contents/Extensions/StallionFS.appex')}
     try:
-        with (APP / 'Contents/Info.plist').open('rb') as source:
-            info = plistlib.load(source)
+        info = _app_info()
         version, build = info.get('CFBundleShortVersionString'), info.get('CFBundleVersion')
         if not isinstance(version, str) or not isinstance(build, str):
             raise ValueError('Missing or invalid bundle version fields')
@@ -75,7 +93,7 @@ def inspect(root):
     if app['present']:
         verify = _probe('codesign', ['--verify', '--deep', '--strict', str(APP)])
         details = _probe('codesign', ['-dv', str(APP)])
-        assessment = _probe('spctl', ['--assess', '--type', 'execute', str(APP)])
+        assessment = _probe('spctl', ['--assess', '--no-cache', '--type', 'execute', str(APP)])
     else:
         verify = {'state': 'skipped', 'error': 'App is absent'}
         details = dict(verify)
@@ -106,7 +124,8 @@ def inspect(root):
     checks = {
         'app_present': app['present'], 'extension_present': app['extension_present'],
         'version_matches_cli': app['version_matches_cli'],
-        'command_installed': command['state'] == 'installed' and not command.get('dangling', False),
+        'command_installed': command['state'] == 'installed' and command.get('executable', False)
+                             and not command.get('dangling', False),
         'command_on_path': command.get('on_path', False),
         'developer_id_signature': signature['state'] == 'Developer ID',
         'gatekeeper_accepted': gatekeeper['state'] == 'accepted',
@@ -135,6 +154,10 @@ def describe(result):
         command_text += ', on PATH' if command['on_path'] else ', not on PATH'
     if command.get('dangling'):
         command_text += ', broken link (target is missing)'
+    elif command.get('state') == 'installed' and not command.get('executable'):
+        command_text += ', target is not executable'
+    if command.get('path_command') and not command['on_path']:
+        command_text += ', PATH selects ' + command['path_command']
     if command.get('error'):
         command_text += ': ' + command['error']
     lines.append('Command: ' + command_text)

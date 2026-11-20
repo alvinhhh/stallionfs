@@ -209,7 +209,11 @@ def main(argv=None):
             parser.error('--native-host requires --continue')
     if args.action == 'doctor' and args.installation:
         from ._installation import inspect, describe
-        result = inspect(args.root)
+        try:
+            result = inspect(args.root)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(json.dumps({'error': str(error)}) if args.json else 'stallionfs: ' + str(error), file=sys.stderr)
+            return 1
         print(json.dumps(result, sort_keys=True) if args.json else describe(result))
         return 0 if result['ready'] else 1
     if args.action == 'command':
