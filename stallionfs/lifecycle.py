@@ -241,7 +241,12 @@ class Lifecycle:
                 raise core.StallionError('Workspace metadata identity changed')
             self._continuation_target(meta, True, operation_id)
             return compound_status(self, path, meta, operation_id)
-        _, meta = self.object('workspaces', workspace)
+        core.identifier(workspace, 32)
+        collection = 'workspaces'
+        if (not os.path.lexists(self.root / collection / workspace)
+                and os.path.lexists(self.root / 'trash' / workspace)):
+            collection = 'trash'
+        _, meta = self.object(collection, workspace)
         if meta.get('backend') == 'native-image':
             with self._workspace_lock(workspace):
                 path, meta = self.object('workspaces', workspace)
