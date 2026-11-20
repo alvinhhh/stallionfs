@@ -13,7 +13,6 @@ import tarfile
 
 from . import _bundle, _git_sources
 
-BRIDGES = ('GIT_STALLIONFS_ATTR_SYSTEM', 'GIT_STALLIONFS_CONFIG_PROVIDER', 'GIT_STALLIONFS_ATTR_PROVIDER')
 LEGACY_USAGE = ("error: unknown subcommand: `list'\n"
                 'usage: git hook run [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]\n\n')
 LEGACY_SHORT = 'usage: git hook run [--ignore-missing] <hook-name> [-- <hook-args>]\n\n'

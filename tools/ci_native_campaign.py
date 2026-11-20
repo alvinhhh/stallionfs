@@ -1,5 +1,5 @@
 """One retained raw-input exact-command campaign; no authority registration."""
-import copy, hashlib, importlib.util, json, os, shutil, stat, subprocess, sys, tempfile, traceback
+import copy, hashlib, importlib.util, json, os, shutil, stat, subprocess, tempfile, traceback
 from pathlib import Path
 from unittest.mock import patch
 

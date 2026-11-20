@@ -1185,6 +1185,21 @@ class MountedOperationArguments(unittest.TestCase):
                 self.assertEqual(json.loads(output.getvalue()), result)
                 if argv[0] == 'snapshots': store.return_value.opportunistic_cleanup.assert_not_called()
 
+    def test_run_reports_signaled_commands_as_shell_statuses(self):
+        import signal
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from stallionfs.__main__ import main
+        workspace = 'a' * 32
+        cases = ((0, 0), (42, 42), (-signal.SIGTERM, 128 + signal.SIGTERM), (-signal.SIGKILL, 128 + signal.SIGKILL))
+        for returncode, status in cases:
+            with self.subTest(returncode=returncode), patch('stallionfs.core.Store') as store, \
+                 redirect_stdout(StringIO()) as output:
+                store.return_value.run.return_value = {'workspace': workspace, 'returncode': returncode}
+                self.assertEqual(main(['--json', 'run', workspace, '--', 'true']), status)
+                self.assertEqual(json.loads(output.getvalue())['returncode'], returncode)
+
     @staticmethod
     def compound_record(*, root=Path('/private/tmp/store with spaces'), action='restore', name='saved'):
         workspace, operation = 'a' * 32, 'b' * 32

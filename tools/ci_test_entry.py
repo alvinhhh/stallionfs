@@ -380,7 +380,7 @@ def validate_receipt(data):
             or any(type(v) is not bool for v in r['eof'].values())
             or type(r['bytes']) is not int or not 0 <= r['bytes'] <= OUTPUT_CAP + 65536
             or type(r['timeout']) not in (float, int) or not math.isfinite(r['timeout'])
-            or not 0 < r['timeout'] <= 45 * 60 - RESERVE
+            or not 0 < r['timeout'] <= 60 * 60 - RESERVE
             or r['escaped_descendants'] != 'unavailable'):
         raise ValueError('Receipt capture')
     if r['reason'] not in (None, 'spawn_error', 'collection_error', 'cancelled', 'deadline', 'no_eof', 'output_cap'):
@@ -456,7 +456,7 @@ def allocation_clock_ns():
 
 def remainder(start_ns, minutes, now_ns=None, *, tail=False):
     now_ns = allocation_clock_ns() if now_ns is None else now_ns
-    if (type(minutes) is not int or minutes not in (15, 20, 30, 45)
+    if (type(minutes) is not int or minutes not in (15, 20, 30, 45, 60)
             or type(start_ns) is not int or type(now_ns) is not int
             or not 0 <= start_ns <= now_ns or type(tail) is not bool):
         raise ValueError('Invalid worker allocation')
@@ -524,7 +524,7 @@ def supervise(argv, event_path, timeout, *, output_cap=OUTPUT_CAP, echo=True, ca
 
 def _supervise(argv, event_path, timeout, *, output_cap, echo, cancelled, mode, invocation, job):
     """Capture only a newly spawned direct child, with bounded post-reap drain."""
-    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or timeout > 45 * 60 - RESERVE:
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or timeout > 60 * 60 - RESERVE:
         raise ValueError('Suite deadline')
     receipt = dict(pid=None, eof={'stdout': False, 'stderr': False}, bytes=0,
                    reason=None, reaped=False, returncode=None, last_phase=None,

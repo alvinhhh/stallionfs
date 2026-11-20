@@ -4045,6 +4045,17 @@ os.chflags('file',0x8001)
         self.assertEqual((second / "repo/partial").read_text(), "partial")
         self.assertEqual(error.__notes__, [f"Unfinished files retained at {second}"])
 
+    def test_prepare_rejects_http_credentials_case_insensitively(self):
+        git(self.source, "remote", "add", "origin", "https://example.invalid/repo.git")
+        for scheme in ("http", "https", "HTTP", "HTTPS", "Http", "Https"):
+            with self.subTest(scheme=scheme):
+                git(self.source, "remote", "set-url", "origin",
+                    f"{scheme}://user:token@example.invalid/repo.git")
+                with self.assertRaisesRegex(StallionError, "without embedded credentials"):
+                    self.prepare()
+        self.assertEqual(self.store.list("seeds"), [])
+        self.assertEqual(list((self.store.root / "staging").iterdir()), [])
+
     def test_source_and_command_validation(self):
         (self.source / "file").write_text("uncommitted")
         with self.assertRaisesRegex(StallionError, "Commit or stash"):

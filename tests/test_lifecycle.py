@@ -4,6 +4,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -801,6 +802,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.store.snapshots(self.workspace)[0]['id'], snapshot)
         self.assertTrue(self.repo.exists())
 
+    def test_image_snapshot_git_lock_preserves_prior_mount_state(self):
+        from stallionfs import images
+        image = self.path / 'workspace.sparseimage'
+        image.write_bytes(b'original image')
+        image.chmod(0o600)
+        point = self.path / 'volume'
+        point.mkdir(mode=0o700)
+        repo = point / 'repo'
+        self.repo.rename(repo)
+        (repo / '.git' / 'index.lock').touch()
+        lifecycle.replace_json(self.path / 'meta.json', {**self.meta, 'backend': 'image'})
+        for attached in (None, {'mountpoint': str(point)}):
+            with self.subTest(attached=attached is not None), \
+                    patch.object(images, 'mounted', return_value=attached), \
+                    patch.object(images, 'detach') as detach, \
+                    patch.object(self.store, '_mount', return_value={'path': str(repo)}) as mount:
+                with self.assertRaisesRegex(StallionError, 'without active Git locks'):
+                    self.store.snapshot(self.workspace, name='locked')
+                if attached is None:
+                    mount.assert_called_once()
+                    detach.assert_called_once_with(image, point)
+                else:
+                    mount.assert_not_called()
+                    detach.assert_not_called()
+                self.assertEqual(self.store.snapshots(self.workspace), [])
+
     def test_image_capture_uses_detach_flush_clone_and_preserves_remount_failure(self):
         from stallionfs import images
         import shutil
@@ -1001,6 +1028,17 @@ with store._lease(sys.argv[2]):
         self.assertTrue(command('cleanup', '--enable')[1]['enabled'])
         self.assertEqual(command('cleanup', '--apply')[1]['retired'], [])
         self.assertFalse(command('cleanup', '--disable')[1]['enabled'])
+
+    def test_cli_run_reports_signaled_child_as_shell_status(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from stallionfs.__main__ import main
+        output = StringIO()
+        with redirect_stdout(output):
+            status = main(['--root', str(self.store.root), '--json', 'run', self.workspace, '--',
+                           sys.executable, '-c', 'import os, signal; os.kill(os.getpid(), signal.SIGTERM)'])
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertEqual(json.loads(output.getvalue())['returncode'], -signal.SIGTERM)
 
     def test_snapshot_metadata_failure_retains_unpublished_clone(self):
         original = core.write_json
