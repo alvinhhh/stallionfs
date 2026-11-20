@@ -62,8 +62,57 @@ def _creation_purge_output(result, root):
     return status in {'preview', 'purged'}, '\n'.join(lines)
 
 
+GLOBAL_OPTIONS = ('--help', '--version', '--root', '--json')
+
+
+def _global_option(option):
+    """The global option `option` names, accepting unique prefixes as argparse does."""
+    name = option.split('=', 1)[0]
+    if name in GLOBAL_OPTIONS or not name.startswith('--') or len(name) < 3:
+        return name if name in GLOBAL_OPTIONS else None
+    matches = [known for known in GLOBAL_OPTIONS if known.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _global_arguments(raw):
+    """Whether --json was given before the command, and the command's index."""
+    index, json_errors = 0, False
+    while index < len(raw):
+        option = raw[index]
+        name = _global_option(option)
+        if name == '--json' and '=' not in option:
+            json_errors = True
+        if name == '--root' and '=' not in option:
+            index += 2
+        elif name is not None or (option.startswith('-') and option != '--'):
+            index += 1
+        else:
+            break
+    return json_errors, index
+
+
+def _json_arguments(raw):
+    return _global_arguments(raw)[0]
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    json_errors = False
+
+    def error(self, message):
+        if self.json_errors:
+            print(json.dumps({'error': message}), file=sys.stderr)
+            self.exit(2)
+        super().error(message)
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="stallionfs", description="Filesystem tools for macOS")
+    raw = list(sys.argv[1:] if argv is None else argv)
+    invoked = Path(sys.argv[0]).name
+    prog = invoked if invoked in ('sfs', 'stallionfs') else os.environ.get('STALLIONFS_CLI_PROG', 'stallionfs')
+    if prog not in ('sfs', 'stallionfs'):
+        prog = 'stallionfs'
+    parser = _ArgumentParser(prog=prog, description="Filesystem tools for macOS")
+    parser.json_errors = _json_arguments(raw)
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--root", default=os.environ.get("STALLIONFS_HOME", str(Path.home() / "Library/Application Support/stallionfs")))
     parser.add_argument("--json", action="store_true", help="Print structured output")
@@ -172,17 +221,10 @@ def main(argv=None):
     commands.add_parser("doctor", help="Test native cloning and write isolation")
     from . import benchmark
     benchmark.parser(commands)
-    raw = list(sys.argv[1:] if argv is None else argv)
+    for command_parser in commands.choices.values():
+        command_parser.json_errors = parser.json_errors
     setup = []
-    command_index = 0
-    while command_index < len(raw):
-        option = raw[command_index]
-        if option == "--root":
-            command_index += 2
-        elif option == "--json" or option.startswith("--root="):
-            command_index += 1
-        else:
-            break
+    command_index = _global_arguments(raw)[1]
     if (command_index < len(raw) and raw[command_index] == "prepare"
             and "--" in raw[command_index + 1:]):
         index = raw.index("--", command_index + 1)
@@ -217,7 +259,7 @@ def main(argv=None):
         except (OSError, ValueError, ImportError, KeyError, TypeError, KeyboardInterrupt, MemoryError) as error:
             interrupted = isinstance(error, KeyboardInterrupt)
             message = 'interrupted; inspect command status' if interrupted else str(error)
-            print(json.dumps({'error': message}) if args.json else 'stallionfs: ' + message, file=sys.stderr)
+            print(json.dumps({'error': message}) if args.json else prog + ': ' + message, file=sys.stderr)
             return 130 if interrupted else 1
     if args.action == 'benchmark':
         return benchmark.run(args)
@@ -397,7 +439,7 @@ def main(argv=None):
                 notes.append('Recovery snapshot name: ' + details['recovery'])
         if notes:
             error["notes"] = list(notes)
-        print(json.dumps(error) if args.json else f"stallionfs: {message}", file=sys.stderr)
+        print(json.dumps(error) if args.json else f"{prog}: {message}", file=sys.stderr)
         if not args.json:
             for note in notes:
                 print(note, file=sys.stderr)

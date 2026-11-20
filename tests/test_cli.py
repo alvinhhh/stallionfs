@@ -932,7 +932,12 @@ class InstalledCLI(unittest.TestCase):
                                   (('clone', '--jobs=5', '--', 'source', 'never-created'), 2)):
             old = self.command(*arguments, status=status)
             short = self.command(*arguments, launcher=launcher, status=status)
-            self.assertEqual((short.stdout, short.stderr), (old.stdout, old.stderr))
+            if status == 2:
+                self.assertEqual((old.stdout, short.stdout), ('', ''))
+                self.assertEqual(old.stderr, 'stallionfs: invalid arguments; use stallionfs clone --help\n')
+                self.assertEqual(short.stderr, 'sfs: invalid arguments; use sfs clone --help\n')
+            else:
+                self.assertEqual((short.stdout, short.stderr), (old.stdout, old.stderr))
         self.assertFalse((self.base / 'never-created').exists())
         self.assertFalse((self.base / 'unused-store').exists())
 
@@ -969,7 +974,7 @@ class InstalledCLI(unittest.TestCase):
         invalid = self.command('--json', 'clone', '--jobs=5', '--', source, 'invalid',
                                launcher=launcher, status=2)
         self.assertEqual(invalid.stdout, '')
-        self.assertFalse(invalid.stderr.lstrip().startswith('{'))
+        self.assertEqual(json.loads(invalid.stderr), {'error': 'invalid arguments; use stallionfs clone --help'})
         self.assertFalse((self.base / 'invalid').exists())
         self.assertEqual((self.base / source).read_bytes(), b'original')
         self.assertFalse(store.exists())
