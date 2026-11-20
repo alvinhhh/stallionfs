@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -193,6 +194,28 @@ class CreateRecovery(unittest.TestCase):
         self.proof['writer']['actors'][0]['input'].pop('shallow')
         self.save(self.owned / 'native-create.json', self.proof)
         self.assert_installed(self.continuation())
+
+    def test_retired_input_legacy_candidate_recovers(self):
+        self.legacy_input()
+        for actor in self.proof['writer']['actors']:
+            actor['input'].pop('shallow')
+        self.save(self.owned / 'native-create.json', self.proof)
+        shutil.rmtree(self.stage / 'input')
+        self.assert_installed(self.continuation())
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.stage / 'input').exists())
+
+    def test_legacy_missing_repo_in_present_input_is_not_retired(self):
+        self.legacy_input()
+        for actor in self.proof['writer']['actors']:
+            actor['input'].pop('shallow')
+        self.save(self.owned / 'native-create.json', self.proof)
+        shutil.rmtree(self.stage / 'input/repo')
+        before = self.snapshot()
+        result = self.continuation()
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(result['code'], 'FileNotFoundError')
+        self.assertEqual(before, self.snapshot())
 
     def test_legacy_shallow_candidate_is_refused_without_publication(self):
         admitted = self.legacy_input(shallow=True)
