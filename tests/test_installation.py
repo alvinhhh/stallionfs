@@ -92,6 +92,16 @@ class Installation(unittest.TestCase):
         self.assertFalse(result['checks']['command_on_path'])
         self.assertEqual(result['command']['path_command'], str(other))
 
+    def test_symlinked_and_dotted_managed_bin_on_path_is_selected(self):
+        alias = self.root / 'bin-alias'
+        alias.symlink_to(self.bin)
+        dotted = str(self.home / '.local/../.local/bin')
+        for entry in (str(alias), dotted):
+            with self.subTest(entry=entry), patch.dict(os.environ, {'PATH': entry}):
+                result = installation.inspect(self.root)
+                self.assertTrue(result['checks']['command_on_path'])
+                self.assertTrue(result['ready'])
+
     def test_nonregular_plist_is_rejected_without_opening(self):
         self.info.unlink()
         os.mkfifo(self.info)

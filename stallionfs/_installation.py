@@ -58,7 +58,8 @@ def _command_status():
         resolved = shutil.which('sfs')
         result['path_command'] = resolved
         result['on_path'] = (resolved is not None
-                             and Path(resolved).absolute() == home / '.local/bin/sfs'
+                             and Path(resolved).name == 'sfs'
+                             and os.path.realpath(Path(resolved).parent) == os.path.realpath(home / '.local/bin')
                              and _command._ours(entry, target) and result['executable'])
         return result
 
