@@ -673,9 +673,25 @@ def account_result(result, probe, require_contextual, contextual_test):
             'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
         )
     }
+    sigkill_tests |= {
+        'test_sigkill_workspace.WorkspaceDeath.' + name for name in (
+            'test_killed_create_publishes_only_complete_workspace',
+            'test_killed_snapshot_publishes_only_complete_capture',
+            'test_killed_remove_preserves_payload_in_workspaces_or_trash',
+            'test_killed_purge_and_gc_retain_reported_remainder',
+            'test_killed_native_delete_is_confined_and_survivors_intact',
+        )
+    }
+    sigkill_image_tests = {
+        'test_sigkill_workspace.MountedImageDeath.' + name for name in (
+            'test_killed_image_create_keeps_closed_complete_candidate',
+            'test_killed_image_snapshot_keeps_closed_complete_candidate',
+            'test_killed_mount_and_detach_reconcile_existing_attachment',
+        )
+    }
     sigkill_skips = [
         (test, reason) for test, reason in result.skipped
-        if test.id() in sigkill_tests
+        if test.id() in sigkill_tests | sigkill_image_tests
         and reason.startswith('SIGKILL pause hook unavailable: ')
     ]
     sigkill_root_tests = {
@@ -689,7 +705,13 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() in sigkill_root_tests
         and reason == 'SIGKILL Git fixtures require a non-root test process'
     ]
-    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips + sigkill_root_skips
+    sigkill_image_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in sigkill_image_tests
+        and reason.startswith('SIGKILL image fixtures unavailable: ')
+    ]
+    allowed_skips = (capability_skips + adapter_skips + ownership_skips + sigkill_skips
+                     + sigkill_root_skips + sigkill_image_skips)
     for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
     required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [

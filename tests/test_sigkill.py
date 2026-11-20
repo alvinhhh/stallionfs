@@ -25,12 +25,13 @@ def kill_stopped(process):
         raise RuntimeError(f'Expected SIGKILL exit, got {process.returncode}: {stdout!r} {stderr!r}')
 
 
-def pause_at_hook(command, library, kind, count=1):
+def pause_at_hook(command, library, kind, count=1, extra_env=None):
     read, write = os.pipe()
     try:
         environment = {**os.environ, 'DYLD_INSERT_LIBRARIES': str(library),
                        'STALLIONFS_TEST_CUT_KIND': kind, 'STALLIONFS_TEST_CUT_COUNT': str(count),
-                       'STALLIONFS_TEST_CUT_FD': str(write)}
+                       'STALLIONFS_TEST_CUT_FD': str(write), 'STALLIONFS_TEST_CUT_PARENT': str(os.getpid())}
+        environment.update(extra_env or {})
         process = subprocess.Popen(command, env=environment, pass_fds=(write,),
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         os.close(write)
@@ -78,8 +79,7 @@ def probe_pause_hook(library, binary):
     return None
 
 
-@unittest.skipUnless(sys.platform == 'darwin', 'SIGKILL integration requires macOS APFS')
-class ProcessDeath(unittest.TestCase):
+class ProcessDeathFixture:
     @classmethod
     def setUpClass(cls):
         temporary = tempfile.TemporaryDirectory(prefix='stallionfs-sigkill-hook-')
@@ -128,6 +128,23 @@ class ProcessDeath(unittest.TestCase):
     def cut(self, kind, *arguments, count=1):
         pause_at_hook(self.command(*arguments), self.library, kind, count=count)
 
+    def repository(self):
+        if os.geteuid() == 0:
+            self.skipTest('SIGKILL Git fixtures require a non-root test process')
+        source = self.base / 'repository'
+        source.mkdir()
+        (source / 'payload').mkdir()
+        (source / 'payload/file').write_text('original\n')
+        for arguments in (('init', '-q'), ('add', '.'),
+                          ('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                           'commit', '-qm', 'Fixture')):
+            subprocess.run(['git', '-C', str(source), *arguments], check=True,
+                           capture_output=True, timeout=15)
+        return source
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'SIGKILL integration requires macOS APFS')
+class ProcessDeath(ProcessDeathFixture, unittest.TestCase):
     def test_killed_copy_clone_preserve_source_and_allow_partial_destination(self):
         source = self.base / 'source'
         before = self.fixture(source)
@@ -159,20 +176,6 @@ class ProcessDeath(unittest.TestCase):
                 self.assertTrue(report['strict_equal'], report)
                 self.assertTrue(report['move_identity'], report)
                 self.assertIs(report['sparse_preserved'], True, report)
-
-    def repository(self):
-        if os.geteuid() == 0:
-            self.skipTest('SIGKILL Git fixtures require a non-root test process')
-        source = self.base / 'repository'
-        source.mkdir()
-        (source / 'payload').mkdir()
-        (source / 'payload/file').write_text('original\n')
-        for arguments in (('init', '-q'), ('add', '.'),
-                          ('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-                           'commit', '-qm', 'Fixture')):
-            subprocess.run(['git', '-C', str(source), *arguments], check=True,
-                           capture_output=True, timeout=15)
-        return source
 
     def test_killed_preparation_is_unpublished_reported_and_not_cached(self):
         source = self.repository()
