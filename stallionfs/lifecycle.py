@@ -685,6 +685,7 @@ class Lifecycle:
                         if kind == 'trash':
                             core.sync_directory(path.parent)
                             core.sync_directory(stage)
+                            core.sync_directory(stage.parent)
                             protection = self.root / 'protected' / f'{value}.json'
                             if os.path.lexists(protection):
                                 protection.unlink()
