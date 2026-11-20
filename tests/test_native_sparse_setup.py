@@ -28,6 +28,19 @@ class SparseOperandSetup(unittest.TestCase):
         subprocess.run(['/usr/bin/ditto', '--rsrc', '--extattr', '--acl',
                         str(self.source), str(self.target)], check=True, capture_output=True)
         self.data = self.target / 'metadata-fixture/sparse'
+        timestamp = self.data.stat()
+        try:
+            with self.data.open('r+b') as stream:
+                for start, stop in self.expected['entries']['metadata-fixture/sparse']['holes']['ranges']:
+                    stream.seek(start)
+                    while start < stop:
+                        size = min(stop - start, 1024 * 1024)
+                        stream.write(bytes(size))
+                        start += size
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.utime(self.data, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
 
     def test_ditto_operand_keeps_sparse_holes_and_hardlinks(self):
         before = suite.native_correctness.verify_clone(
@@ -70,3 +83,10 @@ class SparseOperandSetup(unittest.TestCase):
 
     def test_no_sparse_entries_need_no_repairs(self):
         self.assertEqual(suite.restore_setup_sparse_holes(self.target, {'entries': {}}), [])
+
+    def test_preserved_holes_need_no_punch(self):
+        suite.restore_setup_sparse_holes(self.target, self.expected)
+        with mock.patch.object(suite.fcntl, 'fcntl', side_effect=AssertionError('unexpected punch')):
+            self.assertEqual(suite.restore_setup_sparse_holes(self.target, self.expected), [])
+        self.assertTrue(suite.preserved(suite.native_correctness.verify_clone(
+            self.expected, suite.native_correctness.snapshot(self.target))))
