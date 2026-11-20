@@ -97,7 +97,7 @@ def macho(path):
     result = []
     for start, size in slices:
         require(size >= 32 and start + size <= len(data), 'Invalid Mach-O slice')
-        magic, cpu, subtype, kind, count, commands_size, flags, reserved = struct.unpack_from('<8I', data, start)
+        magic, cpu, _, kind, count, commands_size, flags, _ = struct.unpack_from('<8I', data, start)
         require(magic == 0xfeedfacf and cpu in (0x100000c, 0x1000007)
                 and count <= 1024 and commands_size <= size - 32, 'Unsupported Mach-O slice')
         offset, minima, dependencies, rpaths = start + 32, [], [], []
