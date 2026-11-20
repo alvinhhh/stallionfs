@@ -103,8 +103,7 @@ def structure(repo, *, branch=None, allow_shallow=False):
             finally:
                 os.close(table)
         result = {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(gitdir)), 'config': config_identity}
-        if allow_shallow:
-            result['shallow'] = read_at(gitdir, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(gitdir) else None
+        result['shallow'] = read_at(gitdir, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(gitdir) else None
         return result
     finally:
         if gitdir is not None:
@@ -135,7 +134,9 @@ def bindings(repo):
         directory = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
         try:
             _, config = read_at(directory, 'config', INPUT_CAP)
-            return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(directory)), 'config': config}
+            shallow = read_at(directory, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(directory) else None
+            return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(directory)),
+                    'config': config, 'shallow': shallow}
         finally:
             os.close(directory)
     finally:

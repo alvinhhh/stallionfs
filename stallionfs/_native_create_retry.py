@@ -39,10 +39,16 @@ def actors(record, spec, *, pending):
                 and Path(executable['path']).name == 'git' and executable['sha256'] == spec['runtime']['executable_sha256']
                 and item['argv'] == [executable['path'], *git.PREFIX, *commands[index]], 'unqualified-actor-command')
         admitted = item['input']
-        require(set(admitted) == {'repository', 'git', 'config'} and type(admitted['config']) is dict
+        require(set(admitted) == {'repository', 'git', 'config', 'shallow'} and type(admitted['config']) is dict
                 and set(admitted['config']) == {'file', 'sha256'}, 'unqualified-actor-input')
         core.identifier(admitted['config']['sha256'], 64)
-        for identity in (admitted['repository'], admitted['git'], admitted['config']['file']):
+        identities = [admitted['repository'], admitted['git'], admitted['config']['file']]
+        if admitted['shallow'] is not None:
+            require(type(admitted['shallow']) is dict and set(admitted['shallow']) == {'file', 'sha256'},
+                    'unqualified-actor-input')
+            core.identifier(admitted['shallow']['sha256'], 64)
+            identities.append(admitted['shallow']['file'])
+        for identity in identities:
             require(type(identity) is list and len(identity) == 2
                     and all(type(n) is int and n >= 0 for n in identity), 'unqualified-actor-input')
         require(index == 0 or admitted == rows[0]['input'], 'actor-input-disagreement')
