@@ -863,7 +863,7 @@ class Store(Lifecycle):
                 if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
                     raise StallionError("Preparation replaced the standalone Git directory")
                 from ._native_create_git import inspect_refs, PSEUDO
-                roots = inspect_refs(repo)
+                roots = inspect_refs(repo, allow_shallow=True)
                 if any(name in PSEUDO or name.startswith("refs/bisect/") for name in roots):
                     raise StallionError("Preparation left transient Git state")
                 if any((repo / ".git" / name).exists() for name in ("commondir", "objects/info/alternates", "worktrees")):

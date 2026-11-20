@@ -52,7 +52,7 @@ def read_at(parent, name, cap):
         os.close(fd)
 
 
-def structure(repo, *, branch=None):
+def structure(repo, *, branch=None, allow_shallow=False):
     """No-follow structure admission. Detached inputs and resulting HEAD differ."""
     repo = Path(repo)
     require(repo.resolve() == repo, 'aliased-repository')
@@ -70,7 +70,8 @@ def structure(repo, *, branch=None):
                     info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
                     require(info.st_uid == os.getuid() and info.st_dev == device, 'unsafe-git-owner')
                     require(not entry.name.endswith('.lock') and not entry.name.endswith('.promisor'), 'git-active-state')
-                    require(name not in UNSUPPORTED and name.split('/')[0] not in TRANSIENT
+                    require((name not in UNSUPPORTED or (allow_shallow and name == 'shallow'))
+                            and name.split('/')[0] not in TRANSIENT
                             and not name.startswith('refs/bisect/'), 'git-transient-state')
                     if stat.S_ISDIR(info.st_mode):
                         child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
@@ -228,11 +229,11 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
     require(after == admitted, 'git-config-changed')
 
 
-def _inspect(repo, *, branch=None, structure_required=True, references=False, runtime=None):
+def _inspect(repo, *, branch=None, structure_required=True, references=False, runtime=None, allow_shallow=False):
     """Read a standalone repository's config as data, with no ambient startup."""
     import tempfile
     from . import _bundle
-    admit = (lambda: structure(repo, branch=branch)) if structure_required else (lambda: bindings(repo))
+    admit = (lambda: structure(repo, branch=branch, allow_shallow=allow_shallow)) if structure_required else (lambda: bindings(repo))
     admitted = admit()
     if runtime is None:
         runtime = _bundle.product_git()
@@ -292,8 +293,8 @@ def inspect_standalone(repo, *, branch=None, structure_required=True, runtime=No
     return _inspect(repo, branch=branch, structure_required=structure_required, runtime=runtime)[0]
 
 
-def inspect_refs(repo):
-    return _inspect(repo, references=True)[1]
+def inspect_refs(repo, *, allow_shallow=False):
+    return _inspect(repo, references=True, allow_shallow=allow_shallow)[1]
 
 
 def qualified_runtime(native_host=None):
