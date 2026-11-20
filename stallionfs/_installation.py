@@ -45,6 +45,27 @@ def _probe(tool, arguments):
         return {'state': 'error', 'error': str(error)}
 
 
+def _path_command(name):
+    """First executable `name` on PATH, searched as the shell does (leading ~ expanded)."""
+    for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
+        if directory.startswith('~'):
+            directory = os.path.expanduser(directory)
+        candidate = Path(directory or '.') / name
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _same_directory(left, right):
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
 def _command_status():
     home = _command._home()
     target = APP / 'Contents/Resources/Runtime/CLI/bin/sfs'
@@ -55,11 +76,10 @@ def _command_status():
         result = _command._result(home, entry, target)
         result['dangling'] = _command._ours(entry, target) and not target.exists()
         result['executable'] = target.is_file() and os.access(target, os.X_OK)
-        resolved = shutil.which('sfs')
-        result['path_command'] = resolved
+        resolved = _path_command('sfs')
+        result['path_command'] = None if resolved is None else str(resolved)
         result['on_path'] = (resolved is not None
-                             and Path(resolved).name == 'sfs'
-                             and os.path.realpath(Path(resolved).parent) == os.path.realpath(home / '.local/bin')
+                             and _same_directory(resolved.parent, home / '.local/bin')
                              and _command._ours(entry, target) and result['executable'])
         return result
 

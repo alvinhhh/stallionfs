@@ -102,6 +102,37 @@ class Installation(unittest.TestCase):
                 self.assertTrue(result['checks']['command_on_path'])
                 self.assertTrue(result['ready'])
 
+    def test_tilde_path_entry_shadowing_is_detected(self):
+        other_bin = self.home / 'other'
+        other_bin.mkdir()
+        other = other_bin / 'sfs'
+        other.write_bytes(b'foreign executable')
+        other.chmod(0o755)
+        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/other' + os.pathsep + str(self.bin)}):
+            result = installation.inspect(self.root)
+        self.assertFalse(result['checks']['command_on_path'])
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['command']['path_command'], str(other))
+        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/.local/bin'}):
+            self.assertTrue(installation.inspect(self.root)['checks']['command_on_path'])
+
+    def test_case_variant_of_managed_bin_counts_when_filesystem_is_case_insensitive(self):
+        upper = self.home / '.LOCAL/BIN'
+        real_samefile = os.path.samefile
+        real_is_file = Path.is_file
+        def samefile(left, right):
+            if Path(left) == upper:
+                left = self.bin
+            return real_samefile(left, right)
+        def is_file(path):
+            return real_is_file(self.bin / 'sfs') if path == upper / 'sfs' else real_is_file(path)
+        with patch.object(installation.os.path, 'samefile', side_effect=samefile), \
+                patch.object(Path, 'is_file', is_file), \
+                patch.object(installation.os, 'access', return_value=True), \
+                patch.dict(os.environ, {'PATH': str(upper)}):
+            result = installation.inspect(self.root)
+        self.assertTrue(result['checks']['command_on_path'])
+
     def test_nonregular_plist_is_rejected_without_opening(self):
         self.info.unlink()
         os.mkfifo(self.info)
