@@ -13,8 +13,6 @@ BULK_IMPROVEMENT = 0.10
 MINIMUM_PAIRS = 10
 MINIMUM_RUNS = 3
 CANDIDATE_METHODS = {'stallionfs', 'candidate', 'bulk', 'bulk_serial', 'stallionfs_folder'}
-CATALOG_ONLY = {'cli/scan/empty', 'cli/scan/nested_1000',
-                'cli/volumes/volumes', 'cli/move/tiny_4kib'}
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
                             'stallionfs' / '_benchmark_cases.py'))['CASES']
 UNIVERSE = tuple(case['id'] for case in CATALOG)
@@ -239,8 +237,7 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
         required = [group for group in groups if not group['excluded']]
         reasons = sorted({reason for group in required for reason in group['reasons']})
         if not groups:
-            reasons = (['catalog only: no native reference or collector'] if case in CATALOG_ONLY
-                       else ['not collected'])
+            reasons = ['not collected']
         elif not required:
             reasons.append('no comparable reference')
         cases.append({'case': case, 'passed': bool(groups) and not reasons,
