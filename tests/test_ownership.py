@@ -15,13 +15,28 @@ import unittest
 from unittest.mock import patch
 
 
+def fixture_actor():
+    if os.geteuid() != 0:
+        return os.getuid(), os.getgid()
+    candidates = [os.environ.get('SUDO_UID'), str(Path(__file__).stat().st_uid)]
+    for value in candidates:
+        if value is not None and value.isdecimal() and 0 < int(value) < 65532:
+            try:
+                actor = pwd.getpwuid(int(value))
+            except KeyError:
+                continue
+            return actor.pw_uid, actor.pw_gid
+    raise RuntimeError('Ownership fixtures require a real non-root actor (SUDO_UID or test file owner)')
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'Ownership integration requires macOS APFS')
 class Ownership(unittest.TestCase):
     def privileged_case(self, name):
         import stallionfs
+        uid, gid = fixture_actor()
         command = [sys.executable, '-I', '-B', str(Path(__file__).resolve()), name,
                    str(Path(stallionfs.__file__).resolve().parent.parent),
-                   str(os.getuid() or 65533), str(os.getgid() or 65533)]
+                   str(uid), str(gid)]
         if os.geteuid() != 0:
             probe = subprocess.run(['/usr/bin/sudo', '-n', '/usr/bin/true'],
                                    capture_output=True, text=True, timeout=15)
@@ -45,6 +60,31 @@ class Ownership(unittest.TestCase):
 
 
 class OwnershipCapabilities(unittest.TestCase):
+    def test_root_actor_uses_real_sudo_account_primary_group(self):
+        actor = type('Actor', (), {'pw_uid': 501, 'pw_gid': 20})()
+        with patch.object(os, 'geteuid', return_value=0), patch.dict(os.environ, SUDO_UID='501'), \
+             patch.object(pwd, 'getpwuid', return_value=actor) as lookup:
+            self.assertEqual(fixture_actor(), (501, 20))
+            lookup.assert_called_once_with(501)
+
+    def test_nonroot_actor_keeps_invoking_ids(self):
+        with patch.object(os, 'geteuid', return_value=501), patch.object(os, 'getuid', return_value=501), \
+             patch.object(os, 'getgid', return_value=20):
+            self.assertEqual(fixture_actor(), (501, 20))
+
+    def test_root_actor_falls_back_to_test_owner_not_synthetic_uid(self):
+        actor = type('Actor', (), {'pw_uid': 502, 'pw_gid': 21})()
+        with patch.object(os, 'geteuid', return_value=0), patch.dict(os.environ, SUDO_UID='0'), \
+             patch.object(Path, 'stat', return_value=type('Info', (), {'st_uid': 502})()), \
+             patch.object(pwd, 'getpwuid', return_value=actor):
+            self.assertEqual(fixture_actor(), (502, 21))
+
+    def test_root_without_real_actor_fails_clearly(self):
+        with patch.object(os, 'geteuid', return_value=0), patch.dict(os.environ, SUDO_UID='0'), \
+             patch.object(Path, 'stat', return_value=type('Info', (), {'st_uid': 0})()):
+            with self.assertRaisesRegex(RuntimeError, 'require a real non-root actor'):
+                fixture_actor()
+
     def test_unavailable_sudo_skips_even_in_ci_with_diagnostic(self):
         probe = subprocess.CompletedProcess(['sudo'], 1, stdout='', stderr='sudo: a password is required\n')
         case = Ownership('test_privileged_copy_clone_move_preserve_foreign_ownership')
@@ -102,7 +142,7 @@ def run_case(name, package, uid, gid):
         return subprocess.run(argv, capture_output=True, text=True, timeout=30,
                               cwd='/', **credentials)
 
-    with tempfile.TemporaryDirectory(prefix='stallionfs-ownership-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='stallionfs-ownership-', dir='/tmp') as temporary:
         base = Path(temporary).resolve()
         if name in ('privileged', 'unprivileged'):
             base.chmod(0o755)

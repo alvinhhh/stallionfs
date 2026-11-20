@@ -424,6 +424,27 @@ class EntryTests(unittest.TestCase):
                 self.assertTrue(refused([unrelated]))
                 self.assertTrue(refused(skips + [unrelated]))
 
+    def test_root_git_sigkill_skips_are_narrow(self):
+        reason = 'SIGKILL Git fixtures require a non-root test process'
+        names = ['test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay')]
+        def refused(name, message=reason, success=True, probe=None):
+            result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: name), message)],
+                                     contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=1)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+            for name in names:
+                self.assertFalse(refused(name))
+                self.assertTrue(refused(name, success=False))
+                self.assertTrue(refused(name, probe='pass'))
+                self.assertTrue(refused(name, message=reason + ': other'))
+            for name in ('test_sigkill.ProcessDeath.test_killed_move_has_exactly_one_complete_inode_tree',
+                         'test_sigkill.ProcessDeath.test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+                         'setUpClass (test_sigkill.ProcessDeath)', 'unrelated.test'):
+                self.assertTrue(refused(name))
+
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
         from unittest.mock import patch

@@ -161,6 +161,8 @@ class ProcessDeath(unittest.TestCase):
                 self.assertIs(report['sparse_preserved'], True, report)
 
     def repository(self):
+        if os.geteuid() == 0:
+            self.skipTest('SIGKILL Git fixtures require a non-root test process')
         source = self.base / 'repository'
         source.mkdir()
         (source / 'payload').mkdir()
@@ -252,6 +254,12 @@ class ProcessDeath(unittest.TestCase):
 
 
 class PauseHookCapabilities(unittest.TestCase):
+    def test_root_git_fixture_skips_before_creating_repository(self):
+        case = ProcessDeath('test_killed_preparation_is_unpublished_reported_and_not_cached')
+        with patch.object(os, 'geteuid', return_value=0):
+            with self.assertRaisesRegex(unittest.SkipTest, '^SIGKILL Git fixtures require a non-root test process$'):
+                case.repository()
+
     def test_compile_failure_has_compiler_diagnostic(self):
         error = subprocess.CalledProcessError(1, ['cc'], stderr='unsupported SDK\n')
         with patch.object(subprocess, 'run', side_effect=error):

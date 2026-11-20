@@ -678,7 +678,18 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() in sigkill_tests
         and reason.startswith('SIGKILL pause hook unavailable: ')
     ]
-    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips
+    sigkill_root_tests = {
+        'test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+    }
+    sigkill_root_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in sigkill_root_tests
+        and reason == 'SIGKILL Git fixtures require a non-root test process'
+    ]
+    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips + sigkill_root_skips
     for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
     required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
