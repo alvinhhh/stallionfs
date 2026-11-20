@@ -664,15 +664,15 @@ class Lifecycle:
                     if not os.path.lexists(path) and os.path.lexists(protection):
                         if os.path.lexists(self.root / 'workspaces' / value):
                             raise core.StallionError('Retained object not found: ' + value)
-                        marker = core.read_json(protection)
-                        if (os.path.lexists(journal)
-                                or state.get('operation') in ('native-purge', 'native-retire', 'native-return', 'native-purge-complete')
-                                or marker.get('kind') == 'native-owned'):
-                            raise core.StallionError('Pending journal or native protection requires explicit native recovery')
-                        if yes:
-                            protection.unlink()
-                            core.sync_directory(protection.parent)
-                        return {'deleted' if yes else 'would_delete': str(protection)}
+                        native = (os.path.lexists(journal)
+                                  or state.get('operation') in ('native-purge', 'native-retire', 'native-return', 'native-purge-complete'))
+                        if not native:
+                            if core.read_json(protection).get('kind') == 'native-owned':
+                                raise core.StallionError('Native protection requires explicit native recovery')
+                            if yes:
+                                protection.unlink()
+                                core.sync_directory(protection.parent)
+                            return {'deleted' if yes else 'would_delete': str(protection)}
                     if (metadata.get('backend') == 'native-image'
                             or pending.get('operation') in ('native-purge', 'native-retire', 'native-return')
                             or state.get('operation') == 'native-purge-complete'):

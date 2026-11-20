@@ -1068,31 +1068,43 @@ with store._lease(sys.argv[2]):
             self.assertEqual(protection.read_bytes(), original)
             self.assertEqual((self.repo / 'file').read_text(), 'original\n')
 
-    def test_orphan_protection_with_native_intent_is_refused(self):
+    def test_orphan_protection_with_native_intent_routes_to_native_purge(self):
         self.stale()
         self.store.cleanup(apply=True)
         trash = self.store.root / 'trash' / self.workspace
         trash.rename(self.store.root / 'staging' / 'retained')
         protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        lifecycle.replace_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
         original = protection.read_bytes()
         journal = self.store.root / 'journals' / f'{self.workspace}.json'
-        write_json(journal, {'operation': 'native-retire'})
-        for yes in (False, True):
-            with self.assertRaisesRegex(StallionError, 'journal or native protection'):
-                self.store.purge('trash', self.workspace, yes=yes)
-            self.assertEqual(protection.read_bytes(), original)
-        journal.unlink()
-        for operation in ('native-purge', 'native-retire', 'native-return', 'native-purge-complete'):
-            lifecycle.replace_json(self.store._state(self.workspace), {'operation': operation})
+        for operation in ('native-purge', 'native-retire', 'native-return'):
+            lifecycle.replace_json(journal, {'operation': operation})
             for yes in (False, True):
-                with self.assertRaisesRegex(StallionError, 'journal or native protection'):
-                    self.store.purge('trash', self.workspace, yes=yes)
-                self.assertEqual(protection.read_bytes(), original)
-        lifecycle.replace_json(self.store._state(self.workspace), {})
+                with self.subTest(operation=operation, yes=yes):
+                    response = {'pending': operation}
+                    with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                        self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+                    purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+                    self.assertEqual(protection.read_bytes(), original)
+        journal.unlink()
+        lifecycle.replace_json(self.store._state(self.workspace), {'operation': 'native-purge-complete'})
+        for yes in (False, True):
+            response = {'completed': True}
+            with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+            purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+
+    def test_orphan_native_owned_protection_without_intent_is_refused(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        trash.rename(self.store.root / 'staging' / 'retained')
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
         lifecycle.replace_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
         original = protection.read_bytes()
         for yes in (False, True):
-            with self.assertRaisesRegex(StallionError, 'journal or native protection'):
+            with self.assertRaisesRegex(StallionError, 'Native protection requires explicit native recovery'):
                 self.store.purge('trash', self.workspace, yes=yes)
             self.assertEqual(protection.read_bytes(), original)
 
