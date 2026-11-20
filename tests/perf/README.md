@@ -318,6 +318,11 @@ comparisons exclude memory and full metadata equivalence.
 The baseline includes dependency installation, not just an Apple file command. Paired intervals assume independent rounds, which host drift can violate.
 Folder comparisons use locked dependencies, generated source files and offline installation without lifecycle scripts. Validation checks content/executable modes and React rendering, excluding Git bookkeeping.
 
+Use the lockfile from the measured revision when reproducing a historical result.
+The current fixture includes security updates for Zod, follow-redirects and
+ESLint's minimatch dependency; measurements taken with earlier lockfiles keep
+their original fixture digests and do not qualify the updated fixture.
+
 Use the Python and installed native executable from the same environment. The
 campaign passes its candidate executable to this stage. `stallionfs_folder`
 invokes `create`, `remove` and `gc --older-than 0 --yes` through that executable
