@@ -78,7 +78,8 @@ class Installation(unittest.TestCase):
                     return_value=SimpleNamespace(returncode=code, stdout='', stderr=diagnostic)):
                 result = installation.inspect(self.root)
                 self.assertEqual(result['signature']['state'], expected)
-                self.assertFalse(result['ready'])
+                self.assertTrue(result['ready'])
+                self.assertFalse(result['checks']['developer_id_signature'])
                 self.assertIn('Signature: ' + expected, installation.describe(result))
 
     def test_tools_missing_timeout_and_failure_are_reports(self):
@@ -86,7 +87,7 @@ class Installation(unittest.TestCase):
             result = installation.inspect(self.root)
             self.assertEqual(result['signature']['verify']['state'], 'unavailable')
             self.assertEqual(result['gatekeeper']['state'], 'unavailable')
-            self.assertFalse(result['ready'])
+            self.assertTrue(result['ready'])
         for error, expected in ((subprocess.TimeoutExpired('codesign', 10), 'timeout'),
                                 (OSError('probe failed'), 'error')):
             with self.subTest(error=error), patch.object(installation.subprocess, 'run', side_effect=error):
@@ -94,7 +95,7 @@ class Installation(unittest.TestCase):
                 self.assertEqual(result['signature']['verify']['state'], expected)
                 self.assertEqual(result['signature']['details']['state'], expected)
                 self.assertEqual(result['gatekeeper']['state'], expected)
-                self.assertFalse(result['ready'])
+                self.assertTrue(result['ready'])
 
     def test_mismatched_version_missing_extension_and_root(self):
         self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.6.0', 'CFBundleVersion': '1'}))
@@ -120,7 +121,8 @@ class Installation(unittest.TestCase):
             result = installation.inspect(self.root)
         self.assertEqual(result['signature']['state'], 'Developer ID')
         self.assertEqual(result['gatekeeper']['state'], 'rejected')
-        self.assertFalse(result['ready'])
+        self.assertTrue(result['ready'])
+        self.assertIn('not accepted by Gatekeeper', installation.describe(result))
 
     def test_missing_store_is_informational(self):
         absent = self.root / 'new-store'
@@ -161,8 +163,8 @@ class Installation(unittest.TestCase):
             text = installation.describe(installation.inspect(self.root))
         self.assertIn('Signature: unknown: codesign is not available', text)
         self.assertIn('Gatekeeper: unavailable: spctl is not available', text)
-        self.assertTrue(text.splitlines()[-1].startswith('Not ready:'))
-        self.assertIn('Developer ID signature required', text.splitlines()[-1])
+        self.assertNotIn('Not ready:', text)
+        self.assertIn('Release signing (informational, not part of readiness): no Developer ID signature', text)
         self.assertNotIn('developer_id_signature', text)
 
     def test_missing_command_directory_is_not_created(self):

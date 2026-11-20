@@ -10,6 +10,7 @@ from xml.parsers.expat import ExpatError
 from . import __version__, _command
 
 APP = Path('/Applications/StallionFS.app')
+INFORMATIONAL = frozenset({'store_root_exists', 'developer_id_signature', 'gatekeeper_accepted'})
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
 REMOVAL_PLAN = [
     'Stop processes using workspaces and unmount them normally. Stop if anything is busy, pending or uncertain; do not force unmount or delete data to proceed. Keep verified recovery archives and installation history outside the app.',
@@ -114,7 +115,8 @@ def inspect(root):
     invoked = Path(sys.argv[0]).absolute()
     helper = (invoked.with_name('stallionfs-python') if invoked.name in ('sfs', 'stallionfs', 'stallionfs-python')
               else Path(sysconfig.get_path('scripts')) / 'stallionfs-python')
-    return {'ready': all(value for name, value in checks.items() if name != 'store_root_exists'),
+    return {'ready': all(value for name, value in checks.items() if name not in INFORMATIONAL),
+            'informational': sorted(INFORMATIONAL),
             'checks': checks, 'cli_version': __version__,
             'python_helper': str(helper), 'command': command,
             'app': app, 'signature': signature, 'gatekeeper': gatekeeper,
@@ -177,8 +179,11 @@ def describe(result):
     lines.extend(str(index) + '. ' + step for index, step in enumerate(result['removal_plan'], 1))
     names = {'app_present': 'app missing', 'extension_present': 'extension missing',
              'version_matches_cli': 'app version must match CLI',
-             'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH',
-             'developer_id_signature': 'Developer ID signature required', 'gatekeeper_accepted': 'Gatekeeper acceptance required'}
+             'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH'}
+    signing = {'developer_id_signature': 'no Developer ID signature', 'gatekeeper_accepted': 'not accepted by Gatekeeper'}
+    unsigned = [label for name, label in signing.items() if not result['checks'][name]]
+    if unsigned:
+        lines.append('Release signing (informational, not part of readiness): ' + '; '.join(unsigned) + '.')
     failed = [label for name, label in names.items() if not result['checks'][name]]
     if failed:
         lines.append('Not ready: ' + '; '.join(failed) + '.')
