@@ -134,6 +134,19 @@ class Installation(unittest.TestCase):
         self.assertNotIn('Not ready:', text)
         self.assertIn(str(absent) + ' are kept', text)
 
+    def test_unreadable_store_root_is_reported(self):
+        original = Path.is_dir
+
+        def is_dir(path):
+            if path.name == 'locked-store':
+                raise PermissionError(13, 'Permission denied')
+            return original(path)
+
+        with patch.object(Path, 'is_dir', is_dir):
+            result = installation.inspect(self.root / 'locked-store')
+        self.assertFalse(result['store_root']['exists'])
+        self.assertIn('Removal plan', installation.describe(result))
+
     def test_readable_text_without_json_blobs(self):
         result = installation.inspect(self.root)
         text = installation.describe(result)

@@ -20,6 +20,13 @@ REMOVAL_PLAN = [
 ]
 
 
+def _is_dir(path):
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _probe(tool, arguments):
     executable = shutil.which(tool)
     if executable is None:
@@ -49,8 +56,8 @@ def _command_status():
 
 def inspect(root):
     root = Path(root).expanduser().absolute()
-    app = {'path': str(APP), 'present': APP.is_dir(),
-           'extension_present': (APP / 'Contents/Extensions/StallionFS.appex').is_dir()}
+    app = {'path': str(APP), 'present': _is_dir(APP),
+           'extension_present': _is_dir(APP / 'Contents/Extensions/StallionFS.appex')}
     try:
         with (APP / 'Contents/Info.plist').open('rb') as source:
             info = plistlib.load(source)
@@ -102,7 +109,7 @@ def inspect(root):
         'command_on_path': command.get('on_path', False),
         'developer_id_signature': signature['state'] == 'Developer ID',
         'gatekeeper_accepted': gatekeeper['state'] == 'accepted',
-        'store_root_exists': root.is_dir(),
+        'store_root_exists': _is_dir(root),
     }
     invoked = Path(sys.argv[0]).absolute()
     helper = (invoked.with_name('stallionfs-python') if invoked.name in ('sfs', 'stallionfs', 'stallionfs-python')
