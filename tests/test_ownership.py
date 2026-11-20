@@ -12,6 +12,7 @@ import sys
 import sysconfig
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Ownership integration requires macOS APFS')
@@ -25,9 +26,7 @@ class Ownership(unittest.TestCase):
             probe = subprocess.run(['/usr/bin/sudo', '-n', '/usr/bin/true'],
                                    capture_output=True, text=True, timeout=15)
             if probe.returncode:
-                if os.environ.get('CI') == 'true':
-                    self.fail(f'CI requires passwordless sudo for ownership fixtures: {probe.stderr}')
-                self.skipTest('Ownership fixture requires root or passwordless sudo')
+                self.skipTest('Ownership fixtures require root or passwordless sudo: ' + probe.stderr.strip())
             command = ['/usr/bin/sudo', '-n', '--', *command]
         result = subprocess.run(command, capture_output=True, text=True, timeout=180, cwd='/')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -43,6 +42,18 @@ class Ownership(unittest.TestCase):
 
     def test_image_import_preserves_foreign_ownership_and_aliases(self):
         self.privileged_case('image')
+
+
+class OwnershipCapabilities(unittest.TestCase):
+    def test_unavailable_sudo_skips_even_in_ci_with_diagnostic(self):
+        probe = subprocess.CompletedProcess(['sudo'], 1, stdout='', stderr='sudo: a password is required\n')
+        case = Ownership('test_privileged_copy_clone_move_preserve_foreign_ownership')
+        with patch.dict(os.environ, CI='true'), patch.object(os, 'geteuid', return_value=501), \
+             patch.object(subprocess, 'run', return_value=probe) as run:
+            with self.assertRaisesRegex(unittest.SkipTest,
+                    'Ownership fixtures require root or passwordless sudo: sudo: a password is required'):
+                case.privileged_case('privileged')
+        self.assertEqual(run.call_count, 1)
 
 
 def run_case(name, package, uid, gid):

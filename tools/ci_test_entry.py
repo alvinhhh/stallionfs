@@ -652,10 +652,24 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() == ADAPTER_TEST and reason == 'requires compiled offline activation driver'
         and (activation_covered or (not require_contextual and len(capability_skips) == 1))
     ]
-    for _, reason in capability_skips + adapter_skips:
+    ownership_tests = {
+        'test_ownership.Ownership.' + name for name in (
+            'test_privileged_copy_clone_move_preserve_foreign_ownership',
+            'test_unprivileged_copy_refuses_loss_clone_uses_darwin_ownership_move_preserves',
+            'test_move_round_trip_preserves_acl_xattrs_resource_fork_and_aliases',
+            'test_image_import_preserves_foreign_ownership_and_aliases',
+        )
+    }
+    ownership_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in ownership_tests
+        and reason.startswith('Ownership fixtures require root or passwordless sudo: ')
+    ]
+    allowed_skips = capability_skips + adapter_skips + ownership_skips
+    for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
     required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
-        entry for entry in result.skipped if entry not in capability_skips + adapter_skips
+        entry for entry in result.skipped if entry not in allowed_skips
     ]
     if required_skips:
         print('Required filesystem tests were skipped.', file=sys.stderr)

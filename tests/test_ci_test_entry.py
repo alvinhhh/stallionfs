@@ -370,6 +370,30 @@ class EntryTests(unittest.TestCase):
             self.assertTrue(entry.account_result(result(success=False), None, False, 'context'))
             self.assertTrue(entry.account_result(result([capability]), 'pass', False, 'context'))
 
+    def test_ownership_capability_skips_do_not_exempt_unrelated_skips_or_failures(self):
+        names = (
+            'test_privileged_copy_clone_move_preserve_foreign_ownership',
+            'test_unprivileged_copy_refuses_loss_clone_uses_darwin_ownership_move_preserves',
+            'test_move_round_trip_preserves_acl_xattrs_resource_fork_and_aliases',
+            'test_image_import_preserves_foreign_ownership_and_aliases',
+        )
+        reason = 'Ownership fixtures require root or passwordless sudo: sudo: a password is required'
+        def refused(skips, success=True, probe=None):
+            result = SimpleNamespace(skipped=skips, contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=4)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        skips = [(SimpleNamespace(id=lambda name=name: 'test_ownership.Ownership.' + name), reason)
+                 for name in names]
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+            self.assertFalse(refused([]))
+            self.assertFalse(refused(skips))
+            self.assertTrue(refused(skips, success=False))
+            self.assertTrue(refused(skips, probe='pass'))
+            self.assertTrue(refused([(skips[0][0], 'different reason')]))
+            unrelated = (SimpleNamespace(id=lambda: 'test_ownership.Ownership.test_other'), reason)
+            self.assertTrue(refused([unrelated]))
+            self.assertTrue(refused(skips + [unrelated]))
+
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
         from unittest.mock import patch
