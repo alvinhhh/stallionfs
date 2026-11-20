@@ -1030,6 +1030,72 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertEqual(self.store.gc(older_than=0, yes=True), [])
 
+    def test_orphan_protection_purge_preserves_staging_and_frees_retention(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        unlink = Path.unlink
+        def interrupted(path, *args, **kwargs):
+            if path == protection:
+                raise KeyboardInterrupt()
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.purge('trash', self.workspace, yes=True)
+        stage = next((self.store.root / 'staging').iterdir())
+        original = protection.read_bytes()
+        self.assertEqual(self.store.purge('trash', self.workspace), {'would_delete': str(protection)})
+        self.assertEqual(protection.read_bytes(), original)
+        with patch.object(lifecycle, 'RETENTION_COUNT', 1):
+            with self.assertRaisesRegex(StallionError, 'retention limit'):
+                with self.store._retention():
+                    pass
+            self.assertEqual(self.store.purge('trash', self.workspace, yes=True), {'deleted': str(protection)})
+            with self.store._retention():
+                pass
+        self.assertFalse(protection.exists())
+        self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
+        with self.assertRaisesRegex(StallionError, 'Retained object not found'):
+            self.store.purge('trash', self.workspace)
+
+    def test_orphan_protection_beside_live_workspace_is_refused(self):
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        write_json(protection, {'id': self.workspace})
+        original = protection.read_bytes()
+        for yes in (False, True):
+            with self.assertRaisesRegex(StallionError, 'Retained object not found'):
+                self.store.purge('trash', self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+            self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+
+    def test_orphan_protection_with_native_intent_is_refused(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        trash.rename(self.store.root / 'staging' / 'retained')
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        original = protection.read_bytes()
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        write_json(journal, {'operation': 'native-retire'})
+        for yes in (False, True):
+            with self.assertRaisesRegex(StallionError, 'journal or native protection'):
+                self.store.purge('trash', self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+        journal.unlink()
+        for operation in ('native-purge', 'native-retire', 'native-return', 'native-purge-complete'):
+            lifecycle.replace_json(self.store._state(self.workspace), {'operation': operation})
+            for yes in (False, True):
+                with self.assertRaisesRegex(StallionError, 'journal or native protection'):
+                    self.store.purge('trash', self.workspace, yes=yes)
+                self.assertEqual(protection.read_bytes(), original)
+        lifecycle.replace_json(self.store._state(self.workspace), {})
+        lifecycle.replace_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
+        original = protection.read_bytes()
+        for yes in (False, True):
+            with self.assertRaisesRegex(StallionError, 'journal or native protection'):
+                self.store.purge('trash', self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)

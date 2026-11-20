@@ -197,6 +197,8 @@ sfs purge trash WORKSPACE_ID
 ```
 
 `purge` is deliberate permanent deletion. Inspect the data first. Interrupted deletion retains its remainder in staging and reports that path, keeping usable snapshot listings clear of partial entries. Pending rollback journals and mounted images prevent purging. Keep any previous rollback repository you need by copying `recovery/RECOVERY_ID/repo` to a new path before purging its slot; image recovery remains a closed `workspace.sparseimage` backing file.
+If an interrupted trash purge leaves only a protection record, `sfs purge trash WORKSPACE_ID` previews it and `--yes` clears it, freeing its retention slot. This does not delete any retained staging data; live workspaces and pending journals or native protection prevent this cleanup.
+
 ## Owned native workspaces
 
 Native workspaces require a qualified, signed StallionFS package enabled in
