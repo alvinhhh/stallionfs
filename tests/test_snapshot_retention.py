@@ -16,7 +16,9 @@ class SnapshotRetention(unittest.TestCase):
         package.__path__ = [str(Path(__file__).resolve().parents[1] / 'stallionfs')]
         scan = ModuleType(self.package + '._scan')
         scan._private_directory = lambda path: None
-        isolated = patch.dict(sys.modules, {self.package: package, scan.__name__: scan})
+        image = ModuleType(self.package + '._image')
+        isolated = patch.dict(sys.modules, {
+            self.package: package, scan.__name__: scan, image.__name__: image})
         isolated.start()
         self.addCleanup(isolated.stop)
         self.core = importlib.import_module(self.package + '.core')
@@ -80,3 +82,50 @@ class SnapshotRetention(unittest.TestCase):
         self.detach.assert_not_called()
         self.clone.assert_not_called()
         self.assertEqual(list((self.store.root / 'snapshots').iterdir()), [])
+
+    def saved_snapshot(self):
+        snapshot = 'c' * 32
+        saved = self.store.root / 'snapshots' / snapshot
+        saved.mkdir(mode=0o700)
+        image = saved / self.image.name
+        image.write_bytes(b'saved image')
+        self.core.write_json(saved / 'meta.json', {
+            'id': snapshot, 'workspace': self.workspace, 'backend': 'image',
+            'payload': self.lifecycle.identity(image)})
+        return snapshot
+
+    def test_full_retention_refuses_rollback_without_detaching_workspace(self):
+        snapshot = self.saved_snapshot()
+        for index in range(self.lifecycle.RETENTION_COUNT - 1):
+            (self.store.root / 'recovery' / f'{index:032x}').mkdir(mode=0o700)
+        before = self.lifecycle.identity(self.image), self.image.read_bytes()
+        with self.assertRaisesRegex(self.core.StallionError, 'retention limit'):
+            self.store.rollback(self.workspace, snapshot)
+        self.assertTrue(self.attached, 'refused rollback unmounted the workspace')
+        self.assertEqual((self.lifecycle.identity(self.image), self.image.read_bytes()), before)
+        self.detach.assert_not_called()
+        self.mount.assert_not_called()
+        self.clone.assert_not_called()
+        self.assertEqual(len(list((self.store.root / 'recovery').iterdir())),
+                         self.lifecycle.RETENTION_COUNT - 1)
+        self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+
+    def test_rollback_restores_saved_image_and_remounts(self):
+        snapshot = self.saved_snapshot()
+        def exchange(source, target, *, exchange):
+            self.assertTrue(exchange)
+            temporary = source.with_name('exchange-temporary')
+            source.rename(temporary)
+            target.rename(source)
+            temporary.rename(target)
+        scan = sys.modules[self.package + '._scan']
+        with patch.object(scan, 'move', side_effect=exchange, create=True):
+            result = self.store.rollback(self.workspace, snapshot)
+        self.assertTrue(self.attached)
+        self.detach.assert_called_once()
+        self.mount.assert_called_once()
+        self.assertEqual(self.image.read_bytes(), b'saved image')
+        recovery = self.store.root / 'recovery' / result['recovery']
+        self.assertEqual((recovery / self.image.name).read_bytes(), b'owned synthetic image')
+        self.assertEqual(self.core.read_json(recovery / 'meta.json')['outcome'], 'exchanged')
+        self.assertEqual(list((self.store.root / 'journals').iterdir()), [])

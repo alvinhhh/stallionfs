@@ -340,10 +340,10 @@ class Lifecycle:
             if saved['backend'] != meta.get('backend', 'folder'):
                 raise core.StallionError('Snapshot backend does not match workspace')
             self._open(workspace, path, meta)
-            payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
-            recovery = uuid.uuid4().hex
-            slot = self.root / 'recovery' / recovery
             with self._retention():
+                payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+                recovery = uuid.uuid4().hex
+                slot = self.root / 'recovery' / recovery
                 source, saved = self._snapshot(snapshot, workspace)
                 slot.mkdir(mode=0o700)
                 candidate = slot / payload.name
