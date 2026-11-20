@@ -802,6 +802,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.store.snapshots(self.workspace)[0]['id'], snapshot)
         self.assertTrue(self.repo.exists())
 
+    def test_image_snapshot_git_lock_preserves_prior_mount_state(self):
+        from stallionfs import images
+        image = self.path / 'workspace.sparseimage'
+        image.write_bytes(b'original image')
+        image.chmod(0o600)
+        point = self.path / 'volume'
+        point.mkdir(mode=0o700)
+        repo = point / 'repo'
+        self.repo.rename(repo)
+        (repo / '.git' / 'index.lock').touch()
+        lifecycle.replace_json(self.path / 'meta.json', {**self.meta, 'backend': 'image'})
+        for attached in (None, {'mountpoint': str(point)}):
+            with self.subTest(attached=attached is not None), \
+                    patch.object(images, 'mounted', return_value=attached), \
+                    patch.object(images, 'detach') as detach, \
+                    patch.object(self.store, '_mount', return_value={'path': str(repo)}) as mount:
+                with self.assertRaisesRegex(StallionError, 'without active Git locks'):
+                    self.store.snapshot(self.workspace, name='locked')
+                if attached is None:
+                    mount.assert_called_once()
+                    detach.assert_called_once_with(image, point)
+                else:
+                    mount.assert_not_called()
+                    detach.assert_not_called()
+                self.assertEqual(self.store.snapshots(self.workspace), [])
+
     def test_image_capture_uses_detach_flush_clone_and_preserves_remount_failure(self):
         from stallionfs import images
         import shutil
