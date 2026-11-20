@@ -473,6 +473,22 @@ class ImageRecoveryTests(unittest.TestCase):
                 self.assertIs(caught.exception, original)
                 self.assertTrue(any(str(inspection) in note for note in original.__notes__))
 
+    def test_build_vanished_recovery_reraises_interrupt(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            source = base / 'source'
+            source.mkdir(mode=0o700)
+            original = subprocess.TimeoutExpired('create', 300)
+            interrupted = KeyboardInterrupt('recovery interrupted')
+            with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                    patch.object(images, '_command', side_effect=original), \
+                    patch.object(images, '_plist', side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    images.build(source, base / 'missing.sparseimage', 1)
+            self.assertIs(caught.exception, interrupted)
+            self.assertIs(interrupted.__context__, original)
+
     def test_build_vanished_uses_detach_busy_retry_policy(self):
         from stallionfs import images
         with tempfile.TemporaryDirectory() as temporary:

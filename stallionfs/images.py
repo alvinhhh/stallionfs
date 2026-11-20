@@ -483,6 +483,9 @@ def build(source_repo, destination_image, capacity_gib):
             try:
                 detach(destination, point, missing=True)
             except BaseException as cleanup:
+                if not isinstance(cleanup, Exception):
+                    cleanup.add_note(f'Image creation failed before recovery: {original}')
+                    raise
                 original.add_note(f"Preparation failed and left an attachment for missing image {destination}: {cleanup}")
                 raise original from cleanup
         raise
