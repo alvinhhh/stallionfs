@@ -2061,8 +2061,17 @@ func contextualGetBoundary(_ m: Mounted, principal: CallerIdentity? = nil) {
             release.signal()
         }
         m.serial {}
+        var traced = ""
+#if STALLION_MOUNT_TRACE
+        traced = MountTrace.shared.recordsForTesting().suffix(2).joined(separator: "|")
+#endif
+        let probe = FSItem.GetAttributesRequest(); probe.wantedAttributes = raw
+        let projected = ([.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize, .fileID, .parentID,
+                          .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
+                          .supportsLimitedXAttrs, .inhibitKernelOffloadedIO] as [FSItem.Attribute])
+            .filter { probe.isAttributeWanted($0) }.reduce(0) { $0 | $1.rawValue }
         need(replies == 1 && code(result.1) == expected && (result.0 != nil) == (expected == 0),
-             "boundary exact atomic outcome: wanted=\(raw.rawValue) stage=\(stage) mutate=\(mutate) foreignItem=\(item != nil) foreignCaller=\(who != nil) replies=\(replies) code=\(code(result.1)) expected=\(expected) result=\(result.0 != nil)")
+             "boundary exact atomic outcome: projected=\(projected) sdk=\(sdk.rawValue) trace=\(traced) wanted=\(raw.rawValue) stage=\(stage) mutate=\(mutate) foreignItem=\(item != nil) foreignCaller=\(who != nil) replies=\(replies) code=\(code(result.1)) expected=\(expected) result=\(result.0 != nil)")
         need(constructors == (stage == 7 || expected == 0 ? 1 : 0), "boundary constructor count")
         need(request.wantedAttributes == (mutate ? .backupTime : raw) && FSGetAttributesResult.requestedAttributes.wantedAttributes == sdk, "boundary request ownership")
         if expected == 0 {
