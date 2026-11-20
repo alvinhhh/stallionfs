@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import pwd
 import shutil
 import stat
@@ -495,12 +496,24 @@ class OrdinaryCopy(unittest.TestCase):
                                     stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, umask=0o077,
                                     timeout=timeout)
             if result.returncode:
-                raise images._error(f'{args[0]} failed ({result.returncode}): '
-                                    + result.stderr.decode(errors='replace').strip())
+                raise images._CommandFailure(args, result)
             return result.stdout
         except BaseException:
             self.image_command_failed = True
             raise
+
+    def _detach_copy_image(self, image, point):
+        from stallionfs import images
+        if self.image_command_failed:
+            return
+        state = images.mounted(image)
+        if state is not None:
+            if state['mountpoint'] != str(point):
+                raise RuntimeError(f'Unexpected attachment; retaining {image}: {state}')
+            images.detach(image, point)
+        if images.mounted(image) is not None:
+            raise RuntimeError(f'Retaining attached image {image}')
+        self.image_command_failed = False
 
     @unittest.skipUnless(os.environ.get('STALLIONFS_TEST_IMAGES') == '1', 'Enable disposable APFS cross-volume check')
     def test_actual_cross_volume_copy_preserves_metadata_and_clone_move_still_refuse(self):
@@ -567,14 +580,7 @@ class OrdinaryCopy(unittest.TestCase):
             self.assertIn(raised.exception.errno, (errno.EXDEV, errno.EBUSY))
             self.assertTrue(self.checks.verify_source(before, self.checks.snapshot(source))['unchanged'])
         finally:
-            if not self.image_command_failed:
-                state = images.mounted(image)
-                if state is not None:
-                    if state['mountpoint'] != str(point):
-                        raise RuntimeError(f'Unexpected attachment; retaining {image}: {state}')
-                    images.detach(image, point)
-                if images.mounted(image) is not None:
-                    raise RuntimeError(f'Retaining attached image {image}')
+            self._detach_copy_image(image, point)
 
 
 class MaterializedCopy(OrdinaryCopy):
@@ -635,6 +641,38 @@ class CopyFixtureSafety(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 case._bounded_image_command('/usr/bin/hdiutil', 'create')
         self.assertTrue(case.image_command_failed)
+
+    def test_copy_fixture_cleanup_recovers_partial_eject_and_busy_detach(self):
+        from stallionfs import images
+        case = self.fixture()
+        image, point = case.base / 'copy.sparseimage', case.base / 'mounted'
+        case.image = image
+        image.write_bytes(b'owned backing')
+        image.chmod(0o600)
+        device, volume = '/dev/disk7', '/dev/disk7s1'
+        attachment = {'system-entities': [{'dev-entry': device},
+                                          {'dev-entry': volume, 'mount-point': str(point)}]}
+        mounted = dict(image=str(image), device=device, mountpoint=str(point), volume_device=volume,
+                       attachment=plistlib.dumps(attachment, fmt=plistlib.FMT_BINARY))
+        del attachment['system-entities'][1]['mount-point']
+        unmounted = dict(mounted, mountpoint=None, volume_device=None,
+                         attachment=plistlib.dumps(attachment, fmt=plistlib.FMT_BINARY))
+        eject = ['/usr/sbin/diskutil', 'eject', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
+        outcomes = [subprocess.CompletedProcess(eject, 1, b'Eject failed for disk7\n', b'Volume failed to eject\n'),
+                    subprocess.CompletedProcess(detach, 16, b'', b'hdiutil: couldn\'t eject "disk7" - Resource busy\n'),
+                    subprocess.CompletedProcess(detach, 0, b'', b'')]
+        with mock.patch.object(images, '_command', side_effect=case._bounded_image_command), \
+                mock.patch.object(images, '_device_identity', return_value=(1, 2, 3, 4)), \
+                mock.patch.object(images, '_no_graph_mounts'), \
+                mock.patch.object(images, 'mounted', side_effect=[mounted] * 3 + [unmounted] * 4 + [None] * 3), \
+                mock.patch.object(images.time, 'sleep') as sleep, \
+                mock.patch.object(subprocess, 'run', side_effect=outcomes) as run:
+            case._detach_copy_image(image, point)
+            case.tearDown()
+        self.assertEqual([call.args[0] for call in run.call_args_list], [eject, detach, detach])
+        sleep.assert_called_once_with(0.25)
+        self.assertFalse(case.base.exists())
 
 
 class CopyRuntimeDiscovery(unittest.TestCase):
