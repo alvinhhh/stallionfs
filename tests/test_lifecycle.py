@@ -995,6 +995,133 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertTrue(any(str(stage) in note for note in raised.exception.__notes__))
 
+    def test_failed_protected_purge_rename_preserves_protection(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        original = protection.read_bytes()
+        rename = Path.rename
+        for error in (OSError(errno.EIO, 'purge rename failed'), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                def interrupted(path, target):
+                    if path == trash:
+                        raise error
+                    return rename(path, target)
+                with patch.object(Path, 'rename', interrupted):
+                    with self.assertRaises(type(error)):
+                        self.store.purge('trash', self.workspace, yes=True)
+                self.assertEqual(protection.read_bytes(), original)
+                self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+                self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+                self.assertTrue(trash.exists())
+
+    def test_protected_purge_sync_failure_keeps_protection(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        original = protection.read_bytes()
+        with patch.object(core, 'sync_directory', side_effect=OSError(errno.EIO, 'purge sync failed')):
+            with self.assertRaisesRegex(OSError, 'purge sync failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertEqual(protection.read_bytes(), original)
+        self.assertFalse((self.store.root / 'trash' / self.workspace).exists())
+        stage = next((self.store.root / 'staging').iterdir())
+        self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
+        self.assertEqual(self.store.gc(older_than=0, yes=True), [])
+
+    def test_orphan_protection_purge_preserves_staging_and_frees_retention(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        unlink = Path.unlink
+        def interrupted(path, *args, **kwargs):
+            if path == protection:
+                raise KeyboardInterrupt()
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.purge('trash', self.workspace, yes=True)
+        stage = next((self.store.root / 'staging').iterdir())
+        original = protection.read_bytes()
+        self.assertEqual(self.store.purge('trash', self.workspace), {'would_delete': str(protection)})
+        self.assertEqual(protection.read_bytes(), original)
+        with patch.object(lifecycle, 'RETENTION_COUNT', 1):
+            with self.assertRaisesRegex(StallionError, 'retention limit'):
+                with self.store._retention():
+                    pass
+            self.assertEqual(self.store.purge('trash', self.workspace, yes=True), {'deleted': str(protection)})
+            with self.store._retention():
+                pass
+        self.assertFalse(protection.exists())
+        self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
+        with self.assertRaisesRegex(StallionError, 'Retained object not found'):
+            self.store.purge('trash', self.workspace)
+
+    def test_orphan_protection_beside_live_workspace_is_refused(self):
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        write_json(protection, {'id': self.workspace})
+        original = protection.read_bytes()
+        for yes in (False, True):
+            with self.assertRaisesRegex(StallionError, 'Retained object not found'):
+                self.store.purge('trash', self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+            self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+
+    def test_orphan_protection_with_native_intent_routes_to_native_purge(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        trash.rename(self.store.root / 'staging' / 'retained')
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        lifecycle.replace_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
+        original = protection.read_bytes()
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        for operation in ('native-purge', 'native-retire', 'native-return'):
+            lifecycle.replace_json(journal, {'operation': operation})
+            for yes in (False, True):
+                with self.subTest(operation=operation, yes=yes):
+                    response = {'pending': operation}
+                    with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                        self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+                    purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+                    self.assertEqual(protection.read_bytes(), original)
+        journal.unlink()
+        lifecycle.replace_json(self.store._state(self.workspace), {'operation': 'native-purge-complete'})
+        for yes in (False, True):
+            response = {'completed': True}
+            with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+            purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+
+    def test_native_purge_pending_return_bypasses_live_workspace_orphan_check(self):
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        write_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
+        journal = self.store.root / 'journals' / f'{self.workspace}.json'
+        write_json(journal, {'operation': 'native-return'})
+        original = protection.read_bytes(), journal.read_bytes()
+        for yes in (False, True):
+            response = {'pending': 'native-move'}
+            with patch('stallionfs._native_purge.purge_locked', return_value=response) as purge:
+                self.assertIs(self.store.purge('trash', self.workspace, yes=yes), response)
+            purge.assert_called_once_with(self.store, self.workspace, yes=yes)
+            self.assertEqual((protection.read_bytes(), journal.read_bytes()), original)
+            self.assertEqual((self.repo / 'file').read_text(), 'original\n')
+
+    def test_orphan_native_owned_protection_without_intent_is_refused(self):
+        self.stale()
+        self.store.cleanup(apply=True)
+        trash = self.store.root / 'trash' / self.workspace
+        trash.rename(self.store.root / 'staging' / 'retained')
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        lifecycle.replace_json(protection, {'id': self.workspace, 'kind': 'native-owned'})
+        original = protection.read_bytes()
+        for yes in (False, True):
+            with self.assertRaisesRegex(StallionError, 'Native protection requires explicit native recovery'):
+                self.store.purge('trash', self.workspace, yes=yes)
+            self.assertEqual(protection.read_bytes(), original)
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)
