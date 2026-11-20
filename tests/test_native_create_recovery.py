@@ -162,6 +162,17 @@ class CreateRecovery(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertEqual(self.guard_calls, [])
 
+    def test_pre_upgrade_writer_without_shallow_identity_recovers(self):
+        for actor in self.proof['writer']['actors']:
+            actor['input'].pop('shallow')
+        self.save(self.owned / 'native-create.json', self.proof)
+        self.assert_installed(self.continuation())
+
+    def test_mixed_legacy_and_current_actor_inputs_agree(self):
+        self.proof['writer']['actors'][0]['input'].pop('shallow')
+        self.save(self.owned / 'native-create.json', self.proof)
+        self.assert_installed(self.continuation())
+
     def test_missing_locks_or_containers_never_repaired(self):
         for path in (self.root / '.lock', self.root / 'locks' / ('use-' + self.workspace)):
             contents = path.read_bytes(); path.unlink(); before = self.snapshot()

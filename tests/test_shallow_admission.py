@@ -38,6 +38,16 @@ class ShallowAdmission(unittest.TestCase):
         with self.assertRaises(core.StallionError):
             git.structure(self.repo)
 
+    def test_legacy_bindings_match_only_absent_shallow(self):
+        self.shallow.unlink()
+        admitted = git.structure(self.repo)
+        admitted.pop('shallow')
+        self.assertTrue(git.same_bindings(git.bindings(self.repo), admitted))
+        self.assertTrue(git.same_bindings(admitted, git.bindings(self.repo)))
+        self.shallow.write_text('a' * 40 + '\n')
+        self.assertFalse(git.same_bindings(git.bindings(self.repo), admitted))
+        self.assertFalse(git.same_bindings(admitted, git.bindings(self.repo)))
+
     def test_actor_admission_validates_shallow_identity(self):
         retry = importlib.import_module(self.package + '._native_create_retry')
         stage = self.repo.parent

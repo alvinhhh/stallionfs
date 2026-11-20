@@ -143,6 +143,10 @@ def bindings(repo):
         os.close(root)
 
 
+def same_bindings(left, right):
+    return dict(left, shallow=left.get('shallow')) == dict(right, shallow=right.get('shallow'))
+
+
 def config_gate(entries):
     exact = {'core.repositoryformatversion', 'core.bare', 'core.filemode', 'core.logallrefupdates',
         'core.ignorecase', 'core.precomposeunicode', 'core.hookspath', 'core.fsmonitor', 'core.autocrlf',
@@ -200,7 +204,7 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
         if 'check' in runtime:
             runtime['check']()
         current = bindings(repo)
-        require(current == admitted, 'git-input-changed')
+        require(same_bindings(current, admitted), 'git-input-changed')
         log = actors / role
         log.mkdir(mode=0o700)
         core.sync_directory(actors)
@@ -282,7 +286,7 @@ def _inspect(repo, *, branch=None, structure_required=True, references=False, ru
                 os.close(fd)
         refs = []
         if references:
-            require(bindings(repo) == admitted, 'git-input-changed')
+            require(same_bindings(bindings(repo), admitted), 'git-input-changed')
             log = directory / 'refs'; log.mkdir(mode=0o700)
             data = query(log, ['--git-dir=' + str(repo / '.git'), '--work-tree=' + str(repo),
                 'for-each-ref', '--include-root-refs', '--format=%(refname)'])
