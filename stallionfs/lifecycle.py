@@ -26,6 +26,7 @@ def replace_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        core.sync_directory(path.parent)
     finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)
@@ -101,8 +102,6 @@ class Lifecycle:
                  'enrolled': enrolled,
                  'object': identity(path), 'payload': identity(self._payload(path, meta))}
         replace_json(state_path, state)
-        if meta.get('backend') == 'native-image':
-            core.sync_directory(state_path.parent)
         protection = self.root / 'protected' / f'{workspace}.json'
         if (meta.get('backend') != 'native-image' and path.parent == self.root / 'workspaces'
                 and os.path.lexists(protection)):

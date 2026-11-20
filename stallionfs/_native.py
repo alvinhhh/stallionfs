@@ -44,9 +44,7 @@ def failure(message, result):
 
 def _persist(path, value):
     from .lifecycle import replace_json
-    from .core import sync_directory
     replace_json(path, value)
-    sync_directory(path.parent)
 
 
 def _same(info):
