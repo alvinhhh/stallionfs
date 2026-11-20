@@ -899,6 +899,41 @@ class LifecycleTests(unittest.TestCase):
                 images.flush(image)
         self.assertEqual((self.base / 'retained.sparseimage').read_bytes(), b'keep image')
 
+    def test_remove_detaches_image_before_scanning_its_mount_directory(self):
+        from stallionfs import images
+        image = self.path / 'workspace.sparseimage'
+        image.write_bytes(b'keep image')
+        point = self.path / 'volume'
+        point.mkdir(mode=0o700)
+        events = point / '.fseventsd'
+        events.mkdir()
+        lifecycle.replace_json(self.path / 'meta.json', {**self.meta, 'backend': 'image'})
+        target = self.store.root / 'trash' / self.workspace
+        scandir = os.scandir
+
+        def scan(path):
+            if path == str(events):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            return scandir(path)
+
+        with patch.object(core.os, 'scandir', side_effect=scan):
+            with patch.object(images, 'detach', side_effect=StallionError('image is busy')) as detach:
+                with self.assertRaisesRegex(StallionError, 'image is busy'):
+                    self.store.move(self.workspace)
+                detach.assert_called_once_with(image, point)
+            self.assertEqual([item['id'] for item in self.store.list()], [self.workspace])
+            self.assertFalse(target.exists())
+            self.assertEqual(image.read_bytes(), b'keep image')
+            self.assertTrue(events.is_dir())
+
+            with patch.object(images, 'detach', side_effect=lambda *_: events.rmdir()) as detach:
+                result = self.store.move(self.workspace)
+                detach.assert_called_once_with(image, point)
+            self.assertEqual(self.store.list(), [])
+            self.assertEqual([item['id'] for item in self.store.list('trash')], [self.workspace])
+            self.assertEqual(Path(result['path']), target / image.name)
+            self.assertEqual(Path(result['path']).read_bytes(), b'keep image')
+
     def test_external_git_storage_and_config_references_are_rejected(self):
         gitdir = self.repo / '.git'
         cases = ('alternates', 'include', 'commondir', 'worktrees')

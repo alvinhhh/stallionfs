@@ -1055,13 +1055,13 @@ class Store(Lifecycle):
                     from ._native_recovery import move_locked
                     native_result[0] = move_locked(self, workspace, restore=restore)
                     return native_result[0]
-                self._guard_native_tree(path)
                 target = self.root / destination / workspace
                 if target.exists() or target.is_symlink():
                     raise StallionError("Destination already exists")
                 if metadata.get("backend") == "image":
                     from . import images
                     images.detach(path / "workspace.sparseimage", path / "volume")
+                self._guard_native_tree(path)
                 self._open(workspace, path, metadata)
                 path.rename(target)
                 self._open(workspace, target, metadata)
