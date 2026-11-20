@@ -57,6 +57,17 @@ class ArgumentErrors(unittest.TestCase):
         for args in (['--root', '--json', 'copy'], ['run', 'id', '--', '--json']):
             self.assertFalse(cli._json_arguments(args))
 
+    def test_abbreviated_global_options_are_recognized(self):
+        for prefix in (['--roo', '/unused', '--json'], ['--ro=/unused', '--json'],
+                       ['--roo', '/unused', '--js'], ['--js', '--r', '/unused']):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(cli._json_arguments(prefix + ['prepare']))
+                code, output, errors = self.invoke(prefix + ['prepare'])
+                self.assertEqual((code, output), (2, ''))
+                self.assertEqual(set(json.loads(errors)), {'error'})
+        self.assertEqual(cli._global_arguments(['--roo', '/r', 'prepare', 'x', '--', 'make']), (False, 2))
+        self.assertFalse(cli._json_arguments(['--roo', '--json', 'copy']))
+
     def test_helper_preserves_native_alias_and_version(self):
         with patch.dict(cli.os.environ, {'STALLIONFS_CLI_PROG': 'sfs'}):
             code, output, errors = self.invoke(['--help'], 'stallionfs-python')

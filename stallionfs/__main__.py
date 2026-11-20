@@ -62,19 +62,37 @@ def _creation_purge_output(result, root):
     return status in {'preview', 'purged'}, '\n'.join(lines)
 
 
-def _json_arguments(raw):
-    index = 0
+GLOBAL_OPTIONS = ('--help', '--version', '--root', '--json')
+
+
+def _global_option(option):
+    """The global option `option` names, accepting unique prefixes as argparse does."""
+    name = option.split('=', 1)[0]
+    if name in GLOBAL_OPTIONS or not name.startswith('--') or len(name) < 3:
+        return name if name in GLOBAL_OPTIONS else None
+    matches = [known for known in GLOBAL_OPTIONS if known.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _global_arguments(raw):
+    """Whether --json was given before the command, and the command's index."""
+    index, json_errors = 0, False
     while index < len(raw):
         option = raw[index]
-        if option == '--json':
-            return True
-        if option == '--root':
+        name = _global_option(option)
+        if name == '--json' and '=' not in option:
+            json_errors = True
+        if name == '--root' and '=' not in option:
             index += 2
-        elif option.startswith('-') and option != '--':
+        elif name is not None or (option.startswith('-') and option != '--'):
             index += 1
         else:
             break
-    return False
+    return json_errors, index
+
+
+def _json_arguments(raw):
+    return _global_arguments(raw)[0]
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -206,15 +224,7 @@ def main(argv=None):
     for command_parser in commands.choices.values():
         command_parser.json_errors = parser.json_errors
     setup = []
-    command_index = 0
-    while command_index < len(raw):
-        option = raw[command_index]
-        if option == "--root":
-            command_index += 2
-        elif option == "--json" or option.startswith("--root="):
-            command_index += 1
-        else:
-            break
+    command_index = _global_arguments(raw)[1]
     if (command_index < len(raw) and raw[command_index] == "prepare"
             and "--" in raw[command_index + 1:]):
         index = raw.index("--", command_index + 1)
