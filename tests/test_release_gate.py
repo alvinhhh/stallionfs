@@ -122,7 +122,43 @@ class ReleaseGate(unittest.TestCase):
                              decision='insufficient_samples', native=None, candidate=None)
         result = evaluate(document)
         self.assertFalse(result['passed'])
-        self.assertIn('not comparable: no valid elapsed paired comparison', result['cases'][0]['reasons'])
+        self.assertIn('no comparable reference', result['cases'][0]['reasons'])
+        self.assertTrue(result['cases'][0]['references'][0]['excluded'])
+
+    def test_loss_only_reference_excluded_but_other_failures_are_not(self):
+        document = report()
+        lost = report()
+        for row in lost['rows']:
+            row['reference'] = 'lossy'
+            if row['method'] == 'native':
+                row.update(validated=False, correctness={'strict_equal': False,
+                           'candidate_losses': [{'field': 'acl'}]})
+        for comparison in lost['comparisons']:
+            comparison['reference'] = 'lossy'
+            for value in comparison['metrics'].values():
+                value.update(complete_pairs=0, excluded_pairs=[{'pair_id': 0}],
+                             decision='insufficient_samples', native=None, candidate=None)
+        for key in ('rows', 'comparisons'):
+            document[key].extend(lost[key])
+        document['unavailable'] = [dict(reference='lossy', cache='warm', method='native',
+            reason='method failed; remaining identical attempts skipped')]
+        self.assertTrue(evaluate(document)['passed'])
+        for change in ({'reason': 'timeout'}, {'reason': 'setup failure'},
+                       {'failed_methods': ['candidate']}):
+            with self.subTest(change=change):
+                invalid = copy.deepcopy(document)
+                invalid['unavailable'][0].update(change)
+                self.assertFalse(evaluate(invalid)['passed'])
+        for change in ({'completion_uncertain': True}, {'source_unchanged': False},
+                       {'ok': False}, {'validated': False}):
+            with self.subTest(candidate=change):
+                invalid = copy.deepcopy(document)
+                next(row for row in invalid['rows'] if row['reference'] == 'lossy' and
+                     row['method'] == 'candidate').update(change)
+                self.assertFalse(evaluate(invalid)['passed'])
+        missing = copy.deepcopy(document)
+        missing['rows'] = [row for row in missing['rows'] if row['reference'] != 'lossy']
+        self.assertFalse(evaluate(missing)['passed'])
 
     def test_reference_execution_and_source_failures_still_fail(self):
         for change in ({'ok': False}, {'exit_code': 1}, {'completion_uncertain': True},

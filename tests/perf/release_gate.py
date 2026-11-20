@@ -62,10 +62,11 @@ def native_groups(document):
             context = tuple(record.get(key) for key in ('run', 'cache', 'output', 'reference'))
             key = (case, context)
             group = groups.setdefault(key, {'case': case, 'reference': str(context),
-                                            'metrics': {}, 'rows': {},
+                                            'metrics': {}, 'rows': {}, 'unavailable': [],
                                             'errors': document_errors(document)})
             if kind == 'unavailable':
                 group['errors'].append('unavailable')
+                group['unavailable'].append(record)
                 continue
             phase = record.get('phase')
             if kind == 'rows':
@@ -134,6 +135,20 @@ def reference_losses(row):
     return None
 
 
+def operation_failed(row):
+    correctness = row.get('correctness', {})
+    return (row.get('ok') is not True or row.get('exit_code', 0) != 0 or
+            row.get('completion_uncertain') or row.get('source_unchanged') is False or
+            row.get('source_verification', {}).get('unchanged') is False or
+            row.get('source_precheck', {}).get('unchanged') is False or
+            row.get('counts_validated') is False or
+            not reference_losses(row) and
+            (row.get('validated') is not True or correctness.get('passed') is False or
+             correctness.get('strict_equal') is False or
+             any(correctness.get(key) is False for key in
+                 ('sparse_preserved', 'independent_clone', 'move_identity', 'move_source_absent'))))
+
+
 def row_errors(phases):
     errors = []
     if not phases.get('timing'):
@@ -141,17 +156,7 @@ def row_errors(phases):
     for phase, rows in phases.items():
         methods = {}
         for row in rows:
-            correctness = row.get('correctness', {})
-            if (row.get('ok') is not True or row.get('exit_code', 0) != 0 or
-                    row.get('completion_uncertain') or row.get('source_unchanged') is False or
-                    row.get('source_verification', {}).get('unchanged') is False or
-                    row.get('source_precheck', {}).get('unchanged') is False or
-                    row.get('counts_validated') is False or
-                    not reference_losses(row) and
-                    (row.get('validated') is not True or correctness.get('passed') is False or
-                     correctness.get('strict_equal') is False or
-                     any(correctness.get(key) is False for key in
-                         ('sparse_preserved', 'independent_clone', 'move_identity', 'move_source_absent')))):
+            if operation_failed(row):
                 errors.append('row correctness/validation failed')
             if row.get('warmup'):
                 continue
@@ -202,8 +207,18 @@ def evaluate_group(group):
     errors.extend(floor_errors)
     warnings = [reference_losses(row) for rows in group['rows'].values() for row in rows
                 if reference_losses(row)]
+    excluded = (bool(warnings) and
+                not (valid_metric(wall) and any(valid_metric(metrics.get(metric))
+                                               for metric in ('cpu_s', 'rss_bytes'))) and
+                not any(operation_failed(row) for rows in group['rows'].values() for row in rows) and
+                all(error == 'unavailable' for error in group['errors']) and
+                all(record.get('reason') in ('method failed; remaining identical attempts skipped',
+                                            'pair unavailable after a method failed; neither side repeated')
+                    and set(record.get('failed_methods', [record.get('method')])) <=
+                    {warning['method'] for warning in warnings}
+                    for record in group.get('unavailable', [])))
     return {**group, 'passed': not errors, 'floor_passed': not floor_errors,
-            'reference_losses': warnings,
+            'reference_losses': warnings, 'excluded': excluded,
             'reasons': sorted(set(errors))}
 
 
@@ -221,11 +236,14 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
                 collected[group['case']].append(evaluate_group(group))
     cases = []
     for case, groups in collected.items():
-        reasons = sorted({reason for group in groups for reason in group['reasons']})
+        required = [group for group in groups if not group['excluded']]
+        reasons = sorted({reason for group in required for reason in group['reasons']})
         if not groups:
             reasons = ['not collected']
+        elif not required:
+            reasons.append('no comparable reference')
         cases.append({'case': case, 'passed': bool(groups) and not reasons,
-                      'floor_passed': (all(group['floor_passed'] for group in groups) if groups else
+                      'floor_passed': (all(group['floor_passed'] for group in required) if required else
                                        'tiny_4kib' not in case and not bulk_case(case)),
                       'reasons': reasons, 'references': groups})
     passing = sum(case['passed'] for case in cases)
@@ -334,7 +352,9 @@ def main(argv=None):
                     ({'sparse_preserved'} if warning['correctness'].get('sparse_preserved') is False else set())))
                     for group in value['references'] for warning in group['reference_losses']})
                 if losses:
-                    detail += '; reference losses (not candidate failures): ' + '; '.join(losses)
+                    detail += '; reference not comparable: ' + '; '.join(losses) if any(
+                        group['excluded'] for group in value['references']) else (
+                        '; reference losses (not candidate failures): ' + '; '.join(losses))
                 details.append(f'R{i + 1}: {detail}' + ('; ' + measured if measured else ''))
             print(case + ' | ' + ' | '.join('PASS' if value['passed'] else 'FAIL' for value in values)
                   + ' | ' + ' / '.join(details))

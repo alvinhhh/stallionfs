@@ -129,10 +129,13 @@ follow summary/campaign links; overlapping files cannot establish independent ru
 Native and CLI comparisons retain each recorded reference, cache and output form;
 both API bulk variants must beat POSIX. The gate consumes existing paired decisions,
 requires at least ten complete pairs and correctness for every candidate operation.
-Reference preservation losses are shown, not attributed to the candidate; command
-failures, source changes and uncertainty still fail. Existing invalid or absent
-comparisons remain `not comparable`: the gate does not regenerate paired decisions
-or recover samples the collector excluded. Against every recorded reference,
+Reference preservation losses are shown, not attributed to the candidate. A
+reference with no valid comparison solely because its own rows lost metadata or
+sparse holes is excluded and listed as `reference not comparable: <losses>`.
+At least one reference must remain comparable. Missing evidence, setup failures,
+command failures, source changes and uncertainty still fail the case, including
+on excluded-reference candidate operations. The gate does not regenerate paired
+decisions or recover samples the collector excluded. Against every comparable reference,
 elapsed must win beyond noise and either CPU or peak process RSS must also win.
 At least 90% of cases must
 pass, every tiny-file case must save at least 0.01 ms in median paired elapsed time,
@@ -141,7 +144,7 @@ Qualification requires at least three passing runs with identical per-case verdi
 The command prints reasons and native-to-StallionFS medians, writes full evidence
 and verdicts with `--json`, and exits nonzero unless qualified. One or two runs can
 be inspected but cannot qualify. Missing RSS can be covered by a valid CPU win;
-unavailable or failed recorded operations cannot. No missing collector is supplied
+other unavailable or failed operations cannot. No missing collector is supplied
 by this gate. Linux/OpenZFS native-only descriptive results do not qualify as
 paired product comparisons; the platform/cache/memory caveats above still apply.
 
