@@ -1,5 +1,11 @@
 # Usage
 
+Use `sfs --help` (or `sfs COMMAND --help`) for options and `sfs --version`
+for the version. Argument errors exit 2; operational errors normally exit 1.
+With `--json` before the command, argument errors print one `{"error": "..."}`
+object on stdout, without usage text. Operational error receipts remain on stderr.
+Without `--json`, argument errors print usage and diagnostics on stderr.
+
 ## File operations
 
 ```sh

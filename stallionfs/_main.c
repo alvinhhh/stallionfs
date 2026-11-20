@@ -13,10 +13,14 @@
 #include "_tree.h"
 
 static volatile sig_atomic_t interrupted;
+static const char *program = "stallionfs";
 static void interrupt(int value) { interrupted = value; }
 static int cancelled(void *unused) { (void)unused; return interrupted != 0; }
 
 static int python(int argc, char **argv) {
+    const char *prog = strrchr(argv[0], '/');
+    prog = prog ? prog + 1 : argv[0];
+    if (setenv("STALLIONFS_CLI_PROG", !strcmp(prog, "sfs") ? "sfs" : "stallionfs", 1)) return -1;
     uint32_t size = 0;
     _NSGetExecutablePath(NULL, &size);
     char *raw = malloc(size);
@@ -85,11 +89,13 @@ static int report_error(int json, const char *path, int error) {
         if (path && *path) { json_text(stderr, path); fputs(": ", stderr); }
         json_text(stderr, strerror(error));
         fputs("\"}\n", stderr);
-    } else fprintf(stderr, "stallionfs: %s%s%s\n", path ? path : "", path && *path ? ": " : "", strerror(error));
+    } else fprintf(stderr, "%s: %s%s%s\n", program, path ? path : "", path && *path ? ": " : "", strerror(error));
     return interrupted ? 128 + interrupted : 1;
 }
 
 int main(int argc, char **argv) {
+    program = strrchr(argv[0], '/');
+    program = program ? program + 1 : argv[0];
     int json = 0, command = 1;
     while (command < argc) {
         if (!strcmp(argv[command], "--json")) { json = 1; command++; }
@@ -193,7 +199,17 @@ output:
     if (fflush(stdout) == EOF || ferror(stdout)) { errno = EIO; goto failed; }
     return 0;
 usage:
-    fprintf(stderr, "stallionfs: invalid arguments; use stallionfs %s --help\n", name);
+    {
+        const char *prog = strrchr(argv[0], '/');
+        prog = prog ? prog + 1 : argv[0];
+        if (json) {
+            fputs("{\"error\":\"invalid arguments; use ", stdout);
+            json_text(stdout, prog);
+            fputc(' ', stdout);
+            json_text(stdout, name);
+            fputs(" --help\"}\n", stdout);
+        } else fprintf(stderr, "%s: invalid arguments; use %s %s --help\n", prog, prog, name);
+    }
     return 2;
 failed:
     return report_error(json, NULL, errno);
@@ -203,6 +219,6 @@ helper:
         goto output;
     }
     python(argc, argv);
-    fprintf(stderr, "stallionfs: cannot run installed Python helper: %s\n", strerror(errno));
+    fprintf(stderr, "%s: cannot run installed Python helper: %s\n", program, strerror(errno));
     return 1;
 }
