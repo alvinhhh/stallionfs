@@ -102,7 +102,10 @@ def structure(repo, *, branch=None, allow_shallow=False):
                     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'unsafe-reftable')
             finally:
                 os.close(table)
-        return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(gitdir)), 'config': config_identity}
+        result = {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(gitdir)), 'config': config_identity}
+        if allow_shallow:
+            result['shallow'] = read_at(gitdir, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(gitdir) else None
+        return result
     finally:
         if gitdir is not None:
             os.close(gitdir)
