@@ -168,6 +168,25 @@ class Lifecycle:
             core.clone_tree(source, target)
 
     @contextlib.contextmanager
+    def _capture_payload(self, path, meta, *, quiescent):
+        payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+        try:
+            yield payload
+        except BaseException as original:
+            if remount:
+                try:
+                    self._mount(path, meta)
+                except BaseException as error:
+                    try:
+                        original.add_note(f'Workspace remount failed: {error}')
+                    except (AttributeError, MemoryError):
+                        pass
+            raise
+        else:
+            if remount:
+                self._mount(path, meta)
+
+    @contextlib.contextmanager
     def _retention(self):
         with core.lock(self.root / 'locks' / 'retention', blocking=False):
             import itertools
@@ -201,8 +220,7 @@ class Lifecycle:
             if not isinstance(name, str) or len(name) > 128:
                 raise core.StallionError('Snapshot name must be at most 128 characters')
             self._open(workspace, path, meta)
-            with self._retention():
-                payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+            with self._retention(), self._capture_payload(path, meta, quiescent=quiescent) as payload:
                 value = uuid.uuid4().hex
                 with self.staging() as stage:
                     self._clone_payload(payload, stage / payload.name, meta)
@@ -210,8 +228,6 @@ class Lifecycle:
                               'backend': meta.get('backend', 'folder'), 'payload': identity(stage / payload.name)}
                     core.write_json(stage / 'meta.json', record)
                     stage.rename(self.root / 'snapshots' / value)
-            if remount:
-                self._mount(path, meta)
             return record
 
     @staticmethod
@@ -340,8 +356,7 @@ class Lifecycle:
             if saved['backend'] != meta.get('backend', 'folder'):
                 raise core.StallionError('Snapshot backend does not match workspace')
             self._open(workspace, path, meta)
-            with self._retention():
-                payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+            with self._retention(), self._capture_payload(path, meta, quiescent=quiescent) as payload:
                 recovery = uuid.uuid4().hex
                 slot = self.root / 'recovery' / recovery
                 source, saved = self._snapshot(snapshot, workspace)
@@ -365,8 +380,6 @@ class Lifecycle:
                     except BaseException as recovery_error:
                         original.add_note(f'Rollback reconciliation failed; retain {slot}: {recovery_error}')
                     raise
-            if remount:
-                self._mount(path, meta)
             return {'workspace': workspace, 'snapshot': snapshot, 'recovery': recovery}
 
     def enroll(self, workspace, *, enabled=True):

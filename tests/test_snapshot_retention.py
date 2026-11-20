@@ -94,6 +94,42 @@ class SnapshotRetention(unittest.TestCase):
             'payload': self.lifecycle.identity(image)})
         return snapshot
 
+    def test_snapshot_clone_failure_remounts_and_preserves_error(self):
+        original = OSError('snapshot clone failed')
+        self.clone.side_effect = original
+        with self.assertRaises(OSError) as caught:
+            self.store.snapshot(self.workspace)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(self.attached)
+        self.mount.assert_called_once()
+        self.assertEqual(list((self.store.root / 'snapshots').iterdir()), [])
+
+    def test_rollback_clone_failure_remounts_and_preserves_error(self):
+        snapshot = self.saved_snapshot()
+        original = OSError('rollback clone failed')
+        self.clone.side_effect = original
+        with self.assertRaises(OSError) as caught:
+            self.store.rollback(self.workspace, snapshot)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(self.attached)
+        self.mount.assert_called_once()
+        self.assertEqual(self.image.read_bytes(), b'owned synthetic image')
+        self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+
+    def test_remount_failure_does_not_mask_clone_failure(self):
+        snapshot = self.saved_snapshot()
+        for operation in (lambda: self.store.snapshot(self.workspace),
+                          lambda: self.store.rollback(self.workspace, snapshot)):
+            with self.subTest(operation=operation):
+                self.attached = True
+                original = OSError('clone failed')
+                self.clone.side_effect = original
+                self.mount.side_effect = OSError('remount failed')
+                with self.assertRaises(OSError) as caught:
+                    operation()
+                self.assertIs(caught.exception, original)
+                self.assertTrue(any('remount failed' in note for note in original.__notes__))
+
     def test_full_retention_refuses_rollback_without_detaching_workspace(self):
         snapshot = self.saved_snapshot()
         for index in range(self.lifecycle.RETENTION_COUNT - 1):
@@ -129,3 +165,27 @@ class SnapshotRetention(unittest.TestCase):
         self.assertEqual((recovery / self.image.name).read_bytes(), b'owned synthetic image')
         self.assertEqual(self.core.read_json(recovery / 'meta.json')['outcome'], 'exchanged')
         self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+
+    def test_rollback_exchange_error_reconciles_before_remount(self):
+        snapshot = self.saved_snapshot()
+        original = OSError('exchange response failed')
+        def exchange(source, target, *, exchange):
+            temporary = source.with_name('exchange-temporary')
+            source.rename(temporary)
+            target.rename(source)
+            temporary.rename(target)
+            raise original
+        def remount(*args):
+            self.assertEqual(list((self.store.root / 'journals').iterdir()), [])
+            recovery, = (self.store.root / 'recovery').iterdir()
+            self.assertEqual(self.core.read_json(recovery / 'meta.json')['outcome'], 'exchanged')
+            self.assertEqual(self.image.read_bytes(), b'saved image')
+            return self.remount(*args)
+        self.mount.side_effect = remount
+        scan = sys.modules[self.package + '._scan']
+        with patch.object(scan, 'move', side_effect=exchange, create=True):
+            with self.assertRaises(OSError) as caught:
+                self.store.rollback(self.workspace, snapshot)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(self.attached)
+        self.mount.assert_called_once()
