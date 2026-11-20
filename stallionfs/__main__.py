@@ -169,7 +169,8 @@ def main(argv=None):
     purge.add_argument("kind", choices=("snapshots", "recovery", "trash"))
     purge.add_argument("id")
     purge.add_argument("--yes", action="store_true", help="Permanently delete selected data, including all snapshots inside a native image")
-    commands.add_parser("doctor", help="Test native cloning and write isolation")
+    doctor = commands.add_parser("doctor", help="Test native cloning and write isolation")
+    doctor.add_argument('--installation', action='store_true', help='Read-only installation checks and removal plan; no clone test')
     from . import benchmark
     benchmark.parser(commands)
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -206,6 +207,15 @@ def main(argv=None):
                 parser.error(label + ' must contain 32 lowercase hexadecimal characters')
         if args.native_host is not None and args.continue_operation is None:
             parser.error('--native-host requires --continue')
+    if args.action == 'doctor' and args.installation:
+        from ._installation import inspect, describe
+        try:
+            result = inspect(args.root)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(json.dumps({'error': str(error)}) if args.json else 'stallionfs: ' + str(error), file=sys.stderr)
+            return 1
+        print(json.dumps(result, sort_keys=True) if args.json else describe(result))
+        return 0 if result['ready'] else 1
     if args.action == 'command':
         if any(value == '--root' or value.startswith('--root=') for value in raw[:command_index]):
             parser.error('--root applies to workspace commands')
