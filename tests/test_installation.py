@@ -66,6 +66,7 @@ class Installation(unittest.TestCase):
         self.assertEqual(result['python_helper'], '/installed/bin/stallionfs-python')
         self.assertIn('does not imply release qualification', result['qualification'])
         self.assertIn('sfs command remove', result['removal_plan'][1])
+        self.assertIn(str(installation.APP / 'Contents/Resources/Runtime/CLI/bin/sfs') + ' command remove', result['removal_plan'][1])
         self.assertIn('System Settings', result['removal_plan'][2])
         self.assertIn('Trash', result['removal_plan'][3])
         self.assertIn('Your workspaces, snapshots and recovery data in ' + str(self.root), result['removal_plan'][4])
@@ -108,14 +109,17 @@ class Installation(unittest.TestCase):
         other = other_bin / 'sfs'
         other.write_bytes(b'foreign executable')
         other.chmod(0o755)
-        for path in ('~/other' + os.pathsep + str(self.bin), '~/.local/bin'):
+        for path in [prefix + '/other' + os.pathsep + str(self.bin)
+                     for prefix in ('~', '~+', '~-', '~0')] + ['~/.local/bin']:
             with self.subTest(path=path), \
                     patch.dict(os.environ, {'HOME': str(self.home), 'PATH': path}):
                 result = installation.inspect(self.root)
                 self.assertTrue(result['command']['path_ambiguous'])
                 self.assertFalse(result['checks']['command_on_path'])
                 self.assertFalse(result['ready'])
-                self.assertIn('bash and zsh resolve differently', installation.describe(result))
+                text = installation.describe(result)
+                self.assertIn('replace ~ with $HOME or an absolute path', text)
+                self.assertNotIn('PATH selects', text)
 
     def test_tilde_path_entries_that_do_not_change_the_result_are_fine(self):
         with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': str(self.bin) + os.pathsep + '~/other'}):

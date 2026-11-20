@@ -16,7 +16,7 @@ INFORMATIONAL = frozenset({'store_root_exists', 'developer_id_signature', 'gatek
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
 REMOVAL_PLAN = [
     'Stop processes using workspaces and unmount them normally. Stop if anything is busy, pending or uncertain; do not force unmount or delete data to proceed. Keep verified recovery archives and installation history outside the app.',
-    'Run sfs command remove while the app is still installed. If it was already deleted, reinstall the same version from your verified recovery copy first. Remove only your owned link; leave other files and other users\' links alone.',
+    'Run {cli} command remove (by absolute path, so PATH cannot pick another sfs) while the app is still installed. If it was already deleted, reinstall the same version from your verified recovery copy first. Remove only your owned link; leave other files and other users\' links alone.',
     'Quit the app and turn off its File System Extension in System Settings. Check that it is off and no processes are using workspaces before continuing.',
     'Move only /Applications/StallionFS.app to the Trash using Finder. Do not empty the Trash or reset system registrations.',
     'Your workspaces, snapshots and recovery data in {root} are kept — delete them yourself only if you no longer need them. Other stores, external files and recovery archives are also kept.',
@@ -45,27 +45,22 @@ def _probe(tool, arguments):
         return {'state': 'error', 'error': str(error)}
 
 
-def _path_command(name, expand_tilde):
-    """First executable `name` on PATH, with a leading ~ in entries expanded or taken literally."""
+def _path_command(name):
+    """First executable `name` on PATH, and whether a ~ entry precedes it.
+
+    Shells disagree on ~ in PATH (bash and sh expand ~, ~+, ~-, ~N and ~user; zsh
+    expands none), so the result is ambiguous when such an entry is searched first.
+    """
     for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
-        if expand_tilde and directory.startswith('~'):
-            directory = os.path.expanduser(directory)
+        if directory.startswith('~'):
+            return None, True
         candidate = Path(directory or '.') / name
         try:
             if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
+                return candidate, False
         except OSError:
             continue
-    return None
-
-
-def _same_file(left, right):
-    if left is None or right is None or left == right:
-        return left == right
-    try:
-        return os.path.samefile(left, right)
-    except OSError:
-        return False
+    return None, False
 
 
 def _same_directory(left, right):
@@ -85,11 +80,7 @@ def _command_status():
         result = _command._result(home, entry, target)
         result['dangling'] = _command._ours(entry, target) and not target.exists()
         result['executable'] = target.is_file() and os.access(target, os.X_OK)
-        # bash expands a leading ~ in PATH entries and zsh does not; the shell that will
-        # run `sfs` is unknown, so a PATH whose answer depends on it is ambiguous.
-        resolved = _path_command('sfs', expand_tilde=True)
-        literal = _path_command('sfs', expand_tilde=False)
-        result['path_ambiguous'] = not _same_file(resolved, literal)
+        resolved, result['path_ambiguous'] = _path_command('sfs')
         result['path_command'] = None if resolved is None else str(resolved)
         result['on_path'] = (resolved is not None and not result['path_ambiguous']
                              and _same_directory(resolved.parent, home / '.local/bin')
@@ -174,7 +165,7 @@ def inspect(root):
             'python_helper': str(helper), 'command': command,
             'app': app, 'signature': signature, 'gatekeeper': gatekeeper,
             'store_root': {'path': str(root), 'exists': checks['store_root_exists']},
-            'removal_plan': [step.format(root=root) for step in REMOVAL_PLAN], 'qualification': QUALIFICATION}
+            'removal_plan': [step.format(root=root, cli=APP / 'Contents/Resources/Runtime/CLI/bin/sfs') for step in REMOVAL_PLAN], 'qualification': QUALIFICATION}
 
 
 def describe(result):
@@ -191,8 +182,9 @@ def describe(result):
     elif command.get('state') == 'installed' and not command.get('executable'):
         command_text += ', target is not executable'
     if command.get('path_ambiguous'):
-        command_text += ', PATH has a ~ entry that bash and zsh resolve differently'
-    if command.get('path_command') and not command['on_path']:
+        command_text += (', PATH has a ~ entry before any sfs, which shells resolve differently;'
+                         ' replace ~ with $HOME or an absolute path')
+    elif command.get('path_command') and not command['on_path']:
         command_text += ', PATH selects ' + command['path_command']
     if command.get('error'):
         command_text += ': ' + command['error']
