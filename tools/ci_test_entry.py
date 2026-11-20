@@ -665,7 +665,20 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() in ownership_tests
         and reason.startswith('Ownership fixtures require root or passwordless sudo: ')
     ]
-    allowed_skips = capability_skips + adapter_skips + ownership_skips
+    sigkill_tests = {
+        'test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+            'test_killed_move_has_exactly_one_complete_inode_tree',
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+    }
+    sigkill_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in sigkill_tests
+        and reason.startswith('SIGKILL pause hook unavailable: ')
+    ]
+    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips
     for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
     required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [

@@ -394,6 +394,36 @@ class EntryTests(unittest.TestCase):
             self.assertTrue(refused([unrelated]))
             self.assertTrue(refused(skips + [unrelated]))
 
+    def test_sigkill_capability_skips_require_exact_test_ids_and_reason(self):
+        names = (
+            'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+            'test_killed_move_has_exactly_one_complete_inode_tree',
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+        reason = 'SIGKILL pause hook unavailable: compile: unsupported SDK'
+        skips = [(SimpleNamespace(id=lambda name=name: 'test_sigkill.ProcessDeath.' + name), reason)
+                 for name in names]
+        def refused(entries, success=True, probe=None):
+            result = SimpleNamespace(skipped=entries, contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=4)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+            self.assertFalse(refused([]))
+            for skip in skips:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(skips))
+            self.assertTrue(refused(skips, success=False))
+            self.assertTrue(refused(skips, probe='pass'))
+            for invalid_reason in ('different reason', 'SIGKILL pause hook unavailable', ''):
+                self.assertTrue(refused([(skips[0][0], invalid_reason)]))
+            for invalid_id in ('test_sigkill.ProcessDeath.test_other',
+                               'setUpClass (test_sigkill.ProcessDeath)',
+                               'test_sigkill.PauseHookCapabilities.test_unavailable_probe_skips_individual_tests'):
+                unrelated = (SimpleNamespace(id=lambda: invalid_id), reason)
+                self.assertTrue(refused([unrelated]))
+                self.assertTrue(refused(skips + [unrelated]))
+
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
         from unittest.mock import patch
