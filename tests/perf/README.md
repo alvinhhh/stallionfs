@@ -122,9 +122,12 @@ directories (or benchmark summary/native JSON files) with the stdlib-only gate:
 python3 tests/perf/release_gate.py RUN1 RUN2 RUN3 --json release-gate.json
 ```
 
-The fixed denominator is all 33 non-catalog-only `sfs benchmark --list` cases,
-including native commands, scanner APIs and workspace references. Missing cases
-are reported as `not collected`, never dropped. Directories combine reports and
+The fixed denominator is all 37 `sfs benchmark --list` cases, including native
+commands, scanner APIs and workspace references. Missing cases are reported as
+`not collected`, never dropped. The four catalog-only cases have no native
+reference or collector yet, so they count as failing; until they gain a baseline
+at most 33 of 37 (89%) can pass. Stopped or fingerprint-invalidated campaign
+stages fail the run. Directories combine reports and
 follow summary/campaign links; overlapping files cannot establish independent runs.
 Native and CLI comparisons retain each recorded reference, cache and output form;
 both API bulk variants must beat POSIX. The gate consumes existing paired decisions,

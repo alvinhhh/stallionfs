@@ -44,14 +44,21 @@ def evaluate(document):
 
 
 class ReleaseGate(unittest.TestCase):
-    def test_universe_matches_catalog_except_catalog_only(self):
-        self.assertEqual(len(gate.UNIVERSE), 33)
-        self.assertEqual(set(gate.UNIVERSE),
-                         {case['id'] for case in gate.CATALOG} - gate.CATALOG_ONLY)
+    def test_universe_counts_every_catalog_case(self):
+        self.assertEqual(len(gate.UNIVERSE), 37)
+        self.assertEqual(set(gate.UNIVERSE), {case['id'] for case in gate.CATALOG})
+
+    def test_uncollectable_catalog_only_cases_fail_in_denominator(self):
+        result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE
+                                          if case not in gate.CATALOG_ONLY])
+        self.assertEqual((result['passing_cases'], result['total_cases']), (33, 37))
+        self.assertFalse(result['passed'])
+        case = next(case for case in result['cases'] if case['case'] == 'cli/volumes/volumes')
+        self.assertEqual(case['reasons'], ['catalog only: no native reference or collector'])
 
     def test_all_pass(self):
         result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE])
-        self.assertEqual(result['passing_cases'], 33)
+        self.assertEqual(result['passing_cases'], 37)
         self.assertTrue(gate.qualify([result, copy.deepcopy(result), copy.deepcopy(result)])['qualified'])
 
     def test_89_versus_90_percent(self):
@@ -181,7 +188,7 @@ class ReleaseGate(unittest.TestCase):
         document = next(d for d in documents if d['case_id'] == 'native/copy/tiny_4kib')
         document['comparisons'][0]['metrics']['wall_s']['paired_median_savings'] = 0
         result = gate.evaluate_documents(documents)
-        self.assertEqual(result['passing_cases'], 32)
+        self.assertEqual(result['passing_cases'], 36)
         self.assertFalse(result['passed'])
 
     def test_bulk_floor(self):
@@ -198,7 +205,7 @@ class ReleaseGate(unittest.TestCase):
         document = next(d for d in documents if d['case_id'] == 'fileops/clone/flat_2000')
         document['comparisons'][0]['metrics']['wall_s'] = metric('wall_s', 100, 99)
         result = gate.evaluate_documents(documents)
-        self.assertEqual(result['passing_cases'], 32)
+        self.assertEqual(result['passing_cases'], 36)
         self.assertFalse(result['passed'])
 
     def test_elapsed_must_win_not_just_cpu_and_rss(self):
@@ -321,6 +328,29 @@ class ReleaseGate(unittest.TestCase):
             case = next(case for case in result['cases'] if case['case'] == 'fileops/move/large_64mib')
             self.assertTrue(case['passed'])
             self.assertEqual(len(case['references']), 1)
+
+    def test_stopped_or_invalidated_campaign_fails_its_reports(self):
+        for stage in ({'output': 'summary.json', 'fingerprints_unchanged': False},
+                      {'output': 'summary.json', 'status': 'stopped', 'completion_uncertain': True}):
+            with tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                (root / 'native.json').write_text(json.dumps(report()))
+                (root / 'summary.json').write_text(json.dumps({'report': 'native.json'}))
+                (root / 'campaign.json').write_text(json.dumps({'stages': [stage]}))
+                result = gate.load_run(root)
+                self.assertTrue(result['input_errors'])
+                self.assertFalse(result['passed'])
+
+    def test_summary_directory_still_reads_sibling_reports(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'native.json').write_text(json.dumps(report()))
+            (root / 'summary.json').write_text(json.dumps({'report': 'native.json'}))
+            (root / 'cli').mkdir()
+            (root / 'cli' / 'native.json').write_text(json.dumps(report('cli/clone/tiny_4kib')))
+            result = gate.load_run(root)
+            passed = {case['case'] for case in result['cases'] if case['passed']}
+            self.assertEqual(passed, {'fileops/move/large_64mib', 'cli/clone/tiny_4kib'})
 
     def test_invalid_empty_and_missing_inputs_fail_closed(self):
         with tempfile.TemporaryDirectory() as name:

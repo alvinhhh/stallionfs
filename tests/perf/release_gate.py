@@ -17,7 +17,7 @@ CATALOG_ONLY = {'cli/scan/empty', 'cli/scan/nested_1000',
                 'cli/volumes/volumes', 'cli/move/tiny_4kib'}
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
                             'stallionfs' / '_benchmark_cases.py'))['CASES']
-UNIVERSE = tuple(case['id'] for case in CATALOG if case['id'] not in CATALOG_ONLY)
+UNIVERSE = tuple(case['id'] for case in CATALOG)
 
 
 def number(value):
@@ -239,7 +239,8 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
         required = [group for group in groups if not group['excluded']]
         reasons = sorted({reason for group in required for reason in group['reasons']})
         if not groups:
-            reasons = ['not collected']
+            reasons = (['catalog only: no native reference or collector'] if case in CATALOG_ONLY
+                       else ['not collected'])
         elif not required:
             reasons.append('no comparable reference')
         cases.append({'case': case, 'passed': bool(groups) and not reasons,
@@ -276,6 +277,11 @@ def load_run(path):
             document = json.loads(file.read_text(), parse_constant=lambda value: None)
             if not isinstance(document, dict):
                 raise ValueError('expected a JSON object')
+            for row in [document] + list(document.get('stages', [])):
+                if (row.get('error') or row.get('completion_uncertain') or
+                        row.get('status') == 'stopped' or row.get('fingerprints_unchanged') is False):
+                    errors.append(f'{file}: collection wrapper stopped or invalidated'
+                                  + (f": {row['error']}" if row.get('error') else ''))
             if 'report' in document:
                 target = Path(document['report'])
                 read(target if target.is_absolute() else file.parent / target, True)
@@ -302,10 +308,9 @@ def load_run(path):
                       if (path / name).is_file()), None)
         if entry:
             read(entry, True)
-        else:
-            for file in sorted(path.rglob('*.json')):
-                if not file.name.endswith('.partial.json'):
-                    read(file)
+        for file in sorted(path.rglob('*.json')):
+            if not file.name.endswith('.partial.json'):
+                read(file)
     else:
         read(path, True)
     if not documents:
