@@ -509,11 +509,13 @@ class ImageRecoveryTests(unittest.TestCase):
             with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
                     patch.object(images, '_command', side_effect=command), \
                     patch.object(images, '_plist', side_effect=lambda *args: {'images': [record] if len(attempts) < 2 else []}), \
-                    patch.object(images.time, 'sleep'), patch.object(images, 'detach', wraps=images.detach) as detach:
+                    patch.object(images.time, 'sleep'), patch.object(images, 'detach', wraps=images.detach) as detach, \
+                    patch.object(images, '_detach_vanished', wraps=images._detach_vanished) as recovery:
                 with self.assertRaises(subprocess.TimeoutExpired) as caught:
                     images.build(source, destination, 1)
             self.assertIs(caught.exception, original)
-            detach.assert_called_once()
+            detach.assert_not_called()
+            recovery.assert_called_once_with(destination)
             self.assertEqual(len(attempts), 2)
 
     def test_unclassifiable_inventory_record_is_named(self):

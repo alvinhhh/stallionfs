@@ -343,13 +343,8 @@ def _detach_device(device, verify):
         time.sleep(delay)
 
 
-def detach(image, mountpoint, *, missing=False):
+def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
-    if missing:
-        image, point = _path(image), _path(mountpoint)
-        _directory(image.parent)
-        _directory(point.parent)
-        return _detach_vanished(image)
     image, point = _image(image), _path(mountpoint)
     _directory(point.parent)
     identity = _backing_identity(image)
@@ -481,7 +476,7 @@ def build(source_repo, destination_image, capacity_gib):
             # A stuck or killed create can leave the device attached after its file is gone,
             # and that record blocks classifying every other image.
             try:
-                detach(destination, point, missing=True)
+                _detach_vanished(destination)
             except BaseException as cleanup:
                 if not isinstance(cleanup, Exception):
                     cleanup.add_note(f'Image creation failed before recovery: {original}')
