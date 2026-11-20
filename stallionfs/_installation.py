@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import plistlib
+import pwd
 import shutil
 import stat
 import subprocess
@@ -45,10 +46,24 @@ def _probe(tool, arguments):
         return {'state': 'error', 'error': str(error)}
 
 
+TILDE_PATH_SHELLS = frozenset({'bash', 'sh'})
+
+
+def _login_shell():
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_shell).name
+    except (KeyError, OSError):
+        return Path(os.environ.get('SHELL', '')).name
+
+
 def _path_command(name):
-    """First executable `name` on PATH, searched as the shell does (leading ~ expanded)."""
+    """First executable `name` on PATH, searched as the login shell does.
+
+    bash and sh expand a leading ~ in PATH entries; zsh and others use it literally.
+    """
+    expand = _login_shell() in TILDE_PATH_SHELLS
     for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
-        if directory.startswith('~'):
+        if expand and directory.startswith('~'):
             directory = os.path.expanduser(directory)
         candidate = Path(directory or '.') / name
         try:

@@ -102,19 +102,32 @@ class Installation(unittest.TestCase):
                 self.assertTrue(result['checks']['command_on_path'])
                 self.assertTrue(result['ready'])
 
-    def test_tilde_path_entry_shadowing_is_detected(self):
+    def test_tilde_path_entries_follow_login_shell(self):
         other_bin = self.home / 'other'
         other_bin.mkdir()
         other = other_bin / 'sfs'
         other.write_bytes(b'foreign executable')
         other.chmod(0o755)
-        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/other' + os.pathsep + str(self.bin)}):
-            result = installation.inspect(self.root)
-        self.assertFalse(result['checks']['command_on_path'])
-        self.assertFalse(result['ready'])
-        self.assertEqual(result['command']['path_command'], str(other))
-        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/.local/bin'}):
-            self.assertTrue(installation.inspect(self.root)['checks']['command_on_path'])
+        shadowed = '~/other' + os.pathsep + str(self.bin)
+        for shell, shadow_ready, tilde_ready in (('bash', False, True), ('sh', False, True),
+                                                  ('zsh', True, False), ('fish', True, False)):
+            with self.subTest(shell=shell), \
+                    patch.object(installation, '_login_shell', return_value=shell):
+                with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': shadowed}):
+                    result = installation.inspect(self.root)
+                self.assertEqual(result['checks']['command_on_path'], shadow_ready)
+                if not shadow_ready:
+                    self.assertEqual(result['command']['path_command'], str(other))
+                with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '~/.local/bin'}):
+                    self.assertEqual(installation.inspect(self.root)['checks']['command_on_path'], tilde_ready)
+
+    def test_login_shell_comes_from_passwd(self):
+        entry = SimpleNamespace(pw_shell='/bin/zsh')
+        with patch.object(installation.pwd, 'getpwuid', return_value=entry):
+            self.assertEqual(installation._login_shell(), 'zsh')
+        with patch.object(installation.pwd, 'getpwuid', side_effect=KeyError), \
+                patch.dict(os.environ, {'SHELL': '/bin/bash'}):
+            self.assertEqual(installation._login_shell(), 'bash')
 
     def test_case_variant_of_managed_bin_counts_when_filesystem_is_case_insensitive(self):
         upper = self.home / '.LOCAL/BIN'
