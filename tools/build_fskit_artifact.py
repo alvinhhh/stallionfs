@@ -134,6 +134,24 @@ class Build:
             raise RuntimeError('Build command failed or exceeded accepted output: ' + ' '.join(public))
         return data.decode('utf-8', errors='strict').strip()
 
+    def build_wheel(self, wheel_dir, env):
+        env = {key: value for key, value in env.items() if not key.startswith('PYTHON')}
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+        env['PIP_CONFIG_FILE'] = os.devnull
+        venv = wheel_dir.parent / 'wheel-venv'
+        self.run([sys.executable, '-I', '-B', '-m', 'venv', venv], 90, env=env)
+        python = [venv / 'bin/python', '-I', '-B']
+        pip = [*python, '-m', 'pip', '--isolated']
+        self.run([*pip, 'install', '--no-deps', '--no-compile', '--only-binary=:all:',
+                  '--require-hashes', '-r', self.source / 'tools/ci-build-requirements.txt'], 90, env=env)
+        version = self.run([*python, '-c', "from importlib.metadata import version; print(version('setuptools'))"],
+                           env=env)
+        # Use the private environment rather than letting pip resolve another backend.
+        self.run([*pip, 'wheel', '--no-deps', '--no-build-isolation', '--check-build-dependencies',
+                  '--wheel-dir', wheel_dir, '--config-settings=--build-option=--plat-name=macosx-15.0-arm64',
+                  self.source], 300, env=env)
+        return version
+
     def build(self):
         source, root = self.source, self.root
         revision = self.run(['git', 'rev-parse', 'HEAD'])
@@ -194,8 +212,7 @@ class Build:
         wheel_dir = work / 'wheels'; wheel_dir.mkdir(mode=0o700)
         env = dict(os.environ, MACOSX_DEPLOYMENT_TARGET='15.0', ARCHFLAGS='-arch arm64',
                    CFLAGS='', CPPFLAGS='', CXXFLAGS='', LDFLAGS='')
-        self.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--wheel-dir', wheel_dir,
-                  '--config-settings=--build-option=--plat-name=macosx-15.0-arm64', source], 300, env=env)
+        setuptools_version = self.build_wheel(wheel_dir, env)
         built_wheel = select_wheel(wheel_dir)
         metadata = {'python_tag': 'cp313', 'target_triple': 'aarch64-apple-darwin',
                     'python_config_vars': {name: str(sysconfig.get_config_var(name) or 0)
@@ -222,7 +239,8 @@ class Build:
                     'tools': tools, 'commands': self.commands, 'wheel_build_environment': {key: env[key] for key in
                         ('MACOSX_DEPLOYMENT_TARGET', 'ARCHFLAGS', 'CFLAGS', 'CPPFLAGS', 'CXXFLAGS', 'LDFLAGS')},
                     'package': package_receipt,
-                    'wheel': {'tag': tag, 'record_and_current_source_validated': True,
+                    'wheel': {'tag': tag, 'setuptools_version': setuptools_version,
+                              'record_and_current_source_validated': True,
                               'native_members': observations,
                               'build_source_sha256': build_sources,
                               'git_source_assets': {'stallionfs/_git/' + name: {
