@@ -6,6 +6,7 @@ import fcntl
 import math
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -168,6 +169,30 @@ class Lifecycle:
             core.clone_tree(source, target)
 
     @contextlib.contextmanager
+    def _capture_payload(self, path, meta, *, quiescent, recovery_journal=None):
+        payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
+        try:
+            yield payload
+        except BaseException as original:
+            if remount and recovery_journal is not None and os.path.lexists(recovery_journal):
+                command = shlex.join(['sfs', '--root', str(self.root), 'mount', meta['id']])
+                original.add_note('Workspace left unmounted pending recovery; keep current and recovery files unchanged. '
+                                  f'Run {command} to retry rollback reconciliation before mounting.')
+                raise
+            if remount:
+                try:
+                    self._mount(path, meta)
+                except BaseException as error:
+                    try:
+                        original.add_note(f'Workspace remount failed: {error}')
+                    except (AttributeError, MemoryError):
+                        pass
+            raise
+        else:
+            if remount:
+                self._mount(path, meta)
+
+    @contextlib.contextmanager
     def _retention(self):
         with core.lock(self.root / 'locks' / 'retention', blocking=False):
             import itertools
@@ -201,16 +226,14 @@ class Lifecycle:
             if not isinstance(name, str) or len(name) > 128:
                 raise core.StallionError('Snapshot name must be at most 128 characters')
             self._open(workspace, path, meta)
-            payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
-            value = uuid.uuid4().hex
-            with self._retention(), self.staging() as stage:
-                self._clone_payload(payload, stage / payload.name, meta)
-                record = {'id': value, 'workspace': workspace, 'name': name, 'created': time.time(),
-                          'backend': meta.get('backend', 'folder'), 'payload': identity(stage / payload.name)}
-                core.write_json(stage / 'meta.json', record)
-                stage.rename(self.root / 'snapshots' / value)
-            if remount:
-                self._mount(path, meta)
+            with self._retention(), self._capture_payload(path, meta, quiescent=quiescent) as payload:
+                value = uuid.uuid4().hex
+                with self.staging() as stage:
+                    self._clone_payload(payload, stage / payload.name, meta)
+                    record = {'id': value, 'workspace': workspace, 'name': name, 'created': time.time(),
+                              'backend': meta.get('backend', 'folder'), 'payload': identity(stage / payload.name)}
+                    core.write_json(stage / 'meta.json', record)
+                    stage.rename(self.root / 'snapshots' / value)
             return record
 
     @staticmethod
@@ -339,10 +362,11 @@ class Lifecycle:
             if saved['backend'] != meta.get('backend', 'folder'):
                 raise core.StallionError('Snapshot backend does not match workspace')
             self._open(workspace, path, meta)
-            payload, remount = self._closed_payload(path, meta, quiescent=quiescent)
-            recovery = uuid.uuid4().hex
-            slot = self.root / 'recovery' / recovery
-            with self._retention():
+            journal = self.root / 'journals' / f'{workspace}.json'
+            with self._retention(), self._capture_payload(
+                    path, meta, quiescent=quiescent, recovery_journal=journal) as payload:
+                recovery = uuid.uuid4().hex
+                slot = self.root / 'recovery' / recovery
                 source, saved = self._snapshot(snapshot, workspace)
                 slot.mkdir(mode=0o700)
                 candidate = slot / payload.name
@@ -351,7 +375,6 @@ class Lifecycle:
                 record = {'id': recovery, 'workspace': workspace, 'recovery': recovery,
                           'snapshot': snapshot, 'backend': saved['backend'], 'created': time.time(),
                           'old': identity(payload), 'candidate': identity(candidate), 'outcome': 'intent'}
-                journal = self.root / 'journals' / f'{workspace}.json'
                 try:
                     core.write_json(slot / 'meta.json', record)
                     core.write_json(journal, record)
@@ -364,8 +387,6 @@ class Lifecycle:
                     except BaseException as recovery_error:
                         original.add_note(f'Rollback reconciliation failed; retain {slot}: {recovery_error}')
                     raise
-            if remount:
-                self._mount(path, meta)
             return {'workspace': workspace, 'snapshot': snapshot, 'recovery': recovery}
 
     def enroll(self, workspace, *, enabled=True):
