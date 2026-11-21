@@ -90,6 +90,17 @@ class Images(unittest.TestCase):
             self.retain = True
             raise
 
+    def test_build_empty_tree(self):
+        source = self.base / 'empty-source'
+        source.mkdir(mode=0o750)
+        image, point = self.base / 'empty.sparseimage', self.base / 'empty-mount'
+        with failure_scope(self.base, image, mountpoint=point, stage='empty-build'):
+            images.build(source, image, 1)
+            repo = images.attach(image, point)
+            self.assertEqual(list(repo.iterdir()), [])
+            self.assertEqual(stat.S_IMODE(repo.stat().st_mode), 0o750)
+            self._detach(image, point)
+
     def test_clone_ownership_busy_detach_and_recovery(self):
         first, second = self.base / 'first.sparseimage', self.base / 'second.sparseimage'
         images.clone(self.seed, first)
