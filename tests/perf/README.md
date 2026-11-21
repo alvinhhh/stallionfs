@@ -322,6 +322,8 @@ Use the lockfile from the measured revision when reproducing a historical result
 The current fixture includes security updates for Zod, follow-redirects and
 ESLint's minimatch dependency; measurements taken with earlier lockfiles keep
 their original fixture digests and do not qualify the updated fixture.
+The native export allowlist pins the current fixture. To export older
+`installed_dependencies` measurements, use the exporter from the measured revision.
 
 Use the Python and installed native executable from the same environment. The
 campaign passes its candidate executable to this stage. `stallionfs_folder`
