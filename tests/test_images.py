@@ -3,6 +3,7 @@ import os
 from contextlib import nullcontext
 from pathlib import Path
 import platform
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -166,6 +167,49 @@ class Images(unittest.TestCase):
         with self.assertRaises(StallionError):
             images.attach(image, link)
         self._detach(image, point)
+
+def _attachments_of(path):
+    inventory = plistlib.loads(subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
+                                              capture_output=True, check=True).stdout)
+    return [entry for entry in inventory.get('images', []) if entry.get('image-path') == str(path)]
+
+
+@unittest.skipUnless(os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and sys.platform == 'darwin' and int(platform.mac_ver()[0].split('.')[0] or 0) >= 26,
+                     'Set STALLIONFS_TEST_IMAGES=1 on macOS 26 or newer to run real mount checks')
+class CreateRecovery(unittest.TestCase):
+    def test_timed_out_create_leaves_no_attachment_blocking_other_images(self):
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-create-timeout-')).resolve()
+        source, seed, other = base / 'source', base / 'seed.sparseimage', base / 'other.sparseimage'
+        source.mkdir(mode=0o700)
+        (source / 'file').write_bytes(b'data')
+        real = images._command
+
+        def leftover_devices():
+            return [entity['dev-entry'] for entry in _attachments_of(seed)
+                    for entity in entry.get('system-entities', [])[:1]]
+
+        def release():
+            # Never leave a record that would block classifying later tests' images.
+            for device in leftover_devices():
+                subprocess.run(['/usr/bin/hdiutil', 'detach', device], capture_output=True)
+        self.addCleanup(release)
+
+        def stuck(*args):
+            # Reproduce the CI state: the create was killed after its device attached,
+            # and the image file is gone while hdiutil info still lists it.
+            if args[:2] == ('/usr/bin/hdiutil', 'create') and Path(args[-1]) == seed:
+                real(*args)
+                real('/usr/bin/hdiutil', 'attach', '-nobrowse', '-nomount', seed)
+                seed.unlink()
+                raise subprocess.TimeoutExpired([str(a) for a in args], images._COMMAND_SECONDS)
+            return real(*args)
+        with patch.object(images, '_command', side_effect=stuck), self.assertRaises(subprocess.TimeoutExpired):
+            images.build(source, seed, 1)
+        self.assertEqual(_attachments_of(seed), [])
+        images.build(source, other, 1)
+        self.assertIsNone(images.mounted(other))
+        shutil.rmtree(base)
+
 
 class ImageFormatErrors(unittest.TestCase):
     def test_invalid_plist_reports_an_actionable_error(self):
