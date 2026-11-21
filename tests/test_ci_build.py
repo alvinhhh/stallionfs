@@ -779,17 +779,20 @@ class RegisteredRecheck(unittest.TestCase):
             self.assertEqual(len(actual), len(set(actual)), 'duplicate-' + phase + '-cell')
             self.assertEqual(set(actual), set(expected), phase + '-cell-identities')
         self.assertIn('    name: ${{ matrix.phase }} (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})\n', execution)
-        self.assertIn("    if: github.event_name != 'workflow_dispatch'\n", execution)
+        self.assertIn('    needs: preflight\n', execution)
+        self.assertIn("    if: github.event_name != 'workflow_dispatch' && needs.preflight.result == 'success' && needs.preflight.outputs.macos == 'true'\n", execution)
         convergence = job(text, 'test')
         self.assertCountEqual(rows(convergence, False), INSTALLED, 'convergence-cell-identities')
         for line in ('    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})',
-                     '    needs: test-execution', "    if: always() && github.event_name != 'workflow_dispatch'",
+                     '    needs: [preflight, test-execution]', "    if: always() && github.event_name != 'workflow_dispatch'",
                      '    timeout-minutes: 2', '    runs-on: ubuntu-latest'):
             self.assertIn(line + '\n', convergence)
         self.assertEqual(len(re.findall(r'^      - ', convergence, re.M)), 1)
         aggregate = step(convergence, 'Require all installed and sanitizer jobs')
         self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', aggregate)
-        self.assertIn('        run: test "${EXECUTION_RESULT:-}" = success\n', aggregate, 'convergence-success-gate')
+        self.assertIn('PREFLIGHT_RESULT: ${{ needs.preflight.result }}', aggregate)
+        self.assertIn('MACOS: ${{ needs.preflight.outputs.macos }}', aggregate)
+        self.assertIn('        run: test "${PREFLIGHT_RESULT:-}" = success && { test "${EXECUTION_RESULT:-}" = success || { test "${MACOS:-}" = false && test "${EXECUTION_RESULT:-}" = skipped; }; }\n', aggregate, 'convergence-success-gate')
         for block in (execution, convergence):
             self.assertIn('      fail-fast: false\n', block)
         for mode in ('native-git-qualification', 'registered-git-recheck', 'unsigned-app-artifact'):
@@ -1643,11 +1646,11 @@ class WorkflowContractRegression(unittest.TestCase):
             ("              admitted['check']()\n          PY\n      - name: Check installed runtime", "              pass\n          PY\n      - name: Check installed runtime", fetch_check, 'sanitizer-final-admission'),
             ("              'test_image.ImageCore',", "              'test_image.ImageCoreMissing',", fetch_check, 'sanitizer-selectors'),
             (convergence_cell, convergence_cell * 2, matrix_check, 'convergence-cell-identities'),
-            ('run: test "${EXECUTION_RESULT:-}" = success\n', 'run: test "${EXECUTION_RESULT:-}" = success || true\n', matrix_check, 'convergence-success-gate'),
+            ('test "${MACOS:-}" = false && test "${EXECUTION_RESULT:-}" = skipped', 'true', matrix_check, 'convergence-success-gate'),
             ('or result.skipped or result.testsRun != 52:', 'or result.testsRun != 52:', fetch_check, 'sanitizer-skip-guard'),
             (' or result.testsRun != 52:', ':', fetch_check, 'sanitizer-completed-count-guard'),
             ('                  assert suite.countTestCases() == 52\n', '', fetch_check, 'loaded-count-assertion'),
-            ('run: test "${EXECUTION_RESULT:-}" = success', 'run: test "${EXECUTION_RESULT:-}" != failure', matrix_check, 'convergence-success-gate'),
+            ('run: test "${PREFLIGHT_RESULT:-}" = success', 'run: test "${PREFLIGHT_RESULT:-}" != failure', matrix_check, 'convergence-success-gate'),
         )
         for old, new, check, message in cases:
             changed = text.replace(old, new, 1)

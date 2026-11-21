@@ -740,8 +740,8 @@ class Workflow(unittest.TestCase):
         self.assertCountEqual([row[:3] for row in cells if row[3] == 'sanitizer'], SANITIZERS)
         self.assertIn("if: github.event_name != 'workflow_dispatch'", job(text, 'test-execution'))
         aggregate = job(text, 'test')
-        self.assertIn('needs: test-execution', aggregate)
-        self.assertIn('run: test "${EXECUTION_RESULT:-}" = success', aggregate)
+        self.assertIn('needs: [preflight, test-execution]', aggregate)
+        self.assertIn('run: test "${PREFLIGHT_RESULT:-}" = success && { test "${EXECUTION_RESULT:-}" = success', aggregate)
         self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
         self.assertIn('defaultTestLoader.discover', (ROOT / 'tools/ci_test_entry.py').read_text())
 

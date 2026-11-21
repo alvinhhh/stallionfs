@@ -1220,10 +1220,10 @@ class WorkflowTests(unittest.TestCase):
         legacy = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)'\}$", gate, re.MULTILINE)
         self.assertEqual(legacy, expected)
         self.assertIn('    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.images }})\n', gate)
-        self.assertIn('    needs: test-execution\n', gate)
+        self.assertIn('    needs: [preflight, test-execution]\n', gate)
         self.assertIn("    if: always() && github.event_name != 'workflow_dispatch'\n", gate)
         self.assertIn('EXECUTION_RESULT: ${{ needs.test-execution.result }}', gate)
-        self.assertIn('    if: github.event_name != \'workflow_dispatch\'\n', worker)
+        self.assertIn("    if: github.event_name != 'workflow_dispatch' && needs.preflight.result == 'success' && needs.preflight.outputs.macos == 'true'\n", worker)
         self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
         self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 30 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 60 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
         self.assertIn('      fail-fast: false\n', worker)
@@ -1255,10 +1255,11 @@ class WorkflowTests(unittest.TestCase):
     def test_legacy_gate_runs_actual_success_only_command(self):
         _, gate = self.workflow()
         script = re.search(r'^        run: (.+)$', gate, re.MULTILINE)[1]
-        self.assertEqual(script, 'test "${EXECUTION_RESULT:-}" = success')
+        self.assertEqual(script, 'test "${PREFLIGHT_RESULT:-}" = success && { test "${EXECUTION_RESULT:-}" = success || { test "${MACOS:-}" = false && test "${EXECUTION_RESULT:-}" = skipped; }; }')
         for outcome in (None, '', 'success', 'failure', 'cancelled', 'skipped', 'unknown', 'success\n', '$(printf success)'):
             with self.subTest(outcome=outcome):
                 environment = dict(os.environ)
+                environment.update(PREFLIGHT_RESULT='success', MACOS='true')
                 environment.pop('EXECUTION_RESULT', None)
                 if outcome is not None:
                     environment['EXECUTION_RESULT'] = outcome
