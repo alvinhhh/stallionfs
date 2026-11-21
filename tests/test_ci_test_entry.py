@@ -482,7 +482,7 @@ class EntryTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
 
-    def test_workspace_sigkill_capability_skips_require_exact_ids_and_reasons(self):
+    def test_workspace_sigkill_skips_require_exact_ids_reasons_and_nonqualification(self):
         folder_names = (
             'test_killed_create_publishes_only_complete_workspace',
             'test_killed_snapshot_publishes_only_complete_capture',
@@ -506,7 +506,7 @@ class EntryTests(unittest.TestCase):
             result = SimpleNamespace(skipped=skips, contextual_successes=0, activation_successes=0,
                                      wasSuccessful=lambda: success, testsRun=8)
             return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
             valid = [skipped(name, hook) for name in folders + images] + [skipped(name, image) for name in images]
             for skip in valid:
                 self.assertFalse(refused([skip]))
@@ -519,6 +519,18 @@ class EntryTests(unittest.TestCase):
             self.assertFalse(refused(root_skips))
             self.assertTrue(refused(root_skips, success=False))
             self.assertTrue(refused(root_skips, probe='pass'))
+            for image_flag in ('0', '1'):
+                with patch.dict(os.environ, STALLIONFS_QUALIFICATION='1', STALLIONFS_TEST_IMAGES=image_flag):
+                    self.assertFalse(refused([]))
+                    self.assertTrue(refused([], success=False))
+                    for skip in valid + root_skips:
+                        with self.subTest(test=skip[0].id(), reason=skip[1], images=image_flag):
+                            output = io.StringIO()
+                            with contextlib.redirect_stderr(output):
+                                self.assertTrue(refused([skip]))
+                            self.assertIn(f'Qualification requires {skip[0].id()}: skipped: {skip[1]}',
+                                          output.getvalue())
+                    self.assertTrue(refused(valid + root_skips))
             native_delete = skipped(folders[-1], root_reason)
             self.assertTrue(refused([native_delete]))
             self.assertTrue(refused(root_skips + [native_delete]))
