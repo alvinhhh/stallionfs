@@ -482,6 +482,75 @@ class EntryTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
 
+    def test_workspace_sigkill_skips_require_exact_ids_reasons_and_nonqualification(self):
+        folder_names = (
+            'test_killed_create_publishes_only_complete_workspace',
+            'test_killed_snapshot_publishes_only_complete_capture',
+            'test_killed_remove_preserves_payload_in_workspaces_or_trash',
+            'test_killed_purge_and_gc_retain_reported_remainder',
+            'test_killed_native_delete_is_confined_and_survivors_intact',
+        )
+        image_names = (
+            'test_killed_image_create_keeps_closed_complete_candidate',
+            'test_killed_image_snapshot_keeps_closed_complete_candidate',
+            'test_killed_mount_and_detach_reconcile_existing_attachment',
+        )
+        folders = ['test_sigkill_workspace.WorkspaceDeath.' + name for name in folder_names]
+        images = ['test_sigkill_workspace.MountedImageDeath.' + name for name in image_names]
+        root_reason = 'SIGKILL Git fixtures require a non-root test process'
+        hook = 'SIGKILL pause hook unavailable: workspace rename: DYLD stripped'
+        image = 'SIGKILL image fixtures unavailable: missing /usr/bin/hdiutil'
+        def skipped(name, reason):
+            return SimpleNamespace(id=lambda: name), reason
+        def refused(skips, success=True, probe=None):
+            result = SimpleNamespace(skipped=skips, contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=8)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
+            valid = [skipped(name, hook) for name in folders + images] + [skipped(name, image) for name in images]
+            for skip in valid:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(valid))
+            self.assertTrue(refused(valid, success=False))
+            self.assertTrue(refused(valid, probe='pass'))
+            root_skips = [skipped(name, root_reason) for name in folders[:-1] + images]
+            for skip in root_skips:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(root_skips))
+            self.assertTrue(refused(root_skips, success=False))
+            self.assertTrue(refused(root_skips, probe='pass'))
+            for image_flag in ('0', '1'):
+                with patch.dict(os.environ, STALLIONFS_QUALIFICATION='1', STALLIONFS_TEST_IMAGES=image_flag):
+                    self.assertFalse(refused([]))
+                    self.assertTrue(refused([], success=False))
+                    for skip in valid + root_skips:
+                        with self.subTest(test=skip[0].id(), reason=skip[1], images=image_flag):
+                            output = io.StringIO()
+                            with contextlib.redirect_stderr(output):
+                                self.assertTrue(refused([skip]))
+                            self.assertIn(f'Qualification requires {skip[0].id()}: skipped: {skip[1]}',
+                                          output.getvalue())
+                    self.assertTrue(refused(valid + root_skips))
+            native_delete = skipped(folders[-1], root_reason)
+            self.assertTrue(refused([native_delete]))
+            self.assertTrue(refused(root_skips + [native_delete]))
+            for name in folders + images:
+                self.assertTrue(refused([skipped(name, root_reason + ': other')]))
+            for name in folders:
+                self.assertTrue(refused([skipped(name, image)]))
+            for reason in ('', 'SIGKILL pause hook unavailable', 'SIGKILL image fixtures unavailable', 'other'):
+                for name in folders + images:
+                    self.assertTrue(refused([skipped(name, reason)]))
+            for name in ('test_sigkill_workspace.WorkspaceDeath.test_other',
+                         'test_sigkill_workspace.MountedImageDeath.test_other',
+                         'setUpClass (test_sigkill_workspace.WorkspaceDeath)',
+                         'setUpClass (test_sigkill_workspace.MountedImageDeath)',
+                         'test_sigkill_workspace.WorkspaceHookCapabilities.test_probe_failure_names_boundary'):
+                for reason in (hook, image, root_reason):
+                    invalid = skipped(name, reason)
+                    self.assertTrue(refused([invalid]))
+                    self.assertTrue(refused(valid + [invalid]))
+
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
         from unittest.mock import patch
