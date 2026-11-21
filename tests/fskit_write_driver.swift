@@ -2060,8 +2060,34 @@ func contextualGetBoundary(_ m: Mounted, principal: CallerIdentity? = nil) {
             if mutate { request.wantedAttributes = .backupTime }
             release.signal()
         }
-        m.serial {}
-        need(replies == 1 && code(result.1) == expected && (result.0 != nil) == (expected == 0), "boundary exact atomic outcome")
+        m.serial {
+            guard replies != 1 || code(result.1) != expected || (result.0 != nil) != (expected == 0) else { return }
+            let validity: String
+            if let prepared {
+                func missingBits(_ required: FSItem.Attribute) -> [Int] {
+                    (0..<UInt.bitWidth).filter { n in
+                        required.rawValue & bit(n).rawValue != 0 && !prepared.isValid(bit(n))
+                    }
+                }
+                validity = "missingSDK=\(missingBits(sdk)) missingCaller=\(missingBits(raw))"
+            } else {
+                validity = "not-prepared"
+            }
+            let error = result.1 as NSError?
+            let line = "boundary result validity: \(validity) constructors=\(constructors) domain=\(error?.domain ?? "none")\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        var traced = ""
+#if STALLION_MOUNT_TRACE
+        traced = MountTrace.shared.recordsForTesting().suffix(2).joined(separator: "|")
+#endif
+        let probe = FSItem.GetAttributesRequest(); probe.wantedAttributes = raw
+        let projected = ([.type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize, .fileID, .parentID,
+                          .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
+                          .supportsLimitedXAttrs, .inhibitKernelOffloadedIO] as [FSItem.Attribute])
+            .filter { probe.isAttributeWanted($0) }.reduce(0) { $0 | $1.rawValue }
+        need(replies == 1 && code(result.1) == expected && (result.0 != nil) == (expected == 0),
+             "boundary exact atomic outcome: projected=\(projected) sdk=\(sdk.rawValue) trace=\(traced) wanted=\(raw.rawValue) stage=\(stage) mutate=\(mutate) foreignItem=\(item != nil) foreignCaller=\(who != nil) replies=\(replies) code=\(code(result.1)) expected=\(expected) result=\(result.0 != nil)")
         need(constructors == (stage == 7 || expected == 0 ? 1 : 0), "boundary constructor count")
         need(request.wantedAttributes == (mutate ? .backupTime : raw) && FSGetAttributesResult.requestedAttributes.wantedAttributes == sdk, "boundary request ownership")
         if expected == 0 {
