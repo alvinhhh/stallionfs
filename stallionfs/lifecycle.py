@@ -42,6 +42,20 @@ def finite_time(value):
     return (type(value) is int or (type(value) is float and math.isfinite(value))) and value > 0
 
 
+def _validate_rollback_record(record, workspace):
+    fields = {'format', 'id', 'workspace', 'recovery', 'snapshot', 'backend',
+              'created', 'old', 'candidate', 'outcome'}
+    if (record.keys() != fields or record['workspace'] != workspace or
+            record['id'] != record['recovery'] or record['backend'] not in ('folder', 'image') or
+            record['old'] == record['candidate'] or not finite_time(record['created'])):
+        raise core.StallionError('Uncertain rollback record; retained without changes')
+    for key in ('recovery', 'snapshot'):
+        core.identifier(record[key], 32)
+    for key in ('old', 'candidate'):
+        pair = record[key]
+        if not isinstance(pair, list) or len(pair) != 2 or any(type(n) is not int or n < 0 for n in pair):
+            raise core.StallionError('Uncertain rollback identities; retained without changes')
+
 
 class Lifecycle:
     @contextlib.contextmanager
@@ -283,7 +297,7 @@ class Lifecycle:
             validate_intent(workspace, record)
             return  # Explicit current admission; never replay catalog or move mutations.
         if record.get('operation') in ('native-create', 'native-mount', 'native-unmount'):
-            if registration.exists():
+            if os.path.lexists(registration):
                 metadata = core.read_json(registration)
                 if metadata.get('backend') == 'native-image' and metadata.get('ownership') == 'store-created':
                     from ._native import check_pending
@@ -292,26 +306,29 @@ class Lifecycle:
             if record.get('operation') == 'native-create':
                 raise core.StallionError(f'Native candidate intent retained without reconciliation: {journal}')
             raise core.StallionError('Native operation intent has no installed owned workspace')
-        if registration.exists() and core.read_json(registration).get('backend') == 'native-image':
+        if os.path.lexists(registration) and core.read_json(registration).get('backend') == 'native-image':
             raise core.StallionError('Unexpected exchange journal for a native image registration; retained unchanged')
-        record = core.read_json(journal)
-        if record.get('operation') == 'native-create':
-            raise core.StallionError(f'Native candidate intent retained without reconciliation: {journal}')
-        core.identifier(record.get('recovery'), 32)
-        if record.get('workspace') != workspace or record.get('backend') not in ('folder', 'image'):
+        _validate_rollback_record(record, workspace)
+        path, meta = self.object('workspaces', workspace)
+        if record['outcome'] != 'intent' or record['backend'] != meta.get('backend', 'folder'):
             raise core.StallionError('Uncertain rollback journal; retained without changes')
-        current = self._payload(self.root / 'workspaces' / workspace, record)
-        recovery = self._payload(self.root / 'recovery' / record['recovery'], record)
+        slot = self.root / 'recovery' / record['recovery']
+        core.private_directory(slot)
+        saved = core.read_json(slot / 'meta.json')
+        _validate_rollback_record(saved, workspace)
+        current = self._payload(path, meta)
+        recovery = self._payload(slot, record)
         pair = [identity(current), identity(recovery)]
-        if pair == [record.get('old'), record.get('candidate')]:
+        if pair == [record['old'], record['candidate']]:
             outcome = 'not-exchanged'
-        elif pair == [record.get('candidate'), record.get('old')]:
+        elif pair == [record['candidate'], record['old']]:
             outcome = 'exchanged'
         else:
             raise core.StallionError('Uncertain rollback identities; current and recovery retained without changes')
-        record['outcome'] = outcome
-        replace_json(recovery.parent / 'meta.json', record)
-        path, meta = self.object('workspaces', workspace)
+        finalized = {**record, 'outcome': outcome}
+        if saved != record and saved != finalized:
+            raise core.StallionError(f'Conflicting rollback evidence at {slot}; retained without changes')
+        replace_json(slot / 'meta.json', finalized)
         self._open(workspace, path, meta)
         journal.unlink()
 
