@@ -45,6 +45,7 @@ jobs:
       CI_SPARSE_REQUIRED: ${{ matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.phase == 'installed' && '1' || '0' }}
       PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
+      STALLIONFS_QUALIFICATION: ${{ matrix.phase == 'installed' && matrix.images == '1' && '1' || '0' }}
     steps:
       - name: Anchor worker allocation
         env:
