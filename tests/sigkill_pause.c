@@ -3,6 +3,8 @@
 #include <sys/clonefile.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -10,6 +12,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+__attribute__((constructor)) static void confine_injection(void) {
+    char path[PATH_MAX];
+    uint32_t size = sizeof(path);
+    if (!_NSGetExecutablePath(path, &size)) {
+        const char *name = strrchr(path, '/');
+        name = name ? name + 1 : path;
+        if (!strcmp(name, "sfs") || !strcmp(name, "stallionfs")) return;
+    }
+    extern char **environ;
+    for (size_t index = 0; environ[index];) {
+        const char *entry = environ[index];
+        const char *equals = strchr(entry, '=');
+        if (strncmp(entry, "DYLD_", 5) || !equals) { index++; continue; }
+        char *name = strndup(entry, (size_t)(equals - entry));
+        if (!name || unsetenv(name)) _exit(90);
+        free(name);
+        index = 0;
+    }
+}
 
 static atomic_uint hits;
 

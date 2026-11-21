@@ -257,6 +257,63 @@ class ProcessDeath(ProcessDeathFixture, unittest.TestCase):
 
 
 class PauseHookCapabilities(unittest.TestCase):
+    def test_constructor_preserves_native_handoff_and_scrubs_helper_children(self):
+        source = Path(__file__).with_name('sigkill_pause.c').read_text()
+        constructor = source[source.index('__attribute__((constructor))'):source.index('static atomic_uint hits;')]
+        harness = '''
+#define _DARWIN_C_SOURCE
+#define _GNU_SOURCE
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static int _NSGetExecutablePath(char *path, uint32_t *size) {
+    const char *keys[] = {"DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_TEST_OTHER"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        char key[128];
+        snprintf(key, sizeof(key), "TEST_%s", keys[i]);
+        const char *injected = getenv(key);
+        if (injected) setenv(keys[i], injected, 1);
+    }
+    const char *value = getenv("TEST_EXECUTABLE");
+    if (!value || strlen(value) + 1 > *size) return -1;
+    strcpy(path, value);
+    return 0;
+}
+''' + constructor + '''
+int main(void) {
+    extern char **environ;
+    for (size_t i = 0; environ[i]; i++) puts(environ[i]);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / 'environment.c').write_text(harness)
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(path / 'environment.c'),
+                            '-o', str(path / 'environment')], check=True, capture_output=True, timeout=30)
+            injection = {'DYLD_INSERT_LIBRARIES': '/unused/pause.dylib', 'DYLD_LIBRARY_PATH': '/unused',
+                         'DYLD_FRAMEWORK_PATH': '/unused', 'DYLD_TEST_OTHER': 'value'}
+            for executable in ('/installed/sfs', '/installed/stallionfs', '/installed/python3.13', ''):
+                with self.subTest(executable=executable):
+                    environment = {**os.environ, **{'TEST_' + key: value for key, value in injection.items()},
+                                   'STALLIONFS_TEST_CUT_KIND': 'clone'}
+                    if executable:
+                        environment['TEST_EXECUTABLE'] = executable
+                    else:
+                        environment.pop('TEST_EXECUTABLE', None)
+                    result = subprocess.run([str(path / 'environment')], env=environment,
+                                            capture_output=True, text=True, check=True, timeout=5)
+                    values = dict(line.split('=', 1) for line in result.stdout.splitlines())
+                    self.assertEqual(values['STALLIONFS_TEST_CUT_KIND'], 'clone')
+                    for key, value in injection.items():
+                        if executable in ('/installed/sfs', '/installed/stallionfs'):
+                            self.assertEqual(values[key], value)
+                        else:
+                            self.assertNotIn(key, values)
+
     def test_root_git_fixture_skips_before_creating_repository(self):
         case = ProcessDeath('test_killed_preparation_is_unpublished_reported_and_not_cached')
         with patch.object(os, 'geteuid', return_value=0):
