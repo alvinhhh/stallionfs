@@ -221,9 +221,7 @@ def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
         except (ValueError, OSError) as error:
             from ._git_runtime import GitError
             if isinstance(error, GitError):
-                failure = StallionError(str(error))
-                failure.git_reason = error.reason
-                raise failure from error
+                raise StallionError(str(error)) from error
             raise StallionError('Invalid bundled Git: ' + str(error)) from error
         args = [executable, *args[1:]]
     if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
@@ -700,9 +698,7 @@ class Store(Lifecycle):
         with self._native_creation_scope(seed, native_result, carrier, held=_held) as held:
             base, seed_meta = self.object('seeds', seed)
             if seed_meta.get('backend', 'folder') != 'folder':
-                error = StallionError('Native candidate creation requires a folder seed')
-                error.native_reason = 'source-backend'
-                raise error
+                raise StallionError('Native candidate creation requires a folder seed')
             final = self.root / 'workspaces' / workspace
             journal = self.root / 'journals' / f'{workspace}.json'
             with request.prepare_controller(self.root, held, base, seed_meta, workspace=workspace, transaction=transaction,

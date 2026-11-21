@@ -1,5 +1,7 @@
 """Owned synthetic processes only; no product or host storage operations."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -369,6 +371,116 @@ class EntryTests(unittest.TestCase):
             self.assertTrue(entry.account_result(result(contextual=2), None, True, 'context'))
             self.assertTrue(entry.account_result(result(success=False), None, False, 'context'))
             self.assertTrue(entry.account_result(result([capability]), 'pass', False, 'context'))
+
+    def test_ownership_capability_skips_do_not_exempt_unrelated_skips_or_failures(self):
+        names = (
+            'test_privileged_copy_clone_move_preserve_foreign_ownership',
+            'test_unprivileged_copy_refuses_loss_clone_uses_darwin_ownership_move_preserves',
+            'test_move_round_trip_preserves_acl_xattrs_resource_fork_and_aliases',
+            'test_image_import_preserves_foreign_ownership_and_aliases',
+        )
+        reason = 'Ownership fixtures require root or passwordless sudo: sudo: a password is required'
+        def refused(skips, success=True, probe=None):
+            result = SimpleNamespace(skipped=skips, contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=4)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        skips = [(SimpleNamespace(id=lambda name=name: 'test_ownership.Ownership.' + name), reason)
+                 for name in names]
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
+            self.assertFalse(refused([]))
+            self.assertFalse(refused(skips))
+            self.assertTrue(refused(skips, success=False))
+            self.assertTrue(refused(skips, probe='pass'))
+            self.assertTrue(refused([(skips[0][0], 'different reason')]))
+            unrelated = (SimpleNamespace(id=lambda: 'test_ownership.Ownership.test_other'), reason)
+            self.assertTrue(refused([unrelated]))
+            self.assertTrue(refused(skips + [unrelated]))
+
+    def test_sigkill_capability_skips_require_exact_test_ids_and_reason(self):
+        names = (
+            'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+            'test_killed_move_has_exactly_one_complete_inode_tree',
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+        reason = 'SIGKILL pause hook unavailable: compile: unsupported SDK'
+        skips = [(SimpleNamespace(id=lambda name=name: 'test_sigkill.ProcessDeath.' + name), reason)
+                 for name in names]
+        def refused(entries, success=True, probe=None):
+            result = SimpleNamespace(skipped=entries, contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=4)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
+            self.assertFalse(refused([]))
+            for skip in skips:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(skips))
+            self.assertTrue(refused(skips, success=False))
+            self.assertTrue(refused(skips, probe='pass'))
+            for invalid_reason in ('different reason', 'SIGKILL pause hook unavailable', ''):
+                self.assertTrue(refused([(skips[0][0], invalid_reason)]))
+            for invalid_id in ('test_sigkill.ProcessDeath.test_other',
+                               'setUpClass (test_sigkill.ProcessDeath)',
+                               'test_sigkill.PauseHookCapabilities.test_unavailable_probe_skips_individual_tests'):
+                unrelated = (SimpleNamespace(id=lambda: invalid_id), reason)
+                self.assertTrue(refused([unrelated]))
+                self.assertTrue(refused(skips + [unrelated]))
+
+    def test_root_git_sigkill_skips_are_narrow(self):
+        reason = 'SIGKILL Git fixtures require a non-root test process'
+        names = ['test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay')]
+        def refused(name, message=reason, success=True, probe=None):
+            result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: name), message)],
+                                     contextual_successes=0, activation_successes=0,
+                                     wasSuccessful=lambda: success, testsRun=1)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
+            for name in names:
+                self.assertFalse(refused(name))
+                self.assertTrue(refused(name, success=False))
+                self.assertTrue(refused(name, probe='pass'))
+                self.assertTrue(refused(name, message=reason + ': other'))
+            for name in ('test_sigkill.ProcessDeath.test_killed_move_has_exactly_one_complete_inode_tree',
+                         'test_sigkill.ProcessDeath.test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+                         'setUpClass (test_sigkill.ProcessDeath)', 'unrelated.test'):
+                self.assertTrue(refused(name))
+
+    def test_qualification_refuses_ownership_hook_and_root_git_skips(self):
+        cases = (
+            ('test_ownership.Ownership.test_privileged_copy_clone_move_preserve_foreign_ownership',
+             'Ownership fixtures require root or passwordless sudo: denied'),
+            ('test_sigkill.ProcessDeath.test_killed_move_has_exactly_one_complete_inode_tree',
+             'SIGKILL pause hook unavailable: denied'),
+            ('test_sigkill.ProcessDeath.test_killed_preparation_is_unpublished_reported_and_not_cached',
+             'SIGKILL Git fixtures require a non-root test process'),
+        )
+        for identity, reason in cases:
+            for images in ('0', '1'):
+                for qualification in ('0', '1'):
+                    with self.subTest(identity=identity, images=images, qualification=qualification), \
+                            patch.dict(os.environ, STALLIONFS_TEST_IMAGES=images,
+                                       STALLIONFS_QUALIFICATION=qualification):
+                        result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: identity), reason)],
+                                                 contextual_successes=0, activation_successes=0,
+                                                 wasSuccessful=lambda: True, testsRun=1)
+                        output = io.StringIO()
+                        with contextlib.redirect_stderr(output):
+                            self.assertEqual(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST),
+                                             qualification == '1')
+                        if qualification == '1':
+                            self.assertIn(f'Qualification requires {identity}: skipped: {reason}', output.getvalue())
+                        result.skipped = []
+                        self.assertFalse(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
+
+    def test_qualification_rejects_unrelated_skips_without_image_flag(self):
+        result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: 'unrelated.test'), 'missing')],
+                                 contextual_successes=0, activation_successes=0,
+                                 wasSuccessful=lambda: True, testsRun=1)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='0', STALLIONFS_QUALIFICATION='1'), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
 
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
