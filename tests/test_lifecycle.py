@@ -16,6 +16,82 @@ from stallionfs import core, lifecycle, _scan
 from stallionfs.core import Store, StallionError, git, read_json, write_json
 
 
+class RollbackEvidenceTests(unittest.TestCase):
+    def pending_exchange(self, backend):
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = Store(base / 'store')
+        workspace, recovery = 'a' * 32, 'b' * 32
+        path = store.root / 'workspaces' / workspace
+        slot = store.root / 'recovery' / recovery
+        for directory in (path, slot):
+            directory.mkdir(mode=0o700)
+        if backend == 'image':
+            (path / 'volume').mkdir(mode=0o700)
+            current, candidate = path / 'workspace.sparseimage', slot / 'workspace.sparseimage'
+            before, after = current, candidate
+        else:
+            current, candidate = path / 'repo', slot / 'repo'
+            current.mkdir()
+            candidate.mkdir()
+            before, after = current / 'file', candidate / 'file'
+        before.write_bytes(b'old workspace')
+        after.write_bytes(b'snapshot clone')
+        meta = {'id': workspace, 'commit': 'c' * 40, 'backend': backend}
+        write_json(path / 'meta.json', meta)
+        store._open(workspace, path, meta)
+        record = dict(format=1, id=recovery, workspace=workspace, recovery=recovery,
+                      snapshot='d' * 32, backend=backend, created=1,
+                      old=lifecycle.identity(current), candidate=lifecycle.identity(candidate), outcome='intent')
+        journal = store.root / 'journals' / f'{workspace}.json'
+        retained = slot / 'meta.json'
+        write_json(journal, record)
+        write_json(retained, record)
+        temporary = slot / 'exchange-temp'
+        current.rename(temporary)
+        candidate.rename(current)
+        temporary.rename(candidate)
+        return store, journal, retained, current, candidate, record
+
+    def assert_exchanged_payloads(self, current, candidate, record):
+        for path, key, content in ((current, 'candidate', b'snapshot clone'),
+                                   (candidate, 'old', b'old workspace')):
+            self.assertEqual(lifecycle.identity(path), record[key])
+            payload = path / 'file' if record['backend'] == 'folder' else path
+            self.assertEqual(payload.read_bytes(), content)
+
+    def test_restart_refuses_corrupt_or_conflicting_rollback_evidence(self):
+        for backend in ('folder', 'image'):
+            for corruption in ('malformed-copy', 'duplicate-journal-key', 'wrong-outcome', 'different-snapshot'):
+                with self.subTest(backend=backend, corruption=corruption):
+                    store, journal, retained, current, candidate, record = self.pending_exchange(backend)
+                    if corruption == 'malformed-copy':
+                        retained.write_bytes(b'{"format": 1,')
+                    elif corruption == 'duplicate-journal-key':
+                        journal.write_text('{"workspace": "other", ' + json.dumps(record)[1:])
+                    elif corruption == 'wrong-outcome':
+                        retained.write_text(json.dumps({**record, 'outcome': 'not-exchanged'}))
+                    else:
+                        retained.write_text(json.dumps({**record, 'snapshot': 'e' * 32}))
+                    state = store._state(record['workspace'])
+                    evidence = {p: p.read_bytes() for p in (journal, retained, state)}
+                    with self.assertRaisesRegex(StallionError, 'Invalid metadata|Conflicting rollback evidence'):
+                        Store(store.root).enroll(record['workspace'])
+                    self.assertEqual({p: p.read_bytes() for p in evidence}, evidence)
+                    self.assert_exchanged_payloads(current, candidate, record)
+
+    def test_restart_admits_already_finalized_rollback_with_pending_journal(self):
+        for backend in ('folder', 'image'):
+            with self.subTest(backend=backend):
+                store, journal, retained, current, candidate, record = self.pending_exchange(backend)
+                finalized = {**record, 'outcome': 'exchanged'}
+                retained.write_text(json.dumps(finalized))
+                restarted = Store(store.root)
+                restarted.enroll(record['workspace'])
+                self.assertFalse(journal.exists())
+                self.assertEqual(read_json(retained), finalized)
+                self.assert_exchanged_payloads(current, candidate, record)
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'requires native private-directory admission')
 class NativeReferenceTests(unittest.TestCase):
     """Managed metadata/lease boundaries; real image behavior is tested through installed sfs."""

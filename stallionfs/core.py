@@ -282,6 +282,15 @@ def json_read_limit(max_bytes):
         _json_read_limit.reset(token)
 
 
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
 def read_json(path):
     if path.is_symlink() or not path.is_file():
         raise StallionError(f"Missing or unsafe metadata: {path}")
@@ -300,8 +309,8 @@ def read_json(path):
                 data = stream.read(limit + 1)
                 if len(data) > limit:
                     raise MetadataLimitError(f"Metadata exceeds {limit} byte limit: {path}")
-        value = json.loads(data)
-        if not isinstance(value, dict) or value.get("format") != 1:
+        value = json.loads(data, object_pairs_hook=_unique_json_object)
+        if not isinstance(value, dict) or type(value.get("format")) is not int or value["format"] != 1:
             raise ValueError("unsupported format")
         return value
     except (ValueError, UnicodeError) as exc:
@@ -962,16 +971,33 @@ class Store(Lifecycle):
         if metadata.get("backend") == "image":
             from . import images
             try:
-                repo = images.attach(path / "workspace.sparseimage", path / "volume")
                 ready = path / "ready.json"
-                if ready.exists():
-                    if read_json(ready).get("id") != metadata["id"]:
+                initialized = os.path.lexists(ready)
+                if initialized:
+                    if read_json(ready) != {"format": 1, "id": metadata["id"]}:
                         raise StallionError("Invalid image initialization marker")
                 else:
-                    if git(repo, "branch", "--show-current") != metadata["branch"]:
-                        if git(repo, "rev-parse", "HEAD") != metadata["commit"]:
+                    branch = metadata.get("branch")
+                    if not isinstance(branch, str) or not re.fullmatch(
+                            rf"stallionfs/(?:[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}-)?{re.escape(metadata['id'])}", branch):
+                        raise StallionError("Invalid image workspace branch")
+                repo = images.attach(path / "workspace.sparseimage", path / "volume")
+                if not initialized:
+                    head = git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+                    ref = f"refs/heads/{branch}"
+                    fields = "%(refname) %(objectname) %(if)%(HEAD)%(then)current%(else)other%(end) %(symref)"
+                    refs = git(repo, "for-each-ref", f"--format={fields}", "--", ref)
+                    existing = next((row.split() for row in refs.splitlines() if row.startswith(ref + " ")), None)
+                    if existing != [ref, head, "current"]:
+                        if head != metadata["commit"]:
                             raise StallionError("Uninitialized image has an unexpected Git commit")
-                        git(repo, "checkout", "-b", metadata["branch"])
+                        if existing is None:
+                            git(repo, "checkout", "-b", branch)
+                        elif existing == [ref, head, "other"]:
+                            # Checkout may have created the ref before failing to switch HEAD.
+                            git(repo, "checkout", "--no-guess", branch, "--")
+                        else:
+                            raise StallionError("Uninitialized image has an unexpected workspace branch")
                     write_json(ready, {"id": metadata["id"]})
             except (OSError, StallionError) as exc:
                 raise StallionError(f"Workspace {metadata['id']} retained; retry with mount: {exc}") from exc
