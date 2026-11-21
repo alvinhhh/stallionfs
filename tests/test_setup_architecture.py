@@ -12,6 +12,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import tomllib
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -50,6 +51,12 @@ def select_host(system, machine):
 
 
 class HostArchitecture(unittest.TestCase):
+    def test_build_backend_floor_matches_qualified_ci_version(self):
+        build = tomllib.loads((SOURCE / 'pyproject.toml').read_text())['build-system']
+        pin = (SOURCE / 'tools/ci-build-requirements.txt').read_text().split()[0]
+        version = pin.removeprefix('setuptools==')
+        self.assertEqual(build['requires'], [f'setuptools>={version}'])
+
     def backend(self):
         try: distribution = importlib.metadata.distribution('setuptools')
         except importlib.metadata.PackageNotFoundError:

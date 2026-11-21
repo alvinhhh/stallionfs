@@ -30,9 +30,9 @@ SELECTION_FIELDS = frozenset({'binary', 'scratch', 'output', 'samples', 'runs',
                              'cache', 'fixtures', 'copy_tools', 'operations', 'timeout', 'jobs'})
 DEPENDENCY_SELECTION_FIELDS = frozenset({'node', 'npm', 'npm_cache'})
 LOCKED_DEPENDENCY_INPUTS = {
-    'package.json': '6c0c343e91ab0689397ad98e0c52417f6f71024582856b376cec5b33f7afd160',
-    'package-lock.json': '518e2a3693b5f2a51ac10dd2fb46d3d42436e6bacd50fc71ccc4ad0f5bcefd5e',
-    'check.cjs': 'c0c31b1f975222e1fa3cbd0b90fc6e8fb0ab5e04c708b062e3fe5971a82e215e',
+    'package.json': 'b12dfc204de928a8d92bf6f972fd0ffefc6f9a8fcd579f962ce78047a0f2ae99',
+    'package-lock.json': 'f39b10dd8f66100b3f793b869a906ce414dc92d7005bacf459594acfd1e10aa7',
+    'check.cjs': 'c7f0fe1da6bb782629ebefcfd19939a1d188a96dda62fad5193b4e36251f8f05',
 }
 DEPENDENCY_POLICY = 'offline npm ci; lifecycle scripts, audit and funding disabled; no cache cleanup'
 DEPENDENCY_PIN_SCOPE = 'Node executable, npm entrypoint and package manifest only; npm package tree is not fully pinned'
@@ -92,9 +92,9 @@ def require_locked_dependencies(report, preparations=None):
                 or not isinstance(platform, dict) or set(platform) != {'platform', 'arch'}
                 or platform['platform'] != 'darwin' or platform['arch'] not in ('arm64', 'x64')
                 or not isinstance(dependencies, dict) or dependencies != {
-                    'axios': '1.20.0', 'date-fns': '4.4.0', 'eslint': '10.12.0', 'lodash': '4.18.1',
+                    'axios': '1.20.0', 'date-fns': '4.4.0', 'eslint': '10.15.0', 'lodash': '4.18.1',
                     'prettier': '3.9.9', 'react': '19.3.0', 'react-dom': '19.3.0', 'rxjs': '7.8.2',
-                    'typescript': '7.0.2', 'zod': '4.6.5'}
+                    'typescript': '7.0.2', 'zod': '4.6.6'}
                 or receipt['typescript_platform'] != {'name': '@typescript/typescript-darwin-' + platform['arch'], 'version': '7.0.2'}
                 or receipt['typescript_cli_version'] != 'Version 7.0.2'
                 or not isinstance(receipt['node_version'], str) or not re.fullmatch(r'v\d+\.\d+\.\d+', receipt['node_version'])
