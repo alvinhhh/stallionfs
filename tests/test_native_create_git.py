@@ -67,6 +67,43 @@ class CreationGit(unittest.TestCase):
         self.assertIn('branch.main.remote', self.command(seed, 'config', '--local', '--name-only', '--list'))
         self.checkout(seed, commit)
 
+    def shallow_seed(self):
+        self.command(self.source, 'commit', '--allow-empty', '-m', 'Second')
+        shallow = self.base / 'shallow'
+        self.command(self.source, 'clone', '--depth=1', '--no-local', '--', str(self.source), str(shallow))
+        self.source = shallow
+        seed, commit = self.prepare()
+        self.assertEqual(self.command(seed, 'rev-parse', '--is-shallow-repository'), 'true')
+        return seed, commit
+
+    def test_shallow_prepared_seed_checkout(self):
+        seed, commit = self.shallow_seed()
+        repo, _ = self.checkout(seed, commit)
+        self.assertEqual(self.command(repo, 'rev-parse', '--is-shallow-repository'), 'true')
+        self.assertEqual(self.command(repo, 'status', '--porcelain'), '')
+
+    def test_shallow_workspace_readiness(self):
+        seed, commit = self.shallow_seed()
+        workspace = self.store.create(seed.parent.name, name='shallow')
+        repo = Path(workspace['path'])
+        with patch.object(git, 'qualified_runtime', return_value=self.runtime):
+            self.assertEqual(git.readiness(repo, workspace), (commit, workspace['branch']))
+
+    def test_other_unsupported_state_refuses_before_actor(self):
+        seed, commit = self.prepare()
+        for number, name in enumerate(sorted(git.UNSUPPORTED - {'shallow'})):
+            with self.subTest(name=name):
+                stage = self.base / ('unsupported-' + str(number)); stage.mkdir(mode=0o700)
+                repo = stage / 'repo'; shutil.copytree(seed, repo)
+                path = repo / '.git' / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(commit)
+                with patch.object(git._native, 'execute_owned', side_effect=AssertionError('actor before refusal')):
+                    with self.assertRaises(core.StallionError):
+                        git.checkout(repo, commit, 'stallionfs/' + 'f' * 32, stage, {}, lambda: None, self.runtime)
+                    with patch.object(git, 'qualified_runtime', return_value=self.runtime):
+                        with self.assertRaises(core.StallionError): git.readiness(repo, {})
+
     def test_actual_prepared_reftable(self):
         seed, commit = self.prepare(ref_format='reftable')
         self.assertTrue((seed / '.git/reftable/tables.list').exists())
@@ -133,6 +170,9 @@ class CreationGit(unittest.TestCase):
                     with self.assertRaises(core.StallionError):
                         git.checkout(repo, commit, 'stallionfs/' + 'f' * 32, stage, {}, lambda: None, self.runtime)
                 self.assertFalse((stage / 'actors').exists())
+                with patch.object(git, 'qualified_runtime', return_value=self.runtime), \
+                        patch.object(git._native, 'execute_owned', side_effect=AssertionError('actor before refusal')):
+                    with self.assertRaises(core.StallionError): git.readiness(repo, {})
         for kind in ('symlink', 'hardlink', 'fifo'):
             with self.subTest(kind=kind):
                 stage = self.base / ('refusal-' + kind); stage.mkdir(mode=0o700)

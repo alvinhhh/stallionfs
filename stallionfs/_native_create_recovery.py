@@ -701,7 +701,13 @@ def finalize(a, loaded):
     target = loaded['target']
     anchor = origin['native_image']['anchor']
     from ._native_create_authority import proof
-    proof(origin, a.read(loaded['path'] / 'native-create.json'))
+    writer = proof(origin, a.read(loaded['path'] / 'native-create.json'))
+    if (any('shallow' not in actor['input'] for actor in writer['actors'])
+            and a.exists(loaded['stage'] / 'input')):
+        from ._native_create_git import bindings
+        repo = loaded['stage'] / 'input/repo'
+        a.directory(repo.parent)
+        require(bindings(repo)['shallow'] is None, 'legacy-shallow-unbound', repo)
     tokens = []
 
     def relocate(token):

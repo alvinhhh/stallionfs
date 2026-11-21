@@ -48,7 +48,7 @@ def writer(origin, stage):
         log = stage / 'actors' / role
         actors.append(dict(terminal(code), role=role, cwd=str(stage / 'actors/environment/inspect'),
             environment=git.POLICY, runtime=spec['runtime'], input={'repository': [1, 8], 'git': [1, 9],
-                'config': {'file': [1, 10], 'sha256': '8' * 64}},
+                'config': {'file': [1, 10], 'sha256': '8' * 64}, 'shallow': None},
             executable={'path': executable, 'sha256': spec['runtime']['executable_sha256']},
             argv=[executable, *git.PREFIX, *args], stdout=str(log / 'stdout'), stderr=str(log / 'stderr')))
     log = stage / 'discovery/00-verify-package'
