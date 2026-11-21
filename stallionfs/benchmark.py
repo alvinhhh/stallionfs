@@ -60,8 +60,7 @@ def parser(commands):
 
 def _catalog():
     return {'cases': [{'id': case['id'], 'required_set': case['required_set'],
-                       'catalog_only': case['required_set'] in ('CLI-SCAN', 'CLI-VOLUMES', 'CLI-TINY')
-                                       and case['id'] not in ('cli/delete/tiny_4kib', 'cli/clone/tiny_4kib')}
+                       'catalog_only': False}
                       for case in CASES], 'quick': ['native/copy/tiny_4kib',
             'fileops/move/tiny_4kib', 'fileops/delete/tiny_4kib'],
             'full': 'Existing three-cycle collection, with required coverage gaps retained',
@@ -269,6 +268,9 @@ def _coverage(cache, *, collected=True):
         native = family.startswith('TREE-') or family == 'COMMAND-SCAN'
         collector = ('native-cli-clone' if case['id'] == 'cli/clone/tiny_4kib'
                      else 'native-cli-delete' if case['id'] == 'cli/delete/tiny_4kib'
+                     else 'native-cli-move' if case['id'] == 'cli/move/tiny_4kib'
+                     else 'native-cli-scan' if family == 'CLI-SCAN'
+                     else 'native-cli-volumes' if family == 'CLI-VOLUMES'
                      else 'native-scan' if family == 'COMMAND-SCAN' else 'native-files' if native
                      else 'native-copy' if family == 'ORDINARY-COPY'
                      else 'scan-api' if family == 'API-SCAN' else 'workspaces' if family == 'WORKSPACE' else None)
@@ -278,6 +280,9 @@ def _coverage(cache, *, collected=True):
                    ('plain',) if native or family == 'ORDINARY-COPY' else ('plain', 'json'))
         references = (('/bin/cp -cRp',) if case['id'] == 'cli/clone/tiny_4kib'
                       else ('/bin/rm -f',) if case['id'] == 'cli/delete/tiny_4kib'
+                      else ('/bin/mv -n',) if case['id'] == 'cli/move/tiny_4kib'
+                      else ('find-stat',) if family == 'CLI-SCAN'
+                      else ('/sbin/mount',) if family == 'CLI-VOLUMES'
                       else ('cp-clone', 'cp', 'ditto', 'rsync') if family == 'TREE-CLONE'
                       else ('bulk_serial-vs-posix', 'bulk-vs-posix') if family == 'API-SCAN'
                       else ('recorded-native-reference',))
@@ -504,7 +509,8 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
         path = root / 'campaign/campaign.json'
         state = json.loads(path.read_text()) if path.is_file() else {}
         stages = state.get('stages', [])
-        planned = ('native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone', 'native-scan', 'scan-api',
+        planned = ('native-files', 'native-copy', 'native-cli-delete', 'native-cli-clone',
+                   'native-cli-move', 'native-cli-scan', 'native-cli-volumes', 'native-scan', 'scan-api',
                    *(('scan-api-cold',) if 'cold' in args.cache else ()), 'workspaces')
         expected = [(cycle, stage) for cycle in range(1, 4) for stage in planned]
         complete = (state.get('status') == 'complete'

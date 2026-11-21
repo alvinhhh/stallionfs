@@ -48,13 +48,13 @@ class ReleaseGate(unittest.TestCase):
         self.assertEqual(len(gate.UNIVERSE), 37)
         self.assertEqual(set(gate.UNIVERSE), {case['id'] for case in gate.CATALOG})
 
-    def test_uncollectable_catalog_only_cases_fail_in_denominator(self):
-        result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE
-                                          if case not in gate.CATALOG_ONLY])
-        self.assertEqual((result['passing_cases'], result['total_cases']), (33, 37))
+    def test_uncollected_cases_fail_in_denominator(self):
+        missing = {'cli/scan/empty', 'cli/volumes/volumes'}
+        result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE if case not in missing])
+        self.assertEqual((result['passing_cases'], result['total_cases']), (35, 37))
         self.assertFalse(result['passed'])
         case = next(case for case in result['cases'] if case['case'] == 'cli/volumes/volumes')
-        self.assertEqual(case['reasons'], ['catalog only: no native reference or collector'])
+        self.assertEqual(case['reasons'], ['not collected'])
 
     def test_all_pass(self):
         result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE])
