@@ -3,7 +3,7 @@
 
 stallionfs provides native file operations and prepared Git workspaces on macOS.
 
-[Usage](docs/usage.md) · [Storage and recovery](docs/storage.md) · [Issues](https://github.com/alvinhhh/stallionfs/issues)
+[Usage](docs/usage.md) · [Storage and recovery](docs/storage.md) · [0.7.0 user guide](docs/user-guide-0.7.0.md) · [Draft release notes](docs/release-notes-0.7.0.md) · [Issues](https://github.com/alvinhhh/stallionfs/issues)
 
 ## Highlights
 
