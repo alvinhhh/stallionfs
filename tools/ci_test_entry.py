@@ -652,10 +652,55 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() == ADAPTER_TEST and reason == 'requires compiled offline activation driver'
         and (activation_covered or (not require_contextual and len(capability_skips) == 1))
     ]
-    for _, reason in capability_skips + adapter_skips:
+    ownership_tests = {
+        'test_ownership.Ownership.' + name for name in (
+            'test_privileged_copy_clone_move_preserve_foreign_ownership',
+            'test_unprivileged_copy_refuses_loss_clone_uses_darwin_ownership_move_preserves',
+            'test_move_round_trip_preserves_acl_xattrs_resource_fork_and_aliases',
+            'test_image_import_preserves_foreign_ownership_and_aliases',
+        )
+    }
+    ownership_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in ownership_tests
+        and reason.startswith('Ownership fixtures require root or passwordless sudo: ')
+    ]
+    sigkill_tests = {
+        'test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+            'test_killed_move_has_exactly_one_complete_inode_tree',
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+    }
+    sigkill_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in sigkill_tests
+        and reason.startswith('SIGKILL pause hook unavailable: ')
+    ]
+    sigkill_root_tests = {
+        'test_sigkill.ProcessDeath.' + name for name in (
+            'test_killed_preparation_is_unpublished_reported_and_not_cached',
+            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+        )
+    }
+    sigkill_root_skips = [
+        (test, reason) for test, reason in result.skipped
+        if test.id() in sigkill_root_tests
+        and reason == 'SIGKILL Git fixtures require a non-root test process'
+    ]
+    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips + sigkill_root_skips
+    qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'
+    qualification_skips = [
+        (test, reason) for test, reason in result.skipped
+        if qualification and test.id() in ownership_tests | sigkill_tests | sigkill_root_tests
+    ]
+    for test, reason in qualification_skips:
+        print(f'Qualification requires {test.id()}: skipped: {reason}', file=sys.stderr)
+    for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
-    required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1' and [
-        entry for entry in result.skipped if entry not in capability_skips + adapter_skips
+    required_skips = (qualification or os.environ.get('STALLIONFS_TEST_IMAGES') == '1') and [
+        entry for entry in result.skipped if entry not in allowed_skips
     ]
     if required_skips:
         print('Required filesystem tests were skipped.', file=sys.stderr)
@@ -665,7 +710,7 @@ def account_result(result, probe, require_contextual, contextual_test):
     missing_activation = require_contextual and not activation_covered
     if missing_activation:
         print(f'Required {ACTIVATION_TEST} successes: expected 1, observed {activation_successes}', file=sys.stderr)
-    return not result.wasSuccessful() or bool(required_skips) or missing_contextual or missing_activation
+    return not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) or missing_contextual or missing_activation
 
 
 def installed(probe=None):

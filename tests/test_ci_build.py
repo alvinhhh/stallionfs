@@ -129,8 +129,10 @@ class Routing(unittest.TestCase):
         self.assertIn('cancel-in-progress: false', intel)
         self.assertIn('persist-credentials: false', intel)
         test = (Path(__file__).resolve().parents[1] / 'tools/ci_test_entry.py').read_text()
-        self.assertIn("required_skips = os.environ.get('STALLIONFS_TEST_IMAGES') == '1'", test)
-        self.assertIn('not result.wasSuccessful() or bool(required_skips) or missing_contextual', test)
+        self.assertIn("qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'", test)
+        self.assertIn("required_skips = (qualification or os.environ.get('STALLIONFS_TEST_IMAGES') == '1')", test)
+        self.assertIn('not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) or missing_contextual', test)
+        self.assertIn("STALLIONFS_QUALIFICATION: ${{ matrix.phase == 'installed' && matrix.images == '1' && '1' || '0' }}", text)
         self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
         self.assertLess(test.index('controller.initialize_installed'), test.index("sys.path.insert(0, str(checkout / 'tests'))"))
         self.assertLess(test.index('controller.initialize_installed'), test.index('defaultTestLoader.discover'))
@@ -1439,7 +1441,7 @@ class FetchPhases(unittest.TestCase):
         rows = re.findall(r"^          - \{os: ([\w-]+), python: '([^']+)', images: '([^']+)', phase: (\w+)\}$",
                           worker, re.MULTILINE)
         expected = {
-            ('macos-15', '3.12', '0', 'installed'): 20,
+            ('macos-15', '3.12', '0', 'installed'): 30,
             ('macos-26', '3.11', '1', 'installed'): 30,
             ('macos-26', '3.13', '1', 'installed'): 30,
             ('macos-26', '3.14', '1', 'installed'): 30,
@@ -1483,7 +1485,7 @@ class FetchPhases(unittest.TestCase):
     def test_workflow_fetch_budget_artifacts_and_sanitizer_coverage(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text()
         ordinary = job(text, 'test-execution')
-        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 20 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 60 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 30 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 60 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}", ordinary)
         fetch = step(ordinary, 'Fetch exact qualified architecture component')
         self.assertIn('tools/ci_execute.py --timeout 600 --stem "$RUNNER_TEMP/component-fetch" tools/ci_build.py fetch', fetch)
         build = step(ordinary, 'Build current wheel with enforced Git cache reuse')

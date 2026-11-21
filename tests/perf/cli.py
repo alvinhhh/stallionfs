@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import re
 import shutil
 import stat
 import statistics
@@ -1040,6 +1041,300 @@ def native_clone(args):
     return 0 if report['passed'] else 1
 
 
+CATALOG_POLICIES = {'move': 'cli-move-original-tiny-v1',
+                    'scan': 'cli-scan-original-counts-v1',
+                    'volumes': 'cli-volumes-getmntinfo-projection-v1'}
+CATALOG_REFERENCES = {'move': '/bin/mv -n', 'scan': 'find-stat', 'volumes': '/sbin/mount'}
+
+
+def mount_projection(output):
+    rows = []
+    for line in output.decode('utf-8').splitlines():
+        match = re.fullmatch(r'.+? on (/.*) \(([^,()]+)(?:, (.*))?\)', line)
+        require(match is not None, 'Malformed mount listing')
+        path, filesystem, flags = match.groups()
+        require('\0' not in line, 'Invalid mount listing')
+        rows.append((path, filesystem, 'read-only' in (flags or '').split(', ')))
+    return sorted(rows)
+
+
+def inventory_projection(inventory):
+    require(type(inventory) is list and bool(inventory), 'Empty or invalid volume inventory')
+    rows = []
+    for row in inventory:
+        require(isinstance(row, dict) and isinstance(row.get('path'), str)
+                and row['path'].startswith('/') and isinstance(row.get('filesystem'), str)
+                and bool(row['filesystem']) and type(row.get('readonly')) is bool,
+                'Invalid volume inventory row')
+        rows.append((row['path'], row['filesystem'], row['readonly']))
+    return sorted(rows)
+
+
+def validate_catalog_output(operation, method, form, stdout, *, expected, source, destination,
+                            counts, inventory, prepared=None):
+    if operation == 'move':
+        wanted = {'source': str(source), 'destination': str(destination)}
+        require(json.loads(stdout) == wanted if method == 'candidate' and form == 'json'
+                else stdout == b'', 'Move output contract differs')
+        require(not os.path.lexists(source) and manifest(destination) == expected,
+                'Move contents, mode or source removal differ')
+        after = destination.lstat()
+        require(prepared is not None and (after.st_dev, after.st_ino) == (prepared.st_dev, prepared.st_ino),
+                'Move copied the file')
+    elif operation == 'scan':
+        if method == 'native' or form == 'json':
+            observed = native_suite.parse_scan_output('find-stat' if method == 'native' else 'stallionfs',
+                                                     stdout, source.lstat().st_dev)
+            require(observed == counts, 'Scan counts differ')
+        else:
+            require(stdout == scan_text(counts), 'Scan text contract differs')
+    else:
+        projected = inventory_projection(inventory)
+        if method == 'native':
+            require(mount_projection(stdout) == projected, 'Mount inventory differs')
+        elif form == 'json':
+            observed = json.loads(stdout)
+            require(inventory_projection(observed) == projected and observed == inventory,
+                    'Volumes JSON contract differs')
+        else:
+            require(stdout == volumes_text(inventory), 'Volumes text contract differs')
+
+
+def catalog_comparison(rows, phase, samples, policy):
+    require(phase in ('timing', 'resources') and policy in CATALOG_POLICIES.values(),
+            'Unknown CLI catalog comparison')
+    require(all(row.get('fixture_policy') == policy and row.get('method') in ('native', 'candidate')
+                for row in rows), 'CLI catalog fixture policies or methods differ')
+    expected = set(range(1, 32 if phase == 'timing' else samples + 1))
+    methods = {}
+    for method in ('native', 'candidate'):
+        warmups = [row for row in rows if row['method'] == method and row['warmup']]
+        require((len(warmups) == 1 and warmups[0]['pair_id'] == 0) if phase == 'timing' else not warmups,
+                'Incorrect planned CLI catalog warmup')
+        selected = [row for row in rows if row['method'] == method and not row['warmup']]
+        ids = [row['pair_id'] for row in selected]
+        require(len(ids) == len(expected) and all(type(value) is int for value in ids)
+                and set(ids) == expected, 'Incomplete or duplicate planned CLI catalog pairs')
+        require(all(row['phase'] == phase and row.get('ok') is True and row.get('validated') is True
+                    and not row.get('completion_uncertain') for row in selected + warmups),
+                'Invalid planned CLI catalog measurement')
+        methods[method] = selected
+    return {metric: native_metrics.compare_paired(methods['native'], methods['candidate'], metric)
+            for metric in (('wall_s', 'cpu_s') if phase == 'timing' else ('rss_bytes',))}
+
+
+def catalog_pins(runtime, cache):
+    pins = native_clone_pins(runtime, cache)
+    pins['tools'].update({name: digest(Path(name)) for name in
+                          ('/bin/mv', '/usr/bin/find', '/usr/bin/stat', '/sbin/mount')})
+    return pins
+
+
+def native_catalog(args, operation):
+    require(operation in CATALOG_POLICIES and platform.system() == 'Darwin', 'Unknown or unsupported CLI case')
+    scratch = args.scratch.expanduser().resolve(strict=True)
+    output = args.output.expanduser().absolute()
+    require(scratch.is_dir() and output.parent.is_dir(), 'Scratch and output parent must exist')
+    require(shutil.disk_usage(scratch).free >= 256 * 1024**2, 'At least 256 MiB free is required')
+    runtime = installed(args.candidate.expanduser().resolve(strict=True))
+    binary, policy = runtime['binary'], CATALOG_POLICIES[operation]
+    pins = catalog_pins(runtime, args.cache)
+    inventory = json.loads(command([binary, '--json', 'volumes']).stdout)
+    inventory_projection(inventory)
+    fixtures = ('empty', 'nested_1000') if operation == 'scan' else (
+        'tiny_4kib' if operation == 'move' else 'volumes',)
+    case_ids = ['cli/' + operation + '/' + fixture for fixture in fixtures]
+    report = {'schema': 1, 'case_ids': case_ids, 'fixture_policy': policy, 'pins': pins,
+              'status': 'running', 'passed': False, 'qualified': False, 'cleanup_passed': False,
+              'source_checks_passed': False, 'cache': args.cache, 'timing_pairs': 31,
+              'timing_warmup_id': 0, 'resource_pairs': args.samples, 'cold_cache_unavailable': None,
+              'volume': scratch_volume(inventory, scratch),
+              'limits': ['Original cli.make_fixtures fixtures; startup and command completion are measured.',
+                         'find-stat is a recorded-equivalent six-counter reference, not identical process work.',
+                         'mount is a getmntinfo-backed listing projected to path, filesystem and readonly.',
+                         'RSS is an individual-process peak, not aggregate or whole-system RAM.',
+                         'Full source checks precede conditioning and follow every operation; cold residency is not guaranteed.',
+                         'Stable owned fixtures only; concurrent hostile replacement is not contained.']}
+    if len(case_ids) == 1: report['case_id'] = case_ids[0]
+    journal = native_report.ReportJournal(output)
+    counters = dict.fromkeys(('rows', 'preparation', 'comparisons', 'unavailable'), 0)
+    base, cleaned, poisoned = None, False, False
+
+    def checkpoint():
+        nonlocal poisoned
+        try: journal.checkpoint(report)
+        except BaseException:
+            poisoned = True
+            raise
+
+    def record(kind, value, index=None):
+        nonlocal poisoned
+        if index is None:
+            index = counters[kind]; counters[kind] += 1
+        try: journal.append(kind, index, value)
+        except BaseException:
+            poisoned = True
+            raise
+        return index
+
+    try:
+        checkpoint()
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-cli-' + operation + '-', dir=scratch))
+        base.chmod(0o700)
+        identity = base.lstat()
+        report['fixture_root'] = str(base)
+        roots, counts = make_fixtures(base)
+        expected = {name: content_manifest(path) for name, path in roots.items()}
+        identities = {name: (path.lstat().st_dev, path.lstat().st_ino) for name, path in roots.items()}
+        report['fixtures'] = {name: {'manifest_sha256': hashlib.sha256(
+            json.dumps(value, sort_keys=True).encode()).hexdigest(), 'root_identity': identities[name],
+            'counts': counts.get(name)} for name, value in expected.items()}
+        target, destination, unused_store = base / 'target', base / 'destination', base / 'unused-store'
+        environment = dict(os.environ, STALLIONFS_HOME=str(unused_store), PYTHONDONTWRITEBYTECODE='1')
+        environment.pop('PYTHONPATH', None); environment.pop('PYTHONHOME', None)
+
+        def owned():
+            current = base.lstat()
+            require(stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700
+                    and current.st_uid == os.getuid() and (current.st_dev, current.st_ino) ==
+                    (identity.st_dev, identity.st_ino), 'Private fixture root changed')
+
+        def sources():
+            owned(); no_mounts_below(binary, base)
+            require(not os.path.lexists(unused_store), 'Command created an unnecessary store')
+            require((base / 'outside-sentinel').read_bytes() == b'keep outside linked trees\n', 'Sentinel changed')
+            for name, path in roots.items():
+                info = path.lstat()
+                require((info.st_dev, info.st_ino) == identities[name] and content_manifest(path) == expected[name],
+                        'CLI source fixture changed: ' + name)
+
+        rng, denied = random.Random(SEED), False
+        for fixture, case in zip(fixtures, case_ids):
+            for form in ('plain', 'json'):
+                for cache in args.cache:
+                    for phase in ('timing', 'resources'):
+                        if denied: continue
+                        key = dict(case_id=case, operation=operation, fixture=fixture, output=form,
+                                   cache=cache, phase=phase, reference=CATALOG_REFERENCES[operation],
+                                   fixture_policy=policy)
+                        rows = []
+                        for pair_id in (range(32) if phase == 'timing' else range(1, args.samples + 1)):
+                            methods = ['native', 'candidate']; rng.shuffle(methods)
+                            for method in methods:
+                                sources()
+                                require(not os.path.lexists(target) and not os.path.lexists(destination), 'Stale operation paths')
+                                source = roots.get(fixture)
+                                prepared = None
+                                if operation == 'move':
+                                    setup = key | {'argv': ['/bin/cp', '-cRp', str(source), str(target)], 'validated': False}
+                                    setup_id = record('preparation', setup); checkpoint()
+                                    result = command(setup['argv'])
+                                    verify_clone(source, target, expected[fixture])
+                                    prepared = target.lstat()
+                                    setup.update(exit_code=result.returncode, validated=True,
+                                                 identity=[prepared.st_dev, prepared.st_ino])
+                                    record('preparation', setup, setup_id)
+                                    source = target
+                                if method == 'candidate':
+                                    argv = [str(binary), *(['--json'] if form == 'json' else []), operation]
+                                    argv += [str(source), str(destination)] if operation == 'move' else (
+                                        [str(source)] if operation == 'scan' else [])
+                                else:
+                                    argv = (['/bin/mv', '-n', str(source), str(destination)] if operation == 'move' else
+                                            native_suite.arguments('find-stat', 'scan', binary, source, None)
+                                            if operation == 'scan' else ['/sbin/mount'])
+                                row = key | {'pair_id': pair_id, 'warmup': phase == 'timing' and pair_id == 0,
+                                             'method': method, 'argv': argv, 'ok': False, 'validated': False}
+                                row_id = record('rows', row)
+                                report['active_operation'] = row; checkpoint()
+                                conditioning = native_suite.cache_prepare(cache, 120)
+                                row['cache_receipt'] = conditioning
+                                if cache == 'cold':
+                                    code = conditioning.get('exit_code')
+                                    require(type(code) is int and code >= 0, 'Purge completion uncertain')
+                                    if code:
+                                        report.update(cold_cache_unavailable='cache purge unavailable; no further purge retries',
+                                                      cold_cache_receipt=conditioning)
+                                        row['unavailable'] = report['cold_cache_unavailable']
+                                        record('rows', row, row_id)
+                                        record('unavailable', key | {'reason': row['unavailable']})
+                                        sources()
+                                        if prepared is not None: remove_fixture(target)
+                                        report.pop('active_operation', None)
+                                        denied = True
+                                        break
+                                owned()
+                                if prepared is not None:
+                                    require(_clone_metadata(target.lstat()) == _clone_metadata(prepared),
+                                            'Move operand metadata changed after conditioning')
+                                row.update(native_metrics.collect(argv, timeout_s=120, env=environment, phase=phase))
+                                record('rows', row, row_id); checkpoint()
+                                try:
+                                    require(row.get('ok') is True and row.get('exit_code') == 0
+                                            and not row.get('completion_uncertain'), 'CLI measurement failed or uncertain')
+                                    stderr = base64.b64decode(row['stderr_b64'], validate=True)
+                                    require(not (native_metrics.time_diagnostics(stderr) if phase == 'resources' else stderr),
+                                            'CLI command emitted diagnostics')
+                                    validate_catalog_output(operation, method, form,
+                                        base64.b64decode(row['stdout_b64'], validate=True),
+                                        expected=expected.get(fixture), source=source, destination=destination,
+                                        counts=counts.get(fixture), inventory=inventory, prepared=prepared)
+                                    sources()
+                                    row.update(validated=True, source_unchanged=True, correctness={'passed': True})
+                                    if prepared is not None: remove_fixture(destination)
+                                except BaseException as error:
+                                    row['correctness'] = {'passed': False, 'reason': str(error)}
+                                    record('rows', row, row_id); checkpoint()
+                                    raise
+                                record('rows', row, row_id); rows.append(row)
+                                report.pop('active_operation', None); checkpoint()
+                            if denied: break
+                        if not denied:
+                            record('comparisons', key | {'metrics': catalog_comparison(rows, phase, args.samples, policy)})
+                            checkpoint()
+        sources()
+        report['source_checks_passed'] = True
+        require(catalog_pins(runtime, args.cache) == pins, 'CLI runtime or tool provenance changed')
+        checkpoint()
+        journal.verify(); owned(); remove_fixture(base); cleaned = True
+        report.update(status='complete', passed=not denied, cleanup_passed=True)
+        if 'cold' in args.cache:
+            report['cold_tool_identity_verified'] = True
+            report['cold_tool_content_verified'] = all(row['content_hash_status'] == 'available'
+                and row['sha256'] is not None for row in pins['cold_tools'].values())
+        if denied: report['denial_runtime_verified'] = True
+        if operation == 'scan':
+            children = []
+            for fixture, case in zip(fixtures, case_ids):
+                child = output.with_name(output.stem + '-' + fixture + '.json')
+                child_journal = native_report.ReportJournal(child)
+                try:
+                    for kind in counters:
+                        for index, value in enumerate(row for row in journal.iter_latest(kind) if row.get('case_id') == case):
+                            child_journal.append(kind, index, value)
+                    child_journal.finish(report | {'case_id': case})
+                finally:
+                    child_journal.close()
+                children.append({'output': str(child)})
+            report['stages'] = children
+        checkpoint(); journal.finish(report)
+    except BaseException as error:
+        report.update(status='failed', passed=False, error=f'{type(error).__name__}: {error}')
+        if hasattr(error, 'receipt'): report['command_receipt'] = error.receipt
+        if base is not None and not cleaned: report['retained_fixture'] = str(base)
+        if not poisoned:
+            try: checkpoint(); journal.finish(report)
+            except BaseException as secondary: error.add_note('Report closeout also failed: ' + str(secondary))
+        raise
+    finally:
+        primary = sys.exc_info()[1]
+        try: journal.close()
+        except BaseException as secondary:
+            if primary is None: raise
+            primary.add_note('Journal close also failed: ' + str(secondary))
+    return 0 if report['passed'] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, help="Older installed CLI for legacy two-release comparisons")
@@ -1049,10 +1344,13 @@ def main():
     native_route = parser.add_mutually_exclusive_group()
     native_route.add_argument('--native-delete', action='store_true', help='Collect the existing tiny-delete case against rm')
     native_route.add_argument('--native-clone', action='store_true', help='Collect the existing tiny-clone case against cp -cRp')
+    native_route.add_argument('--native-move', action='store_true', help='Collect tiny move against mv -n')
+    native_route.add_argument('--native-scan', action='store_true', help='Collect empty and nested CLI scans against find-stat')
+    native_route.add_argument('--native-volumes', action='store_true', help='Collect volumes against mount')
     parser.add_argument('--samples', type=int, help='Native CLI resource pairs, 10–100; timing always uses 31 pairs')
     parser.add_argument('--cache', nargs='+', choices=('warm', 'cold'), help='Native CLI cache modes')
     args = parser.parse_args()
-    if args.native_delete or args.native_clone:
+    if args.native_delete or args.native_clone or args.native_move or args.native_scan or args.native_volumes:
         if args.baseline is not None:
             parser.error('Native CLI comparisons use the candidate and native command; do not supply --baseline')
         args.samples = args.samples if args.samples is not None else 10
@@ -1064,6 +1362,8 @@ def main():
         if not supplied_deadline:
             os.environ[deadline] = str(time.monotonic() + 600)
         try:
+            for operation in CATALOG_POLICIES:
+                if getattr(args, 'native_' + operation): return native_catalog(args, operation)
             return native_clone(args) if args.native_clone else native_delete(args)
         finally:
             if not supplied_deadline:

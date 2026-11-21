@@ -71,7 +71,10 @@ def fingerprints(args):
 
 
 CLI_CASES = {'native-cli-delete': 'cli/delete/tiny_4kib',
-             'native-cli-clone': 'cli/clone/tiny_4kib'}
+             'native-cli-clone': 'cli/clone/tiny_4kib',
+             'native-cli-move': 'cli/move/tiny_4kib',
+             'native-cli-scan': ('cli/scan/empty', 'cli/scan/nested_1000'),
+             'native-cli-volumes': 'cli/volumes/volumes'}
 
 
 def stages(args, cycle):
@@ -86,6 +89,12 @@ def stages(args, cycle):
         ('native-cli-delete', 'cli.py', ['--native-delete', '--cache', *args.cache,
          '--candidate', str(args.binary)]),
         ('native-cli-clone', 'cli.py', ['--native-clone', '--cache', *args.cache,
+         '--candidate', str(args.binary)]),
+        ('native-cli-move', 'cli.py', ['--native-move', '--cache', *args.cache,
+         '--candidate', str(args.binary)]),
+        ('native-cli-scan', 'cli.py', ['--native-scan', '--cache', *args.cache,
+         '--candidate', str(args.binary)]),
+        ('native-cli-volumes', 'cli.py', ['--native-volumes', '--cache', *args.cache,
          '--candidate', str(args.binary)]),
         ('native-scan', 'native_suite.py', [*native, '--operations', 'scan', '--fixtures', *SCANS]),
         ('scan-api', 'scan.py', ['--files', '20000', '--memory', '--cache', 'warm']),
@@ -134,7 +143,7 @@ def outcome(name, output):
     fields = ('status', 'passed', 'cleanup_passed', 'retained_fixture',
               'completion_uncertain', 'error', 'cleanup_error', 'cold_cache_unavailable',
               'cache', 'cold_cache_receipt', 'denial_source_verification', 'denial_runtime_verified',
-              'cold_tool_identity_verified', 'cold_tool_content_verified', 'case_id', 'source_checks_passed',
+              'cold_tool_identity_verified', 'cold_tool_content_verified', 'case_id', 'case_ids', 'source_checks_passed',
               'format', 'workspace_invocation')
     return {key: state[key] for key in fields if key in state}, evidence
 
@@ -162,7 +171,9 @@ def safe_to_continue(name, code, state, evidence):
                 and type(state.get('passed')) is bool and evidence['final_report_exists']
                 and (name not in ('scan-api', 'scan-api-cold') or
                      state.get('cache') == ('cold' if name == 'scan-api-cold' else 'warm'))
-                and (name not in CLI_CASES or (state.get('case_id') == CLI_CASES[name]
+                and (name not in CLI_CASES or (state.get('case_ids', [state.get('case_id')]) ==
+                     ([CLI_CASES[name]] if isinstance(CLI_CASES[name], str) else list(CLI_CASES[name]))
+                     and (state.get('case_id') is None or state['case_id'] == CLI_CASES[name])
                      and state.get('source_checks_passed') is True))
                 and (name != 'workspaces' or (state.get('format') == 4
                      and state.get('workspace_invocation') == 'cli'))

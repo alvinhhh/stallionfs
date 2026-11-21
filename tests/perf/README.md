@@ -1,5 +1,27 @@
 # Internal performance checks
 
+## Fixed CLI native-reference collectors
+
+`cli.py --native-move`, `--native-scan` and `--native-volumes` accept the same
+`--candidate`, `--scratch`, `--output`, `--samples` and `--cache warm cold`
+arguments as the native clone/delete collectors. Each candidate plain/JSON form
+is independently paired with its native reference: 31 timing pairs plus one
+warmup, and `--samples` separate resource pairs (minimum ten). Full original
+`cli.make_fixtures` source manifests and the outside sentinel are checked after
+every operation, outside measurement. Runtime/tool pins, correctness, preparation
+receipts and failures are retained in journals; a denied cold purge is not retried.
+
+Move compares `/bin/mv -n` on fresh `cp -cRp` operands, requires the original
+4 KiB fixture contents/mode, source disappearance and unchanged device/inode.
+Scan covers both `empty` and `nested_1000`, comparing the existing find/stat
+numeric protocol with the six CLI counters. This is a **recorded-equivalent
+counts reference**, not identical process work. The scan summary links two
+per-case reports for the release gate; its parent journal retains all rows.
+Volumes compares `/sbin/mount` (a getmntinfo-backed listing), projected to path,
+filesystem and read-only status, against the candidate inventory. Plain/JSON
+candidate contracts remain exact. A changing mount inventory fails validation.
+These four cases now have campaign collectors and are not catalog-only entries.
+
 [Expanded native comparisons and current status](../../work/BENCHMARKS.md).
 
 JSON results retain samples, validation outcomes and source/runtime hashes.
@@ -112,6 +134,43 @@ mkdir -p /tmp/stallionfs-perf
 Caches are flushed only for native cold-cache phases. Setup, validation and cleanup are outside timing unless stated otherwise. Uncertain child completion retains the fixture. KiB/MiB/GiB use powers of 1,024; MB/GB are decimal. Speedup is baseline/stallionfs time; signed changes are stallionfs minus baseline. CLI paired savings use Apple minus stallionfs.
 
 CPU seconds measure total work. Average CPU cores is the median of per-sample CPU-seconds/wall-seconds ratios: command CPU for file operations, matching lifecycle CPU/wall phases for workspaces. Less CPU work does not imply lower average or instantaneous load. Peak utilization is unmeasured.
+
+## Performance release gate
+
+Collection passing is not release acceptance. Evaluate three independent result
+directories (or benchmark summary/native JSON files) with the stdlib-only gate:
+
+```sh
+python3 tests/perf/release_gate.py RUN1 RUN2 RUN3 --json release-gate.json
+```
+
+The fixed denominator is all 37 `sfs benchmark --list` cases, including native
+commands, scanner APIs and workspace references. Missing cases are reported as
+`not collected`, never dropped. The CLI scan, volumes and move cases are
+collected by `cli.py --native-scan`, `--native-volumes` and `--native-move`. Stopped or fingerprint-invalidated campaign
+stages fail the run. Directories combine reports and
+follow summary/campaign links; overlapping files cannot establish independent runs.
+Native and CLI comparisons retain each recorded reference, cache and output form;
+both API bulk variants must beat POSIX. The gate consumes existing paired decisions,
+requires at least ten complete pairs and correctness for every candidate operation.
+Reference preservation losses are shown, not attributed to the candidate. A
+reference with no valid comparison solely because its own rows lost metadata or
+sparse holes is excluded and listed as `reference not comparable: <losses>`.
+At least one reference must remain comparable. Missing evidence, setup failures,
+command failures, source changes and uncertainty still fail the case, including
+on excluded-reference candidate operations. The gate does not regenerate paired
+decisions or recover samples the collector excluded. Against every comparable reference,
+elapsed must win beyond noise and either CPU or peak process RSS must also win.
+At least 90% of cases must
+pass, every tiny-file case must save at least 0.01 ms in median paired elapsed time,
+and every bulk/scan case must improve the elapsed median by at least 10%.
+Qualification requires at least three passing runs with identical per-case verdicts.
+The command prints reasons and native-to-StallionFS medians, writes full evidence
+and verdicts with `--json`, and exits nonzero unless qualified. One or two runs can
+be inspected but cannot qualify. Missing RSS can be covered by a valid CPU win;
+other unavailable or failed operations cannot. No missing collector is supplied
+by this gate. Linux/OpenZFS native-only descriptive results do not qualify as
+paired product comparisons; the platform/cache/memory caveats above still apply.
 
 ## Sequential campaign
 
