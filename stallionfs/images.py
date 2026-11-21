@@ -390,6 +390,7 @@ def clone(source_image, dest_image):
 
 def build(source_repo, destination_image, capacity_gib):
     """Prepare and durably close an APFS image. Failed mounted images remain recoverable."""
+    from . import copy
     from .core import validate_tree
     _require_supported()
     if type(capacity_gib) is not int or capacity_gib <= 0:
@@ -409,7 +410,7 @@ def build(source_repo, destination_image, capacity_gib):
         os.chown(point, os.getuid(), os.getgid())
         os.chmod(point, 0o700)
         _directory(point)
-        _command('/usr/bin/ditto', source, repo)
+        copy(source, repo, strategy='materialized')
         detach_attempted = True
         detach(destination, point)
         flush(destination)

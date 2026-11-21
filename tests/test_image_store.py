@@ -358,11 +358,10 @@ class ImageRecoveryTests(unittest.TestCase):
                 def command(*args):
                     if args[1] == 'create':
                         image.write_bytes(b'preserved image'); image.chmod(0o600)
-                    elif failure in ('populate', 'cleanup'):
-                        raise primary
                     return b''
                 detach_error = primary if failure in ('detach', 'interrupt') else recovery if failure == 'cleanup' else None
                 with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                        patch('stallionfs.copy', side_effect=primary if failure in ('populate', 'cleanup') else None) as populate, \
                         patch.object(images, '_command', side_effect=command), \
                         patch.object(images, 'attach', side_effect=lambda _image, point: point / 'repo'), \
                         patch.object(images.os, 'chown'), \
@@ -371,6 +370,8 @@ class ImageRecoveryTests(unittest.TestCase):
                         patch.object(images, 'flush', side_effect=primary if failure == 'flush' else None) as flush:
                     with self.assertRaises(BaseException) as caught:
                         images.build(source, image, 1)
+                populate.assert_called_once()
+                self.assertEqual(populate.call_args.kwargs, {'strategy': 'materialized'})
                 detach.assert_called_once()
                 self.assertEqual(inspect.call_count, int(failure in ('populate', 'cleanup')))
                 self.assertEqual(flush.call_count, int(failure == 'flush'))
@@ -415,6 +416,104 @@ class ImageRecoveryTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "darwin" and os.environ.get("STALLIONFS_TEST_IMAGES") == "1",
                      "requires macOS disk-image access and explicit test selection")
 class ImageStoreTests(unittest.TestCase):
+    def test_prepared_metadata_survives_build_create_snapshot_and_rollback(self):
+        from stallionfs import images
+        perf = str(Path(__file__).parent / 'perf')
+        sys.path.insert(0, perf)
+        self.addCleanup(sys.path.remove, perf)
+        import native_correctness as checks
+
+        preparation = r"""import ctypes, fcntl, os, struct, subprocess
+from pathlib import Path
+root = Path('metadata'); root.mkdir(mode=0o750)
+(root / 'directory').mkdir(); (root / 'empty').mkdir()
+(root / 'file').write_bytes(b'original\x00data')
+os.link(root / 'file', root / 'alias')
+for name, target in (('relative', 'file'), ('dangling', 'missing'), ('directory-link', 'directory')):
+    (root / name).symlink_to(target)
+with (root / 'sparse').open('wb') as stream:
+    stream.write(b'HEAD'); stream.seek(8 * 1024 * 1024 - 1); stream.write(b'T')
+    stream.flush()
+    fcntl.fcntl(stream.fileno(), 99, struct.pack('=IIqq', 0, 0, 1024 * 1024, 6 * 1024 * 1024))
+    os.fsync(stream.fileno()); fcntl.fcntl(stream.fileno(), 51)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+for path in (root, root / 'directory', root / 'file', root / 'sparse', root / 'relative'):
+    subprocess.run(['/bin/chmod', '-h', '+a', 'everyone allow read,readattr,readextattr,readsecurity', str(path)], check=True)
+    attributes = {'user.small': b'value\x00\xff', 'user.large': bytes(range(256)) * 32,
+                  'com.apple.metadata:stallionfs-test': b'apple\x00value'}
+    if path.is_file() and not path.is_symlink():
+        attributes['com.apple.ResourceFork'] = b'fork\x00' + bytes(range(256)) * 32
+    for name, value in attributes.items():
+        if libc.setxattr(os.fsencode(path), name.encode(), value, len(value), 0, 1):
+            raise OSError(ctypes.get_errno(), 'setxattr', str(path))
+"""
+        base = Path(tempfile.mkdtemp(prefix='stallionfs-image-metadata-')).resolve()
+        store = Store(base / 'store')
+        with image_fixture(store, base) as fixture:
+            source = base / 'source'
+            source.mkdir()
+            git(source, 'init', '-b', 'main')
+            (source / 'tracked').write_text('tracked\n')
+            git(source, 'add', '.')
+            git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'Fixture')
+            expected = []
+            original_build = images.build
+
+            def observe_build(repo, image, capacity):
+                before = checks.snapshot(Path(repo) / 'metadata')
+                sparse = before['entries']['sparse']
+                self.assertLess(sparse['allocated_bytes'], sparse['size'])
+                self.assertIsNone(sparse['holes']['unavailable'])
+                self.assertTrue(any(start <= 1024 * 1024 and end >= 7 * 1024 * 1024
+                                    for start, end in sparse['holes']['ranges']))
+                self.assertEqual(before['hardlink_groups'], [['alias', 'file']])
+                self.assertTrue(before['entries']['relative']['acl']['text_hex'])
+                self.assertTrue(before['entries']['relative']['xattrs'])
+                expected.append(before)
+                return original_build(repo, image, capacity)
+
+            def assert_metadata(repo):
+                observed = checks.snapshot(Path(repo) / 'metadata')
+                report = checks.compare(expected[0], observed)
+                self.assertTrue(report['strict_equal'], report)
+                self.assertIs(report['sparse_preserved'], True, report)
+                self.assertLess(observed['entries']['sparse']['allocated_bytes'],
+                                observed['entries']['sparse']['size'])
+
+            with patch.object(images, 'build', side_effect=observe_build):
+                seed = fixture.call(store.prepare, source, key='metadata', image_size=1,
+                                    command=[sys.executable, '-c', preparation])
+            seed_image = store.root / 'seeds' / seed['id'] / 'workspace.sparseimage'
+            point = base / 'inspect-seed'
+            with failure_scope(base, seed_image, mountpoint=point, stage='verify-build'):
+                repo = images.attach(seed_image, point)
+                assert_metadata(repo)
+                images.detach(seed_image, point)
+            workspace = fixture.call(store.create, seed['id'])
+            value, repo = workspace['id'], Path(workspace['path'])
+            assert_metadata(repo)
+            snapshot = fixture.call(store.snapshot, value, quiescent=True, workspace=value)
+            saved = store.root / 'snapshots' / snapshot['id'] / 'workspace.sparseimage'
+            with failure_scope(base, saved, mountpoint=point, stage='verify-snapshot'):
+                saved_repo = images.attach(saved, point)
+                assert_metadata(saved_repo)
+                images.detach(saved, point)
+            (repo / 'metadata/file').write_bytes(b'changed')
+            subprocess.run(['/usr/bin/xattr', '-d', 'user.large', str(repo / 'metadata/file')], check=True)
+            (repo / 'metadata/alias').unlink()
+            (repo / 'metadata/relative').unlink()
+            (repo / 'metadata/relative').symlink_to('directory')
+            with (repo / 'metadata/sparse').open('r+b') as stream:
+                stream.seek(2 * 1024 * 1024)
+                stream.write(b'changed hole')
+            fixture.call(store.rollback, value, snapshot['id'], quiescent=True, workspace=value)
+            assert_metadata(repo)
+            with failure_scope(base, saved, mountpoint=point, stage='verify-independent-snapshot'):
+                saved_repo = images.attach(saved, point)
+                assert_metadata(saved_repo)
+                images.detach(saved, point)
+
     def test_snapshot_rollback_and_protected_retirement(self):
         observation = detach_observation_selection()
         from stallionfs import lifecycle
