@@ -1102,6 +1102,7 @@ class NativeSuite(unittest.TestCase):
         self.assertEqual(len(report['preparation']), len(report['rows']))
         self.assertTrue(all(row['argv'][:4] == ['/usr/bin/ditto', '--rsrc', '--extattr', '--acl'] and row['validated']
                             and row['correctness']['independent_clone'] for row in report['preparation']))
+        self.assertTrue(all('sparse_hole_repairs' in row for row in report['preparation']))
         self.assertFalse(any(argv[:2] == [str(self.binary), 'clone'] for argv in self.commands))
 
     def test_setup_mismatch_retains_validation_and_fixture(self):

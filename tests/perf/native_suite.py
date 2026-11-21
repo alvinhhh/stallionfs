@@ -2,6 +2,7 @@
 import argparse
 import base64
 import gzip
+import fcntl
 from datetime import datetime, timezone
 import json
 import hashlib
@@ -13,6 +14,7 @@ import random
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -202,6 +204,59 @@ def restore_setup_symlink_times(target, expected):
                         and os.readlink(os.fsencode(path)).hex() == entry['symlink_bytes']
                         and after.st_mtime_ns == entry['mtime_ns'], 'Setup symlink timestamp restoration failed')
         repairs.append({'path': name, 'before_mtime_ns': before.st_mtime_ns, 'after_mtime_ns': after.st_mtime_ns})
+    return repairs
+
+
+def restore_setup_sparse_holes(target, expected):
+    """Restore holes only in content-verified, independent disposable operands."""
+    entries = expected.get('entries', {})
+    source_inodes = {tuple(entry['device_inode']) for entry in entries.values()}
+    seen, repairs = {}, []
+    for name, entry in entries.items():
+        if entry['kind'] != 'file': continue
+        ranges = entry['holes']['ranges']
+        fileops.require(ranges is not None, 'Setup source hole ranges unavailable')
+        if not ranges: continue
+        path = target / name
+        before = path.lstat()
+        fileops.require(stat.S_ISREG(before.st_mode), 'Setup sparse operand is not a regular file')
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(fd)
+            identity = (opened.st_dev, opened.st_ino)
+            fileops.require(identity == (before.st_dev, before.st_ino) and
+                            stat.S_ISREG(opened.st_mode) and opened.st_size == entry['size'],
+                            'Setup sparse operand changed before restoration')
+            fileops.require(identity not in source_inodes, 'Setup sparse operand aliases a source inode')
+            signature = (entry['sha256'], entry['size'], ranges)
+            if identity in seen:
+                fileops.require(seen[identity] == signature, 'Inconsistent setup hard-link expectations')
+                continue
+            seen[identity] = signature
+            if native_correctness._holes(fd, opened.st_size)['ranges'] == ranges: continue
+            fileops.require(sys.platform == 'darwin', 'Setup hole restoration requires Darwin')
+            end = 0
+            for start, stop in ranges:
+                fileops.require(end <= start < stop <= opened.st_size, 'Invalid setup source hole range')
+                end = stop
+            try:
+                digest = hashlib.sha256()
+                os.lseek(fd, 0, os.SEEK_SET)
+                while chunk := os.read(fd, 1024 * 1024): digest.update(chunk)
+                fileops.require(digest.hexdigest() == entry['sha256'], 'Setup sparse operand content changed')
+                checked = os.fstat(fd)
+                fileops.require((checked.st_size, checked.st_mtime_ns) ==
+                                (opened.st_size, opened.st_mtime_ns), 'Setup sparse operand changed while reading')
+                for start, stop in ranges:
+                    fcntl.fcntl(fd, 99, struct.pack('=IIqq', 0, 0, start, stop - start))  # F_PUNCHHOLE
+                fileops.require(native_correctness._holes(fd, opened.st_size)['ranges'] == ranges,
+                                'Setup sparse hole restoration failed')
+            finally:
+                os.utime(fd, ns=(opened.st_atime_ns, opened.st_mtime_ns))
+                os.fsync(fd)
+            repairs.append({'path': name, 'ranges': ranges})
+        finally:
+            os.close(fd)
     return repairs
 
 
@@ -496,6 +551,7 @@ def main():
                                             uncertain = True
                                             raise RuntimeError('Operand preparation failed; receipt and fixture retained')
                                         setup['symlink_timestamp_repairs'] = restore_setup_symlink_times(target, expected)
+                                        setup['sparse_hole_repairs'] = restore_setup_sparse_holes(target, expected)
                                         operand = target
                                     argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs)
                                     report['active_operation'] = key | {'argv': argv, 'state': 'source validation, cache preparation or command pending'}
