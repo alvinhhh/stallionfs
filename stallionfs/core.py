@@ -863,7 +863,8 @@ class Store(Lifecycle):
                 "command": list(command), "system": platform.system(),
                 "release": platform.release(), "machine": platform.machine(), "format": 1}
         if image_size is not None:
-            spec.update(backend="image", capacity_gib=image_size)
+            # Include the materialized copy recipe in the image seed ID.
+            spec.update(backend="image", capacity_gib=image_size, image_copy_recipe=2)
         seed = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         with lock(self.root / "locks" / f"seed-{seed}"):
             final = self.root / "seeds" / seed
