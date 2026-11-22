@@ -1,5 +1,9 @@
 """Release acceptance over recorded paired comparisons, not collection success."""
 import argparse
+from contextlib import closing
+from datetime import datetime
+import hashlib
+from itertools import takewhile, zip_longest
 import json
 import math
 from pathlib import Path
@@ -18,6 +22,21 @@ SAMPLE_ID = re.compile(r'[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
                             'stallionfs' / '_benchmark_cases.py'))['CASES']
 UNIVERSE = tuple(case['id'] for case in CATALOG)
+
+CAMPAIGN_STAGES = {
+    'native-files': 'fileops/',
+    'native-copy': 'native/copy/',
+    'native-cli-delete': 'cli/delete/',
+    'native-cli-clone': 'cli/clone/',
+    'native-cli-move': 'cli/move/',
+    'native-cli-scan': 'cli/scan/',
+    'native-cli-volumes': 'cli/volumes/',
+    'native-scan': 'native/scan/',
+    'scan-api': 'api-scan/',
+    'scan-api-cold': 'api-scan/',
+    'workspaces': 'workspace/',
+}
+SHA256 = re.compile(r'[0-9a-f]{64}')
 
 
 def number(value):
@@ -385,6 +404,206 @@ def load_run(path):
     return result
 
 
+def campaign_file(expected, recorded):
+    if (expected.parent / recorded != expected or expected.resolve() != expected or
+            not expected.is_file()):
+        raise ValueError(f'missing or misassigned campaign file: {expected.name}')
+    return expected
+
+
+def json_object(raw):
+    document = json.loads(raw, parse_constant=lambda value: None)
+    if not isinstance(document, dict):
+        raise ValueError('expected a JSON object')
+    return document
+
+
+def clean_campaign_report(document):
+    return (not document_errors(document) and not document.get('cleanup_error') and
+            type(document.get('passed')) is bool)
+
+
+def verified_native_report(output, raw, evidence=None):
+    from native_report import ENCODER, KINDS, ReportJournal
+
+    if evidence is not None:
+        campaign_file(output.with_suffix('.json.manifest'), evidence['manifest'])
+        campaign_file(output.with_suffix('.json.journal'), evidence['journal'])
+    try:
+        with closing(ReportJournal.open_existing(output)) as reader:
+            if evidence is not None:
+                provenance = reader.provenance
+                if (provenance['original_manifest_sha256'] != evidence['manifest_sha256'] or
+                        provenance['committed_bytes'] != evidence['committed_bytes'] or
+                        provenance['committed_prefix_sha256'] != evidence['claimed_prefix_sha256']):
+                    raise ValueError('native journal does not match its recorded control evidence')
+            document = json.loads(raw)
+            state = reader.state
+            if (not isinstance(document, dict) or set(document) != set(state).union(KINDS) or
+                    ENCODER.encode({key: document[key] for key in state}) != ENCODER.encode(state)):
+                raise ValueError('final native report state differs from committed journal')
+            for kind in KINDS:
+                records = document[kind]
+                if not isinstance(records, list) or any(
+                        not isinstance(final, dict) or committed is None or
+                        ENCODER.encode(final) != ENCODER.encode(committed)
+                        for final, committed in zip_longest(records, reader.iter_latest(kind))):
+                    raise ValueError(f'final native report {kind} differ from committed journal')
+            return document
+    except ValueError as error:
+        raise ValueError(f'{output.name}: {error}') from error
+
+
+def campaign_reports(output, stage, cache):
+    name = stage['stage']
+    raw = output.read_bytes()
+    outcome, evidence = stage['outcome'], stage['evidence']
+    native = name.startswith('native-')
+    cli = name.startswith('native-cli-')
+    document = verified_native_report(output, raw, evidence) if native else json_object(raw)
+    passed = document.get('passed')
+    if (not clean_campaign_report(document) or not clean_campaign_report(outcome) or
+            any(document.get(key) != value for key, value in outcome.items()) or
+            evidence.get('final_report_exists') is not True or
+            stage.get('status') != ('complete' if passed else 'complete_with_failures') or
+            type(stage.get('exit_code')) is not int or stage['exit_code'] != (0 if passed else 1) or
+            (not passed and (not native or cli))):
+        raise ValueError('stage did not finish with confirmed cleanup and final report')
+
+    if not native:
+        campaign_file(output, evidence['summary'])
+        if hashlib.sha256(raw).hexdigest() != evidence['summary_sha256']:
+            raise ValueError('report does not match its recorded summary evidence')
+
+    cases = [case for case in UNIVERSE if case.startswith(CAMPAIGN_STAGES[name])]
+    reports = {output: document}
+    if cli:
+        if (document.get('case_ids', [document.get('case_id')]) != cases or
+                document.get('case_id') not in (None, *cases) or
+                document.get('source_checks_passed') is not True or document.get('cache') != cache):
+            raise ValueError('CLI case IDs, source checks or cache do not match the stage')
+        if name == 'native-cli-scan':
+            reports = {}
+            links = document['stages']
+            if not isinstance(links, list) or len(links) != len(cases):
+                raise ValueError('missing CLI scan case reports')
+            if any(row.get('case_id') not in cases for kind in ('rows', 'comparisons', 'unavailable')
+                   for row in document[kind]):
+                raise ValueError('unexpected evidence in the CLI scan aggregate')
+            for case, link in zip(cases, links):
+                child = campaign_file(output.with_stem(output.stem + '-' + case.rsplit('/', 1)[-1]),
+                                      link['output'])
+                report = verified_native_report(child, child.read_bytes())
+                if (not clean_campaign_report(report) or report['passed'] is not True or
+                        report.get('case_id') != case or report.get('source_checks_passed') is not True or
+                        report.get('cache') != cache or any(
+                            report[kind] != [row for row in document[kind] if row.get('case_id') == case]
+                            for kind in ('rows', 'comparisons', 'unavailable'))):
+                    raise ValueError(f'{child.name}: CLI scan case report does not match its aggregate')
+                reports[child] = report
+    if native:
+        contexts = {(case_id(row, report), row.get('cache'), row.get('output') if cli else None)
+                    for report in reports.values() for kind in ('rows', 'comparisons', 'unavailable')
+                    for row in report[kind]}
+        if not {(case, mode, form) for case in cases for mode in cache
+                for form in (('plain', 'json') if cli else (None,))} <= contexts:
+            raise ValueError('missing case, cache or output-form evidence for the stage')
+    elif name == 'workspaces':
+        if (document.get('format') != 4 or document.get('workspace_invocation') != 'cli' or
+                not {'1', '4'} <= document['comparisons'].keys()):
+            raise ValueError('missing CLI folder-workspace comparisons')
+    elif (document.get('cache') != cache[0] or
+          not {case.split('/')[-1] for case in cases} <= document['workloads'].keys()):
+        raise ValueError('missing API scan workload or wrong cache')
+
+    return list(reports.values()), {output, *reports}
+
+
+def campaign_time(record, key):
+    stamp = datetime.fromisoformat(record[key])
+    if stamp.utcoffset() is None:
+        raise ValueError('campaign timestamp is missing its time zone')
+    return stamp
+
+
+def load_campaign(path):
+    """Use one closed campaign as one qualification input per sequential cycle."""
+    path = path.resolve()
+    try:
+        campaign = json_object(path.read_bytes())
+        cache, samples = campaign['cache'], campaign['samples']
+        if (type(campaign.get('schema')) is not int or campaign['schema'] != 1 or
+                type(campaign.get('cycles')) is not int or campaign['cycles'] != MINIMUM_RUNS or
+                campaign.get('status') != 'complete' or any(campaign.get(key) for key in
+                    ('error', 'completion_uncertain', 'cold_cache_unavailable')) or
+                not isinstance(cache, list) or not cache or not set(cache) <= {'warm', 'cold'} or
+                len(cache) != len(set(cache)) or type(samples) is not int or not 10 <= samples <= 100):
+            raise ValueError('expected a complete three-cycle campaign with valid cache and sample settings')
+        pins = campaign['fingerprints']
+        for kind in ('source_sha256', 'runtime_sha256'):
+            if not isinstance(pins[kind], dict) or not pins[kind] or not all(
+                    isinstance(value, str) and SHA256.fullmatch(value) for value in pins[kind].values()):
+                raise ValueError(f'missing or invalid campaign {kind} fingerprints')
+        if 'cold' in cache and (not isinstance(pins.get('cold_tools'), dict) or not pins['cold_tools']):
+            raise ValueError('missing cold-tool fingerprints')
+        stages = [name for name in CAMPAIGN_STAGES if name != 'scan-api-cold' or 'cold' in cache]
+        expected = [(cycle, name) for cycle in range(1, MINIMUM_RUNS + 1) for name in stages]
+        if [(row['cycle'], row['stage']) for row in campaign['stages']] != expected:
+            raise ValueError('missing, repeated or nonsequential campaign stages')
+        previous = campaign_time(campaign, 'started_utc')
+        for row in campaign['stages']:
+            started, ended = campaign_time(row, 'started_utc'), campaign_time(row, 'ended_utc')
+            if type(row['cycle']) is not int or not previous <= started <= ended:
+                raise ValueError('nonsequential campaign stage timestamps')
+            previous = ended
+        if (previous > campaign_time(campaign, 'ended_utc') or
+                campaign.get('collection_passed') is not
+                all(row.get('status') == 'complete' for row in campaign['stages'])):
+            raise ValueError('inconsistent campaign completion status')
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return [dict(evaluate_documents([], input_errors=[f'{path}: {error}']), input=str(path))]
+
+    configurations, runs = {}, []
+    rows = iter(campaign['stages'])
+    for cycle in range(1, MINIMUM_RUNS + 1):
+        documents, files, errors = [], [], []
+        for name in stages:
+            stage = next(rows)
+            label = f'cycle-{cycle}-{name}'
+            try:
+                mode = cache if name.startswith('native-') else ['cold' if name == 'scan-api-cold' else 'warm']
+                if (stage.get('fingerprints_unchanged') is not True or stage.get('cache') != mode or
+                        any(stage.get(key) for key in ('error', 'completion_uncertain', 'omitted_cold_cache'))):
+                    raise ValueError('invalidated or incomplete stage, or mismatched cache')
+                output = campaign_file(path.parent / (label + '.json'), stage['output'])
+                campaign_file(output.with_suffix('.log'), stage['log'])
+                argv = stage['argv']
+                if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+                    raise ValueError('invalid stage command')
+                output_index = argv.index('--output') + 1
+                campaign_file(output, argv[output_index])
+                command = argv[:output_index] + argv[output_index + 1:]
+                actual_cache = (list(takewhile(lambda arg: not arg.startswith('--'),
+                                               argv[argv.index('--cache') + 1:]))
+                                if name != 'workspaces' else mode)
+                if (command != configurations.setdefault(name, command) or actual_cache != mode or
+                        argv[argv.index('--samples') + 1] != str(samples) or
+                        (name in ('native-files', 'native-copy', 'native-scan') and
+                         argv[argv.index('--runs') + 1] != '1')):
+                    raise ValueError('stage command does not match the campaign configuration')
+                reports, report_files = campaign_reports(output, stage, mode)
+                documents.extend(reports)
+                files.extend(report_files)
+            except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
+                errors.append(f'{label}: {error}')
+        try:
+            run = evaluate_documents(documents, input_errors=errors)
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            run = evaluate_documents([], input_errors=[*errors, f'Cycle {cycle}: {error}'])
+        runs.append(dict(run, input=str(path), cycle=cycle, report_files=sorted(map(str, files))))
+    return runs
+
+
 def medians(group):
     parts = []
     for key in ('wall_s', 'cpu_s', 'rss_bytes'):
@@ -398,13 +617,18 @@ def medians(group):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('runs', type=Path, nargs='+', metavar='RUN')
+    parser.add_argument('runs', type=Path, nargs='*', metavar='RUN')
+    parser.add_argument('--campaign', type=Path, metavar='CAMPAIGN.JSON',
+                        help='Evaluate each of the three cycles in one completed campaign')
     parser.add_argument('--json', type=Path, help='Write the full release-gate decision')
     args = parser.parse_args(argv)
+    if bool(args.campaign) == bool(args.runs):
+        parser.error('Provide positional runs or one --campaign manifest')
     try:
-        result = qualify([load_run(path) for path in args.runs])
+        runs = load_campaign(args.campaign) if args.campaign else [load_run(path) for path in args.runs]
+        result = qualify(runs)
         print('RELEASE GATE (not collection passing); elapsed/CPU seconds, RSS bytes')
-        print('Case | ' + ' | '.join(f'Run {i + 1}' for i in range(len(args.runs))) + ' | Reasons / medians native→sfs')
+        print('Case | ' + ' | '.join(f'Run {i + 1}' for i in range(len(runs))) + ' | Reasons / medians native→sfs')
         for index, case in enumerate(UNIVERSE):
             values = [run['cases'][index] for run in result['runs']]
             details = []
@@ -433,7 +657,7 @@ def main(argv=None):
         if result.get('input_error'):
             print(result['input_error'])
         print(f"RELEASE GATE: {'QUALIFIED' if result['qualified'] else 'NOT QUALIFIED'} "
-              f"({len(args.runs)} runs; at least {MINIMUM_RUNS} required)")
+              f"({len(runs)} runs; at least {MINIMUM_RUNS} required)")
         if args.json:
             args.json.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n')
         return 0 if result['qualified'] else 1

@@ -1,5 +1,6 @@
 """Campaign ordering and stop rules with subprocesses replaced by report fixtures."""
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,10 +11,12 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-
+from uuid import uuid4
 
 PERF = Path(__file__).parent / 'perf'
-with mock.patch.object(sys, 'path', [str(PERF), *sys.path]):
+with mock.patch.object(sys, 'path', [str(PERF), str(PERF.parent), *sys.path]):
+    from test_release_gate import gate, identified_report
+
     spec = importlib.util.spec_from_file_location('campaign_under_test', PERF / 'campaign.py')
     campaign = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(campaign)
@@ -67,6 +70,247 @@ class CampaignTests(unittest.TestCase):
 
     def report(self):
         return json.loads((self.output / 'campaign.json').read_text())
+
+    def collect_gate_fixture(self, *, reference_loss=False):
+        """Exercise the real campaign and journal writers with synthetic measurements."""
+        self.args.append('cold')
+        digest = hashlib.sha256(b'synthetic').hexdigest()
+        pins = {'source_sha256': {'tests/perf/campaign.py': digest},
+                'runtime_sha256': {str(self.root / 'binary'): digest},
+                'cold_tools': {'purge': {'content_hash_status': 'unavailable', 'sha256': None}}}
+
+        def native(path, state, reports):
+            writer = campaign.native_report.ReportJournal(path)
+            try:
+                for kind in ('rows', 'comparisons', 'unavailable'):
+                    records = (record for report in reports for record in report.get(kind, []))
+                    for i, record in enumerate(records):
+                        writer.append(kind, i, record)
+                writer.finish(state)
+            finally:
+                writer.close()
+
+        def child(argv, **kwargs):
+            output = Path(argv[argv.index('--output') + 1])
+            stage = output.stem.split('-', 2)[2]
+            state = {'status': 'complete', 'passed': True, 'cleanup_passed': True,
+                     'fixture_root': str(output.with_suffix('.fixture'))}
+            if stage.startswith('native-'):
+                if stage in campaign.CLI_CASES:
+                    case_ids = campaign.CLI_CASES[stage]
+                    cases = [case_ids] if isinstance(case_ids, str) else list(case_ids)
+                    state.update(case_ids=cases, source_checks_passed=True, cache=['warm', 'cold'])
+                else:
+                    prefix = {'native-files': 'fileops/', 'native-copy': 'native/copy/',
+                              'native-scan': 'native/scan/'}[stage]
+                    cases = [case for case in gate.UNIVERSE if case.startswith(prefix)]
+                reports = []
+                for case in cases:
+                    for cache in ('warm', 'cold'):
+                        for form in (('plain', 'json') if stage in campaign.CLI_CASES else (None,)):
+                            report = identified_report(case)
+                            for kind in ('rows', 'comparisons'):
+                                for record in report[kind]:
+                                    record.update(cache=cache, output=form)
+                                    if stage in campaign.CLI_CASES:
+                                        record['case_id'] = case
+                            reports.append(report)
+                if reference_loss and stage == 'native-files':
+                    loss = identified_report('fileops/move/large_64mib')
+                    for row in loss['rows']:
+                        row['reference'] = 'lossy'
+                        if row['method'] == 'native':
+                            row.update(validated=False, correctness={'strict_equal': False,
+                                       'candidate_losses': [{'field': 'acl'}]})
+                    del loss['comparisons']
+                    reports.append(loss)
+                    state['passed'] = False
+                if stage == 'native-cli-scan':
+                    links = []
+                    for case in cases:
+                        path = output.with_stem(output.stem + '-' + case.rsplit('/', 1)[-1])
+                        native(path, dict(state, case_id=case, case_ids=[case]),
+                               [report for report in reports if report['case_id'] == case])
+                        links.append({'output': str(path)})
+                    state['stages'] = links
+                elif stage in campaign.CLI_CASES:
+                    state['case_id'] = cases[0]
+                native(output, state, reports)
+            elif stage == 'workspaces':
+                state.update(format=4, workspace_invocation='cli', raw={}, comparisons={})
+                for case in gate.UNIVERSE:
+                    if case.startswith('workspace/'):
+                        report = identified_report(case)
+                        for key in ('raw', 'comparisons'):
+                            state[key].update(report[key])
+                campaign.f.write_new_json(output, state)
+            else:
+                state.update(cache=argv[-1], workloads={})
+                for case in gate.UNIVERSE:
+                    if case.startswith('api-scan/'):
+                        state['workloads'].update(identified_report(case)['workloads'])
+                campaign.f.write_new_json(output, state)
+            return subprocess.CompletedProcess(argv, 0 if state['passed'] else 1)
+
+        self.assertEqual(self.run_mocked(child=child, pins={'return_value': pins}), int(reference_loss))
+        return self.output / 'campaign.json'
+
+    def gate_decision(self, *args):
+        decision = self.root / 'gate.json'
+        with redirect_stdout(io.StringIO()):
+            code = gate.main([*map(str, args), '--json', str(decision)])
+        return code, json.loads(decision.read_text())
+
+    def test_release_gate_qualifies_three_cycles_from_one_campaign(self):
+        manifest = self.collect_gate_fixture()
+        code, positional = self.gate_decision(manifest)
+        self.assertEqual(code, 1)
+        self.assertEqual([run['passing_cases'] for run in positional['runs']], [37])
+
+        code, decision = self.gate_decision('--campaign', manifest)
+        self.assertEqual(code, 0)
+        self.assertTrue(decision['qualified'])
+        self.assertEqual([run['cycle'] for run in decision['runs']], [1, 2, 3])
+        self.assertEqual([run['passing_cases'] for run in decision['runs']], [37, 37, 37])
+        files = [set(run['report_files']) for run in decision['runs']]
+        self.assertTrue(all(str(manifest) not in paths for paths in files))
+        self.assertFalse(gate.runs_overlap(files))
+
+    def test_release_gate_distinguishes_reference_loss_from_incomplete_collection(self):
+        manifest = self.collect_gate_fixture(reference_loss=True)
+        self.assertFalse(self.report()['collection_passed'])
+        code, decision = self.gate_decision('--campaign', manifest)
+        self.assertEqual(code, 0)
+        self.assertTrue(decision['qualified'])
+        for run in decision['runs']:
+            case = next(case for case in run['cases'] if case['case'] == 'fileops/move/large_64mib')
+            self.assertTrue(any(group['excluded'] for group in case['references']))
+
+    def test_release_gate_rejects_campaign_sample_reuse(self):
+        manifest = self.collect_gate_fixture()
+        document = self.report()
+        scans = [stage for stage in document['stages'] if stage['stage'] == 'scan-api']
+        source, target = (Path(stage['output']) for stage in scans[:2])
+        report = json.loads(target.read_text())
+        source_row = json.loads(source.read_text())['workloads']['flat']['memory_rows'][0]
+        report['workloads']['flat']['memory_rows'][0]['sample_id'] = source_row['sample_id']
+        target.write_text(json.dumps(report))
+        scans[1]['evidence']['summary_sha256'] = hashlib.sha256(target.read_bytes()).hexdigest()
+        manifest.write_text(json.dumps(document))
+        code, decision = self.gate_decision('--campaign', manifest)
+        self.assertEqual(code, 1)
+        self.assertFalse(decision['qualified'])
+        self.assertEqual([run['passing_cases'] for run in decision['runs']], [37, 37, 37])
+        self.assertIn('raw benchmark samples were reused', decision['input_error'])
+
+    def test_release_gate_rejects_final_sample_id_edits_in_native_and_cli_reports(self):
+        manifest = self.collect_gate_fixture()
+        for stage, reports in (
+            ('native-copy', ('native-copy',)),
+            ('native-cli-delete', ('native-cli-delete',)),
+            ('native-cli-scan', ('native-cli-scan', 'native-cli-scan-empty')),
+        ):
+            with self.subTest(stage=stage):
+                paths = [self.output / f'cycle-2-{name}.json' for name in reports]
+                originals = [path.read_bytes() for path in paths]
+                forged_id = uuid4().hex
+                try:
+                    for path, raw in zip(paths, originals):
+                        document = json.loads(raw)
+                        document['rows'][0]['sample_id'] = forged_id
+                        path.write_text(json.dumps(document))
+                    code, decision = self.gate_decision('--campaign', manifest)
+                    self.assertEqual(code, 1)
+                    self.assertFalse(decision['qualified'])
+                    self.assertEqual(decision['runs'][1]['input_errors'], [
+                        f'cycle-2-{stage}: {paths[0].name}: '
+                        'final native report rows differ from committed journal'])
+                finally:
+                    for path, raw in zip(paths, originals):
+                        path.write_bytes(raw)
+
+    def test_release_gate_verifies_linked_cli_scan_journals(self):
+        manifest = self.collect_gate_fixture()
+        child = self.output / 'cycle-2-native-cli-scan-empty.json'
+        journal = child.with_suffix('.json.journal')
+        raw = journal.read_bytes()
+        identity = json.loads(child.read_bytes())['rows'][0]['sample_id'].encode()
+        self.assertIn(identity, raw)
+        journal.write_bytes(raw.replace(identity, uuid4().hex.encode(), 1))
+        code, decision = self.gate_decision('--campaign', manifest)
+        self.assertEqual(code, 1)
+        self.assertEqual(decision['runs'][1]['input_errors'], [
+            f'cycle-2-native-cli-scan: {child.name}: Journal prefix digest mismatch'])
+
+    def test_release_gate_accepts_native_and_cli_writer_output(self):
+        from test_native_suite import NativeSuite
+        from test_perf_cli import NativeClone, NativeDelete, cli
+        from test_perf_cli_catalog import CatalogCollection, cli as catalog
+
+        def verify(stage, output, report_count):
+            outcome, evidence = campaign.outcome(stage, output)
+            reports, paths = gate.campaign_reports(output, dict(
+                stage=stage, outcome=outcome, evidence=evidence, status='complete', exit_code=0), ['warm'])
+            self.assertEqual(len(reports), report_count)
+            self.assertIn(output, paths)
+            self.assertTrue(all(report['rows'] for report in reports))
+
+        native = NativeSuite()
+        native.setUp()
+        self.addCleanup(native.tearDown)
+        native.run_suite(operations=('copy',), copy_tools=('cp',), extra=('--runs', '1'))
+        self.assertEqual(native.exit_code, 0)
+        verify('native-copy', native.output, 1)
+
+        for operation in ('delete', 'clone', 'move', 'scan', 'volumes'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                test = {'delete': NativeDelete, 'clone': NativeClone}.get(operation, CatalogCollection)()
+                test.configure(stack, Path(directory).resolve())
+                if operation in ('delete', 'clone'):
+                    code = getattr(cli, 'native_' + operation)(test.args)
+                else:
+                    code = catalog.native_catalog(test.args, operation)
+                self.assertEqual(code, 0)
+                verify('native-cli-' + operation, test.args.output, 2 if operation == 'scan' else 1)
+
+    def test_release_gate_refuses_incomplete_or_misassigned_campaign_evidence(self):
+        manifest = self.collect_gate_fixture()
+        original = manifest.read_text()
+        scans = [i for i, stage in enumerate(self.report()['stages']) if stage['stage'] == 'native-cli-scan']
+        first_output = self.report()['stages'][scans[0]]['output']
+        for name, mutate in (
+            ('missing stage', lambda d: d['stages'].pop()),
+            ('out of order', lambda d: d['stages'].reverse()),
+            ('same cycle label', lambda d: d['stages'][-1].update(cycle=2)),
+            ('omitted cold stage', lambda d: d['stages'].pop(-2)),
+            ('missing source fingerprints', lambda d: d['fingerprints'].pop('source_sha256')),
+            ('stopped campaign', lambda d: d.update(status='stopped')),
+            ('stopped stage', lambda d: d['stages'][0].update(status='stopped')),
+            ('incomplete cleanup', lambda d: d['stages'][0]['outcome'].update(cleanup_passed=False)),
+            ('changed fingerprints', lambda d: d['stages'][0].update(fingerprints_unchanged=False)),
+            ('wrong cache', lambda d: d['stages'][0].update(cache=['warm'])),
+            ('overlapping stage times', lambda d: d['stages'][-1].update(started_utc=d['started_utc'])),
+            ('cross-cycle output', lambda d: d['stages'][scans[1]].update(output=first_output)),
+        ):
+            with self.subTest(name=name):
+                document = json.loads(original)
+                mutate(document)
+                manifest.write_text(json.dumps(document))
+                code, decision = self.gate_decision('--campaign', manifest)
+                self.assertEqual(code, 1)
+                self.assertFalse(decision['qualified'])
+                self.assertTrue(any(run['input_errors'] for run in decision['runs']))
+        manifest.write_text(original)
+        child = self.output / 'cycle-2-native-cli-scan-empty.json'
+        child.rename(child.with_suffix('.missing'))
+        for alias in (False, True):
+            with self.subTest(aliased_child=alias):
+                if alias:
+                    child.symlink_to(self.output / 'cycle-1-native-cli-scan-empty.json')
+                code, decision = self.gate_decision('--campaign', manifest)
+                self.assertEqual(code, 1)
+                self.assertFalse(decision['qualified'])
+                self.assertIn(child.name, ' '.join(decision['runs'][1]['input_errors']))
 
     def test_three_sequential_cycles_cover_existing_workloads_once(self):
         self.assertEqual(self.run_mocked(), 0)
