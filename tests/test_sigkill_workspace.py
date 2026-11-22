@@ -1,5 +1,6 @@
 """Process cuts at folder publication and owned APFS image boundaries."""
 import copy
+import json
 import os
 from pathlib import Path
 import platform
@@ -34,13 +35,18 @@ def probe_workspace_hooks(library, binary, *, image_hooks=False):
         source.write_text('probe')
         pause_at_hook([str(binary), '--json', 'delete', str(source)], library, 'unlink-after')
         if image_hooks:
+            stage = 'ready-link-before'
             source.write_text('probe')
-            environment = {'STALLIONFS_TEST_CUT_PATH': str(source)}
-            for kind, code in (('image-ready', 'open(sys.argv[1]).close()'),
-                               ('unmount-result', 'print(\'{"unmounted": "probe"}\')')):
-                stage = kind
-                pause_at_hook([sys.executable, '-I', '-B', '-c', 'import os, sys; ' + code, str(source)],
-                              library, kind, extra_env=environment)
+            ready = base / 'ready.json'
+            pause_at_hook([sys.executable, '-I', '-B', '-c',
+                           'import os, sys; os.link(sys.argv[1], sys.argv[2], follow_symlinks=False)',
+                           str(source), str(ready)], library, stage,
+                          extra_env={'STALLIONFS_TEST_CUT_PATH': str(ready)})
+            if os.path.lexists(ready):
+                raise RuntimeError('Ready marker was published before the pause')
+            stage = 'unmount-result'
+            pause_at_hook([sys.executable, '-I', '-B', '-c', 'print(\'{"unmounted": "probe"}\')'],
+                          library, stage)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         return f'{stage}: {error}'
     return None
@@ -297,6 +303,16 @@ class MountedImageDeath(WorkspaceFixture, unittest.TestCase):
         self.assertTrue(report['strict_equal'], report)
         self.assertIs(report['sparse_preserved'], True, report)
 
+    def assert_direct_branch(self, workspace, repo):
+        ref = 'refs/heads/' + workspace['branch']
+        command = ['git', '-C', str(repo)]
+        head = subprocess.run([*command, 'symbolic-ref', '--no-recurse', 'HEAD'],
+                              check=True, capture_output=True, text=True, timeout=15).stdout
+        self.assertEqual(head.rstrip('\n'), ref)
+        row = subprocess.run([*command, 'for-each-ref', '--format=%(refname)%00%(objectname)%00%(symref)', '--', ref],
+                             check=True, capture_output=True, text=True, timeout=15).stdout
+        self.assertEqual(row.rstrip('\n').split('\0'), [ref, workspace['commit'], ''])
+
     def test_killed_image_create_keeps_closed_complete_candidate(self):
         source, payload, seed = self.image_seed()
         source_image = self.root / 'seeds' / seed / 'workspace.sparseimage'
@@ -362,9 +378,22 @@ class MountedImageDeath(WorkspaceFixture, unittest.TestCase):
         before = self.checks.snapshot(repo)
         self.cli('unmount', workspace['id'])
         path = self.root / 'workspaces' / workspace['id']
-        self.cut_path('image-ready', path / 'ready.json', 'mount', workspace['id'])
-        self.assertIsNotNone(images.mounted(path / 'workspace.sparseimage'))
-        self.cli('mount', workspace['id'])
+        ready = path / 'ready.json'
+        image = path / 'workspace.sparseimage'
+        self.assertIsNone(images.mounted(image))
+        # Recreate an owned workspace interrupted after checkout but before marker publication.
+        ready.unlink()
+        self.cut_path('ready-link-before', ready, 'mount', workspace['id'])
+        self.assertFalse(os.path.lexists(ready))
+        attachment = images.mounted(image)
+        self.assertIsNotNone(attachment)
+        self.assertEqual(attachment['mountpoint'], str(path / 'volume'))
+        self.assert_direct_branch(workspace, repo)
+
+        recovered = self.cli('mount', workspace['id'])
+        self.assertEqual(Path(recovered['path']), repo)
+        self.assertEqual(json.loads(ready.read_text()), {'format': 1, 'id': workspace['id']})
+        self.assert_direct_branch(workspace, repo)
         self.content_equal(before, repo)
         self.cut_path('rename-after', self.root / 'lifecycle' / (workspace['id'] + '.json'),
                       'unmount', workspace['id'])
@@ -400,11 +429,14 @@ class WorkspaceHookCapabilities(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch(__name__ + '.pause_at_hook') as pause:
             self.assertIsNone(probe_workspace_hooks(Path(temporary) / 'pause.dylib', Path('/unused/sfs'), image_hooks=True))
         self.assertEqual([call.args[2] for call in pause.call_args_list],
-                         ['rename-before', 'rename-after', 'unlink-after', 'image-ready', 'unmount-result'])
+                         ['rename-before', 'rename-after', 'unlink-after', 'ready-link-before', 'unmount-result'])
+        command = pause.call_args_list[-2].args[0]
+        self.assertIn('os.link(sys.argv[1], sys.argv[2], follow_symlinks=False)', command[4])
+        self.assertEqual(pause.call_args_list[-2].kwargs['extra_env'], {'STALLIONFS_TEST_CUT_PATH': command[-1]})
 
     def test_probe_failure_names_boundary(self):
         for index, stage in enumerate(('workspace rename', 'workspace rename', 'native unlink',
-                                       'image-ready', 'unmount-result')):
+                                       'ready-link-before', 'unmount-result')):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary, \
                  patch(__name__ + '.pause_at_hook', side_effect=[None] * index + [RuntimeError('DYLD stripped')]):
                 self.assertEqual(probe_workspace_hooks(Path(temporary) / 'pause.dylib', Path('/unused/sfs'),

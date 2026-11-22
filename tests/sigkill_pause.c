@@ -6,7 +6,6 @@
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,17 +117,22 @@ static int stopped_unlinkat(int parent, const char *name, int flags) {
     return result;
 }
 
-static int stopped_open(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = (mode_t)va_arg(args, int);
-        va_end(args);
-    }
-    int result = open(path, flags, mode);
-    if (result >= 0 && selected_path(path)) cut("image-ready");
-    return result;
+static void cut_ready_publication(const char *destination) {
+    const char *selected = getenv("STALLIONFS_TEST_CUT_PATH");
+    // An absolute destination has the same meaning for link and linkat.
+    if (selected && destination[0] == '/' && !strcmp(destination, selected))
+        cut("ready-link-before");
+}
+
+static int stopped_link(const char *source, const char *destination) {
+    cut_ready_publication(destination);
+    return link(source, destination);
+}
+
+static int stopped_linkat(int source_parent, const char *source, int destination_parent,
+                          const char *destination, int flags) {
+    cut_ready_publication(destination);
+    return linkat(source_parent, source, destination_parent, destination, flags);
 }
 
 static ssize_t stopped_write(int descriptor, const void *buffer, size_t size) {
@@ -151,5 +155,6 @@ INTERPOSE(stopped_move, renamex_np);
 INTERPOSE(stopped_rename, rename);
 INTERPOSE(stopped_renameat, renameat);
 INTERPOSE(stopped_unlinkat, unlinkat);
-INTERPOSE(stopped_open, open);
+INTERPOSE(stopped_link, link);
+INTERPOSE(stopped_linkat, linkat);
 INTERPOSE(stopped_write, write);
