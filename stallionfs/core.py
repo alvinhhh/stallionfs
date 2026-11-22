@@ -21,6 +21,9 @@ import tempfile
 import time
 
 
+_SFS_RECOVERY_REQUIRED = 7  # sfs_status in filesystem/image.h.
+
+
 class StallionError(Exception):
     """An actionable user or filesystem error."""
 
@@ -159,7 +162,13 @@ def native_operation(target, operation, *names):
             outcome = result.get('outcome')
             suffix = ('; the change committed' if committed else
                       '; publication outcome is unknown' if outcome == 'unknown' else '')
-            error = StallionError(f"Native image {operation} failed: {os.strerror(result['error_code'])}{suffix}")
+            receipt = result.get('receipt')
+            if isinstance(receipt, dict) and receipt.get('status') == _SFS_RECOVERY_REQUIRED:
+                reason = ('Image recovery is required. Keep this backing file unchanged. '
+                          'If you have a verified intact backup, register a separate closed copy in a fresh store.')
+            else:
+                reason = os.strerror(result['error_code'])
+            error = StallionError(f"Native image {operation} failed: {reason}{suffix}")
             error.native_image_result = result
             raise error
     except MemoryError as error:

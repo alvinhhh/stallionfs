@@ -298,6 +298,48 @@ class NativeReferenceTests(unittest.TestCase):
             self.assertEqual(observed['native_image_result']['receipt']['physical_end'], 69632)
             self.assertIn('committed', observed['error'])
 
+    def test_native_recovery_error_reports_safe_backup_option(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        import stallionfs
+        from stallionfs.__main__ import main
+
+        args = ['--root', str(self.store.root), '--json']
+        catalog = [{'id': 'before', 'name': 'before', 'view': 1, 'backend': 'native-image'}]
+        module = SimpleNamespace(snapshots=lambda *_args: {'ok': True, 'snapshots': catalog})
+        with patch.object(core, 'native_operation', self.real_native_operation):
+            with patch.object(stallionfs, '_image', module, create=True), \
+                    redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                self.assertEqual(main(args + ['snapshots', self.workspace]), 0)
+            self.assertEqual(json.loads(out.getvalue()), catalog)
+            self.assertEqual(err.getvalue(), '')
+
+            for branch, operation, status, error_code in (
+                    (['snapshots', self.workspace], 'snapshots', 7, errno.EIO),
+                    (['snapshots', self.workspace], 'snapshots', 2, errno.EIO),
+                    (['rollback', self.workspace, 'missing'], 'restore', 10, errno.ENOENT),
+                    (['snapshots', self.workspace], 'snapshots', None, errno.EIO)):
+                with self.subTest(operation=operation, status=status, error_code=error_code):
+                    receipt = None if status is None else {'status': status, 'system_errno': 0}
+                    result = dict(ok=False, operation=operation, error_code=error_code, receipt=receipt,
+                                  committed=False, commit_attempted=False, outcome='not_committed')
+                    module = SimpleNamespace(**{operation: lambda *_args: result})
+                    with patch.object(stallionfs, '_image', module, create=True), \
+                            redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                        self.assertEqual(main(args + branch), 1)
+                    self.assertEqual(out.getvalue(), '')
+                    report = json.loads(err.getvalue())
+                    self.assertEqual(report['native_image_result'], result)
+                    if status == 7:
+                        self.assertIn('Image recovery is required. Keep this backing file unchanged.', report['error'])
+                        self.assertIn('verified intact backup, register a separate closed copy in a fresh store.',
+                                      report['error'])
+                    else:
+                        self.assertEqual(report['error'], f'Native image {operation} failed: {os.strerror(error_code)}')
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+        self.assertFalse(list((self.store.root / 'journals').iterdir()))
+
     def test_response_exists_before_mutation_and_error_format_oom_retains_returned_receipts(self):
         import inspect
         from types import SimpleNamespace
