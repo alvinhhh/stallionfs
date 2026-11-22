@@ -331,9 +331,20 @@ class Lifecycle:
         finalized = {**record, 'outcome': outcome}
         if saved != record and saved != finalized:
             raise core.StallionError(f'Conflicting rollback evidence at {slot}; retained without changes')
+        image = record['backend'] == 'image'
+        if image and outcome == 'exchanged':
+            core.sync_directory(current.parent)
+            core.sync_directory(slot)
         replace_json(slot / 'meta.json', finalized)
         self._open(workspace, path, meta)
+        if image:
+            # Keep the intent until both recovery and lifecycle records are durable.
+            core.sync_directory(slot)
+            core.sync_directory(slot.parent)
+            core.sync_directory(self._state(workspace).parent)
         journal.unlink()
+        if image:
+            core.sync_directory(journal.parent)
 
     def rollback(self, workspace, snapshot, *, quiescent=False, continue_operation=None):
         native_result = [None]
@@ -373,8 +384,17 @@ class Lifecycle:
                           'old': identity(payload), 'candidate': identity(candidate), 'outcome': 'intent'}
                 journal = self.root / 'journals' / f'{workspace}.json'
                 try:
+                    image = saved['backend'] == 'image'
+                    if image:
+                        from . import images
+                        images.flush(candidate)
                     core.write_json(slot / 'meta.json', record)
+                    if image:
+                        core.sync_directory(slot)
+                        core.sync_directory(slot.parent)
                     core.write_json(journal, record)
+                    if image:
+                        core.sync_directory(journal.parent)
                     from ._scan import move
                     move(payload, candidate, exchange=True)
                     self._reconcile(workspace)
