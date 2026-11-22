@@ -3,8 +3,10 @@
 `sfs doctor --installation` reports read-only installation checks and an ordered
 removal plan; it does not install, remove, enable or change anything. Use
 `sfs --root PATH --json doctor --installation` for one JSON report. Exit 0 means
-all readiness checks passed; exit 1 means attention is needed. Developer ID
-signature and Gatekeeper/notarization acceptance are reported separately as
+all readiness checks passed; exit 1 means attention is needed. The packaged
+0.7 FSKit app requires Apple silicon and macOS 27 or newer. The platform check
+applies only to the app. Developer ID signature and Gatekeeper/notarization
+acceptance are reported separately as
 informational and do not affect readiness; neither does a missing store root on
 a fresh install. The product version in
 Info.plist is compared to the CLI version; the independent bundle build number

@@ -1,7 +1,11 @@
 """Read-only installation observations, not release qualification."""
+import ctypes
+import errno
 import os
 from pathlib import Path
+import platform
 import plistlib
+import re
 import stat
 import subprocess
 import sys
@@ -11,6 +15,7 @@ from xml.parsers.expat import ExpatError
 from . import __version__, _command
 
 APP = Path('/Applications/StallionFS.app')
+_APP_MINIMUM_MACOS = (27, 0)
 INFORMATIONAL = frozenset({'store_root_exists', 'developer_id_signature', 'gatekeeper_accepted'})
 INFO_ERRORS = (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException, ExpatError)
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
@@ -118,6 +123,56 @@ def _check_extension(extension, version, build):
         raise ValueError('Extension executable is missing or unusable')
 
 
+def _rosetta_translated():
+    try:
+        probe = ctypes.CDLL(None, use_errno=True).sysctlbyname
+        probe.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                          ctypes.c_void_p, ctypes.c_size_t)
+        probe.restype = ctypes.c_int
+        translated = ctypes.c_int()
+        size = ctypes.c_size_t(ctypes.sizeof(translated))
+        status = probe(b'sysctl.proc_translated', ctypes.byref(translated), ctypes.byref(size), None, 0)
+    except (AttributeError, OSError):
+        return None
+    if status == -1 and ctypes.get_errno() == errno.ENOENT:
+        return False
+    if status == 0 and size.value == ctypes.sizeof(translated) and translated.value in (0, 1):
+        return bool(translated.value)
+    return None
+
+
+def _app_platform():
+    version = running = hardware = None
+    minimum = '.'.join(map(str, _APP_MINIMUM_MACOS))
+    if sys.platform == 'darwin':
+        try:
+            observed = platform.mac_ver()[0]
+        except (OSError, KeyError, TypeError, ValueError, ExpatError):
+            observed = ''
+        if isinstance(observed, str) and re.fullmatch(r'[0-9]{1,4}(?:\.[0-9]{1,4}){0,2}', observed):
+            version = observed
+            parts = tuple(map(int, version.split('.')))
+            running = parts + (0,) * (3 - len(parts))
+        try:
+            machine = platform.machine()
+        except OSError:
+            machine = ''
+        if machine == 'arm64':
+            hardware = 'Apple silicon'
+        elif machine == 'x86_64':
+            translated = _rosetta_translated()
+            if translated is not None:
+                hardware = 'Apple silicon' if translated else 'Intel'
+    if sys.platform != 'darwin' or hardware == 'Intel' or (running is not None and running < _APP_MINIMUM_MACOS):
+        state = 'unsupported'
+    elif version is None or hardware is None:
+        state = 'unknown'
+    else:
+        state = 'supported'
+    return {'state': state, 'macos_version': version, 'hardware': hardware, 'minimum_macos': minimum,
+            'required_hardware': 'Apple silicon'}
+
+
 def inspect(root):
     root = Path(root).expanduser().absolute()
     extension = APP / 'Contents/Extensions/StallionFS.appex'
@@ -173,9 +228,11 @@ def inspect(root):
             signature['state'] = 'other'
     gatekeeper = {'state': ('accepted' if assessment['returncode'] == 0 else 'rejected')
                   if assessment['state'] == 'completed' else assessment['state'], 'probe': assessment}
+    app_platform = _app_platform()
     checks = {
         'app_present': app['present'], 'extension_present': app['extension_present'],
         'extension_matches_app': app['extension_matches_app'],
+        'app_platform_compatible': app_platform['state'] == 'supported',
         'version_matches_cli': app['version_matches_cli'],
         'command_installed': command['state'] == 'installed' and command.get('executable', False)
                              and not command.get('dangling', False),
@@ -191,7 +248,7 @@ def inspect(root):
             'informational': sorted(INFORMATIONAL),
             'checks': checks, 'cli_version': __version__,
             'python_helper': str(helper), 'command': command,
-            'app': app, 'signature': signature, 'gatekeeper': gatekeeper,
+            'app': app, 'app_platform': app_platform, 'signature': signature, 'gatekeeper': gatekeeper,
             'store_root': {'path': str(root), 'exists': checks['store_root_exists']},
             'removal_plan': [step.format(root=root) for step in REMOVAL_PLAN],
             'qualification': QUALIFICATION}
@@ -235,6 +292,12 @@ def describe(result):
     if app.get('error'):
         app_text += ': ' + app['error']
     lines.append('App: ' + app_text)
+    app_platform = result['app_platform']
+    hardware = app_platform['hardware'] or 'processor unknown'
+    version = 'macOS ' + app_platform['macos_version'] if app_platform['macos_version'] else 'macOS version unknown'
+    lines.append(f"FSKit app platform: {app_platform['state']} ({hardware}, {version}). "
+                 f"The packaged app requires {app_platform['required_hardware']} and macOS "
+                 f"{app_platform['minimum_macos']} or newer.")
     signature = result['signature']
     signature_text = signature['state']
     if signature['authorities']:
@@ -260,6 +323,7 @@ def describe(result):
     lines.append('Removal plan (instructions only; nothing has been changed):')
     lines.extend(str(index) + '. ' + step for index, step in enumerate(result['removal_plan'], 1))
     names = {'app_present': 'app missing', 'extension_present': 'extension missing',
+             'app_platform_compatible': 'FSKit app requirements are unmet or unknown',
              'version_matches_cli': 'app version must match CLI',
              'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH'}
     if app['extension_present']:

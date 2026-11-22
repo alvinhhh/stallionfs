@@ -1,5 +1,7 @@
 """Installation observations use inert app fixtures and mocked platform probes."""
 from contextlib import redirect_stderr, redirect_stdout
+import ctypes
+import errno
 import io
 import json
 import os
@@ -40,6 +42,8 @@ class Installation(unittest.TestCase):
         self.target.write_bytes(b'inert executable')
         self.target.chmod(0o755)
         for item in (patch.object(installation, 'APP', self.app),
+                     patch.object(installation.platform, 'mac_ver', return_value=('27.0', ('', '', ''), '')),
+                     patch.object(installation.platform, 'machine', return_value='arm64'),
                      patch.object(installation._command, '_home', return_value=self.home),
                      patch.object(installation._command, '_acl'),
                      patch.object(installation.subprocess, 'run', side_effect=self.probe)):
@@ -75,6 +79,78 @@ class Installation(unittest.TestCase):
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
         self.assertFalse((self.bin / installation._command.LOCK).exists())
+
+    def test_installation_needs_attention_on_older_macos(self):
+        with (patch('platform.mac_ver', return_value=('26.6.2', ('', '', ''), '')),
+              patch('platform.machine', return_value='arm64'),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            code = cli.main(['--root', str(self.root), '--json', 'doctor', '--installation'])
+        self.assertEqual(code, 1)
+        self.assertEqual(error.getvalue(), '')
+        report = json.loads(output.getvalue())
+        self.assertFalse(report['ready'])
+        self.assertTrue(report['checks']['extension_matches_app'])
+        self.assertFalse(report['checks']['app_platform_compatible'])
+        self.assertEqual(report['app_platform']['state'], 'unsupported')
+        self.assertIn('requires Apple silicon and macOS 27.0 or newer', installation.describe(report))
+
+    def test_current_apple_silicon_needs_no_rosetta_probe(self):
+        for version in ('27', '27.0', '28.0.1'):
+            with (self.subTest(version=version), patch.object(installation.ctypes, 'CDLL') as library,
+                  patch.object(installation.platform, 'mac_ver', return_value=(version, (), ''))):
+                result = installation.inspect(self.root)
+            library.assert_not_called()
+            self.assertTrue(result['ready'])
+            self.assertEqual(result['app_platform'], {'state': 'supported', 'macos_version': version,
+                                                     'minimum_macos': '27.0', 'hardware': 'Apple silicon',
+                                                     'required_hardware': 'Apple silicon'})
+
+    def test_x86_64_observation_distinguishes_rosetta_from_intel_and_unknown(self):
+        full_size = ctypes.sizeof(ctypes.c_int)
+        cases = (
+            (0, 1, full_size, 0, 'Apple silicon', 'supported'),
+            (0, 0, full_size, 0, 'Intel', 'unsupported'),
+            (-1, 0, full_size, errno.ENOENT, 'Intel', 'unsupported'),
+            (-1, 0, full_size, errno.EPERM, None, 'unknown'),
+            (0, 2, full_size, 0, None, 'unknown'),
+            (0, 1, full_size - 1, 0, None, 'unknown'),
+        )
+        for code, value, length, reported_errno, hardware, state in cases:
+            def probe(name, output, size, new_value, new_size):
+                self.assertEqual((name, new_value, new_size), (b'sysctl.proc_translated', None, 0))
+                self.assertEqual(ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0], full_size)
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = value
+                ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = length
+                return code
+
+            with (self.subTest(code=code, value=value, length=length, errno=reported_errno),
+                  patch.object(installation.platform, 'machine', return_value='x86_64'),
+                  patch.object(installation.ctypes, 'CDLL') as library,
+                  patch.object(installation.ctypes, 'get_errno', return_value=reported_errno)):
+                library.return_value.sysctlbyname.side_effect = probe
+                result = installation.inspect(self.root)
+                library.assert_called_once_with(None, use_errno=True)
+                library.return_value.sysctlbyname.assert_called_once()
+                self.assertEqual(result['app_platform']['hardware'], hardware)
+                self.assertEqual(result['app_platform']['state'], state)
+                self.assertEqual(result['ready'], state == 'supported')
+
+    def test_unknown_macos_version_needs_attention(self):
+        for version in ('', '27..0', '27.0beta', '27.0.0.1'):
+            with self.subTest(version=version), patch.object(installation.platform, 'mac_ver', return_value=(version, (), '')):
+                result = installation.inspect(self.root)
+                self.assertFalse(result['ready'])
+                self.assertEqual(result['app_platform']['state'], 'unknown')
+                self.assertIsNone(result['app_platform']['macos_version'])
+
+    def test_unknown_machine_needs_attention(self):
+        with (patch.object(installation.platform, 'machine', return_value=''),
+              patch.object(installation.ctypes, 'CDLL') as library):
+            result = installation.inspect(self.root)
+        library.assert_not_called()
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['app_platform']['state'], 'unknown')
+        self.assertIsNone(result['app_platform']['hardware'])
 
     def test_removal_advice_requires_exact_artifact_and_downtime(self):
         for app in (self.app, self.root / 'absent-app'):
