@@ -223,6 +223,20 @@ def preserved(result):
             and result.get('move_source_absent', True) is True)
 
 
+def source_payload_sha256(snapshot):
+    """Fingerprint all fixture payloads, including Git files, from the sorted snapshot."""
+    digest = hashlib.sha256(b'stallionfs-native-source-payload-v1\n')
+    fields = {'directory': (), 'file': ('size', 'sha256'), 'symlink': ('symlink_bytes',)}
+    for relative, entry in snapshot['entries'].items():
+        kind = entry['kind']
+        record = (relative, kind, *(entry[key] for key in fields[kind]))
+        digest.update(json.dumps(record, separators=(',', ':')).encode('ascii') + b'\n')
+    digest.update(b'hardlinks\n')
+    for group in snapshot['hardlink_groups']:
+        digest.update(json.dumps(group, separators=(',', ':')).encode('ascii') + b'\n')
+    return digest.hexdigest()
+
+
 def require_linux_delete_paths(base, identity, volume, operand, expected):
     """Bind the one owned operand and recheck mounts before a copy or deletion."""
     current = base.lstat()
@@ -486,6 +500,8 @@ def main():
                     expected, metadata['seed'], precision_links=native_fixtures.precision_link_paths(name),
                     precision_scope='scan-only' if scan_mode else 'copy-clone')
                 fileops.require(metadata['coverage']['populated'] is True, 'Metadata coverage incomplete')
+                if name in fileops.LARGE_PROFILES:
+                    metadata['source_payload_sha256'] = source_payload_sha256(expected)
                 metadata['status'] = 'prepared'
                 checkpoint()
                 release('metadata_preparation')

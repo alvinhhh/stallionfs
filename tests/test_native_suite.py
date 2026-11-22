@@ -88,26 +88,29 @@ class NativeSuite(unittest.TestCase):
             result = SNAPSHOT(path, **options)
         else:
             info = path.stat()
-            result = {'payload': path.read_bytes().hex(), 'mode': info.st_mode,
-                      'identity': (info.st_dev, info.st_ino)}
+            payload = path.read_bytes()
+            result = {'payload': payload.hex(), 'mode': info.st_mode,
+                      'identity': (info.st_dev, info.st_ino), 'hardlink_groups': [],
+                      'entries': {'': {'kind': 'file', 'size': len(payload),
+                                       'sha256': hashlib.sha256(payload).hexdigest()}}}
         self.snapshot_results.append(result)
         return result
 
     @staticmethod
     def compare(before, after, baseline=None):
-        if 'entries' in before: return COMPARE(before, after, baseline)
+        if 'payload' not in before: return COMPARE(before, after, baseline)
         equal = (before['payload'], before['mode']) == (after['payload'], after['mode'])
         return {'strict_equal': equal, 'independent_clone': True,
                 'sparse_preserved': True, 'differences': [] if equal else ['payload or mode']}
 
     @staticmethod
     def verify_clone(before, after):
-        if 'entries' in before: return VERIFY_CLONE(before, after)
+        if 'payload' not in before: return VERIFY_CLONE(before, after)
         return NativeSuite.compare(before, after) | {'independent_clone': before['identity'] != after['identity']}
 
     @staticmethod
     def verify_source(before, after):
-        if 'entries' in before: return VERIFY_SOURCE(before, after)
+        if 'payload' not in before: return VERIFY_SOURCE(before, after)
         differences = [key for key in ('payload', 'mode', 'identity') if before[key] != after[key]]
         return {'unchanged': not differences, 'differences': differences}
 
@@ -291,6 +294,7 @@ class NativeSuite(unittest.TestCase):
                 self.assertEqual(self.large_fixture_calls[-1], (fixture, specification))
                 self.assertEqual(self.exit_code, 0)
                 self.assertTrue(report['passed'])
+                self.assertRegex(report['metadata_preparation'][0]['source_payload_sha256'], r'^[0-9a-f]{64}$')
                 self.assertNotIn('all_metrics_won', report)
                 self.assertNotIn('binary', report['selection'])
                 self.assertNotIn('version', report)
@@ -311,6 +315,32 @@ class NativeSuite(unittest.TestCase):
                 self.assertEqual(report['environment']['memory_bytes'], 4*1024**3)
                 self.assertEqual(report['environment']['host_storage'], 'unobserved by guest')
                 self.assertFalse(any(str(self.binary) in argv for argv in self.commands))
+
+    def test_bulk_source_fingerprint_includes_payload_paths_and_hardlinks_only(self):
+        byte_a = hashlib.sha256(b'a').hexdigest()
+        byte_b = hashlib.sha256(b'b').hexdigest()
+        entries = {'': {'kind': 'directory'}, '.git': {'kind': 'directory'},
+                   '.git/index': {'kind': 'file', 'size': 1, 'sha256': byte_a},
+                   'alias': {'kind': 'file', 'size': 1, 'sha256': byte_a},
+                   'link': {'kind': 'symlink', 'symlink_bytes': '616c696173'},
+                   'payload': {'kind': 'file', 'size': 1, 'sha256': byte_a}}
+        snapshot = {'entries': entries, 'hardlink_groups': [['alias', 'payload']]}
+        fingerprint = suite.source_payload_sha256(snapshot)
+        different_metadata = {name: entry | {'device_inode': [4, 17], 'mode': 0o700, 'uid': 501,
+                                              'mtime_ns': 1234, 'allocated_bytes': 4096,
+                                              'acl': {}, 'xattrs': {}}
+                              for name, entry in entries.items()}
+        self.assertEqual(fingerprint, suite.source_payload_sha256(snapshot | {'entries': different_metadata}))
+        self.assertNotEqual(fingerprint, suite.source_payload_sha256(snapshot | {'hardlink_groups': []}))
+        renamed = {('renamed' if name == 'link' else name): entry for name, entry in entries.items()}
+        self.assertNotEqual(fingerprint, suite.source_payload_sha256(
+            snapshot | {'entries': dict(sorted(renamed.items()))}))
+        for name, changed in (('.git/index', {'sha256': byte_b}), ('payload', {'sha256': byte_b}),
+                              ('link', {'symlink_bytes': '6f74686572'}), ('alias', {'size': 2})):
+            with self.subTest(name=name):
+                different_payload = entries | {name: entries[name] | changed}
+                self.assertNotEqual(fingerprint, suite.source_payload_sha256(
+                    snapshot | {'entries': different_payload}))
 
     def test_linux_dependencies_reserve_boundary_precedes_generation(self):
         with self.assertRaisesRegex(RuntimeError, 'Insufficient space for dependencies_100k'):
