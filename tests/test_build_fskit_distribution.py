@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,15 @@ class BuildDistribution(unittest.TestCase):
             fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.app = fixture.app
+        self.app.chmod(0o755)
+        host = self.app / 'Contents/Info.plist'
+        info = plistlib.loads(host.read_bytes())
+        info.update(CFBundleExecutable='StallionFS', CFBundleShortVersionString=fixture.build['package_version'])
+        host.write_bytes(plistlib.dumps(info))
+        module = 'Contents/Extensions/StallionFS.appex/Contents'
+        info['CFBundleIdentifier'] = 'com.alvinhhh.stallionfs.module'
+        self.module_info = fixture.write(module + '/Info.plist', plistlib.dumps(info))
+        fixture.write(module + '/MacOS/StallionFS', b'inert extension executable', 0o755)
         self.publisher = fixture.o['PUBLISHER_TEAM']
         self.release = fixture.base / 'release'
         self.release.mkdir(mode=0o700)
@@ -85,6 +95,22 @@ class BuildDistribution(unittest.TestCase):
         self.assertFalse(restored.exists())
         self.assertEqual(subprocess.check_output(['/usr/bin/xattr', '-p', 'com.apple.quarantine', self.leaf],
                                                  timeout=10).strip(), b'0081;12345678;Fixture;')
+
+    def test_mismatched_extension_build_refuses_before_archive(self):
+        module = plistlib.loads(self.module_info.read_bytes())
+        module['CFBundleVersion'] = '8'
+        self.module_info.write_bytes(plistlib.dumps(module))
+        with self.assertRaisesRegex(ValueError, 'product versions and build numbers must match'):
+            self.build()
+        self.assertFalse(any(argv[0] == '/usr/bin/ditto' for argv in self.calls))
+        self.assertFalse(list(self.release.iterdir()))
+
+    def test_malformed_extension_metadata_refuses_before_archive(self):
+        self.module_info.write_bytes(b'<?xml version="1.0"?><plist><date>invalid</date></plist>')
+        with self.assertRaisesRegex(ValueError, 'Invalid app metadata'):
+            self.build()
+        self.assertFalse(any(argv[0] == '/usr/bin/ditto' for argv in self.calls))
+        self.assertFalse(list(self.release.iterdir()))
 
     def test_fails_closed_on_metadata_absent_from_exact_zip(self):
         subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.ResourceFork', 'fixture', self.leaf],

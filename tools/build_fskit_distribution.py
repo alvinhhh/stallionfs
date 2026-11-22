@@ -6,11 +6,13 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+from xml.parsers.expat import ExpatError
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,6 +20,7 @@ import package_fskit as package
 
 
 APP_NAME = 'StallionFS.app'
+MODULE_CONTENTS = 'Contents/Extensions/StallionFS.appex/Contents'
 ARCHIVE_NAME = 'StallionFS.zip'
 BINDINGS_NAME = 'final-maintenance-bindings.json'
 DITTO_OPTIONS = ('--norsrc', '--noextattr', '--noacl', '--noqtn')
@@ -52,6 +55,42 @@ def private_staging(release_parent):
     except BaseException as error:
         error.add_note(f'Private staging path: {staging}')
         raise
+
+
+def verify_bundle_pair(descriptor, rows):
+    inventory = {row['path']: row for row in rows}
+
+    def metadata(path, decode):
+        row = inventory.get(path)
+        if row is None or row['type'] != 'file' or not 0 < row['size'] <= 64 * 1024:
+            raise ValueError(f'Invalid app metadata file: {path}')
+        data = package._runtime_read_at(descriptor, path)
+        if len(data) != row['size'] or package._runtime_sha(data) != row['sha256']:
+            raise ValueError(f'App metadata changed during staging: {path}')
+        try:
+            value = decode(data)
+        except (AttributeError, IndexError, ValueError, ExpatError) as error:
+            raise ValueError(f'Invalid app metadata: {path}') from error
+        if not isinstance(value, dict):
+            raise ValueError(f'Invalid app metadata: {path}')
+        return value
+
+    host = metadata('Contents/Info.plist', plistlib.loads)
+    module = metadata(MODULE_CONTENTS + '/Info.plist', plistlib.loads)
+    runtime = metadata('Contents/Resources/Runtime/runtime.json', json.loads)
+    if (host.get('CFBundleIdentifier') != 'com.alvinhhh.stallionfs'
+            or module.get('CFBundleIdentifier') != 'com.alvinhhh.stallionfs.module'
+            or module.get('CFBundleExecutable') != 'StallionFS'):
+        raise ValueError('Unexpected app or FSKit extension identity')
+    executable = inventory.get(MODULE_CONTENTS + '/MacOS/StallionFS')
+    if (executable is None or executable['type'] != 'file'
+            or not int(executable['mode'], 8) & stat.S_IXUSR):
+        raise ValueError('FSKit extension executable is missing or unusable')
+    versions = (runtime.get('package_version'), runtime.get('bundle_version'))
+    if (not all(isinstance(value, str) and value.strip() for value in versions)
+            or (host.get('CFBundleShortVersionString'), host.get('CFBundleVersion')) != versions
+            or (module.get('CFBundleShortVersionString'), module.get('CFBundleVersion')) != versions):
+        raise ValueError('App and FSKit extension product versions and build numbers must match the runtime')
 
 
 def inspect_metadata(app, rows, staging):
@@ -108,12 +147,13 @@ def build_distribution(app, release_parent, publisher):
                                  '-acl', '-print', '-quit'], release_parent):
             raise ValueError('Release parent must have no ACL')
         require_named(release_parent, parent_fd)
+        source_rows = package._runtime_inventory(app, source_fd)
+        verify_bundle_pair(source_fd, source_rows)
         with private_staging(release_parent) as staging, held_directory(staging) as staging_fd:
             def require_staging():
                 require_named(release_parent, parent_fd)
                 require_named(staging, staging_fd)
 
-            source_rows = package._runtime_inventory(app, source_fd)
             source_flags = inspect_metadata(app, source_rows, staging)
             require_named(app, source_fd)
             require_staging()
