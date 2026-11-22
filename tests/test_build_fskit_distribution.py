@@ -65,6 +65,51 @@ class BuildDistribution(unittest.TestCase):
     def assert_incomplete(self):
         self.assertFalse(list(self.release.glob('*/' + builder.BINDINGS_NAME)))
 
+    def test_unsigned_source_refuses_before_creating_an_archive(self):
+        (self.app / 'Contents/CodeResources-link').unlink()
+        self.leaf.unlink()
+
+        def refuse_unsigned_host(argv, directory):
+            if argv[0] == '/usr/bin/codesign' and argv[-1] == str(self.app):
+                self.calls.append(argv)
+                raise ValueError('fixture app has no signature')
+            return self.tools(argv, directory)
+
+        with self.assertRaisesRegex(ValueError, 'Source app failed Developer ID Application verification'):
+            self.build(refuse_unsigned_host)
+        self.assertFalse(list(self.release.iterdir()))
+        self.assertFalse(any(argv[0] in ('/usr/bin/ditto', '/usr/bin/xcrun') for argv in self.calls))
+
+    def test_wrong_source_extension_class_refuses_before_creating_an_archive(self):
+        module = self.module_info.parent.parent
+
+        def refuse_extension_class(argv, directory):
+            if argv[0] == '/usr/bin/codesign' and argv[-1] == str(module) and '100.6.1.13' in argv[-2]:
+                self.calls.append(argv)
+                raise ValueError('fixture extension certificate has the wrong class')
+            return self.tools(argv, directory)
+
+        with self.assertRaisesRegex(ValueError, 'Source FSKit extension failed Developer ID Application verification'):
+            self.build(refuse_extension_class)
+        self.assertFalse(list(self.release.iterdir()))
+        self.assertFalse(any(argv[0] in ('/usr/bin/ditto', '/usr/bin/xcrun') for argv in self.calls))
+
+    def test_wrong_extracted_extension_class_refuses_before_ticket(self):
+        module_path = self.module_info.parent.parent.relative_to(self.app)
+
+        def refuse_extracted_extension_class(argv, directory):
+            if (argv[0] == '/usr/bin/codesign' and '100.6.1.13' in argv[-2]
+                    and argv[-1] == str(directory / '.verification' / self.app.name / module_path)):
+                self.calls.append(argv)
+                raise ValueError('fixture extracted extension certificate has the wrong class')
+            return self.tools(argv, directory)
+
+        with self.assertRaisesRegex(ValueError, 'Extracted FSKit extension failed Developer ID Application verification'):
+            self.build(refuse_extracted_extension_class)
+        self.assertTrue(any(argv[:3] == ['/usr/bin/ditto', '-x', '-k'] for argv in self.calls))
+        self.assertFalse(any(argv[0] == '/usr/bin/xcrun' for argv in self.calls))
+        self.assert_incomplete()
+
     def test_command_stages_exact_archive_and_verifies_the_extracted_app(self):
         argv = ['build_fskit_distribution.py', '--app', str(self.app),
                 '--release-parent', str(self.release), '--publisher', self.publisher]
@@ -83,15 +128,25 @@ class BuildDistribution(unittest.TestCase):
         self.assertEqual(bindings['archive']['sha256'], hashlib.sha256(archive).hexdigest())
         self.assertEqual(bindings['inventory'], builder.package._runtime_inventory(self.app))
         builder.package.verify_maintenance_archive(archive, bindings['inventory'], self.app.name)
+        create = next(argv for argv in self.calls if argv[:3] == ['/usr/bin/ditto', '-c', '-k'])
         extract = next(argv for argv in self.calls if argv[:3] == ['/usr/bin/ditto', '-x', '-k'])
         restored = Path(extract[-1]) / self.app.name
-        dev_id = next(argv for argv in self.calls if any('100.6.1.13' in arg for arg in argv))
+        dev_id = [argv for argv in self.calls if argv[0] == '/usr/bin/codesign' and '100.6.1.13' in argv[-2]]
         ticket, = [argv for argv in self.calls if argv[:3] == ['/usr/bin/xcrun', 'stapler', 'validate']]
-        self.assertEqual(dev_id[-1], str(restored))
-        self.assertIn('100.6.2.6', dev_id[-2])
+        module_path = self.module_info.parent.parent.relative_to(self.app)
+        requirements = [
+            '=anchor apple generic and identifier "' + identifier + '" and certificate leaf[subject.OU] = "'
+            + self.publisher + '" and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+            + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+            for identifier in ('com.alvinhhh.stallionfs', 'com.alvinhhh.stallionfs.module')
+        ]
+        self.assertEqual(dev_id, [
+            ['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(path)]
+            for app in (self.app, restored) for requirement, path in zip(requirements, (app, app / module_path))
+        ])
         self.assertEqual(ticket[-1], str(restored))
-        self.assertLess(self.calls.index(extract), self.calls.index(dev_id))
-        self.assertLess(self.calls.index(dev_id), self.calls.index(ticket))
+        order = [self.calls.index(argv) for argv in (*dev_id[:2], create, extract, *dev_id[2:], ticket)]
+        self.assertEqual(order, sorted(order))
         self.assertFalse(restored.exists())
         self.assertEqual(subprocess.check_output(['/usr/bin/xattr', '-p', 'com.apple.quarantine', self.leaf],
                                                  timeout=10).strip(), b'0081;12345678;Fixture;')

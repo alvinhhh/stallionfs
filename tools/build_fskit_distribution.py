@@ -20,7 +20,10 @@ import package_fskit as package
 
 
 APP_NAME = 'StallionFS.app'
-MODULE_CONTENTS = 'Contents/Extensions/StallionFS.appex/Contents'
+HOST_IDENTIFIER = 'com.alvinhhh.stallionfs'
+MODULE_IDENTIFIER = 'com.alvinhhh.stallionfs.module'
+MODULE_PATH = 'Contents/Extensions/StallionFS.appex'
+MODULE_CONTENTS = MODULE_PATH + '/Contents'
 ARCHIVE_NAME = 'StallionFS.zip'
 BINDINGS_NAME = 'final-maintenance-bindings.json'
 DITTO_OPTIONS = ('--norsrc', '--noextattr', '--noacl', '--noqtn')
@@ -78,8 +81,8 @@ def verify_bundle_pair(descriptor, rows):
     host = metadata('Contents/Info.plist', plistlib.loads)
     module = metadata(MODULE_CONTENTS + '/Info.plist', plistlib.loads)
     runtime = metadata('Contents/Resources/Runtime/runtime.json', json.loads)
-    if (host.get('CFBundleIdentifier') != 'com.alvinhhh.stallionfs'
-            or module.get('CFBundleIdentifier') != 'com.alvinhhh.stallionfs.module'
+    if (host.get('CFBundleIdentifier') != HOST_IDENTIFIER
+            or module.get('CFBundleIdentifier') != MODULE_IDENTIFIER
             or module.get('CFBundleExecutable') != 'StallionFS'):
         raise ValueError('Unexpected app or FSKit extension identity')
     executable = inventory.get(MODULE_CONTENTS + '/MacOS/StallionFS')
@@ -117,14 +120,35 @@ def inspect_metadata(app, rows, staging):
     return flags
 
 
-def verify_distribution(app, descriptor, bindings, staging):
-    requirement = next(role['requirement'] for role in bindings['signing_roles'] if role['path'] == '.')
-    require_named(app, descriptor)
-    try:
-        package._tool_output(['/usr/bin/codesign', '--verify', '--strict', '-R',
-                              f'{requirement} and {DEVELOPER_ID_APPLICATION}', str(app)], staging)
-    except (ValueError, subprocess.TimeoutExpired) as error:
-        raise ValueError('Extracted app failed Developer ID Application verification') from error
+def developer_id_requirements(publisher):
+    _, _, maintenance = package._maintenance_source()
+    if publisher != maintenance['PUBLISHER_TEAM']:
+        raise ValueError('Unexpected maintenance publisher')
+    return tuple((path, role, '=' + maintenance['publisher_requirement'](identifier, publisher)
+                  + ' and ' + DEVELOPER_ID_APPLICATION)
+                 for path, role, identifier in (('.', 'app', HOST_IDENTIFIER),
+                                                (MODULE_PATH, 'FSKit extension', MODULE_IDENTIFIER)))
+
+
+def verify_developer_id(app, descriptor, requirements, scratch, scratch_fd, stage):
+    for relative, role, requirement in requirements:
+        target = app / relative
+        require_named(app, descriptor)
+        with held_directory(target) as target_fd:
+            require_named(target, target_fd)
+            require_named(scratch, scratch_fd)
+            try:
+                package._tool_output(['/usr/bin/codesign', '--verify', '--strict', '-R',
+                                      requirement, str(target)], scratch)
+            except (ValueError, subprocess.TimeoutExpired) as error:
+                raise ValueError(f'{stage} {role} failed Developer ID Application verification') from error
+            require_named(target, target_fd)
+            require_named(app, descriptor)
+            require_named(scratch, scratch_fd)
+
+
+def verify_distribution(app, descriptor, requirements, staging, staging_fd):
+    verify_developer_id(app, descriptor, requirements, staging, staging_fd, 'Extracted')
     require_named(app, descriptor)
     try:
         package._tool_output(['/usr/bin/xcrun', 'stapler', 'validate', str(app)], staging)
@@ -149,6 +173,8 @@ def build_distribution(app, release_parent, publisher):
         require_named(release_parent, parent_fd)
         source_rows = package._runtime_inventory(app, source_fd)
         verify_bundle_pair(source_fd, source_rows)
+        requirements = developer_id_requirements(publisher)
+        verify_developer_id(app, source_fd, requirements, release_parent, parent_fd, 'Source')
         with private_staging(release_parent) as staging, held_directory(staging) as staging_fd:
             def require_staging():
                 require_named(release_parent, parent_fd)
@@ -193,7 +219,7 @@ def build_distribution(app, release_parent, publisher):
                     if package.final_maintenance_bindings(restored, archive, expected_publisher=publisher) != source_bindings:
                         raise ValueError('Extracted app does not match source bindings')
                     require_named(restored, restored_fd)
-                    verify_distribution(restored, restored_fd, source_bindings, staging)
+                    verify_distribution(restored, restored_fd, requirements, staging, staging_fd)
                     require_named(restored, restored_fd)
                     if package._runtime_inventory(restored, restored_fd) != source_rows:
                         raise ValueError('Extracted app changed during distribution checks')
