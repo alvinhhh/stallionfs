@@ -18,6 +18,15 @@ LEGACY_USAGE = ("error: unknown subcommand: `list'\n"
 LEGACY_SHORT = 'usage: git hook run [--ignore-missing] <hook-name> [-- <hook-args>]\n\n'
 LEGACY_DIAGNOSTICS = (LEGACY_USAGE.encode(), LEGACY_SHORT.encode(),
                       ("error: unknown subcommand: `list'\n" + LEGACY_SHORT).encode())
+_APPLE_GIT_VERSION = re.compile(rb'git version [0-9]+(?:\.[0-9]+){2} \(Apple Git-[0-9]+\)\n')
+_XCODE_STARTUP_LINE = re.compile(
+    rb'[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} '
+    rb'xcodebuild\[[0-9]+:[0-9]+\](?:'
+    rb'  DVTFilePathFSEvents: Failed to start fs event stream\.'
+    rb'| \[MT\] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR '
+    rb'from confstr\(3\), error = Error Domain=NSPOSIXErrorDomain Code=5 '
+    rb'"Input/output error"\. Using NSCachesDirectory instead\.)\n'
+)
 _payload_cache = None
 MESSAGES = {
     'git-capability-query': 'Git hook capability could not be determined.',
@@ -34,6 +43,11 @@ class GitError(ValueError):
 
 def _fail(reason):
     raise GitError(reason)
+
+
+def _xcode_startup_only(stderr):
+    lines = stderr.splitlines(keepends=True)
+    return 0 < len(lines) <= 2 and all(_XCODE_STARTUP_LINE.fullmatch(line) for line in lines)
 
 
 def _query(executable, args, environment, directory):
@@ -120,6 +134,14 @@ def select(environment, *, cwd=None):
         try:
             version = _query(executable, ['--version'], isolated, root / 'repo')
             check()
+            if (executable == '/usr/bin/git' and version[0] == 0 and
+                    _APPLE_GIT_VERSION.fullmatch(version[1]) and _xcode_startup_only(version[2])):
+                # The system dispatcher can emit Xcode startup notices on first use.
+                retry = _query(executable, ['--version'], isolated, root / 'repo')
+                check()
+                if retry != (0, version[1], b''):
+                    _fail('git-capability-query')
+                version = retry
             if version[0] or version[2] or not re.fullmatch(rb'git version [^\x00\r\n]+\n', version[1]):
                 _fail('git-capability-query')
             capability = _query(executable, ['-c', 'core.hooksPath=' + str(root / 'hooks'),
