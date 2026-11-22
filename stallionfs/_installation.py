@@ -177,7 +177,8 @@ def inspect(root):
     root = Path(root).expanduser().absolute()
     extension = APP / 'Contents/Extensions/StallionFS.appex'
     app = {'path': str(APP), 'present': _is_dir(APP),
-           'extension_present': _is_dir(extension), 'extension_matches_app': False}
+           'host_executable_usable': False, 'extension_present': _is_dir(extension),
+           'extension_matches_app': False}
     try:
         info = _bundle_info(APP / 'Contents/Info.plist')
         version, build = info.get('CFBundleShortVersionString'), info.get('CFBundleVersion')
@@ -186,6 +187,18 @@ def inspect(root):
         app.update(version=version, bundle_version=build, version_matches_cli=version == __version__)
     except INFO_ERRORS as error:
         app.update(version=None, bundle_version=None, version_matches_cli=False, error=str(error))
+    else:
+        if app['present']:
+            try:
+                if info.get('CFBundleExecutable') != 'StallionFS':
+                    raise ValueError('Unexpected app executable name')
+                binary = APP / 'Contents/MacOS/StallionFS'
+                if not os.access(binary, os.X_OK) or not stat.S_ISREG(binary.lstat().st_mode):
+                    raise ValueError('App executable is missing or unusable')
+            except (OSError, ValueError) as error:
+                app['host_error'] = str(error)
+            else:
+                app['host_executable_usable'] = True
     if app['extension_present']:
         try:
             _check_extension(extension, app['version'], app['bundle_version'])
@@ -231,6 +244,7 @@ def inspect(root):
     app_platform = _app_platform()
     checks = {
         'app_present': app['present'], 'extension_present': app['extension_present'],
+        'host_executable_usable': app['host_executable_usable'],
         'extension_matches_app': app['extension_matches_app'],
         'app_platform_compatible': app_platform['state'] == 'supported',
         'version_matches_cli': app['version_matches_cli'],
@@ -284,6 +298,8 @@ def describe(result):
             app_text += ', build ' + app['bundle_version']
         else:
             app_text += ', version unavailable'
+        if app.get('host_error'):
+            app_text += ', ' + app['host_error']
         app_text += ', extension present' if app['extension_present'] else ', extension missing'
         if app.get('extension_error'):
             app_text += ' (' + app['extension_error'] + ')'
@@ -326,6 +342,8 @@ def describe(result):
              'app_platform_compatible': 'FSKit app requirements are unmet or unknown',
              'version_matches_cli': 'app version must match CLI',
              'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH'}
+    if app['present']:
+        names['host_executable_usable'] = 'app executable must be usable'
     if app['extension_present']:
         names['extension_matches_app'] = 'extension must match the app'
     signing = {'developer_id_signature': 'no Developer ID signature', 'gatekeeper_accepted': 'not accepted by Gatekeeper'}

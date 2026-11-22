@@ -33,8 +33,14 @@ class Installation(unittest.TestCase):
                                    'CFBundleVersion': '146'}
         self.extension_info.write_bytes(plistlib.dumps(self.extension_metadata))
         self.info = self.app / 'Contents/Info.plist'
-        self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': installation.__version__,
-                                              'CFBundleVersion': '146'}))
+        self.host_metadata = {'CFBundleExecutable': 'StallionFS',
+                              'CFBundleShortVersionString': installation.__version__,
+                              'CFBundleVersion': '146'}
+        self.info.write_bytes(plistlib.dumps(self.host_metadata))
+        self.host_binary = self.app / 'Contents/MacOS/StallionFS'
+        self.host_binary.parent.mkdir()
+        self.host_binary.write_bytes(b'inert host')
+        self.host_binary.chmod(0o755)
         self.home = self.root / 'home'
         self.home.mkdir()
         self.target = self.app / 'Contents/Resources/Runtime/CLI/bin/sfs'
@@ -69,6 +75,7 @@ class Installation(unittest.TestCase):
         with patch.object(installation.sys, 'argv', ['/installed/bin/sfs']):
             result = installation.inspect(self.root)
         self.assertTrue(result['ready'])
+        self.assertTrue(result['checks']['host_executable_usable'])
         self.assertTrue(result['checks']['extension_matches_app'])
         self.assertEqual(result['signature']['state'], 'Developer ID')
         self.assertEqual(result['gatekeeper']['state'], 'accepted')
@@ -79,6 +86,31 @@ class Installation(unittest.TestCase):
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
         self.assertFalse((self.bin / installation._command.LOCK).exists())
+
+    def test_installation_needs_attention_when_host_executable_is_missing(self):
+        self.host_binary.unlink()
+        with redirect_stdout(io.StringIO()) as output:
+            code = cli.main(['--root', str(self.root), '--json', 'doctor', '--installation'])
+        self.assertEqual(code, 1)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result['ready'])
+        self.assertTrue(result['checks']['app_present'])
+        self.assertFalse(result['checks']['host_executable_usable'])
+        self.assertTrue(result['checks']['extension_matches_app'])
+        self.assertEqual(result['app']['bundle_version'], '146')
+        self.assertEqual(result['signature']['state'], 'Developer ID')
+        self.assertIn('App executable is missing or unusable', installation.describe(result))
+
+    def test_host_executable_name_and_mode_are_required(self):
+        self.info.write_bytes(plistlib.dumps(dict(self.host_metadata, CFBundleExecutable='OtherExecutable')))
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['app']['host_error'], 'Unexpected app executable name')
+        self.info.write_bytes(plistlib.dumps(self.host_metadata))
+        self.host_binary.chmod(0o644)
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['app']['host_error'], 'App executable is missing or unusable')
 
     def test_installation_needs_attention_on_older_macos(self):
         with (patch('platform.mac_ver', return_value=('26.6.2', ('', '', ''), '')),
@@ -304,7 +336,8 @@ class Installation(unittest.TestCase):
                 self.assertTrue(result['ready'])
 
     def test_mismatched_version_missing_extension_and_root(self):
-        self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.6.0', 'CFBundleVersion': '1'}))
+        self.info.write_bytes(plistlib.dumps(dict(self.host_metadata, CFBundleShortVersionString='0.6.0',
+                                                  CFBundleVersion='1')))
         self.extension.rename(self.root / 'parked.appex')
         absent = self.root / 'absent'
         result = installation.inspect(absent)
