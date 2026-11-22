@@ -73,7 +73,7 @@ class PackageProfileTests(unittest.TestCase):
                 with self.assertRaises(ValueError): package.compiled_factory_profile(b'fixture')
 
     def test_tools_require_success_complete_output_and_deadline(self):
-        for tool, mode in ((tool, mode) for tool in ('nm', 'otool')
+        for tool, mode in ((tool, mode) for tool in ('nm', 'otool', 'codesign')
                            for mode in ('status', 'oversize', 'encoding', 'timeout')):
             def run(argv, **kwargs):
                 self.assertEqual(kwargs['timeout'], 30)
@@ -85,6 +85,48 @@ class PackageProfileTests(unittest.TestCase):
             with self.subTest(mode=mode), patch.object(package.subprocess, 'run', side_effect=run):
                 with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
                     package._tool_output(['/usr/bin/' + tool, 'fixture'], None)
+
+    def test_lipo_inventory_uses_only_stdout(self):
+        for stdout, stderr, expected in ((b'arm64\n', b'fixture warning\n', ['arm64']),
+                                         (b'', b'arm64\n', None)):
+            def run(argv, **kwargs):
+                kwargs['stdout'].write(stdout)
+                kwargs['stderr'].write(stderr)
+                return subprocess.CompletedProcess(argv, 0)
+            with self.subTest(stdout=stdout, stderr=stderr), patch.object(package.subprocess, 'run', side_effect=run):
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, 'Missing or unsupported executable architecture inventory'):
+                        package._architectures(Path('fixture'), None)
+                else:
+                    self.assertEqual(package._architectures(Path('fixture'), None), expected)
+
+    def test_lipo_refuses_failed_or_malformed_inventory_with_bounded_diagnostics(self):
+        member = 'scripts/sfs'
+        arm = b'arm64\n'
+        cases = ((arm, b'\x1b\n' + b'x' * 200 + b'unlogged tail', 7, 'lipo -archs failed (exit 7)', '\\x1b\\n'),
+                 (arm, b'x' * (package.PROFILE_OUTPUT_LIMIT + 1 - len(arm)), 0, 'exceeded output limit', None),
+                 (b'\xff\n', arm, 0, 'Invalid lipo -archs stdout encoding', '\\xff\\n'),
+                 (b'arm64 arm64\n', b'', 0, 'unsupported executable architecture inventory', 'arm64 arm64\\n'))
+        for stdout, stderr, status, reason, preview in cases:
+            def run(argv, **kwargs):
+                self.assertEqual(argv[:2], ['/usr/bin/lipo', '-archs'])
+                self.assertEqual(kwargs['timeout'], 30)
+                self.assertIsNot(kwargs['stdout'], kwargs['stderr'])
+                kwargs['stdout'].write(stdout)
+                kwargs['stderr'].write(stderr)
+                return subprocess.CompletedProcess(argv, status)
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                with patch.object(package.subprocess, 'run', side_effect=run), self.assertRaises(ValueError) as caught:
+                    package._inspect_runtime_wheel({member: b'inert'}, 'scripts/', [], Path(directory))
+                message = str(caught.exception)
+                self.assertIn(reason, message)
+                self.assertIn(member, message)
+                if preview is not None:
+                    self.assertIn(preview, message)
+                self.assertNotIn('\x1b', message)
+                self.assertNotIn('\n', message)
+                self.assertNotIn('unlogged tail', message)
+                self.assertLess(len(message), 400)
 
     def test_inspected_executable_cannot_change_before_copy(self):
         def inspect(argv, directory):

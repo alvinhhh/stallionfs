@@ -3,6 +3,7 @@ import argparse
 import ast
 import base64
 import csv
+from contextlib import nullcontext
 import io
 import importlib.util
 import hashlib
@@ -52,28 +53,52 @@ def write_new(path, data, mode):
 PROFILE_SYMBOLS = {'_stallionfs_factory_read_only_v1': 'read-only',
                    '_stallionfs_factory_contextual_writes_v1': 'contextual-writes'}
 PROFILE_OUTPUT_LIMIT = 1024 * 1024
+PROFILE_PREVIEW_LIMIT = 160
 
 
 def _tool_output(argv, directory):
     # Keep tool output off pipes and bound the accepted complete response.
     with tempfile.TemporaryFile(dir=directory) as output:
-        result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
-                                stderr=output, timeout=30, check=False)
-        output.seek(0)
-        data = output.read(PROFILE_OUTPUT_LIMIT + 1)
-    if result.returncode != 0 or len(data) > PROFILE_OUTPUT_LIMIT:
+        # Only lipo's stdout is an architecture inventory.
+        split_lipo = argv[:2] == ['/usr/bin/lipo', '-archs']
+        errors = tempfile.TemporaryFile(dir=directory) if split_lipo else nullcontext(output)
+        with errors as stderr:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                    stderr=stderr, timeout=30, check=False)
+            output.seek(0)
+            data = output.read(PROFILE_OUTPUT_LIMIT + 1)
+            diagnostics = b''
+            if split_lipo:
+                stderr.seek(0)
+                diagnostics = stderr.read(max(PROFILE_PREVIEW_LIMIT, PROFILE_OUTPUT_LIMIT + 1 - len(data)))
+    oversized = len(data) + len(diagnostics) > PROFILE_OUTPUT_LIMIT
+    if result.returncode != 0 or oversized:
+        if split_lipo:
+            limit_note = ', exceeded output limit' if oversized else ''
+            raise ValueError(f'lipo -archs failed (exit {result.returncode}{limit_note}). '
+                             f'Stdout starts {data[:PROFILE_PREVIEW_LIMIT]!r}. '
+                             f'Stderr starts {diagnostics[:PROFILE_PREVIEW_LIMIT]!r}.')
         raise ValueError('Artifact inspection failed or exceeded its output limit')
     try:
         return data.decode('utf-8', errors='strict')
     except UnicodeError as error:
+        if split_lipo:
+            raise ValueError(f'Invalid lipo -archs stdout encoding. '
+                             f'Stdout starts {data[:PROFILE_PREVIEW_LIMIT]!r}.') from error
         raise ValueError('Invalid artifact inspection output') from error
 
 
-def _architectures(executable, directory):
-    architectures = _tool_output(['/usr/bin/lipo', '-archs', str(executable)], directory).split()
+def _architectures(executable, directory, *, member=None):
+    subject = (executable.name if member is None else member)[:PROFILE_PREVIEW_LIMIT]
+    try:
+        stdout = _tool_output(['/usr/bin/lipo', '-archs', str(executable)], directory)
+    except ValueError as error:
+        raise ValueError(f'Could not inspect architecture for {subject!a}. {error}') from error
+    architectures = stdout.split()
     if (not architectures or len(architectures) != len(set(architectures))
             or any(arch not in ('arm64', 'arm64e', 'x86_64') for arch in architectures)):
-        raise ValueError('Missing or unsupported executable architecture inventory')
+        raise ValueError(f'Missing or unsupported executable architecture inventory for {subject!a}. '
+                         f'Stdout starts {stdout[:PROFILE_PREVIEW_LIMIT]!a}.')
     return architectures
 
 
@@ -764,7 +789,8 @@ def _inspect_runtime_wheel(files, scripts, extensions, directory):
     for index, name in enumerate([scripts + 'sfs', scripts + 'stallionfs', *extensions]):
         executable = directory / ('wheel-' + str(index))
         write_new(executable, files[name], 0o700)
-        _runtime_require(_architectures(executable, directory) == ['arm64'], 'Wheel must be arm64')
+        _runtime_require(_architectures(executable, directory, member=name) == ['arm64'],
+                         f'Wheel must be arm64 for {name[:PROFILE_PREVIEW_LIMIT]!a}')
         target = _deployment_target(_tool_output(['/usr/bin/otool', '-arch', 'arm64', '-l', str(executable)], directory), 'arm64')
         _runtime_require(_version(target['minimum_os']) <= _version('27.0'), 'Wheel exceeds the app minimum')
         if name in extensions:
