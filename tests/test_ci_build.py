@@ -136,6 +136,16 @@ class Routing(unittest.TestCase):
         self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
         self.assertLess(test.index('controller.initialize_installed'), test.index("sys.path.insert(0, str(checkout / 'tests'))"))
         self.assertLess(test.index('controller.initialize_installed'), test.index('defaultTestLoader.discover'))
+        worker = job(text, 'test-execution')
+        installed = step(worker, 'Test installed wheel with image failure diagnostics')
+        self.assertIn("        if: matrix.phase == 'installed'\n", installed)
+        installed_env = installed.split('        env:\n', 1)[1].split('        run:', 1)[0]
+        flag = 'STALLIONFS_TEST_CLONE_SEED_CREATE:'
+        self.assertEqual(text.count(flag), 1)
+        self.assertIn("          " + flag + " ${{ matrix.os == 'macos-26' && "
+                      "matrix.python == '3.14' && matrix.images == '1' && '1' || '0' }}\n", installed_env)
+        target = ('macos-26', '3.14', '1', 'installed')
+        self.assertEqual(rows(worker, phased=True).count(target), 1)
 
 
 class ComponentArchive(unittest.TestCase):

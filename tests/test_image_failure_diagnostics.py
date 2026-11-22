@@ -271,6 +271,62 @@ class CreateStatusObservationTests(unittest.TestCase):
         self.assertEqual([json.loads(c.args[1])['phase'] for c in self.writer.call_args_list], ['start', 'finish'])
         self.waitid.assert_not_called()
 
+    def test_clone_seed_samples_near_original_deadline_within_console_budget(self):
+        value = diagnostics.CreateObservation(('selected',), clone_ownership=True)
+        value.child = self.observer().child
+        with patch.object(diagnostics.time, 'monotonic', return_value=0):
+            value.communicating(value.child, 300)
+            value.done = Mock()
+            value.done.is_set.return_value = False
+            value.done.wait.side_effect = [False, False, False, True]
+            self.waitid.side_effect = [None, self.exit_status(), ChildProcessError()]
+            value._run()
+        self.assertEqual(value.done.wait.call_args_list, [call(60), call(120), call(295), call()])
+        records = [json.loads(entry.args[1]) for entry in self.writer.call_args_list]
+        self.assertEqual([r['phase'] for r in records], ['start', '60', '120', '295', 'finish'])
+        self.assertEqual([r['state'] for r in records[1:-1]],
+                         ['no_exit_observed', 'exited_status_observed', 'unknown'])
+        self.assertEqual({r['fixture'] for r in records}, {'clone-ownership'})
+        self.assertLessEqual(value.bytes, 4096)
+
+    def test_clone_seed_never_queries_at_deadline_or_with_known_returncode(self):
+        value = diagnostics.CreateObservation(('selected',), clone_ownership=True)
+        value.child = self.observer().child
+        with patch.object(diagnostics.time, 'monotonic', side_effect=[0, 300]):
+            value.communicating(value.child, 300)
+            self.assertEqual(value._sample()['reason'], 'communicate_deadline_reached')
+        value.child.returncode = 0
+        with patch.object(diagnostics.time, 'monotonic', return_value=295):
+            self.assertEqual(value._sample()['state'], 'exited_status_observed')
+        with self.subTest(source='late cached returncode'), \
+                patch.object(diagnostics.time, 'monotonic', return_value=301):
+            record = value._sample()
+            self.assertEqual(record['state'], 'unknown')
+            self.assertEqual(record['reason'], 'communicate_deadline_reached')
+            self.assertIsNone(record['returncode_before'])
+        self.waitid.assert_not_called()
+
+        value.child.returncode = None
+        now = [295]
+
+        def late_exit(*args):
+            now[0] = 301
+            return self.exit_status()
+
+        self.waitid.side_effect = late_exit
+        with self.subTest(source='waitid finished after deadline'), \
+                patch.object(diagnostics.time, 'monotonic', side_effect=lambda: now[0]):
+            record = value._sample()
+            self.assertEqual(record['state'], 'unknown')
+            self.assertEqual(record['reason'], 'communicate_deadline_reached')
+            self.assertNotIn('status', record)
+        self.waitid.assert_called_once_with(diagnostics.os.P_PID, value.child.pid,
+                                           diagnostics.os.WEXITED | diagnostics.os.WNOHANG | diagnostics.os.WNOWAIT)
+        value.child.returncode = 0
+        value.stop_queries()
+        with patch.object(diagnostics.time, 'monotonic', return_value=295):
+            self.assertEqual(value._sample()['state'], 'unknown')
+
     def test_thread_start_and_bounded_join_preserve_uncertainty(self):
         value = self.observer()
         self.thread.return_value.start.side_effect = RuntimeError('thread unavailable')
@@ -407,6 +463,78 @@ class CreateStatusObservationTests(unittest.TestCase):
             self.assertTrue(observations[0].done.is_set())
             self.assertEqual(observations[0].outcome, 'raised')
         self.waitid.assert_not_called()
+
+    def test_clone_seed_timeout_records_only_bounded_lengths_from_communicate(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        args = ('/usr/bin/hdiutil', 'create', base / 'seed.sparseimage')
+        primary = subprocess.TimeoutExpired(args, 300, output=b'secret' * diagnostics.CAPTURE_BYTES)
+        read = Mock(side_effect=primary)
+        observations = []
+        class FakePopen:
+            def __init__(self, argv):
+                observations.append(diagnostics._active_create)
+
+            def communicate(self, **kwargs):
+                return read(**kwargs)
+
+        def original(*actual):
+            return subprocess.Popen([str(v) for v in actual]).communicate(timeout=300)
+
+        with patch.object(subprocess, 'Popen', FakePopen), \
+                diagnostics.observe_seed_create(base, clone_ownership=True):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                diagnostics._observed_create(original, args)
+            self.assertIs(caught.exception, primary)
+            self.assertIs(subprocess.Popen, FakePopen)
+        read.assert_called_once_with(timeout=300)
+        observation, = observations
+        self.assertTrue(observation.query_stopped.is_set())
+        self.assertTrue(observation.done.is_set())
+        observation._run()
+        finish = self.writer.call_args.args[1]
+        self.assertEqual(json.loads(finish)['timeout_capture'],
+                         dict(stdout_bytes=diagnostics.CAPTURE_BYTES, stdout_capped=True,
+                              stderr_bytes=None, stderr_capped=False))
+        self.assertNotIn(b'secret', finish)
+        self.assertNotIn(os.fsencode(base), finish)
+        self.waitid.assert_not_called()
+
+    def test_clone_seed_binds_only_the_exact_private_owned_path(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary).resolve()
+        seed = base / 'seed.sparseimage'
+        other = base / 'other.sparseimage'
+        seed.symlink_to(other)
+        with patch.object(diagnostics, 'CreateObservation') as observation:
+            for image in (other, seed, base / '..' / base.name / seed.name):
+                with self.subTest(image=image.name), diagnostics.observe_seed_create(base, clone_ownership=True):
+                    original = Mock()
+                    diagnostics._observed_create(original, ('/usr/bin/hdiutil', 'create', image))
+                    original.assert_called_once_with('/usr/bin/hdiutil', 'create', image, '-verbose')
+            observation.assert_not_called()
+
+    def test_clone_seed_opt_in_follows_only_the_named_fixture_setup(self):
+        selected = 'test_clone_ownership_busy_detach_and_recovery'
+        for method, flag, expected in ((selected, '1', True), (selected, '0', False),
+                                       ('test_build_empty_tree', '1', False)):
+            fixture = image_cases.Images(method)
+            def build(source, image, capacity):
+                scope = diagnostics._create_scope.get()
+                if expected:
+                    self.assertTrue(scope['clone_ownership'])
+                    self.assertEqual(image, scope['base'] / 'seed.sparseimage')
+                else:
+                    self.assertIsNone(scope)
+
+            with self.subTest(method=method, flag=flag), tempfile.TemporaryDirectory() as temporary, \
+                    patch.dict(os.environ, STALLIONFS_TEST_CLONE_SEED_CREATE=flag), \
+                    patch.object(image_cases.tempfile, 'mkdtemp', return_value=temporary), \
+                    patch.object(image_cases.subprocess, 'run'), \
+                    patch.object(image_cases.images, 'build', side_effect=build) as prepare:
+                fixture._prepare()
+                prepare.assert_called_once()
+                self.assertIsNone(diagnostics._create_scope.get())
 
     def test_primary_exception_nested_scope_and_lock_restoration(self):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
