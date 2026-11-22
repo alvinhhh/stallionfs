@@ -1227,7 +1227,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('    runs-on: ${{ matrix.os }}\n', worker)
         self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' && matrix.python == '3.12' && matrix.images == '0' && matrix.phase == 'installed') && 30 || matrix.os == 'macos-26-intel' && matrix.phase == 'installed' && 60 || (matrix.os == 'xcode-27' && matrix.python == '3.13' && matrix.images == '1' && matrix.phase == 'installed') && 45 || (matrix.os == 'macos-26-intel' || matrix.os == 'xcode-27') && 30 || matrix.os == 'macos-26' && matrix.phase == 'installed' && 30 || (matrix.os == 'macos-26' && matrix.python == '3.13') && 20 || 15 }}\n", worker)
         self.assertIn('      fail-fast: false\n', worker)
-        self.assertNotIn('continue-on-error:', worker + gate)
+        self.assertNotIn('continue-on-error:', gate)
+        steps = re.split(r'(?=^      - )', worker, flags=re.MULTILINE)
+        optional = []
+        for block in steps:
+            if 'continue-on-error:' in block:
+                self.assertEqual(re.findall(r'^.*continue-on-error:.*$', block, re.MULTILINE),
+                                 ['        continue-on-error: true'])
+                optional.append(block.splitlines()[0])
+        self.assertEqual(optional, ['      - name: Admit installed Intel wheel upload',
+                                    '      - name: Upload tested Intel wheel'])
         sanitizer = worker.split('      - name: Check native code with sanitizers\n', 1)[1]
         self.assertTrue(sanitizer.startswith("        if: matrix.phase == 'sanitizer'\n"))
         self.assertIn('          ASAN_OPTIONS: halt_on_error=1\n', sanitizer)
