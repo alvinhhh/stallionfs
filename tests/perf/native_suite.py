@@ -34,6 +34,13 @@ COPY_TOOLS = {
 }
 SCAN_FIELDS = ('files', 'directories', 'symlinks', 'other', 'logical_bytes', 'skipped_mounts')
 ZPOOL = '/usr/sbin/zpool'
+LINUX_BULK_FIXTURES = ('dependencies_100k', 'git_50k_2gb', 'cache_200k_10gb',
+                       'docs_5k_100mb', 'dataset_2k_50gb')
+LINUX_REFERENCES = {
+    ('copy', 'cp'): 'gnu-cp',
+    ('clone', 'cp-clone'): 'gnu-cp-reflink',
+    ('delete', 'cp'): 'gnu-rm',
+}
 
 
 def clone_pool_observation(pool, timeout):
@@ -143,7 +150,7 @@ def parse_scan_output(method, output, root_device):
     return counts
 
 
-def arguments(method, operation, binary, source, destination, jobs=None):
+def arguments(method, operation, binary, source, destination, jobs=None, *, gnu_rm=None):
     if operation not in ('clone', 'copy', 'move', 'delete', 'scan'):
         raise ValueError('Unknown operation')
     options = ['--jobs', str(jobs)] if jobs is not None and operation != 'move' else []
@@ -151,6 +158,8 @@ def arguments(method, operation, binary, source, destination, jobs=None):
         return ['/bin/cp', '-a', '--reflink=never', '--', str(source), str(destination)]
     if method == 'gnu-cp-reflink' and operation == 'clone':
         return ['/bin/cp', '-a', '--reflink=always', '--', str(source), str(destination)]
+    if method == 'gnu-rm' and operation == 'delete' and gnu_rm is not None:
+        return [gnu_rm, '-rf', '--one-file-system', '--', str(source)]
     if operation == 'scan':
         if method == 'stallionfs':
             return [str(binary), '--json', 'scan'] + options + [str(source)]
@@ -214,6 +223,21 @@ def preserved(result):
             and result.get('move_source_absent', True) is True)
 
 
+def require_linux_delete_paths(base, identity, volume, operand, expected):
+    """Bind the one owned operand and recheck mounts before a copy or deletion."""
+    current = base.lstat()
+    fileops.require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.getuid()
+                    and stat.S_IMODE(current.st_mode) == 0o700 and os.path.samestat(current, identity)
+                    and fileops.linux_mount_id(base) == (volume['mount_id'], identity.st_dev),
+                    'Linux delete fixture root identity changed')
+    info = operand.lstat()
+    fileops.require(operand.parent == base and stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                    and (info.st_dev, info.st_ino) == tuple(expected['entries']['']['device_inode'])
+                    and fileops.linux_mount_id(operand) == (volume['mount_id'], identity.st_dev),
+                    'Linux delete operand identity changed')
+    fileops.no_mounts_below(None, base)
+
+
 def summarize_report(rows, required_samples, *, native_only=False):
     groups = {}
     for row in rows:
@@ -255,7 +279,7 @@ def main():
     p.add_argument('--fixtures', nargs='+', choices=[*fileops.SAMPLES, *PROFILES, *native_fixtures.PROFILES, *native_fixtures.SCAN_PROFILES, 'installed_dependencies'],
                    default=['docs_5k_100mb'] if linux else list(fileops.SAMPLES) + list(PROFILES) + list(native_fixtures.PROFILES))
     p.add_argument('--copy-tools', nargs='+', choices=list(COPY_TOOLS), default=['cp'] if linux else list(COPY_TOOLS),
-                   help='Linux: docs copy/cp or clone/cp-clone, dependencies_100k copy/cp; macOS clone references and ordinary cp -Rp')
+                   help='Linux: bulk clone/cp-clone or delete/cp, docs or dependencies copy/cp; macOS clone references and ordinary cp -Rp')
     p.add_argument('--operations', nargs='+', choices=['clone', 'copy', 'move', 'delete', 'scan'], default=['copy'] if linux else ['clone', 'move', 'delete'])
     p.add_argument('--jobs', type=int, choices=range(1, 5), help='Explicit StallionFS worker count for clone, copy, delete and scan')
     p.add_argument('--node', type=Path, help='Node executable for installed_dependencies')
@@ -266,19 +290,24 @@ def main():
     for selection in (a.fixtures, a.operations, a.cache, a.copy_tools):
         fileops.require(len(selection) == len(set(selection)), 'Duplicate benchmark selectors are not allowed')
     fileops.require(system in ('Darwin', 'Linux'), 'macOS or Linux is required')
+    linux_reference = None
     if linux:
-        fileops.require((a.fixtures, a.operations, a.copy_tools) in (
-                            (['docs_5k_100mb'], ['copy'], ['cp']),
-                            (['docs_5k_100mb'], ['clone'], ['cp-clone']),
-                            (['dependencies_100k'], ['copy'], ['cp'])) and a.cache == ['warm']
+        linux_reference = LINUX_REFERENCES.get((*a.operations, *a.copy_tools)) if (
+            len(a.operations) == len(a.copy_tools) == 1) else None
+        allowed = ('docs_5k_100mb', 'dependencies_100k') if linux_reference == 'gnu-cp' else LINUX_BULK_FIXTURES
+        fileops.require(linux_reference is not None and len(a.fixtures) == 1 and a.fixtures[0] in allowed
+                        and a.cache == ['warm']
                         and a.samples == 10 and a.runs == 1
                         and all(value is None for value in (a.binary, a.jobs, a.node, a.npm, a.npm_cache)),
-                        'Linux admits only warm docs_5k_100mb copy/cp or clone/cp-clone, or dependencies_100k copy/cp, 10 samples per phase, one run and no binary, jobs or install arguments')
+                        'Linux admits only one warm frozen bulk clone/cp-clone or delete/cp, or docs/dependencies copy/cp, with 10 samples per phase, one run and no binary, jobs or install arguments')
     else:
         fileops.require(a.binary is not None, 'An installed executable is required')
     fileops.require(a.samples >= 10 and a.runs >= 1, 'At least 10 samples and 1 collection run are required')
     fileops.require(0 < a.timeout < float('inf'), 'Timeout must be finite and positive')
-    linux_clone = linux and a.operations == ['clone']
+    linux_clone = linux_reference == 'gnu-cp-reflink'
+    linux_delete = linux_reference == 'gnu-rm'
+    linux_bulk = linux_clone or linux_delete
+    gnu_rm = None
     scan_mode = 'scan' in a.operations
     scan_fixtures = [name in native_fixtures.SCAN_PROFILES for name in a.fixtures]
     fileops.require((scan_mode and a.operations == ['scan'] and all(scan_fixtures)) or
@@ -298,12 +327,22 @@ def main():
     if 'installed_dependencies' in a.fixtures:
         sources.update({'tests/perf/fixture/'+name: fileops.digest(Path(__file__).parent/'fixture'/name) for name in native_fixtures.LOCKED_FILES})
     if linux:
-        executables = {path: fileops.digest(Path(path)) for path in ('/bin/cp', '/usr/bin/time', volume['zfs_executable'])}
+        tool_paths = ['/bin/cp', '/usr/bin/time']
+        if linux_delete:
+            gnu_rm = str(Path('/bin/rm').resolve(strict=True))
+            tool_paths.append(gnu_rm)
+        if a.fixtures == ['git_50k_2gb']:
+            tool_paths.append('/usr/bin/git')
+        executables = {path: fileops.digest(Path(path)) for path in [*tool_paths, volume['zfs_executable']]}
         if linux_clone: executables[ZPOOL] = fileops.digest(Path(ZPOOL))
         versions = {path: fileops.command([path, '--version'], environment={**os.environ, 'LC_ALL': 'C'}).stdout.decode(errors='replace').strip()
-                    for path in ('/bin/cp', '/usr/bin/time')}
+                    for path in tool_paths}
         fileops.require(versions['/bin/cp'].startswith('cp (GNU coreutils)')
                         and 'GNU Time' in versions['/usr/bin/time'], 'GNU cp and GNU time are required')
+        if linux_delete:
+            fileops.require(versions[gnu_rm].startswith('rm (GNU coreutils)'), 'GNU rm is required')
+        if '/usr/bin/git' in versions:
+            fileops.require(versions['/usr/bin/git'].startswith('git version '), 'Git is required for the Git fixture')
     else:
         helper = binary.with_name('stallionfs-python')
         fileops.require(helper.is_file(), 'Installed Python helper is missing')
@@ -332,12 +371,13 @@ def main():
         fileops.require(len(memory) == 1 and int(memory[0]) > 0, 'Guest memory inventory unavailable')
         report.pop('version'); report.pop('all_metrics_won')
         report.update(benchmark=('Linux/OpenZFS native required-reflink clone' if linux_clone else
+                                 'Linux/OpenZFS native recursive deletion' if linux_delete else
                                  'Linux/OpenZFS native ordinary copy'), tool_versions=versions,
                       environment={'kernel': platform.release(), 'machine': platform.machine(),
                                    'cpu_count': os.cpu_count(), 'memory_bytes': int(memory[0]) * 1024,
                                    'host_storage': 'unobserved by guest', 'whole_system_memory': 'unobserved'},
                       limits=[
-                          'One native GNU cp method; descriptive statistics only, with no paired verdict or product comparison.',
+                          'One native method; descriptive statistics only, with no paired verdict or product comparison.',
                           'Direct timing and GNU time resource samples are separate phases; both include process startup.',
                           'Warm means the preceding validated snapshot read every byte; residency is not guaranteed.',
                           'RSS is the measured process peak and excludes ZFS ARC, kernel and host caches.',
@@ -350,6 +390,8 @@ def main():
                 'Required-reflink API acceptance and strict copy correctness are separate from aggregate pool-counter corroboration.',
                 'Stale or unavailable pool counters do not negate API acceptance; physical optimization remains inconclusive without corroboration.',
                 'Pool counters do not establish per-file full physical sharing, exclusive storage savings or causal performance benefits.'])
+        if linux_delete:
+            report['limits'].append('Each delete starts from a fresh, validated GNU cp --reflink=never operand prepared outside measurement.')
     if scan_mode:
         report['limits'].extend([
             'Scan fixtures reuse scan.py\'s flat, nested and deep40 layouts with 20,000 generated files and unchanged special entries.',
@@ -398,6 +440,7 @@ def main():
         checkpoint()
         base = Path(tempfile.mkdtemp(prefix='native-suite-', dir=scratch))
         identity = base.stat()
+        uncertain = linux_bulk
         report['fixture_root'] = str(base)
         checkpoint()
         (base / 'outside-sentinel').write_bytes(b'keep outside linked trees\n')
@@ -446,7 +489,11 @@ def main():
                 metadata['status'] = 'prepared'
                 checkpoint()
                 release('metadata_preparation')
-                uncertain = False
+                uncertain = linux_bulk
+                if linux_delete:
+                    entries = expected['entries']
+                    copy_reserve = (max(spec['bytes'], sum(row['size'] for row in entries.values() if row['kind'] == 'file'))
+                                    + max(spec['files'], len(entries)) * 8192 + fileops.HEADROOM)
                 if name == 'installed_dependencies':
                     preparation['manifest_sha256'] = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
                     regular = [entry for entry in expected['entries'].values() if entry['kind'] == 'file']
@@ -454,7 +501,7 @@ def main():
                     checkpoint()
                     release('preparation')
                 for operation in a.operations:
-                    references = (['gnu-cp-reflink' if linux_clone else 'gnu-cp'] if linux else ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
+                    references = ([linux_reference] if linux else ['find-stat'] if operation == 'scan' else a.copy_tools if operation == 'clone' else
                                   ['cp'] if operation == 'copy' else [operation])
                     for reference in references:
                         for cache, phase in product(a.cache, native_metrics.PHASE_METRICS):
@@ -484,8 +531,14 @@ def main():
                                                cache=cache, phase=phase, sample=sample, method=method)
                                     if operation in ('move', 'delete'):
                                         # Setup stays outside timing and does not prelaunch the measured candidate.
-                                        setup = key | {'argv': ['/usr/bin/ditto', '--rsrc', '--extattr', '--acl', str(source), str(target)],
-                                                       'exit_code': None, 'validated': False}
+                                        if linux_delete:
+                                            require_linux_delete_paths(base, identity, volume, source, expected)
+                                            fileops.require(shutil.disk_usage(scratch).free >= copy_reserve,
+                                                            'Insufficient space for the Linux delete operand')
+                                            setup_argv = arguments('gnu-cp', 'copy', None, source, target)
+                                        else:
+                                            setup_argv = ['/usr/bin/ditto', '--rsrc', '--extattr', '--acl', str(source), str(target)]
+                                        setup = key | {'argv': setup_argv, 'exit_code': None, 'validated': False}
                                         uncertain = True
                                         record('preparation', setup, active=True); checkpoint()
                                         prepared = fileops.command(setup['argv'], check=False, timeout=a.timeout)
@@ -495,9 +548,10 @@ def main():
                                         if prepared.returncode:
                                             uncertain = True
                                             raise RuntimeError('Operand preparation failed; receipt and fixture retained')
-                                        setup['symlink_timestamp_repairs'] = restore_setup_symlink_times(target, expected)
+                                        if not linux_delete:
+                                            setup['symlink_timestamp_repairs'] = restore_setup_symlink_times(target, expected)
                                         operand = target
-                                    argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs)
+                                    argv = arguments(method, operation, binary, operand, dest, jobs=a.jobs, gnu_rm=gnu_rm)
                                     report['active_operation'] = key | {'argv': argv, 'state': 'source validation, cache preparation or command pending'}
                                     checkpoint()
                                     if linux_clone: uncertain = True
@@ -514,7 +568,7 @@ def main():
                                         setup['validated'] &= setup['source_verification']['unchanged']
                                         if not setup['validated']:
                                             raise RuntimeError('Setup changed the source fixture; evidence retained')
-                                        uncertain = False
+                                        uncertain = linux_bulk
                                     if scan_mode and not setup_correctness['unchanged']:
                                         report['source_precheck_failure'] = setup_correctness
                                         raise RuntimeError('Scan source changed before measurement; preserved for inspection')
@@ -538,6 +592,8 @@ def main():
                                                               'full_data_stream_sharing': None}}
                                         checkpoint()
                                     uncertain = True  # Retain evidence until source and sentinel checks complete.
+                                    if linux_delete:
+                                        require_linux_delete_paths(base, identity, volume, operand, before)
                                     try:
                                         receipt = native_metrics.collect(argv, timeout_s=a.timeout, phase=phase)
                                     except native_metrics.ChildCompletionUnknown as error:
@@ -570,6 +626,10 @@ def main():
                                         row['correctness'] = {'passed': False, 'reason': 'command or raw measurement failed'}
                                         checkpoint()
                                         raise RuntimeError('Required-reflink command or raw measurement failed; fixture retained')
+                                    if linux_delete and not row.get('ok'):
+                                        row['correctness'] = {'passed': False, 'reason': 'command or raw measurement failed'}
+                                        checkpoint()
+                                        raise RuntimeError('GNU rm command or raw measurement failed; fixture retained')
                                     if row['exit_code'] == 0:
                                         if operation == 'scan':
                                             try:
@@ -619,6 +679,9 @@ def main():
                                             checkpoint()
                                             fileops.require(evidence['corroboration']['same_pool_guid'] is not False,
                                                             'Clone observation pool GUID changed; fixture retained')
+                                    if linux_delete and not row['validated']:
+                                        checkpoint()
+                                        raise RuntimeError('GNU rm validation failed; fixture retained')
                                     if not row['validated'] or not row.get('ok'):
                                         blocked_methods.add(case)
                                         record('unavailable', key | {'reason': 'method failed; remaining identical attempts skipped'})
@@ -626,10 +689,11 @@ def main():
                                     if not row['source_unchanged']:
                                         uncertain = True
                                         raise RuntimeError('Operation changed the retained source fixture; preserved for inspection')
-                                    if not linux_clone: uncertain = False
+                                    if not linux_bulk: uncertain = False
                                     fileops.no_mounts_below(binary, base)
-                                    for path in (target, dest): fileops.remove_fixture(path)
-                                    uncertain = False
+                                    if not linux_delete:
+                                        for path in (target, dest): fileops.remove_fixture(path)
+                                    uncertain = linux_bulk
                                     checkpoint()
                                     all_rows_valid &= row['validated'] and bool(row.get('ok'))
                                     projection_fields = (*key, 'pair_id', 'ok', 'validated', 'completion_uncertain',
@@ -645,9 +709,9 @@ def main():
                             checkpoint()
                             print(json.dumps({'run': run, 'fixture': name, 'operation': operation,
                                               'reference': reference, 'cache': cache, 'phase': phase}), flush=True)
-                if not linux_clone:
+                if not linux_bulk:
                     fileops.remove_fixture(base / 'fixtures' if name in fileops.SAMPLES else base/name if name == 'installed_dependencies' else source)
-        if linux_clone: uncertain = True
+        if linux_bulk: uncertain = True
         fileops.require(all(fileops.digest(Path(path)) == value for path, value in executables.items()), 'Executable changed')
         current_sources = fileops.fingerprint_sources()
         current_sources.update({x.name: fileops.digest(x) for x in Path(__file__).parent.glob('native_*.py')})
@@ -656,7 +720,7 @@ def main():
         fileops.require(current_sources == sources, 'Harness or product source changed')
         report['status'] = 'complete'
         report['passed'] = bool(counts['rows']) and not counts['unavailable'] and all_rows_valid
-        if linux_clone: uncertain = False
+        if linux_bulk: uncertain = False
     except BaseException as error:
         if scan_mode or isinstance(error, (fileops.ChildCompletionUnknown, native_metrics.ChildCompletionUnknown, subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit)):
             uncertain = True

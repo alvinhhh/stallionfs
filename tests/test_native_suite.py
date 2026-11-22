@@ -27,6 +27,7 @@ COMPARE = suite.native_correctness.compare
 VERIFY_CLONE = suite.native_correctness.verify_clone
 VERIFY_SOURCE = suite.native_correctness.verify_source
 SCAN_FIXTURE = suite.native_fixtures.scan_fixture
+NO_MOUNTS_BELOW = suite.fileops.no_mounts_below
 
 # Native time -lp field labels; values are synthetic.
 TIME_FOOTER = b'''real 0.25
@@ -150,6 +151,13 @@ class NativeSuite(unittest.TestCase):
         self.commands.append(argv)
         if argv == ['/bin/cp', '--version']:
             return subprocess.CompletedProcess(argv, 0, b'cp (GNU coreutils) 9.7\n', b'')
+        if argv == [str(Path('/bin/rm').resolve()), '--version']:
+            return subprocess.CompletedProcess(argv, 0, b'rm (GNU coreutils) 9.7\n', b'')
+        if argv == ['/usr/bin/git', '--version']:
+            return subprocess.CompletedProcess(argv, 0, b'git version 2.53.0\n', b'')
+        if argv[:4] == ['/bin/cp', '-a', '--reflink=never', '--']:
+            shutil.copytree(argv[-2], argv[-1])
+            return subprocess.CompletedProcess(argv, 0, b'', b'')
         if argv == ['/usr/bin/time', '--version']:
             return subprocess.CompletedProcess(argv, 0, b'time (GNU Time) 1.9\n', b'')
         if argv == [suite.ZPOOL, 'get', '-Hp', '-o', 'property,value',
@@ -177,12 +185,16 @@ class NativeSuite(unittest.TestCase):
         argv = [os.fspath(value) for value in argv]
         self.measured.append(argv)
         candidate = argv[0] == str(self.binary)
+        native_rm = argv[0] in ('/bin/rm', str(Path('/bin/rm').resolve()))
         operation = ('scan' if argv[0] == '/usr/bin/find' or (candidate and argv[1:3] == ['--json', 'scan']) else
-                     argv[1] if candidate else 'move' if argv[0] == '/bin/mv' else 'delete' if argv[0] == '/bin/rm' else 'clone')
+                     argv[1] if candidate else 'move' if argv[0] == '/bin/mv' else 'delete' if native_rm else 'clone')
         stdout = b''
         if operation in ('clone', 'copy'): shutil.copy2(argv[-2], argv[-1])
         elif operation == 'move': Path(argv[-2]).rename(argv[-1])
-        elif operation == 'delete': Path(argv[-1]).unlink()
+        elif operation == 'delete':
+            target = Path(argv[-1])
+            if target.is_dir(): shutil.rmtree(target)
+            else: target.unlink()
         elif operation == 'scan':
             source = Path(argv[-1] if candidate else argv[3])
             if candidate: stdout = json.dumps(self.scan_expected[str(source)]).encode()
@@ -199,7 +211,7 @@ class NativeSuite(unittest.TestCase):
                 'cpu_s': 0.2, 'rss_bytes': 16384, 'io_input_blocks': 0, 'io_output_blocks': 1,
                 'precision_floor': {'wall_s': 1e-9, 'user_s': 0.01, 'system_s': 0.01, 'cpu_s': 0.02}}
 
-    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, digest=None, system='Darwin', free_space=None):
+    def run_suite(self, *, operations=('clone',), cache=('warm',), copy_tools=('cp-clone',), collector=None, command=None, fixture='tiny_4kib', extra=(), fixture_names=None, sharing=None, enrich=None, coverage=None, digest=None, system='Darwin', free_space=None, mounts=None):
         fixture_names = (fixture,) if fixture_names is None else fixture_names
         argv = ['native_suite.py', *([] if system == 'Linux' else ['--binary', str(self.binary)]), '--scratch', str(self.root),
                 '--output', str(self.output), '--fixtures', *fixture_names, '--copy-tools', *copy_tools,
@@ -220,6 +232,7 @@ class NativeSuite(unittest.TestCase):
                 mock.patch.object(suite.native_report, 'ReportJournal', CapturingJournal),
                 mock.patch.object(sys, 'argv', argv),
                 mock.patch.object(suite.platform, 'system', return_value=system),
+                mock.patch.object(suite.platform, 'platform', return_value=system),
                 mock.patch.object(suite.fileops, 'command', side_effect=command or self.command),
                 mock.patch.object(suite, 'restore_setup_symlink_times', return_value=[]),
                 mock.patch.object(suite.fileops, 'scratch_volume', return_value={'fstype': 'apfs'}),
@@ -229,7 +242,7 @@ class NativeSuite(unittest.TestCase):
                 mock.patch.object(suite.native_fixtures, 'scan_fixture', side_effect=self.scan_fixture),
                 mock.patch.object(suite.native_fixtures, 'enrich_metadata', side_effect=enrich or self.enrich_metadata),
                 mock.patch.object(suite.native_fixtures, 'verify_metadata_coverage', side_effect=coverage or self.verify_metadata_coverage),
-                mock.patch.object(suite.fileops, 'no_mounts_below'),
+                mock.patch.object(suite.fileops, 'no_mounts_below', side_effect=NO_MOUNTS_BELOW if mounts else None),
                 mock.patch.object(suite.fileops, 'manifest', side_effect=warm_manifest),
                 mock.patch.object(suite.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(2**60, 0, 2**60 if free_space is None else free_space)),
                 mock.patch.object(suite.native_metrics, 'collect', side_effect=collector or self.collect),
@@ -245,12 +258,20 @@ class NativeSuite(unittest.TestCase):
             if system == 'Linux':
                 def tiny_large(base, name, specification):
                     self.large_fixture_calls.append((name, dict(specification)))
-                    path = base/name; path.write_bytes(b'tiny Linux coordinator fixture')
+                    path = base/name
+                    if operations == ('delete',):
+                        path.mkdir()
+                        (path/'one').write_bytes(b'tiny Linux delete operand')
+                    else:
+                        path.write_bytes(b'tiny Linux coordinator fixture')
                     return path
                 read_text = Path.read_text
-                stack.enter_context(mock.patch.object(suite.fileops, 'linux_mounts', return_value=[]))
+                stack.enter_context(mock.patch.object(suite.fileops, 'linux_mounts', side_effect=mounts))
+                stack.enter_context(mock.patch.object(suite.fileops, 'linux_mount_id',
+                    side_effect=lambda path: (41, path.stat().st_dev)))
                 stack.enter_context(mock.patch.object(suite.fileops, 'linux_scratch_volume',
-                    return_value={'filesystem': 'zfs', 'zfs_executable': '/usr/sbin/zfs', 'dataset': 'testpool/bench'}))
+                    return_value={'filesystem': 'zfs', 'zfs_executable': '/usr/sbin/zfs',
+                                  'dataset': 'testpool/bench', 'mount_id': 41}))
                 stack.enter_context(mock.patch.object(suite.fileops, 'large_fixture', side_effect=tiny_large))
                 stack.enter_context(mock.patch.object(Path, 'read_text', autospec=True,
                     side_effect=lambda path, *args, **kwargs: 'MemTotal:       4194304 kB\n' if str(path) == '/proc/meminfo'
@@ -334,6 +355,77 @@ class NativeSuite(unittest.TestCase):
         self.assertTrue(report['clone_pool_evidence']['corroboration']['same_pool_guid'])
         self.assertIn(suite.ZPOOL, report['executables'])
         self.assertEqual(self.digest_reads.count(suite.ZPOOL), 2)
+
+    def test_linux_frozen_bulk_cells_use_one_exact_reference(self):
+        spec = {
+            'dependencies_100k': (100000, 102400000), 'git_50k_2gb': (50000, 2000000000),
+            'cache_200k_10gb': (200000, 10000000000), 'docs_5k_100mb': (5000, 100000000),
+            'dataset_2k_50gb': (2000, 50000000000),
+        }
+        for fixture, (files, size) in spec.items():
+            for operation, tool in (('clone', 'cp-clone'), ('delete', 'cp')):
+                with self.subTest(fixture=fixture, operation=operation):
+                    self.output = self.root/f'{fixture}-{operation}.json'
+                    self.measured.clear(); self.commands.clear()
+                    def command(argv, **kwargs):
+                        if argv[:4] == ['/bin/cp', '-a', '--reflink=never', '--']:
+                            self.assertEqual(len(self.measured), self.commands.count(argv))
+                        return self.command(argv, **kwargs)
+                    report = self.run_suite(system='Linux', operations=(operation,), copy_tools=(tool,),
+                                            fixture=fixture, command=command)
+                    base = Path(report['fixture_root'])
+                    self.assertEqual(self.large_fixture_calls[-1], (fixture, {'files': files, 'bytes': size}))
+                    self.assertTrue(report['passed'] and report['cleanup_passed'])
+                    self.assertEqual(['/usr/bin/git', '--version'] in self.commands, fixture.startswith('git_'))
+                    if operation == 'delete':
+                        begin = ['/bin/cp', '-a', '--reflink=never', '--', str(base/fixture), str(base/'target')]
+                        measured = [str(Path('/bin/rm').resolve()), '-rf', '--one-file-system', '--', str(base/'target')]
+                        method = 'gnu-rm'
+                        self.assertEqual(self.commands.count(begin), 20)
+                        self.assertTrue(all(row['validated'] and row['correctness']['independent_clone']
+                                            for row in report['preparation']))
+                    else:
+                        measured = ['/bin/cp', '-a', '--reflink=always', '--',
+                                    str(base/fixture), str(base/'destination')]
+                        method = 'gnu-cp-reflink'
+                    self.assertEqual(self.measured, [measured] * 20)
+                    self.assertEqual({row['method'] for row in report['rows']}, {method})
+                    self.assertTrue(all(row['validated'] and row['source_unchanged'] and 'pair_id' not in row
+                                        for row in report['rows']))
+                    self.assertEqual({row['phase'] for row in report['comparisons']}, {'timing', 'resources'})
+                    self.assertTrue(all(row['complete'] and row['kind'] == 'descriptive' for row in report['comparisons']))
+
+    def test_linux_delete_refuses_nested_mount_before_rm_in_each_phase(self):
+        for prior in (0, 10):
+            with self.subTest(completed_before_refusal=prior):
+                self.measured.clear()
+                self.output = self.root/f'mounted-{prior}.json'
+                def mounts():
+                    rows = [{'path': str(self.root)}]
+                    if len(self.measured) == prior and self.metadata_calls:
+                        target = self.metadata_calls[-1][0].parent/'target'
+                        if target.exists():
+                            rows.append({'path': str(target/'same-device-bind')})
+                    return rows
+                with self.assertRaisesRegex(RuntimeError, 'mounted filesystem'):
+                    self.run_suite(system='Linux', operations=('delete',), copy_tools=('cp',),
+                                   fixture='docs_5k_100mb', mounts=mounts)
+                report = json.loads(self.output.read_text())
+                retained = Path(report['retained_fixture'])
+                self.assertEqual(len(self.measured), prior)
+                self.assertTrue((retained/'target'/'one').exists() and (retained/'docs_5k_100mb'/'one').exists())
+
+    def test_linux_delete_failure_retains_unremoved_operand_without_retry(self):
+        def stays(argv, **kwargs):
+            self.measured.append(argv)
+            return dict(argv=argv, phase=kwargs['phase'], exit_code=0, ok=True, completion_uncertain=False)
+        with self.assertRaisesRegex(RuntimeError, 'GNU rm validation failed'):
+            self.run_suite(system='Linux', operations=('delete',), copy_tools=('cp',),
+                           fixture='docs_5k_100mb', collector=stays)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(len(self.measured), 1)
+        self.assertFalse(report['rows'][0]['validated'])
+        self.assertTrue((Path(report['retained_fixture'])/'target'/'one').exists())
 
     def test_linux_reflink_stale_or_unavailable_counters_do_not_negate_api_acceptance(self):
         for failure in ('stale', 'unavailable', 'malformed'):
@@ -477,10 +569,11 @@ class NativeSuite(unittest.TestCase):
     def test_linux_unsupported_selections_fail_before_artifacts_or_commands(self):
         for options in ({'fixture': 'tiny_4kib'}, {'operations': ('scan',)}, {'operations': ('clone',)},
                         {'fixture': 'git_50k_2gb'}, {'fixture': 'cache_200k_10gb'}, {'fixture': 'dataset_2k_50gb'},
-                        {'fixture': 'dependencies_100k', 'operations': ('clone',), 'copy_tools': ('cp-clone',)},
+                        {'fixture': 'dependencies_100k', 'operations': ('clone',), 'copy_tools': ('ditto',)},
                         {'fixture_names': ('docs_5k_100mb', 'dependencies_100k')},
                         {'operations': ('clone', 'copy'), 'copy_tools': ('cp-clone', 'cp')},
-                        {'operations': ('move',)}, {'operations': ('delete',)}, {'cache': ('cold',)},
+                        {'operations': ('move',)}, {'operations': ('delete',), 'copy_tools': ('cp-clone',)},
+                        {'operations': ('delete',), 'fixture': 'huge_2x10gib'}, {'cache': ('cold',)},
                         {'copy_tools': ('cp-clone',)}, {'extra': ('--jobs', '1')},
                         {'extra': ('--runs', '2')}, {'extra': ('--samples', '11')},
                         {'extra': ('--binary', str(self.binary))},

@@ -181,6 +181,11 @@ enum sfs_status sfs_image_pin_set_xattr(sfs_image *, sfs_pin,
     const void *, size_t, const void *, size_t, sfs_result *);
 enum sfs_status sfs_image_pin_remove_xattr(sfs_image *, sfs_pin,
     const void *, size_t, sfs_result *);
+/* Tests inclusive ancestry in the committed live namespace of a format 0.6
+ * image outside a transaction. Both inodes must identify directories. The
+ * output is set only after the directory's parent chain is checked to root. */
+enum sfs_status sfs_image_directory_contains(sfs_image *, sfs_inode ancestor,
+    sfs_inode directory, int *contains, sfs_result *);
 /* Exact transaction-current identities; expected destination0 means absent.
  * Replacement is atomic in the existing transaction. Failure after its first
  * edit aborts the entire transaction, including all pending pin changes. */

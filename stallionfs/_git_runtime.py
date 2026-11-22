@@ -18,6 +18,15 @@ LEGACY_USAGE = ("error: unknown subcommand: `list'\n"
 LEGACY_SHORT = 'usage: git hook run [--ignore-missing] <hook-name> [-- <hook-args>]\n\n'
 LEGACY_DIAGNOSTICS = (LEGACY_USAGE.encode(), LEGACY_SHORT.encode(),
                       ("error: unknown subcommand: `list'\n" + LEGACY_SHORT).encode())
+_APPLE_GIT_VERSION = re.compile(rb'git version [0-9]+(?:\.[0-9]+){2} \(Apple Git-[0-9]+\)\n')
+_XCODE_STARTUP_LINE = re.compile(
+    rb'[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} '
+    rb'xcodebuild\[[0-9]+:[0-9]+\](?:'
+    rb'  DVTFilePathFSEvents: Failed to start fs event stream\.'
+    rb'| \[MT\] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR '
+    rb'from confstr\(3\), error = Error Domain=NSPOSIXErrorDomain Code=5 '
+    rb'"Input/output error"\. Using NSCachesDirectory instead\.)\n'
+)
 _payload_cache = None
 MESSAGES = {
     'git-capability-query': 'Git hook capability could not be determined.',
@@ -34,6 +43,11 @@ class GitError(ValueError):
 
 def _fail(reason):
     raise GitError(reason)
+
+
+def _xcode_startup_only(stderr):
+    lines = stderr.splitlines(keepends=True)
+    return 0 < len(lines) <= 2 and all(_XCODE_STARTUP_LINE.fullmatch(line) for line in lines)
 
 
 def _query(executable, args, environment, directory):
@@ -120,6 +134,14 @@ def select(environment, *, cwd=None):
         try:
             version = _query(executable, ['--version'], isolated, root / 'repo')
             check()
+            if (executable == '/usr/bin/git' and version[0] == 0 and
+                    _APPLE_GIT_VERSION.fullmatch(version[1]) and _xcode_startup_only(version[2])):
+                # The system dispatcher can emit Xcode startup notices on first use.
+                retry = _query(executable, ['--version'], isolated, root / 'repo')
+                check()
+                if retry != (0, version[1], b''):
+                    _fail('git-capability-query')
+                version = retry
             if version[0] or version[2] or not re.fullmatch(rb'git version [^\x00\r\n]+\n', version[1]):
                 _fail('git-capability-query')
             capability = _query(executable, ['-c', 'core.hooksPath=' + str(root / 'hooks'),
@@ -136,7 +158,7 @@ def select(environment, *, cwd=None):
         if capability != (0, b'stallionfs-capability\n', b''):
             _fail('git-capability-query')
         root_runtime = Path(__file__).resolve().parent / '_git'
-        payload = regular_payload(root_runtime)
+        payload = regular_payload(root_runtime, allow_wheel_umask=True)
         discovery = dict(result, LC_ALL='C')
         args = ['--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
         try:
@@ -243,16 +265,25 @@ def _read_file(root, path, cap, identities, admitted):
             os.close(parent)
 
 
-def regular_payload(root):
+def _wheel_mode_matches(actual, declared):
+    if declared not in ('0o644', '0o755'):
+        return False
+    expected = int(declared, 8)
+    # Pip can remove access for group and others when installing a wheel.
+    return actual & 0o700 == expected & 0o700 and not actual & ~expected
+
+
+def regular_payload(root, *, allow_wheel_umask=False):
     global _payload_cache
     root = Path(root).absolute()
     _bundle.require(not root.is_symlink(), 'Git payload changed')
     root = root.resolve(strict=True)
     def identity(path):
         return _identity(path.lstat())
-    if _payload_cache is not None and _payload_cache['root'] == root:
-        _payload_cache['check']()
-        return _payload_cache
+    cached = _payload_cache
+    if cached is not None and (cached['root'], cached['allow_wheel_umask']) == (root, allow_wheel_umask):
+        cached['check']()
+        return cached
     identities = {root: identity(root)}; admitted = set()
     root_info = root.stat()
     _bundle.require(stat.S_ISDIR(root_info.st_mode) and root_info.st_uid in (0, os.getuid())
@@ -303,7 +334,11 @@ def regular_payload(root):
     for relative, row in rows.items():
         path = root / relative; info = path.lstat()
         _bundle.require(set(row) == {'path', 'mode', 'size', 'sha256'} and type(row['size']) is int
-            and row['size'] == info.st_size and row['mode'] == oct(stat.S_IMODE(info.st_mode)), 'Git payload changed')
+            and row['size'] == info.st_size, 'Git payload changed')
+        mode = stat.S_IMODE(info.st_mode)
+        mode_matches = (_wheel_mode_matches(mode, row['mode']) if allow_wheel_umask
+                        else row['mode'] == oct(mode))
+        _bundle.require(mode_matches, 'Git payload changed')
         digest = hashlib.sha256(read(path, 64 * 1024**2)).hexdigest()
         total += info.st_size; _bundle.require(total <= 128 * 1024**2, 'Git payload byte limit')
         _bundle.require(row['sha256'] == digest, 'Git payload changed')
@@ -335,5 +370,6 @@ def regular_payload(root):
         _bundle.require(all(identity(path) == expected for path, expected in identities.items()), 'Git payload changed')
     _bundle.require(admitted == {root / name for name in actual}, 'Missing Git runtime support')
     check()
-    _payload_cache = {'root': root, 'check': check, 'manifest': value}
-    return _payload_cache
+    payload = {'root': root, 'allow_wheel_umask': allow_wheel_umask, 'check': check, 'manifest': value}
+    _payload_cache = payload
+    return payload

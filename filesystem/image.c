@@ -591,14 +591,26 @@ static enum sfs_status parent_step(reader *r, const namespace *ns, uint64_t id, 
     node n; e = node_get(r, ns, id, 1, &n); if (e) return e == SFS_NOT_FOUND ? SFS_CORRUPT : e;
     if (n.e.kind != SFS_DIRECTORY) return SFS_CORRUPT; *out = n.e.parent; return SFS_OK;
 }
-static enum sfs_status parent_chain(reader *r, const namespace *ns, uint64_t start, uint64_t forbidden) {
+static enum sfs_status walk_parent_chain(reader *r, const namespace *ns, uint64_t start,
+                                        uint64_t ancestor, int *contains) {
     uint64_t slow = start, fast = start;
+    int matched = 0;
     for (uint64_t steps = 0; steps <= ns->count; ++steps) {
-        if (slow == forbidden) return SFS_INVALID; if (slow == 1) return SFS_OK;
+        if (slow == ancestor) {
+            if (!contains) return SFS_INVALID;
+            matched = 1;
+        }
+        if (slow == 1) {
+            if (contains) *contains = matched;
+            return SFS_OK;
+        }
         enum sfs_status e = parent_step(r, ns, slow, &slow); if (e) return e;
         e = parent_step(r, ns, fast, &fast); if (e) return e; e = parent_step(r, ns, fast, &fast); if (e) return e;
         if (slow == fast && slow != 1) return SFS_CORRUPT;
     } return SFS_CORRUPT;
+}
+static enum sfs_status parent_chain(reader *r, const namespace *ns, uint64_t start, uint64_t forbidden) {
+    return walk_parent_chain(r, ns, start, forbidden, NULL);
 }
 static enum sfs_status extent_growth(reader *r, reference root, uint64_t old_size) {
     key k = number_key(old_size / CELL); cursor c; enum sfs_status e = cursor_start(&c, r, root, MAP_EXTENT, UINT64_MAX, old_size, &k); if (e) return e;
@@ -2042,6 +2054,20 @@ enum sfs_status sfs_image_unlink_expected(sfs_image *h, sfs_inode parent, const 
     if (!e && n.e.inode != expected) e = SFS_STATE;
     if (e) return mutation_failure(h, e, r.phase, r.error, 0, out);
     return name_mutation(h, NAME_UNLINK, 0, parent, name, length, 0, NULL, 0, out);
+}
+enum sfs_status sfs_image_directory_contains(sfs_image *h, sfs_inode ancestor, sfs_inode directory,
+                                            int *contains, sfs_result *out) {
+    enum sfs_status e = pin_gate(h, 0, 0, out);
+    if (e) return e;
+    if (h->transaction) return result(h, SFS_STATE, SFS_PHASE_NONE, 0, out);
+    if (!ancestor || !directory || !contains) return result(h, SFS_INVALID, SFS_PHASE_NONE, 0, out);
+    if (stable(h)) return read_result(h, SFS_IO, SFS_PHASE_IDENTITY, errno, out);
+    reader r = current_reader(h, 0);
+    const namespace *ns = &h->live.ns;
+    e = directory_check(&r, ns, ancestor);
+    if (!e && ancestor != directory) e = directory_check(&r, ns, directory);
+    if (!e) e = walk_parent_chain(&r, ns, directory, ancestor, contains);
+    return touched_result(&r, e, out);
 }
 enum sfs_status sfs_image_rename_replace(sfs_image *h, sfs_inode old_parent, const void *old_name, size_t old_length, sfs_inode expected_source, sfs_inode new_parent, const void *new_name, size_t new_length, sfs_inode expected_destination, sfs_result *out) {
     enum sfs_status e = pin_gate(h, 1, 1, out); if (e) return e;

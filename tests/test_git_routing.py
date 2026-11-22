@@ -19,6 +19,13 @@ VERSION = (0, b'git version 2.54.0\n', b'')
 MODERN = (0, b'stallionfs-capability\n', b'')
 LEGACY = (129, b'', b"error: unknown subcommand: `list'\n"
           b'usage: git hook run [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]\n\n')
+APPLE_VERSION = b'git version 2.50.1 (Apple Git-155)\n'
+XCODE_STARTUP = (
+    b'2000-01-02 03:04:05.000 xcodebuild[10:20]  DVTFilePathFSEvents: Failed to start fs event stream.\n'
+    b'2000-01-02 03:04:05.010 xcodebuild[10:21] [MT] DVTDeveloperPaths: Failed to get length of '
+    b'DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 '
+    b'"Input/output error". Using NSCachesDirectory instead.\n'
+)
 PATHS = ((0, b'/provider/etc/gitconfig\n', b''),
          (0, b'/provider/etc/gitattributes\n', b''),
          (0, b'/provider/libexec/git-core\n', b''))
@@ -84,7 +91,7 @@ class GitRoutingTests(unittest.TestCase):
                 self.assertEqual(executable, str(self.corrected / 'bin/git'))
                 self.assertEqual(result['GIT_EXEC_PATH'], str(self.corrected / 'libexec/git-core'))
                 self.assertEqual(result['GIT_TEMPLATE_DIR'], str(self.corrected / 'share/git-core/templates'))
-                calls.payload.assert_called_once_with(self.corrected)
+                calls.payload.assert_called_once_with(self.corrected, allow_wheel_umask=True)
                 self.assertEqual(calls.payload_check.call_count, 2)
 
     def test_older_traditional_only_diagnostics_keep_the_original_provider(self):
@@ -329,6 +336,43 @@ class GitRoutingTests(unittest.TestCase):
                 self.assertEqual(environment['DEVELOPER_DIR'], '/selected/Xcode.app/Contents/Developer')
             self.assertEqual(result['DEVELOPER_DIR'], '/selected/Xcode.app/Contents/Developer')
             self.assertEqual(self.environment, before)
+
+    def test_system_git_retries_version_after_recognized_xcode_startup_diagnostics(self):
+        self.executable = '/usr/bin/git'
+        responses = [(0, b'/selected/developer\n', b''), (0, APPLE_VERSION, XCODE_STARTUP),
+                     (0, APPLE_VERSION, b''), LEGACY]
+        with self.routing(responses=responses) as calls:
+            executable, result = runtime.select(self.environment)
+        self.assertEqual(executable, self.executable)
+        self.assertEqual(result['DEVELOPER_DIR'], '/selected/developer')
+        developer, first, retry, hooks = calls.query.call_args_list
+        self.assertEqual(developer.args[:2], ('/usr/bin/xcode-select', ['--print-path']))
+        self.assertEqual(first.args[:2], (self.executable, ['--version']))
+        self.assertEqual(retry, first)
+        self.assertEqual(hooks.args[1][-3:], ['hook', 'list', 'post-checkout'])
+        self.assertEqual(calls.check.call_count, 4)
+        calls.payload.assert_not_called()
+
+    def test_xcode_startup_retry_keeps_version_and_provider_checks_strict(self):
+        system = '/usr/bin/git'
+        cold = (0, APPLE_VERSION, XCODE_STARTUP)
+        cases = (
+            ('other-provider', self.executable, [cold]),
+            ('unknown-warning', system, [(0, APPLE_VERSION, XCODE_STARTUP + b'warning\n')]),
+            ('non-apple', system, [(0, VERSION[1], XCODE_STARTUP)]),
+            ('first-error', system, [(1, APPLE_VERSION, XCODE_STARTUP)]),
+            ('different-version', system, [cold, (0, APPLE_VERSION.replace(b'155', b'157'), b'')]),
+            ('retry-error', system, [cold, (1, APPLE_VERSION, b'')]),
+            ('retry-warnings', system, [cold, cold]),
+        )
+        inherited = dict(self.environment, DEVELOPER_DIR='/selected/developer')
+        for case, executable, responses in cases:
+            self.executable = executable
+            with self.subTest(case=case), self.routing(responses=responses) as calls:
+                self.assert_reason('git-capability-query', runtime.select, inherited)
+                self.assertEqual(calls.query.call_count, len(responses))
+                self.assertEqual(calls.check.call_count, len(responses))
+                calls.payload.assert_not_called()
 
     def test_explicit_developer_directory_is_preserved_without_selector_query(self):
         self.executable = '/usr/bin/git'
