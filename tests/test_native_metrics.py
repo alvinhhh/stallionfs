@@ -8,6 +8,7 @@ import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from uuid import UUID
 
 spec = importlib.util.spec_from_file_location('native_metrics', Path(__file__).parent / 'perf/native_metrics.py')
 metrics = importlib.util.module_from_spec(spec)
@@ -129,11 +130,13 @@ class NativeCollector(unittest.TestCase):
         self.assertIsNone(duplicate['cpu_s'])
 
     def test_receipt_uses_exact_argv_lossless_output_and_separate_wall(self):
-        child = process()
-        with mock.patch.object(metrics.subprocess, 'Popen', return_value=child) as popen, \
-             mock.patch.object(metrics.time, 'perf_counter', side_effect=[10, 10.5]):
+        with mock.patch.object(metrics.subprocess, 'Popen', side_effect=[process(), process()]) as popen, \
+             mock.patch.object(metrics.time, 'perf_counter', side_effect=[10, 10.5, 10, 10.5]):
             row = metrics.collect(['/bin/cp', 'name with spaces', 'dest'], timeout_s=2, env={'PATH': '/bin'})
+            repeated = metrics.collect(['/bin/cp', 'name with spaces', 'dest'], timeout_s=2, env={'PATH': '/bin'})
         self.assertTrue(row['ok'])
+        self.assertEqual(UUID(row['sample_id']).version, 4)
+        self.assertNotEqual(row['sample_id'], repeated['sample_id'])
         self.assertEqual(row['wall_s'], 0.5)
         self.assertEqual(row['time_wall_s'], 0.25)
         self.assertEqual(row['argv'], ['/bin/cp', 'name with spaces', 'dest'])
@@ -304,6 +307,7 @@ class DirectTiming(unittest.TestCase):
              mock.patch.object(metrics.time, 'perf_counter', side_effect=[20, 20.001, 20.004]):
             row = metrics.collect(['/bin/cp', 'source', 'dest'], timeout_s=2, phase='timing')
         self.assertTrue(row['ok'])
+        self.assertEqual(UUID(row['sample_id']).version, 4)
         self.assertEqual(row['phase'], 'timing')
         self.assertIsNone(row['wrapped_argv'])
         self.assertEqual(popen.call_args.args[0], ['/bin/cp', 'source', 'dest'])
