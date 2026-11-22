@@ -12,6 +12,7 @@ from . import __version__, _command
 
 APP = Path('/Applications/StallionFS.app')
 INFORMATIONAL = frozenset({'store_root_exists', 'developer_id_signature', 'gatekeeper_accepted'})
+INFO_ERRORS = (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException, ExpatError)
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
 REMOVAL_PLAN = [
     'See the finite removal and restoration procedure in the FSKit maintenance guide '
@@ -92,8 +93,7 @@ def _command_status():
         return result
 
 
-def _app_info():
-    path = APP / 'Contents/Info.plist'
+def _bundle_info(path):
     if not stat.S_ISREG(path.lstat().st_mode):
         raise ValueError('Info.plist must be a regular file')
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
@@ -103,18 +103,41 @@ def _app_info():
         return plistlib.load(source)
 
 
+def _check_extension(extension, version, build):
+    info = _bundle_info(extension / 'Contents/Info.plist')
+    if info.get('CFBundleIdentifier') != 'com.alvinhhh.stallionfs.module':
+        raise ValueError('Unexpected extension bundle identifier')
+    if info.get('CFBundleExecutable') != 'StallionFS':
+        raise ValueError('Unexpected extension executable name')
+    if not version or info.get('CFBundleShortVersionString') != version:
+        raise ValueError('Extension version does not match the app')
+    if not build or info.get('CFBundleVersion') != build:
+        raise ValueError('Extension build does not match the app')
+    binary = extension / 'Contents/MacOS/StallionFS'
+    if not os.access(binary, os.X_OK) or not stat.S_ISREG(binary.lstat().st_mode):
+        raise ValueError('Extension executable is missing or unusable')
+
+
 def inspect(root):
     root = Path(root).expanduser().absolute()
+    extension = APP / 'Contents/Extensions/StallionFS.appex'
     app = {'path': str(APP), 'present': _is_dir(APP),
-           'extension_present': _is_dir(APP / 'Contents/Extensions/StallionFS.appex')}
+           'extension_present': _is_dir(extension), 'extension_matches_app': False}
     try:
-        info = _app_info()
+        info = _bundle_info(APP / 'Contents/Info.plist')
         version, build = info.get('CFBundleShortVersionString'), info.get('CFBundleVersion')
         if not isinstance(version, str) or not isinstance(build, str):
             raise ValueError('Missing or invalid bundle version fields')
         app.update(version=version, bundle_version=build, version_matches_cli=version == __version__)
-    except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException, ExpatError) as error:
+    except INFO_ERRORS as error:
         app.update(version=None, bundle_version=None, version_matches_cli=False, error=str(error))
+    if app['extension_present']:
+        try:
+            _check_extension(extension, app['version'], app['bundle_version'])
+        except INFO_ERRORS as error:
+            app['extension_error'] = str(error)
+        else:
+            app['extension_matches_app'] = True
     try:
         command = _command_status()
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -152,6 +175,7 @@ def inspect(root):
                   if assessment['state'] == 'completed' else assessment['state'], 'probe': assessment}
     checks = {
         'app_present': app['present'], 'extension_present': app['extension_present'],
+        'extension_matches_app': app['extension_matches_app'],
         'version_matches_cli': app['version_matches_cli'],
         'command_installed': command['state'] == 'installed' and command.get('executable', False)
                              and not command.get('dangling', False),
@@ -204,6 +228,8 @@ def describe(result):
         else:
             app_text += ', version unavailable'
         app_text += ', extension present' if app['extension_present'] else ', extension missing'
+        if app.get('extension_error'):
+            app_text += ' (' + app['extension_error'] + ')'
     else:
         app_text += ', missing'
     if app.get('error'):
@@ -236,6 +262,8 @@ def describe(result):
     names = {'app_present': 'app missing', 'extension_present': 'extension missing',
              'version_matches_cli': 'app version must match CLI',
              'command_installed': 'command link must be installed', 'command_on_path': 'command must be on PATH'}
+    if app['extension_present']:
+        names['extension_matches_app'] = 'extension must match the app'
     signing = {'developer_id_signature': 'no Developer ID signature', 'gatekeeper_accepted': 'not accepted by Gatekeeper'}
     unsigned = [label for name, label in signing.items() if not result['checks'][name]]
     if unsigned:

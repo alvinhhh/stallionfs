@@ -19,7 +19,17 @@ class Installation(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.app = self.root / 'StallionFS.app'
-        (self.app / 'Contents/Extensions/StallionFS.appex').mkdir(parents=True)
+        self.extension = self.app / 'Contents/Extensions/StallionFS.appex'
+        self.extension_binary = self.extension / 'Contents/MacOS/StallionFS'
+        self.extension_binary.parent.mkdir(parents=True)
+        self.extension_binary.write_bytes(b'inert extension')
+        self.extension_binary.chmod(0o755)
+        self.extension_info = self.extension / 'Contents/Info.plist'
+        self.extension_metadata = {'CFBundleIdentifier': 'com.alvinhhh.stallionfs.module',
+                                   'CFBundleExecutable': 'StallionFS',
+                                   'CFBundleShortVersionString': installation.__version__,
+                                   'CFBundleVersion': '146'}
+        self.extension_info.write_bytes(plistlib.dumps(self.extension_metadata))
         self.info = self.app / 'Contents/Info.plist'
         self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': installation.__version__,
                                               'CFBundleVersion': '146'}))
@@ -55,6 +65,7 @@ class Installation(unittest.TestCase):
         with patch.object(installation.sys, 'argv', ['/installed/bin/sfs']):
             result = installation.inspect(self.root)
         self.assertTrue(result['ready'])
+        self.assertTrue(result['checks']['extension_matches_app'])
         self.assertEqual(result['signature']['state'], 'Developer ID')
         self.assertEqual(result['gatekeeper']['state'], 'accepted')
         self.assertEqual(result['app']['bundle_version'], '146')
@@ -218,7 +229,7 @@ class Installation(unittest.TestCase):
 
     def test_mismatched_version_missing_extension_and_root(self):
         self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.6.0', 'CFBundleVersion': '1'}))
-        (self.app / 'Contents/Extensions/StallionFS.appex').rmdir()
+        self.extension.rename(self.root / 'parked.appex')
         absent = self.root / 'absent'
         result = installation.inspect(absent)
         self.assertFalse(result['ready'])
@@ -230,6 +241,40 @@ class Installation(unittest.TestCase):
         self.assertIn('extension missing', text)
         self.assertIn('app version must match CLI', text.splitlines()[-1])
         self.assertNotIn('store', text.splitlines()[-1])
+
+    def test_mismatched_extension_build_is_not_ready(self):
+        self.assertTrue(installation.inspect(self.root)['ready'])
+        self.extension_info.write_bytes(plistlib.dumps(dict(self.extension_metadata, CFBundleVersion='145')))
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertTrue(result['checks']['extension_present'])
+        self.assertFalse(result['checks']['extension_matches_app'])
+        self.assertIn('Extension build does not match the app', installation.describe(result))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli.main(['--root', str(self.root), '--json', 'doctor', '--installation']), 1)
+        self.assertFalse(json.loads(output.getvalue())['checks']['extension_matches_app'])
+
+    def test_extension_metadata_and_executable_are_required(self):
+        for field, value, error in (
+                ('CFBundleIdentifier', 'example.other', 'Unexpected extension bundle identifier'),
+                ('CFBundleExecutable', 'OtherExecutable', 'Unexpected extension executable name'),
+                ('CFBundleShortVersionString', '0.6.0', 'Extension version does not match the app')):
+            with self.subTest(field=field):
+                self.extension_info.write_bytes(plistlib.dumps(dict(self.extension_metadata, **{field: value})))
+                result = installation.inspect(self.root)
+                self.assertFalse(result['ready'])
+                self.assertEqual(result['app']['extension_error'], error)
+        self.extension_info.write_bytes(plistlib.dumps(self.extension_metadata))
+        self.extension_binary.chmod(0o644)
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['app']['extension_error'], 'Extension executable is missing or unusable')
+        self.extension_binary.unlink()
+        self.extension_info.unlink()
+        result = installation.inspect(self.root)
+        self.assertFalse(result['ready'])
+        self.assertTrue(result['checks']['extension_present'])
+        self.assertFalse(result['checks']['extension_matches_app'])
 
     def test_gatekeeper_rejection_does_not_hide_valid_signature(self):
         def rejected(argv, **kwargs):
