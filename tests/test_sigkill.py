@@ -1,4 +1,5 @@
 """External process death at real syscall boundaries, not simulated cancellation."""
+import ctypes
 import importlib.util
 import json
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 import select
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -25,13 +27,64 @@ def kill_stopped(process):
         raise RuntimeError(f'Expected SIGKILL exit, got {process.returncode}: {stdout!r} {stderr!r}')
 
 
+def owned_executable(path):
+    executable = Path(path).resolve(strict=True)
+    info = executable.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o022 or not os.access(executable, os.X_OK)):
+        raise RuntimeError(f'Pause hook executable is not owned: {executable}')
+    return str(executable)
+
+
+def running_executable():
+    executable_path = ctypes.CDLL(None)._NSGetExecutablePath
+    executable_path.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32)]
+    executable_path.restype = ctypes.c_int
+    size = ctypes.c_uint32()
+    executable_path(None, ctypes.byref(size))
+    if not size.value:
+        raise RuntimeError('Cannot identify the running Python executable')
+    path = ctypes.create_string_buffer(size.value)
+    if executable_path(path, ctypes.byref(size)):
+        raise RuntimeError('Cannot identify the running Python executable')
+    return Path(os.fsdecode(path.value)).resolve(strict=True)
+
+
+def framework_launcher():
+    framework = sysconfig.get_config_var('PYTHONFRAMEWORK')
+    if not framework:
+        return None
+    executable = Path(sys.executable).resolve(strict=True)
+    running = running_executable()
+    if executable == running:
+        return None
+    framework_binary = (Path(sys.base_prefix) / 'Resources' / (framework + '.app')
+                        / 'Contents' / 'MacOS' / framework).resolve(strict=True)
+    if running != framework_binary:
+        raise RuntimeError(f'Unexpected framework Python executable: {running}')
+    return owned_executable(executable)
+
+
 def pause_at_hook(command, library, kind, count=1, extra_env=None):
+    environment = {**os.environ, **(extra_env or {})}
+    for key in ('STALLIONFS_TEST_NATIVE_EXECUTABLE', 'STALLIONFS_TEST_FORWARD_EXECUTABLE',
+                'STALLIONFS_TEST_FORWARD_PID'):
+        environment.pop(key, None)
+    scripts = Path(sysconfig.get_path('scripts'))
+    executable = Path(command[0])
+    native = executable in (scripts / 'sfs', scripts / 'stallionfs')
+    if native:
+        environment['STALLIONFS_TEST_NATIVE_EXECUTABLE'] = owned_executable(executable)
+    if native or executable == Path(sys.executable):
+        launcher = framework_launcher()
+        if launcher is not None:
+            environment['STALLIONFS_TEST_FORWARD_EXECUTABLE'] = launcher
+
     read, write = os.pipe()
     try:
-        environment = {**os.environ, 'DYLD_INSERT_LIBRARIES': str(library),
-                       'STALLIONFS_TEST_CUT_KIND': kind, 'STALLIONFS_TEST_CUT_COUNT': str(count),
-                       'STALLIONFS_TEST_CUT_FD': str(write), 'STALLIONFS_TEST_CUT_PARENT': str(os.getpid())}
-        environment.update(extra_env or {})
+        environment.update(DYLD_INSERT_LIBRARIES=str(library), STALLIONFS_TEST_CUT_KIND=kind,
+                           STALLIONFS_TEST_CUT_COUNT=str(count), STALLIONFS_TEST_CUT_FD=str(write),
+                           STALLIONFS_TEST_CUT_PARENT=str(os.getpid()))
         process = subprocess.Popen(command, env=environment, pass_fds=(write,),
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         os.close(write)
@@ -257,7 +310,7 @@ class ProcessDeath(ProcessDeathFixture, unittest.TestCase):
 
 
 class PauseHookCapabilities(unittest.TestCase):
-    def test_constructor_preserves_native_handoff_and_scrubs_helper_children(self):
+    def test_constructor_preserves_only_owned_same_process_handoffs(self):
         source = Path(__file__).with_name('sigkill_pause.c').read_text()
         constructor = source[source.index('__attribute__((constructor))'):source.index('static atomic_uint hits;')]
         harness = '''
@@ -282,6 +335,8 @@ static int _NSGetExecutablePath(char *path, uint32_t *size) {
     strcpy(path, value);
     return 0;
 }
+static pid_t modeled_pid(void) { return (pid_t)strtol(getenv("TEST_PID"), NULL, 10); }
+#define getpid modeled_pid
 ''' + constructor + '''
 int main(void) {
     extern char **environ;
@@ -296,23 +351,104 @@ int main(void) {
                             '-o', str(path / 'environment')], check=True, capture_output=True, timeout=30)
             injection = {'DYLD_INSERT_LIBRARIES': '/unused/pause.dylib', 'DYLD_LIBRARY_PATH': '/unused',
                          'DYLD_FRAMEWORK_PATH': '/unused', 'DYLD_TEST_OTHER': 'value'}
-            for executable in ('/installed/sfs', '/installed/stallionfs', '/installed/python3.13', ''):
+            native = 'STALLIONFS_TEST_NATIVE_EXECUTABLE'
+            forward = 'STALLIONFS_TEST_FORWARD_EXECUTABLE'
+            owner = 'STALLIONFS_TEST_FORWARD_PID'
+            keys = (native, forward, owner)
+            paths = ('venv/bin/sfs', 'venv/bin/stallionfs', 'venv/bin/python3.13',
+                     'framework/Resources/Python.app/Contents/MacOS/Python', 'direct/python3.13',
+                     'other/sfs', 'other/stallionfs', 'other/python3.13', 'usr/bin/hdiutil')
+            for name in paths:
+                target = path / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
+            sfs, stallionfs, launcher, interpreter, direct, other_sfs, other_cli, other_python, child = (
+                str((path / name).resolve(strict=True)) for name in paths)
+
+            def model(executable, route, *, keep=False, pid='472', parent=str(os.getpid())):
+                environment = {**{'TEST_' + key: value for key, value in injection.items()}, **route,
+                               'TEST_PID': pid, 'STALLIONFS_TEST_CUT_PARENT': parent,
+                               'STALLIONFS_TEST_CUT_KIND': 'clone'}
+                if executable:
+                    environment['TEST_EXECUTABLE'] = executable
+                result = subprocess.run([str(path / 'environment')], env=environment,
+                                        capture_output=True, text=True, check=True, timeout=5)
+                values = dict(line.split('=', 1) for line in result.stdout.splitlines())
+                self.assertEqual(values['STALLIONFS_TEST_CUT_KIND'], 'clone')
+                self.assertEqual({key: values[key] for key in injection if key in values},
+                                 injection if keep else {})
+                return {key: values[key] for key in keys if key in values}
+
+            for cli in (sfs, stallionfs):
+                with self.subTest(cli=cli):
+                    initial = {native: cli, forward: launcher}
+                    handoff = model(cli, initial, keep=True)
+                    self.assertEqual(handoff, {forward: launcher, owner: '472'})
+                    self.assertEqual(model(launcher, handoff, keep=True), {})
+                    self.assertEqual(model(launcher, handoff, pid='473'), {})
+                    self.assertEqual(model(launcher, initial), {})
+                    self.assertEqual(model(cli, {native: cli}, keep=True), {})
+
+            self.assertEqual(model(launcher, {forward: launcher}, keep=True), {})
+            for executable in (interpreter, direct, launcher, child):
                 with self.subTest(executable=executable):
-                    environment = {**os.environ, **{'TEST_' + key: value for key, value in injection.items()},
-                                   'STALLIONFS_TEST_CUT_KIND': 'clone'}
-                    if executable:
-                        environment['TEST_EXECUTABLE'] = executable
-                    else:
-                        environment.pop('TEST_EXECUTABLE', None)
-                    result = subprocess.run([str(path / 'environment')], env=environment,
-                                            capture_output=True, text=True, check=True, timeout=5)
-                    values = dict(line.split('=', 1) for line in result.stdout.splitlines())
-                    self.assertEqual(values['STALLIONFS_TEST_CUT_KIND'], 'clone')
-                    for key, value in injection.items():
-                        if executable in ('/installed/sfs', '/installed/stallionfs'):
-                            self.assertEqual(values[key], value)
-                        else:
-                            self.assertNotIn(key, values)
+                    self.assertEqual(model(executable, {}), {})
+            initial = {native: sfs, forward: launcher}
+            for executable in (other_sfs, other_cli, other_python, child, str(path / 'missing'), ''):
+                with self.subTest(unexpected=executable):
+                    self.assertEqual(model(executable, initial), {})
+                    self.assertEqual(model(executable, handoff), {})
+            self.assertEqual(model(sfs, initial, parent='0'), {})
+            self.assertEqual(model(launcher, handoff, parent='0'), {})
+
+    def test_framework_launcher_is_the_owned_executable_that_reached_the_framework_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            launcher = base / 'venv/bin/python3.13'
+            interpreter = base / 'framework/Resources/Python.app/Contents/MacOS/Python'
+            for executable in (launcher, interpreter):
+                executable.parent.mkdir(parents=True)
+                executable.touch(mode=0o700)
+            with patch.object(sysconfig, 'get_config_var', return_value='Python'), \
+                    patch.object(sys, 'base_prefix', str(base / 'framework')), \
+                    patch.object(sys, 'executable', str(launcher)), \
+                    patch(__name__ + '.running_executable', return_value=interpreter) as running:
+                self.assertEqual(framework_launcher(), str(launcher))
+                running.return_value = launcher
+                self.assertIsNone(framework_launcher())
+                running.return_value = base / 'unexpected/python3.13'
+                with self.assertRaisesRegex(RuntimeError, 'Unexpected framework Python executable'):
+                    framework_launcher()
+                running.return_value = interpreter
+                launcher.chmod(0o722)
+                with self.assertRaisesRegex(RuntimeError, 'Pause hook executable is not owned'):
+                    framework_launcher()
+
+    def test_pause_launch_owns_the_route_environment(self):
+        scripts = Path('/owned/venv/bin')
+        binary, python = str(scripts / 'sfs'), str(scripts / 'python3.13')
+        native = 'STALLIONFS_TEST_NATIVE_EXECUTABLE'
+        forward = 'STALLIONFS_TEST_FORWARD_EXECUTABLE'
+        owner = 'STALLIONFS_TEST_FORWARD_PID'
+        supplied = dict.fromkeys((native, forward, owner, 'STALLIONFS_TEST_CUT_PARENT'), '/unexpected')
+        with patch.object(sysconfig, 'get_path', return_value=str(scripts)), \
+                patch.object(sys, 'executable', python), \
+                patch(__name__ + '.owned_executable', return_value=binary), \
+                patch(__name__ + '.framework_launcher', return_value=python) as launcher, \
+                patch.object(subprocess, 'Popen', side_effect=RuntimeError('synthetic launch')) as launch:
+            for executable, framework, expected in (
+                (binary, python, {native: binary, forward: python}),
+                (python, python, {forward: python}),
+                (python, None, {}),
+                ('/unexpected/python3.13', python, {}),
+            ):
+                with self.subTest(executable=executable, framework=framework):
+                    launcher.return_value = framework
+                    with self.assertRaisesRegex(RuntimeError, '^synthetic launch$'):
+                        pause_at_hook([executable], '/unused/pause.dylib', 'clone', extra_env=supplied)
+                    env = launch.call_args.kwargs['env']
+                    self.assertEqual(env['STALLIONFS_TEST_CUT_PARENT'], str(os.getpid()))
+                    self.assertEqual({key: env[key] for key in (native, forward, owner) if key in env}, expected)
 
     def test_root_git_fixture_skips_before_creating_repository(self):
         case = ProcessDeath('test_killed_preparation_is_unpublished_reported_and_not_cached')

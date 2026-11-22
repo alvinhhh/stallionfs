@@ -14,13 +14,31 @@
 #include <unistd.h>
 
 __attribute__((constructor)) static void confine_injection(void) {
-    char path[PATH_MAX];
-    uint32_t size = sizeof(path);
-    if (!_NSGetExecutablePath(path, &size)) {
-        const char *name = strrchr(path, '/');
-        name = name ? name + 1 : path;
-        if (!strcmp(name, "sfs") || !strcmp(name, "stallionfs")) return;
+    const char *native_key = "STALLIONFS_TEST_NATIVE_EXECUTABLE";
+    const char *launcher_key = "STALLIONFS_TEST_FORWARD_EXECUTABLE";
+    const char *pid_key = "STALLIONFS_TEST_FORWARD_PID";
+    const char *parent = getenv("STALLIONFS_TEST_CUT_PARENT");
+    char parent_pid[32], pid[32], raw[PATH_MAX], path[PATH_MAX];
+    snprintf(parent_pid, sizeof(parent_pid), "%ld", (long)getppid());
+    snprintf(pid, sizeof(pid), "%ld", (long)getpid());
+    uint32_t size = sizeof(raw);
+    if (parent && !strcmp(parent, parent_pid) && !_NSGetExecutablePath(raw, &size) && realpath(raw, path)) {
+        const char *native = getenv(native_key);
+        const char *launcher = getenv(launcher_key);
+        const char *owner = getenv(pid_key);
+        if (native && !owner && !strcmp(path, native)) {
+            // The installed native CLI can exec its console helper in this process.
+            if ((launcher && setenv(pid_key, pid, 1)) || unsetenv(native_key)) _exit(90);
+            return;
+        }
+        if (!native && launcher && !strcmp(path, launcher) && (!owner || !strcmp(owner, pid))) {
+            // A direct Python probe starts here. A native handoff must keep the PID.
+            // Consume the exception before the launcher execs the final interpreter.
+            if (unsetenv(launcher_key) || unsetenv(pid_key)) _exit(90);
+            return;
+        }
     }
+    if (unsetenv(native_key) || unsetenv(launcher_key) || unsetenv(pid_key)) _exit(90);
     extern char **environ;
     for (size_t index = 0; environ[index];) {
         const char *entry = environ[index];
