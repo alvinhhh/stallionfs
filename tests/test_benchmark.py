@@ -953,7 +953,7 @@ class QuickBenchmarkReferences(unittest.TestCase):
                     mock.patch.object(benchmark, '_read_native', return_value=(
                         {'status': 'complete', 'passed': True, 'cleanup_passed': True}, [])):
                 result = benchmark._collect_pinned(args, root, root / 'stallionfs', directory,
-                    ['docs_5k_100mb'], ['clone'], io.BytesIO(), {})
+                    args.fixtures or ['docs_5k_100mb'], args.operations or ['clone'], io.BytesIO(), {})
         finally:
             os.close(descriptor)
         return result, seen[0]
@@ -1046,6 +1046,51 @@ class QuickBenchmarkReferences(unittest.TestCase):
             self.assertEqual(failures['rsync']['loss_counts'], {})
             self.assertEqual(failures['rsync']['gate_counts'], {'sparse_preserved': 1, 'data_stream_sharing': 1})
             self.assertEqual(failures['rsync']['failed_rows'], 1)
+
+    def test_failed_resource_collection_does_not_report_unchecked_correctness(self):
+        args = arguments(fixtures=['tiny_4kib'], operations=['copy'], jobs=1)
+
+        def prepare(root, args, *, copy_mismatch):
+            selection = {'binary': str(root / 'stallionfs'), 'scratch': str(root),
+                         'output': str(root / 'native.json'), 'samples': args.samples, 'runs': 1,
+                         'cache': ['warm'], 'jobs': args.jobs, 'fixtures': args.fixtures,
+                         'operations': args.operations, 'copy_tools': ['cp']}
+            row = dict(run=0, fixture='tiny_4kib', operation='copy', reference='cp', method='cp',
+                       phase='resources', sample=0, exit_code=1, ok=False, validated=False,
+                       completion_uncertain=False, source_unchanged=True,
+                       parse_errors=['rss_bytes', 'io_input_blocks', 'io_output_blocks'],
+                       correctness={'passed': False, 'reason': 'command failed'})
+            if copy_mismatch:
+                row.update(exit_code=0, correctness={'strict_equal': False,
+                    'candidate_losses': [{'field': 'mode'}]})
+            journal = self.ReportJournal(root / 'native.json')
+            try:
+                journal.append('rows', 0, row)
+                journal.finish({'status': 'complete', 'passed': False, 'cleanup_passed': True,
+                                'selection': selection})
+            finally:
+                journal.close()
+
+        for copy_mismatch in (False, True):
+            with self.subTest(copy_mismatch=copy_mismatch), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                result, _ = self.collect(root, args, exit_code=1,
+                    prepare=lambda root, args: prepare(root, args, copy_mismatch=copy_mismatch))
+                self.assertEqual(result['collection_failed_rows'], 1)
+                self.assertEqual(result['missing_samples'], 40)
+                if copy_mismatch:
+                    failure, = result['reference_failures']
+                    self.assertEqual(failure['loss_counts'], {'mode': 1})
+                    self.assertEqual(failure['gate_counts'], {'strict_equal': 1})
+                else:
+                    self.assertEqual(result['reference_failures'], [])
+                    self.assertEqual(result['error'], 'Native comparison could not collect all samples; see report')
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['exit_code'], 1)
+                self.assertFalse(result['collection_complete'])
+                self.assertFalse(result['required_coverage_complete'])
+                self.assertFalse(result['qualified'])
+                self.assertEqual(result['report'], str(root / 'native.json'))
 
     def test_tampered_missing_incomplete_and_foreign_reports_have_no_attributed_diagnostics(self):
         for change in ('journal', 'final-json', 'incomplete', 'selection', 'missing'):
