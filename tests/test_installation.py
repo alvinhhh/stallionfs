@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -13,9 +12,6 @@ import unittest
 from unittest.mock import patch
 
 from stallionfs import __main__ as cli, _installation as installation
-
-REAL_WHICH = shutil.which
-
 
 class Installation(unittest.TestCase):
     def setUp(self):
@@ -36,8 +32,6 @@ class Installation(unittest.TestCase):
         for item in (patch.object(installation, 'APP', self.app),
                      patch.object(installation._command, '_home', return_value=self.home),
                      patch.object(installation._command, '_acl'),
-                     patch.object(installation.shutil, 'which', side_effect=lambda tool:
-                                  REAL_WHICH(tool) if tool == 'sfs' else '/usr/bin/' + tool),
                      patch.object(installation.subprocess, 'run', side_effect=self.probe)):
             item.start()
             self.addCleanup(item.stop)
@@ -50,6 +44,7 @@ class Installation(unittest.TestCase):
 
     def probe(self, argv, **kwargs):
         self.assertEqual(kwargs['timeout'], 10)
+        self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
         self.assertTrue(kwargs['capture_output'])
         diagnostic = 'Authority=Developer ID Application: Example (TEAM)\n' if '-dv' in argv else ''
         return SimpleNamespace(returncode=0, stdout='', stderr=diagnostic)
@@ -65,15 +60,25 @@ class Installation(unittest.TestCase):
         self.assertEqual(result['app']['bundle_version'], '146')
         self.assertEqual(result['python_helper'], '/installed/bin/stallionfs-python')
         self.assertIn('does not imply release qualification', result['qualification'])
-        self.assertIn('sfs command remove', result['removal_plan'][1])
-        self.assertIn(str(installation.APP / 'Contents/Resources/Runtime/CLI/bin/sfs') + ' command remove', result['removal_plan'][1])
-        self.assertIn('System Settings', result['removal_plan'][2])
-        self.assertIn('Trash', result['removal_plan'][3])
-        self.assertIn('Your workspaces, snapshots and recovery data in ' + str(self.root), result['removal_plan'][4])
         after = {str(path): (path.lstat().st_mode, path.lstat().st_mtime_ns)
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
         self.assertFalse((self.bin / installation._command.LOCK).exists())
+
+    def test_removal_advice_requires_exact_artifact_and_downtime(self):
+        for app in (self.app, self.root / 'absent-app'):
+            with self.subTest(app=app), patch.object(installation, 'APP', app):
+                advice = '\n'.join(installation.inspect(self.root)['removal_plan'])
+                self.assertIn('docs/fskit-maintenance.md#finite-removal-and-restoration-procedure', advice)
+                self.assertIn('exact last installed artifact', advice)
+                self.assertIn('no newer executable', advice)
+                self.assertIn('fresh, complete downtime across all users', advice)
+                self.assertIn('Stop while provenance, history, or activity is uncertain', advice)
+                self.assertIn('Preserve other users\' links, foreign entries, and system registrations', advice)
+                self.assertIn('workspaces, snapshots and recovery data in ' + str(self.root), advice)
+                self.assertNotIn('same version', advice)
+                self.assertNotIn('command remove', advice)
+                self.assertNotIn('Trash', advice)
 
     def test_command_must_be_executable_and_selected_on_path(self):
         self.target.chmod(0o644)
@@ -174,11 +179,17 @@ class Installation(unittest.TestCase):
         self.assertEqual(json.loads(errors.getvalue()), {'error': 'Could not determine home directory.'})
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
-    def test_gatekeeper_assessment_disables_cache(self):
+    def test_security_probes_use_fixed_system_paths(self):
+        for name in ('codesign', 'spctl'):
+            candidate = self.bin / name
+            candidate.write_bytes(b'inert PATH entry')
+            candidate.chmod(0o755)
         with patch.object(installation.subprocess, 'run', side_effect=self.probe) as run:
             installation.inspect(self.root)
-        assessment = [call.args[0] for call in run.call_args_list if '--assess' in call.args[0]]
-        self.assertEqual(assessment, [['/usr/bin/spctl', '--assess', '--no-cache', '--type', 'execute', str(self.app)]])
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [['/usr/bin/codesign', '--verify', '--deep', '--strict', str(self.app)],
+                          ['/usr/bin/codesign', '-dv', str(self.app)],
+                          ['/usr/sbin/spctl', '--assess', '--no-cache', '--type', 'execute', str(self.app)]])
 
     def test_signature_states(self):
         cases = [('unsigned', 1, 'code object is not signed at all'),
@@ -195,12 +206,8 @@ class Installation(unittest.TestCase):
                 self.assertIn('Signature: ' + expected, installation.describe(result))
 
     def test_tools_missing_timeout_and_failure_are_reports(self):
-        with patch.object(installation.shutil, 'which', side_effect=lambda tool: REAL_WHICH(tool) if tool == 'sfs' else None):
-            result = installation.inspect(self.root)
-            self.assertEqual(result['signature']['verify']['state'], 'unavailable')
-            self.assertEqual(result['gatekeeper']['state'], 'unavailable')
-            self.assertTrue(result['ready'])
-        for error, expected in ((subprocess.TimeoutExpired('codesign', 10), 'timeout'),
+        for error, expected in ((FileNotFoundError('probe missing'), 'unavailable'),
+                                (subprocess.TimeoutExpired('codesign', 10), 'timeout'),
                                 (OSError('probe failed'), 'error')):
             with self.subTest(error=error), patch.object(installation.subprocess, 'run', side_effect=error):
                 result = installation.inspect(self.root)
@@ -246,7 +253,7 @@ class Installation(unittest.TestCase):
         text = installation.describe(result)
         self.assertIn('not created yet (informational)', text)
         self.assertNotIn('Not ready:', text)
-        self.assertIn(str(absent) + ' are kept', text)
+        self.assertIn('recovery data in ' + str(absent), text)
 
     def test_unreadable_store_root_is_reported(self):
         original = Path.is_dir
@@ -271,7 +278,7 @@ class Installation(unittest.TestCase):
         self.assertIn('Gatekeeper: accepted', text)
         self.assertNotIn('{', text)
         self.assertNotIn('Not ready:', text)
-        with patch.object(installation.shutil, 'which', side_effect=lambda tool: REAL_WHICH(tool) if tool == 'sfs' else None):
+        with patch.object(installation.subprocess, 'run', side_effect=FileNotFoundError):
             text = installation.describe(installation.inspect(self.root))
         self.assertIn('Signature: unknown: codesign is not available', text)
         self.assertIn('Gatekeeper: unavailable: spctl is not available', text)

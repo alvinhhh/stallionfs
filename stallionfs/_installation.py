@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 import plistlib
-import shutil
 import stat
 import subprocess
 import sys
@@ -15,11 +14,16 @@ APP = Path('/Applications/StallionFS.app')
 INFORMATIONAL = frozenset({'store_root_exists', 'developer_id_signature', 'gatekeeper_accepted'})
 QUALIFICATION = 'Passing these checks does not imply release qualification or extension enablement.'
 REMOVAL_PLAN = [
-    'Stop processes using workspaces and unmount them normally. Stop if anything is busy, pending or uncertain; do not force unmount or delete data to proceed. Keep verified recovery archives and installation history outside the app.',
-    'Run {cli} command remove (by absolute path, so PATH cannot pick another sfs) while the app is still installed. If it was already deleted, reinstall the same version from your verified recovery copy first. Remove only your owned link; leave other files and other users\' links alone.',
-    'Quit the app and turn off its File System Extension in System Settings. Check that it is off and no processes are using workspaces before continuing.',
-    'Move only /Applications/StallionFS.app to the Trash using Finder. Do not empty the Trash or reset system registrations.',
-    'Your workspaces, snapshots and recovery data in {root} are kept — delete them yourself only if you no longer need them. Other stores, external files and recovery archives are also kept.',
+    'See the finite removal and restoration procedure in the FSKit maintenance guide '
+    '(https://github.com/alvinhhh/stallionfs/blob/main/docs/fskit-maintenance.md#finite-removal-and-restoration-procedure).',
+    'Removal and restoration require independent artifact and publisher verification, known installation history, '
+    'and fresh, complete downtime across all users. Stop while provenance, history, or activity is uncertain.',
+    'Removal requires the exact admitted app and independently authenticated recovery bytes. '
+    'Restoration requires the exact last installed artifact and confirmation that no newer executable could have been installed. '
+    'Follow the guide for the actual app state.',
+    'Use the guide for your exact owned command link and File System Extension settings. '
+    'Preserve other users\' links, foreign entries, and system registrations.',
+    'Keep your workspaces, snapshots and recovery data in {root}, along with other stores, external files and recovery archives.',
 ]
 
 
@@ -30,15 +34,15 @@ def _is_dir(path):
         return False
 
 
-def _probe(tool, arguments):
-    executable = shutil.which(tool)
-    if executable is None:
-        return {'state': 'unavailable', 'error': tool + ' is not available'}
+def _probe(executable, arguments):
+    tool = Path(executable).name
     try:
-        result = subprocess.run([executable, *arguments], capture_output=True,
+        result = subprocess.run([executable, *arguments], stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=10, check=False)
         return {'state': 'completed', 'returncode': result.returncode,
                 'stdout': result.stdout, 'stderr': result.stderr}
+    except FileNotFoundError:
+        return {'state': 'unavailable', 'error': tool + ' is not available'}
     except subprocess.TimeoutExpired:
         return {'state': 'timeout', 'error': tool + ' timed out after 10 seconds'}
     except (OSError, UnicodeError) as error:
@@ -116,9 +120,9 @@ def inspect(root):
     except (OSError, ValueError, KeyError, TypeError) as error:
         command = {'state': 'error', 'error': str(error)}
     if app['present']:
-        verify = _probe('codesign', ['--verify', '--deep', '--strict', str(APP)])
-        details = _probe('codesign', ['-dv', str(APP)])
-        assessment = _probe('spctl', ['--assess', '--no-cache', '--type', 'execute', str(APP)])
+        verify = _probe('/usr/bin/codesign', ['--verify', '--deep', '--strict', str(APP)])
+        details = _probe('/usr/bin/codesign', ['-dv', str(APP)])
+        assessment = _probe('/usr/sbin/spctl', ['--assess', '--no-cache', '--type', 'execute', str(APP)])
     else:
         verify = {'state': 'skipped', 'error': 'App is absent'}
         details = dict(verify)
@@ -165,7 +169,8 @@ def inspect(root):
             'python_helper': str(helper), 'command': command,
             'app': app, 'signature': signature, 'gatekeeper': gatekeeper,
             'store_root': {'path': str(root), 'exists': checks['store_root_exists']},
-            'removal_plan': [step.format(root=root, cli=APP / 'Contents/Resources/Runtime/CLI/bin/sfs') for step in REMOVAL_PLAN], 'qualification': QUALIFICATION}
+            'removal_plan': [step.format(root=root) for step in REMOVAL_PLAN],
+            'qualification': QUALIFICATION}
 
 
 def describe(result):
