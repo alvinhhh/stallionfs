@@ -262,6 +262,7 @@ def raw_report_rows(document):
 def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     collected = {case: [] for case in universe}
     raw_sample_ids = set()
+    candidate_failure_cases = set()
     for document in documents:
         # Unscored reports and methods can still reveal reuse by a scored comparison.
         for row in raw_report_rows(document):
@@ -279,6 +280,9 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
         for group in groups:
             if group['case'] in collected:
                 collected[group['case']].append(evaluate_group(group))
+                if any(row.get('method') in CANDIDATE_METHODS and operation_failed(row)
+                       for rows in group['rows'].values() for row in rows):
+                    candidate_failure_cases.add(group['case'])
     cases = []
     for case, groups in collected.items():
         required = [group for group in groups if not group['excluded']]
@@ -294,8 +298,10 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     passing = sum(case['passed'] for case in cases)
     required = math.ceil(len(cases) * PASS_FRACTION)
     return {'passed': passing >= required and all(case['floor_passed'] for case in cases)
-            and not input_errors, 'passing_cases': passing, 'total_cases': len(cases),
+            and not candidate_failure_cases and not input_errors,
+            'passing_cases': passing, 'total_cases': len(cases),
             'required_passing_cases': required, 'cases': cases, 'input_errors': list(input_errors),
+            'candidate_failure_cases': sorted(candidate_failure_cases),
             'raw_sample_ids': sorted(raw_sample_ids)}
 
 
@@ -651,6 +657,8 @@ def main(argv=None):
             print(f"Run {i + 1}: {run['passing_cases']}/{run['total_cases']} cases pass; "
                   f"need {run['required_passing_cases']} plus all single-file/bulk floors; "
                   + ('PASS' if run['passed'] else 'FAIL'))
+            if run['candidate_failure_cases']:
+                print('Candidate operation or correctness failures: ' + ', '.join(run['candidate_failure_cases']))
             for error in run['input_errors']:
                 print('Input error: ' + error)
         print('Verdict flips: ' + (', '.join(result['verdict_flips']) or 'none'))

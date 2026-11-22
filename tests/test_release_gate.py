@@ -493,6 +493,26 @@ class ReleaseIndependence(unittest.TestCase):
     def test_independent_complete_runs_with_identical_results_qualify(self):
         self.check_decision(self.paths, True)
 
+    def test_candidate_correctness_failure_blocks_release_above_90_percent(self):
+        case = 'fileops/move/large_64mib'
+        for run, directory in enumerate(self.paths):
+            path = self.report_path(run, case)
+            document = json.loads(path.read_text())
+            candidate = next(row for row in document['rows'] if row['method'] == 'candidate')
+            candidate['correctness']['move_identity'] = False
+            path.write_text(json.dumps(document))
+            (directory / 'summary.json').write_text(json.dumps({'report': path.name, 'passed': True}))
+
+        with redirect_stdout(io.StringIO()) as output:
+            code = gate.main([*map(str, self.paths), '--json', str(self.decision)])
+        decision = json.loads(self.decision.read_text())
+        self.assertEqual([run['passing_cases'] for run in decision['runs']], [36, 36, 36])
+        self.assertTrue(all(case['floor_passed'] for run in decision['runs'] for case in run['cases']))
+        self.assertFalse(decision['qualified'])
+        self.assertEqual(code, 1)
+        self.assertTrue(all(run['candidate_failure_cases'] == [case] for run in decision['runs']))
+        self.assertIn('Candidate operation or correctness failures: ' + case, output.getvalue())
+
     def test_same_resolved_report_paths_cannot_qualify(self):
         self.check_decision([self.paths[0]] * 3, False, 'Runs overlap')
 
