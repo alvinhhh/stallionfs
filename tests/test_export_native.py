@@ -630,6 +630,8 @@ class JournalExportNative(unittest.TestCase):
     def test_legacy_and_journal_export_value_parity_and_alias_counts(self):
         for data in (sharing_report(), copy_report(), scan_report(), scan_report('stallionfs'), dependency_report()):
             with self.subTest(fixture=data['selection']['fixtures']), tempfile.TemporaryDirectory() as folder:
+                identity = '1234567890ab4def81234567890abcde'
+                data['rows'][0]['sample_id'] = identity
                 data['metadata_preparation'] = [{'fixture':data['selection']['fixtures'][0],
                     'seed':{'acl_command':{'argv':['/Users/example/tool','/Users/example/file'],'exit_code':0}}}]
                 if 'preparation' in data:
@@ -649,6 +651,7 @@ class JournalExportNative(unittest.TestCase):
                 self.assertNotIn('original_report_sha256', actual['export'])
                 actual.pop('export'); legacy.pop('export')
                 self.assertEqual(actual, legacy)
+                self.assertEqual(actual['rows'][0]['sample_id'], identity)
                 if data['selection'].get('operations') == ['copy']:
                     for key in ('status', 'passed', 'all_metrics_won', 'source_sha256', 'comparisons', 'unavailable'):
                         self.assertEqual(actual[key], data[key])

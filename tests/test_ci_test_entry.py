@@ -193,15 +193,55 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(data.count(b'  File '), 64 * 64)
         self.assertEqual(data.count(b'  ...\n'), 64)
 
-    def run_child(self, mode, timeout=4, **kwargs):
-        with tempfile.TemporaryDirectory(prefix='ci-entry-owned-') as directory:
+    def run_child(self, mode, timeout=4, *, ready_phase=None, **kwargs):
+        with tempfile.TemporaryDirectory(prefix='ci-entry-owned-') as directory, contextlib.ExitStack() as stack:
             root = Path(directory)
             child = root / 'child.py'; child.write_text(CHILD)
             events = root / 'events.jsonl'
+            ready_at = None
+            if ready_phase is not None:
+                popen = subprocess.Popen
+                startup_timeout = 5
+
+                def cleanup(process):
+                    try:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=2)
+                    finally:
+                        process.stdout.close()
+                        process.stderr.close()
+
+                def spawn(*args, **kwargs):
+                    nonlocal ready_at
+                    process = popen(*args, **kwargs)
+                    stack.callback(cleanup, process)
+                    # The supervisor starts its real deadline when Popen returns.
+                    startup_deadline = time.monotonic() + startup_timeout
+                    while time.monotonic() < startup_deadline and process.poll() is None:
+                        with contextlib.suppress(FileNotFoundError):
+                            for line in events.read_bytes().splitlines(keepends=True):
+                                if not line.endswith(b'\n'):
+                                    break
+                                record = json.loads(line)
+                                if (record.get('phase'), record.get('state')) == ready_phase:
+                                    ready_at = time.monotonic()
+                                    return process
+                        time.sleep(.01)
+                    # Let the supervisor collect and reap before reporting missing readiness.
+                    return process
+
+                stack.enter_context(patch.object(entry.subprocess, 'Popen', new=spawn))
             start = time.monotonic()
             receipt = entry.supervise([sys.executable, '-I', '-B', str(child), str(SOURCE), str(events), mode],
                                       events, timeout, echo=False, **kwargs)
-            elapsed = time.monotonic() - start
+            end = time.monotonic()
+            if ready_phase is not None:
+                self.assertIsNotNone(
+                    ready_at, f'{mode} did not reach {ready_phase} within {startup_timeout}s: {receipt}'
+                )
+                start = ready_at
+            elapsed = end - start
             self.assertGreaterEqual(receipt['collected'], receipt['launched'])
             entry.validate_receipt(json.dumps(receipt))
             raw = events.read_text() if events.exists() else ''
@@ -249,23 +289,31 @@ class EntryTests(unittest.TestCase):
 
     def test_deadlines_distinguish_post_suite_stalls(self):
         for boundary in ('close', 'admission', 'accounting'):
-            r, elapsed = self.run_child(boundary + '-stall', timeout=.6)
-            self.assertEqual(r['reason'], 'deadline')
-            self.assertEqual(r['last_phase']['phase'], boundary)
-            self.assertFalse(r['success'])
-            self.assertTrue(r['reaped'])
-            completed = [x for x in r['events'] if x.get('phase') == 'suite' and x['state'] == 'end']
-            self.assertEqual(completed[0]['tests'], 1)
-            self.assertEqual(completed[0]['failures'], 0)
-            self.assertLess(elapsed, 3)
+            with self.subTest(boundary=boundary):
+                r, elapsed = self.run_child(
+                    boundary + '-stall', timeout=.6, ready_phase=(boundary, 'start')
+                )
+                self.assertEqual(r['reason'], 'deadline', r)
+                last = r['last_phase'] or {}
+                self.assertEqual((last.get('phase'), last.get('state')), (boundary, 'start'), r)
+                self.assertFalse(r['success'], r)
+                self.assertTrue(r['reaped'], r)
+                completed = [x for x in r['events'] if x.get('phase') == 'suite' and x['state'] == 'end']
+                self.assertEqual([(x['tests'], x['failures']) for x in completed], [(1, 0)], r)
+                self.assertGreaterEqual(elapsed, .6, r)
+                self.assertLess(elapsed, 3, r)
 
     def test_finalization_stall_has_exit_request_without_success(self):
-        r, elapsed = self.run_child('finalization-stall', timeout=.6)
-        self.assertEqual(r['reason'], 'deadline')
-        self.assertEqual(r['last_phase']['phase'], 'exit')
-        self.assertTrue(r['complete'] and r['reaped'])
-        self.assertFalse(r['success'])
-        self.assertLess(elapsed, 3)
+        r, elapsed = self.run_child('finalization-stall', timeout=.6, ready_phase=('exit', 'end'))
+        self.assertEqual(r['reason'], 'deadline', r)
+        last = r['last_phase'] or {}
+        self.assertEqual((last.get('phase'), last.get('state')), ('exit', 'end'), r)
+        self.assertTrue(r['complete'] and r['reaped'], r)
+        self.assertFalse(r['success'], r)
+        exits = [x['code'] for x in r['events'] if x.get('phase') == 'exit' and x['state'] == 'start']
+        self.assertEqual(exits, [0], r)
+        self.assertGreaterEqual(elapsed, .6, r)
+        self.assertLess(elapsed, 3, r)
 
     def test_cap_no_eof_invalid_and_cancellation_fail_closed(self):
         for mode, kwargs, reason in (('cap', {'output_cap': 4096}, 'output_cap'),

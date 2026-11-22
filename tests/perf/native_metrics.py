@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+from uuid import uuid4
 
 
 TIME = '/usr/bin/time'
@@ -488,6 +489,7 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
         try:
             if alarm is not None:
                 receipt['child_cpu_before'], receipt['cpu_error'] = _child_cpu()
+            receipt['sample_id'] = uuid4().hex
             start = time.perf_counter()
             process = subprocess.Popen(executed, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, cwd=cwd, env=environment, start_new_session=True)

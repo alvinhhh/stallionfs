@@ -350,6 +350,7 @@ def main():
                 shutil.rmtree(path)
 
         def batch(method, count):
+            sample_id = uuid.uuid4().hex
             cpu_start = cpu_seconds()
             start = time.perf_counter()
             with ThreadPoolExecutor(max_workers=count) as pool:
@@ -393,7 +394,7 @@ def main():
                               if line.startswith('worktree ')]
                 if registered != [str(source)]:
                     raise RuntimeError("Baseline cleanup left registered worktrees")
-            return {"ready_s": ready, "remove_s": removed, "reclaim_s": reclaimed,
+            return {"sample_id": sample_id, "ready_s": ready, "remove_s": removed, "reclaim_s": reclaimed,
                     "total_s": ready + removed + reclaimed,
                     "ready_cpu_s": ready_cpu, "remove_cpu_s": removed_cpu,
                     "reclaim_cpu_s": reclaimed_cpu,

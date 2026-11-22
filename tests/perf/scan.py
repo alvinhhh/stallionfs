@@ -12,6 +12,7 @@ import statistics
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 import fileops as f
 import native_correctness
@@ -217,6 +218,7 @@ def main():
                         row['source_precheck'] = native_correctness.verify_source(expected_source, before)
                         f.require(row['source_precheck']['unchanged'], 'Scan source changed before timing attempt')
                         condition(row)
+                        row['sample_id'] = uuid4().hex
                         cpu_start = time.process_time()
                         start = time.perf_counter()
                         observed = _scan.scan(path, bulk=method != 'posix', jobs=METHODS[method])

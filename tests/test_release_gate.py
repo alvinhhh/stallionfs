@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from uuid import uuid4
 
 
 SPEC = importlib.util.spec_from_file_location('release_gate',
@@ -43,6 +44,61 @@ def evaluate(document):
     return gate.evaluate_documents([document], (document['case_id'],))
 
 
+def scanner_report(layout):
+    methods = ('posix', 'bulk_serial', 'bulk')
+    workload = {'sample_rows': rows('timing', methods),
+                'memory_rows': rows('resources', methods),
+                'timing_comparisons': {method: {name: metric(name) for name in ('wall_s', 'cpu_s')}
+                                       for method in methods[1:]},
+                'memory_comparisons': {method: {'rss_bytes': metric('rss_bytes')}
+                                       for method in methods[1:]}}
+    return {'status': 'complete', 'cleanup_passed': True, 'workloads': {layout: workload}}
+
+
+def workspace_report(count):
+    methods = ('worktree_install', 'stallionfs_folder')
+    return {'status': 'complete', 'cleanup_passed': True,
+            'raw': {count: {method: rows('timing', (method,)) for method in methods}},
+            'comparisons': {count: {'methods': {'stallionfs_folder': {
+                'total_s': metric('wall_s'), 'total_cpu_s': metric('cpu_s')}}}}}
+
+
+def identified_report(case):
+    if case.startswith('api-scan/'):
+        layout = case.split('/')[-1]
+        document = scanner_report(layout)
+        workload = document['workloads'][layout]
+        samples = workload['sample_rows'] + workload['memory_rows']
+        for row in workload['memory_rows']:
+            row['started_utc'] = '2026-01-01T00:00:00.000001+00:00'
+            row['time_output'] = 'synthetic time diagnostics'
+    elif case.startswith('workspace/'):
+        count = case.rsplit('concurrency', 1)[1]
+        document = workspace_report(count)
+        samples = [row for method in document['raw'][count].values() for row in method]
+    else:
+        document = report(case)
+        samples = document['rows']
+        for row in samples:
+            row['started_utc'] = '2026-01-01T00:00:00.000001+00:00'
+            row['cwd'] = '/synthetic/collector'
+        if not case.startswith('cli/'):
+            del document['case_id']
+            _, operation, fixture = case.split('/')
+            for row in samples + document['comparisons']:
+                row.update(operation=operation, fixture=fixture)
+    for row in samples:
+        row['sample_id'] = uuid4().hex
+        value = 1.0 if row['method'] in ('native', 'posix', 'worktree_install') else 0.5
+        if case.startswith('workspace/'):
+            row.update(total_s=value, total_cpu_s=value)
+        elif row['phase'] == 'timing':
+            row.update(wall_s=value, cpu_s=value)
+        else:
+            row['rss_bytes'] = int(2 * value)
+    return document
+
+
 class ReleaseGate(unittest.TestCase):
     def test_universe_counts_every_catalog_case(self):
         self.assertEqual(len(gate.UNIVERSE), 37)
@@ -57,9 +113,16 @@ class ReleaseGate(unittest.TestCase):
         self.assertEqual(case['reasons'], ['not collected'])
 
     def test_all_pass(self):
-        result = gate.evaluate_documents([report(case) for case in gate.UNIVERSE])
-        self.assertEqual(result['passing_cases'], 37)
-        self.assertTrue(gate.qualify([result, copy.deepcopy(result), copy.deepcopy(result)])['qualified'])
+        runs = [gate.evaluate_documents([identified_report(case) for case in gate.UNIVERSE])
+                for _ in range(3)]
+        self.assertEqual([run['passing_cases'] for run in runs], [37, 37, 37])
+        self.assertTrue(gate.qualify(runs)['qualified'])
+
+    def test_qualify_itself_rejects_repeated_evaluated_evidence(self):
+        run = gate.evaluate_documents([identified_report(case) for case in gate.UNIVERSE])
+        decision = gate.qualify([run, copy.deepcopy(run), copy.deepcopy(run)])
+        self.assertFalse(decision['qualified'])
+        self.assertIn('raw benchmark samples were reused', decision['input_error'])
 
     def test_89_versus_90_percent(self):
         universe = tuple('fileops/move/case' + str(i) for i in range(100))
@@ -283,26 +346,12 @@ class ReleaseGate(unittest.TestCase):
                 self.assertTrue(gate.evaluate_documents([document], (expected,))['passed'])
 
     def test_api_adapter(self):
-        workload = {'sample_rows': rows('timing', ('posix', 'bulk_serial')) +
-                    [r for r in rows('timing', ('bulk',))],
-                    'memory_rows': rows('resources', ('posix', 'bulk_serial')) +
-                    [r for r in rows('resources', ('bulk',))],
-                    'timing_comparisons': {method: {name: metric(name) for name in ('wall_s', 'cpu_s')}
-                                           for method in ('bulk', 'bulk_serial')},
-                    'memory_comparisons': {method: {'rss_bytes': metric('rss_bytes')}
-                                           for method in ('bulk', 'bulk_serial')}}
-        document = {'status': 'complete', 'cleanup_passed': True, 'workloads': {'flat': workload}}
-        result = gate.evaluate_documents([document], ('api-scan/flat',))
+        result = gate.evaluate_documents([scanner_report('flat')], ('api-scan/flat',))
         self.assertTrue(result['passed'])
         self.assertEqual(len(result['cases'][0]['references']), 2)
 
     def test_workspace_adapter_without_rss(self):
-        document = {'status': 'complete', 'cleanup_passed': True,
-                    'raw': {'1': {method: rows('timing', (method,)) for method in
-                                   ('worktree_install', 'stallionfs_folder')}},
-                    'comparisons': {'1': {'methods': {'stallionfs_folder': {
-                        'total_s': metric('wall_s'), 'total_cpu_s': metric('cpu_s')}}}}}
-        result = gate.evaluate_documents([document],
+        result = gate.evaluate_documents([workspace_report('1')],
                                         ('workspace/total/folder-vs-worktree_install/concurrency1',))
         self.assertTrue(result['passed'])
 
@@ -405,23 +454,137 @@ class ReleaseGate(unittest.TestCase):
             self.assertIn('collection incomplete', case['reasons'])
             self.assertNotIn('not collected', case['reasons'])
 
-    def test_three_distinct_complete_directories_qualify_but_reuse_does_not(self):
-        with tempfile.TemporaryDirectory() as name:
-            root = Path(name)
-            paths = []
-            for i in range(3):
-                directory = root / str(i)
-                directory.mkdir()
-                paths.append(str(directory))
-                for j, case in enumerate(gate.UNIVERSE):
-                    (directory / f'{j}.json').write_text(json.dumps(report(case)))
-            output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(gate.main(paths), 0)
-            self.assertIn('RELEASE GATE: QUALIFIED', output.getvalue())
-            with redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(gate.main([paths[0]] * 3), 1)
-            self.assertIn('Runs overlap', output.getvalue())
+
+class ReleaseIndependence(unittest.TestCase):
+    ROW_SOURCES = (
+        ('native/scan/scan_flat_20k', ('rows',)),
+        ('cli/clone/tiny_4kib', ('rows',)),
+        ('api-scan/flat', ('workloads', 'flat', 'sample_rows')),
+        ('api-scan/flat', ('workloads', 'flat', 'memory_rows')),
+        ('workspace/total/folder-vs-worktree_install/concurrency1', ('raw', '1', 'worktree_install')),
+    )
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.decision = root / 'decision.json'
+        self.paths = [root / str(i) for i in range(3)]
+        for i, directory in enumerate(self.paths):
+            directory.mkdir()
+            for case in gate.UNIVERSE:
+                document = identified_report(case)
+                document['timestamp'] = f'2026-01-01T00:00:0{i}+00:00'
+                document['collection_metadata'] = {'run': i}
+                self.report_path(i, case).write_text(json.dumps(document))
+            (directory / 'summary.json').write_text(json.dumps({'report': '0.json'}))
+
+    def report_path(self, run, case):
+        return self.paths[run] / f'{gate.UNIVERSE.index(case)}.json'
+
+    def check_decision(self, paths, qualified, error=None):
+        with redirect_stdout(io.StringIO()):
+            code = gate.main([*map(str, paths), '--json', str(self.decision)])
+        decision = json.loads(self.decision.read_text())
+        self.assertEqual([run['passing_cases'] for run in decision['runs']], [37, 37, 37])
+        self.assertEqual(code, 0 if qualified else 1)
+        self.assertEqual(decision['qualified'], qualified)
+        if error:
+            self.assertIn(error, decision['input_error'])
+
+    def test_independent_complete_runs_with_identical_results_qualify(self):
+        self.check_decision(self.paths, True)
+
+    def test_same_resolved_report_paths_cannot_qualify(self):
+        self.check_decision([self.paths[0]] * 3, False, 'Runs overlap')
+
+    def test_copies_at_distinct_paths_cannot_qualify(self):
+        case = 'native/scan/scan_flat_20k'
+        recorded = self.report_path(1, case).read_text()
+        for copied in (recorded, json.dumps(json.loads(recorded), sort_keys=True, indent=2)):
+            with self.subTest(reformatted=copied != recorded):
+                self.report_path(2, case).write_text(copied)
+                self.check_decision(self.paths, False, 'Runs overlap')
+
+    def test_row_transplants_cannot_qualify_with_rewritten_or_pruned_metadata(self):
+        for case, location in self.ROW_SOURCES:
+            with self.subTest(case=case, rows=location):
+                target = self.report_path(2, case)
+                original = target.read_text()
+                source_document = json.loads(self.report_path(1, case).read_text())
+                target_document = json.loads(original)
+                self.assertNotEqual(target_document['timestamp'], source_document['timestamp'])
+                del target_document['collection_metadata']
+                source, destination = source_document, target_document
+                for key in location:
+                    source, destination = source[key], destination[key]
+                destination[0] = source[0].copy()
+                # Metadata pruning can also change the serialized raw row.
+                destination[0].pop('cwd', None)
+                destination[0].pop('time_output', None)
+                target.write_text(json.dumps(target_document, sort_keys=True, indent=2))
+                try:
+                    self.check_decision(self.paths, False, 'Runs overlap')
+                finally:
+                    target.write_text(original)
+
+    def test_missing_or_malformed_sample_id_blocks_qualification(self):
+        for case, location in self.ROW_SOURCES:
+            target = self.report_path(2, case)
+            original = target.read_text()
+            for identity in (None, 'not-a-uuid'):
+                with self.subTest(case=case, rows=location, identity=identity):
+                    document = json.loads(original)
+                    samples = document
+                    for key in location:
+                        samples = samples[key]
+                    if identity is None:
+                        del samples[0]['sample_id']
+                    else:
+                        samples[0]['sample_id'] = identity
+                    target.write_text(json.dumps(document))
+                    self.check_decision(self.paths, False, 'missing or invalid raw sample_id')
+            target.write_text(original)
+
+    def test_row_transplants_from_unscored_samples_cannot_qualify(self):
+        diagnostic = self.paths[0] / 'diagnostic.json'
+        for case, location in self.ROW_SOURCES:
+            with self.subTest(case=case, rows=location):
+                target = self.report_path(2, case)
+                original = target.read_text()
+                source = identified_report(case)
+                document = json.loads(original)
+                source_rows, target_rows = source, document
+                for key in location:
+                    source_rows, target_rows = source_rows[key], target_rows[key]
+                if 'workloads' in source:
+                    source['workloads']['diagnostic'] = source['workloads'].pop('flat')
+                elif 'raw' in source:
+                    source['raw']['2'] = source['raw'].pop('1')
+                    source['comparisons']['2'] = source['comparisons'].pop('1')
+                else:
+                    source['case_id'] = 'native/scan/diagnostic'
+                diagnostic.write_text(json.dumps(source))
+                try:
+                    self.check_decision(self.paths, True)
+                    target_rows[0] = source_rows[0]
+                    target.write_text(json.dumps(document))
+                    self.check_decision(self.paths, False, 'raw benchmark samples were reused')
+                finally:
+                    target.write_text(original)
+                    diagnostic.unlink()
+
+    def test_legacy_report_can_be_inspected_but_blocks_qualification(self):
+        case = 'cli/clone/tiny_4kib'
+        target = self.report_path(2, case)
+        target.write_text(json.dumps(report(case)))
+        self.assertEqual(gate.load_run(self.paths[2])['passing_cases'], 37)
+        self.check_decision(self.paths, False, 'missing or invalid raw sample_id')
+
+    def test_a_sample_cannot_stand_in_for_two_pairs_in_one_comparison(self):
+        target = self.report_path(2, 'native/scan/scan_flat_20k')
+        document = json.loads(target.read_text())
+        document['rows'][1]['sample_id'] = document['rows'][0]['sample_id']
+        target.write_text(json.dumps(document))
+        self.check_decision(self.paths, False, 'raw sample_id repeated within a comparison')
 
 
 if __name__ == '__main__':

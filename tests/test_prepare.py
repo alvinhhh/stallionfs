@@ -1,5 +1,7 @@
 """Prepare publication checks using real Git without the macOS runtime."""
+import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -41,9 +43,39 @@ class Prepare(unittest.TestCase):
         self.core.git(self.source, 'commit', '-m', 'Fixture')
         self.store = self.core.Store(self.base / 'storage')
 
-    def prepare(self, command=()):
+    def prepare(self, command=(), *, image_size=None):
         with patch.object(self.core.sys, 'platform', 'darwin'):
-            return self.store.prepare(self.source, key='test-v1', command=command)
+            return self.store.prepare(self.source, key='test-v1', command=command, image_size=image_size)
+
+    def test_image_prepare_rebuilds_legacy_seed_and_then_uses_cache(self):
+        folder_seed = self.prepare()
+        # The legacy image recipe added only backend and capacity to the folder spec.
+        legacy_spec = {key: value for key, value in folder_seed.items()
+                       if key not in ('id', 'created', 'cached')}
+        legacy_spec.update(backend='image', capacity_gib=1)
+        legacy_id = hashlib.sha256(json.dumps(legacy_spec, sort_keys=True).encode()).hexdigest()
+        legacy_path = self.store.root / 'seeds' / legacy_id
+        legacy_path.mkdir(mode=0o700)
+        legacy_metadata = {'id': legacy_id, **legacy_spec, 'created': 0}
+        self.core.write_json(legacy_path / 'meta.json', legacy_metadata)
+        legacy_image = legacy_path / 'workspace.sparseimage'
+        legacy_image.write_bytes(b'legacy image fixture')
+
+        def build_image(repo, destination, capacity_gib):
+            self.assertEqual((repo / 'file').read_bytes(), b'original\n')
+            self.assertEqual(capacity_gib, 1)
+            destination.write_bytes(b'new image fixture')
+
+        with patch(self.package + '.images.build', side_effect=build_image) as build, \
+                patch.object(self.core, 'remove_tree', side_effect=shutil.rmtree):
+            seed = self.prepare(image_size=1)
+            self.assertFalse(seed['cached'])
+            self.assertNotEqual(seed['id'], legacy_id)
+            self.assertEqual(seed['format'], 1)
+            self.assertEqual(self.prepare(image_size=1), {**seed, 'cached': True})
+        build.assert_called_once()
+        self.assertEqual(self.store.object('seeds', legacy_id), (legacy_path, legacy_metadata))
+        self.assertEqual(legacy_image.read_bytes(), b'legacy image fixture')
 
     def test_staged_change_with_worktree_matching_head_is_refused(self):
         command = [sys.executable, '-c',

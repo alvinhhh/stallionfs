@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from uuid import UUID
 
 
 PERF = Path(__file__).parent / 'perf'
@@ -133,6 +134,7 @@ class WorkspaceCLI(unittest.TestCase):
 
 class WorkspaceStatistics(unittest.TestCase):
     def test_completion_requires_finished_cleanup(self):
+        identities = set()
         for cleanup, mode in ((True, 'api_diagnostic'), (False, 'api_diagnostic'),
                               (True, 'cli'), (False, 'cli')):
             with self.subTest(cleanup=cleanup, mode=mode), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -175,6 +177,11 @@ class WorkspaceStatistics(unittest.TestCase):
                     self.assertEqual(report['workspace_invocation'], mode)
                     self.assertEqual(len(report['raw']['1']['stallionfs_folder']), 10)
                     self.assertEqual({row['invocation_mode'] for row in report['raw']['1']['stallionfs_folder']}, {mode})
+                    for row in report['raw']['1']['stallionfs_folder']:
+                        identity = row['sample_id']
+                        self.assertEqual(UUID(identity).version, 4)
+                        self.assertNotIn(identity, identities)
+                        identities.add(identity)
                 else:
                     with self.assertRaisesRegex(RuntimeError, 'cleanup did not complete'):
                         workspace.main()

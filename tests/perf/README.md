@@ -165,6 +165,13 @@ At least 90% of cases must
 pass, every tiny-file case must save at least 0.01 ms in median paired elapsed time,
 and every bulk/scan case must improve the elapsed median by at least 10%.
 Qualification requires at least three passing runs with identical per-case verdicts.
+Raw samples must carry their collector-issued `sample_id` (UUIDv4 in lowercase
+hex). Samples shared by API comparisons against POSIX count as one observation
+for independence checks. The gate checks for reuse in all loaded raw benchmark
+rows, including unscored workloads and copies or redacted exports. Historical
+reports without IDs remain inspectable. IDs support reuse detection when retained
+on the raw rows. They provide no authentication of measurements or IDs that have
+been rewritten.
 The command prints reasons and native-to-StallionFS medians, writes full evidence
 and verdicts with `--json`, and exits nonzero unless qualified. One or two runs can
 be inspected but cannot qualify. Missing RSS can be covered by a valid CPU win;

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -495,10 +496,11 @@ class ChildCompletionUnknown(RuntimeError):
 def measure_memory(arguments, metrics):
     """Return peak-byte metrics and the completed child; wrapper time is separate."""
     started_utc = datetime.now(timezone.utc).isoformat()
+    sample_id = uuid4().hex
     start = time.perf_counter()
     try:
         completed = command(["/usr/bin/time", "-lp", "-o", metrics, *arguments], check=False, timeout=None)
-        row = {"started_utc": started_utc, "wrapper_wall_s": time.perf_counter() - start,
+        row = {"started_utc": started_utc, "sample_id": sample_id, "wrapper_wall_s": time.perf_counter() - start,
                "exit_code": completed.returncode, "time_output": metrics.read_text() if metrics.exists() else ""}
         if completed.returncode:
             row.update(completion_uncertain=True, error=completed.stderr.decode(errors="replace").strip())

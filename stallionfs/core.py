@@ -204,7 +204,16 @@ def native_failure_details(error):
     return None
 
 
-def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
+def _ref_query_output(result, command):
+    # Only symbolic-ref -q distinguishes a direct or absent ref with a silent 1.
+    if command == "symbolic-ref" and result.returncode == 1 and not result.stdout and not result.stderr:
+        return None
+    if result.returncode or result.stderr:
+        raise StallionError(f"Git {command} returned {result.returncode}: " + os.fsdecode(result.stderr).strip())
+    return os.fsdecode(result.stdout).removesuffix('\n')
+
+
+def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False, ref_query=None):
     # Inherited Git routing variables must never redirect an operation elsewhere.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -227,6 +236,8 @@ def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
     if os.environ.get('STALLIONFS_BENCHMARK_DEADLINE'):
         from ._benchmark_budget import command
         result = command(args, cwd=cwd, environment=env, persist_success=False)
+        if ref_query is not None:
+            return _ref_query_output(result, ref_query)
         if result.returncode:
             raise StallionError(f'{args[0]} failed ({result.returncode}): '
                                 + result.stderr.decode(errors='replace').strip())
@@ -241,6 +252,8 @@ def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
         stdout=subprocess.PIPE if capture else sys.stderr,
         stderr=subprocess.PIPE if capture else sys.stderr,
     )
+    if ref_query is not None:
+        return _ref_query_output(result, ref_query)
     if result.returncode:
         raise StallionError(
             f"{args[0]} failed ({result.returncode}): "
@@ -251,11 +264,12 @@ def run(args, cwd=None, *, capture=True, internal_git=False, path_output=False):
     return result.stdout.removesuffix('\n') if path_output else result.stdout.strip()
 
 
-def git(repo, *args, path_output=False):
+def git(repo, *args, path_output=False, ref_query=False):
     return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "hook.post-checkout.enabled=false", "-c", "hook.reference-transaction.enabled=false",
                 "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
-                "-C", repo, *args], internal_git=True, path_output=path_output)
+                "-C", repo, *args], internal_git=True, path_output=path_output,
+               ref_query=args[0] if ref_query else None)
 
 
 def identifier(value, length):
@@ -282,6 +296,15 @@ def json_read_limit(max_bytes):
         _json_read_limit.reset(token)
 
 
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
 def read_json(path):
     if path.is_symlink() or not path.is_file():
         raise StallionError(f"Missing or unsafe metadata: {path}")
@@ -300,8 +323,8 @@ def read_json(path):
                 data = stream.read(limit + 1)
                 if len(data) > limit:
                     raise MetadataLimitError(f"Metadata exceeds {limit} byte limit: {path}")
-        value = json.loads(data)
-        if not isinstance(value, dict) or value.get("format") != 1:
+        value = json.loads(data, object_pairs_hook=_unique_json_object)
+        if not isinstance(value, dict) or type(value.get("format")) is not int or value["format"] != 1:
             raise ValueError("unsupported format")
         return value
     except (ValueError, UnicodeError) as exc:
@@ -840,7 +863,8 @@ class Store(Lifecycle):
                 "command": list(command), "system": platform.system(),
                 "release": platform.release(), "machine": platform.machine(), "format": 1}
         if image_size is not None:
-            spec.update(backend="image", capacity_gib=image_size)
+            # Include the materialized copy recipe in the image seed ID.
+            spec.update(backend="image", capacity_gib=image_size, image_copy_recipe=2)
         seed = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         with lock(self.root / "locks" / f"seed-{seed}"):
             final = self.root / "seeds" / seed
@@ -962,16 +986,48 @@ class Store(Lifecycle):
         if metadata.get("backend") == "image":
             from . import images
             try:
-                repo = images.attach(path / "workspace.sparseimage", path / "volume")
                 ready = path / "ready.json"
-                if ready.exists():
-                    if read_json(ready).get("id") != metadata["id"]:
+                initialized = os.path.lexists(ready)
+                if initialized:
+                    if read_json(ready) != {"format": 1, "id": metadata["id"]}:
                         raise StallionError("Invalid image initialization marker")
                 else:
-                    if git(repo, "branch", "--show-current") != metadata["branch"]:
-                        if git(repo, "rev-parse", "HEAD") != metadata["commit"]:
+                    branch = metadata.get("branch")
+                    if not isinstance(branch, str) or not re.fullmatch(
+                            rf"stallionfs/(?:[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}-)?{re.escape(metadata['id'])}", branch):
+                        raise StallionError("Invalid image workspace branch")
+                repo = images.attach(path / "workspace.sparseimage", path / "volume")
+                if not initialized:
+                    head = git(repo, "rev-parse", "--verify", "HEAD^{commit}", ref_query=True)
+                    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+                        raise StallionError("Uninitialized image has an unexpected Git commit")
+                    ref = f"refs/heads/{branch}"
+
+                    def workspace_ref():
+                        fields = ("%(refname)%00%(objectname)%00"
+                                  "%(if)%(HEAD)%(then)current%(else)other%(end)%00%(symref)")
+                        row = git(repo, "for-each-ref", f"--format={fields}", "--", ref, ref_query=True)
+                        return row.split("\0") if row else None
+
+                    current = [ref, head, "current", ""]
+                    existing = workspace_ref()
+                    if existing != current:
+                        if head != metadata["commit"]:
                             raise StallionError("Uninitialized image has an unexpected Git commit")
-                        git(repo, "checkout", "-b", metadata["branch"])
+                        if existing is None:
+                            # for-each-ref omits dangling symbolic refs; checkout -b would follow one.
+                            if git(repo, "symbolic-ref", "-q", "--no-recurse", ref, ref_query=True) is not None:
+                                raise StallionError("Uninitialized image has an unexpected workspace branch")
+                            git(repo, "checkout", "-b", branch)
+                        elif existing == [ref, head, "other", ""]:
+                            # Checkout may have created the ref before failing to switch HEAD.
+                            git(repo, "checkout", "--no-guess", branch, "--")
+                        else:
+                            raise StallionError("Uninitialized image has an unexpected workspace branch")
+                        existing = workspace_ref()
+                    if (existing != current or
+                            git(repo, "symbolic-ref", "-q", "--no-recurse", "HEAD", ref_query=True) != ref):
+                        raise StallionError("Uninitialized image has an unexpected workspace branch")
                     write_json(ready, {"id": metadata["id"]})
             except (OSError, StallionError) as exc:
                 raise StallionError(f"Workspace {metadata['id']} retained; retry with mount: {exc}") from exc

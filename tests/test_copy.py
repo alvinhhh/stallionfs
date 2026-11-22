@@ -690,7 +690,13 @@ class CopyFixtureSafety(unittest.TestCase):
                                               {'dev-entry': volume, 'mount-point': str(mountpoint)}]}
             state = dict(image=str(path), device=device, mountpoint=str(mountpoint), volume_device=volume,
                          attachment=plistlib.dumps(attachment, fmt=plistlib.FMT_BINARY))
-            return mountpoint
+            return mountpoint / 'repo'
+
+        def populate_repo(source, destination, *, strategy):
+            self.assertEqual(strategy, 'materialized')
+            self.assertEqual(source, seed)
+            self.assertEqual(destination, Path(state['mountpoint']) / 'repo')
+            shutil.copytree(source, destination)
 
         eject = ['/usr/sbin/diskutil', 'eject', device]
         detach = ['/usr/bin/hdiutil', 'detach', device]
@@ -699,8 +705,6 @@ class CopyFixtureSafety(unittest.TestCase):
             if args[:2] == ['/usr/bin/hdiutil', 'create']:
                 image.write_bytes(b'owned backing')
                 image.chmod(0o600)
-            elif args[0] == '/usr/bin/ditto':
-                self.assertIsNotNone(state)
             elif args == eject and state['mountpoint'] != str(point):
                 state = dict(state, mountpoint=None, volume_device=None,
                              attachment=images._unmounted_snapshot(state, Path(state['mountpoint'])))
@@ -714,6 +718,7 @@ class CopyFixtureSafety(unittest.TestCase):
         with mock.patch.object(images, '_command', side_effect=case._bounded_image_command), \
                 mock.patch.object(images, '_require_supported'), mock.patch.object(images, 'flush'), \
                 mock.patch.object(images, 'attach', side_effect=attach), \
+                mock.patch('stallionfs.copy', side_effect=populate_repo) as populate, \
                 mock.patch.object(images, 'mounted', side_effect=lambda _: state), \
                 mock.patch.object(images, '_device_identity', return_value=(1, 2, 3, 4)), \
                 mock.patch.object(images, '_no_graph_mounts'), \
@@ -722,6 +727,7 @@ class CopyFixtureSafety(unittest.TestCase):
             images.attach(image, point)
             case._detach_copy_image(image, point)
             case.tearDown()
+        populate.assert_called_once()
         self.assertEqual([call.args[0] for call in command.call_args_list][-3:], [eject, detach, eject])
         self.assertFalse(case.base.exists())
 
