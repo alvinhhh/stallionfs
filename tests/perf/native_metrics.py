@@ -19,6 +19,7 @@ fixture validation and warmup exclusion belong to the calling harness.
 import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import math
 import os
 from pathlib import Path
@@ -439,6 +440,7 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
     base64 alongside display text. No shell interpolation or fixture cleanup.
     A timeout always sets completion_uncertain, even after the leader is reaped:
     detached descendants cannot be ruled out. Interruptions raise with receipt.
+    A normal reap requires observed absence of the numeric process group.
     Timing requires sole subprocess ownership: no other child may be reaped
     between its CPU snapshots. CPU includes descendant usage credited to the
     waited-for child, not independent services. Process creation itself cannot
@@ -556,6 +558,17 @@ def collect(argv, *, timeout_s, cwd=None, env=None, termination_grace_s=1.0, pha
             receipt['stdout'] = _bytes(stdout).decode('utf-8', errors='replace')
             receipt['stderr'] = _bytes(stderr).decode('utf-8', errors='replace')
             if phase == 'resources': receipt.update((parse_gnu_time if linux else parse_time)(_bytes(stderr)))
+            if receipt['exit_code'] is not None and not receipt['completion_uncertain']:
+                # Signal zero observes the numeric group without signalling or assuming ownership after reap.
+                try:
+                    os.killpg(process.pid, 0)
+                except OSError as error:
+                    receipt['group_liveness'] = 'absent' if error.errno == errno.ESRCH else 'unknown'
+                    if error.errno != errno.ESRCH:
+                        receipt['group_probe_errno'] = error.errno
+                else:
+                    receipt['group_liveness'] = 'present'
+                receipt['completion_uncertain'] = receipt['group_liveness'] != 'absent'
             receipt['ok'] = (receipt['exit_code'] == 0 and not receipt['completion_uncertain']
                              and not receipt['parse_errors'] and not receipt.get('cpu_error') and 'error' not in receipt)
     if interrupted: raise ChildCompletionUnknown(receipt)

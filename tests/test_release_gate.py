@@ -32,7 +32,8 @@ def rows(phase, methods=('native', 'candidate')):
 def report(case='fileops/move/large_64mib'):
     return {'case_id': case, 'status': 'complete', 'passed': True, 'cleanup_passed': True,
             'comparisons': [dict(phase=phase, reference='cp', cache='warm',
-                                 metrics={name: metric(name) for name in metrics})
+                                 metrics={name: metric(name, 2, 1) if name == 'rss_bytes' else metric(name)
+                                          for name in metrics})
                             for phase, metrics in (('timing', ('wall_s', 'cpu_s')),
                                                     ('resources', ('rss_bytes',)))],
             'rows': [dict(row, reference='cp', cache='warm')
@@ -50,7 +51,7 @@ def scanner_report(layout):
                 'memory_rows': rows('resources', methods),
                 'timing_comparisons': {method: {name: metric(name) for name in ('wall_s', 'cpu_s')}
                                        for method in methods[1:]},
-                'memory_comparisons': {method: {'rss_bytes': metric('rss_bytes')}
+                'memory_comparisons': {method: {'rss_bytes': metric('rss_bytes', 2, 1)}
                                        for method in methods[1:]}}
     return {'status': 'complete', 'cleanup_passed': True, 'workloads': {layout: workload}}
 
@@ -492,6 +493,33 @@ class ReleaseIndependence(unittest.TestCase):
 
     def test_independent_complete_runs_with_identical_results_qualify(self):
         self.check_decision(self.paths, True)
+
+    def test_stale_paired_summaries_do_not_qualify_slower_raw_samples(self):
+        case = 'native/scan/scan_flat_20k'
+        for run in range(len(self.paths)):
+            path = self.report_path(run, case)
+            document = json.loads(path.read_text())
+            for row in document['rows']:
+                if row['method'] == 'candidate':
+                    if row['phase'] == 'timing':
+                        row.update(wall_s=2.0, cpu_s=2.0)
+                    else:
+                        row['rss_bytes'] = 4
+            path.write_text(json.dumps(document))
+
+        with redirect_stdout(io.StringIO()) as output:
+            code = gate.main([*map(str, self.paths), '--json', str(self.decision)])
+        decision = json.loads(self.decision.read_text())
+        self.assertEqual(code, 1)
+        self.assertFalse(decision['qualified'])
+        self.assertEqual([run['passing_cases'] for run in decision['runs']], [36, 36, 36])
+        for run in decision['runs']:
+            self.assertFalse(run['passed'])
+            failed = next(row for row in run['cases'] if row['case'] == case)
+            self.assertFalse(failed['passed'])
+            self.assertFalse(failed['floor_passed'])
+            self.assertIn('paired summaries differ from raw samples', ' '.join(run['input_errors']))
+        self.assertIn('RELEASE GATE: NOT QUALIFIED', output.getvalue())
 
     def test_candidate_correctness_failure_blocks_release_above_90_percent(self):
         case = 'fileops/move/large_64mib'

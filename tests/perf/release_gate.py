@@ -21,6 +21,7 @@ CANDIDATE_METHODS = {'stallionfs', 'candidate', 'bulk', 'bulk_serial', 'stallion
 SAMPLE_ID = re.compile(r'[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
                             'stallionfs' / '_benchmark_cases.py'))['CASES']
+compare_paired = runpy.run_path(str(Path(__file__).resolve().with_name('native_metrics.py')))['compare_paired']
 UNIVERSE = tuple(case['id'] for case in CATALOG)
 
 CAMPAIGN_STAGES = {
@@ -145,6 +146,31 @@ def valid_metric(metric):
                 for side in ('native', 'candidate')))
 
 
+def valid_sample_id(identity):
+    return isinstance(identity, str) and SAMPLE_ID.fullmatch(identity) is not None
+
+
+def paired_claim_matches(case, name, phase, metric, rows):
+    if any(row.get('phase') != phase for row in rows):
+        return False
+    if case.startswith('workspace/'):
+        field = {'wall_s': 'total_s', 'cpu_s': 'total_cpu_s'}.get(name, name)
+        rows = [{**row, name: row.get(field)} for row in rows]
+    candidate = [row for row in rows if row.get('method') in CANDIDATE_METHODS]
+    reference = [row for row in rows if row.get('method') not in CANDIDATE_METHODS]
+    try:
+        observed = compare_paired(reference, candidate, name)
+        decision = metric.get('decision')
+        decision = {'faster': 'candidate_faster', 'lower': 'candidate_lower'}.get(decision, decision)
+    except (AttributeError, ArithmeticError, TypeError, ValueError):
+        return False
+    return (valid_metric(observed) and observed['complete_pairs'] == metric['complete_pairs']
+            and all(observed[side]['median'] == metric[side]['median'] for side in ('native', 'candidate'))
+            and observed['decision'] == decision
+            and ('paired_median_savings' not in metric or
+                 observed['paired_median_savings'] == metric['paired_median_savings']))
+
+
 def reference_losses(row):
     correctness = row.get('correctness', {})
     if (row.get('method') not in CANDIDATE_METHODS and
@@ -189,18 +215,40 @@ def row_errors(phases):
 
 
 def evaluate_group(group):
-    metrics, case = group['metrics'], group['case']
+    metrics, case = dict(group['metrics']), group['case']
     errors = list(group['errors']) + row_errors(group['rows'])
+    warnings = [reference_losses(row) for rows in group['rows'].values() for row in rows
+                if reference_losses(row)]
+    excluded = (bool(warnings) and
+                not (valid_metric(metrics.get('wall_s')) and any(valid_metric(metrics.get(metric))
+                                                               for metric in ('cpu_s', 'rss_bytes'))) and
+                not any(operation_failed(row) for rows in group['rows'].values() for row in rows) and
+                all(error == 'unavailable' for error in group['errors']) and
+                all(record.get('reason') in ('method failed; remaining identical attempts skipped',
+                                            'pair unavailable after a method failed; neither side repeated')
+                    and set(record.get('failed_methods', [record.get('method')])) <=
+                    {warning['method'] for warning in warnings}
+                    for record in group.get('unavailable', [])))
+    mismatches = []
     for name, metric in metrics.items():
         phase = 'resources' if name == 'rss_bytes' else 'timing'
+        samples = [row for row in group['rows'].get(phase, []) if not row.get('warmup')]
         counts = {}
-        for row in group['rows'].get(phase, []):
-            if not row.get('warmup'):
-                method = row.get('method')
-                counts[method] = counts.get(method, 0) + 1
+        for row in samples:
+            method = row.get('method')
+            counts[method] = counts.get(method, 0) + 1
         if (not valid_metric(metric) or any(count != metric['complete_pairs']
                                            for count in counts.values()) or len(counts) != 2):
             errors.append(name + ': incomplete or inconsistent paired evidence')
+        elif (not excluded and all(valid_sample_id(row.get('sample_id')) for row in samples)
+              and not paired_claim_matches(case, name, phase, metric, samples)):
+            mismatches.append(name)
+    mismatch = None
+    if mismatches:
+        mismatch = 'paired summaries differ from raw samples: ' + ', '.join(sorted(mismatches))
+        errors.append(mismatch)
+        for name in mismatches:
+            del metrics[name]
     wall = metrics.get('wall_s')
     if not valid_metric(wall):
         errors.append('not comparable: no valid elapsed paired comparison')
@@ -224,21 +272,8 @@ def evaluate_group(group):
                 wall['candidate']['median'] <= wall['native']['median'] * (1 - BULK_IMPROVEMENT)):
             floor_errors.append('bulk median elapsed improvement below 10% or unverified')
     errors.extend(floor_errors)
-    warnings = [reference_losses(row) for rows in group['rows'].values() for row in rows
-                if reference_losses(row)]
-    excluded = (bool(warnings) and
-                not (valid_metric(wall) and any(valid_metric(metrics.get(metric))
-                                               for metric in ('cpu_s', 'rss_bytes'))) and
-                not any(operation_failed(row) for rows in group['rows'].values() for row in rows) and
-                all(error == 'unavailable' for error in group['errors']) and
-                all(record.get('reason') in ('method failed; remaining identical attempts skipped',
-                                            'pair unavailable after a method failed; neither side repeated')
-                    and set(record.get('failed_methods', [record.get('method')])) <=
-                    {warning['method'] for warning in warnings}
-                    for record in group.get('unavailable', [])))
-    return {**group, 'passed': not errors, 'floor_passed': not floor_errors,
-            'reference_losses': warnings, 'excluded': excluded,
-            'reasons': sorted(set(errors))}
+    return ({**group, 'metrics': metrics, 'passed': not errors, 'floor_passed': not floor_errors,
+             'reference_losses': warnings, 'excluded': excluded, 'reasons': sorted(set(errors))}, mismatch)
 
 
 def raw_report_rows(document):
@@ -261,6 +296,7 @@ def raw_report_rows(document):
 
 def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     collected = {case: [] for case in universe}
+    input_errors = list(input_errors)
     raw_sample_ids = set()
     candidate_failure_cases = set()
     for document in documents:
@@ -269,7 +305,7 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
             if not isinstance(row, dict):
                 raise ValueError('expected a raw benchmark sample object')
             identity = row.get('sample_id')
-            if isinstance(identity, str) and SAMPLE_ID.fullmatch(identity):
+            if valid_sample_id(identity):
                 raw_sample_ids.add(identity)
         if 'workloads' in document:
             groups = api_groups(document)
@@ -279,7 +315,10 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
             groups = native_groups(document)
         for group in groups:
             if group['case'] in collected:
-                collected[group['case']].append(evaluate_group(group))
+                evaluated, mismatch = evaluate_group(group)
+                collected[group['case']].append(evaluated)
+                if mismatch:
+                    input_errors.append(f"{group['case']} {group['reference']}: {mismatch}")
                 if any(row.get('method') in CANDIDATE_METHODS and operation_failed(row)
                        for rows in group['rows'].values() for row in rows):
                     candidate_failure_cases.add(group['case'])
@@ -300,7 +339,7 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     return {'passed': passing >= required and all(case['floor_passed'] for case in cases)
             and not candidate_failure_cases and not input_errors,
             'passing_cases': passing, 'total_cases': len(cases),
-            'required_passing_cases': required, 'cases': cases, 'input_errors': list(input_errors),
+            'required_passing_cases': required, 'cases': cases, 'input_errors': input_errors,
             'candidate_failure_cases': sorted(candidate_failure_cases),
             'raw_sample_ids': sorted(raw_sample_ids)}
 
@@ -322,7 +361,7 @@ def independence_error(runs):
                 for rows in group['rows'].values():
                     for row in rows:
                         identity = row.get('sample_id')
-                        if not isinstance(identity, str) or not SAMPLE_ID.fullmatch(identity):
+                        if not valid_sample_id(identity):
                             return f"Run {index}, {case['case']}: missing or invalid raw sample_id"
                         if identity in group_ids:
                             return f"Run {index}, {case['case']}: raw sample_id repeated within a comparison"
