@@ -46,6 +46,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       STALLIONFS_TEST_IMAGES: ${{ matrix.images }}
       STALLIONFS_QUALIFICATION: ${{ matrix.phase == 'installed' && matrix.images == '1' && '1' || '0' }}
+      CI_RETAIN_INTEL_WHEEL: ${{ github.repository == 'alvinhhh/stallionfs' && github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.phase == 'installed' && matrix.os == 'macos-26-intel' && matrix.python == '3.13' && matrix.images == '1' && '1' || '0' }}
     steps:
       - name: Anchor worker allocation
         env:
@@ -380,8 +381,10 @@ jobs:
                                 and not result.skipped))
           PY
       - name: Test installed wheel with image failure diagnostics
+        id: installed-suite
         if: matrix.phase == 'installed'
         env:
+          STALLIONFS_TEST_CLONE_SEED_CREATE: ${{ matrix.os == 'macos-26' && matrix.python == '3.14' && matrix.images == '1' && '1' || '0' }}
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
           STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'closed-snapshot' || matrix.os == 'macos-26-intel' && 'enospc-initial-detach' || 'initial-unmount' }}
@@ -468,6 +471,27 @@ jobs:
             ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stdout.bin
             ${{ runner.temp }}/sparse-seek-large/stallionfs-image-tests-*/command-*.stderr.bin
           if-no-files-found: ignore
+          retention-days: 1
+      - name: Admit installed Intel wheel upload
+        id: tail-wheel-upload
+        timeout-minutes: 1
+        continue-on-error: true
+        if: success() && env.CI_RETAIN_INTEL_WHEEL == '1' && steps.installed-suite.outcome == 'success'
+        run: |
+          "${CI_PYTHON:?}" -I -B "$GITHUB_WORKSPACE/tools/ci_job_budget.py" tail wheel-upload
+      # Signed-in readers can download artifacts from this public repository.
+      - name: Upload tested Intel wheel
+        timeout-minutes: 1
+        continue-on-error: true
+        if: success() && env.CI_RETAIN_INTEL_WHEEL == '1' && steps.installed-suite.outcome == 'success' && steps.tail-wheel-upload.outcome == 'success' && steps.tail-wheel-upload.outputs.admitted == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-intel-wheel-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/installed-intel-wheel/${{ steps.tail-wheel-upload.outputs.wheel }}
+            ${{ runner.temp }}/installed-intel-wheel/proof.json
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 1
       - name: Check native code with sanitizers
         if: matrix.phase == 'sanitizer'

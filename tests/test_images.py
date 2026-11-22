@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 from stallionfs import images
 if __package__:
-    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
+    from .image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 else:
-    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection
+    from image_failure_diagnostics import failure_scope, observe_detach, detach_observation_selection, observe_seed_create
 from stallionfs.core import StallionError
 
 
@@ -68,7 +68,10 @@ class Images(unittest.TestCase):
         original_detach = images.detach
         def observed_detach(image, point):
             return self._detach(image, point, stage='setup', command=original_detach)
+        selected = (self._testMethodName == 'test_clone_ownership_busy_detach_and_recovery' and
+                    os.environ.get('STALLIONFS_TEST_CLONE_SEED_CREATE') == '1')
         with failure_scope(self.base, self.seed, stage='setup'), \
+                (observe_seed_create(self.base, clone_ownership=True) if selected else nullcontext()), \
                 patch.object(images, 'detach', side_effect=observed_detach):
             images.build(self.source, self.seed, 1)
 
