@@ -41,6 +41,44 @@ but split an internal hardlink, changed 1,994 timestamps by −59 to +60 ns, and
 added `.DS_Store` to the destination container. Completion remained uncertain and
 the check stopped there. No Finder timing, CPU or memory result is claimed.
 
+### Hosted CLI scan, November 22, 2026 (UTC)
+
+Three sequential cycles on one GitHub-hosted `macos-15` arm64 VM (macOS 15.8.2,
+image `20261118.0550.1`) used an installed source wheel from
+`ae38698bc08d67777c9960056311651ace3352fc`. Each warm fixture and output form
+(plain or JSON) had one warmup pair, 31 measured timing pairs and 10 separate
+resource pairs per cycle. All 1,008 command outputs matched the six expected
+counters, including 24 warmup outputs. No pairs were excluded.
+
+The timed native find/stat recipe in the table above emits numeric records for
+each entry on the same device, excluding the root and without following
+symlinks. Its counts are aggregated after timing. StallionFS aggregates and
+formats the counts inside its timed command. The ratios apply to this recipe.
+
+| Fixture | Metric | Native / StallionFS medians across six cycle/form cells | Paired result |
+| --- | --- | --- | --- |
+| `nested_1000` | Direct elapsed | 568.741–604.927 / 5.024–5.608 ms | Faster in all six. Native took 105.78–115.86× as long. |
+| `nested_1000` | Direct child CPU | 566.899–603.043 / 4.659–5.263 ms | Lower in all six. Native used 113.60–124.60× as much. |
+| `nested_1000` | Peak process RSS | 2.0625 / 2.7031 MiB | Higher in all six (+31.1%). |
+| `empty` | Direct elapsed | 3.351–3.686 / 3.994–4.576 ms | Slower in one, inconclusive in five. |
+| `empty` | Direct child CPU | 2.418–2.609 / 3.089–3.428 ms | Higher in four, inconclusive in two. |
+| `empty` | Peak process RSS | 1.9531 / 2.5313 MiB | Higher in all six (+29.6%). |
+
+All 120 resource pairs recorded zero OS input and output block operations for
+both methods. RSS is the peak of an individual process reported by
+`/usr/bin/time -lp`. The results cover two synthetic warm scan fixtures on this
+VM. Physical hardware, the final installed release and the full 37-case matrix
+remain unqualified by this run.
+
+[Raw results (JSON XZ)](../tests/perf/results/hosted-native-scan-20261122-arm64-run44995704979-attempt1.json.xz)
+retain `provenance.json` and `cycle-1.json` through `cycle-3.json` byte for byte,
+including measurements and stdout for every projected row, plus stdout, stderr
+and journal hashes.
+GitHub Actions artifact `14743828581` came from run `44995704979`, attempt 1,
+[job 137126156331](https://github.com/alvinhhh/stallionfs/actions/runs/44995704979/job/137126156331).
+Original ZIP SHA-256 `28bb596ac58197489f657e826cd2564e37a0a385bc476fcf1dc1f3a9b39e3b4b`.
+JSON XZ SHA-256 `c7455e58af3714348e05177c67710791f094522d0b5fcf54aaeeada6e090889c`.
+
 ## Reproduce
 
 Install an isolated build, then run the suite on disposable APFS scratch space:
