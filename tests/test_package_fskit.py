@@ -593,6 +593,136 @@ class RuntimeAssembly(unittest.TestCase):
         with patch.object(sys, 'argv', argv), patch.object(package, '_tool_output', side_effect=self.inspect), redirect_stdout(self.stdout):
             package.main()
 
+    def hosted_provenance(self):
+        wheel = Path(self.value['wheel']['path'])
+        paths = {
+            'StallionFS.app/Contents/MacOS/StallionFS': self.host,
+            'StallionFS.app/Contents/Extensions/StallionFS.appex/Contents/MacOS/StallionFS': self.extension,
+            'StallionFS.app/Contents/Resources/Maintenance/stallionfs-maintenance': self.native,
+            'stallionfs-0.7.0-cp313-cp313-macosx_15_0_arm64.whl': wheel,
+        }
+        local = ['filesystem/fskit/' + name for name in (
+            'Host.Info.plist', 'Module.Info.plist', 'maintenance_native.c',
+            'maintenance_observer.py', 'stallionfs-python.sh')]
+        producer = {'schema': 1, 'kind': 'fskit-unsigned-hosted-components',
+                    'source_commit': 'a' * 40, 'source_tree': 'b' * 40,
+                    'source_sha256': {name: digest((SOURCE / name).read_bytes()) for name in local},
+                    'files': {name: {'sha256': digest(path.read_bytes()), 'size': path.stat().st_size}
+                              for name, path in paths.items()}}
+        return producer
+
+    def select_hosted_inputs(self, producer):
+        receipt = json_file(self.root / 'provenance.json', producer)
+        self.value['hosted_components'] = {
+            'source_commit': 'a' * 40, 'source_tree': 'b' * 40, 'provenance': pinned(receipt)}
+        json_file(self.descriptor, self.value)
+        return receipt
+
+    def test_hosted_packaging_retains_verified_source_and_component_bindings(self):
+        self.inputs()
+        producer = self.hosted_provenance()
+        receipt = self.select_hosted_inputs(producer)
+        self.assemble()
+        runtime = json.loads(self.manifest.read_bytes())['runtime']
+        self.assertEqual(runtime['hosted_components'], {
+            'source_commit': 'a' * 40, 'source_tree': 'b' * 40,
+            'provenance_sha256': digest(receipt.read_bytes()), 'files': producer['files']})
+        self.assertNotIn('hosted_components', json.loads((self.app / self.bundle.DESCRIPTOR).read_bytes()))
+        self.assertNotIn('provenance.json', {row['path'] for row in runtime['inventory']})
+        self.value.pop('hosted_components')
+        json_file(self.descriptor, self.value)
+        self.app = self.root / 'manual.app'
+        self.manifest = self.root / 'manual.json'
+        self.assemble()
+        manual = json.loads(self.manifest.read_bytes())['runtime']
+        self.assertNotIn('hosted_components', manual)
+        self.assertEqual(runtime['source_build_id'], manual['source_build_id'])
+        self.assertEqual(runtime['descriptor_sha256'], manual['descriptor_sha256'])
+
+    def test_hosted_packaging_refuses_a_different_admitted_component_before_output(self):
+        self.inputs()
+        wheel = Path(self.value['wheel']['path'])
+        with zipfile.ZipFile(wheel, 'a') as archive:
+            archive.comment = b'Producer build A'
+        self.value['wheel'] = pinned(wheel)
+        producer = self.hosted_provenance()
+        self.select_hosted_inputs(producer)
+        for path in (self.host, self.extension, self.native, wheel):
+            original = path.read_bytes()
+            try:
+                if path == wheel:
+                    with zipfile.ZipFile(wheel, 'a') as archive:
+                        archive.comment = b'Producer build B'
+                    self.value['wheel'] = pinned(wheel)
+                    json_file(self.descriptor, self.value)
+                else:
+                    path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+                self.assertEqual(path.stat().st_size, len(original))
+                with self.subTest(path=path.name), self.assertRaisesRegex(ValueError, 'Hosted component differs'):
+                    self.assemble()
+                self.assertFalse(self.app.exists())
+                self.assertFalse(self.manifest.exists())
+                self.assertFalse(self.app.with_name(self.app.name + '.sources').exists())
+            finally:
+                path.write_bytes(original)
+
+    def test_hosted_packaging_refuses_wrong_source_selection_and_receipt_digest(self):
+        self.inputs()
+        producer = self.hosted_provenance()
+        for key, invalid, reason in (
+                ('source_commit', 'c' * 40, 'source commit or tree differs'),
+                ('source_tree', 'c' * 40, 'source commit or tree differs'),
+                ('provenance', {'path': str(self.root / 'provenance.json'), 'sha256': '0' * 64},
+                 'Input digest mismatch')):
+            self.select_hosted_inputs(producer)
+            self.value['hosted_components'][key] = invalid
+            json_file(self.descriptor, self.value)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, reason):
+                self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())
+
+    def test_hosted_packaging_refuses_changed_local_assembly_sources(self):
+        self.inputs()
+        producer = self.hosted_provenance()
+        for name, original in producer['source_sha256'].items():
+            producer['source_sha256'][name] = '0' * 64
+            self.select_hosted_inputs(producer)
+            with self.subTest(source=name), self.assertRaisesRegex(ValueError, 'Input digest mismatch'):
+                self.assemble()
+            self.assertFalse(self.app.exists())
+            self.assertFalse(self.manifest.exists())
+            producer['source_sha256'][name] = original
+
+    def test_hosted_packaging_refuses_ambiguous_or_oversized_receipts(self):
+        self.inputs()
+        producer = self.hosted_provenance()
+        receipt = self.select_hosted_inputs(producer)
+        with patch.object(package, 'HOSTED_PROVENANCE_MAX_BYTES', receipt.stat().st_size - 1), \
+                self.assertRaisesRegex(ValueError, 'oversized input'):
+            self.assemble()
+        original = receipt.read_text()
+        receipt.write_text(original.rstrip()[:-1] + ', "schema": 1}\n')
+        self.value['hosted_components']['provenance'] = pinned(receipt)
+        json_file(self.descriptor, self.value)
+        with self.assertRaisesRegex(ValueError, 'Duplicate JSON key'):
+            self.assemble()
+        self.select_hosted_inputs(producer)
+        original = self.descriptor.read_text()
+        self.descriptor.write_text(original.rstrip()[:-1] + ', "hosted_components": null}\n')
+        with self.assertRaisesRegex(ValueError, 'Duplicate JSON key'):
+            self.assemble()
+        wheel = next(name for name in producer['files'] if name.endswith('.whl'))
+        producer['files'][wheel.upper()] = producer['files'][wheel]
+        self.select_hosted_inputs(producer)
+        with self.assertRaisesRegex(ValueError, 'must name one matching wheel'):
+            self.assemble()
+        self.descriptor.write_bytes(self.descriptor.read_bytes() + b' ' * 65536)
+        with self.assertRaisesRegex(ValueError, 'oversized input'):
+            self.assemble()
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.manifest.exists())
+
     def test_complete_synthetic_mapping_modes_and_source_sidecar_under_both_umasks(self):
         self.inputs()
         for mask in (0o022, 0o077):
@@ -602,6 +732,7 @@ class RuntimeAssembly(unittest.TestCase):
             try: self.assemble()
             finally: os.umask(previous)
             value = json.loads(self.manifest.read_bytes())['runtime']
+            self.assertNotIn('hosted_components', value)
             self.assertFalse(value['complete_candidate'])
             self.assertFalse(value['distribution_signing_performed'])
             self.assertEqual(value['inventory'], package._runtime_inventory(self.app))
@@ -809,11 +940,11 @@ class RuntimeAssembly(unittest.TestCase):
         for change in ('missing', 'changed'):
             self.app = self.root / (change + '.app')
             self.manifest = self.root / (change + '.json')
-            def read(path, expected=None):
+            def read(path, expected=None, **limits):
                 if Path(path) == source:
                     if change == 'missing': raise FileNotFoundError('missing observer')
                     if expected is not None: return original(path, '0'*64)
-                return original(path, expected)
+                return original(path, expected, **limits)
             with self.subTest(change=change), patch.object(package, '_runtime_read', side_effect=read), \
                     self.assertRaises((ValueError, OSError)):
                 self.assemble()
@@ -886,9 +1017,9 @@ class RuntimeAssembly(unittest.TestCase):
                     if fault == 'inventory-missing': result = [r for r in result if r['path'] != observer_path]
                     if fault == 'inventory-duplicate': result += [r for r in result if r['path'] == observer_path]
                 return result
-            def readback(root,name):
+            def readback(root,name,**limits):
                 nonlocal reads
-                data = read(root,name)
+                data = read(root,name,**limits)
                 if name == resource_path:
                     reads += 1
                     if fault == 'final-readback' and reads >= 3: return b'changed resource'
