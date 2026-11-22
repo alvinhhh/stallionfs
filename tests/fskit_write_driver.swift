@@ -4583,15 +4583,23 @@ func renameRefusals(_ parent: URL) throws {
     need(sfs_image_close(reopened,&receipt) == SFS_OK,"close hardlinked symlink readback")
     for descendant in [false,true] {
         let cycle = try RenameFixture(parent,"rename-cycle-\(descendant)",directory:true), c = cycle.mount, anchor = c.volume.anchor
-        // Core checks run after begin; they must make no namespace edits. The adapter still remembers the delivery error.
         let result = descendant ? cycle.rename("A","descendant",source:cycle.from,from:c.root,to:cycle.item) : cycle.rename("old","self",to:cycle.item)
-        need(result.0 == nil && code(result.1) == Int(EINVAL),"self/descendant cycle rejected by core")
-        let first = c.volume.diagnosticSnapshot().2!
-        need(first.result.status == SFS_INVALID && first.result.transaction_active != 0,"cycle refusal is inside transaction before cleanup")
+        need(result.0 == nil && code(result.1) == Int(EINVAL),"self/descendant move rejected")
+        need(c.volume.diagnosticSnapshot().2 == nil,"cycle refusal is local to the rename")
         cycle.unchanged(anchor)
-        c.serial { directoryNames(c.coreHandle,cycle.item.inode,["child"]) }
-        need(code(cycle.rename().1) == Int(EINVAL) && anchorMatches(anchor,c.volume.anchor),"sticky cycle delivery error blocks later rename despite nonterminal core rollback")
-        c.close(); c.reopened("old",parent:cycle.from.inode,inode:cycle.item.inode); c.reopened("new",parent:cycle.to.inode,inode:nil)
+        c.serial {
+            var info = sfs_image_information(), receipt = sfs_result()
+            need(sfs_image_get_information(c.coreHandle,&info,&receipt) == SFS_OK && receipt.transaction_active == 0 &&
+                 receipt.poisoned == 0 && anchorMatches(anchor,receipt),"cycle refusal leaves the committed image ready")
+            directoryNames(c.coreHandle,cycle.item.inode,["child"])
+        }
+        let syncError: Error? = wait { c.volume.synchronize(flags:.wait,replyHandler:$0) }
+        need(syncError == nil,"volume synchronizes after rejected move")
+        let moved = cycle.rename()
+        need(moved.0 != nil && moved.1 == nil && c.volume.anchor.generation == anchor.generation + 1,
+             "legal move commits once after rejected move")
+        c.close(); c.reopened("old",parent:cycle.from.inode,inode:nil); cycle.reopened("new",parent:cycle.to.inode)
+        c.reopened("child",parent:cycle.item.inode,inode:cycle.child!.inode,bytes:Data("original".utf8))
     }
 }
 func renamePolicies(_ parent: URL) throws {
