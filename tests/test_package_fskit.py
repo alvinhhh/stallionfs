@@ -175,6 +175,13 @@ class PackageCompatibilityTests(unittest.TestCase):
         for version in ('27', '27.0', '27.0.0'):
             self.admission(version, version)
 
+    def test_bare_package_still_accepts_matching_intel_slices(self):
+        self.inventories = {'host': 'x86_64', 'extension': 'x86_64'}
+        self.assemble()
+        result = json.loads(self.manifest.read_bytes())
+        self.assertEqual(result['architectures'], ['x86_64'])
+        self.assertNotIn('runtime', result)
+
     def test_invalid_architecture_inventories_refuse(self):
         for inventory in ('', 'arm64 arm64', 'unknown', 'arm64 x86_64'):
             for name in ('host', 'extension'):
@@ -401,6 +408,9 @@ class RuntimeAssembly(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.root.chmod(0o700)
+        self.architectures = {}
+        self.deployment_targets = {}
+        self.maintenance_inspections = []
         self.bundle = package._runtime_bundle()
         bundle_patch = patch.object(package, '_runtime_bundle', return_value=self.bundle)
         bundle_patch.start()
@@ -575,12 +585,16 @@ class RuntimeAssembly(unittest.TestCase):
 
 
     def inspect(self, argv, directory):
-        if argv[0] == '/usr/bin/lipo': return 'arm64'
+        name = Path(argv[-1]).name
+        if name == 'maintenance':
+            self.assertEqual(Path(argv[-1]).read_bytes(), self.native.read_bytes())
+            self.maintenance_inspections.append(argv[:-1])
+        if argv[0] == '/usr/bin/lipo': return self.architectures.get(name, 'arm64')
         if argv[0] == '/usr/bin/nm':
-            return {'wheel-2': '_PyInit__scan', 'wheel-3': '_PyInit__image'}.get(Path(argv[-1]).name,
+            return {'wheel-2': '_PyInit__scan', 'wheel-3': '_PyInit__image'}.get(name,
                     '_stallionfs_factory_contextual_writes_v1') + '\n'
         self.assertEqual(argv[0], '/usr/bin/otool')
-        return APPLE_BUILD_VERSION
+        return self.deployment_targets.get((name, argv[2]), APPLE_BUILD_VERSION)
 
     def assemble(self, predecessors=None):
         argv = ['package_fskit.py', '--host', str(self.host), '--extension', str(self.extension),
@@ -592,6 +606,48 @@ class RuntimeAssembly(unittest.TestCase):
         self.stdout = io.StringIO()
         with patch.object(sys, 'argv', argv), patch.object(package, '_tool_output', side_effect=self.inspect), redirect_stdout(self.stdout):
             package.main()
+
+    def assert_runtime_assembly_refused(self, message):
+        sidecar = self.app.with_name(self.app.name + '.sources')
+        try:
+            self.assemble()
+        except ValueError as error:
+            self.assertIn(message, str(error))
+        else:
+            self.fail(f'Incompatible package emitted app={self.app.exists()}, '
+                      f'manifest={self.manifest.exists()}, sidecar={sidecar.exists()}')
+        for output in (self.app, self.manifest, sidecar):
+            self.assertFalse(os.path.lexists(output), output)
+        self.assertEqual(self.stdout.getvalue(), '')
+
+    def test_arm64_runtime_refuses_intel_only_host_and_extension(self):
+        self.inputs()
+        for architecture in ('x86_64', 'x86_64 arm64e'):
+            with self.subTest(architecture=architecture):
+                self.architectures.update(host=architecture, extension=architecture)
+                self.assert_runtime_assembly_refused('Bundled runtime requires arm64 host and module slices')
+
+    def test_arm64_runtime_accepts_matching_universal_host_and_extension(self):
+        self.inputs()
+        self.architectures.update(host='x86_64 arm64', extension='arm64 x86_64')
+        self.assemble()
+        result = json.loads(self.manifest.read_bytes())
+        self.assertEqual(result['architectures'], ['arm64', 'x86_64'])
+        self.assertEqual(self.maintenance_inspections,
+                         [['/usr/bin/lipo', '-archs'], ['/usr/bin/otool', '-arch', 'arm64', '-l']])
+        placed = self.app / 'Contents/Resources/Maintenance/stallionfs-maintenance'
+        self.assertEqual(placed.read_bytes(), self.native.read_bytes())
+
+    def test_arm64_runtime_refuses_incompatible_maintenance_before_output(self):
+        self.inputs()
+        with self.subTest(reason='missing slice'):
+            self.architectures['maintenance'] = 'x86_64'
+            self.assert_runtime_assembly_refused('Bundled runtime requires an arm64 maintenance slice')
+        with self.subTest(reason='deployment floor'):
+            self.architectures['maintenance'] = 'arm64'
+            newer = APPLE_BUILD_VERSION.replace('27.0', '28.0')
+            self.deployment_targets['maintenance', 'arm64'] = newer
+            self.assert_runtime_assembly_refused('Maintenance deployment minimum exceeds the app minimum')
 
     def hosted_provenance(self):
         wheel = Path(self.value['wheel']['path'])

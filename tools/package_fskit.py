@@ -147,7 +147,7 @@ def _deployment_target(text, architecture):
             'minimum_os': fields['minos'], 'sdk': fields['sdk']}
 
 
-def inspect_package_artifacts(host, extension, host_floor, module_floor, requested=None):
+def inspect_package_artifacts(host, extension, host_floor, module_floor, requested=None, *, runtime_native=None):
     """Check matching inventories and each slice against its containing plist floor."""
     floors = (_version(host_floor), _version(module_floor))
     if floors[0] < floors[1]:
@@ -155,11 +155,14 @@ def inspect_package_artifacts(host, extension, host_floor, module_floor, request
     with tempfile.TemporaryDirectory(prefix='stallionfs-package-') as temporary:
         directory = Path(temporary)
         paths = (directory / 'host', directory / 'extension')
-        for path, data in zip(paths, (host, extension)):
+        inputs = list(zip(paths, (host, extension)))
+        for path, data in inputs:
             write_new(path, data, 0o700)
         inventories = [_architectures(path, directory) for path in paths]
         if set(inventories[0]) != set(inventories[1]):
             raise ValueError('Host and module architecture inventories differ')
+        if runtime_native is not None and 'arm64' not in inventories[0]:
+            raise ValueError('Bundled runtime requires arm64 host and module slices')
         factory = _factory_profile(paths[1], extension, inventories[1], directory, requested)
         targets = []
         for path, architectures, floor in zip(paths, inventories, floors):
@@ -171,7 +174,17 @@ def inspect_package_artifacts(host, extension, host_floor, module_floor, request
                     raise ValueError('Executable deployment minimum exceeds its declared plist minimum')
                 slices.append(target)
             targets.append(slices)
-        for path, data in zip(paths, (host, extension)):
+        if runtime_native is not None:
+            maintenance = directory / 'maintenance'
+            write_new(maintenance, runtime_native, 0o700)
+            if 'arm64' not in _architectures(maintenance, directory):
+                raise ValueError('Bundled runtime requires an arm64 maintenance slice')
+            target = _deployment_target(_tool_output(
+                ['/usr/bin/otool', '-arch', 'arm64', '-l', str(maintenance)], directory), 'arm64')
+            if _version(target['minimum_os']) > floors[0]:
+                raise ValueError('Maintenance deployment minimum exceeds the app minimum')
+            inputs.append((maintenance, runtime_native))
+        for path, data in inputs:
             if read_executable(path) != data:
                 raise ValueError('Executable changed during package inspection')
         return factory, targets
@@ -1045,7 +1058,8 @@ def main():
     hosted_sources = runtime['hosted_sources'] if runtime is not None else None
     values = _load_templates(hosted_sources) if hosted_sources is not None else _load_templates()
     factory, targets = inspect_package_artifacts(host, extension,
-        values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy)
+        values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy,
+        runtime_native=runtime['native'] if runtime is not None else None)
     if args.upgrade_predecessors is not None:
         declarations = _runtime_read(args.upgrade_predecessors.absolute())
         _runtime_require(len(declarations) <= 32768, 'Upgrade declarations exceed their limit')
