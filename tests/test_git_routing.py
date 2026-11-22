@@ -84,7 +84,7 @@ class GitRoutingTests(unittest.TestCase):
                 self.assertEqual(executable, str(self.corrected / 'bin/git'))
                 self.assertEqual(result['GIT_EXEC_PATH'], str(self.corrected / 'libexec/git-core'))
                 self.assertEqual(result['GIT_TEMPLATE_DIR'], str(self.corrected / 'share/git-core/templates'))
-                calls.payload.assert_called_once_with(self.corrected)
+                calls.payload.assert_called_once_with(self.corrected, allow_wheel_umask=True)
                 self.assertEqual(calls.payload_check.call_count, 2)
 
     def test_older_traditional_only_diagnostics_keep_the_original_provider(self):

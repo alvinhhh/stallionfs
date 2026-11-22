@@ -229,14 +229,24 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
     require(after == admitted, 'git-config-changed')
 
 
+def _inspection_runtime():
+    from . import _bundle, _git_runtime
+    bundle = _bundle.paths()
+    if bundle is not None:
+        return _bundle._app_git(bundle)
+    root = Path(_bundle.__file__).resolve().parent / '_git'
+    payload = _git_runtime.regular_payload(root, allow_wheel_umask=True)
+    return {'executable': str(root / 'bin/git'), 'exec_path': str(root / 'libexec/git-core'),
+            'check': payload['check']}
+
+
 def _inspect(repo, *, branch=None, structure_required=True, references=False, runtime=None, allow_shallow=False):
     """Read a standalone repository's config as data, with no ambient startup."""
     import tempfile
-    from . import _bundle
     admit = (lambda: structure(repo, branch=branch, allow_shallow=allow_shallow)) if structure_required else (lambda: bindings(repo))
     admitted = admit()
     if runtime is None:
-        runtime = _bundle.product_git()
+        runtime = _inspection_runtime()
     executable = runtime['executable']
     with tempfile.TemporaryDirectory(prefix='sfs-git-inspect-') as temporary:
         directory = Path(temporary).resolve()

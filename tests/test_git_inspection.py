@@ -5,8 +5,26 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from stallionfs import _bundle, _native, core, _native_create_git as git
+from stallionfs import _bundle, _git_runtime, _native, core, _native_create_git as git
 from stallionfs.lifecycle import Lifecycle
+
+
+class InspectorRuntimeSelection(unittest.TestCase):
+    def test_only_ordinary_wheel_inspection_allows_reduced_modes(self):
+        bundle = object()
+        check = Mock()
+        with patch.object(_bundle, 'paths', side_effect=[None, bundle, ValueError('invalid app')]) as paths, \
+                patch.object(_bundle, '_app_git', return_value={'check': check}) as app, \
+                patch.object(_git_runtime, 'regular_payload', return_value={'check': check}) as wheel:
+            root = Path(_bundle.__file__).resolve().parent / '_git'
+            self.assertEqual(git._inspection_runtime(), {'executable': str(root / 'bin/git'),
+                'exec_path': str(root / 'libexec/git-core'), 'check': check})
+            self.assertEqual(git._inspection_runtime(), {'check': check})
+            with self.assertRaisesRegex(ValueError, 'invalid app'):
+                git._inspection_runtime()
+        self.assertEqual(paths.call_count, 3)
+        app.assert_called_once_with(bundle)
+        wheel.assert_called_once_with(root, allow_wheel_umask=True)
 
 
 class GitInspection(unittest.TestCase):
@@ -20,7 +38,7 @@ class GitInspection(unittest.TestCase):
         self.config = b'core.repositoryformatversion\n0\0core.bare\nfalse\0'
         self.refs = b'HEAD\nrefs/heads/main\n'
         self.calls = []
-        selected = patch.object(_bundle, 'product_git', return_value=self.runtime)
+        selected = patch.object(git, '_inspection_runtime', return_value=self.runtime)
         selected.start(); self.addCleanup(selected.stop)
         for name in ('qualified_runtime',):
             forbidden = patch.object(git, name, side_effect=AssertionError('native authority'))
@@ -73,7 +91,7 @@ class GitInspection(unittest.TestCase):
         container, store = self.mounted_fixture()
         self.runtime = dict(self.runtime, executable='/qualified/bin/git', exec_path='/qualified/libexec/git-core')
         with patch.object(git, 'qualified_runtime', return_value=self.runtime) as qualified, \
-                patch.object(_bundle, 'product_git', side_effect=AssertionError('product fallback')) as product, \
+                patch.object(git, '_inspection_runtime', side_effect=AssertionError('product fallback')) as product, \
                 patch.object(core, 'validate_tree'), \
                 patch.object(store, '_standalone_git', wraps=store._standalone_git) as standalone, \
                 patch.object(git, 'inspect_standalone', wraps=git.inspect_standalone) as inspect, \
@@ -89,18 +107,18 @@ class GitInspection(unittest.TestCase):
     def test_native_qualification_and_runtime_check_refusals_never_fall_back_or_execute_git(self):
         container, store = self.mounted_fixture()
         with patch.object(git, 'qualified_runtime', side_effect=core.StallionError('unqualified')) as qualified, \
-                patch.object(_bundle, 'product_git', side_effect=AssertionError('product fallback')) as product:
+                patch.object(git, '_inspection_runtime', side_effect=AssertionError('product fallback')) as product:
             with self.assertRaises(core.StallionError): _native._usable(store, container, {})
         qualified.assert_called_once_with(None); product.assert_not_called(); self.assertFalse(self.calls)
         self.runtime['check'].side_effect = core.StallionError('runtime changed')
         with patch.object(git, 'qualified_runtime', return_value=self.runtime), \
-                patch.object(_bundle, 'product_git', side_effect=AssertionError('product fallback')) as product, \
+                patch.object(git, '_inspection_runtime', side_effect=AssertionError('product fallback')) as product, \
                 patch.object(core, 'validate_tree'):
             with self.assertRaises(core.StallionError): _native._usable(store, container, {'native_host': '/Host'})
         product.assert_not_called(); self.assertFalse(self.calls)
 
     def test_supplied_empty_runtime_is_not_a_generic_selection_request(self):
-        with patch.object(_bundle, 'product_git', side_effect=AssertionError('product fallback')) as product:
+        with patch.object(git, '_inspection_runtime', side_effect=AssertionError('product fallback')) as product:
             with self.assertRaises(KeyError): git.inspect_standalone(self.repo, runtime={})
         product.assert_not_called(); self.assertFalse(self.calls)
 
@@ -108,7 +126,7 @@ class GitInspection(unittest.TestCase):
         container, store = self.mounted_fixture()
         old = self.repo / '.git'; old.rename(self.repo / '.git-old'); old.symlink_to('.git-old', target_is_directory=True)
         with patch.object(git, 'qualified_runtime', return_value=self.runtime), \
-                patch.object(_bundle, 'product_git', side_effect=AssertionError('product fallback')), \
+                patch.object(git, '_inspection_runtime', side_effect=AssertionError('product fallback')), \
                 patch.object(core, 'validate_tree'):
             with self.assertRaises(core.StallionError): _native._usable(store, container, {'native_host': '/Host'})
         self.assertFalse(self.calls)
