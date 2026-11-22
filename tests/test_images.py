@@ -92,7 +92,8 @@ class Images(unittest.TestCase):
 
     def test_build_empty_tree(self):
         source = self.base / 'empty-source'
-        source.mkdir(mode=0o750)
+        source.mkdir()
+        source.chmod(0o750)
         image, point = self.base / 'empty.sparseimage', self.base / 'empty-mount'
         with failure_scope(self.base, image, mountpoint=point, stage='empty-build'):
             images.build(source, image, 1)

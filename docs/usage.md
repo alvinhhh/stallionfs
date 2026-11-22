@@ -100,6 +100,8 @@ cd "$workspace"
 
 `--image-size` sets each workspace's capacity in GiB. The image grows as blocks are used, up to that limit. Creation clones the closed image and mounts a separate APFS volume for the workspace. Editors, shells and Git use the returned path normally.
 
+The first prepare with the materialized copy recipe builds a fresh image seed even when a seed with the same inputs already exists. Existing seed IDs remain usable with `sfs create` and `sfs forget`.
+
 These volumes have Spotlight indexing disabled. File permissions and ownership remain enabled.
 
 Images require macOS 26 or later. After restarting the Mac, run `sfs mount WORKSPACE_ID` to mount a workspace again. `sfs unmount WORKSPACE_ID` releases its mount without moving it to trash. Stop processes using the volume before unmounting; stallionfs never forces an unmount.
