@@ -126,8 +126,8 @@ def _finish_eject(observation, error):
 
 
 @contextmanager
-def observe_seed_create(base):
-    """Select only the initial seed creation in the snapshot/rollback fixture."""
+def observe_seed_create(base, *, clone_ownership=False):
+    """Select the first create for the specified owned seed fixture."""
     previous = _create_scope.get()
     if previous is not None:
         previous['disabled'] = True
@@ -136,7 +136,8 @@ def observe_seed_create(base):
             active.disarm()
         yield
         return
-    token = _create_scope.set(dict(base=Path(base), used=False, disabled=False))
+    token = _create_scope.set(dict(base=Path(base), clone_ownership=clone_ownership,
+                                   used=False, disabled=False))
     try:
         yield
     finally:
@@ -145,8 +146,9 @@ def observe_seed_create(base):
 
 class CreateObservation:
     """Status only; the ordinary communicate remains the pipe reader and waiter."""
-    def __init__(self, argv):
+    def __init__(self, argv, *, clone_ownership=False):
         self.argv, self.owner = argv, threading.get_ident()
+        self.clone_ownership = clone_ownership
         self.child = self.thread = None
         self.ready, self.done, self.disarmed = (threading.Event() for _ in range(3))
         self.query_stopped = threading.Event()
@@ -155,6 +157,9 @@ class CreateObservation:
         self.query_uncertain = self.shutdown_uncertain = False
         self.outcome = 'pending'
         self.start = None
+        self.deadline = None
+        self.checkpoints = (60, 120)
+        self.timeout_capture = {}
         self.records = self.bytes = 0
         self.write_unavailable = False
 
@@ -179,10 +184,21 @@ class CreateObservation:
             self.shutdown_uncertain = True
             self.thread = None
 
-    def communicating(self, child):
-        if child is self.child:
+    def communicating(self, child, timeout):
+        if child is self.child and not self.ready.is_set():
             self.start = time.monotonic()
+            if self.clone_ownership and type(timeout) is int and timeout > 125:
+                self.deadline = self.start + timeout
+                self.checkpoints += (timeout - 5,)
             self.ready.set()
+
+    def capture_timeout(self, error):
+        # These are the standard reader's partial captures. Keep only bounded counts.
+        for name in ('stdout', 'stderr'):
+            raw = getattr(error, name)
+            count = len(raw) if type(raw) is bytes else None
+            self.timeout_capture[name + '_bytes'] = None if count is None else min(count, CAPTURE_BYTES)
+            self.timeout_capture[name + '_capped'] = count is not None and count > CAPTURE_BYTES
 
     def stop_queries(self):
         # Never wait for a query/property/log write to finish before stopping.
@@ -209,8 +225,10 @@ class CreateObservation:
 
     def _emit(self, phase, **values):
         # Called only by the daemon. No TextIO lock, flush, retry or fd mutation.
-        if self.write_unavailable or self.records >= 4:
+        if self.write_unavailable or self.records >= (5 if self.clone_ownership else 4):
             return
+        if self.clone_ownership:
+            values['fixture'] = 'clone-ownership'
         data = (json.dumps(dict(kind='create_status', phase=phase, **values),
                            sort_keys=True) + '\n').encode('ascii')
         if len(data) > 1024 or self.bytes + len(data) > 4096:
@@ -223,15 +241,23 @@ class CreateObservation:
         except Exception:
             self.write_unavailable = True
 
+    def _deadline_reached(self):
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
     def _sample(self):
         unknown = dict(state='unknown', byte_counts='unobserved', eof='unobserved',
                        api='unobserved', returncode_before=None, returncode_after=None)
         child = self.child
         try:
             before = child.returncode
-            unknown['returncode_before'] = before
             closed = dict(stdout_closed=child.stdout.closed, stderr_closed=child.stderr.closed)
             if before is not None:
+                if self._deadline_reached():
+                    return unknown | closed | dict(reason='communicate_deadline_reached')
+                unknown['returncode_before'] = before
+                if (self.clone_ownership and type(before) is int and
+                        not (self.query_stopped.is_set() or self.disarmed.is_set())):
+                    return unknown | closed | dict(state='exited_status_observed', api='returncode')
                 return unknown | closed
             required = ('waitid', 'P_PID', 'WEXITED', 'WNOHANG', 'WNOWAIT')
             if not all(hasattr(os, name) for name in required):
@@ -242,6 +268,8 @@ class CreateObservation:
             with self.gate:
                 if self.query_stopped.is_set() or self.disarmed.is_set():
                     return unknown | closed | dict(reason='stopped_or_disarmed')
+                if self._deadline_reached():
+                    return unknown | closed | dict(reason='communicate_deadline_reached')
                 self.in_flight = True
             try:
                 status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -251,6 +279,8 @@ class CreateObservation:
                         self.query_uncertain = True
                     self.in_flight = False
             after = child.returncode
+            if self._deadline_reached():
+                return unknown | closed | dict(reason='communicate_deadline_reached')
             unknown['returncode_after'] = after
             if self.query_stopped.is_set() or self.disarmed.is_set() or after is not None:
                 return unknown | closed | dict(reason='completion_or_disarm_race')
@@ -274,7 +304,7 @@ class CreateObservation:
             self._emit('start', elapsed_seconds=0)
             self.ready.wait()
             if not self.done.is_set():
-                for checkpoint in (60, 120):
+                for checkpoint in self.checkpoints:
                     if self.done.wait(max(0, self.start + checkpoint - time.monotonic())):
                         break
                     sample = self._sample()
@@ -282,9 +312,10 @@ class CreateObservation:
                         break
                     self._emit(str(checkpoint), elapsed_seconds=max(0, time.monotonic() - self.start), **sample)
             self.done.wait()
+            timeout = {'timeout_capture': self.timeout_capture} if self.timeout_capture else {}
             self._emit('finish', outcome=self.outcome, query_uncertain=self.query_uncertain,
                        disarmed=self.disarmed.is_set(), elapsed_seconds=None if self.start is None
-                       else max(0, time.monotonic() - self.start))
+                       else max(0, time.monotonic() - self.start), **timeout)
         except Exception:
             self.write_unavailable = True
 
@@ -299,9 +330,12 @@ def _observed_create(original, args):
         base, image = scope['base'], Path(args[-1])
         _private(base, True)
         _private(image.parent, True)
-        if (base.resolve() != base or image.resolve() != image or
-                image.parent.parent != base / 'store' / 'staging' or
-                not image.parent.name.startswith('build-') or image.name != 'workspace.sparseimage'):
+        if scope['clone_ownership']:
+            bound = image == base / 'seed.sparseimage'
+        else:
+            bound = (image.parent.parent == base / 'store' / 'staging' and
+                     image.parent.name.startswith('build-') and image.name == 'workspace.sparseimage')
+        if not bound or base.resolve() != base or image.resolve() != image:
             raise ValueError('unbound creation')
     except Exception:
         return original(*args, '-verbose')
@@ -313,7 +347,8 @@ def _observed_create(original, args):
     try:
         saved = subprocess.Popen
         try:
-            observation = CreateObservation(tuple(str(arg) for arg in (*args, '-verbose')))
+            observation = CreateObservation(tuple(str(arg) for arg in (*args, '-verbose')),
+                                            clone_ownership=scope['clone_ownership'])
 
             class ObservedPopen(saved):
                 def __init__(self, *argv, **kwargs):
@@ -325,17 +360,24 @@ def _observed_create(original, args):
 
                 def communicate(self, *argv, **kwargs):
                     selected = self is observation.child
+                    timeout_error = None
                     if selected:
                         try:
-                            observation.communicating(self)
+                            observation.communicating(self, kwargs.get('timeout'))
                         except Exception:
                             observation.disarm()
                     try:
                         return super().communicate(*argv, **kwargs)
+                    except subprocess.TimeoutExpired as error:
+                        timeout_error = error
+                        raise
                     finally:
                         if selected:
                             try:
                                 observation.stop_queries()
+                                if (timeout_error is not None and observation.clone_ownership and
+                                        not observation.disarmed.is_set()):
+                                    observation.capture_timeout(timeout_error)
                             except Exception:
                                 observation.query_uncertain = True
 

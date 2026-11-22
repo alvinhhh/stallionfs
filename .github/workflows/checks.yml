@@ -382,6 +382,7 @@ jobs:
       - name: Test installed wheel with image failure diagnostics
         if: matrix.phase == 'installed'
         env:
+          STALLIONFS_TEST_CLONE_SEED_CREATE: ${{ matrix.os == 'macos-26' && matrix.python == '3.14' && matrix.images == '1' && '1' || '0' }}
           STALLIONFS_FSKIT_ARTIFACT_DIR: ${{ runner.temp }}/fskit-interface-diagnostics
           STALLIONFS_REQUIRE_CONTEXTUAL_FSKIT: ${{ matrix.os == 'xcode-27' && '1' || '0' }}
           STALLIONFS_TEST_SNAPSHOT_OBSERVATION: ${{ matrix.os == 'macos-26' && matrix.python == '3.11' && 'restored-cleanup' || matrix.os == 'macos-26' && matrix.python == '3.14' && 'closed-snapshot' || matrix.os == 'macos-26-intel' && 'enospc-initial-detach' || 'initial-unmount' }}
