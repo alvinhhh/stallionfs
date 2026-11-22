@@ -1413,5 +1413,88 @@ pathlib.Path(sys.argv[7]).write_text('child finished')
         self.assertEqual(read_json(path)['value'], 'original')
 
 
+class TrashFailureTests(unittest.TestCase):
+    def setUp(self):
+        base = tempfile.TemporaryDirectory()
+        self.addCleanup(base.cleanup)
+        self.store = Store(Path(base.name) / 'store')
+        self.workspace = 'a' * 32
+        self.path = self.store.root / 'workspaces' / self.workspace
+        self.trash = self.store.root / 'trash' / self.workspace
+        self.path.mkdir(mode=0o700)
+        (self.path / 'repo').mkdir(mode=0o700)
+        (self.path / 'repo/file').write_bytes(b'uncommitted work')
+        write_json(self.path / 'meta.json', {'id': self.workspace, 'commit': 'a' * 40})
+        old = time.time() - 7 * 86400
+        os.utime(self.path, (old, old))
+
+    def test_interruption_after_remove_does_not_expose_old_age_to_gc(self):
+        original = lifecycle.identity(self.path)
+        rename = Path.rename
+
+        def interrupted(source, destination):
+            result = rename(source, destination)
+            if destination == self.trash:
+                raise KeyboardInterrupt('remove rename completed')
+            return result
+
+        with patch.object(Path, 'rename', interrupted), self.assertRaises(KeyboardInterrupt):
+            self.store.move(self.workspace)
+        restarted = Store(self.store.root)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(lifecycle.identity(self.trash), original)
+        self.assertEqual(restarted.gc(), [])
+        self.assertEqual(restarted.gc(yes=True), [])
+        restarted.move(self.workspace, restore=True)
+        self.assertEqual(lifecycle.identity(self.path), original)
+        self.assertEqual((self.path / 'repo/file').read_bytes(), b'uncommitted work')
+
+    def test_trash_age_enospc_leaves_workspace_in_place_for_retry(self):
+        original = lifecycle.identity(self.path)
+        with patch.object(core.os, 'utime', side_effect=OSError(errno.ENOSPC, 'full')), \
+                self.assertRaises(OSError) as failed:
+            self.store.move(self.workspace)
+        self.assertEqual(failed.exception.errno, errno.ENOSPC)
+        self.assertFalse(self.trash.exists())
+        self.assertEqual(lifecycle.identity(self.path), original)
+        self.store.move(self.workspace)
+        self.assertEqual(self.store.gc(), [])
+        self.assertEqual(lifecycle.identity(self.trash), original)
+        self.assertEqual((self.trash / 'repo/file').read_bytes(), b'uncommitted work')
+
+    def test_move_needs_no_second_lifecycle_write_after_publication(self):
+        state_path = self.store._state(self.workspace)
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        replace = os.replace
+        for restore, destination in ((False, self.trash), (True, self.path)):
+            with self.subTest(restore=restore):
+                if restore:
+                    write_json(protection, {'id': self.workspace, 'object': lifecycle.identity(self.trash),
+                                            'generation': read_json(state_path)['generation']})
+
+                def disk_full_after_rename(source, target):
+                    if target == state_path and destination.exists():
+                        raise OSError(errno.ENOSPC, 'full after publication')
+                    return replace(source, target)
+
+                with patch.object(lifecycle.os, 'replace', side_effect=disk_full_after_rename):
+                    self.store.move(self.workspace, restore=restore)
+                state = read_json(state_path)
+                self.assertEqual(state['status'], 'open')
+                self.assertEqual(state['object'], lifecycle.identity(destination))
+                self.assertEqual(state['payload'], lifecycle.identity(destination / 'repo'))
+                self.assertEqual((destination / 'repo/file').read_bytes(), b'uncommitted work')
+                self.assertFalse(protection.exists())
+
+    def test_dangling_lifecycle_link_blocks_remove_without_overwriting_evidence(self):
+        state = self.store._state(self.workspace)
+        state.symlink_to('missing.json')
+        with self.assertRaisesRegex(StallionError, 'Missing or unsafe metadata'):
+            self.store.move(self.workspace)
+        self.assertEqual(os.readlink(state), 'missing.json')
+        self.assertFalse(self.trash.exists())
+        self.assertEqual((self.path / 'repo/file').read_bytes(), b'uncommitted work')
+
+
 if __name__ == '__main__':
     unittest.main()
