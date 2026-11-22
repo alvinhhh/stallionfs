@@ -26,16 +26,25 @@ are outside it, including the default `~/Library/Application Support/stallionfs`
 and any stores selected with `STALLIONFS_HOME` or `--root`. Preserve those stores.
 
 There is no qualified end-user FSKit app upgrade or uninstall procedure on
-`main`. The repository has [exact-artifact maintenance tooling](fskit-maintenance.md),
-but its signed installed qualification is still pending. The bundled
+`main`. For controlled work on an already installed app, follow the
+[exact-artifact removal and restoration procedure](fskit-maintenance.md#finite-removal-and-restoration-procedure).
+Keep the authenticated recovery archive and every store. Stop all writers
+across users and normally unmount each identified owned workspace through the
+admitted app while it is intact. Stop if a workspace is busy or its mount state
+is uncertain. Quit normally and check the exact extension's selection and
+enablement in File System Extensions settings as directed by the procedure.
+
+If the app copy is incomplete or the app and extension have different product
+versions or build numbers, preserve the copies and stores until you can verify
+the exact installed artifact. The bundled
 `sfs command install` and `sfs command remove` only manage the owned
 per-user `~/.local/bin/sfs` link, not the app, extension, or workspace data.
 
 ## Check your workspace store
 
-`sfs doctor --installation` is not implemented. Run `sfs doctor` to test APFS
-cloning and copy-on-write isolation in your selected store. It reports the
-store path, Git and Python versions, and any remaining staging entries.
+Run `sfs doctor` to test APFS cloning and copy-on-write isolation in your
+selected store. It reports the store path, Git and Python versions, and any
+remaining staging entries.
 It does not verify signatures, the installed app, or extension enablement.
 
 ## Take a snapshot and roll back
