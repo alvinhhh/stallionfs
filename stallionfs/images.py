@@ -400,6 +400,7 @@ def build(source_repo, destination_image, capacity_gib):
     validate_tree(source)
     point = Path(tempfile.mkdtemp(prefix='.prepare-mount-', dir=destination.parent))
     detach_attempted = False
+    retain_mountpoint = False
     try:
         _command('/usr/bin/hdiutil', 'create', '-size', f'{capacity_gib}g', '-type', 'SPARSE',
                  '-fs', 'APFS', '-volname', 'stallionfs', '-uid', os.getuid(), '-gid', os.getgid(),
@@ -422,12 +423,14 @@ def build(source_repo, destination_image, capacity_gib):
                 if state:
                     detach(destination, point)
             except BaseException as cleanup:
+                retain_mountpoint = True
                 interrupted = cleanup if not isinstance(cleanup, Exception) else original
                 _recovery_failure(interrupted, f"Preparation failed; keep image {destination} and mount {point}: {cleanup}")
         raise
     finally:
         # rmdir cannot traverse data or remove a live mount; no recursive cleanup here.
-        try:
-            point.rmdir()
-        except OSError:
-            pass
+        if not retain_mountpoint:
+            try:
+                point.rmdir()
+            except OSError:
+                pass

@@ -383,6 +383,35 @@ class ImageRecoveryTests(unittest.TestCase):
                     self.assertIs(caught.exception, primary)
                 self.assertEqual(image.read_bytes(), b'preserved image')
 
+    def test_build_preserves_mountpoint_when_recovery_inspection_fails(self):
+        from stallionfs import images
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            source, image = base / 'source', base / 'seed.sparseimage'
+            source.mkdir(mode=0o700)
+            primary = OSError('attach failed')
+
+            def create(*args):
+                image.write_bytes(b'preserved image')
+                image.chmod(0o600)
+
+            with patch.object(images, '_require_supported'), patch('stallionfs.core.validate_tree'), \
+                    patch.object(images, '_command', side_effect=create), \
+                    patch.object(images, 'attach', side_effect=primary) as attach, \
+                    patch.object(images, 'mounted', side_effect=OSError('inventory unavailable')) as inspect, \
+                    patch.object(images, 'detach') as detach, patch('stallionfs.copy') as populate:
+                with self.assertRaises(StallionError) as caught:
+                    images.build(source, image, 1)
+            point = attach.call_args.args[1]
+            self.assertIs(caught.exception.__cause__, primary)
+            self.assertIn(f'keep image {image} and mount {point}', str(caught.exception))
+            self.assertIn('inventory unavailable', str(caught.exception))
+            self.assertTrue(point.is_dir())
+            self.assertEqual(image.read_bytes(), b'preserved image')
+            inspect.assert_called_once_with(image)
+            detach.assert_not_called()
+            populate.assert_not_called()
+
     def test_staging_retains_attached_or_uninspectable_image(self):
         from stallionfs import images
         for state in ({"device": "/dev/disk999", "mountpoint": None}, OSError("inspection failed")):
