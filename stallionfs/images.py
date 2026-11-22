@@ -122,7 +122,8 @@ def _attachments(image):
         try:
             recorded_image = Path(recorded).resolve(strict=True)
         except (OSError, RuntimeError) as error:
-            raise _error('Cannot classify image attachment path in inventory') from error
+            raise _error(f'Cannot classify image attachment path in inventory: {recorded}; '
+                         'check hdiutil info and detach it if it is no longer in use') from error
         if recorded_image != image:
             continue
         if entry.get('owner-uid') != os.getuid():
@@ -150,6 +151,51 @@ def _attachments(image):
             if any(isinstance(e.get('dev-entry'), str) and e['dev-entry'] in devices for e in entities):
                 raise _error(f'Ambiguous image attachment devices: {image}')
     return matches
+
+
+def _detach_vanished(destination):
+    """Detach an attachment that a failed create left after its image file disappeared."""
+    def leftover():
+        inventory = _plist('/usr/bin/hdiutil', 'info', '-plist').get('images')
+        if not isinstance(inventory, list):
+            raise _error('Invalid image attachment inventory')
+        matches = [e for e in inventory if isinstance(e, dict) and e.get('image-path') == str(destination)]
+        if not matches:
+            return None
+        entities = matches[0].get('system-entities')
+        devices = [e.get('dev-entry') for e in entities if isinstance(e, dict)] if isinstance(entities, list) else []
+        if (len(matches) > 1 or matches[0].get('owner-uid') != os.getuid() or not devices
+                or len(devices) != len(entities) or any(not isinstance(d, str) or
+                    not re.fullmatch(r'/dev/disk[0-9]+(?:s[0-9]+)*', d) for d in devices)
+                or len(set(devices)) != len(devices)):
+            raise _error(f'Failed image creation left an attachment to inspect: {destination}')
+        whole = [e for e in entities if re.fullmatch(r'/dev/disk[0-9]+', e['dev-entry'])]
+        physical = [e for e in whole if e.get('content-hint') in ('GUID_partition_scheme', 'Apple_partition_scheme')]
+        if len(physical) == 1 and all(e is physical[0] or
+                (isinstance(e.get('content-hint'), str) and e['content-hint'].lower() in
+                 ('apple_apfs', 'ef57347c-0000-11aa-aa11-00306543ecac')) for e in whole):
+            device = physical[0]['dev-entry']
+        elif len(whole) == 1 and all(d == whole[0]['dev-entry'] or
+                re.fullmatch(re.escape(whole[0]['dev-entry']) + r'(?:s[0-9]+)+', d) for d in devices):
+            device = whole[0]['dev-entry']
+        else:
+            raise _error(f'Failed image creation left ambiguous disk devices: {destination}')
+        return device, plistlib.dumps(matches[0], fmt=plistlib.FMT_BINARY)
+    selected = leftover()
+    if selected is None:
+        return
+    device, _ = selected
+    if os.path.lexists(destination):
+        raise _error(f'Failed image creation left {device} attached; inspect before continuing: {destination}')
+    identity = _device_identity(device)
+    def verify():
+        if leftover() != selected or _device_identity(device) != identity:
+            raise _error(f'Failed image attachment changed before detach: {destination}')
+        if os.path.lexists(destination):
+            raise _error(f'Failed image creation reappeared before detach: {destination}')
+    _detach_device(device, verify)
+    if leftover() is not None:
+        raise _error(f'Failed image creation left {device} attached: {destination}')
 
 
 def mounted(image):
@@ -284,6 +330,21 @@ def _busy_detach_failure(error, device):
             f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode())
 
 
+def _detach_device(device, verify):
+    for attempt, delay in enumerate((*_BUSY_DETACH_DELAYS, None), 1):
+        verify()
+        try:
+            _command('/usr/bin/hdiutil', 'detach', device)
+            return
+        except _CommandFailure as busy:
+            if not _busy_detach_failure(busy, device):
+                raise
+            if delay is None:
+                busy.add_note(f'Device stayed busy after {attempt} ordinary detach attempts')
+                raise
+        time.sleep(delay)
+
+
 def detach(image, mountpoint):
     """Detach only this image's verified device, never forcibly and never deleting data."""
     image, point = _image(image), _path(mountpoint)
@@ -322,7 +383,7 @@ def detach(image, mountpoint):
                 raise _error('Eject did not begin with the expected mounted image')
             expected = dict(current, mountpoint=None, volume_device=None,
                             attachment=_unmounted_snapshot(current, point))
-            for attempt, delay in enumerate((*_BUSY_DETACH_DELAYS, None), 1):
+            def verify_continuation():
                 # Two fresh normal inventory reads, each with independent mount-table
                 # checks, admit only the original graph with its mount-point removed.
                 for _ in range(2):
@@ -332,18 +393,8 @@ def detach(image, mountpoint):
                     if (identity != _backing_identity(image) or
                             device_identity != _device_identity(current['device'])):
                         raise _error('Image or selected device identity changed before continuation')
-                # This narrows name reuse races; detaching by name is not atomic with
-                # external detach/reattach, even under a managed workspace lock.
-                try:
-                    _command('/usr/bin/hdiutil', 'detach', current['device'])
-                    break
-                except _CommandFailure as busy:
-                    if not _busy_detach_failure(busy, current['device']):
-                        raise
-                    if delay is None:
-                        busy.add_note(f'Device stayed busy after {attempt} ordinary detach attempts')
-                        raise
-                time.sleep(delay)
+            # Detaching by name is not atomic with external detach/reattach.
+            _detach_device(current['device'], verify_continuation)
             verify_absent()
         except BaseException as recovery:
             original.add_note(f'Eject continuation refused or failed; keep {image}: '
@@ -423,6 +474,17 @@ def build(source_repo, destination_image, capacity_gib):
             except BaseException as cleanup:
                 interrupted = cleanup if not isinstance(cleanup, Exception) else original
                 _recovery_failure(interrupted, f"Preparation failed; keep image {destination} and mount {point}: {cleanup}")
+        elif not detach_attempted and not os.path.lexists(destination):
+            # A stuck or killed create can leave the device attached after its file is gone,
+            # and that record blocks classifying every other image.
+            try:
+                _detach_vanished(destination)
+            except BaseException as cleanup:
+                if not isinstance(cleanup, Exception):
+                    cleanup.add_note(f'Image creation failed before recovery: {original}')
+                    raise
+                original.add_note(f"Preparation failed and left an attachment for missing image {destination}: {cleanup}")
+                raise original from cleanup
         raise
     finally:
         # rmdir cannot traverse data or remove a live mount; no recursive cleanup here.
