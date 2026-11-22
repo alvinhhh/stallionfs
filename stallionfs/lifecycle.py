@@ -459,11 +459,11 @@ class Lifecycle:
                     if meta.get('backend') == 'native-image':
                         native_access = access
                     repo = access['path']
-                options = {}
+                options = {'pass_fds': (lease_fd,)}
                 if auto_retire:
-                    options = {'pass_fds': (lease_fd,), 'env': {
+                    options['env'] = {
                         **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
-                        'STALLIONFS_LEASE_GENERATION': generation}}
+                        'STALLIONFS_LEASE_GENERATION': generation}
                 result = subprocess.run(command, cwd=repo, stdout=stdout, **options)
         except BaseException as error:
             if native_access is not None:

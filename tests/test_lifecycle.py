@@ -1254,6 +1254,47 @@ done.write_text('done')
 """)
         return script
 
+    def test_run_passes_the_managed_lease_without_enabling_retirement(self):
+        self.store.enroll(self.workspace)
+        self.store.cleanup_config(enabled=True)
+        command = ['fixture-command']
+        lease = self.store.root / 'locks' / f'use-{self.workspace}'
+        for auto_retire in (False, True):
+            with self.subTest(auto_retire=auto_retire):
+                inherited = []
+
+                def child(argv, *, cwd, stdout, **options):
+                    self.assertEqual((argv, cwd, stdout), (command, str(self.repo), None))
+                    self.assertIn('pass_fds', options)
+                    descriptor, = options['pass_fds']
+                    self.assertTrue(os.path.samestat(os.fstat(descriptor), lease.stat()))
+                    if auto_retire:
+                        environment = options['env']
+                        self.assertEqual(environment['STALLIONFS_LEASE_FD'], str(descriptor))
+                        self.assertEqual(environment['STALLIONFS_LEASE_GENERATION'],
+                                         read_json(self.store._state(self.workspace))['generation'])
+                    else:
+                        self.assertNotIn('env', options)
+                    inherited.append(os.dup(descriptor))
+                    return subprocess.CompletedProcess(argv, 7)
+
+                try:
+                    with patch.object(lifecycle.subprocess, 'run', side_effect=child) as launch:
+                        self.assertEqual(self.store.run(self.workspace, command, auto_retire=auto_retire),
+                                         {'workspace': self.workspace, 'returncode': 7})
+                    launch.assert_called_once()
+                    self.assertFalse(self.lease_is_free())
+                    state = read_json(self.store._state(self.workspace))
+                    self.assertEqual(state['status'], 'open')
+                    if auto_retire:
+                        self.assertEqual(state['auto_retire'], {'generation': state['generation']})
+                    else:
+                        self.assertNotIn('auto_retire', state)
+                finally:
+                    for descriptor in inherited:
+                        os.close(descriptor)
+                self.assertTrue(self.lease_is_free())
+
     def test_auto_retire_normal_and_nonzero_exit_observe_exact_session(self):
         self.store.enroll(self.workspace)
         self.store.cleanup_config(enabled=True)
