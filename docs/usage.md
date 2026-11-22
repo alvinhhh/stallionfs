@@ -135,6 +135,8 @@ Stop processes using a workspace before moving or deleting it. `remove` moves th
 
 `gc` previews trash older than 24 hours. `gc --yes` permanently deletes eligible trash; `--older-than 0` includes all trash. Save or push any work you need first.
 
+For folder and sparse-image workspaces, `remove` sets the trash age before moving the workspace. If removal is interrupted, check both the workspace list and trash before retrying. If the workspace is already in trash, use `restore` to recover it.
+
 `forget SEED_ID` previews removal of a seed. Add `--yes` to delete it. Existing workspaces remain usable. Prepare again to rebuild the cache.
 
 ## Snapshots and rollback
