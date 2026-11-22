@@ -361,19 +361,37 @@ def _native_failures(output, selection):
             if count != len(records):
                 raise ValueError('Final native report has unverified entries')
         failures = {}
+        collection_failed_rows = 0
+        sample_keys = set()
         references = {'clone': selection['copy_tools'], 'copy': ['cp'], 'move': ['move'],
                       'delete': ['delete'], 'scan': ['find-stat']}
         for row in document['rows']:
-            if row.get('validated') is True and row.get('ok') is True:
-                continue
             operation, reference, method = row['operation'], row['reference'], row['method']
             if (row.get('run') != 0 or row['fixture'] not in selection['fixtures']
                     or operation not in selection['operations'] or reference not in references[operation]
                     or method not in (reference, 'stallionfs') or row.get('completion_uncertain') is not False
                     or row.get('source_unchanged') is not True or row.get('phase') not in ('timing', 'resources')
                     or type(row.get('sample')) is not int or not 0 <= row['sample'] < selection['samples']):
-                raise ValueError('Failed native row has uncertain or unrelated ownership')
+                raise ValueError('Native row has uncertain or unrelated ownership')
             key = (row['fixture'], operation, reference, method)
+            sample = (*key, row['phase'], row['sample'])
+            if sample in sample_keys:
+                raise ValueError('Duplicate native sample')
+            sample_keys.add(sample)
+            if row.get('ok') is not True:
+                collection_failed_rows += 1
+            if row.get('validated') is True:
+                continue
+            correctness = row.get('correctness', {})
+            if not isinstance(correctness, dict):
+                raise ValueError('Invalid native correctness object')
+            sharing = row.get('data_stream_sharing', {})
+            if not isinstance(sharing, dict):
+                raise ValueError('Invalid native sharing object')
+            # A failed command or timing wrapper leaves this placeholder instead of validation.
+            if (row.get('ok') is False and type(row.get('exit_code')) is int and row['exit_code'] != 0
+                    and correctness == {'passed': False, 'reason': 'command failed'} and not sharing):
+                continue
             if key not in failures:
                 if len(failures) >= 128:
                     raise ValueError('Native failure summary exceeds its case bound')
@@ -382,9 +400,6 @@ def _native_failures(output, selection):
                                  'gate_counts': {}, 'examples': []}
             item = failures[key]
             item['failed_rows'] += 1
-            correctness = row.get('correctness', {})
-            if not isinstance(correctness, dict):
-                raise ValueError('Invalid native correctness object')
             losses = correctness.get('candidate_losses', [])
             if not isinstance(losses, list) or any(not isinstance(loss, dict) for loss in losses):
                 raise ValueError('Invalid native correctness loss list')
@@ -401,21 +416,20 @@ def _native_failures(output, selection):
             gates = [name for name in ('passed', 'strict_equal', 'sparse_preserved', 'independent_clone',
                                       'move_identity', 'move_source_absent')
                      if name in correctness and correctness[name] is not True]
-            sharing = row.get('data_stream_sharing', {})
-            if not isinstance(sharing, dict):
-                raise ValueError('Invalid native sharing object')
             if sharing.get('required') is True and sharing.get('full_data_stream_sharing') is not True:
                 gates.append('data_stream_sharing')
-            if row.get('ok') is not True:
-                gates.append('command_success')
             if not gates and not losses:
                 gates.append('validated')
             for gate in gates:
                 item['gate_counts'][gate] = item['gate_counts'].get(gate, 0) + 1
-        if not failures:
+        if not failures and not collection_failed_rows:
             raise ValueError('Completed failed report has no attributable failed rows')
         journal.verify()
-        return list(failures.values())
+        # Quick collections use one warm run, two phases and two methods per comparison.
+        expected_samples = (4 * selection['samples'] * len(selection['fixtures'])
+                            * sum(len(references[operation]) for operation in selection['operations']))
+        missing_samples = expected_samples - len(sample_keys) + collection_failed_rows
+        return list(failures.values()), collection_failed_rows, missing_samples
     finally:
         journal.close()
 
@@ -497,12 +511,15 @@ def _collect_pinned(args, resources, binary, directory, fixtures, operations, lo
                          'samples': args.samples, 'runs': 1, 'cache': ['warm'], 'jobs': args.jobs,
                          'fixtures': list(fixtures), 'operations': list(operations), 'copy_tools': copy_tools}
             try:
-                failures = _native_failures(output, selection)
+                failures, collection_failed_rows, missing_samples = _native_failures(output, selection)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError, RecursionError) as error:
                 raise RuntimeError('Collector failed; no verified completed failure report: ' + str(error)[:512]) from error
-            return {'status': 'failed', 'error': 'Native comparison failed correctness checks; see reference_failures',
+            message = ('Native comparison failed correctness checks; see reference_failures' if failures
+                       else 'Native comparison could not collect all samples; see report')
+            return {'status': 'failed', 'error': message,
                     'collection_complete': False, 'required_coverage_complete': False, 'qualified': False,
                     'comparisons': [], 'reference_failures': failures, 'report': str(output),
+                    'collection_failed_rows': collection_failed_rows, 'missing_samples': missing_samples,
                     'selection': quick_selection, 'exit_code': 1}
         raise RuntimeError('Collector failed; see its retained receipt and partial reports')
     if args.full:
@@ -645,7 +662,9 @@ def _run(args, directories):
             gates = ', '.join(f'{name}={count}' for name, count in failure['gate_counts'].items()) or 'none'
             print(f"{failure['fixture']} reference={failure['reference']} method={failure['method']} "
                   f"losses: {losses}; failed checks: {gates}")
-        if result.get('reference_failures'):
+        if result.get('missing_samples'):
+            print(f"Sample measurements unavailable: {result['missing_samples']}")
+        if result['status'] == 'failed' and 'report' in result:
             print('Report: ' + result['report'])
         for item in result.get('comparisons', []):
             for metric in ('wall_s', 'cpu_s', 'rss_bytes'):
