@@ -414,8 +414,9 @@ class ImageRollbackStateTests(unittest.TestCase):
             image.write_bytes(b'current synthetic image'); image.chmod(0o600)
             backup.write_bytes(b'saved synthetic image'); backup.chmod(0o600)
             point.mkdir(mode=0o700)
-            meta = {'id': workspace, 'commit': 'c' * 40, 'branch': 'main', 'backend': 'image'}
+            meta = {'id': workspace, 'commit': 'c' * 40, 'branch': f'stallionfs/{workspace}', 'backend': 'image'}
             write_json(path / 'meta.json', meta)
+            write_json(path / 'ready.json', {'id': workspace})
             write_json(saved / 'meta.json', {'id': snapshot, 'workspace': workspace, 'backend': 'image',
                                            'payload': lifecycle.identity(backup)})
             identities = lifecycle.identity(image), lifecycle.identity(backup)
@@ -451,7 +452,6 @@ class ImageRollbackStateTests(unittest.TestCase):
                     patch.object(_scan, 'mounts', return_value=[]), \
                     patch.object(images, 'flush') as flush, patch.object(images, 'clone') as clone, \
                     patch.object(_scan, 'move') as exchange, patch.object(store, '_standalone_git'), \
-                    patch.object(core, 'git', return_value='main'), \
                     patch.object(subprocess, 'Popen', side_effect=AssertionError('unexpected subprocess')):
                 store.enroll(workspace); store.cleanup_config(enabled=True)
                 with self.assertRaises(StallionError) as caught:

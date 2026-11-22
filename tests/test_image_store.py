@@ -449,10 +449,17 @@ class ImageRecoveryTests(unittest.TestCase):
     def test_mount_retries_ready_marker_fsync_enospc_without_resetting_branch(self):
         store, path, repo, metadata, _ = self.image_initialization_fixture()
         marker = path / 'ready.json'
-        with patch('stallionfs.core.os.fsync', side_effect=OSError(errno.ENOSPC, 'marker full')):
+        fault = OSError(errno.ENOSPC, 'marker full')
+
+        def write_ready(target, value):
+            self.assertEqual(target, marker)
+            with patch('stallionfs.core.os.fsync', side_effect=fault):
+                write_json(target, value)
+
+        with patch('stallionfs.core.write_json', side_effect=write_ready):
             with self.assertRaisesRegex(StallionError, 'retained; retry with mount') as raised:
                 store._mount(path, metadata)
-        self.assertEqual(raised.exception.__cause__.errno, errno.ENOSPC)
+        self.assertIs(raised.exception.__cause__, fault)
         self.assertFalse(marker.exists())
         self.assertEqual(list(path.glob('.ready.json.*')), [])
         self.assertEqual(git(repo, 'branch', '--show-current'), metadata['branch'])
@@ -478,6 +485,33 @@ class ImageRecoveryTests(unittest.TestCase):
             store._mount(path, metadata)
         self.assertEqual(git(repo, 'branch', '--show-current'), '')
         self.assertEqual(git(repo, 'rev-parse', f'refs/heads/{branch}'), unexpected)
+        self.assertFalse((path / 'ready.json').exists())
+
+    def test_mount_refuses_dangling_workspace_ref_before_checkout(self):
+        store, path, repo, metadata, _ = self.image_initialization_fixture()
+        ref = f"refs/heads/{metadata['branch']}"
+        target = 'refs/heads/missing'
+        git(repo, 'symbolic-ref', ref, target)
+        with self.assertRaisesRegex(StallionError, 'unexpected workspace branch'):
+            store._mount(path, metadata)
+        self.assertEqual(git(repo, 'symbolic-ref', '--no-recurse', ref), target)
+        self.assertEqual(git(repo, 'for-each-ref', '--format=%(refname)', '--', target), '')
+        self.assertEqual(git(repo, 'branch', '--show-current'), '')
+        self.assertEqual(git(repo, 'rev-parse', 'HEAD'), metadata['commit'])
+        self.assertFalse((path / 'ready.json').exists())
+
+    def test_mount_refuses_indirect_head_to_workspace_branch(self):
+        store, path, repo, metadata, _ = self.image_initialization_fixture()
+        ref = f"refs/heads/{metadata['branch']}"
+        alias = 'refs/heads/alias'
+        git(repo, 'branch', metadata['branch'], metadata['commit'])
+        git(repo, 'symbolic-ref', alias, ref)
+        git(repo, 'symbolic-ref', 'HEAD', alias)
+        with self.assertRaisesRegex(StallionError, 'unexpected workspace branch'):
+            store._mount(path, metadata)
+        self.assertEqual(git(repo, 'symbolic-ref', '--no-recurse', 'HEAD'), alias)
+        self.assertEqual(git(repo, 'symbolic-ref', '--no-recurse', alias), ref)
+        self.assertEqual(git(repo, 'rev-parse', ref), metadata['commit'])
         self.assertFalse((path / 'ready.json').exists())
 
     def test_mount_refuses_ambiguous_ready_marker_before_attaching(self):
