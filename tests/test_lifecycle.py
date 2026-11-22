@@ -1106,6 +1106,50 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertTrue(any(str(stage) in note for note in raised.exception.__notes__))
 
+    def test_protected_purge_retains_marker_until_relocation_is_durable(self):
+        self.stale()
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [self.workspace])
+        trash = self.store.root / 'trash' / self.workspace
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        marker = protection.read_bytes()
+        original = lifecycle.identity(trash)
+        rename = Path.rename
+
+        def refuse_rename(source, destination):
+            if source == trash:
+                raise OSError(errno.EIO, 'fixture purge rename failed')
+            return rename(source, destination)
+
+        with patch.object(Path, 'rename', refuse_rename), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge rename failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertEqual(lifecycle.identity(trash), original)
+        self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+        self.assertTrue(protection.is_file(), 'failed relocation discarded trash protection')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
+        sync = core.sync_directory
+        staging = self.store.root / 'staging'
+
+        def refuse_stage_sync(directory):
+            if directory.parent == staging:
+                self.assertEqual(protection.read_bytes(), marker)
+                raise OSError(errno.EIO, 'fixture purge staging sync failed')
+            return sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=refuse_stage_sync), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before durable relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge staging sync failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertFalse(trash.exists())
+        retained, = staging.glob('*/expired')
+        self.assertEqual(lifecycle.identity(retained), original)
+        self.assertEqual((retained / 'repo/file').read_text(), 'original\n')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)
