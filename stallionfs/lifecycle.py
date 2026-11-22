@@ -123,15 +123,29 @@ class Lifecycle:
 
     def _clear_restored_protection(self, workspace, path):
         protection = self.root / 'protected' / f'{workspace}.json'
-        if os.path.lexists(protection):
-            try:
-                retired = core.read_json(protection)
-                if (retired.get('id') == workspace and retired.get('object') == identity(path) and
-                        core.re.fullmatch('[0-9a-f]{32}', str(retired.get('generation', ''))) and
-                        not os.path.lexists(self.root / 'trash' / workspace)):
-                    protection.unlink()
-            except (core.StallionError, OSError):
-                pass  # Uncertain protection remains; reopening never authorizes deletion.
+        if not os.path.lexists(protection):
+            return
+        trash = self.root / 'trash'
+        try:
+            retired = core.read_json(protection)
+            matches = (retired.get('id') == workspace and retired.get('object') == identity(path) and
+                       core.re.fullmatch('[0-9a-f]{32}', str(retired.get('generation', ''))) and
+                       not os.path.lexists(trash / workspace))
+        except (core.StallionError, OSError):
+            return  # Uncertain protection remains.
+        if not matches:
+            return
+        try:
+            # Keep protection until the active location and open state are durable.
+            core.sync_directory(path.parent)
+            core.sync_directory(trash)
+            core.sync_directory(self._state(workspace).parent)
+            protection.unlink()
+            core.sync_directory(protection.parent)
+        except OSError as error:
+            raise core.StallionError(
+                f'Workspace is active at {path}. Could not finish updating trash protection ({error}). '
+                'Reopen the workspace after resolving the storage error.') from error
 
     def _no_mounts(self, path):
         from ._scan import mounts
@@ -331,9 +345,20 @@ class Lifecycle:
         finalized = {**record, 'outcome': outcome}
         if saved != record and saved != finalized:
             raise core.StallionError(f'Conflicting rollback evidence at {slot}; retained without changes')
+        image = record['backend'] == 'image'
+        if image and outcome == 'exchanged':
+            core.sync_directory(current.parent)
+            core.sync_directory(slot)
         replace_json(slot / 'meta.json', finalized)
         self._open(workspace, path, meta)
+        if image:
+            # Keep the intent until both recovery and lifecycle records are durable.
+            core.sync_directory(slot)
+            core.sync_directory(slot.parent)
+            core.sync_directory(self._state(workspace).parent)
         journal.unlink()
+        if image:
+            core.sync_directory(journal.parent)
 
     def rollback(self, workspace, snapshot, *, quiescent=False, continue_operation=None):
         native_result = [None]
@@ -373,8 +398,17 @@ class Lifecycle:
                           'old': identity(payload), 'candidate': identity(candidate), 'outcome': 'intent'}
                 journal = self.root / 'journals' / f'{workspace}.json'
                 try:
+                    image = saved['backend'] == 'image'
+                    if image:
+                        from . import images
+                        images.flush(candidate)
                     core.write_json(slot / 'meta.json', record)
+                    if image:
+                        core.sync_directory(slot)
+                        core.sync_directory(slot.parent)
                     core.write_json(journal, record)
+                    if image:
+                        core.sync_directory(journal.parent)
                     from ._scan import move
                     move(payload, candidate, exchange=True)
                     self._reconcile(workspace)
