@@ -1,5 +1,18 @@
 # Usage
 
+`sfs doctor --installation` reports read-only installation checks and an ordered
+removal plan; it does not install, remove, enable or change anything. Use
+`sfs --root PATH --json doctor --installation` for one JSON report. Exit 0 means
+all readiness checks passed; exit 1 means attention is needed. The packaged
+0.7 FSKit app requires Apple silicon and macOS 27 or newer. The platform check
+applies only to the app. Developer ID signature and Gatekeeper/notarization
+acceptance are reported separately as
+informational and do not affect readiness; neither does a missing store root on
+a fresh install. The product version in
+Info.plist is compared to the CLI version; the independent bundle build number
+is also reported. Passing does not imply release qualification or extension
+enablement. Plain `sfs doctor` still runs the existing clone/isolation test.
+
 ## File operations
 
 ```sh
@@ -171,7 +184,7 @@ sfs cleanup --apply
 sfs cleanup --disable
 ```
 
-Cleanup is off by default. Both global enablement and workspace enrollment are required. `enroll --disable WORKSPACE_ID` removes enrollment. `run` holds an exclusive managed-use lease and records the workspace as open before starting the command. For ordinary `run`, command exit, a dead process, or a released lease never means closed. Only explicit `close --quiescent` records closure. It also normally detaches and flushes image workspaces. Running commands does not contain their descendants or restrict filesystem access.
+Cleanup is off by default. Both global enablement and workspace enrollment are required. `enroll --disable WORKSPACE_ID` removes enrollment. `run` holds an exclusive managed-use lease and records the workspace as open before starting the command. The direct child inherits the lease and keeps the workspace busy while its descriptor stays open, even if the `sfs run` wrapper exits. Stop unmanaged writers before asserting `--quiescent`. For ordinary `run`, command exit, a dead process, or a released lease never means closed. Only explicit `close --quiescent` records closure. It also normally detaches and flushes image workspaces. Running commands does not contain their descendants or restrict filesystem access.
 
 Enabled cleanup retires eligible workspaces seven days after explicit closure or the first reliable idle observation of an opted-in cooperative session. It skips ordinary open, legacy, unknown, busy, mounted, corrupt, or identity-changed workspaces and invalid or future timestamps. Explicit preview and apply inspect the full workspace collection. Managed CLI mutations also attempt a nonblocking pass over at most eight workspace IDs after completing the requested operation. A saved lexical cursor advances over busy and ineligible IDs too, so later workspaces are visited on subsequent passes. Ordinary file operations never run cleanup. This is opportunistic maintenance; there is no scheduled service. Preview does not record idle observations, reconcile pending rollbacks, or advance the cursor. Apply also skips pending rollback journals until an explicit workspace operation resolves them.
 
@@ -446,3 +459,9 @@ command can report a committed change or unknown publication; it does not imply
 rollback. Preserve its recovery name and inspect the image before repeating the
 operation. Later explicitly requested calls use fresh ordinary validation;
 malformed slot pairs require explicit recovery rather than automatic repair.
+
+If the command reports that image recovery is required, keep the backing file
+and its store records unchanged. If you have a verified intact backup, make a
+separate closed copy in a private directory on local APFS. Register that copy
+with `sfs --root NEW_STORE register-native-image BACKUP_COPY.sfs`, using an
+unused store path to keep the new registration separate.

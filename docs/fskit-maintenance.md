@@ -41,7 +41,36 @@ Sign the standalone role with identifier
 `sign_maintenance_leaf` accepts an explicit signer and unsigned input digest,
 refuses an already sealed app, and verifies the independent expected publisher.
 Sign all other nested code, finalize Git and its generated `runtime.json`, then
-seal the outer app. `final_maintenance_bindings` verifies the outer app,
+seal the outer app.
+
+For direct distribution, submit a separate ZIP for notarization and staple the
+accepted ticket to the sealed app. Create a fresh final ZIP after stapling.
+Set `FINAL_APP` to the source-matched, admitted physical `StallionFS.app`,
+`RELEASE_PARENT` to a caller-exclusive 0700 output directory outside the app,
+and `PUBLISHER_TEAM` to the independently selected publisher. Run the command
+from the reviewed checkout with a trusted Xcode selected. Keep the input and
+working directories local, outside file sync and exclusive to this staging
+operation.
+
+```sh
+python3 -I -B tools/build_fskit_distribution.py \
+  --app "$FINAL_APP" --release-parent "$RELEASE_PARENT" --publisher "$PUBLISHER_TEAM"
+```
+
+On success, the printed private directory holds `StallionFS.zip` and
+`final-maintenance-bindings.json`. The command checks the exact archive before
+extraction and checks the physical extraction against the same binding. It
+requires Developer ID Application and validates the stapled ticket on that
+extracted app. The ZIP excludes quarantine and provenance transfer metadata.
+Other extended attributes, ACLs, and filesystem flags changed by the archive
+round trip stop staging. A failed attempt can leave a private ZIP and
+verification scratch at the path reported with the error. Use only the
+directory reported on success, and retain its archive and bindings together.
+Keep corresponding sources and
+licenses beside the archive. Installation and qualification of that exact ZIP
+remain separate release steps.
+
+`final_maintenance_bindings` verifies the outer app,
 extension, leaf and every Mach-O member against the independently expected
 publisher, compares the exact app-only ZIP against the final app inventory, and
 returns final artifact, descriptor, observer, compatibility and signed-leaf

@@ -373,8 +373,9 @@ and an existing owned `0700` output parent. The default host/module-only recipe
 below is unchanged. This option assembles an unsigned candidate; it does not
 install, register, sign or notarize an app.
 
-The schema-1 input object has exactly `schema`, `python_descriptor`, `git`,
-`wheel`, `licenses` and `sources`. A pinned file is an object with absolute
+The schema-1 input object requires `schema`, `python_descriptor`, `git`,
+`wheel`, `licenses` and `sources`, with optional `hosted_components`
+for hosted build inputs. A pinned file is an object with absolute
 `path` and lowercase SHA-256 `sha256` fields:
 
 ```json
@@ -556,9 +557,27 @@ These are assembly inputs, not a self-contained release: the shell app lacks
 the private Python and Git runtimes required by the bundled-runtime recipe.
 No private runtime descriptors, licenses/source sidecars, installation receipts,
 fixture identities, keys, profiles, or account identifiers are workflow inputs.
-Bundle version 146 identifies this component build; the product version is
-unchanged. A later private assembly must use the matching wheel and preserve
-its source and build provenance.
+Bundle version 146 identifies this component build. For private assembly
+from these components, include this entry in the `--runtime-inputs` JSON using
+the commit, tree and receipt digest retained from the reviewed producer run:
+
+```json
+"hosted_components": {
+  "source_commit": "<40 lowercase hexadecimal digits>",
+  "source_tree": "<40 lowercase hexadecimal digits>",
+  "provenance": {"path": "/inputs/provenance.json", "sha256": "<64 lowercase hexadecimal digits>"}
+}
+```
+
+The packager checks the unsigned producer receipt's SHA-256 and compares
+its commit and tree fields with the independently selected values.
+It compares the Host, extension, maintenance executable and wheel it actually
+consumes with the producer's sizes and digests. It also checks the local plist
+templates, maintenance sources and launcher helper against their producer
+source digests. Assembly can assign a different bundle version to the new app.
+The external assembly receipt records the matched inputs in
+`runtime.hosted_components`. Keep it with the producer receipt. Manual
+assembly can omit this entry and produces no hosted component binding.
 
 ## Maintenance resources
 

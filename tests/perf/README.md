@@ -493,10 +493,11 @@ is also validated and preserved byte for byte.
 
 ## Linux/OpenZFS native references
 
-Linux admits `docs_5k_100mb` with copy/cp or clone/cp-clone, and
-`dependencies_100k` with copy/cp. Both require warm cache, ten direct and ten
-resource samples, one run, and no StallionFS binary or worker-count option.
-Select one workload and method per new report:
+Linux admits the five original bulk profiles with clone/cp-clone or delete/cp.
+The separate ordinary-copy controls remain `docs_5k_100mb` and
+`dependencies_100k` with copy/cp. Each report selects one workload and method
+with warm cache, ten direct and ten resource samples, one run, and no
+StallionFS binary or worker-count option.
 
 ```sh
 python tests/perf/native_suite.py --scratch /path/on/zfs \
@@ -514,8 +515,11 @@ an unsupported clone fails rather than falling back to byte copy. Both retain
 the same content, metadata, POSIX ACL/xattr, hardlink, sparse, independent-inode,
 unchanged-source and sentinel checks. A clone command, raw measurement or
 semantic failure stops the cell and retains the owned fixture and journal.
-Changed source or executable pins also retain the clone fixture. Do not resume
-or rerun a failed cell.
+For deletion, `gnu-rm` times `rm -rf --one-file-system -- TARGET` on a fresh
+independent operand prepared with `gnu-cp` outside timing. The runner checks
+space before each copy and rechecks the owned paths and mount inventory before
+running the command. A failed clone or delete cell retains the fixture and
+journal. Do not resume or rerun a failed cell.
 
 Clone evidence has separate outcomes:
 
@@ -541,10 +545,11 @@ physical-optimization claim remains inconclusive without corroboration. GNU
 documents required-reflink behavior in its [coreutils source](https://github.com/coreutils/coreutils/blob/v9.7/src/copy.c);
 OpenZFS documents the aggregate [pool counters](https://openzfs.github.io/openzfs-docs/man/v2.4/7/zpoolprops.7.html).
 
-The two methods produce separate descriptive summaries, with no paired verdict
+The methods produce separate descriptive summaries, with no paired verdict
 or product comparison. Keep an existing ordinary-copy reference intact when
 adding clone evidence; do not pool statistics or recollect ordinary copy merely
-because other source changed. No clone results are implied by these instructions.
+because other source changed. The retained documents-tree measurements above
+apply only to the recorded copy and clone cells.
 Any published reference needs its measured source identity, raw evidence hashes,
 host/guest context and independent verification, with private paths removed.
 

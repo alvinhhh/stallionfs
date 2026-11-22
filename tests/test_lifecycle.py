@@ -17,28 +17,38 @@ from stallionfs.core import Store, StallionError, git, read_json, write_json
 
 
 class RollbackEvidenceTests(unittest.TestCase):
-    def pending_exchange(self, backend):
+    def workspace_fixture(self, backend):
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         store = Store(base / 'store')
-        workspace, recovery = 'a' * 32, 'b' * 32
+        workspace = 'a' * 32
         path = store.root / 'workspaces' / workspace
-        slot = store.root / 'recovery' / recovery
-        for directory in (path, slot):
-            directory.mkdir(mode=0o700)
+        path.mkdir(mode=0o700)
         if backend == 'image':
             (path / 'volume').mkdir(mode=0o700)
-            current, candidate = path / 'workspace.sparseimage', slot / 'workspace.sparseimage'
-            before, after = current, candidate
+            current = path / 'workspace.sparseimage'
+            before = current
         else:
-            current, candidate = path / 'repo', slot / 'repo'
+            current = path / 'repo'
             current.mkdir()
-            candidate.mkdir()
-            before, after = current / 'file', candidate / 'file'
+            before = current / 'file'
         before.write_bytes(b'old workspace')
-        after.write_bytes(b'snapshot clone')
         meta = {'id': workspace, 'commit': 'c' * 40, 'backend': backend}
         write_json(path / 'meta.json', meta)
         store._open(workspace, path, meta)
+        return store, workspace, current
+
+    def pending_exchange(self, backend, *, exchanged=True):
+        store, workspace, current = self.workspace_fixture(backend)
+        recovery = 'b' * 32
+        slot = store.root / 'recovery' / recovery
+        slot.mkdir(mode=0o700)
+        candidate = slot / current.name
+        if backend == 'image':
+            after = candidate
+        else:
+            candidate.mkdir()
+            after = candidate / 'file'
+        after.write_bytes(b'snapshot clone')
         record = dict(format=1, id=recovery, workspace=workspace, recovery=recovery,
                       snapshot='d' * 32, backend=backend, created=1,
                       old=lifecycle.identity(current), candidate=lifecycle.identity(candidate), outcome='intent')
@@ -46,10 +56,11 @@ class RollbackEvidenceTests(unittest.TestCase):
         retained = slot / 'meta.json'
         write_json(journal, record)
         write_json(retained, record)
-        temporary = slot / 'exchange-temp'
-        current.rename(temporary)
-        candidate.rename(current)
-        temporary.rename(candidate)
+        if exchanged:
+            temporary = slot / 'exchange-temp'
+            current.rename(temporary)
+            candidate.rename(current)
+            temporary.rename(candidate)
         return store, journal, retained, current, candidate, record
 
     def assert_exchanged_payloads(self, current, candidate, record):
@@ -90,6 +101,87 @@ class RollbackEvidenceTests(unittest.TestCase):
                 self.assertFalse(journal.exists())
                 self.assertEqual(read_json(retained), finalized)
                 self.assert_exchanged_payloads(current, candidate, record)
+
+    def test_image_rollback_does_not_exchange_before_intent_sync(self):
+        from stallionfs import images
+        store, workspace, current = self.workspace_fixture('image')
+        snapshot = 'd' * 32
+        source = store.root / 'snapshots' / snapshot
+        source.mkdir(mode=0o700)
+        saved = source / current.name
+        saved.write_bytes(b'snapshot clone')
+        write_json(source / 'meta.json', {'id': snapshot, 'workspace': workspace,
+                                         'backend': 'image', 'payload': lifecycle.identity(saved)})
+        journal = store.root / 'journals' / f'{workspace}.json'
+        events = []
+
+        def clone(source_image, candidate):
+            self.assertEqual(source_image, saved)
+            candidate.write_bytes(saved.read_bytes())
+
+        def sync(directory):
+            events.append(('sync', directory))
+            if directory == journal.parent and journal.exists():
+                raise OSError(errno.EIO, 'journal sync refused')
+
+        with (patch.object(store, '_closed_payload', return_value=(current, False)),
+              patch.object(images, 'clone', side_effect=clone),
+              patch.object(images, 'flush', side_effect=lambda candidate: events.append(('flush', candidate))),
+              patch.object(core, 'sync_directory', side_effect=sync),
+              patch.object(_scan, 'move', side_effect=AssertionError('exchange reached before intent was synced')) as move):
+            with self.assertRaisesRegex(OSError, 'journal sync refused'):
+                store.rollback(workspace, snapshot)
+            move.assert_not_called()
+        slot, = (store.root / 'recovery').iterdir()
+        candidate = slot / current.name
+        self.assertEqual(events[:4], [('flush', candidate), ('sync', slot),
+                                      ('sync', slot.parent), ('sync', journal.parent)])
+        self.assertEqual(current.read_bytes(), b'old workspace')
+        self.assertEqual(candidate.read_bytes(), b'snapshot clone')
+        self.assertEqual(saved.read_bytes(), b'snapshot clone')
+
+    def test_image_rollback_keeps_intent_until_recovery_is_synced(self):
+        for exchanged in (False, True):
+            with self.subTest(exchanged=exchanged):
+                store, journal, retained, current, candidate, record = self.pending_exchange('image', exchanged=exchanged)
+                workspace = record['workspace']
+                state = store._state(workspace)
+                outcome = 'exchanged' if exchanged else 'not-exchanged'
+                expected = {**record, 'outcome': outcome}
+                events = []
+                refuse = True
+
+                def sync(directory):
+                    events.append((directory, read_json(retained)['outcome'], journal.exists()))
+                    if directory == state.parent and refuse:
+                        raise OSError(errno.EIO, 'lifecycle sync refused')
+
+                with (patch.object(_scan, 'move') as move,
+                      patch.object(core, 'sync_directory', side_effect=sync)):
+                    with self.assertRaisesRegex(OSError, 'lifecycle sync refused'):
+                        Store(store.root).enroll(workspace)
+                    self.assertEqual(read_json(journal), record)
+                    self.assertEqual(read_json(retained), expected)
+                    final_syncs = [(directory, outcome, True)
+                                   for directory in (retained.parent, retained.parent.parent, state.parent)]
+                    exchange_syncs = ([(directory, 'intent', True)
+                                       for directory in (current.parent, candidate.parent)] if exchanged else [])
+                    self.assertEqual(events, exchange_syncs + final_syncs)
+                    refuse = False
+                    events.clear()
+                    Store(store.root).enroll(workspace)
+                    self.assertEqual(events[-1], (journal.parent, outcome, False))
+                    move.assert_not_called()
+                self.assertFalse(journal.exists())
+                self.assertEqual(read_json(retained), expected)
+                self.assertTrue(read_json(state)['enrolled'])
+                if exchanged:
+                    self.assert_exchanged_payloads(current, candidate, record)
+                else:
+                    self.assertEqual(lifecycle.identity(current), record['old'])
+                    self.assertEqual(lifecycle.identity(candidate), record['candidate'])
+                    self.assertEqual(current.read_bytes(), b'old workspace')
+                    self.assertEqual(candidate.read_bytes(), b'snapshot clone')
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'requires native private-directory admission')
@@ -297,6 +389,48 @@ class NativeReferenceTests(unittest.TestCase):
             self.assertEqual(observed['native_image_result']['recovery'], 'prior-current')
             self.assertEqual(observed['native_image_result']['receipt']['physical_end'], 69632)
             self.assertIn('committed', observed['error'])
+
+    def test_native_recovery_error_reports_safe_backup_option(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        import stallionfs
+        from stallionfs.__main__ import main
+
+        args = ['--root', str(self.store.root), '--json']
+        catalog = [{'id': 'before', 'name': 'before', 'view': 1, 'backend': 'native-image'}]
+        module = SimpleNamespace(snapshots=lambda *_args: {'ok': True, 'snapshots': catalog})
+        with patch.object(core, 'native_operation', self.real_native_operation):
+            with patch.object(stallionfs, '_image', module, create=True), \
+                    redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                self.assertEqual(main(args + ['snapshots', self.workspace]), 0)
+            self.assertEqual(json.loads(out.getvalue()), catalog)
+            self.assertEqual(err.getvalue(), '')
+
+            for branch, operation, status, error_code in (
+                    (['snapshots', self.workspace], 'snapshots', 7, errno.EIO),
+                    (['snapshots', self.workspace], 'snapshots', 2, errno.EIO),
+                    (['rollback', self.workspace, 'missing'], 'restore', 10, errno.ENOENT),
+                    (['snapshots', self.workspace], 'snapshots', None, errno.EIO)):
+                with self.subTest(operation=operation, status=status, error_code=error_code):
+                    receipt = None if status is None else {'status': status, 'system_errno': 0}
+                    result = dict(ok=False, operation=operation, error_code=error_code, receipt=receipt,
+                                  committed=False, commit_attempted=False, outcome='not_committed')
+                    module = SimpleNamespace(**{operation: lambda *_args: result})
+                    with patch.object(stallionfs, '_image', module, create=True), \
+                            redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+                        self.assertEqual(main(args + branch), 1)
+                    self.assertEqual(out.getvalue(), '')
+                    report = json.loads(err.getvalue())
+                    self.assertEqual(report['native_image_result'], result)
+                    if status == 7:
+                        self.assertIn('Image recovery is required. Keep this backing file unchanged.', report['error'])
+                        self.assertIn('verified intact backup, register a separate closed copy in a fresh store.',
+                                      report['error'])
+                    else:
+                        self.assertEqual(report['error'], f'Native image {operation} failed: {os.strerror(error_code)}')
+        self.assertEqual(self.image.read_bytes(), b'owned external fixture')
+        self.assertFalse(list((self.store.root / 'journals').iterdir()))
 
     def test_response_exists_before_mutation_and_error_format_oom_retains_returned_receipts(self):
         import inspect
@@ -752,6 +886,57 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
         self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
 
+    def test_protected_restore_keeps_marker_until_active_location_is_synced(self):
+        self.stale()
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [self.workspace])
+        root = self.store.root
+        trash = root / 'trash' / self.workspace
+        protection = root / 'protected' / f'{self.workspace}.json'
+        marker = protection.read_bytes()
+        original = lifecycle.identity(trash)
+        contents = (trash / 'repo/file').read_bytes()
+        failed = OSError(errno.EIO, 'restore collection failed to sync')
+        sync = core.sync_directory
+
+        def fail_sync(directory):
+            if directory == self.path.parent:
+                raise failed
+            sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=fail_sync):
+            error = None
+            try:
+                self.store.move(self.workspace, restore=True)
+            except StallionError as reported:
+                error = reported
+            self.assertTrue(protection.exists(), 'restore cleared protection before syncing the active location')
+            self.assertEqual(protection.read_bytes(), marker)
+            self.assertIn(str(self.path), str(error))
+            self.assertFalse(trash.exists())
+            self.assertEqual(lifecycle.identity(self.path), original)
+            self.assertEqual((self.repo / 'file').read_bytes(), contents)
+            with self.assertRaisesRegex(StallionError, 'restore collection failed to sync'):
+                Store(root).enroll(self.workspace)
+            self.assertEqual(protection.read_bytes(), marker)
+
+        self.path.rename(trash)  # Model the old namespace after interrupted synchronization.
+        self.assertEqual(Store(root).gc(older_than=0), [])
+        self.assertEqual(lifecycle.identity(trash), original)
+        events = []
+
+        def record_sync(directory):
+            events.append((directory, protection.exists()))
+            sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=record_sync):
+            Store(root).move(self.workspace, restore=True)
+        self.assertEqual(events, [(root / 'workspaces', True), (root / 'trash', True),
+                                  (root / 'lifecycle', True), (root / 'protected', False)])
+        self.assertFalse(protection.exists())
+        self.assertEqual(lifecycle.identity(self.path), original)
+        self.assertEqual((self.repo / 'file').read_bytes(), contents)
+        self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
+
     def test_cleanup_skips_open_unknown_clock_corrupt_identity_and_mounts(self):
         state = self.stale()
         cases = ({'status': 'open'}, {'status': 'unknown'}, {'generation': 'old'}, {'enrolled': False},
@@ -1106,6 +1291,50 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertTrue(any(str(stage) in note for note in raised.exception.__notes__))
 
+    def test_protected_purge_retains_marker_until_relocation_is_durable(self):
+        self.stale()
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [self.workspace])
+        trash = self.store.root / 'trash' / self.workspace
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        marker = protection.read_bytes()
+        original = lifecycle.identity(trash)
+        rename = Path.rename
+
+        def refuse_rename(source, destination):
+            if source == trash:
+                raise OSError(errno.EIO, 'fixture purge rename failed')
+            return rename(source, destination)
+
+        with patch.object(Path, 'rename', refuse_rename), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge rename failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertEqual(lifecycle.identity(trash), original)
+        self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+        self.assertTrue(protection.is_file(), 'failed relocation discarded trash protection')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
+        sync = core.sync_directory
+        staging = self.store.root / 'staging'
+
+        def refuse_stage_sync(directory):
+            if directory.parent == staging:
+                self.assertEqual(protection.read_bytes(), marker)
+                raise OSError(errno.EIO, 'fixture purge staging sync failed')
+            return sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=refuse_stage_sync), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before durable relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge staging sync failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertFalse(trash.exists())
+        retained, = staging.glob('*/expired')
+        self.assertEqual(lifecycle.identity(retained), original)
+        self.assertEqual((retained / 'repo/file').read_text(), 'original\n')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)
@@ -1209,6 +1438,47 @@ os.close(fd)
 done.write_text('done')
 """)
         return script
+
+    def test_run_passes_the_managed_lease_without_enabling_retirement(self):
+        self.store.enroll(self.workspace)
+        self.store.cleanup_config(enabled=True)
+        command = ['fixture-command']
+        lease = self.store.root / 'locks' / f'use-{self.workspace}'
+        for auto_retire in (False, True):
+            with self.subTest(auto_retire=auto_retire):
+                inherited = []
+
+                def child(argv, *, cwd, stdout, **options):
+                    self.assertEqual((argv, cwd, stdout), (command, str(self.repo), None))
+                    self.assertIn('pass_fds', options)
+                    descriptor, = options['pass_fds']
+                    self.assertTrue(os.path.samestat(os.fstat(descriptor), lease.stat()))
+                    if auto_retire:
+                        environment = options['env']
+                        self.assertEqual(environment['STALLIONFS_LEASE_FD'], str(descriptor))
+                        self.assertEqual(environment['STALLIONFS_LEASE_GENERATION'],
+                                         read_json(self.store._state(self.workspace))['generation'])
+                    else:
+                        self.assertNotIn('env', options)
+                    inherited.append(os.dup(descriptor))
+                    return subprocess.CompletedProcess(argv, 7)
+
+                try:
+                    with patch.object(lifecycle.subprocess, 'run', side_effect=child) as launch:
+                        self.assertEqual(self.store.run(self.workspace, command, auto_retire=auto_retire),
+                                         {'workspace': self.workspace, 'returncode': 7})
+                    launch.assert_called_once()
+                    self.assertFalse(self.lease_is_free())
+                    state = read_json(self.store._state(self.workspace))
+                    self.assertEqual(state['status'], 'open')
+                    if auto_retire:
+                        self.assertEqual(state['auto_retire'], {'generation': state['generation']})
+                    else:
+                        self.assertNotIn('auto_retire', state)
+                finally:
+                    for descriptor in inherited:
+                        os.close(descriptor)
+                self.assertTrue(self.lease_is_free())
 
     def test_auto_retire_normal_and_nonzero_exit_observe_exact_session(self):
         self.store.enroll(self.workspace)
