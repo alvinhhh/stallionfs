@@ -17,6 +17,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from uuid import UUID
 
 
 PERF = Path(__file__).parent / 'perf'
@@ -218,6 +219,7 @@ class ScannerStatistics(unittest.TestCase):
             self.assertEqual(self.sampler.call_count, 90)
             self.assertIn('native_metrics.py', report['implementation_sha256'])
             self.assertIn('native_correctness.py', report['implementation_sha256'])
+            identities = set()
             for details in report['workloads'].values():
                 metadata = details['metadata']
                 self.assertEqual(metadata['status'], 'prepared')
@@ -228,6 +230,11 @@ class ScannerStatistics(unittest.TestCase):
                     self.assertIn('file', json.load(stream)['entries'])
                 self.assertEqual(len(details['sample_rows']), 36)
                 self.assertEqual(len(details['memory_rows']), 30)
+                for row in details['sample_rows']:
+                    identity = row['sample_id']
+                    self.assertEqual(UUID(identity).version, 4)
+                    self.assertNotIn(identity, identities)
+                    identities.add(identity)
                 self.assertTrue(all(row['validated'] and row['source_precheck']['unchanged'] and
                                     row['source_verification']['unchanged']
                                     for row in details['sample_rows'] + details['memory_rows']))
@@ -596,6 +603,24 @@ class ScannerStatistics(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, 'Memory child counts'):
             scan.memory_sample('/unused', 'posix', {'files': 1}, 'hash', '/unused-metrics', row)
         self.assertEqual(row, {'validated': False, **measured})
+
+    def test_memory_sample_retains_the_wrapper_identity(self):
+        child = subprocess.CompletedProcess([], 0,
+            b'{"counts": {"files": 1}, "native_binary_sha256": "hash"}', b'')
+        metrics = mock.Mock()
+        metrics.read_text.return_value = '4096 maximum resident set size\n'
+        ids = []
+        with mock.patch.object(scan.f, 'command', return_value=child), \
+             mock.patch.object(scan.f.time, 'perf_counter', side_effect=[0, 1, 0, 1]):
+            for _ in range(2):
+                row = {}
+                sample = scan.memory_sample('/unused', 'posix', {'files': 1}, 'hash', metrics, row)
+                self.assertEqual(sample['rss_bytes'], 4096)
+                identity = sample['sample_id']
+                self.assertEqual(row['sample_id'], identity)
+                self.assertEqual(UUID(identity).version, 4)
+                ids.append(identity)
+        self.assertNotEqual(*ids)
 
     def test_memory_requires_rss_and_footprint_remains_optional(self):
         completed = subprocess.CompletedProcess([], 0,

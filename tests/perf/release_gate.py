@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 import runpy
 import sys
 
@@ -13,6 +14,7 @@ BULK_IMPROVEMENT = 0.10
 MINIMUM_PAIRS = 10
 MINIMUM_RUNS = 3
 CANDIDATE_METHODS = {'stallionfs', 'candidate', 'bulk', 'bulk_serial', 'stallionfs_folder'}
+SAMPLE_ID = re.compile(r'[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
 CATALOG = runpy.run_path(str(Path(__file__).resolve().parents[2] /
                             'stallionfs' / '_benchmark_cases.py'))['CASES']
 UNIVERSE = tuple(case['id'] for case in CATALOG)
@@ -220,9 +222,35 @@ def evaluate_group(group):
             'reasons': sorted(set(errors))}
 
 
+def raw_report_rows(document):
+    if 'workloads' in document:
+        for workload in document['workloads'].values():
+            yield from workload.get('sample_rows', [])
+            yield from workload.get('memory_rows', [])
+    elif isinstance(document.get('comparisons'), dict) and 'raw' in document:
+        raw = document['raw']
+        if not isinstance(raw, dict):
+            raise ValueError('expected a raw workspace sample object')
+        for concurrency in raw.values():
+            if not isinstance(concurrency, dict):
+                raise ValueError('expected raw workspace methods for each concurrency')
+            for rows in concurrency.values():
+                yield from rows
+    else:
+        yield from document.get('rows', [])
+
+
 def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     collected = {case: [] for case in universe}
+    raw_sample_ids = set()
     for document in documents:
+        # Unscored reports and methods can still reveal reuse by a scored comparison.
+        for row in raw_report_rows(document):
+            if not isinstance(row, dict):
+                raise ValueError('expected a raw benchmark sample object')
+            identity = row.get('sample_id')
+            if isinstance(identity, str) and SAMPLE_ID.fullmatch(identity):
+                raw_sample_ids.add(identity)
         if 'workloads' in document:
             groups = api_groups(document)
         elif isinstance(document.get('comparisons'), dict) and 'raw' in document:
@@ -248,18 +276,53 @@ def evaluate_documents(documents, universe=UNIVERSE, input_errors=()):
     required = math.ceil(len(cases) * PASS_FRACTION)
     return {'passed': passing >= required and all(case['floor_passed'] for case in cases)
             and not input_errors, 'passing_cases': passing, 'total_cases': len(cases),
-            'required_passing_cases': required, 'cases': cases, 'input_errors': list(input_errors)}
+            'required_passing_cases': required, 'cases': cases, 'input_errors': list(input_errors),
+            'raw_sample_ids': sorted(raw_sample_ids)}
+
+
+def runs_overlap(identities):
+    return any(not left.isdisjoint(right) for index, left in enumerate(identities)
+               for right in identities[index + 1:])
+
+
+def independence_error(runs):
+    if runs_overlap([set(run.get('report_files', [])) for run in runs]):
+        return 'Runs overlap; independent qualification runs are required'
+    evidence = []
+    for index, run in enumerate(runs, 1):
+        sample_ids = set(run.get('raw_sample_ids', []))
+        for case in run['cases']:
+            for group in case['references']:
+                group_ids = set()
+                for rows in group['rows'].values():
+                    for row in rows:
+                        identity = row.get('sample_id')
+                        if not isinstance(identity, str) or not SAMPLE_ID.fullmatch(identity):
+                            return f"Run {index}, {case['case']}: missing or invalid raw sample_id"
+                        if identity in group_ids:
+                            return f"Run {index}, {case['case']}: raw sample_id repeated within a comparison"
+                        group_ids.add(identity)
+                # The two API bulk comparisons share the same POSIX samples.
+                sample_ids.update(group_ids)
+        evidence.append(sample_ids)
+    if runs_overlap(evidence):
+        return 'Runs overlap; raw benchmark samples were reused'
+    return None
 
 
 def qualify(runs):
     flips = [case['case'] for case in runs[0]['cases']
              if len({next(item['passed'] for item in run['cases'] if item['case'] == case['case'])
                      for run in runs}) > 1] if runs else []
-    return {'kind': 'release gate', 'qualified': len(runs) >= MINIMUM_RUNS and
-            all(run['passed'] for run in runs) and not flips,
-            'minimum_runs': MINIMUM_RUNS, 'constants': {'pass_fraction': PASS_FRACTION,
-            'single_file_saving_s': SINGLE_FILE_SAVING_S, 'bulk_improvement': BULK_IMPROVEMENT},
-            'verdict_flips': flips, 'runs': runs}
+    error = independence_error(runs)
+    result = {'kind': 'release gate', 'qualified': len(runs) >= MINIMUM_RUNS and
+              all(run['passed'] for run in runs) and not flips and error is None,
+              'minimum_runs': MINIMUM_RUNS, 'constants': {'pass_fraction': PASS_FRACTION,
+              'single_file_saving_s': SINGLE_FILE_SAVING_S, 'bulk_improvement': BULK_IMPROVEMENT},
+              'verdict_flips': flips, 'runs': runs}
+    if error:
+        result['input_error'] = error
+    return result
 
 
 def load_run(path):
@@ -340,10 +403,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         result = qualify([load_run(path) for path in args.runs])
-        files = [set(run['report_files']) for run in result['runs']]
-        if any(left & right for index, left in enumerate(files) for right in files[index + 1:]):
-            result['qualified'] = False
-            result['input_error'] = 'Runs overlap; independent qualification runs are required'
         print('RELEASE GATE (not collection passing); elapsed/CPU seconds, RSS bytes')
         print('Case | ' + ' | '.join(f'Run {i + 1}' for i in range(len(args.runs))) + ' | Reasons / medians native→sfs')
         for index, case in enumerate(UNIVERSE):
