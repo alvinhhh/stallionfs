@@ -543,12 +543,15 @@ def _remember_pin(pins, path, digest):
     _runtime_require(pins.setdefault(path, digest) == digest, 'Conflicting input pin')
 
 
-def _runtime_pinned(item, pins, *, max_bytes=RUNTIME_MAX_FILE):
+def _runtime_pinned(item, pins, *, max_bytes=None):
     _runtime_require(isinstance(item, dict) and set(item) == {'path', 'sha256'}
                      and isinstance(item['path'], str) and Path(item['path']).is_absolute()
                      and isinstance(item['sha256'], str) and re.fullmatch('[0-9a-f]{64}', item['sha256']),
                      'Expected an absolute pinned input')
-    data = _runtime_read(item['path'], item['sha256'], max_bytes=max_bytes)
+    if max_bytes is None:
+        data = _runtime_read(item['path'], item['sha256'])
+    else:
+        data = _runtime_read(item['path'], item['sha256'], max_bytes=max_bytes)
     _remember_pin(pins, item['path'], item['sha256'])
     return data
 
