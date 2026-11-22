@@ -9,12 +9,21 @@ storage. These source instructions do not install or enable the FSKit app.
 
 To replace a source install, stop commands using the old environment. Use the
 same source-install steps from the desired checkout in a fresh virtual
-environment, then activate it instead of the old one. This replaces the CLI
-you run; it does not migrate workspace data or qualify an FSKit app upgrade.
-To remove a source install, deactivate and remove the dedicated virtual
-environment. The workspace store is separate by default
-(`~/Library/Application Support/stallionfs`); preserve it and any custom
-`STALLIONFS_HOME` or `--root` location if you want to keep your workspaces.
+environment. If you reuse the same checkout, use a different path such as
+`.venv-replacement` in the environment creation, install, and activation
+commands. Keep the old environment until `command -v sfs` points to the new
+environment's `bin/sfs` and `sfs --help` runs successfully.
+
+To remove a source install, stop editors, shells, and other processes using
+its workspaces. With the old CLI, run `sfs unmount WORKSPACE_ID` for each
+mounted [APFS disk-image workspace](usage.md#disk-image-workspaces) you own.
+For a custom store, use the same `STALLIONFS_HOME` setting or run
+`sfs --root STORE_PATH unmount WORKSPACE_ID`. If a volume is busy or you cannot
+confirm it unmounted, keep the old CLI available until you resolve the mount state.
+
+Before deactivating and removing the old environment, confirm that your stores
+are outside it, including the default `~/Library/Application Support/stallionfs`
+and any stores selected with `STALLIONFS_HOME` or `--root`. Preserve those stores.
 
 There is no qualified end-user FSKit app upgrade or uninstall procedure on
 `main`. The repository has [exact-artifact maintenance tooling](fskit-maintenance.md),
