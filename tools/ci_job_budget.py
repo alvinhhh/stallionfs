@@ -287,9 +287,9 @@ def sparse():
 
 
 def tail(phase):
-    if phase not in ('validation', 'suite-upload', 'image-upload', 'interface-upload'):
-        raise ValueError('Fixed tail phase required')
     entry = entry_module_load()
+    if phase not in entry.TAIL_PHASES:
+        raise ValueError('Fixed tail phase required')
     job = None
     try:
         record, job, remaining = load(tail=True)
@@ -297,15 +297,33 @@ def tail(phase):
         root.mkdir(mode=0o700, exist_ok=True)
         # Reserve exclusively before exposing admission to the next action.
         with (root / ('tail-' + phase + '.json')).open('x') as stream:
+            wheel = None
+            if phase == 'wheel-upload':
+                # Both staging and upload are capped at one minute. Admit this
+                # optional work only after the existing diagnostic tail.
+                if remaining < 125:
+                    raise ValueError('Insufficient wheel staging and upload remainder')
+                checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+                import importlib.util
+                spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
+                controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
+                wheel = controller.stage_intel_wheel(checkout, root.parent, entry, job)
+                _, current, remaining = load(tail=True)
+                if current != job:
+                    raise ValueError('Allocation changed during wheel staging')
             if remaining < 65:
                 raise ValueError('Insufficient action remainder')
             receipt = dict(kind='tail', phase=phase, admitted=True, job=job,
                            remaining=remaining, action_cap=60)
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                 write_receipt(entry, stream, receipt)
+                if wheel is not None:
+                    output.write('wheel=' + wheel + '\n')
                 output.write('admitted=true\n')
         return 0
     except Exception as error:
+        if phase == 'wheel-upload':
+            print('Installed Intel wheel upload admission refused:', entry.exception_category(error), file=sys.stderr)
         try:
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                 output.write('admitted=false\n')

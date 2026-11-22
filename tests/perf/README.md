@@ -144,6 +144,22 @@ directories (or benchmark summary/native JSON files) with the stdlib-only gate:
 python3 tests/perf/release_gate.py RUN1 RUN2 RUN3 --json release-gate.json
 ```
 
+For a completed sequential campaign, pass its original manifest directly:
+
+```sh
+python3 tests/perf/release_gate.py --campaign /tmp/stallionfs-campaign/campaign.json \
+  --json release-gate.json
+```
+
+The gate checks the three ordered cycles and evaluates each against the same
+37 cases. Keep the manifest and its stage evidence at their recorded paths.
+Every stage must have confirmed cleanup, unchanged fingerprints and evidence for
+its selected cache modes. The gate verifies native journals and checks that their
+committed records match the final reports, including both linked CLI scan reports.
+It checks for raw sample ID reuse between cycles. The manifest's collection
+status records whether the collectors passed. Release qualification comes from
+the gate decision.
+
 The fixed denominator is all 37 `sfs benchmark --list` cases, including native
 commands, scanner APIs and workspace references. Missing cases are reported as
 `not collected`, never dropped. The CLI scan, volumes and move cases are
@@ -204,7 +220,7 @@ are not run again. This includes the existing 50 GB dataset and its copies.
 
 `--cache warm cold` is the default for native command stages. The API scanner
 always has a warm stage and adds a separate purge-conditioned stage when cold
-was requested: 21 planned stages for warm selection, 24 with cold. Workspace
+was requested: 30 planned stages for warm selection, 33 with cold. Workspace
 stages remain warm. A denied purge is retained and never retried by later stages:
 warm work continues only after confirmed source/runtime validation and cleanup;
 later cold API stages, and native stages requested only cold, are unavailable.
@@ -250,15 +266,16 @@ Cold tools retain entry and target metadata plus content hashes when readable.
 Permission-denied content reads are reported with an unavailable hash; matching
 metadata establishes observed identity stability, not unchanged executable bytes.
 Missing tools, metadata failures and changed identity, hash or readability stop collection.
-The complete campaign remains unqualified. Use `native_suite.py --runs 1`
+Evaluate the completed manifest with `release_gate.py --campaign`.
+Use `native_suite.py --runs 1`
 for a single native diagnostic run. It omits the campaign's API and workspace
 stages and does not establish a complete acceptance suite.
 
 ## CLI startup and structured output
 
-The full campaign collects only `cli/delete/tiny_4kib` from this CLI matrix.
-Each plain/JSON and cache group uses fresh paired `rm -f` references: 31 timing
-pairs plus warmup 0, and `--samples` resource pairs (minimum ten). Candidate JSON
+For `cli/delete/tiny_4kib`, each plain/JSON and cache group uses fresh paired
+`rm -f` references. It collects 31 timing pairs plus warmup 0 and
+`--samples` resource pairs (minimum ten). Candidate JSON
 output is checked independently. Direct CPU covers command/reaped-child work;
 resource comparisons use RSS only, with footprint unavailable. Full source and
 candidate-based mount checks precede conditioning and follow measurement. Between

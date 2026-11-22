@@ -22,6 +22,7 @@ PHASES = ('setup', 'suite', 'close', 'admission', 'accounting', 'exit')
 DIAGNOSTIC_CAP = 1024 * 1024
 OUTPUT_CAP = 16 * 1024 * 1024
 RESERVE = 130  # tail actions consume one shared remainder; each is admitted separately
+TAIL_PHASES = ('validation', 'suite-upload', 'image-upload', 'interface-upload', 'wheel-upload')
 
 
 EXCEPTIONS = frozenset(('Exception', 'AssertionError', 'ValueError', 'TypeError',
@@ -318,7 +319,7 @@ def validate_receipt(data):
                     or r['kind'] not in ('sparse', 'tail') or r['success'] is not False
                     or r['qualification'] is not False or type(r['error']) is not str or r['error'] not in EXCEPTIONS
                     or (r['kind'] == 'sparse' and r['phase'] != 'sparse')
-                    or (r['kind'] == 'tail' and r['phase'] not in ('validation', 'suite-upload', 'image-upload', 'interface-upload'))
+                    or (r['kind'] == 'tail' and r['phase'] not in TAIL_PHASES)
                     or (r['job'] is not None and (type(r['job']) is not str or len(r['job']) != 64
                         or any(c not in '0123456789abcdef' for c in r['job'])))):
                 raise ValueError('Budget refusal')
@@ -331,7 +332,7 @@ def validate_receipt(data):
             return r
         if r.get('kind') == 'tail':
             if (set(r) != {'kind', 'phase', 'admitted', 'reason'} or r['admitted'] is not False
-                    or r['phase'] not in ('validation', 'suite-upload', 'image-upload', 'interface-upload')):
+                    or r['phase'] not in TAIL_PHASES):
                 raise ValueError('Tail refusal')
         elif (set(r) == {'success', 'reason', 'mode'} and r['success'] is False
               and r['mode'] in ('pass', 'fail', 'suite')):
@@ -345,7 +346,7 @@ def validate_receipt(data):
                 or r['admitted'] is not True or type(r['action_cap']) is not int or r['action_cap'] != 60
                 or type(r['remaining']) not in (int, float) or not math.isfinite(r['remaining'])
                 or r['remaining'] < 65
-                or r['phase'] not in ('validation', 'suite-upload', 'image-upload', 'interface-upload')
+                or r['phase'] not in TAIL_PHASES
                 or type(r['job']) is not str or len(r['job']) != 64
                 or any(c not in '0123456789abcdef' for c in r['job'])):
             raise ValueError('Tail receipt')
@@ -813,7 +814,11 @@ def installed(probe=None):
     import importlib.util
     spec = importlib.util.spec_from_file_location('ci_build', checkout / 'tools/ci_build.py')
     controller = importlib.util.module_from_spec(spec); spec.loader.exec_module(controller)
-    admitted = controller.initialize_installed(checkout, Path(os.environ['RUNNER_TEMP']).resolve() / 'qualified-wheel')
+    temporary = Path(os.environ['RUNNER_TEMP']).resolve()
+    wheel_receipts = []
+    retain_wheel = not probe and os.environ.get('CI_RETAIN_INTEL_WHEEL') == '1'
+    receipt_option = {'wheel_receipt': wheel_receipts.append} if retain_wheel else {}
+    admitted = controller.initialize_installed(checkout, temporary / 'qualified-wheel', **receipt_option)
     admitted['check']()
     import sysconfig
     native_cli = Path(sysconfig.get_path('scripts')) / 'stallionfs'
@@ -844,6 +849,20 @@ def installed(probe=None):
                             str(Path(os.environ['RUNNER_TEMP']) / 'stallionfs-smoke'),
                             'doctor'], check=True)
             admitted['check']()
+            if retain_wheel:
+                try:
+                    contract = admitted['contract']
+                    candidate = temporary / 'installed-wheel-candidate.json'
+                    pending = candidate.with_suffix('.pending')
+                    controller.write(pending, {
+                        'job': os.environ['CI_JOB_BINDING'], 'pid': os.getpid(),
+                        'invocation': os.environ['CI_INVOCATION'], 'source_sha': os.environ['GITHUB_SHA'],
+                        'build_result_sha256': wheel_receipts[0], 'descriptor_sha256': contract['descriptor_sha256'],
+                        'inventory_sha256': contract['input_inventory_sha256']})
+                    os.link(pending, candidate)
+                    pending.unlink()
+                except Exception:
+                    print('Installed Intel wheel candidate unavailable', file=sys.stderr)
     return suite, diagnostics.close, final_admission, account, ContextualResult
 
 
