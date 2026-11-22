@@ -844,6 +844,57 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
         self.assertEqual(self.store.cleanup(apply=True)['retired'], [])
 
+    def test_protected_restore_keeps_marker_until_active_location_is_synced(self):
+        self.stale()
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [self.workspace])
+        root = self.store.root
+        trash = root / 'trash' / self.workspace
+        protection = root / 'protected' / f'{self.workspace}.json'
+        marker = protection.read_bytes()
+        original = lifecycle.identity(trash)
+        contents = (trash / 'repo/file').read_bytes()
+        failed = OSError(errno.EIO, 'restore collection failed to sync')
+        sync = core.sync_directory
+
+        def fail_sync(directory):
+            if directory == self.path.parent:
+                raise failed
+            sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=fail_sync):
+            error = None
+            try:
+                self.store.move(self.workspace, restore=True)
+            except StallionError as reported:
+                error = reported
+            self.assertTrue(protection.exists(), 'restore cleared protection before syncing the active location')
+            self.assertEqual(protection.read_bytes(), marker)
+            self.assertIn(str(self.path), str(error))
+            self.assertFalse(trash.exists())
+            self.assertEqual(lifecycle.identity(self.path), original)
+            self.assertEqual((self.repo / 'file').read_bytes(), contents)
+            with self.assertRaisesRegex(StallionError, 'restore collection failed to sync'):
+                Store(root).enroll(self.workspace)
+            self.assertEqual(protection.read_bytes(), marker)
+
+        self.path.rename(trash)  # Model the old namespace after interrupted synchronization.
+        self.assertEqual(Store(root).gc(older_than=0), [])
+        self.assertEqual(lifecycle.identity(trash), original)
+        events = []
+
+        def record_sync(directory):
+            events.append((directory, protection.exists()))
+            sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=record_sync):
+            Store(root).move(self.workspace, restore=True)
+        self.assertEqual(events, [(root / 'workspaces', True), (root / 'trash', True),
+                                  (root / 'lifecycle', True), (root / 'protected', False)])
+        self.assertFalse(protection.exists())
+        self.assertEqual(lifecycle.identity(self.path), original)
+        self.assertEqual((self.repo / 'file').read_bytes(), contents)
+        self.assertEqual(read_json(self.store._state(self.workspace))['status'], 'open')
+
     def test_cleanup_skips_open_unknown_clock_corrupt_identity_and_mounts(self):
         state = self.stale()
         cases = ({'status': 'open'}, {'status': 'unknown'}, {'generation': 'old'}, {'enrolled': False},
