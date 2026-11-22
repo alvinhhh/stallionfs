@@ -106,7 +106,7 @@ class Lifecycle:
 
     def _open(self, workspace, path, meta, *, enrolled=None):
         state_path = self._state(workspace)
-        previous = core.read_json(state_path) if state_path.exists() else {}
+        previous = core.read_json(state_path) if os.path.lexists(state_path) else {}
         if meta.get('backend') == 'native-image' and meta.get('ownership') != 'store-created':
             enrolled = False
         elif enrolled is None:
@@ -117,9 +117,13 @@ class Lifecycle:
         replace_json(state_path, state)
         if meta.get('backend') == 'native-image':
             core.sync_directory(state_path.parent)
+        elif path.parent == self.root / 'workspaces':
+            self._clear_restored_protection(workspace, path)
+        return state
+
+    def _clear_restored_protection(self, workspace, path):
         protection = self.root / 'protected' / f'{workspace}.json'
-        if (meta.get('backend') != 'native-image' and path.parent == self.root / 'workspaces'
-                and os.path.lexists(protection)):
+        if os.path.lexists(protection):
             try:
                 retired = core.read_json(protection)
                 if (retired.get('id') == workspace and retired.get('object') == identity(path) and
@@ -128,7 +132,6 @@ class Lifecycle:
                     protection.unlink()
             except (core.StallionError, OSError):
                 pass  # Uncertain protection remains; reopening never authorizes deletion.
-        return state
 
     def _no_mounts(self, path):
         from ._scan import mounts

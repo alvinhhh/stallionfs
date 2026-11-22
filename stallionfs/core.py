@@ -1114,11 +1114,12 @@ class Store(Lifecycle):
                     from . import images
                     images.detach(path / "workspace.sparseimage", path / "volume")
                 self._open(workspace, path, metadata)
+                if not restore:
+                    # Set trash age before the rename can expose an old workspace to GC.
+                    os.utime(path, None, follow_symlinks=False)
                 path.rename(target)
-                self._open(workspace, target, metadata)
-                # Directory mtime records trash age without an extra metadata transaction.
-                os.utime(target, None, follow_symlinks=False)
                 if restore:
+                    self._clear_restored_protection(workspace, target)
                     return self._mount(target, metadata)
                 return {**metadata, "path": str(target / ("workspace.sparseimage" if metadata.get("backend") == "image" else "repo"))}
         except BaseException as error:
