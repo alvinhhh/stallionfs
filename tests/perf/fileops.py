@@ -382,15 +382,23 @@ def linux_scratch_volume(inventory, scratch):
     zfs = shutil.which('zfs')
     require(zfs is not None, 'The installed ZFS command is required')
     environment = {**os.environ, 'LC_ALL': 'C'}
+    required = {'type': 'filesystem', 'mounted': 'yes', 'readonly': 'off', 'mountpoint': str(point)}
+    configuration = ('recordsize', 'sync', 'compression')
     properties = command([zfs, 'get', '-H', '-p', '-o', 'property,value',
-                          'type,mounted,readonly,mountpoint', dataset], environment=environment).stdout.decode().splitlines()
+                          ','.join((*required, *configuration)), dataset],
+                         environment=environment).stdout.decode().splitlines()
     values = {}
     for line in properties:
         fields = line.split('\t')
         require(len(fields) == 2 and fields[0] not in values, 'Invalid ZFS dataset properties')
         values[fields[0]] = fields[1]
-    require(values == {'type': 'filesystem', 'mounted': 'yes', 'readonly': 'off', 'mountpoint': str(point)},
+    require(set(values) == set((*required, *configuration))
+            and all(values[key] == value for key, value in required.items()),
             'Scratch is not the admitted writable ZFS dataset mount')
+    require(re.fullmatch(r'[1-9][0-9]*', values['recordsize']) is not None
+            and values['sync'] in ('standard', 'always', 'disabled')
+            and re.fullmatch(r'[a-z0-9-]+', values['compression']) is not None,
+            'Invalid ZFS dataset configuration')
     volume.update(dataset=dataset, dataset_properties=values, zfs_executable=zfs,
                   zfs_version=command([zfs, '--version'], environment=environment).stdout.decode(errors='replace').strip())
     return volume
