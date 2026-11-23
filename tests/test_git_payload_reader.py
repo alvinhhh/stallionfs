@@ -1,8 +1,12 @@
 """Descriptor admission and bounded reads for package Git files."""
 from contextlib import contextmanager
+import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import stat
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -42,6 +46,87 @@ class GitPayloadReader(unittest.TestCase):
                       for item in (root, root / 'sources', parent, path)}
         return SimpleNamespace(root=root, path=path, identities=identities,
                                admitted=set(), data=data, info=path.lstat())
+
+    @contextmanager
+    def package_git(self):
+        root = self.temporary / '_git'
+        def digest(data):
+            return hashlib.sha256(data).hexdigest()
+        files = {'bin/git': b'inert executable', 'COPYING': b'license',
+                 'CURL-COPYING': b'curl license', 'SOURCES.txt': b'rebuild instructions',
+                 'sources/git-source.tar.xz': b'corresponding source',
+                 'sources/header-manifest.json': b'[]'}
+        inputs = {'header-manifest.json': digest(files['sources/header-manifest.json'])}
+        scripts = {'tools/build_git_runtime.py': 'recipe_sha256',
+                   'tools/_git_capture.py': 'capture_sha256',
+                   'stallionfs/_git_sources.py': 'registry_sha256',
+                   'stallionfs/_bundle.py': 'bundle_sha256'}
+        source_digest = digest(files['sources/git-source.tar.xz'])
+        build = {'source_distribution_sha256': source_digest}
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:xz') as tar:
+            for name in (*scripts, 'tools/git-inputs/header-manifest.json'):
+                data = files['sources/header-manifest.json'] if name.startswith('tools/git-inputs/') else name.encode()
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                tar.addfile(member, io.BytesIO(data))
+                if name in scripts:
+                    build[scripts[name]] = digest(data)
+        files['sources/build-scripts.tar.xz'] = archive.getvalue()
+        rows = []
+        for name, data in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            mode = 0o755 if name == 'bin/git' else 0o644
+            path.chmod(mode)
+            rows.append(dict(path=name, mode=oct(mode), size=len(data), sha256=digest(data)))
+        contract = dict(_bundle.GIT_CONTRACT, source_distribution_sha256=source_digest)
+        manifest = dict(schema=1, kind='package-git-runtime', build=build, files=rows,
+                        source={key: contract[key] for key in _bundle.GIT_SOURCE_KEYS})
+        (root / 'manifest.json').write_text(json.dumps(manifest))
+        licenses = {name: digest(files[name]) for name in ('COPYING', 'CURL-COPYING')}
+        with patch.multiple(runtime._git_sources, INPUTS=inputs, LICENSES=licenses,
+                            LAYOUT={'bin/git': {'mode': '0o755'}}, DIRECTORIES=()), \
+                patch.object(_bundle, 'GIT_CONTRACT', contract), \
+                patch.object(runtime, '_headers', return_value=[]), \
+                patch.object(runtime, '_payload_cache', None):
+            yield root, manifest
+
+    def test_restricted_wheel_admission_keeps_strict_cache_and_actual_modes(self):
+        with self.package_git() as (root, manifest):
+            executable, license_file = root / 'bin/git', root / 'COPYING'
+            executable.chmod(0o711)
+            license_file.chmod(0o600)
+            payload = runtime.regular_payload(root, allow_wheel_umask=True)
+            self.assertEqual(payload['manifest'], manifest)
+            self.assertIs(runtime.regular_payload(root, allow_wheel_umask=True), payload)
+            with self.assertRaisesRegex(_bundle.BundleError, 'Git payload changed'):
+                runtime.regular_payload(root)
+            executable.chmod(0o700)
+            with self.assertRaisesRegex(_bundle.BundleError, 'Git payload changed'):
+                payload['check']()
+            executable.chmod(0o755)
+            license_file.chmod(0o644)
+            self.assertEqual(runtime.regular_payload(root)['manifest'], manifest)
+
+    def test_restricted_wheel_refuses_added_bits_and_missing_owner_access(self):
+        with self.package_git() as (root, _):
+            for name, mode in (('COPYING', 0o700), ('COPYING', 0o440),
+                               ('bin/git', 0o611), ('bin/git', 0o511),
+                               ('bin/git', 0o777)):
+                with self.subTest(name=name, mode=oct(mode)):
+                    path = root / name
+                    original = stat.S_IMODE(path.stat().st_mode)
+                    try:
+                        path.chmod(mode)
+                        with self.assertRaisesRegex(_bundle.BundleError, 'Git payload changed'):
+                            runtime.regular_payload(root, allow_wheel_umask=True)
+                    finally:
+                        path.chmod(original)
+        for bit in (0o1000, 0o2000, 0o4000):
+            with self.subTest(special_bit=oct(bit)):
+                self.assertFalse(runtime._wheel_mode_matches(0o711 | bit, '0o755'))
 
     def read(self, fixture, cap=None):
         return runtime._read_file(fixture.root, fixture.path,
