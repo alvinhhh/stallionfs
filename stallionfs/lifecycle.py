@@ -459,11 +459,11 @@ class Lifecycle:
                     if meta.get('backend') == 'native-image':
                         native_access = access
                     repo = access['path']
-                options = {}
+                options = {'pass_fds': (lease_fd,)}
                 if auto_retire:
-                    options = {'pass_fds': (lease_fd,), 'env': {
+                    options['env'] = {
                         **os.environ, 'STALLIONFS_LEASE_FD': str(lease_fd),
-                        'STALLIONFS_LEASE_GENERATION': generation}}
+                        'STALLIONFS_LEASE_GENERATION': generation}
                 result = subprocess.run(command, cwd=repo, stdout=stdout, **options)
         except BaseException as error:
             if native_access is not None:
@@ -700,12 +700,17 @@ class Lifecycle:
                         raise core.StallionError('Retained image is still attached')
                 if yes:
                     with self.staging() as stage:
+                        expired = stage / 'expired'
+                        path.rename(expired)
                         if kind == 'trash':
                             protection = self.root / 'protected' / f'{value}.json'
                             if os.path.lexists(protection):
+                                # Keep GC protection until the relocation can survive restart.
+                                core.sync_directory(stage)
+                                core.sync_directory(stage.parent)
+                                core.sync_directory(path.parent)
                                 protection.unlink()
-                        expired = stage / 'expired'
-                        path.rename(expired)
+                                core.sync_directory(protection.parent)
                         core.remove_tree(expired)
                         stage.rmdir()
                 return {'deleted' if yes else 'would_delete': str(path)}

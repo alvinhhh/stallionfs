@@ -1106,6 +1106,50 @@ with store._lease(sys.argv[2]):
         self.assertEqual((stage / 'expired/repo/file').read_text(), 'original\n')
         self.assertTrue(any(str(stage) in note for note in raised.exception.__notes__))
 
+    def test_protected_purge_retains_marker_until_relocation_is_durable(self):
+        self.stale()
+        self.assertEqual(self.store.cleanup(apply=True)['retired'], [self.workspace])
+        trash = self.store.root / 'trash' / self.workspace
+        protection = self.store.root / 'protected' / f'{self.workspace}.json'
+        marker = protection.read_bytes()
+        original = lifecycle.identity(trash)
+        rename = Path.rename
+
+        def refuse_rename(source, destination):
+            if source == trash:
+                raise OSError(errno.EIO, 'fixture purge rename failed')
+            return rename(source, destination)
+
+        with patch.object(Path, 'rename', refuse_rename), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge rename failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertEqual(lifecycle.identity(trash), original)
+        self.assertEqual((trash / 'repo/file').read_text(), 'original\n')
+        self.assertTrue(protection.is_file(), 'failed relocation discarded trash protection')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
+        sync = core.sync_directory
+        staging = self.store.root / 'staging'
+
+        def refuse_stage_sync(directory):
+            if directory.parent == staging:
+                self.assertEqual(protection.read_bytes(), marker)
+                raise OSError(errno.EIO, 'fixture purge staging sync failed')
+            return sync(directory)
+
+        with patch.object(core, 'sync_directory', side_effect=refuse_stage_sync), \
+                patch.object(core, 'remove_tree', side_effect=AssertionError('delete before durable relocation')):
+            with self.assertRaisesRegex(OSError, 'fixture purge staging sync failed'):
+                self.store.purge('trash', self.workspace, yes=True)
+        self.assertFalse(trash.exists())
+        retained, = staging.glob('*/expired')
+        self.assertEqual(lifecycle.identity(retained), original)
+        self.assertEqual((retained / 'repo/file').read_text(), 'original\n')
+        self.assertEqual(protection.read_bytes(), marker)
+        self.assertEqual(self.store.gc(older_than=0), [])
+
     def test_interrupted_protected_purge_does_not_orphan_protection(self):
         self.stale()
         self.store.cleanup(apply=True)
@@ -1209,6 +1253,47 @@ os.close(fd)
 done.write_text('done')
 """)
         return script
+
+    def test_run_passes_the_managed_lease_without_enabling_retirement(self):
+        self.store.enroll(self.workspace)
+        self.store.cleanup_config(enabled=True)
+        command = ['fixture-command']
+        lease = self.store.root / 'locks' / f'use-{self.workspace}'
+        for auto_retire in (False, True):
+            with self.subTest(auto_retire=auto_retire):
+                inherited = []
+
+                def child(argv, *, cwd, stdout, **options):
+                    self.assertEqual((argv, cwd, stdout), (command, str(self.repo), None))
+                    self.assertIn('pass_fds', options)
+                    descriptor, = options['pass_fds']
+                    self.assertTrue(os.path.samestat(os.fstat(descriptor), lease.stat()))
+                    if auto_retire:
+                        environment = options['env']
+                        self.assertEqual(environment['STALLIONFS_LEASE_FD'], str(descriptor))
+                        self.assertEqual(environment['STALLIONFS_LEASE_GENERATION'],
+                                         read_json(self.store._state(self.workspace))['generation'])
+                    else:
+                        self.assertNotIn('env', options)
+                    inherited.append(os.dup(descriptor))
+                    return subprocess.CompletedProcess(argv, 7)
+
+                try:
+                    with patch.object(lifecycle.subprocess, 'run', side_effect=child) as launch:
+                        self.assertEqual(self.store.run(self.workspace, command, auto_retire=auto_retire),
+                                         {'workspace': self.workspace, 'returncode': 7})
+                    launch.assert_called_once()
+                    self.assertFalse(self.lease_is_free())
+                    state = read_json(self.store._state(self.workspace))
+                    self.assertEqual(state['status'], 'open')
+                    if auto_retire:
+                        self.assertEqual(state['auto_retire'], {'generation': state['generation']})
+                    else:
+                        self.assertNotIn('auto_retire', state)
+                finally:
+                    for descriptor in inherited:
+                        os.close(descriptor)
+                self.assertTrue(self.lease_is_free())
 
     def test_auto_retire_normal_and_nonzero_exit_observe_exact_session(self):
         self.store.enroll(self.workspace)
