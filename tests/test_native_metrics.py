@@ -1,6 +1,7 @@
 """Collector failure receipts and paired-statistics checks, without performance runs."""
 import base64
 from contextlib import contextmanager, ExitStack
+import errno
 import importlib.util
 from pathlib import Path
 import signal
@@ -76,6 +77,10 @@ def usage(user, system):
 
 
 class NativeCollector(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(metrics.os, 'killpg',
+                                           side_effect=ProcessLookupError(errno.ESRCH, 'No process group')))
+
     def test_gnu_parser_units_missing_malformed_duplicate_and_nonfinite(self):
         parsed = metrics.parse_gnu_time(GNU_REPORT)
         self.assertEqual(parsed['rss_bytes'], 16384)
@@ -299,6 +304,51 @@ class NativeCollector(unittest.TestCase):
 
 
 class DirectTiming(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(metrics.os, 'killpg',
+                                           side_effect=ProcessLookupError(errno.ESRCH, 'No process group')))
+
+    def test_normally_reaped_leader_requires_observed_empty_group(self):
+        absent = ProcessLookupError(errno.ESRCH, 'No process group')
+        denied = PermissionError(errno.EPERM, 'Cannot inspect group')
+        cases = ((0, None, 'present'), (0, denied, 'unknown'), (0, absent, 'absent'),
+                 (7, None, 'present'), (7, absent, 'absent'),
+                 (-signal.SIGTERM, None, 'present'), (-signal.SIGTERM, absent, 'absent'))
+        for phase in ('timing', 'resources'):
+            for code, error, expected in cases:
+                with self.subTest(phase=phase, code=code, group=expected), alarm_environment(), \
+                        mock.patch.object(metrics.sys, 'platform', 'darwin'), \
+                        mock.patch.object(metrics.subprocess, 'Popen', return_value=process(code=code)) as popen, \
+                        mock.patch.object(metrics.resource, 'getrusage',
+                                          side_effect=[usage(3, 8), usage(3.001, 8.002)]) as counters, \
+                        mock.patch.object(metrics.time, 'perf_counter',
+                                          side_effect=[10, 10.001, 10.004]) as clock:
+                    def probe(pid, sig):
+                        popen.return_value.communicate.assert_called_once()
+                        self.assertEqual(counters.call_count, 2 if phase == 'timing' else 0)
+                        self.assertEqual(clock.call_count, 3 if phase == 'timing' else 2)
+                        if error is not None:
+                            raise error
+
+                    with mock.patch.object(metrics.os, 'killpg', side_effect=probe) as group:
+                        row = metrics.collect(['/bin/cp', 'source', 'dest'], timeout_s=2, phase=phase)
+                    self.assertEqual(row['completion_uncertain'], expected != 'absent')
+                    self.assertEqual(row['ok'], code == 0 and expected == 'absent')
+                    self.assertEqual(row['exit_code'], code)
+                    self.assertEqual(row.get('group_liveness'), expected)
+                    group.assert_called_once_with(54321, 0)
+                    self.assertEqual(base64.b64decode(row['stderr_b64']), REPORT)
+                    if expected == 'unknown':
+                        self.assertEqual(row['group_probe_errno'], errno.EPERM)
+                    if phase == 'timing':
+                        self.assertAlmostEqual(row['wall_s'], 0.004)
+                        self.assertAlmostEqual(row['cpu_s'], 0.003)
+                    else:
+                        self.assertAlmostEqual(row['wall_s'], 0.001)
+                        self.assertAlmostEqual(row['cpu_s'], 0.06)
+                        self.assertEqual((row['rss_bytes'], row['io_input_blocks'], row['io_output_blocks']),
+                                         (16384, 0, 2))
+
     def test_direct_blocking_communication_and_precise_cpu_exclude_harness(self):
         child = process(effects=[(b'output', b'command diagnostic')])
         with alarm_environment() as alarm, \
