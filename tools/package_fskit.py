@@ -3,6 +3,7 @@ import argparse
 import ast
 import base64
 import csv
+from contextlib import nullcontext
 import io
 import importlib.util
 import hashlib
@@ -52,28 +53,52 @@ def write_new(path, data, mode):
 PROFILE_SYMBOLS = {'_stallionfs_factory_read_only_v1': 'read-only',
                    '_stallionfs_factory_contextual_writes_v1': 'contextual-writes'}
 PROFILE_OUTPUT_LIMIT = 1024 * 1024
+PROFILE_PREVIEW_LIMIT = 160
 
 
 def _tool_output(argv, directory):
     # Keep tool output off pipes and bound the accepted complete response.
     with tempfile.TemporaryFile(dir=directory) as output:
-        result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
-                                stderr=output, timeout=30, check=False)
-        output.seek(0)
-        data = output.read(PROFILE_OUTPUT_LIMIT + 1)
-    if result.returncode != 0 or len(data) > PROFILE_OUTPUT_LIMIT:
+        # Only lipo's stdout is an architecture inventory.
+        split_lipo = argv[:2] == ['/usr/bin/lipo', '-archs']
+        errors = tempfile.TemporaryFile(dir=directory) if split_lipo else nullcontext(output)
+        with errors as stderr:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                    stderr=stderr, timeout=30, check=False)
+            output.seek(0)
+            data = output.read(PROFILE_OUTPUT_LIMIT + 1)
+            diagnostics = b''
+            if split_lipo:
+                stderr.seek(0)
+                diagnostics = stderr.read(max(PROFILE_PREVIEW_LIMIT, PROFILE_OUTPUT_LIMIT + 1 - len(data)))
+    oversized = len(data) + len(diagnostics) > PROFILE_OUTPUT_LIMIT
+    if result.returncode != 0 or oversized:
+        if split_lipo:
+            limit_note = ', exceeded output limit' if oversized else ''
+            raise ValueError(f'lipo -archs failed (exit {result.returncode}{limit_note}). '
+                             f'Stdout starts {data[:PROFILE_PREVIEW_LIMIT]!r}. '
+                             f'Stderr starts {diagnostics[:PROFILE_PREVIEW_LIMIT]!r}.')
         raise ValueError('Artifact inspection failed or exceeded its output limit')
     try:
         return data.decode('utf-8', errors='strict')
     except UnicodeError as error:
+        if split_lipo:
+            raise ValueError(f'Invalid lipo -archs stdout encoding. '
+                             f'Stdout starts {data[:PROFILE_PREVIEW_LIMIT]!r}.') from error
         raise ValueError('Invalid artifact inspection output') from error
 
 
-def _architectures(executable, directory):
-    architectures = _tool_output(['/usr/bin/lipo', '-archs', str(executable)], directory).split()
+def _architectures(executable, directory, *, member=None):
+    subject = (executable.name if member is None else member)[:PROFILE_PREVIEW_LIMIT]
+    try:
+        stdout = _tool_output(['/usr/bin/lipo', '-archs', str(executable)], directory)
+    except ValueError as error:
+        raise ValueError(f'Could not inspect architecture for {subject!a}. {error}') from error
+    architectures = stdout.split()
     if (not architectures or len(architectures) != len(set(architectures))
             or any(arch not in ('arm64', 'arm64e', 'x86_64') for arch in architectures)):
-        raise ValueError('Missing or unsupported executable architecture inventory')
+        raise ValueError(f'Missing or unsupported executable architecture inventory for {subject!a}. '
+                         f'Stdout starts {stdout[:PROFILE_PREVIEW_LIMIT]!a}.')
     return architectures
 
 
@@ -147,7 +172,7 @@ def _deployment_target(text, architecture):
             'minimum_os': fields['minos'], 'sdk': fields['sdk']}
 
 
-def inspect_package_artifacts(host, extension, host_floor, module_floor, requested=None):
+def inspect_package_artifacts(host, extension, host_floor, module_floor, requested=None, *, runtime_native=None):
     """Check matching inventories and each slice against its containing plist floor."""
     floors = (_version(host_floor), _version(module_floor))
     if floors[0] < floors[1]:
@@ -155,11 +180,14 @@ def inspect_package_artifacts(host, extension, host_floor, module_floor, request
     with tempfile.TemporaryDirectory(prefix='stallionfs-package-') as temporary:
         directory = Path(temporary)
         paths = (directory / 'host', directory / 'extension')
-        for path, data in zip(paths, (host, extension)):
+        inputs = list(zip(paths, (host, extension)))
+        for path, data in inputs:
             write_new(path, data, 0o700)
         inventories = [_architectures(path, directory) for path in paths]
         if set(inventories[0]) != set(inventories[1]):
             raise ValueError('Host and module architecture inventories differ')
+        if runtime_native is not None and 'arm64' not in inventories[0]:
+            raise ValueError('Bundled runtime requires arm64 host and module slices')
         factory = _factory_profile(paths[1], extension, inventories[1], directory, requested)
         targets = []
         for path, architectures, floor in zip(paths, inventories, floors):
@@ -171,14 +199,27 @@ def inspect_package_artifacts(host, extension, host_floor, module_floor, request
                     raise ValueError('Executable deployment minimum exceeds its declared plist minimum')
                 slices.append(target)
             targets.append(slices)
-        for path, data in zip(paths, (host, extension)):
+        if runtime_native is not None:
+            maintenance = directory / 'maintenance'
+            write_new(maintenance, runtime_native, 0o700)
+            if 'arm64' not in _architectures(maintenance, directory):
+                raise ValueError('Bundled runtime requires an arm64 maintenance slice')
+            target = _deployment_target(_tool_output(
+                ['/usr/bin/otool', '-arch', 'arm64', '-l', str(maintenance)], directory), 'arm64')
+            if _version(target['minimum_os']) > floors[0]:
+                raise ValueError('Maintenance deployment minimum exceeds the app minimum')
+            inputs.append((maintenance, runtime_native))
+        for path, data in inputs:
             if read_executable(path) != data:
                 raise ValueError('Executable changed during package inspection')
         return factory, targets
 
 
-def _load_templates():
+def _load_templates(hosted_sources=None):
     templates = Path(__file__).resolve().parents[1] / 'filesystem/fskit'
+    if hosted_sources is not None:
+        return [plistlib.loads(_runtime_read(templates / name, hosted_sources[name]))
+                for name in ('Host.Info.plist', 'Module.Info.plist')]
     return [plistlib.loads((templates / name).read_bytes())
             for name in ('Host.Info.plist', 'Module.Info.plist')]
 
@@ -252,6 +293,15 @@ def _candidate_manifest(args, values, targets, factory, files, output):
 
 RUNTIME_NOFOLLOW = os.O_NOFOLLOW | os.O_CLOEXEC
 RUNTIME_MAX_FILES, RUNTIME_MAX_FILE, RUNTIME_MAX_TOTAL = 5000, 128 * 1024**2, 512 * 1024**2
+HOSTED_PROVENANCE_MAX_BYTES = 1024**2
+HOSTED_COMPONENT_PATHS = (
+    'StallionFS.app/Contents/MacOS/StallionFS',
+    'StallionFS.app/Contents/Extensions/StallionFS.appex/Contents/MacOS/StallionFS',
+    'StallionFS.app/Contents/Resources/Maintenance/stallionfs-maintenance',
+    f'stallionfs-{PACKAGE_VERSION}-cp313-cp313-macosx_15_0_arm64.whl',
+)
+HOSTED_SOURCE_FILES = ('Host.Info.plist', 'Module.Info.plist', 'maintenance_native.c',
+                       'maintenance_observer.py', 'stallionfs-python.sh')
 
 
 def _runtime_require(ok, message):
@@ -316,14 +366,14 @@ def _runtime_identity(info):
                  'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
 
 
-def _runtime_read_at(root, name):
+def _runtime_read_at(root, name, *, max_bytes=RUNTIME_MAX_FILE):
     parts = _runtime_relative(name).split('/')
     parent = _runtime_subdir(root, '/'.join(parts[:-1])) if len(parts) > 1 else os.dup(root)
     try:
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | RUNTIME_NOFOLLOW, dir_fd=parent)
         try:
             before = os.fstat(fd)
-            _runtime_require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= RUNTIME_MAX_FILE,
+            _runtime_require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= max_bytes,
                     'Nonordinary, hardlinked or oversized input')
             _runtime_require(before.st_uid == os.getuid() and not stat.S_IMODE(before.st_mode) & 0o7022,
                              'Unsafe input ownership or permissions')
@@ -339,11 +389,11 @@ def _runtime_read_at(root, name):
         os.close(parent)
 
 
-def _runtime_read(path, expected=None):
+def _runtime_read(path, expected=None, *, max_bytes=RUNTIME_MAX_FILE):
     path = Path(path)
     parent = _runtime_directory(path.parent)
     try:
-        data = _runtime_read_at(parent, path.name)
+        data = _runtime_read_at(parent, path.name, max_bytes=max_bytes)
     finally:
         os.close(parent)
     _runtime_require(expected is None or _runtime_sha(data) == expected, 'Input digest mismatch: ' + str(path))
@@ -527,15 +577,60 @@ def _runtime_wheel_members(data, metadata):
 
 
 
-def _runtime_pinned(item, pins):
+def _remember_pin(pins, path, digest):
+    _runtime_require(pins.setdefault(path, digest) == digest, 'Conflicting input pin')
+
+
+def _runtime_pinned(item, pins, *, max_bytes=None):
     _runtime_require(isinstance(item, dict) and set(item) == {'path', 'sha256'}
                      and isinstance(item['path'], str) and Path(item['path']).is_absolute()
                      and isinstance(item['sha256'], str) and re.fullmatch('[0-9a-f]{64}', item['sha256']),
                      'Expected an absolute pinned input')
-    data = _runtime_read(item['path'], item['sha256'])
-    _runtime_require(item['path'] not in pins or pins[item['path']] == item['sha256'], 'Conflicting input pin')
-    pins[item['path']] = item['sha256']
+    if max_bytes is None:
+        data = _runtime_read(item['path'], item['sha256'])
+    else:
+        data = _runtime_read(item['path'], item['sha256'], max_bytes=max_bytes)
+    _remember_pin(pins, item['path'], item['sha256'])
     return data
+
+
+def _unique_json_object(entries):
+    value = dict(entries)
+    _runtime_require(len(value) == len(entries), 'Duplicate JSON key in hosted assembly input')
+    return value
+
+
+def _hosted_components(declaration, component_bytes):
+    revision_keys = ('source_commit', 'source_tree')
+    _runtime_require(type(declaration) is dict and set(declaration) == {*revision_keys, 'provenance'}
+                     and all(type(declaration[key]) is str and re.fullmatch('[0-9a-f]{40}', declaration[key])
+                             for key in revision_keys), 'Invalid hosted component source selection')
+    # Only the retained, digest-checked receipt determines the assembly claim.
+    provenance = _runtime_pinned(declaration['provenance'], {}, max_bytes=HOSTED_PROVENANCE_MAX_BYTES)
+    producer = json.loads(provenance, object_pairs_hook=_unique_json_object)
+    _runtime_require(type(producer) is dict and producer.get('kind') == 'fskit-unsigned-hosted-components'
+                     and type(producer.get('schema')) is int and producer['schema'] == 1,
+                     'Unsupported hosted component provenance')
+    _runtime_require(all(producer.get(key) == declaration[key] for key in revision_keys),
+                     'Hosted component source commit or tree differs')
+    files = producer.get('files')
+    _runtime_require(type(files) is dict
+                     and [name for name in files if name.casefold().endswith('.whl')] == [HOSTED_COMPONENT_PATHS[-1]],
+                     'Hosted provenance must name one matching wheel')
+    matched = {}
+    for name, data in zip(HOSTED_COMPONENT_PATHS, component_bytes, strict=True):
+        row = files.get(name)
+        actual = {'sha256': _runtime_sha(data), 'size': len(data)}
+        _runtime_require(type(row) is dict and type(row.get('size')) is int and row == actual,
+                         'Hosted component differs: ' + name)
+        matched[name] = actual
+    hashes = producer.get('source_sha256')
+    _runtime_require(type(hashes) is dict, 'Hosted component source hashes are missing')
+    sources = {name: hashes.get('filesystem/fskit/' + name) for name in HOSTED_SOURCE_FILES}
+    _runtime_require(all(type(digest) is str and re.fullmatch('[0-9a-f]{64}', digest)
+                         for digest in sources.values()), 'Hosted assembly source hashes are incomplete')
+    return {**{key: declaration[key] for key in revision_keys},
+            'provenance_sha256': _runtime_sha(provenance), 'files': matched}, sources
 
 
 def _runtime_mapping(item, pins):
@@ -694,7 +789,8 @@ def _inspect_runtime_wheel(files, scripts, extensions, directory):
     for index, name in enumerate([scripts + 'sfs', scripts + 'stallionfs', *extensions]):
         executable = directory / ('wheel-' + str(index))
         write_new(executable, files[name], 0o700)
-        _runtime_require(_architectures(executable, directory) == ['arm64'], 'Wheel must be arm64')
+        _runtime_require(_architectures(executable, directory, member=name) == ['arm64'],
+                         f'Wheel must be arm64 for {name[:PROFILE_PREVIEW_LIMIT]!a}')
         target = _deployment_target(_tool_output(['/usr/bin/otool', '-arch', 'arm64', '-l', str(executable)], directory), 'arm64')
         _runtime_require(_version(target['minimum_os']) <= _version('27.0'), 'Wheel exceeds the app minimum')
         if name in extensions:
@@ -732,35 +828,46 @@ def _runtime_admit_git(git, pins, *, architecture):
             'contract': git_contract, 'qualification': qualification}
 
 
-def _maintenance_source():
+def _maintenance_source(expected=None):
     # Load only the fixed repository source, from the bytes retained for staging.
     path = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_observer.py'
-    data = _runtime_read(path)
+    data = _runtime_read(path, expected)
     _runtime_require(0 < len(data) <= 128 * 1024, 'Maintenance observer exceeds its limit')
     namespace = {'__file__': str(path), '__name__': 'maintenance_observer_resource'}
     exec(compile(data, str(path), 'exec'), namespace)
     return path, data, namespace
 
 
-def _prepare_runtime(path, output, native_path):
-    observer_path, observer, maintenance = _maintenance_source()
-    native_source = Path(__file__).resolve().parents[1] / 'filesystem/fskit/maintenance_native.c'
-    native_source_data = _runtime_read(native_source)
-    native = read_executable(native_path)
-    pins = {str(observer_path): _runtime_sha(observer), str(native_path): _runtime_sha(native),
-            str(native_source): _runtime_sha(native_source_data)}
+def _prepare_runtime(path, output, native_path, host, extension):
     parent = _runtime_directory(output.parent)
     try:
         _runtime_require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'Runtime output parent must be private 0700')
     finally:
         os.close(parent)
-    descriptor_data = _runtime_read(path)
-    _runtime_require(len(descriptor_data) <= 65536, 'Runtime input descriptor exceeds its limit')
-    pins[str(path)] = _runtime_sha(descriptor_data)
+    descriptor_data = _runtime_read(path, max_bytes=65536)
     value = json.loads(descriptor_data)
+    hosted = isinstance(value, dict) and 'hosted_components' in value
+    if hosted:
+        value = json.loads(descriptor_data, object_pairs_hook=_unique_json_object)
     _runtime_require(isinstance(value, dict) and set(value) == {
-        'schema', 'python_descriptor', 'git', 'wheel', 'licenses', 'sources'}
+        'schema', 'python_descriptor', 'git', 'wheel', 'licenses', 'sources'} | ({'hosted_components'} if hosted else set())
         and type(value['schema']) is int and value['schema'] == 1, 'Unsupported runtime input descriptor')
+    pins = {str(path): _runtime_sha(descriptor_data)}
+    native = read_executable(native_path)
+    wheel = _runtime_pinned(value['wheel'], pins)
+    binding, hosted_sources = (None, None)
+    if hosted:
+        binding, hosted_sources = _hosted_components(value['hosted_components'], (host, extension, native, wheel))
+    observer_path, observer, maintenance = (_maintenance_source(hosted_sources['maintenance_observer.py'])
+                                            if hosted else _maintenance_source())
+    source = Path(__file__).resolve().parents[1] / 'filesystem/fskit'
+    native_source = source / 'maintenance_native.c'
+    helper = source / 'stallionfs-python.sh'
+    native_source_data = _runtime_read(native_source, hosted_sources['maintenance_native.c'] if hosted else None)
+    helper_data = _runtime_read(helper, hosted_sources['stallionfs-python.sh'] if hosted else None)
+    for input_path, data in ((observer_path, observer), (native_path, native),
+                             (native_source, native_source_data), (helper, helper_data)):
+        _remember_pin(pins, str(input_path), _runtime_sha(data))
     python = json.loads(_runtime_pinned(value['python_descriptor'], pins))
     _runtime_require(python['python_exe'] == 'bin/python3.13', 'Unsupported runtime interpreter path')
     checked = {}
@@ -781,8 +888,7 @@ def _prepare_runtime(path, output, native_path):
     admitted_git = _runtime_admit_git(git, pins, architecture='arm64')
     git_rows = admitted_git['inventory']
     git_contract = admitted_git['contract']
-    files, scripts, extensions, tag, build_sources, wheel_assets = _runtime_source_wheel(
-        _runtime_pinned(value['wheel'], pins), metadata, pins)
+    files, scripts, extensions, tag, build_sources, wheel_assets = _runtime_source_wheel(wheel, metadata, pins)
     licenses = []
     python_licenses = json.loads(checked['license_records'])['licenses']
     _runtime_require(isinstance(python_licenses, list) and python_licenses, 'Python license records are required')
@@ -814,7 +920,9 @@ def _prepare_runtime(path, output, native_path):
     with tempfile.TemporaryDirectory(prefix='stallionfs-wheel-', dir=output.parent) as temporary:
         directory = Path(temporary)
         observations = _inspect_runtime_wheel(files, scripts, extensions, directory)
-    return {'observer': observer, 'native': native, 'maintenance': maintenance, 'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
+    return {'observer': observer, 'native': native, 'maintenance': maintenance, 'helper': helper_data,
+            'hosted_components': binding, 'hosted_sources': hosted_sources,
+            'pins': pins, 'python': python, 'python_rows': python_rows, 'git': git, 'git_rows': git_rows,
             'files': files, 'scripts': scripts, 'licenses': licenses, 'sources': sources, 'git_contract': dict(git_contract),
             'sidecar': sidecar, 'wheel_tag': tag, 'wheel_observations': observations,
             'source_build_id': _runtime_sha(json.dumps(build_sources, sort_keys=True, separators=(',', ':')).encode())}
@@ -857,9 +965,7 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
             target = 'Contents/Resources/Runtime/CLI/bin/' + name[len(prepared['scripts']):] if script else site + name
             _runtime_write_at(app, target, data, 0o755 if script else 0o644)
             expected.append(_runtime_file_row(target, data, 0o755 if script else 0o644))
-        template = Path(__file__).resolve().parents[1] / 'filesystem/fskit/stallionfs-python.sh'
-        helper = _runtime_read(template)
-        prepared['pins'][str(template)] = _runtime_sha(helper)
+        helper = prepared['helper']
         _runtime_write_at(app, 'Contents/Resources/Runtime/CLI/bin/stallionfs-python', helper, 0o755)
         expected.append(_runtime_file_row('Contents/Resources/Runtime/CLI/bin/stallionfs-python', helper, 0o755))
         paths = {'python': 'Contents/Resources/Runtime/CPython/bin/python3.13',
@@ -923,7 +1029,7 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
             _runtime_require(_runtime_read_at(app, roles[role]) == data, 'Maintenance role readback differs')
             _runtime_require([row for row in rows if row['path'] == roles[role]]
                              == [_runtime_file_row(roles[role], data, 0o755 if role == 'native' else 0o644)], 'Maintenance inventory role differs')
-        return {'kind': 'self-contained-runtime-payload', 'complete_candidate': False,
+        result = {'kind': 'self-contained-runtime-payload', 'complete_candidate': False,
                 'distribution_signing_performed': False, 'source_build_id': prepared['source_build_id'],
                 'wheel_tag': prepared['wheel_tag'], 'wheel_observations': prepared['wheel_observations'],
                 'git': git_contract, 'descriptor_sha256': _runtime_sha(descriptor_data),
@@ -931,6 +1037,9 @@ def _stage_runtime(output, prepared, bundle_version, bundle_id):
                 'input_file_sha256': sorted(prepared['pins'].values()), 'inventory': rows,
                 'licenses': [{'path': name, 'sha256': _runtime_sha(data)} for name, data in prepared['licenses']],
                 'source_sidecar': {'path': prepared['sidecar'].name, 'inventory': source_rows}}
+        if prepared['hosted_components'] is not None:
+            result['hosted_components'] = prepared['hosted_components']
+        return result
     finally:
         os.close(app)
         os.close(parent)
@@ -963,14 +1072,20 @@ def main():
         parser.error('--runtime-inputs requires --manifest-out')
     if args.upgrade_predecessors is not None and args.runtime_inputs is None:
         parser.error('--upgrade-predecessors requires --runtime-inputs')
-    host, extension = read_executable(args.host), read_executable(args.extension)
-    values = _load_templates()
-    factory, targets = inspect_package_artifacts(host, extension,
-        values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy)
     if args.runtime_inputs is not None and args.maintenance_native is None:
         parser.error('--runtime-inputs requires --maintenance-native')
-    native = read_executable(args.maintenance_native) if args.maintenance_native is not None else None
-    runtime = _prepare_runtime(args.runtime_inputs.absolute(), output, args.maintenance_native.absolute()) if args.runtime_inputs is not None else None
+    host, extension = read_executable(args.host), read_executable(args.extension)
+    runtime = native = None
+    if args.runtime_inputs is not None:
+        runtime = _prepare_runtime(args.runtime_inputs.absolute(), output, args.maintenance_native.absolute(),
+                                   host, extension)
+    elif args.maintenance_native is not None:
+        native = read_executable(args.maintenance_native)
+    hosted_sources = runtime['hosted_sources'] if runtime is not None else None
+    values = _load_templates(hosted_sources) if hosted_sources is not None else _load_templates()
+    factory, targets = inspect_package_artifacts(host, extension,
+        values[0].get('LSMinimumSystemVersion'), values[1].get('LSMinimumSystemVersion'), args.access_policy,
+        runtime_native=runtime['native'] if runtime is not None else None)
     if args.upgrade_predecessors is not None:
         declarations = _runtime_read(args.upgrade_predecessors.absolute())
         _runtime_require(len(declarations) <= 32768, 'Upgrade declarations exceed their limit')

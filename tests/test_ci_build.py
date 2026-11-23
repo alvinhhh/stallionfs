@@ -214,6 +214,22 @@ class ComponentArchive(unittest.TestCase):
 
 
 class CacheAndReceipt(unittest.TestCase):
+    def test_package_git_pin_uses_ci_validation_reader(self):
+        package = load('package_fskit')
+        bindings = load('ci_git_input')._Bindings(package._runtime_bundle())
+        bindings.reader = package._runtime_read
+        with tempfile.TemporaryDirectory() as temporary:
+            inventory = Path(temporary).resolve() / 'input-inventory.json'
+            data = b'[]'
+            inventory.write_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            pins = {}
+            with patch.object(package, '_runtime_read', bindings.read):
+                self.assertEqual(package._runtime_pinned({'path': str(inventory), 'sha256': digest}, pins), data)
+            self.assertEqual(pins, {str(inventory): digest})
+            self.assertIn(inventory, bindings.identities)
+            bindings.check()
+
     def test_owned_destination_uses_physical_parent(self):
         module = load('ci_build')
         with tempfile.TemporaryDirectory(dir='/var/tmp') as temporary:
