@@ -108,10 +108,14 @@ def scan_report(method='find-stat', raw=None, fixture='scan_flat_20k'):
 
 def dependency_report():
     data = sharing_report()
+    fixture = PERF / 'fixture'
+    locked_inputs = {name: hashlib.sha256((fixture / name).read_bytes()).hexdigest()
+                     for name in exporter.native_suite.native_fixtures.LOCKED_FILES}
+    dependencies = json.loads((fixture / 'package.json').read_text())['dependencies']
     data['selection'].update(fixtures=['installed_dependencies'], node='/Users/example/bin/node',
                              npm='/Users/example/npm/bin/npm-cli.js', npm_cache='/Users/example/npm-cache')
     data['rows'][0].update(fixture='installed_dependencies', run=1)
-    data['source_sha256'].update({'tests/perf/fixture/' + key: value for key, value in exporter.LOCKED_DEPENDENCY_INPUTS.items()})
+    data['source_sha256'].update({'tests/perf/fixture/' + key: value for key, value in locked_inputs.items()})
     root, node, npm, cache = '/Users/example/scratch/deps', '/Users/example/bin/node', '/Users/example/npm/bin/npm-cli.js', '/Users/example/npm-cache'
     common = [node, npm, '--prefix', root, '--userconfig', root + '/empty-user.npmrc',
               '--globalconfig', root + '/empty-global.npmrc', '--cache', cache]
@@ -125,11 +129,9 @@ def dependency_report():
         npm_version='11.15.0', node_version='v24.19.0', node_platform={'platform': 'darwin', 'arch': 'arm64'},
         typescript_platform={'name': '@typescript/typescript-darwin-arm64', 'version': '7.0.2'},
         typescript_cli_version='Version 7.0.2', runtime_pin_scope=exporter.DEPENDENCY_PIN_SCOPE,
-        policy=exporter.DEPENDENCY_POLICY, locked_inputs=dict(exporter.LOCKED_DEPENDENCY_INPUTS),
+        policy=exporter.DEPENDENCY_POLICY, locked_inputs=locked_inputs,
         source=root + '/node_modules', regular_files=11564, logical_bytes=85568073,
-        dependencies={'axios': '1.20.0', 'date-fns': '4.4.0', 'eslint': '10.12.0', 'lodash': '4.18.1',
-                      'prettier': '3.9.9', 'react': '19.3.0', 'react-dom': '19.3.0', 'rxjs': '7.8.2',
-                      'typescript': '7.0.2', 'zod': '4.6.5'},
+        dependencies=dependencies,
         commands=[dict(argv=argv, exit_code=0, stdout='', stderr='diagnostic /Users/example/npm-cache/log') for argv in commands])
     data['preparation'] = [receipt]
     return data

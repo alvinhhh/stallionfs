@@ -4,3 +4,5 @@ const { renderToStaticMarkup } = require('react-dom/server');
 assert.equal(renderToStaticMarkup(React.createElement('div', null, 'ready')), '<div>ready</div>');
 assert.equal(require('zod').z.string().parse('ready'), 'ready');
 assert.deepEqual(require('lodash').uniq([1, 1, 2]), [1, 2]);
+const linter = new (require('eslint').Linter)();
+assert.deepEqual(linter.verify('const ready = true;', [{ rules: { 'no-undef': 'error' } }]), []);
