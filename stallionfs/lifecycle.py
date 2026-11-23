@@ -247,6 +247,11 @@ class Lifecycle:
             action = 'snapshot' if record['operation'] == 'native-mounted-snapshot' else 'restore'
             return compound_locked(self, path, meta, action, record['name'], operation_id=operation_id, withdrawal=True)
 
+    def _snapshot_collection(self, workspace):
+        for collection in ('workspaces', 'trash'):
+            if os.path.lexists(self.root / collection / workspace):
+                return collection
+
     def snapshots(self, workspace, *, operation_id=None):
         if operation_id is not None:
             from ._native_recovery import compound_status
@@ -258,15 +263,28 @@ class Lifecycle:
                 raise core.StallionError('Workspace metadata identity changed')
             self._continuation_target(meta, True, operation_id)
             return compound_status(self, path, meta, operation_id)
-        _, meta = self.object('workspaces', workspace)
-        if meta.get('backend') == 'native-image':
-            with self._workspace_lock(workspace):
-                path, meta = self.object('workspaces', workspace)
-                if meta.get('ownership') == 'store-created':
-                    from ._native_recovery import catalog_locked
-                    return catalog_locked(self, path, meta, 'snapshots')
-                return core.native_operation(core.native_target(meta), 'snapshots')['snapshots']
         core.identifier(workspace, 32)
+        collection = self._snapshot_collection(workspace)
+        meta = None
+        if collection is not None:
+            try:
+                _, meta = self.object(collection, workspace)
+            except FileNotFoundError:
+                pass
+        if meta is None or meta.get('backend') == 'native-image':
+            with self._workspace_lock(workspace, reconcile=False):
+                current = self._snapshot_collection(workspace)
+                if current is None and collection is not None:
+                    raise core.StallionError(f'Workspace no longer exists: {workspace}')
+                path, meta = self.object(current or 'workspaces', workspace)
+                if meta.get('backend') == 'native-image':
+                    if current == 'trash':
+                        raise core.StallionError('Restore the workspace to list its native snapshots')
+                    self._reconcile(workspace)
+                    if meta.get('ownership') == 'store-created':
+                        from ._native_recovery import catalog_locked
+                        return catalog_locked(self, path, meta, 'snapshots')
+                    return core.native_operation(core.native_target(meta), 'snapshots')['snapshots']
         result = []
         for path in sorted((self.root / 'snapshots').iterdir()):
             core.private_directory(path)
