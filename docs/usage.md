@@ -446,3 +446,9 @@ command can report a committed change or unknown publication; it does not imply
 rollback. Preserve its recovery name and inspect the image before repeating the
 operation. Later explicitly requested calls use fresh ordinary validation;
 malformed slot pairs require explicit recovery rather than automatic repair.
+
+If the command reports that image recovery is required, keep the backing file
+and its store records unchanged. If you have a verified intact backup, make a
+separate closed copy in a private directory on local APFS. Register that copy
+with `sfs --root NEW_STORE register-native-image BACKUP_COPY.sfs`, using an
+unused store path to keep the new registration separate.
