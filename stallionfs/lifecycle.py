@@ -680,6 +680,18 @@ class Lifecycle:
                     state_path = self._state(value)
                     state = core.read_json(state_path) if os.path.lexists(state_path) else {}
                     metadata = core.read_json(path / 'meta.json') if os.path.lexists(path) else {}
+                    protection = self.root / 'protected' / f'{value}.json'
+                    native = (os.path.lexists(journal)
+                              or state.get('operation') in ('native-purge', 'native-retire', 'native-return', 'native-purge-complete'))
+                    if not native and not os.path.lexists(path) and os.path.lexists(protection):
+                        if os.path.lexists(self.root / 'workspaces' / value):
+                            raise core.StallionError('Retained object not found: ' + value)
+                        if core.read_json(protection).get('kind') == 'native-owned':
+                            raise core.StallionError('Native protection requires explicit native recovery')
+                        if yes:
+                            protection.unlink()
+                            core.sync_directory(protection.parent)
+                        return {'deleted' if yes else 'would_delete': str(protection)}
                     if (metadata.get('backend') == 'native-image'
                             or pending.get('operation') in ('native-purge', 'native-retire', 'native-return')
                             or state.get('operation') == 'native-purge-complete'):
@@ -700,12 +712,16 @@ class Lifecycle:
                         raise core.StallionError('Retained image is still attached')
                 if yes:
                     with self.staging() as stage:
+                        expired = stage / 'expired'
+                        path.rename(expired)
                         if kind == 'trash':
+                            core.sync_directory(path.parent)
+                            core.sync_directory(stage)
+                            core.sync_directory(stage.parent)
                             protection = self.root / 'protected' / f'{value}.json'
                             if os.path.lexists(protection):
                                 protection.unlink()
-                        expired = stage / 'expired'
-                        path.rename(expired)
+                                core.sync_directory(protection.parent)
                         core.remove_tree(expired)
                         stage.rmdir()
                 return {'deleted' if yes else 'would_delete': str(path)}
