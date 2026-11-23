@@ -102,7 +102,9 @@ def structure(repo, *, branch=None, allow_shallow=False):
                     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'unsafe-reftable')
             finally:
                 os.close(table)
-        return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(gitdir)), 'config': config_identity}
+        result = {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(gitdir)), 'config': config_identity}
+        result['shallow'] = read_at(gitdir, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(gitdir) else None
+        return result
     finally:
         if gitdir is not None:
             os.close(gitdir)
@@ -132,11 +134,17 @@ def bindings(repo):
         directory = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
         try:
             _, config = read_at(directory, 'config', INPUT_CAP)
-            return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(directory)), 'config': config}
+            shallow = read_at(directory, 'shallow', INPUT_CAP)[1] if 'shallow' in os.listdir(directory) else None
+            return {'repository': pair(os.fstat(root)), 'git': pair(os.fstat(directory)),
+                    'config': config, 'shallow': shallow}
         finally:
             os.close(directory)
     finally:
         os.close(root)
+
+
+def same_bindings(left, right):
+    return dict(left, shallow=left.get('shallow')) == dict(right, shallow=right.get('shallow'))
 
 
 def config_gate(entries):
@@ -174,7 +182,7 @@ def environment(directory, runtime):
 
 def checkout(repo, commit, branch, stage, record, persist, runtime):
     """Exactly five roles; durable pending receipts precede every launch."""
-    admitted = structure(repo)
+    admitted = structure(repo, allow_shallow=True)
     actors = stage / 'actors'
     actors.mkdir(mode=0o700)
     directory = actors / 'environment'
@@ -196,7 +204,7 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
         if 'check' in runtime:
             runtime['check']()
         current = bindings(repo)
-        require(current == admitted, 'git-input-changed')
+        require(same_bindings(current, admitted), 'git-input-changed')
         log = actors / role
         log.mkdir(mode=0o700)
         core.sync_directory(actors)
@@ -225,7 +233,7 @@ def checkout(repo, commit, branch, stage, record, persist, runtime):
     actor('03-head-state', [*prefix, 'symbolic-ref', '--quiet', 'HEAD'], code=1)
     actor('04-checkout', [*prefix, 'checkout', '-b', branch])
     # core.preferSymlinkRefs intentionally changes HEAD to a contained symlink.
-    after = structure(repo, branch=branch)
+    after = structure(repo, branch=branch, allow_shallow=True)
     require(after == admitted, 'git-config-changed')
 
 
@@ -278,7 +286,7 @@ def _inspect(repo, *, branch=None, structure_required=True, references=False, ru
                 os.close(fd)
         refs = []
         if references:
-            require(bindings(repo) == admitted, 'git-input-changed')
+            require(same_bindings(bindings(repo), admitted), 'git-input-changed')
             log = directory / 'refs'; log.mkdir(mode=0o700)
             data = query(log, ['--git-dir=' + str(repo / '.git'), '--work-tree=' + str(repo),
                 'for-each-ref', '--include-root-refs', '--format=%(refname)'])
@@ -337,7 +345,7 @@ def readiness(repo, metadata):
     """Qualified bounded read-only queries for an already installed workspace."""
     import tempfile
     runtime = qualified_runtime(metadata.get('native_host'))
-    admitted = structure(repo, branch=True)
+    admitted = structure(repo, branch=True, allow_shallow=True)
     with tempfile.TemporaryDirectory(prefix='sfs-native-readiness-') as temporary:
         directory = Path(temporary).resolve()
         for name in ('home', 'xdg', 'tmp', 'inspect'):
@@ -356,5 +364,5 @@ def readiness(repo, metadata):
         prefix = ['--git-dir=' + str(repo / '.git'), '--work-tree=' + str(repo)]
         commit = query('head', [*prefix, 'rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}']).decode().strip()
         branch = query('branch', [*prefix, 'symbolic-ref', '--quiet', 'HEAD']).decode().strip().removeprefix('refs/heads/')
-        require(structure(repo, branch=True) == admitted, 'git-input-changed')
+        require(structure(repo, branch=True, allow_shallow=True) == admitted, 'git-input-changed')
         return commit, branch
