@@ -43,7 +43,8 @@ Success requires the attachment to disappear and the backing file to remain
 unchanged. After the volume unmounts, root-owned system clients such as
 `storagekitd` (the `diskutil` backend) briefly open the image's raw whole disk,
 so the ordinary `hdiutil detach` can report `Resource busy` (status 16). Only
-that exact result is retried, up to seven attempts over about eight seconds, and
+that exact result is retried, optionally preceded by the exact macOS 27
+`hdiutil detach` deprecation warning, up to seven attempts over about eight seconds, and
 each attempt first repeats both inventory reads and mount-table checks. Other
 command errors, uncertain inventories and still-mounted volumes retain the image
 and the first error. A failed continuation retains both errors.

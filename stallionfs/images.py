@@ -277,11 +277,20 @@ def _completed_eject_failure(error, device):
 _BUSY_DETACH_DELAYS = (0.25, 0.5, 1, 2, 2, 2)
 
 
+# macOS 27 hdiutil prefixes every detach with this exact deprecation line.
+_DETACH_DEPRECATION = b"hdiutil: WARNING: 'hdiutil detach ...' is deprecated. Please use 'diskutil eject ...' instead."
+
+
+def _busy_detach_stderr(stderr, device):
+    busy = f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode()
+    lines = stderr.strip().splitlines() if isinstance(stderr, bytes) else None
+    return lines in ([busy], [_DETACH_DEPRECATION, busy])
+
+
 def _busy_detach_failure(error, device):
     return (isinstance(error, _CommandFailure) and error.returncode == 16 and
             error.args_native == ('/usr/bin/hdiutil', 'detach', device) and
-            error.stderr.strip() ==
-            f'hdiutil: couldn\'t eject "{device.removeprefix("/dev/")}" - Resource busy'.encode())
+            _busy_detach_stderr(error.stderr, device))
 
 
 def detach(image, mountpoint):
