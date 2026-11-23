@@ -45,7 +45,8 @@ class LinuxMountAdmission(unittest.TestCase):
             device = scratch.stat().st_dev
             row = {'mount_id': 41, 'device': f'{os.major(device)}:{os.minor(device)}', 'path': str(scratch),
                    'root': '/', 'filesystem': 'zfs', 'source': 'pool/benchmark', 'readonly': False}
-            properties = ('type\tfilesystem\nmounted\tyes\nreadonly\toff\nmountpoint\t' + str(scratch) + '\n').encode()
+            properties = ('type\tfilesystem\nmounted\tyes\nreadonly\toff\nmountpoint\t' + str(scratch)
+                          + '\nrecordsize\t131072\nsync\tstandard\ncompression\ton\n').encode()
             def command(argv, **kwargs):
                 return fileops.subprocess.CompletedProcess(argv, 0, b'zfs-2.4\n' if argv[-1] == '--version' else properties, b'')
             with mock.patch.object(fileops, 'linux_mount_id', return_value=(41, device)), \
@@ -54,6 +55,8 @@ class LinuxMountAdmission(unittest.TestCase):
                 volume = fileops.linux_scratch_volume([row], scratch)
                 self.assertEqual(volume['dataset'], 'pool/benchmark')
                 self.assertEqual(volume['mount_id'], 41)
+                self.assertEqual({key: volume['dataset_properties'][key] for key in ('recordsize', 'sync', 'compression')},
+                                 {'recordsize': '131072', 'sync': 'standard', 'compression': 'on'})
                 self.assertEqual(called.call_args_list[0].args[0][-1], 'pool/benchmark')
                 for changes in ({'mount_id': 42}, {'device': '0:999'}, {'root': '/subdir'},
                                 {'readonly': True}, {'filesystem': 'ext4'}, {'source': '/dev/vda'}):
@@ -63,6 +66,11 @@ class LinuxMountAdmission(unittest.TestCase):
                         [], 0, properties.replace(b'readonly\toff', b'readonly\ton'), b'')), \
                         self.assertRaisesRegex(RuntimeError, 'admitted writable ZFS'):
                     fileops.linux_scratch_volume([row], scratch)
+                for invalid in (properties.replace(b'recordsize\t131072\n', b''),
+                                properties.replace(b'131072', b'0'), properties + b'sync\talways\n'):
+                    with self.subTest(invalid=invalid), mock.patch.object(fileops, 'command', return_value=
+                            fileops.subprocess.CompletedProcess([], 0, invalid, b'')), self.assertRaises(RuntimeError):
+                        fileops.linux_scratch_volume([row], scratch)
 
     def test_fdinfo_mount_identity_requires_unique_observation_and_closes_fd(self):
         for text, valid in (('mnt_id:\t41\n', True), ('mnt_id:\t41\nmnt_id:\t42\n', False), ('pos:\t0\n', False)):
