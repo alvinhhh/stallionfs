@@ -131,7 +131,13 @@ class Routing(unittest.TestCase):
         test = (Path(__file__).resolve().parents[1] / 'tools/ci_test_entry.py').read_text()
         self.assertIn("qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'", test)
         self.assertIn("required_skips = (qualification or os.environ.get('STALLIONFS_TEST_IMAGES') == '1')", test)
-        self.assertIn('not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) or missing_contextual', test)
+        accounting = next(node for node in ast.parse(test).body
+                          if isinstance(node, ast.FunctionDef) and node.name == 'account_result')
+        refusal = accounting.body[-1]
+        self.assertIsInstance(refusal, ast.Return)
+        expected = ast.parse('not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) '
+                             'or invalid_sigkill or missing_contextual or missing_activation', mode='eval')
+        self.assertEqual(ast.dump(refusal.value), ast.dump(expected.body))
         self.assertIn("STALLIONFS_QUALIFICATION: ${{ matrix.phase == 'installed' && matrix.images == '1' && '1' || '0' }}", text)
         self.assertIn("'tools/ci_test_entry.py'", step(job(text, 'test-execution'), 'Test installed wheel with image failure diagnostics'))
         self.assertLess(test.index('controller.initialize_installed'), test.index("sys.path.insert(0, str(checkout / 'tests'))"))

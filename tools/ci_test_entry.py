@@ -3,6 +3,7 @@
 The supervisor owns only its retained Popen. EOF and reaping do not establish
 closure of escaped descendants or services. No arbitrary selectors are accepted.
 """
+from collections import Counter
 import datetime
 import json
 import math
@@ -620,6 +621,29 @@ def _supervise(argv, event_path, timeout, *, output_cap, echo, cancelled, mode, 
 CONTEXTUAL_TEST = 'test_fskit.FSKitInterfaces.test_contextual_and_legacy_callbacks_and_production_builds'
 ACTIVATION_TEST = 'test_fskit.FSKitInterfaces.test_managed_activation_and_pending_lock_lifetime'
 ADAPTER_TEST = 'test_native_activation.ActivationAdapter.test_producer_consumer_and_terminal_callback_drain'
+SIGKILL_IMAGE_TESTS = {
+    'test_sigkill_workspace.MountedImageDeath.' + name for name in (
+        'test_killed_image_create_keeps_closed_complete_candidate',
+        'test_killed_image_snapshot_keeps_closed_complete_candidate',
+        'test_killed_mount_and_detach_reconcile_existing_attachment',
+    )
+}
+SIGKILL_TESTS = SIGKILL_IMAGE_TESTS | {
+    'test_sigkill.ProcessDeath.' + name for name in (
+        'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
+        'test_killed_move_has_exactly_one_complete_inode_tree',
+        'test_killed_preparation_is_unpublished_reported_and_not_cached',
+        'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
+    )
+} | {
+    'test_sigkill_workspace.WorkspaceDeath.' + name for name in (
+        'test_killed_create_publishes_only_complete_workspace',
+        'test_killed_snapshot_publishes_only_complete_capture',
+        'test_killed_remove_preserves_payload_in_workspaces_or_trash',
+        'test_killed_purge_and_gc_retain_reported_remainder',
+        'test_killed_native_delete_is_confined_and_survivors_intact',
+    )
+}
 
 
 class ContextualResult(unittest.TextTestResult):
@@ -627,13 +651,39 @@ class ContextualResult(unittest.TextTestResult):
         super().__init__(*args, **kwargs)
         self.contextual_successes = 0
         self.activation_successes = 0
+        self.sigkill_successes = Counter()
 
     def addSuccess(self, test):
         super().addSuccess(test)
-        if test.id() == CONTEXTUAL_TEST:
+        identity = test.id()
+        if identity == CONTEXTUAL_TEST:
             self.contextual_successes += 1
-        if test.id() == ACTIVATION_TEST:
+        if identity == ACTIVATION_TEST:
             self.activation_successes += 1
+        if identity in SIGKILL_TESTS:
+            self.sigkill_successes[identity] += 1
+
+
+def sigkill_qualification_failed(result, skipped_ids):
+    unsuccessful = set(skipped_ids)
+    for field, outcome in (('failures', 'failed'), ('errors', 'errored'),
+                           ('expectedFailures', 'expected failure')):
+        for test, _ in getattr(result, field, ()):
+            identity = getattr(test, 'test_case', test).id()
+            if identity in SIGKILL_TESTS:
+                unsuccessful.add(identity)
+                print(f'Qualification requires {identity}: {outcome}', file=sys.stderr)
+    counts = getattr(result, 'sigkill_successes', {})
+    invalid = bool(unsuccessful)
+    for identity in sorted(SIGKILL_TESTS):
+        count = counts.get(identity, 0)
+        if count > 1:
+            print(f'Qualification requires {identity}: duplicate successes ({count})', file=sys.stderr)
+            invalid = True
+        elif count == 0 and identity not in unsuccessful:
+            print(f'Qualification requires {identity}: missing success', file=sys.stderr)
+            invalid = True
+    return invalid
 
 
 def account_result(result, probe, require_contextual, contextual_test):
@@ -666,17 +716,9 @@ def account_result(result, probe, require_contextual, contextual_test):
         if test.id() in ownership_tests
         and reason.startswith('Ownership fixtures require root or passwordless sudo: ')
     ]
-    sigkill_tests = {
-        'test_sigkill.ProcessDeath.' + name for name in (
-            'test_killed_copy_clone_preserve_source_and_allow_partial_destination',
-            'test_killed_move_has_exactly_one_complete_inode_tree',
-            'test_killed_preparation_is_unpublished_reported_and_not_cached',
-            'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
-        )
-    }
     sigkill_skips = [
         (test, reason) for test, reason in result.skipped
-        if test.id() in sigkill_tests
+        if test.id() in SIGKILL_TESTS
         and reason.startswith('SIGKILL pause hook unavailable: ')
     ]
     sigkill_root_tests = {
@@ -685,19 +727,35 @@ def account_result(result, probe, require_contextual, contextual_test):
             'test_killed_rollback_reconciles_both_sides_of_exchange_without_replay',
         )
     }
+    sigkill_root_tests |= {
+        'test_sigkill_workspace.WorkspaceDeath.' + name for name in (
+            'test_killed_create_publishes_only_complete_workspace',
+            'test_killed_snapshot_publishes_only_complete_capture',
+            'test_killed_remove_preserves_payload_in_workspaces_or_trash',
+            'test_killed_purge_and_gc_retain_reported_remainder',
+        )
+    } | SIGKILL_IMAGE_TESTS
     sigkill_root_skips = [
         (test, reason) for test, reason in result.skipped
         if test.id() in sigkill_root_tests
         and reason == 'SIGKILL Git fixtures require a non-root test process'
     ]
-    allowed_skips = capability_skips + adapter_skips + ownership_skips + sigkill_skips + sigkill_root_skips
-    qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'
-    qualification_skips = [
+    sigkill_image_skips = [
         (test, reason) for test, reason in result.skipped
-        if qualification and test.id() in ownership_tests | sigkill_tests | sigkill_root_tests
+        if test.id() in SIGKILL_IMAGE_TESTS
+        and reason.startswith('SIGKILL image fixtures unavailable: ')
     ]
-    for test, reason in qualification_skips:
-        print(f'Qualification requires {test.id()}: skipped: {reason}', file=sys.stderr)
+    allowed_skips = (capability_skips + adapter_skips + ownership_skips + sigkill_skips
+                     + sigkill_root_skips + sigkill_image_skips)
+    qualification = os.environ.get('STALLIONFS_QUALIFICATION') == '1'
+    qualification_skips = set()
+    if qualification:
+        for test, reason in result.skipped:
+            identity = getattr(test, 'test_case', test).id()
+            if identity in ownership_tests | SIGKILL_TESTS:
+                qualification_skips.add(identity)
+                print(f'Qualification requires {test.id()}: skipped: {reason}', file=sys.stderr)
+    invalid_sigkill = qualification and sigkill_qualification_failed(result, qualification_skips & SIGKILL_TESTS)
     for _, reason in allowed_skips:
         print(reason, file=sys.stderr)
     required_skips = (qualification or os.environ.get('STALLIONFS_TEST_IMAGES') == '1') and [
@@ -711,7 +769,8 @@ def account_result(result, probe, require_contextual, contextual_test):
     missing_activation = require_contextual and not activation_covered
     if missing_activation:
         print(f'Required {ACTIVATION_TEST} successes: expected 1, observed {activation_successes}', file=sys.stderr)
-    return not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips) or missing_contextual or missing_activation
+    return (not result.wasSuccessful() or bool(required_skips) or bool(qualification_skips)
+            or invalid_sigkill or missing_contextual or missing_activation)
 
 
 def installed(probe=None):

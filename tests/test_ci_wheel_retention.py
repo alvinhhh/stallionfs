@@ -23,6 +23,13 @@ import runpy, sys, unittest
 from unittest.mock import patch
 
 class Case(unittest.TestCase):
+    def __init__(self, identity):
+        super().__init__()
+        self.identity = identity
+
+    def id(self):
+        return self.identity
+
     def runTest(self):
         pass
 
@@ -34,9 +41,14 @@ sys.modules.update(
 tool, events = sys.argv[1:]
 sys.argv = [tool, '--child', events, 'suite']
 with patch('platform.machine', return_value='x86_64'), patch('subprocess.run'), \
-        patch('sysconfig.get_path', return_value=str(Path(sys.prefix).resolve() / 'bin')), \
-        patch.object(unittest.defaultTestLoader, 'discover', return_value=unittest.TestSuite([Case()])):
-    runpy.run_path(tool, run_name='__main__')
+        patch('sysconfig.get_path', return_value=str(Path(sys.prefix).resolve() / 'bin')):
+    entry = runpy.run_path(tool)
+    # This child tests receipt binding with synthetic successes. The crash
+    # fixtures and their exact accounting are tested separately.
+    identities = sorted(entry.get('SIGKILL_TESTS', ())) or ['wheel_retention.synthetic']
+    suite = unittest.TestSuite(Case(identity) for identity in identities)
+    with patch.object(unittest.defaultTestLoader, 'discover', return_value=suite):
+        raise SystemExit(entry['main']())
 """
 ADMISSION = """
 import hashlib, json

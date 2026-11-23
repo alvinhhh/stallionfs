@@ -411,7 +411,7 @@ class EntryTests(unittest.TestCase):
         capability = (SimpleNamespace(id=lambda: 'setUpClass (test_fskit.FSKitInterfaces)'),
                       'FSKit capability unavailable: synthetic')
         ordinary = (SimpleNamespace(id=lambda: 'required.test'), 'missing')
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
             self.assertFalse(entry.account_result(result([capability]), None, False, 'context'))
             self.assertTrue(entry.account_result(result([ordinary]), None, False, 'context'))
             self.assertTrue(entry.account_result(result(), None, True, 'context'))
@@ -512,6 +512,7 @@ class EntryTests(unittest.TestCase):
                                        STALLIONFS_QUALIFICATION=qualification):
                         result = SimpleNamespace(skipped=[(SimpleNamespace(id=lambda: identity), reason)],
                                                  contextual_successes=0, activation_successes=0,
+                                                 sigkill_successes=dict.fromkeys(entry.SIGKILL_TESTS, 1),
                                                  wasSuccessful=lambda: True, testsRun=1)
                         output = io.StringIO()
                         with contextlib.redirect_stderr(output):
@@ -530,6 +531,76 @@ class EntryTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST))
 
+    def test_workspace_sigkill_skips_require_exact_ids_reasons_and_nonqualification(self):
+        folder_names = (
+            'test_killed_create_publishes_only_complete_workspace',
+            'test_killed_snapshot_publishes_only_complete_capture',
+            'test_killed_remove_preserves_payload_in_workspaces_or_trash',
+            'test_killed_purge_and_gc_retain_reported_remainder',
+            'test_killed_native_delete_is_confined_and_survivors_intact',
+        )
+        image_names = (
+            'test_killed_image_create_keeps_closed_complete_candidate',
+            'test_killed_image_snapshot_keeps_closed_complete_candidate',
+            'test_killed_mount_and_detach_reconcile_existing_attachment',
+        )
+        folders = ['test_sigkill_workspace.WorkspaceDeath.' + name for name in folder_names]
+        images = ['test_sigkill_workspace.MountedImageDeath.' + name for name in image_names]
+        root_reason = 'SIGKILL Git fixtures require a non-root test process'
+        hook = 'SIGKILL pause hook unavailable: workspace rename: DYLD stripped'
+        image = 'SIGKILL image fixtures unavailable: missing /usr/bin/hdiutil'
+        def skipped(name, reason):
+            return SimpleNamespace(id=lambda: name), reason
+        def refused(skips, success=True, probe=None):
+            result = SimpleNamespace(skipped=skips, contextual_successes=0, activation_successes=0,
+                                     sigkill_successes=dict.fromkeys(entry.SIGKILL_TESTS, 1),
+                                     wasSuccessful=lambda: success, testsRun=8)
+            return entry.account_result(result, probe, False, entry.CONTEXTUAL_TEST)
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'):
+            valid = [skipped(name, hook) for name in folders + images] + [skipped(name, image) for name in images]
+            for skip in valid:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(valid))
+            self.assertTrue(refused(valid, success=False))
+            self.assertTrue(refused(valid, probe='pass'))
+            root_skips = [skipped(name, root_reason) for name in folders[:-1] + images]
+            for skip in root_skips:
+                self.assertFalse(refused([skip]))
+            self.assertFalse(refused(root_skips))
+            self.assertTrue(refused(root_skips, success=False))
+            self.assertTrue(refused(root_skips, probe='pass'))
+            for image_flag in ('0', '1'):
+                with patch.dict(os.environ, STALLIONFS_QUALIFICATION='1', STALLIONFS_TEST_IMAGES=image_flag):
+                    self.assertFalse(refused([]))
+                    self.assertTrue(refused([], success=False))
+                    for skip in valid + root_skips:
+                        with self.subTest(test=skip[0].id(), reason=skip[1], images=image_flag):
+                            output = io.StringIO()
+                            with contextlib.redirect_stderr(output):
+                                self.assertTrue(refused([skip]))
+                            self.assertIn(f'Qualification requires {skip[0].id()}: skipped: {skip[1]}',
+                                          output.getvalue())
+                    self.assertTrue(refused(valid + root_skips))
+            native_delete = skipped(folders[-1], root_reason)
+            self.assertTrue(refused([native_delete]))
+            self.assertTrue(refused(root_skips + [native_delete]))
+            for name in folders + images:
+                self.assertTrue(refused([skipped(name, root_reason + ': other')]))
+            for name in folders:
+                self.assertTrue(refused([skipped(name, image)]))
+            for reason in ('', 'SIGKILL pause hook unavailable', 'SIGKILL image fixtures unavailable', 'other'):
+                for name in folders + images:
+                    self.assertTrue(refused([skipped(name, reason)]))
+            for name in ('test_sigkill_workspace.WorkspaceDeath.test_other',
+                         'test_sigkill_workspace.MountedImageDeath.test_other',
+                         'setUpClass (test_sigkill_workspace.WorkspaceDeath)',
+                         'setUpClass (test_sigkill_workspace.MountedImageDeath)',
+                         'test_sigkill_workspace.WorkspaceHookCapabilities.test_probe_failure_names_boundary'):
+                for reason in (hook, image, root_reason):
+                    invalid = skipped(name, reason)
+                    self.assertTrue(refused([invalid]))
+                    self.assertTrue(refused(valid + [invalid]))
+
     def test_adapter_skip_requires_nested_pass_or_unsupported_host(self):
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -541,7 +612,8 @@ class EntryTests(unittest.TestCase):
             result = SimpleNamespace(skipped=skips, activation_successes=successes,
                                      contextual_successes=contextual, wasSuccessful=lambda: successful)
             return entry.account_result(result, None, required, entry.CONTEXTUAL_TEST)
-        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1'), contextlib.redirect_stderr(io.StringIO()):
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='0'), \
+                contextlib.redirect_stderr(io.StringIO()):
             self.assertFalse(refused([adapter], 1, required=True))
             self.assertFalse(refused([adapter, capability]))
             for count in (0, 2, -1, True, None):
@@ -570,6 +642,68 @@ class EntryTests(unittest.TestCase):
             self.assertEqual(result.contextual_successes, 1)
             self.assertEqual(result.activation_successes, int(outcome == 'pass'))
             self.assertEqual(result.wasSuccessful(), outcome != 'fail')
+
+    def test_qualification_requires_one_success_for_each_installed_sigkill_test(self):
+        if __package__:
+            from .test_sigkill import ProcessDeath
+            from .test_sigkill_workspace import MountedImageDeath, WorkspaceDeath
+        else:
+            from test_sigkill import ProcessDeath
+            from test_sigkill_workspace import MountedImageDeath, WorkspaceDeath
+
+        required = {
+            case(method).id().removeprefix(f'{__package__}.')
+            for case in (ProcessDeath, WorkspaceDeath, MountedImageDeath)
+            for method in unittest.defaultTestLoader.getTestCaseNames(case)
+        }
+        self.assertEqual(len(required), 12)
+        self.assertEqual(entry.SIGKILL_TESTS, required)
+
+        class Synthetic(unittest.TestCase):
+            def __init__(self, identity, outcome='pass'):
+                super().__init__('runTest')
+                self.identity = identity
+                self.outcome = outcome
+
+            def id(self):
+                return self.identity
+
+            def runTest(self):
+                if self.outcome == 'skip':
+                    self.skipTest('SIGKILL pause hook unavailable: synthetic')
+                if self.outcome == 'fail':
+                    with self.subTest(boundary='synthetic'):
+                        self.fail('controlled cut failure')
+                if self.outcome == 'error':
+                    raise RuntimeError('controlled fixture error')
+
+        def account(cases, message=None):
+            result = unittest.TextTestRunner(stream=io.StringIO(), resultclass=entry.ContextualResult).run(
+                unittest.TestSuite([*cases, Synthetic('unrelated.test')]))
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(entry.account_result(result, None, False, entry.CONTEXTUAL_TEST), message is not None)
+            if message:
+                self.assertIn(message, output.getvalue())
+            else:
+                self.assertEqual(result.sigkill_successes, dict.fromkeys(required, 1))
+                self.assertEqual(output.getvalue(), '')
+
+        with patch.dict(os.environ, STALLIONFS_TEST_IMAGES='1', STALLIONFS_QUALIFICATION='1'):
+            account(Synthetic(name) for name in sorted(required))
+            for identity in sorted(required):
+                for outcome, replacements, detail in (
+                    ('missing', (), 'missing success'),
+                    ('duplicate', ('pass', 'pass'), 'duplicate successes (2)'),
+                    ('skip', ('skip',), 'skipped: SIGKILL pause hook unavailable: synthetic'),
+                    ('failure', ('fail',), 'failed'),
+                    ('error', ('error',), 'errored'),
+                    ('pass and skip', ('pass', 'skip'), 'skipped: SIGKILL pause hook unavailable: synthetic'),
+                ):
+                    with self.subTest(identity=identity, outcome=outcome):
+                        others = [Synthetic(name) for name in sorted(required - {identity})]
+                        account(others + [Synthetic(identity, state) for state in replacements],
+                                f'Qualification requires {identity}: {detail}')
 
     def test_workflow_entry_allocation_and_fixed_discovery(self):
         import ast
