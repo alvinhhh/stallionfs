@@ -2794,6 +2794,16 @@ final class StallionVolume: FSVolume, FSVolume.OpenCloseHandler, FSVolume.Access
                     }
                     victim = suppliedVictim; victimMetadata = metadata
                 }
+                if sourceMetadata.entry.kind == SFS_DIRECTORY && oldParent != newParent {
+                    var containsDestination: Int32 = 0
+                    let status = sfs_image_directory_contains(h, source, newParent, &containsDestination, &receipt)
+                    do { try self.check(status, receipt) } catch {
+                        if status == SFS_STATE || status == SFS_UNSUPPORTED { self.latch(error) }
+                        self.rememberDelivery(error, receipt)
+                        throw error
+                    }
+                    if containsDestination != 0 { throw POSIXError(.EINVAL) }
+                }
                 let removedParent: LastKnownParent?
                 if let victim, let victimMetadata, victimMetadata.link_count == 1 {
                     removedParent = LastKnownParent(item: ObjectIdentifier(victim), pin: try self.token(victim.inode),
